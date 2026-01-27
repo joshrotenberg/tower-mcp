@@ -2,9 +2,61 @@
 
 Tower-native Model Context Protocol (MCP) implementation for Rust.
 
-## Philosophy
+## Why This Exists
 
-Unlike framework-style MCP implementations (rmcp, rust-mcp-sdk), tower-mcp treats MCP as just another protocol that can be served through Tower's `Service` trait. This means:
+### The Bigger Picture: jpx-cloud
+
+This project emerged from building **jpx-cloud**, a hosted MCP service for JSON querying:
+
+- **jpx** is an open-source JMESPath implementation with 400+ extension functions
+- **jpx-cloud** is a SaaS offering: hosted MCP server with auth, rate limiting, analytics
+- The value prop: "Deterministic JSON for non-deterministic agents" - same input, same output, every time
+
+jpx-cloud needs to serve MCP over HTTP with:
+- API key authentication
+- Per-tier rate limiting
+- Prometheus metrics
+- Request tracing
+- Multiple protocols (MCP, REST, potentially gRPC)
+
+### The Problem with Existing Options
+
+**rmcp** (official Rust MCP SDK) is framework-style:
+- Great for quick starts with `#[tool]` macros
+- But no middleware story - you'd bolt tower onto rmcp
+- Transport is built-in, not pluggable
+- Hard to integrate with existing axum/tonic services
+
+**rust-mcp-sdk** has similar constraints.
+
+### The tower-mcp Approach
+
+Treat MCP as just another protocol that can be served through Tower's `Service` trait:
+
+```rust
+// Same jpx handler, different protocols/middleware
+let jpx = JpxService::new();
+
+// MCP over stdio (CLI/local)
+let mcp_stdio = ServiceBuilder::new()
+    .layer(JsonRpcLayer::new())
+    .service(jpx.clone());
+
+// MCP over HTTP (cloud)
+let mcp_http = ServiceBuilder::new()
+    .layer(AuthLayer::new(api_keys))
+    .layer(RateLimitLayer::new(tier_limits))
+    .layer(MetricsLayer::new())
+    .layer(JsonRpcLayer::new())
+    .service(jpx.clone());
+
+// REST API (non-MCP users) - same core!
+let rest = ServiceBuilder::new()
+    .layer(AuthLayer::new(api_keys))
+    .service(jpx);
+```
+
+## Philosophy
 
 - Standard tower middleware (tracing, metrics, rate limiting, auth) just works
 - Same service can be exposed over multiple transports (stdio, HTTP, WebSocket)
@@ -55,6 +107,7 @@ https://modelcontextprotocol.io/specification/2025-11-25
 - **Transport**: JSON-RPC 2.0 over stdio, HTTP/SSE, or WebSocket
 - **Session**: Stateful, requires initialize handshake
 - **Capabilities**: Server declares tools, resources, prompts support
+- **Tool names**: 1-128 chars, alphanumeric + underscore/hyphen/dot, case-sensitive
 
 ### Tool Definition Schema
 
@@ -82,6 +135,18 @@ Client                    Server
   |-- tools/call ---------> |
   |<-------- result --------|
 ```
+
+### Notifications (Server -> Client)
+
+MCP supports server-initiated notifications for:
+- Progress updates on long-running tools
+- Log messages
+- Tool list changes
+
+This is the trickiest part for tower (request/response model). Options:
+- Inject `Sender<Notification>` into handler context
+- SSE naturally handles this for HTTP
+- Stdio needs message multiplexing
 
 ## Tool Definition Options
 
@@ -142,25 +207,60 @@ let tool = ToolBuilder::new("dynamic")
 ## Implementation Status
 
 ### Done
-- [x] JSON-RPC 2.0 types
+- [x] JSON-RPC 2.0 types (request, response, notification, error)
 - [x] MCP protocol types (tools, resources, prompts)
 - [x] Tool builder with type-safe handlers
 - [x] McpTool trait for complex tools
 - [x] McpRouter with tower Service impl
-- [x] JsonRpcService layer
+- [x] JsonRpcService layer for protocol framing
 - [x] Basic tests
 
 ### TODO
-- [ ] Stdio transport
+- [ ] Stdio transport (simplest, good for testing)
 - [ ] HTTP transport (with SSE for notifications)
 - [ ] WebSocket transport
-- [ ] Session management (initialize handshake)
-- [ ] Resources support
+- [ ] Session management (initialize handshake, capability negotiation)
+- [ ] Resources support (read, subscribe)
 - [ ] Prompts support
 - [ ] Progress notifications
 - [ ] Cancellation support
 - [ ] Tower layer examples (tracing, metrics, auth)
-- [ ] Integration tests with real MCP clients
+- [ ] Integration tests with Claude Desktop or other MCP clients
+- [ ] Batching layer (combine multiple 1:1 calls into batch internally)
+
+## MCPaaS Landscape Context (Jan 2026)
+
+For context on where MCP is heading:
+
+**Big players entering:**
+- AWS Bedrock AgentCore - context manager, orchestration
+- Microsoft Azure Easy MCP - OpenAPI-to-MCP translation
+- Cloudflare - edge orchestration
+- Salesforce - hosted MCP with SLA
+
+**Gateways/Governance:**
+- MintMCP - role-based endpoints, Cursor partnership
+- Descope - AI agents as first-class identities
+
+**Marketplaces:**
+- MCP.so, Cline Marketplace, MCP Exchange (rental model)
+- ~70% of large SaaS brands now offer remote MCP servers
+- MCP donated to Linux Foundation (Agentic AI Foundation) Dec 2025
+
+tower-mcp is positioned as infrastructure for building MCP services, not a platform or marketplace.
+
+## Related Projects
+
+### Sibling Projects
+- [jmespath-extensions](https://github.com/joshrotenberg/jmespath-extensions) - jpx core library and CLI
+- jpx-cloud (private) - SaaS infrastructure for hosted jpx
+
+### Ecosystem
+- [rmcp](https://github.com/modelcontextprotocol/rust-sdk) - Official Rust MCP SDK
+- [rust-mcp-sdk](https://crates.io/crates/rust-mcp-sdk) - Another MCP SDK
+- [tower](https://github.com/tower-rs/tower) - Tower service abstraction
+- [axum](https://github.com/tokio-rs/axum) - Tower-native web framework
+- [tonic](https://github.com/hyperium/tonic) - gRPC for tower
 
 ## Development
 
@@ -170,21 +270,16 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 ```
 
-## Related Projects
+## Project Goals
 
-- [rmcp](https://github.com/modelcontextprotocol/rust-sdk) - Official Rust MCP SDK
-- [rust-mcp-sdk](https://crates.io/crates/rust-mcp-sdk) - Another MCP SDK
-- [tower](https://github.com/tower-rs/tower) - Tower service abstraction
-- [axum](https://github.com/tokio-rs/axum) - Tower-native web framework
+This is a **learning project first**, potential ecosystem contribution second:
 
-## Motivation
+1. Deeply understand MCP protocol by implementing it
+2. Learn tower patterns for protocol implementation
+3. Build infrastructure for jpx-cloud
+4. If useful to others, publish to crates.io
 
-jpx-cloud needs MCP over HTTP with auth, rate limiting, and metrics. rmcp handles the protocol but not the service layer. Rather than bolt tower onto rmcp, building tower-native MCP provides:
-
-1. Same middleware for MCP, REST, and gRPC endpoints
-2. Clean separation of protocol and transport
-3. Learning opportunity (implement MCP from scratch)
-4. Potential ecosystem contribution
+Not trying to replace rmcp for everyone - just providing an alternative for teams that want tower-native composition.
 
 ## License
 
