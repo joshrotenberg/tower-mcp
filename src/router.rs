@@ -104,6 +104,20 @@ impl McpRouter {
 
     /// Handle an MCP request
     async fn handle(&self, request: McpRequest) -> Result<McpResponse> {
+        // Enforce session state - reject requests before initialization
+        let method = request.method_name();
+        if !self.session.is_request_allowed(method) {
+            tracing::warn!(
+                method = %method,
+                phase = ?self.session.phase(),
+                "Request rejected: session not initialized"
+            );
+            return Err(Error::JsonRpc(JsonRpcError::invalid_request(format!(
+                "Session not initialized. Only 'initialize' and 'ping' are allowed before initialization. Got: {}",
+                method
+            ))));
+        }
+
         match request {
             McpRequest::Initialize(params) => {
                 tracing::info!(
@@ -568,6 +582,28 @@ mod tests {
         b: i64,
     }
 
+    /// Helper to initialize a router for testing
+    async fn init_router(router: &mut McpRouter) {
+        // Send initialize request
+        let init_req = RouterRequest {
+            id: RequestId::Number(0),
+            inner: McpRequest::Initialize(InitializeParams {
+                protocol_version: "2025-03-26".to_string(),
+                capabilities: ClientCapabilities {
+                    roots: None,
+                    sampling: None,
+                },
+                client_info: Implementation {
+                    name: "test".to_string(),
+                    version: "1.0".to_string(),
+                },
+            }),
+        };
+        let _ = router.ready().await.unwrap().call(init_req).await.unwrap();
+        // Send initialized notification
+        router.handle_notification(McpNotification::Initialized);
+    }
+
     #[tokio::test]
     async fn test_router_list_tools() {
         let add_tool = ToolBuilder::new("add")
@@ -579,6 +615,9 @@ mod tests {
             .expect("valid tool name");
 
         let mut router = McpRouter::new().tool(add_tool);
+
+        // Initialize session first
+        init_router(&mut router).await;
 
         let req = RouterRequest {
             id: RequestId::Number(1),
@@ -608,6 +647,9 @@ mod tests {
 
         let mut router = McpRouter::new().tool(add_tool);
 
+        // Initialize session first
+        init_router(&mut router).await;
+
         let req = RouterRequest {
             id: RequestId::Number(1),
             inner: McpRequest::CallTool(CallToolParams {
@@ -631,6 +673,17 @@ mod tests {
         }
     }
 
+    /// Helper to initialize a JsonRpcService for testing
+    async fn init_jsonrpc_service(service: &mut JsonRpcService<McpRouter>, router: &McpRouter) {
+        let init_req = JsonRpcRequest::new(0, "initialize").with_params(serde_json::json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": { "name": "test", "version": "1.0" }
+        }));
+        let _ = service.call_single(init_req).await.unwrap();
+        router.handle_notification(McpNotification::Initialized);
+    }
+
     #[tokio::test]
     async fn test_jsonrpc_service() {
         let add_tool = ToolBuilder::new("add")
@@ -642,7 +695,10 @@ mod tests {
             .expect("valid tool name");
 
         let router = McpRouter::new().tool(add_tool);
-        let mut service = JsonRpcService::new(router);
+        let mut service = JsonRpcService::new(router.clone());
+
+        // Initialize session first
+        init_jsonrpc_service(&mut service, &router).await;
 
         let req = JsonRpcRequest::new(1, "tools/list");
 
@@ -669,7 +725,10 @@ mod tests {
             .expect("valid tool name");
 
         let router = McpRouter::new().tool(add_tool);
-        let mut service = JsonRpcService::new(router);
+        let mut service = JsonRpcService::new(router.clone());
+
+        // Initialize session first
+        init_jsonrpc_service(&mut service, &router).await;
 
         // Create a batch of requests
         let requests = vec![

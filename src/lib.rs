@@ -52,6 +52,7 @@ pub mod protocol;
 pub mod router;
 pub mod session;
 pub mod tool;
+pub mod transport;
 
 // Re-exports
 pub use error::{Error, Result};
@@ -62,3 +63,4 @@ pub use protocol::{
 pub use router::{JsonRpcService, McpRouter};
 pub use session::{SessionPhase, SessionState};
 pub use tool::{Tool, ToolBuilder, ToolHandler};
+pub use transport::{StdioTransport, SyncStdioTransport};

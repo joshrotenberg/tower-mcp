@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "tower-mcp-example": {
+      "command": "cargo",
+      "args": ["run", "--example", "stdio_server"],
+      "env": {
+        "RUST_LOG": "tower_mcp=debug"
+      }
+    }
+  }
+}

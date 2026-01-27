@@ -253,6 +253,25 @@ pub enum McpRequest {
     },
 }
 
+impl McpRequest {
+    /// Get the method name for this request
+    pub fn method_name(&self) -> &str {
+        match self {
+            McpRequest::Initialize(_) => "initialize",
+            McpRequest::ListTools(_) => "tools/list",
+            McpRequest::CallTool(_) => "tools/call",
+            McpRequest::ListResources(_) => "resources/list",
+            McpRequest::ReadResource(_) => "resources/read",
+            McpRequest::SubscribeResource(_) => "resources/subscribe",
+            McpRequest::UnsubscribeResource(_) => "resources/unsubscribe",
+            McpRequest::ListPrompts(_) => "prompts/list",
+            McpRequest::GetPrompt(_) => "prompts/get",
+            McpRequest::Ping => "ping",
+            McpRequest::Unknown { method, .. } => method,
+        }
+    }
+}
+
 /// High-level MCP notification (parsed from JSON-RPC)
 #[derive(Debug, Clone)]
 pub enum McpNotification {
