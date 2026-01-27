@@ -98,6 +98,53 @@ impl JsonRpcResponse {
     }
 }
 
+/// JSON-RPC 2.0 message - can be a single request or a batch
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum JsonRpcMessage {
+    /// A single request
+    Single(JsonRpcRequest),
+    /// A batch of requests
+    Batch(Vec<JsonRpcRequest>),
+}
+
+impl JsonRpcMessage {
+    /// Returns true if this is a batch message
+    pub fn is_batch(&self) -> bool {
+        matches!(self, JsonRpcMessage::Batch(_))
+    }
+
+    /// Returns the number of requests in this message
+    pub fn len(&self) -> usize {
+        match self {
+            JsonRpcMessage::Single(_) => 1,
+            JsonRpcMessage::Batch(batch) => batch.len(),
+        }
+    }
+
+    /// Returns true if this message contains no requests
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// JSON-RPC 2.0 response message - can be a single response or a batch
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum JsonRpcResponseMessage {
+    /// A single response
+    Single(JsonRpcResponse),
+    /// A batch of responses
+    Batch(Vec<JsonRpcResponse>),
+}
+
+impl JsonRpcResponseMessage {
+    /// Returns true if this is a batch response
+    pub fn is_batch(&self) -> bool {
+        matches!(self, JsonRpcResponseMessage::Batch(_))
+    }
+}
+
 /// JSON-RPC 2.0 notification (no response expected)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcNotification {

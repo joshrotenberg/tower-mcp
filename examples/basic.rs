@@ -10,7 +10,6 @@
 
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tower::{Service, ServiceExt};
 use tower_mcp::{CallToolResult, JsonRpcRequest, JsonRpcService, McpRouter, ToolBuilder};
 
 // Input types for our tools - schemars generates JSON Schema automatically
@@ -55,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .handler(|input: GreetInput| async move {
             Ok(CallToolResult::text(format!("Hello, {}!", input.name)))
         })
-        .build();
+        .build()?;
 
     let add = ToolBuilder::new("add")
         .description("Add two numbers together")
@@ -65,19 +64,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let result = input.a + input.b;
             Ok(CallToolResult::text(format!("{}", result)))
         })
-        .build();
+        .build()?;
 
     let echo = ToolBuilder::new("echo")
         .description("Echo a message back, optionally repeated")
         .read_only()
         .handler(|input: EchoInput| async move {
-            let repeated: Vec<_> = std::iter::repeat(&input.message)
-                .take(input.repeat as usize)
+            let repeated: Vec<_> = std::iter::repeat_n(&input.message, input.repeat as usize)
                 .cloned()
                 .collect();
             Ok(CallToolResult::text(repeated.join(" ")))
         })
-        .build();
+        .build()?;
 
     // Create the router with our tools
     let router = McpRouter::new()
@@ -103,13 +101,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "version": "1.0.0"
         }
     }));
-    let resp = service.ready().await?.call(init_req).await?;
+    let resp = service.call_single(init_req).await?;
     println!("   Response: {}\n", serde_json::to_string_pretty(&resp)?);
 
     // 2. List tools
     println!("2. List tools request:");
     let list_req = JsonRpcRequest::new(2, "tools/list");
-    let resp = service.ready().await?.call(list_req).await?;
+    let resp = service.call_single(list_req).await?;
     println!("   Response: {}\n", serde_json::to_string_pretty(&resp)?);
 
     // 3. Call the greet tool
@@ -120,7 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "name": "World"
         }
     }));
-    let resp = service.ready().await?.call(call_req).await?;
+    let resp = service.call_single(call_req).await?;
     println!("   Response: {}\n", serde_json::to_string_pretty(&resp)?);
 
     // 4. Call the add tool
@@ -132,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "b": 25
         }
     }));
-    let resp = service.ready().await?.call(call_req).await?;
+    let resp = service.call_single(call_req).await?;
     println!("   Response: {}\n", serde_json::to_string_pretty(&resp)?);
 
     // 5. Call the echo tool with repeat
@@ -144,13 +142,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "repeat": 3
         }
     }));
-    let resp = service.ready().await?.call(call_req).await?;
+    let resp = service.call_single(call_req).await?;
     println!("   Response: {}\n", serde_json::to_string_pretty(&resp)?);
 
     // 6. Ping
     println!("6. Ping request:");
     let ping_req = JsonRpcRequest::new(6, "ping");
-    let resp = service.ready().await?.call(ping_req).await?;
+    let resp = service.call_single(ping_req).await?;
     println!("   Response: {}\n", serde_json::to_string_pretty(&resp)?);
 
     // 7. Try calling a non-existent tool
@@ -159,7 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "name": "does_not_exist",
         "arguments": {}
     }));
-    let resp = service.ready().await?.call(call_req).await?;
+    let resp = service.call_single(call_req).await?;
     println!("   Response: {}\n", serde_json::to_string_pretty(&resp)?);
 
     Ok(())

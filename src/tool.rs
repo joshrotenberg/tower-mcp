@@ -18,6 +18,36 @@ use serde_json::Value;
 use crate::error::{Error, Result};
 use crate::protocol::{CallToolResult, ToolAnnotations, ToolDefinition};
 
+/// Validate a tool name according to MCP spec.
+///
+/// Tool names must be:
+/// - 1-128 characters long
+/// - Contain only alphanumeric characters, underscores, hyphens, and dots
+///
+/// Returns `Ok(())` if valid, `Err` with description if invalid.
+pub fn validate_tool_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(Error::Tool("Tool name cannot be empty".into()));
+    }
+    if name.len() > 128 {
+        return Err(Error::Tool(format!(
+            "Tool name '{}' exceeds maximum length of 128 characters (got {})",
+            name,
+            name.len()
+        )));
+    }
+    if let Some(invalid_char) = name
+        .chars()
+        .find(|c| !c.is_ascii_alphanumeric() && *c != '_' && *c != '-' && *c != '.')
+    {
+        return Err(Error::Tool(format!(
+            "Tool name '{}' contains invalid character '{}'. Only alphanumeric, underscore, hyphen, and dot are allowed.",
+            name, invalid_char
+        )));
+    }
+    Ok(())
+}
+
 /// A boxed future for tool handlers
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -36,6 +66,16 @@ pub struct Tool {
     pub description: Option<String>,
     pub annotations: Option<ToolAnnotations>,
     handler: Arc<dyn ToolHandler>,
+}
+
+impl std::fmt::Debug for Tool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tool")
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .field("annotations", &self.annotations)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Tool {
@@ -155,17 +195,20 @@ impl ToolBuilder {
     }
 
     /// Create a tool with raw JSON handling (no automatic deserialization)
-    pub fn raw_handler<F, Fut>(self, handler: F) -> Tool
+    ///
+    /// Returns an error if the tool name is invalid.
+    pub fn raw_handler<F, Fut>(self, handler: F) -> Result<Tool>
     where
         F: Fn(Value) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
     {
-        Tool {
+        validate_tool_name(&self.name)?;
+        Ok(Tool {
             name: self.name,
             description: self.description,
             annotations: self.annotations,
             handler: Arc::new(RawHandler { handler }),
-        }
+        })
     }
 }
 
@@ -185,8 +228,11 @@ where
     Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
 {
     /// Build the tool
-    pub fn build(self) -> Tool {
-        Tool {
+    ///
+    /// Returns an error if the tool name is invalid.
+    pub fn build(self) -> Result<Tool> {
+        validate_tool_name(&self.name)?;
+        Ok(Tool {
             name: self.name,
             description: self.description,
             annotations: self.annotations,
@@ -194,7 +240,7 @@ where
                 handler: self.handler,
                 _phantom: std::marker::PhantomData,
             }),
-        }
+        })
     }
 }
 
@@ -298,18 +344,21 @@ pub trait McpTool: Send + Sync + 'static {
     }
 
     /// Convert to a Tool instance
-    fn into_tool(self) -> Tool
+    ///
+    /// Returns an error if the tool name is invalid.
+    fn into_tool(self) -> Result<Tool>
     where
         Self: Sized,
     {
+        validate_tool_name(Self::NAME)?;
         let annotations = self.annotations();
         let tool = Arc::new(self);
-        Tool {
+        Ok(Tool {
             name: Self::NAME.to_string(),
             description: Some(Self::DESCRIPTION.to_string()),
             annotations,
             handler: Arc::new(McpToolHandler { tool }),
-        }
+        })
     }
 }
 
@@ -359,7 +408,8 @@ mod tests {
             .handler(|input: GreetInput| async move {
                 Ok(CallToolResult::text(format!("Hello, {}!", input.name)))
             })
-            .build();
+            .build()
+            .expect("valid tool name");
 
         assert_eq!(tool.name, "greet");
         assert_eq!(tool.description.as_deref(), Some("Greet someone"));
@@ -376,10 +426,66 @@ mod tests {
     async fn test_raw_handler() {
         let tool = ToolBuilder::new("echo")
             .description("Echo input")
-            .raw_handler(|args: Value| async move { Ok(CallToolResult::json(args)) });
+            .raw_handler(|args: Value| async move { Ok(CallToolResult::json(args)) })
+            .expect("valid tool name");
 
         let result = tool.call(serde_json::json!({"foo": "bar"})).await.unwrap();
 
         assert!(!result.is_error);
+    }
+
+    #[test]
+    fn test_invalid_tool_name_empty() {
+        let result = ToolBuilder::new("")
+            .description("Empty name")
+            .raw_handler(|args: Value| async move { Ok(CallToolResult::json(args)) });
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn test_invalid_tool_name_too_long() {
+        let long_name = "a".repeat(129);
+        let result = ToolBuilder::new(long_name)
+            .description("Too long")
+            .raw_handler(|args: Value| async move { Ok(CallToolResult::json(args)) });
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn test_invalid_tool_name_bad_chars() {
+        let result = ToolBuilder::new("my tool!")
+            .description("Bad chars")
+            .raw_handler(|args: Value| async move { Ok(CallToolResult::json(args)) });
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid character")
+        );
+    }
+
+    #[test]
+    fn test_valid_tool_names() {
+        // All valid characters
+        let names = [
+            "my_tool",
+            "my-tool",
+            "my.tool",
+            "MyTool123",
+            "a",
+            &"a".repeat(128),
+        ];
+        for name in names {
+            let result = ToolBuilder::new(name)
+                .description("Valid")
+                .raw_handler(|args: Value| async move { Ok(CallToolResult::json(args)) });
+            assert!(result.is_ok(), "Expected '{}' to be valid", name);
+        }
     }
 }

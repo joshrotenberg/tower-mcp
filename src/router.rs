@@ -323,6 +323,81 @@ impl<S> JsonRpcService<S> {
     pub fn new(inner: S) -> Self {
         Self { inner }
     }
+
+    /// Process a single JSON-RPC request
+    pub async fn call_single(&mut self, req: JsonRpcRequest) -> Result<JsonRpcResponse>
+    where
+        S: Service<RouterRequest, Response = RouterResponse, Error = std::convert::Infallible>
+            + Clone
+            + Send
+            + 'static,
+        S::Future: Send,
+    {
+        process_single_request(self.inner.clone(), req).await
+    }
+
+    /// Process a batch of JSON-RPC requests concurrently
+    pub async fn call_batch(
+        &mut self,
+        requests: Vec<JsonRpcRequest>,
+    ) -> Result<Vec<JsonRpcResponse>>
+    where
+        S: Service<RouterRequest, Response = RouterResponse, Error = std::convert::Infallible>
+            + Clone
+            + Send
+            + 'static,
+        S::Future: Send,
+    {
+        if requests.is_empty() {
+            return Err(Error::JsonRpc(JsonRpcError::invalid_request(
+                "Empty batch request",
+            )));
+        }
+
+        // Process all requests concurrently
+        let futures: Vec<_> = requests
+            .into_iter()
+            .map(|req| {
+                let inner = self.inner.clone();
+                async move { process_single_request(inner, req).await }
+            })
+            .collect();
+
+        let results: Vec<JsonRpcResponse> = futures::future::join_all(futures)
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if results.is_empty() {
+            return Err(Error::JsonRpc(JsonRpcError::internal_error(
+                "All batch requests failed",
+            )));
+        }
+
+        Ok(results)
+    }
+
+    /// Process a JSON-RPC message (single or batch)
+    pub async fn call_message(&mut self, msg: JsonRpcMessage) -> Result<JsonRpcResponseMessage>
+    where
+        S: Service<RouterRequest, Response = RouterResponse, Error = std::convert::Infallible>
+            + Clone
+            + Send
+            + 'static,
+        S::Future: Send,
+    {
+        match msg {
+            JsonRpcMessage::Single(req) => {
+                let response = self.call_single(req).await?;
+                Ok(JsonRpcResponseMessage::Single(response))
+            }
+            JsonRpcMessage::Batch(requests) => {
+                let responses = self.call_batch(requests).await?;
+                Ok(JsonRpcResponseMessage::Batch(responses))
+            }
+        }
+    }
 }
 
 impl<S> Clone for JsonRpcService<S>
@@ -374,6 +449,111 @@ where
     }
 }
 
+/// Service implementation for JSON-RPC batch requests
+impl<S> Service<JsonRpcMessage> for JsonRpcService<S>
+where
+    S: Service<RouterRequest, Response = RouterResponse, Error = std::convert::Infallible>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send,
+{
+    type Response = JsonRpcResponseMessage;
+    type Error = Error;
+    type Future =
+        Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        self.inner.poll_ready(cx).map_err(|_| unreachable!())
+    }
+
+    fn call(&mut self, msg: JsonRpcMessage) -> Self::Future {
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            match msg {
+                JsonRpcMessage::Single(req) => {
+                    let response = process_single_request(inner, req).await?;
+                    Ok(JsonRpcResponseMessage::Single(response))
+                }
+                JsonRpcMessage::Batch(requests) => {
+                    if requests.is_empty() {
+                        // Empty batch is an invalid request per JSON-RPC spec
+                        return Ok(JsonRpcResponseMessage::Single(JsonRpcResponse::error(
+                            None,
+                            JsonRpcError::invalid_request("Empty batch request"),
+                        )));
+                    }
+
+                    // Process all requests concurrently
+                    let futures: Vec<_> = requests
+                        .into_iter()
+                        .map(|req| {
+                            let inner = inner.clone();
+                            async move { process_single_request(inner, req).await }
+                        })
+                        .collect();
+
+                    let results: Vec<JsonRpcResponse> = futures::future::join_all(futures)
+                        .await
+                        .into_iter()
+                        .filter_map(|r| r.ok())
+                        .collect();
+
+                    // If all requests failed to produce responses, return error
+                    if results.is_empty() {
+                        return Ok(JsonRpcResponseMessage::Single(JsonRpcResponse::error(
+                            None,
+                            JsonRpcError::internal_error("All batch requests failed"),
+                        )));
+                    }
+
+                    Ok(JsonRpcResponseMessage::Batch(results))
+                }
+            }
+        })
+    }
+}
+
+/// Helper function to process a single JSON-RPC request
+async fn process_single_request<S>(
+    mut inner: S,
+    req: JsonRpcRequest,
+) -> std::result::Result<JsonRpcResponse, Error>
+where
+    S: Service<RouterRequest, Response = RouterResponse, Error = std::convert::Infallible>
+        + Send
+        + 'static,
+    S::Future: Send,
+{
+    // Validate JSON-RPC version
+    if let Err(e) = req.validate() {
+        return Ok(JsonRpcResponse::error(Some(req.id), e));
+    }
+
+    // Parse the MCP request from JSON-RPC
+    let mcp_request = match McpRequest::from_jsonrpc(&req) {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(JsonRpcResponse::error(
+                Some(req.id),
+                JsonRpcError::invalid_params(e.to_string()),
+            ));
+        }
+    };
+
+    // Create router request
+    let router_req = RouterRequest {
+        id: req.id,
+        inner: mcp_request,
+    };
+
+    // Call the inner service
+    let response = inner.call(router_req).await.unwrap(); // Infallible
+
+    // Convert to JSON-RPC response
+    Ok(response.into_jsonrpc())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,7 +575,8 @@ mod tests {
             .handler(|input: AddInput| async move {
                 Ok(CallToolResult::text(format!("{}", input.a + input.b)))
             })
-            .build();
+            .build()
+            .expect("valid tool name");
 
         let mut router = McpRouter::new().tool(add_tool);
 
@@ -422,7 +603,8 @@ mod tests {
             .handler(|input: AddInput| async move {
                 Ok(CallToolResult::text(format!("{}", input.a + input.b)))
             })
-            .build();
+            .build()
+            .expect("valid tool name");
 
         let mut router = McpRouter::new().tool(add_tool);
 
@@ -456,14 +638,15 @@ mod tests {
             .handler(|input: AddInput| async move {
                 Ok(CallToolResult::text(format!("{}", input.a + input.b)))
             })
-            .build();
+            .build()
+            .expect("valid tool name");
 
         let router = McpRouter::new().tool(add_tool);
         let mut service = JsonRpcService::new(router);
 
         let req = JsonRpcRequest::new(1, "tools/list");
 
-        let resp = service.ready().await.unwrap().call(req).await.unwrap();
+        let resp = service.call_single(req).await.unwrap();
 
         match resp {
             JsonRpcResponse::Result(r) => {
@@ -473,5 +656,71 @@ mod tests {
             }
             JsonRpcResponse::Error(_) => panic!("Expected success response"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_batch_request() {
+        let add_tool = ToolBuilder::new("add")
+            .description("Add two numbers")
+            .handler(|input: AddInput| async move {
+                Ok(CallToolResult::text(format!("{}", input.a + input.b)))
+            })
+            .build()
+            .expect("valid tool name");
+
+        let router = McpRouter::new().tool(add_tool);
+        let mut service = JsonRpcService::new(router);
+
+        // Create a batch of requests
+        let requests = vec![
+            JsonRpcRequest::new(1, "tools/list"),
+            JsonRpcRequest::new(2, "tools/call").with_params(serde_json::json!({
+                "name": "add",
+                "arguments": {"a": 10, "b": 20}
+            })),
+            JsonRpcRequest::new(3, "ping"),
+        ];
+
+        let responses = service.call_batch(requests).await.unwrap();
+
+        assert_eq!(responses.len(), 3);
+
+        // Check first response (tools/list)
+        match &responses[0] {
+            JsonRpcResponse::Result(r) => {
+                assert_eq!(r.id, RequestId::Number(1));
+                let tools = r.result.get("tools").unwrap().as_array().unwrap();
+                assert_eq!(tools.len(), 1);
+            }
+            JsonRpcResponse::Error(_) => panic!("Expected success for tools/list"),
+        }
+
+        // Check second response (tools/call)
+        match &responses[1] {
+            JsonRpcResponse::Result(r) => {
+                assert_eq!(r.id, RequestId::Number(2));
+                let content = r.result.get("content").unwrap().as_array().unwrap();
+                let text = content[0].get("text").unwrap().as_str().unwrap();
+                assert_eq!(text, "30");
+            }
+            JsonRpcResponse::Error(_) => panic!("Expected success for tools/call"),
+        }
+
+        // Check third response (ping)
+        match &responses[2] {
+            JsonRpcResponse::Result(r) => {
+                assert_eq!(r.id, RequestId::Number(3));
+            }
+            JsonRpcResponse::Error(_) => panic!("Expected success for ping"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_empty_batch_error() {
+        let router = McpRouter::new();
+        let mut service = JsonRpcService::new(router);
+
+        let result = service.call_batch(vec![]).await;
+        assert!(result.is_err());
     }
 }
