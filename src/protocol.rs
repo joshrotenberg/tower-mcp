@@ -1,12 +1,21 @@
 //! MCP protocol types based on JSON-RPC 2.0
 //!
-//! These types follow the MCP specification (2025-11-25):
-//! https://modelcontextprotocol.io/specification/2025-11-25
+//! These types follow the MCP specification (2025-03-26):
+//! https://modelcontextprotocol.io/specification/2025-03-26
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::JsonRpcError;
+
+/// The JSON-RPC version. MUST be "2.0".
+pub const JSONRPC_VERSION: &str = "2.0";
+
+/// The latest supported MCP protocol version.
+pub const LATEST_PROTOCOL_VERSION: &str = "2025-03-26";
+
+/// All supported MCP protocol versions (newest first).
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-03-26"];
 
 /// JSON-RPC 2.0 request
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,7 +30,7 @@ pub struct JsonRpcRequest {
 impl JsonRpcRequest {
     pub fn new(id: impl Into<RequestId>, method: impl Into<String>) -> Self {
         Self {
-            jsonrpc: "2.0".to_string(),
+            jsonrpc: JSONRPC_VERSION.to_string(),
             id: id.into(),
             method: method.into(),
             params: None,
@@ -31,6 +40,18 @@ impl JsonRpcRequest {
     pub fn with_params(mut self, params: Value) -> Self {
         self.params = Some(params);
         self
+    }
+
+    /// Validate that this request conforms to JSON-RPC 2.0.
+    /// Returns an error if the jsonrpc version is not "2.0".
+    pub fn validate(&self) -> Result<(), JsonRpcError> {
+        if self.jsonrpc != JSONRPC_VERSION {
+            return Err(JsonRpcError::invalid_request(format!(
+                "Invalid JSON-RPC version: expected '{}', got '{}'",
+                JSONRPC_VERSION, self.jsonrpc
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -62,7 +83,7 @@ pub enum JsonRpcResponse {
 impl JsonRpcResponse {
     pub fn result(id: RequestId, result: Value) -> Self {
         Self::Result(JsonRpcResultResponse {
-            jsonrpc: "2.0".to_string(),
+            jsonrpc: JSONRPC_VERSION.to_string(),
             id,
             result,
         })
@@ -70,7 +91,7 @@ impl JsonRpcResponse {
 
     pub fn error(id: Option<RequestId>, error: JsonRpcError) -> Self {
         Self::Error(JsonRpcErrorResponse {
-            jsonrpc: "2.0".to_string(),
+            jsonrpc: JSONRPC_VERSION.to_string(),
             id,
             error,
         })
@@ -89,7 +110,7 @@ pub struct JsonRpcNotification {
 impl JsonRpcNotification {
     pub fn new(method: impl Into<String>) -> Self {
         Self {
-            jsonrpc: "2.0".to_string(),
+            jsonrpc: JSONRPC_VERSION.to_string(),
             method: method.into(),
             params: None,
         }
@@ -99,6 +120,24 @@ impl JsonRpcNotification {
         self.params = Some(params);
         self
     }
+}
+
+/// MCP notification methods
+pub mod notifications {
+    /// Sent by client after receiving initialize response
+    pub const INITIALIZED: &str = "notifications/initialized";
+    /// Sent when a request is cancelled
+    pub const CANCELLED: &str = "notifications/cancelled";
+    /// Progress updates for long-running operations
+    pub const PROGRESS: &str = "notifications/progress";
+    /// Tool list has changed
+    pub const TOOLS_LIST_CHANGED: &str = "notifications/tools/list_changed";
+    /// Resource list has changed
+    pub const RESOURCES_LIST_CHANGED: &str = "notifications/resources/list_changed";
+    /// Specific resource has been updated
+    pub const RESOURCE_UPDATED: &str = "notifications/resources/updated";
+    /// Prompt list has changed
+    pub const PROMPTS_LIST_CHANGED: &str = "notifications/prompts/list_changed";
 }
 
 /// Request ID - can be string or number per JSON-RPC spec
@@ -150,6 +189,10 @@ pub enum McpRequest {
     ListResources(ListResourcesParams),
     /// Read a resource
     ReadResource(ReadResourceParams),
+    /// Subscribe to resource updates
+    SubscribeResource(SubscribeResourceParams),
+    /// Unsubscribe from resource updates
+    UnsubscribeResource(UnsubscribeResourceParams),
     /// List available prompts
     ListPrompts(ListPromptsParams),
     /// Get a prompt
@@ -161,6 +204,66 @@ pub enum McpRequest {
         method: String,
         params: Option<Value>,
     },
+}
+
+/// High-level MCP notification (parsed from JSON-RPC)
+#[derive(Debug, Clone)]
+pub enum McpNotification {
+    /// Client has completed initialization
+    Initialized,
+    /// Request cancellation
+    Cancelled(CancelledParams),
+    /// Progress update
+    Progress(ProgressParams),
+    /// Unknown notification
+    Unknown {
+        method: String,
+        params: Option<Value>,
+    },
+}
+
+/// Parameters for cancellation notification
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelledParams {
+    /// The ID of the request to cancel
+    pub request_id: RequestId,
+    /// Optional reason for cancellation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Parameters for progress notification
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProgressParams {
+    /// The progress token from the original request
+    pub progress_token: ProgressToken,
+    /// Current progress value (must increase with each notification)
+    pub progress: f64,
+    /// Total expected value (if known)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<f64>,
+    /// Human-readable progress message
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Progress token - can be string or number
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ProgressToken {
+    String(String),
+    Number(i64),
+}
+
+/// Request metadata that can include progress token
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestMeta {
+    /// Progress token for receiving progress notifications
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress_token: Option<ProgressToken>,
 }
 
 /// High-level MCP response
@@ -220,6 +323,10 @@ pub struct InitializeResult {
     pub protocol_version: String,
     pub capabilities: ServerCapabilities,
     pub server_info: Implementation,
+    /// Optional instructions describing how to use this server.
+    /// These hints help LLMs understand the server's features.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -280,12 +387,44 @@ pub struct ListToolsResult {
 pub struct ToolDefinition {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub input_schema: Value,
+    /// Optional annotations describing tool behavior.
+    /// Note: Clients MUST consider these untrusted unless from a trusted server.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_schema: Option<Value>,
+    pub annotations: Option<ToolAnnotations>,
+}
+
+/// Annotations describing tool behavior for trust and safety.
+/// Clients MUST consider these untrusted unless the server is trusted.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolAnnotations {
+    /// Human-readable title for the tool
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// If true, the tool does not modify state. Default: false
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only_hint: bool,
+    /// If true, the tool may have destructive effects. Default: true
+    /// Only meaningful when read_only_hint is false.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub destructive_hint: bool,
+    /// If true, calling repeatedly with same args has same effect. Default: false
+    /// Only meaningful when read_only_hint is false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub idempotent_hint: bool,
+    /// If true, tool interacts with external entities. Default: true
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub open_world_hint: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(v: &bool) -> bool {
+    *v
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -308,7 +447,10 @@ pub struct CallToolResult {
 impl CallToolResult {
     pub fn text(text: impl Into<String>) -> Self {
         Self {
-            content: vec![Content::Text { text: text.into() }],
+            content: vec![Content::Text {
+                text: text.into(),
+                annotations: None,
+            }],
             is_error: false,
             structured_content: None,
         }
@@ -318,6 +460,7 @@ impl CallToolResult {
         Self {
             content: vec![Content::Text {
                 text: message.into(),
+                annotations: None,
             }],
             is_error: true,
             structured_content: None,
@@ -327,7 +470,10 @@ impl CallToolResult {
     pub fn json(value: Value) -> Self {
         let text = serde_json::to_string_pretty(&value).unwrap_or_default();
         Self {
-            content: vec![Content::Text { text }],
+            content: vec![Content::Text {
+                text,
+                annotations: None,
+            }],
             is_error: false,
             structured_content: Some(value),
         }
@@ -338,10 +484,49 @@ impl CallToolResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Content {
-    Text { text: String },
-    Image { data: String, mime_type: String },
-    Audio { data: String, mime_type: String },
-    Resource { resource: ResourceContent },
+    Text {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        annotations: Option<ContentAnnotations>,
+    },
+    Image {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        annotations: Option<ContentAnnotations>,
+    },
+    Audio {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        annotations: Option<ContentAnnotations>,
+    },
+    Resource {
+        resource: ResourceContent,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        annotations: Option<ContentAnnotations>,
+    },
+}
+
+/// Annotations for content items
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContentAnnotations {
+    /// Intended audience for this content
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audience: Option<Vec<ContentRole>>,
+    /// Priority hint from 0 (optional) to 1 (required)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<f64>,
+}
+
+/// Role indicating who content is intended for
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContentRole {
+    User,
+    Assistant,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -393,6 +578,16 @@ pub struct ReadResourceParams {
 #[derive(Debug, Clone, Serialize)]
 pub struct ReadResourceResult {
     pub contents: Vec<ResourceContent>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SubscribeResourceParams {
+    pub uri: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UnsubscribeResourceParams {
+    pub uri: String,
 }
 
 // =============================================================================
@@ -498,6 +693,14 @@ impl McpRequest {
                 let p: ReadResourceParams = serde_json::from_value(params)?;
                 Ok(McpRequest::ReadResource(p))
             }
+            "resources/subscribe" => {
+                let p: SubscribeResourceParams = serde_json::from_value(params)?;
+                Ok(McpRequest::SubscribeResource(p))
+            }
+            "resources/unsubscribe" => {
+                let p: UnsubscribeResourceParams = serde_json::from_value(params)?;
+                Ok(McpRequest::UnsubscribeResource(p))
+            }
             "prompts/list" => {
                 let p: ListPromptsParams = serde_json::from_value(params).unwrap_or_default();
                 Ok(McpRequest::ListPrompts(p))
@@ -510,6 +713,32 @@ impl McpRequest {
             method => Ok(McpRequest::Unknown {
                 method: method.to_string(),
                 params: req.params.clone(),
+            }),
+        }
+    }
+}
+
+impl McpNotification {
+    /// Parse from JSON-RPC notification
+    pub fn from_jsonrpc(notif: &JsonRpcNotification) -> Result<Self, crate::error::Error> {
+        let params = notif
+            .params
+            .clone()
+            .unwrap_or(Value::Object(Default::default()));
+
+        match notif.method.as_str() {
+            notifications::INITIALIZED => Ok(McpNotification::Initialized),
+            notifications::CANCELLED => {
+                let p: CancelledParams = serde_json::from_value(params)?;
+                Ok(McpNotification::Cancelled(p))
+            }
+            notifications::PROGRESS => {
+                let p: ProgressParams = serde_json::from_value(params)?;
+                Ok(McpNotification::Progress(p))
+            }
+            method => Ok(McpNotification::Unknown {
+                method: method.to_string(),
+                params: notif.params.clone(),
             }),
         }
     }

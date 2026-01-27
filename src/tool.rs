@@ -16,7 +16,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::error::{Error, Result};
-use crate::protocol::{CallToolResult, ToolDefinition};
+use crate::protocol::{CallToolResult, ToolAnnotations, ToolDefinition};
 
 /// A boxed future for tool handlers
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -28,18 +28,13 @@ pub trait ToolHandler: Send + Sync {
 
     /// Get the tool's input schema
     fn input_schema(&self) -> Value;
-
-    /// Get the tool's output schema (optional)
-    fn output_schema(&self) -> Option<Value> {
-        None
-    }
 }
 
 /// A complete tool definition with handler
 pub struct Tool {
     pub name: String,
-    pub title: Option<String>,
     pub description: Option<String>,
+    pub annotations: Option<ToolAnnotations>,
     handler: Arc<dyn ToolHandler>,
 }
 
@@ -53,10 +48,9 @@ impl Tool {
     pub fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name.clone(),
-            title: self.title.clone(),
             description: self.description.clone(),
             input_schema: self.handler.input_schema(),
-            output_schema: self.handler.output_schema(),
+            annotations: self.annotations.clone(),
         }
     }
 
@@ -77,7 +71,6 @@ impl Tool {
 /// ```rust,ignore
 /// let tool = ToolBuilder::new("greet")
 ///     .description("Greet someone by name")
-///     .input::<GreetInput>()
 ///     .handler(|input: GreetInput| async move {
 ///         Ok(CallToolResult::text(format!("Hello, {}!", input.name)))
 ///     })
@@ -85,28 +78,60 @@ impl Tool {
 /// ```
 pub struct ToolBuilder {
     name: String,
-    title: Option<String>,
     description: Option<String>,
+    annotations: Option<ToolAnnotations>,
 }
 
 impl ToolBuilder {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            title: None,
             description: None,
+            annotations: None,
         }
     }
 
-    /// Set a human-readable title for the tool
+    /// Set a human-readable title for the tool (stored in annotations)
     pub fn title(mut self, title: impl Into<String>) -> Self {
-        self.title = Some(title.into());
+        self.annotations
+            .get_or_insert_with(ToolAnnotations::default)
+            .title = Some(title.into());
         self
     }
 
     /// Set the tool description
     pub fn description(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
+        self
+    }
+
+    /// Mark the tool as read-only (does not modify state)
+    pub fn read_only(mut self) -> Self {
+        self.annotations
+            .get_or_insert_with(ToolAnnotations::default)
+            .read_only_hint = true;
+        self
+    }
+
+    /// Mark the tool as non-destructive
+    pub fn non_destructive(mut self) -> Self {
+        self.annotations
+            .get_or_insert_with(ToolAnnotations::default)
+            .destructive_hint = false;
+        self
+    }
+
+    /// Mark the tool as idempotent (same args = same effect)
+    pub fn idempotent(mut self) -> Self {
+        self.annotations
+            .get_or_insert_with(ToolAnnotations::default)
+            .idempotent_hint = true;
+        self
+    }
+
+    /// Set tool annotations directly
+    pub fn annotations(mut self, annotations: ToolAnnotations) -> Self {
+        self.annotations = Some(annotations);
         self
     }
 
@@ -122,8 +147,8 @@ impl ToolBuilder {
     {
         ToolBuilderWithHandler {
             name: self.name,
-            title: self.title,
             description: self.description,
+            annotations: self.annotations,
             handler,
             _phantom: std::marker::PhantomData,
         }
@@ -137,8 +162,8 @@ impl ToolBuilder {
     {
         Tool {
             name: self.name,
-            title: self.title,
             description: self.description,
+            annotations: self.annotations,
             handler: Arc::new(RawHandler { handler }),
         }
     }
@@ -147,8 +172,8 @@ impl ToolBuilder {
 /// Builder state after handler is specified
 pub struct ToolBuilderWithHandler<I, F> {
     name: String,
-    title: Option<String>,
     description: Option<String>,
+    annotations: Option<ToolAnnotations>,
     handler: F,
     _phantom: std::marker::PhantomData<I>,
 }
@@ -163,8 +188,8 @@ where
     pub fn build(self) -> Tool {
         Tool {
             name: self.name,
-            title: self.title,
             description: self.description,
+            annotations: self.annotations,
             handler: Arc::new(TypedHandler {
                 handler: self.handler,
                 _phantom: std::marker::PhantomData,
@@ -267,8 +292,8 @@ pub trait McpTool: Send + Sync + 'static {
 
     fn call(&self, input: Self::Input) -> impl Future<Output = Result<Self::Output>> + Send;
 
-    /// Optional title for the tool
-    fn title(&self) -> Option<&str> {
+    /// Optional annotations for the tool
+    fn annotations(&self) -> Option<ToolAnnotations> {
         None
     }
 
@@ -277,11 +302,12 @@ pub trait McpTool: Send + Sync + 'static {
     where
         Self: Sized,
     {
+        let annotations = self.annotations();
         let tool = Arc::new(self);
         Tool {
             name: Self::NAME.to_string(),
-            title: tool.title().map(String::from),
             description: Some(Self::DESCRIPTION.to_string()),
+            annotations,
             handler: Arc::new(McpToolHandler { tool }),
         }
     }

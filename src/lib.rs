@@ -17,41 +17,45 @@
 //! ## Example
 //!
 //! ```rust,ignore
-//! use tower_mcp::{McpRouter, Tool, ToolBuilder};
+//! use tower_mcp::{McpRouter, ToolBuilder, CallToolResult};
 //! use tower::ServiceBuilder;
+//! use schemars::JsonSchema;
+//! use serde::Deserialize;
 //!
-//! // Define a tool using the builder
+//! #[derive(Debug, Deserialize, JsonSchema)]
+//! struct EvaluateInput {
+//!     expression: String,
+//!     data: serde_json::Value,
+//! }
+//!
+//! // Define a tool using the builder - type is inferred from handler
 //! let evaluate = ToolBuilder::new("evaluate")
 //!     .description("Evaluate a JMESPath expression")
-//!     .input::<EvaluateInput>()
 //!     .handler(|input: EvaluateInput| async move {
 //!         // implementation
-//!         Ok(result)
+//!         Ok(CallToolResult::text("result"))
 //!     })
 //!     .build();
 //!
 //! // Create router with tools
 //! let router = McpRouter::new()
-//!     .tool(evaluate)
-//!     .tool(validate);
+//!     .server_info("my-server", "1.0.0")
+//!     .tool(evaluate);
 //!
-//! // Add middleware
+//! // Add middleware via tower's ServiceBuilder
 //! let service = ServiceBuilder::new()
-//!     .layer(TracingLayer::new())
-//!     .layer(MetricsLayer::new())
 //!     .service(router);
-//!
-//! // Serve over any transport
-//! StdioTransport::serve(service).await;
 //! ```
 
 pub mod error;
 pub mod protocol;
 pub mod router;
+pub mod session;
 pub mod tool;
 
 // Re-exports
 pub use error::{Error, Result};
-pub use protocol::{JsonRpcRequest, JsonRpcResponse, McpRequest, McpResponse};
-pub use router::McpRouter;
+pub use protocol::{CallToolResult, JsonRpcRequest, JsonRpcResponse, McpRequest, McpResponse};
+pub use router::{JsonRpcService, McpRouter};
+pub use session::{SessionPhase, SessionState};
 pub use tool::{Tool, ToolBuilder, ToolHandler};
