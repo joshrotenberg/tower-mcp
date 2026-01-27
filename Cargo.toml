@@ -58,3 +58,7 @@ optional = true
 [[example]]
 name = "basic"
 path = "examples/basic.rs"
+
+[[example]]
+name = "stdio_server"
+path = "examples/stdio_server.rs"
