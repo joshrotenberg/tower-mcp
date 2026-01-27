@@ -1,12 +1,15 @@
 //! Integration tests for tower-mcp
 //!
 //! Tests the full protocol flow including session lifecycle,
-//! tool execution, and error handling.
+//! tool execution, resources, prompts, and error handling.
 
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::collections::HashMap;
 use tower_mcp::{
-    CallToolResult, JsonRpcRequest, JsonRpcResponse, JsonRpcService, McpRouter, ToolBuilder,
+    CallToolResult, GetPromptResult, JsonRpcRequest, JsonRpcResponse, JsonRpcService, McpRouter,
+    PromptBuilder, PromptMessage, PromptRole, ReadResourceResult, ResourceBuilder,
+    ResourceContent, ToolBuilder,
 };
 
 // =============================================================================
@@ -56,6 +59,98 @@ fn create_test_router() -> McpRouter {
         .tool(echo)
         .tool(add)
         .tool(failing)
+}
+
+fn create_router_with_resources_and_prompts() -> McpRouter {
+    // Tools
+    let echo = ToolBuilder::new("echo")
+        .description("Echo a message")
+        .handler(|input: EchoInput| async move { Ok(CallToolResult::text(input.message)) })
+        .build()
+        .expect("valid tool");
+
+    // Resources
+    let config_resource = ResourceBuilder::new("file:///config.json")
+        .name("Configuration")
+        .description("Application configuration")
+        .json(serde_json::json!({
+            "version": "1.0",
+            "debug": true
+        }));
+
+    let readme_resource = ResourceBuilder::new("file:///README.md")
+        .name("README")
+        .description("Project documentation")
+        .mime_type("text/markdown")
+        .text("# Test Project\n\nThis is a test project.");
+
+    let dynamic_resource = ResourceBuilder::new("memory://counter")
+        .name("Counter")
+        .description("A dynamic counter")
+        .handler(|| async {
+            Ok(ReadResourceResult {
+                contents: vec![ResourceContent {
+                    uri: "memory://counter".to_string(),
+                    mime_type: Some("text/plain".to_string()),
+                    text: Some("42".to_string()),
+                    blob: None,
+                }],
+            })
+        });
+
+    // Prompts
+    let greet_prompt = PromptBuilder::new("greet")
+        .description("Generate a greeting")
+        .required_arg("name", "The name to greet")
+        .handler(|args: HashMap<String, String>| async move {
+            let name = args.get("name").map(|s| s.as_str()).unwrap_or("World");
+            Ok(GetPromptResult {
+                description: Some("A friendly greeting".to_string()),
+                messages: vec![PromptMessage {
+                    role: PromptRole::User,
+                    content: tower_mcp::protocol::Content::Text {
+                        text: format!("Please greet {} warmly.", name),
+                        annotations: None,
+                    },
+                }],
+            })
+        });
+
+    let code_review_prompt = PromptBuilder::new("code_review")
+        .description("Review code for issues")
+        .required_arg("code", "The code to review")
+        .optional_arg("language", "Programming language")
+        .handler(|args: HashMap<String, String>| async move {
+            let code = args.get("code").map(|s| s.as_str()).unwrap_or("");
+            let lang = args.get("language").map(|s| s.as_str()).unwrap_or("unknown");
+            Ok(GetPromptResult {
+                description: Some("Code review prompt".to_string()),
+                messages: vec![PromptMessage {
+                    role: PromptRole::User,
+                    content: tower_mcp::protocol::Content::Text {
+                        text: format!(
+                            "Please review this {} code for issues:\n\n```{}\n{}\n```",
+                            lang, lang, code
+                        ),
+                        annotations: None,
+                    },
+                }],
+            })
+        });
+
+    let static_prompt = PromptBuilder::new("help")
+        .description("Get help")
+        .user_message("How can I help you today?");
+
+    McpRouter::new()
+        .server_info("test-server", "1.0.0")
+        .tool(echo)
+        .resource(config_resource)
+        .resource(readme_resource)
+        .resource(dynamic_resource)
+        .prompt(greet_prompt)
+        .prompt(code_review_prompt)
+        .prompt(static_prompt)
 }
 
 // =============================================================================
@@ -564,5 +659,415 @@ async fn test_error_prompts_not_found() {
             assert_eq!(e.error.code, -32601); // Method not found (prompt not found)
         }
         JsonRpcResponse::Result(_) => panic!("Expected error for prompt not found"),
+    }
+}
+
+// =============================================================================
+// Resources tests (#7)
+// =============================================================================
+
+#[tokio::test]
+async fn test_resources_list() {
+    let router = create_router_with_resources_and_prompts();
+    let mut service = JsonRpcService::new(router.clone());
+
+    // Initialize
+    let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+        "protocolVersion": "2025-03-26",
+        "capabilities": {},
+        "clientInfo": { "name": "test", "version": "1.0" }
+    }));
+    let resp = service.call_single(init_req).await.unwrap();
+
+    // Check that resources capability is declared
+    match resp {
+        JsonRpcResponse::Result(r) => {
+            let caps = r.result.get("capabilities").unwrap();
+            assert!(caps.get("resources").is_some(), "Resources capability should be declared");
+        }
+        JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
+    }
+
+    router.handle_notification(tower_mcp::protocol::McpNotification::Initialized);
+
+    // List resources
+    let list_req = JsonRpcRequest::new(2, "resources/list");
+    let resp = service.call_single(list_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Result(r) => {
+            let resources = r.result.get("resources").unwrap().as_array().unwrap();
+            assert_eq!(resources.len(), 3);
+
+            // Check that all resources have required fields
+            for resource in resources {
+                assert!(resource.get("uri").is_some());
+                assert!(resource.get("name").is_some());
+            }
+        }
+        JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
+    }
+}
+
+#[tokio::test]
+async fn test_resources_read_json() {
+    let router = create_router_with_resources_and_prompts();
+    let mut service = JsonRpcService::new(router.clone());
+
+    // Initialize
+    let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+        "protocolVersion": "2025-03-26",
+        "capabilities": {},
+        "clientInfo": { "name": "test", "version": "1.0" }
+    }));
+    service.call_single(init_req).await.unwrap();
+    router.handle_notification(tower_mcp::protocol::McpNotification::Initialized);
+
+    // Read JSON resource
+    let read_req = JsonRpcRequest::new(2, "resources/read").with_params(serde_json::json!({
+        "uri": "file:///config.json"
+    }));
+    let resp = service.call_single(read_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Result(r) => {
+            let contents = r.result.get("contents").unwrap().as_array().unwrap();
+            assert_eq!(contents.len(), 1);
+
+            let content = &contents[0];
+            assert_eq!(content.get("uri").unwrap().as_str().unwrap(), "file:///config.json");
+            assert_eq!(
+                content.get("mimeType").unwrap().as_str().unwrap(),
+                "application/json"
+            );
+
+            let text = content.get("text").unwrap().as_str().unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(parsed.get("version").unwrap().as_str().unwrap(), "1.0");
+            assert!(parsed.get("debug").unwrap().as_bool().unwrap());
+        }
+        JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
+    }
+}
+
+#[tokio::test]
+async fn test_resources_read_text() {
+    let router = create_router_with_resources_and_prompts();
+    let mut service = JsonRpcService::new(router.clone());
+
+    // Initialize
+    let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+        "protocolVersion": "2025-03-26",
+        "capabilities": {},
+        "clientInfo": { "name": "test", "version": "1.0" }
+    }));
+    service.call_single(init_req).await.unwrap();
+    router.handle_notification(tower_mcp::protocol::McpNotification::Initialized);
+
+    // Read markdown resource
+    let read_req = JsonRpcRequest::new(2, "resources/read").with_params(serde_json::json!({
+        "uri": "file:///README.md"
+    }));
+    let resp = service.call_single(read_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Result(r) => {
+            let contents = r.result.get("contents").unwrap().as_array().unwrap();
+            let content = &contents[0];
+            let text = content.get("text").unwrap().as_str().unwrap();
+            assert!(text.contains("# Test Project"));
+        }
+        JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
+    }
+}
+
+#[tokio::test]
+async fn test_resources_read_dynamic() {
+    let router = create_router_with_resources_and_prompts();
+    let mut service = JsonRpcService::new(router.clone());
+
+    // Initialize
+    let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+        "protocolVersion": "2025-03-26",
+        "capabilities": {},
+        "clientInfo": { "name": "test", "version": "1.0" }
+    }));
+    service.call_single(init_req).await.unwrap();
+    router.handle_notification(tower_mcp::protocol::McpNotification::Initialized);
+
+    // Read dynamic resource
+    let read_req = JsonRpcRequest::new(2, "resources/read").with_params(serde_json::json!({
+        "uri": "memory://counter"
+    }));
+    let resp = service.call_single(read_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Result(r) => {
+            let contents = r.result.get("contents").unwrap().as_array().unwrap();
+            let content = &contents[0];
+            let text = content.get("text").unwrap().as_str().unwrap();
+            assert_eq!(text, "42");
+        }
+        JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
+    }
+}
+
+#[tokio::test]
+async fn test_resources_read_not_found() {
+    let router = create_router_with_resources_and_prompts();
+    let mut service = JsonRpcService::new(router.clone());
+
+    // Initialize
+    let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+        "protocolVersion": "2025-03-26",
+        "capabilities": {},
+        "clientInfo": { "name": "test", "version": "1.0" }
+    }));
+    service.call_single(init_req).await.unwrap();
+    router.handle_notification(tower_mcp::protocol::McpNotification::Initialized);
+
+    // Try to read non-existent resource
+    let read_req = JsonRpcRequest::new(2, "resources/read").with_params(serde_json::json!({
+        "uri": "file:///nonexistent.txt"
+    }));
+    let resp = service.call_single(read_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Error(e) => {
+            assert_eq!(e.error.code, -32601);
+            assert!(e.error.message.contains("not found"));
+        }
+        JsonRpcResponse::Result(_) => panic!("Expected error for non-existent resource"),
+    }
+}
+
+// =============================================================================
+// Prompts tests (#8)
+// =============================================================================
+
+#[tokio::test]
+async fn test_prompts_list() {
+    let router = create_router_with_resources_and_prompts();
+    let mut service = JsonRpcService::new(router.clone());
+
+    // Initialize
+    let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+        "protocolVersion": "2025-03-26",
+        "capabilities": {},
+        "clientInfo": { "name": "test", "version": "1.0" }
+    }));
+    let resp = service.call_single(init_req).await.unwrap();
+
+    // Check that prompts capability is declared
+    match resp {
+        JsonRpcResponse::Result(r) => {
+            let caps = r.result.get("capabilities").unwrap();
+            assert!(caps.get("prompts").is_some(), "Prompts capability should be declared");
+        }
+        JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
+    }
+
+    router.handle_notification(tower_mcp::protocol::McpNotification::Initialized);
+
+    // List prompts
+    let list_req = JsonRpcRequest::new(2, "prompts/list");
+    let resp = service.call_single(list_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Result(r) => {
+            let prompts = r.result.get("prompts").unwrap().as_array().unwrap();
+            assert_eq!(prompts.len(), 3);
+
+            // Check that all prompts have required fields
+            for prompt in prompts {
+                assert!(prompt.get("name").is_some());
+            }
+        }
+        JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
+    }
+}
+
+#[tokio::test]
+async fn test_prompts_get_with_args() {
+    let router = create_router_with_resources_and_prompts();
+    let mut service = JsonRpcService::new(router.clone());
+
+    // Initialize
+    let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+        "protocolVersion": "2025-03-26",
+        "capabilities": {},
+        "clientInfo": { "name": "test", "version": "1.0" }
+    }));
+    service.call_single(init_req).await.unwrap();
+    router.handle_notification(tower_mcp::protocol::McpNotification::Initialized);
+
+    // Get prompt with arguments
+    let get_req = JsonRpcRequest::new(2, "prompts/get").with_params(serde_json::json!({
+        "name": "greet",
+        "arguments": {
+            "name": "Alice"
+        }
+    }));
+    let resp = service.call_single(get_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Result(r) => {
+            let messages = r.result.get("messages").unwrap().as_array().unwrap();
+            assert_eq!(messages.len(), 1);
+
+            let message = &messages[0];
+            assert_eq!(message.get("role").unwrap().as_str().unwrap(), "user");
+
+            let content = message.get("content").unwrap();
+            let text = content.get("text").unwrap().as_str().unwrap();
+            assert!(text.contains("Alice"));
+        }
+        JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
+    }
+}
+
+#[tokio::test]
+async fn test_prompts_get_code_review() {
+    let router = create_router_with_resources_and_prompts();
+    let mut service = JsonRpcService::new(router.clone());
+
+    // Initialize
+    let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+        "protocolVersion": "2025-03-26",
+        "capabilities": {},
+        "clientInfo": { "name": "test", "version": "1.0" }
+    }));
+    service.call_single(init_req).await.unwrap();
+    router.handle_notification(tower_mcp::protocol::McpNotification::Initialized);
+
+    // Get code review prompt
+    let get_req = JsonRpcRequest::new(2, "prompts/get").with_params(serde_json::json!({
+        "name": "code_review",
+        "arguments": {
+            "code": "fn main() { println!(\"Hello\"); }",
+            "language": "rust"
+        }
+    }));
+    let resp = service.call_single(get_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Result(r) => {
+            let messages = r.result.get("messages").unwrap().as_array().unwrap();
+            let content = messages[0].get("content").unwrap();
+            let text = content.get("text").unwrap().as_str().unwrap();
+            assert!(text.contains("rust"));
+            assert!(text.contains("println"));
+        }
+        JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
+    }
+}
+
+#[tokio::test]
+async fn test_prompts_get_static() {
+    let router = create_router_with_resources_and_prompts();
+    let mut service = JsonRpcService::new(router.clone());
+
+    // Initialize
+    let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+        "protocolVersion": "2025-03-26",
+        "capabilities": {},
+        "clientInfo": { "name": "test", "version": "1.0" }
+    }));
+    service.call_single(init_req).await.unwrap();
+    router.handle_notification(tower_mcp::protocol::McpNotification::Initialized);
+
+    // Get static prompt (no args needed)
+    let get_req = JsonRpcRequest::new(2, "prompts/get").with_params(serde_json::json!({
+        "name": "help"
+    }));
+    let resp = service.call_single(get_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Result(r) => {
+            let messages = r.result.get("messages").unwrap().as_array().unwrap();
+            let content = messages[0].get("content").unwrap();
+            let text = content.get("text").unwrap().as_str().unwrap();
+            assert_eq!(text, "How can I help you today?");
+        }
+        JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
+    }
+}
+
+#[tokio::test]
+async fn test_prompts_get_not_found() {
+    let router = create_router_with_resources_and_prompts();
+    let mut service = JsonRpcService::new(router.clone());
+
+    // Initialize
+    let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+        "protocolVersion": "2025-03-26",
+        "capabilities": {},
+        "clientInfo": { "name": "test", "version": "1.0" }
+    }));
+    service.call_single(init_req).await.unwrap();
+    router.handle_notification(tower_mcp::protocol::McpNotification::Initialized);
+
+    // Try to get non-existent prompt
+    let get_req = JsonRpcRequest::new(2, "prompts/get").with_params(serde_json::json!({
+        "name": "nonexistent"
+    }));
+    let resp = service.call_single(get_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Error(e) => {
+            assert_eq!(e.error.code, -32601);
+            assert!(e.error.message.contains("not found"));
+        }
+        JsonRpcResponse::Result(_) => panic!("Expected error for non-existent prompt"),
+    }
+}
+
+// =============================================================================
+// Capabilities tests
+// =============================================================================
+
+#[tokio::test]
+async fn test_capabilities_tools_only() {
+    let router = create_test_router(); // Has only tools
+    let mut service = JsonRpcService::new(router);
+
+    let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+        "protocolVersion": "2025-03-26",
+        "capabilities": {},
+        "clientInfo": { "name": "test", "version": "1.0" }
+    }));
+    let resp = service.call_single(init_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Result(r) => {
+            let caps = r.result.get("capabilities").unwrap();
+            assert!(caps.get("tools").is_some(), "Tools capability should be present");
+            assert!(caps.get("resources").is_none(), "Resources capability should NOT be present");
+            assert!(caps.get("prompts").is_none(), "Prompts capability should NOT be present");
+        }
+        JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
+    }
+}
+
+#[tokio::test]
+async fn test_capabilities_all() {
+    let router = create_router_with_resources_and_prompts(); // Has tools, resources, and prompts
+    let mut service = JsonRpcService::new(router);
+
+    let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+        "protocolVersion": "2025-03-26",
+        "capabilities": {},
+        "clientInfo": { "name": "test", "version": "1.0" }
+    }));
+    let resp = service.call_single(init_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Result(r) => {
+            let caps = r.result.get("capabilities").unwrap();
+            assert!(caps.get("tools").is_some(), "Tools capability should be present");
+            assert!(caps.get("resources").is_some(), "Resources capability should be present");
+            assert!(caps.get("prompts").is_some(), "Prompts capability should be present");
+        }
+        JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
     }
 }

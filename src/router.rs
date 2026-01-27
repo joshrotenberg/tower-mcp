@@ -12,7 +12,9 @@ use std::task::{Context, Poll};
 use tower_service::Service;
 
 use crate::error::{Error, JsonRpcError, Result};
+use crate::prompt::Prompt;
 use crate::protocol::*;
+use crate::resource::Resource;
 use crate::session::SessionState;
 use crate::tool::Tool;
 
@@ -53,6 +55,8 @@ struct McpRouterInner {
     server_version: String,
     instructions: Option<String>,
     tools: HashMap<String, Arc<Tool>>,
+    resources: HashMap<String, Arc<Resource>>,
+    prompts: HashMap<String, Arc<Prompt>>,
 }
 
 impl McpRouter {
@@ -64,6 +68,8 @@ impl McpRouter {
                 server_version: env!("CARGO_PKG_VERSION").to_string(),
                 instructions: None,
                 tools: HashMap::new(),
+                resources: HashMap::new(),
+                prompts: HashMap::new(),
             }),
             session: SessionState::new(),
         }
@@ -91,6 +97,22 @@ impl McpRouter {
         self
     }
 
+    /// Register a resource
+    pub fn resource(mut self, resource: Resource) -> Self {
+        Arc::make_mut(&mut self.inner)
+            .resources
+            .insert(resource.uri.clone(), Arc::new(resource));
+        self
+    }
+
+    /// Register a prompt
+    pub fn prompt(mut self, prompt: Prompt) -> Self {
+        Arc::make_mut(&mut self.inner)
+            .prompts
+            .insert(prompt.name.clone(), Arc::new(prompt));
+        self
+    }
+
     /// Get access to the session state
     pub fn session(&self) -> &SessionState {
         &self.session
@@ -104,8 +126,16 @@ impl McpRouter {
             } else {
                 Some(ToolsCapability::default())
             },
-            resources: None,
-            prompts: None,
+            resources: if self.inner.resources.is_empty() {
+                None
+            } else {
+                Some(ResourcesCapability::default())
+            },
+            prompts: if self.inner.prompts.is_empty() {
+                None
+            } else {
+                Some(PromptsCapability::default())
+            },
         }
     }
 
@@ -180,15 +210,32 @@ impl McpRouter {
             }
 
             McpRequest::ListResources(_params) => {
+                let resources: Vec<ResourceDefinition> = self
+                    .inner
+                    .resources
+                    .values()
+                    .map(|r| r.definition())
+                    .collect();
+
                 Ok(McpResponse::ListResources(ListResourcesResult {
-                    resources: vec![],
+                    resources,
                     next_cursor: None,
                 }))
             }
 
-            McpRequest::ReadResource(params) => Err(Error::JsonRpc(
-                JsonRpcError::method_not_found(&format!("Resource not found: {}", params.uri)),
-            )),
+            McpRequest::ReadResource(params) => {
+                let resource = self.inner.resources.get(&params.uri).ok_or_else(|| {
+                    Error::JsonRpc(JsonRpcError::method_not_found(&format!(
+                        "Resource not found: {}",
+                        params.uri
+                    )))
+                })?;
+
+                tracing::debug!(uri = %params.uri, "Reading resource");
+                let result = resource.read().await?;
+
+                Ok(McpResponse::ReadResource(result))
+            }
 
             McpRequest::SubscribeResource(params) => {
                 // Resource subscriptions not yet implemented
@@ -206,14 +253,33 @@ impl McpRouter {
                 ))))
             }
 
-            McpRequest::ListPrompts(_params) => Ok(McpResponse::ListPrompts(ListPromptsResult {
-                prompts: vec![],
-                next_cursor: None,
-            })),
+            McpRequest::ListPrompts(_params) => {
+                let prompts: Vec<PromptDefinition> = self
+                    .inner
+                    .prompts
+                    .values()
+                    .map(|p| p.definition())
+                    .collect();
 
-            McpRequest::GetPrompt(params) => Err(Error::JsonRpc(JsonRpcError::method_not_found(
-                &format!("Prompt not found: {}", params.name),
-            ))),
+                Ok(McpResponse::ListPrompts(ListPromptsResult {
+                    prompts,
+                    next_cursor: None,
+                }))
+            }
+
+            McpRequest::GetPrompt(params) => {
+                let prompt = self.inner.prompts.get(&params.name).ok_or_else(|| {
+                    Error::JsonRpc(JsonRpcError::method_not_found(&format!(
+                        "Prompt not found: {}",
+                        params.name
+                    )))
+                })?;
+
+                tracing::debug!(name = %params.name, "Getting prompt");
+                let result = prompt.get(params.arguments).await?;
+
+                Ok(McpResponse::GetPrompt(result))
+            }
 
             McpRequest::Ping => Ok(McpResponse::Pong(EmptyResult {})),
 
