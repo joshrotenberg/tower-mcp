@@ -55,7 +55,10 @@ pub mod tool;
 
 // Re-exports
 pub use error::{Error, Result};
-pub use protocol::{CallToolResult, JsonRpcRequest, JsonRpcResponse, McpRequest, McpResponse};
+pub use protocol::{
+    CallToolResult, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, JsonRpcResponseMessage,
+    McpRequest, McpResponse,
+};
 pub use router::{JsonRpcService, McpRouter};
 pub use session::{SessionPhase, SessionState};
 pub use tool::{Tool, ToolBuilder, ToolHandler};
