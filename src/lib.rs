@@ -43,7 +43,9 @@
 //! ```
 
 pub mod error;
+pub mod prompt;
 pub mod protocol;
+pub mod resource;
 pub mod router;
 pub mod session;
 pub mod tool;
@@ -51,10 +53,13 @@ pub mod transport;
 
 // Re-exports
 pub use error::{Error, Result, ToolError};
+pub use prompt::{Prompt, PromptBuilder, PromptHandler};
 pub use protocol::{
-    CallToolResult, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, JsonRpcResponseMessage,
-    McpRequest, McpResponse,
+    CallToolResult, GetPromptResult, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
+    JsonRpcResponseMessage, McpRequest, McpResponse, PromptMessage, PromptRole, ReadResourceResult,
+    ResourceContent,
 };
+pub use resource::{Resource, ResourceBuilder, ResourceHandler};
 pub use router::{JsonRpcService, McpRouter};
 pub use session::{SessionPhase, SessionState};
 pub use tool::{Tool, ToolBuilder, ToolHandler};
