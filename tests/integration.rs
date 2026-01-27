@@ -8,8 +8,8 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use tower_mcp::{
     CallToolResult, GetPromptResult, JsonRpcRequest, JsonRpcResponse, JsonRpcService, McpRouter,
-    PromptBuilder, PromptMessage, PromptRole, ReadResourceResult, ResourceBuilder,
-    ResourceContent, ToolBuilder,
+    PromptBuilder, PromptMessage, PromptRole, ReadResourceResult, ResourceBuilder, ResourceContent,
+    ToolBuilder,
 };
 
 // =============================================================================
@@ -122,7 +122,10 @@ fn create_router_with_resources_and_prompts() -> McpRouter {
         .optional_arg("language", "Programming language")
         .handler(|args: HashMap<String, String>| async move {
             let code = args.get("code").map(|s| s.as_str()).unwrap_or("");
-            let lang = args.get("language").map(|s| s.as_str()).unwrap_or("unknown");
+            let lang = args
+                .get("language")
+                .map(|s| s.as_str())
+                .unwrap_or("unknown");
             Ok(GetPromptResult {
                 description: Some("Code review prompt".to_string()),
                 messages: vec![PromptMessage {
@@ -683,7 +686,10 @@ async fn test_resources_list() {
     match resp {
         JsonRpcResponse::Result(r) => {
             let caps = r.result.get("capabilities").unwrap();
-            assert!(caps.get("resources").is_some(), "Resources capability should be declared");
+            assert!(
+                caps.get("resources").is_some(),
+                "Resources capability should be declared"
+            );
         }
         JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
     }
@@ -735,7 +741,10 @@ async fn test_resources_read_json() {
             assert_eq!(contents.len(), 1);
 
             let content = &contents[0];
-            assert_eq!(content.get("uri").unwrap().as_str().unwrap(), "file:///config.json");
+            assert_eq!(
+                content.get("uri").unwrap().as_str().unwrap(),
+                "file:///config.json"
+            );
             assert_eq!(
                 content.get("mimeType").unwrap().as_str().unwrap(),
                 "application/json"
@@ -862,7 +871,10 @@ async fn test_prompts_list() {
     match resp {
         JsonRpcResponse::Result(r) => {
             let caps = r.result.get("capabilities").unwrap();
-            assert!(caps.get("prompts").is_some(), "Prompts capability should be declared");
+            assert!(
+                caps.get("prompts").is_some(),
+                "Prompts capability should be declared"
+            );
         }
         JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
     }
@@ -1041,9 +1053,18 @@ async fn test_capabilities_tools_only() {
     match resp {
         JsonRpcResponse::Result(r) => {
             let caps = r.result.get("capabilities").unwrap();
-            assert!(caps.get("tools").is_some(), "Tools capability should be present");
-            assert!(caps.get("resources").is_none(), "Resources capability should NOT be present");
-            assert!(caps.get("prompts").is_none(), "Prompts capability should NOT be present");
+            assert!(
+                caps.get("tools").is_some(),
+                "Tools capability should be present"
+            );
+            assert!(
+                caps.get("resources").is_none(),
+                "Resources capability should NOT be present"
+            );
+            assert!(
+                caps.get("prompts").is_none(),
+                "Prompts capability should NOT be present"
+            );
         }
         JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
     }
@@ -1064,9 +1085,18 @@ async fn test_capabilities_all() {
     match resp {
         JsonRpcResponse::Result(r) => {
             let caps = r.result.get("capabilities").unwrap();
-            assert!(caps.get("tools").is_some(), "Tools capability should be present");
-            assert!(caps.get("resources").is_some(), "Resources capability should be present");
-            assert!(caps.get("prompts").is_some(), "Prompts capability should be present");
+            assert!(
+                caps.get("tools").is_some(),
+                "Tools capability should be present"
+            );
+            assert!(
+                caps.get("resources").is_some(),
+                "Resources capability should be present"
+            );
+            assert!(
+                caps.get("prompts").is_some(),
+                "Prompts capability should be present"
+            );
         }
         JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
     }

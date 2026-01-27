@@ -48,6 +48,19 @@ pub struct McpRouter {
     session: SessionState,
 }
 
+impl std::fmt::Debug for McpRouter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpRouter")
+            .field("server_name", &self.inner.server_name)
+            .field("server_version", &self.inner.server_version)
+            .field("tools_count", &self.inner.tools.len())
+            .field("resources_count", &self.inner.resources.len())
+            .field("prompts_count", &self.inner.prompts.len())
+            .field("session_phase", &self.session.phase())
+            .finish()
+    }
+}
+
 /// Inner configuration that is shared across clones
 #[derive(Clone)]
 struct McpRouterInner {
