@@ -1,0 +1,56 @@
+[package]
+name = "tower-mcp"
+version = "0.1.0"
+edition = "2024"
+authors = ["Josh Rotenberg <joshrotenberg@gmail.com>"]
+license = "MIT OR Apache-2.0"
+description = "Tower-native Model Context Protocol (MCP) implementation"
+repository = "https://github.com/joshrotenberg/tower-mcp"
+keywords = ["mcp", "tower", "json-rpc", "ai", "agents"]
+categories = ["network-programming", "web-programming"]
+
+[dependencies]
+# Tower ecosystem
+tower = { version = "0.5", features = ["util"] }
+tower-service = "0.3"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+pin-project-lite = "0.2"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Schema generation
+schemars = "1.2"
+
+# Error handling
+thiserror = "2"
+
+# Tracing
+tracing = "0.1"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+default = []
+# Transport features
+stdio = []
+http = ["dep:hyper", "dep:http", "dep:http-body-util"]
+websocket = []
+
+[dependencies.hyper]
+version = "1"
+optional = true
+
+[dependencies.http]
+version = "1"
+optional = true
+
+[dependencies.http-body-util]
+version = "0.1"
+optional = true
