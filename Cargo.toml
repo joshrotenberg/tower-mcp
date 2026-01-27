@@ -40,8 +40,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 default = []
 # Transport features
 stdio = []
-http = ["dep:hyper", "dep:http", "dep:http-body-util"]
+http = ["dep:axum", "dep:hyper", "dep:http", "dep:http-body-util", "dep:tokio-stream", "dep:uuid"]
 websocket = []
+
+[dependencies.axum]
+version = "0.8"
+optional = true
+features = ["json"]
 
 [dependencies.hyper]
 version = "1"
@@ -55,6 +60,16 @@ optional = true
 version = "0.1"
 optional = true
 
+[dependencies.tokio-stream]
+version = "0.1"
+optional = true
+features = ["sync"]
+
+[dependencies.uuid]
+version = "1"
+optional = true
+features = ["v4"]
+
 [[example]]
 name = "basic"
 path = "examples/basic.rs"
@@ -62,3 +77,8 @@ path = "examples/basic.rs"
 [[example]]
 name = "stdio_server"
 path = "examples/stdio_server.rs"
+
+[[example]]
+name = "http_server"
+path = "examples/http_server.rs"
+required-features = ["http"]

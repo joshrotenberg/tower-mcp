@@ -64,3 +64,6 @@ pub use router::{JsonRpcService, McpRouter};
 pub use session::{SessionPhase, SessionState};
 pub use tool::{Tool, ToolBuilder, ToolHandler};
 pub use transport::{StdioTransport, SyncStdioTransport};
+
+#[cfg(feature = "http")]
+pub use transport::HttpTransport;
