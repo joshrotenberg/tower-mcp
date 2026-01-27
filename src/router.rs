@@ -13,6 +13,7 @@ use tower_service::Service;
 
 use crate::error::{Error, JsonRpcError, Result};
 use crate::protocol::*;
+use crate::session::SessionState;
 use crate::tool::Tool;
 
 /// MCP Router that dispatches requests to registered handlers
@@ -32,9 +33,18 @@ use crate::tool::Tool;
 ///     .layer(TracingLayer::new())
 ///     .service(router);
 /// ```
+#[derive(Clone)]
 pub struct McpRouter {
+    inner: Arc<McpRouterInner>,
+    session: SessionState,
+}
+
+/// Inner configuration that is shared across clones
+#[derive(Clone)]
+struct McpRouterInner {
     server_name: String,
     server_version: String,
+    instructions: Option<String>,
     tools: HashMap<String, Arc<Tool>>,
 }
 
@@ -42,29 +52,47 @@ impl McpRouter {
     /// Create a new MCP router
     pub fn new() -> Self {
         Self {
-            server_name: "tower-mcp".to_string(),
-            server_version: env!("CARGO_PKG_VERSION").to_string(),
-            tools: HashMap::new(),
+            inner: Arc::new(McpRouterInner {
+                server_name: "tower-mcp".to_string(),
+                server_version: env!("CARGO_PKG_VERSION").to_string(),
+                instructions: None,
+                tools: HashMap::new(),
+            }),
+            session: SessionState::new(),
         }
     }
 
     /// Set server info
     pub fn server_info(mut self, name: impl Into<String>, version: impl Into<String>) -> Self {
-        self.server_name = name.into();
-        self.server_version = version.into();
+        let inner = Arc::make_mut(&mut self.inner);
+        inner.server_name = name.into();
+        inner.server_version = version.into();
+        self
+    }
+
+    /// Set instructions for LLMs describing how to use this server
+    pub fn instructions(mut self, instructions: impl Into<String>) -> Self {
+        Arc::make_mut(&mut self.inner).instructions = Some(instructions.into());
         self
     }
 
     /// Register a tool
     pub fn tool(mut self, tool: Tool) -> Self {
-        self.tools.insert(tool.name.clone(), Arc::new(tool));
+        Arc::make_mut(&mut self.inner)
+            .tools
+            .insert(tool.name.clone(), Arc::new(tool));
         self
+    }
+
+    /// Get access to the session state
+    pub fn session(&self) -> &SessionState {
+        &self.session
     }
 
     /// Get server capabilities based on registered handlers
     fn capabilities(&self) -> ServerCapabilities {
         ServerCapabilities {
-            tools: if self.tools.is_empty() {
+            tools: if self.inner.tools.is_empty() {
                 None
             } else {
                 Some(ToolsCapability::default())
@@ -81,22 +109,36 @@ impl McpRouter {
                 tracing::info!(
                     client = %params.client_info.name,
                     version = %params.client_info.version,
-                    "Client initialized"
+                    "Client initializing"
                 );
 
+                // Protocol version negotiation: respond with same version if supported,
+                // otherwise respond with our latest supported version
+                let protocol_version = if crate::protocol::SUPPORTED_PROTOCOL_VERSIONS
+                    .contains(&params.protocol_version.as_str())
+                {
+                    params.protocol_version
+                } else {
+                    crate::protocol::LATEST_PROTOCOL_VERSION.to_string()
+                };
+
+                // Transition session state to Initializing
+                self.session.mark_initializing();
+
                 Ok(McpResponse::Initialize(InitializeResult {
-                    protocol_version: params.protocol_version,
+                    protocol_version,
                     capabilities: self.capabilities(),
                     server_info: Implementation {
-                        name: self.server_name.clone(),
-                        version: self.server_version.clone(),
+                        name: self.inner.server_name.clone(),
+                        version: self.inner.server_version.clone(),
                     },
+                    instructions: self.inner.instructions.clone(),
                 }))
             }
 
             McpRequest::ListTools(_params) => {
                 let tools: Vec<ToolDefinition> =
-                    self.tools.values().map(|t| t.definition()).collect();
+                    self.inner.tools.values().map(|t| t.definition()).collect();
 
                 Ok(McpResponse::ListTools(ListToolsResult {
                     tools,
@@ -105,10 +147,10 @@ impl McpRouter {
             }
 
             McpRequest::CallTool(params) => {
-                let tool = self
-                    .tools
-                    .get(&params.name)
-                    .ok_or_else(|| Error::JsonRpc(JsonRpcError::method_not_found(&params.name)))?;
+                let tool =
+                    self.inner.tools.get(&params.name).ok_or_else(|| {
+                        Error::JsonRpc(JsonRpcError::method_not_found(&params.name))
+                    })?;
 
                 tracing::debug!(tool = %params.name, "Calling tool");
                 let result = tool.call(params.arguments).await?;
@@ -127,6 +169,22 @@ impl McpRouter {
                 JsonRpcError::method_not_found(&format!("Resource not found: {}", params.uri)),
             )),
 
+            McpRequest::SubscribeResource(params) => {
+                // Resource subscriptions not yet implemented
+                Err(Error::JsonRpc(JsonRpcError::method_not_found(&format!(
+                    "Resource subscription not supported: {}",
+                    params.uri
+                ))))
+            }
+
+            McpRequest::UnsubscribeResource(params) => {
+                // Resource subscriptions not yet implemented
+                Err(Error::JsonRpc(JsonRpcError::method_not_found(&format!(
+                    "Resource subscription not supported: {}",
+                    params.uri
+                ))))
+            }
+
             McpRequest::ListPrompts(_params) => Ok(McpResponse::ListPrompts(ListPromptsResult {
                 prompts: vec![],
                 next_cursor: None,
@@ -143,21 +201,47 @@ impl McpRouter {
             }
         }
     }
+
+    /// Handle an MCP notification (no response expected)
+    pub fn handle_notification(&self, notification: McpNotification) {
+        match notification {
+            McpNotification::Initialized => {
+                if self.session.mark_initialized() {
+                    tracing::info!("Session initialized, entering operation phase");
+                } else {
+                    tracing::warn!(
+                        "Received initialized notification in unexpected state: {:?}",
+                        self.session.phase()
+                    );
+                }
+            }
+            McpNotification::Cancelled(params) => {
+                tracing::debug!(
+                    request_id = ?params.request_id,
+                    reason = ?params.reason,
+                    "Request cancellation requested"
+                );
+                // TODO: Implement request cancellation tracking
+            }
+            McpNotification::Progress(params) => {
+                tracing::trace!(
+                    token = ?params.progress_token,
+                    progress = params.progress,
+                    total = ?params.total,
+                    "Progress notification"
+                );
+                // Progress notifications from client are unusual but valid
+            }
+            McpNotification::Unknown { method, .. } => {
+                tracing::debug!(method = %method, "Unknown notification received");
+            }
+        }
+    }
 }
 
 impl Default for McpRouter {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl Clone for McpRouter {
-    fn clone(&self) -> Self {
-        Self {
-            server_name: self.server_name.clone(),
-            server_version: self.server_version.clone(),
-            tools: self.tools.clone(),
-        }
     }
 }
 
@@ -183,10 +267,16 @@ impl RouterResponse {
     /// Convert to JSON-RPC response
     pub fn into_jsonrpc(self) -> JsonRpcResponse {
         match self.inner {
-            Ok(response) => {
-                let result = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
-                JsonRpcResponse::result(self.id, result)
-            }
+            Ok(response) => match serde_json::to_value(response) {
+                Ok(result) => JsonRpcResponse::result(self.id, result),
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to serialize response");
+                    JsonRpcResponse::error(
+                        Some(self.id),
+                        JsonRpcError::internal_error(format!("Serialization error: {}", e)),
+                    )
+                }
+            },
             Err(error) => JsonRpcResponse::error(Some(self.id), error),
         }
     }
@@ -351,7 +441,7 @@ mod tests {
                 assert!(!result.is_error);
                 // Check the text content
                 match &result.content[0] {
-                    Content::Text { text } => assert_eq!(text, "5"),
+                    Content::Text { text, .. } => assert_eq!(text, "5"),
                     _ => panic!("Expected text content"),
                 }
             }

@@ -54,3 +54,7 @@ optional = true
 [dependencies.http-body-util]
 version = "0.1"
 optional = true
+
+[[example]]
+name = "basic"
+path = "examples/basic.rs"
