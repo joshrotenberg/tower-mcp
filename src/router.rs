@@ -395,7 +395,8 @@ mod tests {
             .handler(|input: AddInput| async move {
                 Ok(CallToolResult::text(format!("{}", input.a + input.b)))
             })
-            .build();
+            .build()
+            .expect("valid tool name");
 
         let mut router = McpRouter::new().tool(add_tool);
 
@@ -422,7 +423,8 @@ mod tests {
             .handler(|input: AddInput| async move {
                 Ok(CallToolResult::text(format!("{}", input.a + input.b)))
             })
-            .build();
+            .build()
+            .expect("valid tool name");
 
         let mut router = McpRouter::new().tool(add_tool);
 
@@ -456,7 +458,8 @@ mod tests {
             .handler(|input: AddInput| async move {
                 Ok(CallToolResult::text(format!("{}", input.a + input.b)))
             })
-            .build();
+            .build()
+            .expect("valid tool name");
 
         let router = McpRouter::new().tool(add_tool);
         let mut service = JsonRpcService::new(router);

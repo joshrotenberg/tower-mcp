@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .handler(|input: GreetInput| async move {
             Ok(CallToolResult::text(format!("Hello, {}!", input.name)))
         })
-        .build();
+        .build()?;
 
     let add = ToolBuilder::new("add")
         .description("Add two numbers together")
@@ -65,19 +65,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let result = input.a + input.b;
             Ok(CallToolResult::text(format!("{}", result)))
         })
-        .build();
+        .build()?;
 
     let echo = ToolBuilder::new("echo")
         .description("Echo a message back, optionally repeated")
         .read_only()
         .handler(|input: EchoInput| async move {
-            let repeated: Vec<_> = std::iter::repeat(&input.message)
-                .take(input.repeat as usize)
+            let repeated: Vec<_> = std::iter::repeat_n(&input.message, input.repeat as usize)
                 .cloned()
                 .collect();
             Ok(CallToolResult::text(repeated.join(" ")))
         })
-        .build();
+        .build()?;
 
     // Create the router with our tools
     let router = McpRouter::new()
