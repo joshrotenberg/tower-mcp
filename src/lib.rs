@@ -16,9 +16,8 @@
 //!
 //! ## Example
 //!
-//! ```rust,ignore
+//! ```rust
 //! use tower_mcp::{McpRouter, ToolBuilder, CallToolResult};
-//! use tower::ServiceBuilder;
 //! use schemars::JsonSchema;
 //! use serde::Deserialize;
 //!
@@ -32,19 +31,15 @@
 //! let evaluate = ToolBuilder::new("evaluate")
 //!     .description("Evaluate a JMESPath expression")
 //!     .handler(|input: EvaluateInput| async move {
-//!         // implementation
-//!         Ok(CallToolResult::text("result"))
+//!         Ok(CallToolResult::text(format!("Evaluated: {}", input.expression)))
 //!     })
-//!     .build();
+//!     .build()
+//!     .expect("valid tool name");
 //!
 //! // Create router with tools
 //! let router = McpRouter::new()
 //!     .server_info("my-server", "1.0.0")
 //!     .tool(evaluate);
-//!
-//! // Add middleware via tower's ServiceBuilder
-//! let service = ServiceBuilder::new()
-//!     .service(router);
 //! ```
 
 pub mod error;
@@ -55,7 +50,7 @@ pub mod tool;
 pub mod transport;
 
 // Re-exports
-pub use error::{Error, Result};
+pub use error::{Error, Result, ToolError};
 pub use protocol::{
     CallToolResult, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, JsonRpcResponseMessage,
     McpRequest, McpResponse,

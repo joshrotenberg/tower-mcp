@@ -71,6 +71,61 @@ impl JsonRpcError {
     }
 }
 
+/// Tool execution error with context
+#[derive(Debug)]
+pub struct ToolError {
+    /// The tool name that failed
+    pub tool: Option<String>,
+    /// Error message
+    pub message: String,
+    /// Source error if any
+    pub source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+impl std::fmt::Display for ToolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(tool) = &self.tool {
+            write!(f, "Tool '{}' error: {}", tool, self.message)
+        } else {
+            write!(f, "Tool error: {}", self.message)
+        }
+    }
+}
+
+impl std::error::Error for ToolError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|e| e.as_ref() as &(dyn std::error::Error + 'static))
+    }
+}
+
+impl ToolError {
+    /// Create a new tool error with just a message
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            tool: None,
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    /// Create a tool error with the tool name
+    pub fn with_tool(tool: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            tool: Some(tool.into()),
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    /// Add a source error
+    pub fn with_source(mut self, source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        self.source = Some(Box::new(source));
+        self
+    }
+}
+
 /// tower-mcp error type
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -80,14 +135,26 @@ pub enum Error {
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 
-    #[error("Tool error: {0}")]
-    Tool(String),
+    #[error("{0}")]
+    Tool(#[from] ToolError),
 
     #[error("Transport error: {0}")]
     Transport(String),
 
     #[error("Internal error: {0}")]
     Internal(String),
+}
+
+impl Error {
+    /// Create a simple tool error from a string (for backwards compatibility)
+    pub fn tool(message: impl Into<String>) -> Self {
+        Error::Tool(ToolError::new(message))
+    }
+
+    /// Create a tool error with the tool name
+    pub fn tool_with_name(tool: impl Into<String>, message: impl Into<String>) -> Self {
+        Error::Tool(ToolError::with_tool(tool, message))
+    }
 }
 
 impl From<JsonRpcError> for Error {
