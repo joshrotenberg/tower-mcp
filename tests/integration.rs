@@ -44,9 +44,9 @@ fn create_test_router() -> McpRouter {
 
     let failing = ToolBuilder::new("failing")
         .description("A tool that always fails")
-        .handler(|_input: EchoInput| async move {
-            Err(tower_mcp::Error::Tool("Intentional failure".into()))
-        })
+        .handler(
+            |_input: EchoInput| async move { Err(tower_mcp::Error::tool("Intentional failure")) },
+        )
         .build()
         .expect("valid tool");
 
@@ -389,5 +389,180 @@ async fn test_invalid_jsonrpc_version() {
             assert_eq!(e.error.code, -32600); // Invalid request
         }
         JsonRpcResponse::Result(_) => panic!("Expected error for invalid JSON-RPC version"),
+    }
+}
+
+// =============================================================================
+// Error path tests (#13)
+// =============================================================================
+
+#[tokio::test]
+async fn test_error_unknown_method() {
+    let router = create_test_router();
+    let mut service = JsonRpcService::new(router.clone());
+
+    // Initialize
+    let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+        "protocolVersion": "2025-03-26",
+        "capabilities": {},
+        "clientInfo": { "name": "test", "version": "1.0" }
+    }));
+    service.call_single(init_req).await.unwrap();
+    router.handle_notification(tower_mcp::protocol::McpNotification::Initialized);
+
+    // Try unknown method
+    let req = JsonRpcRequest::new(2, "unknown/method");
+    let resp = service.call_single(req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Error(e) => {
+            assert_eq!(e.error.code, -32601); // Method not found
+            assert!(e.error.message.contains("unknown/method"));
+        }
+        JsonRpcResponse::Result(_) => panic!("Expected error for unknown method"),
+    }
+}
+
+#[tokio::test]
+async fn test_error_malformed_tool_arguments() {
+    let router = create_test_router();
+    let mut service = JsonRpcService::new(router.clone());
+
+    // Initialize
+    let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+        "protocolVersion": "2025-03-26",
+        "capabilities": {},
+        "clientInfo": { "name": "test", "version": "1.0" }
+    }));
+    service.call_single(init_req).await.unwrap();
+    router.handle_notification(tower_mcp::protocol::McpNotification::Initialized);
+
+    // Call tool with wrong argument types
+    let call_req = JsonRpcRequest::new(2, "tools/call").with_params(serde_json::json!({
+        "name": "add",
+        "arguments": { "a": "not a number", "b": 5 }
+    }));
+    let resp = service.call_single(call_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Error(e) => {
+            assert_eq!(e.error.code, -32603); // Internal error (tool error)
+            assert!(e.error.message.contains("Invalid input"));
+        }
+        JsonRpcResponse::Result(_) => panic!("Expected error for malformed arguments"),
+    }
+}
+
+#[tokio::test]
+async fn test_error_double_initialization() {
+    let router = create_test_router();
+    let mut service = JsonRpcService::new(router.clone());
+
+    // First initialization
+    let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+        "protocolVersion": "2025-03-26",
+        "capabilities": {},
+        "clientInfo": { "name": "test", "version": "1.0" }
+    }));
+    let resp1 = service.call_single(init_req).await.unwrap();
+    assert!(matches!(resp1, JsonRpcResponse::Result(_)));
+
+    router.handle_notification(tower_mcp::protocol::McpNotification::Initialized);
+
+    // Second initialization should still work (per MCP spec, server can re-initialize)
+    let init_req2 = JsonRpcRequest::new(2, "initialize").with_params(serde_json::json!({
+        "protocolVersion": "2025-03-26",
+        "capabilities": {},
+        "clientInfo": { "name": "test", "version": "1.0" }
+    }));
+    let resp2 = service.call_single(init_req2).await.unwrap();
+    // Note: Whether this succeeds or fails depends on implementation
+    // Our implementation allows it currently
+    assert!(matches!(resp2, JsonRpcResponse::Result(_)));
+}
+
+#[tokio::test]
+async fn test_error_missing_required_params() {
+    let router = create_test_router();
+    let mut service = JsonRpcService::new(router.clone());
+
+    // Initialize
+    let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+        "protocolVersion": "2025-03-26",
+        "capabilities": {},
+        "clientInfo": { "name": "test", "version": "1.0" }
+    }));
+    service.call_single(init_req).await.unwrap();
+    router.handle_notification(tower_mcp::protocol::McpNotification::Initialized);
+
+    // Call tools/call without arguments
+    let call_req = JsonRpcRequest::new(2, "tools/call").with_params(serde_json::json!({
+        "name": "echo"
+        // Missing "arguments"
+    }));
+    let resp = service.call_single(call_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Error(e) => {
+            // Tool expects message field in arguments
+            assert!(e.error.code == -32603 || e.error.code == -32602);
+        }
+        JsonRpcResponse::Result(_) => panic!("Expected error for missing arguments"),
+    }
+}
+
+#[tokio::test]
+async fn test_error_resources_not_found() {
+    let router = create_test_router();
+    let mut service = JsonRpcService::new(router.clone());
+
+    // Initialize
+    let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+        "protocolVersion": "2025-03-26",
+        "capabilities": {},
+        "clientInfo": { "name": "test", "version": "1.0" }
+    }));
+    service.call_single(init_req).await.unwrap();
+    router.handle_notification(tower_mcp::protocol::McpNotification::Initialized);
+
+    // Try to read a resource (none registered)
+    let read_req = JsonRpcRequest::new(2, "resources/read").with_params(serde_json::json!({
+        "uri": "file:///nonexistent"
+    }));
+    let resp = service.call_single(read_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Error(e) => {
+            assert_eq!(e.error.code, -32601); // Method not found (resource not found)
+        }
+        JsonRpcResponse::Result(_) => panic!("Expected error for resource not found"),
+    }
+}
+
+#[tokio::test]
+async fn test_error_prompts_not_found() {
+    let router = create_test_router();
+    let mut service = JsonRpcService::new(router.clone());
+
+    // Initialize
+    let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+        "protocolVersion": "2025-03-26",
+        "capabilities": {},
+        "clientInfo": { "name": "test", "version": "1.0" }
+    }));
+    service.call_single(init_req).await.unwrap();
+    router.handle_notification(tower_mcp::protocol::McpNotification::Initialized);
+
+    // Try to get a prompt (none registered)
+    let get_req = JsonRpcRequest::new(2, "prompts/get").with_params(serde_json::json!({
+        "name": "nonexistent"
+    }));
+    let resp = service.call_single(get_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Error(e) => {
+            assert_eq!(e.error.code, -32601); // Method not found (prompt not found)
+        }
+        JsonRpcResponse::Result(_) => panic!("Expected error for prompt not found"),
     }
 }

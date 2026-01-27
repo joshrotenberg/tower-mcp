@@ -22,16 +22,23 @@ use crate::tool::Tool;
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust
+/// use tower_mcp::{McpRouter, ToolBuilder, CallToolResult};
+/// use schemars::JsonSchema;
+/// use serde::Deserialize;
+///
+/// #[derive(Debug, Deserialize, JsonSchema)]
+/// struct Input { value: String }
+///
+/// let tool = ToolBuilder::new("echo")
+///     .description("Echo input")
+///     .handler(|i: Input| async move { Ok(CallToolResult::text(i.value)) })
+///     .build()
+///     .unwrap();
+///
 /// let router = McpRouter::new()
 ///     .server_info("my-server", "1.0.0")
-///     .tool(evaluate_tool)
-///     .tool(validate_tool);
-///
-/// // Use with tower middleware
-/// let service = ServiceBuilder::new()
-///     .layer(TracingLayer::new())
-///     .service(router);
+///     .tool(tool);
 /// ```
 #[derive(Clone)]
 pub struct McpRouter {
@@ -314,7 +321,7 @@ impl Service<RouterRequest> for McpRouter {
                 id: req.id,
                 inner: result.map_err(|e| match e {
                     Error::JsonRpc(err) => err,
-                    Error::Tool(msg) => JsonRpcError::internal_error(msg),
+                    Error::Tool(err) => JsonRpcError::internal_error(err.to_string()),
                     e => JsonRpcError::internal_error(e.to_string()),
                 }),
             })

@@ -27,10 +27,10 @@ use crate::protocol::{CallToolResult, ToolAnnotations, ToolDefinition};
 /// Returns `Ok(())` if valid, `Err` with description if invalid.
 pub fn validate_tool_name(name: &str) -> Result<()> {
     if name.is_empty() {
-        return Err(Error::Tool("Tool name cannot be empty".into()));
+        return Err(Error::tool("Tool name cannot be empty"));
     }
     if name.len() > 128 {
-        return Err(Error::Tool(format!(
+        return Err(Error::tool(format!(
             "Tool name '{}' exceeds maximum length of 128 characters (got {})",
             name,
             name.len()
@@ -40,7 +40,7 @@ pub fn validate_tool_name(name: &str) -> Result<()> {
         .chars()
         .find(|c| !c.is_ascii_alphanumeric() && *c != '_' && *c != '-' && *c != '.')
     {
-        return Err(Error::Tool(format!(
+        return Err(Error::tool(format!(
             "Tool name '{}' contains invalid character '{}'. Only alphanumeric, underscore, hyphen, and dot are allowed.",
             name, invalid_char
         )));
@@ -108,13 +108,25 @@ impl Tool {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust
+/// use tower_mcp::{ToolBuilder, CallToolResult};
+/// use schemars::JsonSchema;
+/// use serde::Deserialize;
+///
+/// #[derive(Debug, Deserialize, JsonSchema)]
+/// struct GreetInput {
+///     name: String,
+/// }
+///
 /// let tool = ToolBuilder::new("greet")
 ///     .description("Greet someone by name")
 ///     .handler(|input: GreetInput| async move {
 ///         Ok(CallToolResult::text(format!("Hello, {}!", input.name)))
 ///     })
-///     .build();
+///     .build()
+///     .expect("valid tool name");
+///
+/// assert_eq!(tool.name, "greet");
 /// ```
 pub struct ToolBuilder {
     name: String,
@@ -263,7 +275,7 @@ where
     fn call(&self, args: Value) -> BoxFuture<'_, Result<CallToolResult>> {
         Box::pin(async move {
             let input: I = serde_json::from_value(args)
-                .map_err(|e| Error::Tool(format!("Invalid input: {}", e)))?;
+                .map_err(|e| Error::tool(format!("Invalid input: {}", e)))?;
             (self.handler)(input).await
         })
     }
@@ -312,22 +324,34 @@ where
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// struct EvaluateTool {
-///     runtime: Arc<Runtime>,
+/// ```rust
+/// use tower_mcp::tool::McpTool;
+/// use tower_mcp::error::Result;
+/// use schemars::JsonSchema;
+/// use serde::{Deserialize, Serialize};
+///
+/// #[derive(Debug, Deserialize, JsonSchema)]
+/// struct AddInput {
+///     a: i64,
+///     b: i64,
 /// }
 ///
-/// impl McpTool for EvaluateTool {
-///     const NAME: &'static str = "evaluate";
-///     const DESCRIPTION: &'static str = "Evaluate a JMESPath expression";
+/// struct AddTool;
 ///
-///     type Input = EvaluateInput;
-///     type Output = Value;
+/// impl McpTool for AddTool {
+///     const NAME: &'static str = "add";
+///     const DESCRIPTION: &'static str = "Add two numbers";
+///
+///     type Input = AddInput;
+///     type Output = i64;
 ///
 ///     async fn call(&self, input: Self::Input) -> Result<Self::Output> {
-///         // implementation
+///         Ok(input.a + input.b)
 ///     }
 /// }
+///
+/// let tool = AddTool.into_tool().expect("valid tool name");
+/// assert_eq!(tool.name, "add");
 /// ```
 pub trait McpTool: Send + Sync + 'static {
     const NAME: &'static str;
@@ -372,10 +396,10 @@ impl<T: McpTool> ToolHandler for McpToolHandler<T> {
         let tool = self.tool.clone();
         Box::pin(async move {
             let input: T::Input = serde_json::from_value(args)
-                .map_err(|e| Error::Tool(format!("Invalid input: {}", e)))?;
+                .map_err(|e| Error::tool(format!("Invalid input: {}", e)))?;
             let output = tool.call(input).await?;
             let value = serde_json::to_value(output)
-                .map_err(|e| Error::Tool(format!("Failed to serialize output: {}", e)))?;
+                .map_err(|e| Error::tool(format!("Failed to serialize output: {}", e)))?;
             Ok(CallToolResult::json(value))
         })
     }

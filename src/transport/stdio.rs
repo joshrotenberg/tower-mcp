@@ -20,13 +20,18 @@ use crate::router::{JsonRpcService, McpRouter};
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// let router = McpRouter::new()
-///     .server_info("my-server", "1.0.0")
-///     .tool(my_tool);
+/// ```rust,no_run
+/// use tower_mcp::{McpRouter, StdioTransport};
 ///
-/// let transport = StdioTransport::new(router);
-/// transport.run().await?;
+/// #[tokio::main]
+/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     let router = McpRouter::new()
+///         .server_info("my-server", "1.0.0");
+///
+///     let mut transport = StdioTransport::new(router);
+///     transport.run().await?;
+///     Ok(())
+/// }
 /// ```
 pub struct StdioTransport {
     service: JsonRpcService<McpRouter>,
