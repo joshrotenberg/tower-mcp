@@ -37,6 +37,13 @@ pub enum ServerNotification {
     Progress(ProgressParams),
     /// Log message notification
     LogMessage(LoggingMessageParams),
+    /// A subscribed resource has been updated
+    ResourceUpdated {
+        /// The URI of the updated resource
+        uri: String,
+    },
+    /// The list of available resources has changed
+    ResourcesListChanged,
 }
 
 /// Sender for server notifications

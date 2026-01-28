@@ -447,6 +447,8 @@ pub enum McpResponse {
     ListResources(ListResourcesResult),
     ListResourceTemplates(ListResourceTemplatesResult),
     ReadResource(ReadResourceResult),
+    SubscribeResource(EmptyResult),
+    UnsubscribeResource(EmptyResult),
     ListPrompts(ListPromptsResult),
     GetPrompt(GetPromptResult),
     EnqueueTask(EnqueueTaskResult),
