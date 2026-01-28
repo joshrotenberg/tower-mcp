@@ -1364,6 +1364,132 @@ pub struct ReadResourceResult {
     pub contents: Vec<ResourceContent>,
 }
 
+impl ReadResourceResult {
+    /// Create a result with text content.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::ReadResourceResult;
+    ///
+    /// let result = ReadResourceResult::text("file://readme.md", "# Hello World");
+    /// ```
+    pub fn text(uri: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            contents: vec![ResourceContent {
+                uri: uri.into(),
+                mime_type: Some("text/plain".to_string()),
+                text: Some(content.into()),
+                blob: None,
+            }],
+        }
+    }
+
+    /// Create a result with text content and a specific MIME type.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::ReadResourceResult;
+    ///
+    /// let result = ReadResourceResult::text_with_mime(
+    ///     "file://readme.md",
+    ///     "# Hello World",
+    ///     "text/markdown"
+    /// );
+    /// ```
+    pub fn text_with_mime(
+        uri: impl Into<String>,
+        content: impl Into<String>,
+        mime_type: impl Into<String>,
+    ) -> Self {
+        Self {
+            contents: vec![ResourceContent {
+                uri: uri.into(),
+                mime_type: Some(mime_type.into()),
+                text: Some(content.into()),
+                blob: None,
+            }],
+        }
+    }
+
+    /// Create a result with JSON content.
+    ///
+    /// The value is serialized to a JSON string automatically.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::ReadResourceResult;
+    /// use serde_json::json;
+    ///
+    /// let data = json!({"name": "example", "count": 42});
+    /// let result = ReadResourceResult::json("data://config", &data);
+    /// ```
+    pub fn json<T: serde::Serialize>(uri: impl Into<String>, value: &T) -> Self {
+        let json_string =
+            serde_json::to_string_pretty(value).unwrap_or_else(|_| "null".to_string());
+        Self {
+            contents: vec![ResourceContent {
+                uri: uri.into(),
+                mime_type: Some("application/json".to_string()),
+                text: Some(json_string),
+                blob: None,
+            }],
+        }
+    }
+
+    /// Create a result with binary content (base64 encoded).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::ReadResourceResult;
+    ///
+    /// let bytes = vec![0x89, 0x50, 0x4E, 0x47]; // PNG magic bytes
+    /// let result = ReadResourceResult::blob("file://image.png", &bytes);
+    /// ```
+    pub fn blob(uri: impl Into<String>, bytes: &[u8]) -> Self {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        Self {
+            contents: vec![ResourceContent {
+                uri: uri.into(),
+                mime_type: Some("application/octet-stream".to_string()),
+                text: None,
+                blob: Some(encoded),
+            }],
+        }
+    }
+
+    /// Create a result with binary content and a specific MIME type.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::ReadResourceResult;
+    ///
+    /// let bytes = vec![0x89, 0x50, 0x4E, 0x47];
+    /// let result = ReadResourceResult::blob_with_mime("file://image.png", &bytes, "image/png");
+    /// ```
+    pub fn blob_with_mime(
+        uri: impl Into<String>,
+        bytes: &[u8],
+        mime_type: impl Into<String>,
+    ) -> Self {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        Self {
+            contents: vec![ResourceContent {
+                uri: uri.into(),
+                mime_type: Some(mime_type.into()),
+                text: None,
+                blob: Some(encoded),
+            }],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SubscribeResourceParams {
     pub uri: String,
@@ -1471,6 +1597,150 @@ pub struct GetPromptResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub messages: Vec<PromptMessage>,
+}
+
+impl GetPromptResult {
+    /// Create a result with a single user message.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::GetPromptResult;
+    ///
+    /// let result = GetPromptResult::user_message("Please analyze this code.");
+    /// ```
+    pub fn user_message(text: impl Into<String>) -> Self {
+        Self {
+            description: None,
+            messages: vec![PromptMessage {
+                role: PromptRole::User,
+                content: Content::Text {
+                    text: text.into(),
+                    annotations: None,
+                },
+            }],
+        }
+    }
+
+    /// Create a result with a single user message and description.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::GetPromptResult;
+    ///
+    /// let result = GetPromptResult::user_message_with_description(
+    ///     "Please analyze this code.",
+    ///     "Code analysis prompt"
+    /// );
+    /// ```
+    pub fn user_message_with_description(
+        text: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
+        Self {
+            description: Some(description.into()),
+            messages: vec![PromptMessage {
+                role: PromptRole::User,
+                content: Content::Text {
+                    text: text.into(),
+                    annotations: None,
+                },
+            }],
+        }
+    }
+
+    /// Create a result with a single assistant message.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::GetPromptResult;
+    ///
+    /// let result = GetPromptResult::assistant_message("Here is my analysis...");
+    /// ```
+    pub fn assistant_message(text: impl Into<String>) -> Self {
+        Self {
+            description: None,
+            messages: vec![PromptMessage {
+                role: PromptRole::Assistant,
+                content: Content::Text {
+                    text: text.into(),
+                    annotations: None,
+                },
+            }],
+        }
+    }
+
+    /// Create a builder for constructing prompts with multiple messages.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::GetPromptResult;
+    ///
+    /// let result = GetPromptResult::builder()
+    ///     .description("Multi-turn conversation prompt")
+    ///     .user("What is the weather today?")
+    ///     .assistant("I don't have access to weather data, but I can help you find it.")
+    ///     .user("Where should I look?")
+    ///     .build();
+    /// ```
+    pub fn builder() -> GetPromptResultBuilder {
+        GetPromptResultBuilder::new()
+    }
+}
+
+/// Builder for constructing [`GetPromptResult`] with multiple messages.
+#[derive(Debug, Clone, Default)]
+pub struct GetPromptResultBuilder {
+    description: Option<String>,
+    messages: Vec<PromptMessage>,
+}
+
+impl GetPromptResultBuilder {
+    /// Create a new builder.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the prompt description.
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Add a user message.
+    pub fn user(mut self, text: impl Into<String>) -> Self {
+        self.messages.push(PromptMessage {
+            role: PromptRole::User,
+            content: Content::Text {
+                text: text.into(),
+                annotations: None,
+            },
+        });
+        self
+    }
+
+    /// Add an assistant message.
+    pub fn assistant(mut self, text: impl Into<String>) -> Self {
+        self.messages.push(PromptMessage {
+            role: PromptRole::Assistant,
+            content: Content::Text {
+                text: text.into(),
+                annotations: None,
+            },
+        });
+        self
+    }
+
+    /// Build the final result.
+    pub fn build(self) -> GetPromptResult {
+        GetPromptResult {
+            description: self.description,
+            messages: self.messages,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

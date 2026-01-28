@@ -17,7 +17,9 @@ pub mod websocket;
 #[cfg(feature = "childproc")]
 pub mod childproc;
 
-pub use stdio::{BidirectionalStdioTransport, StdioTransport, SyncStdioTransport};
+pub use stdio::{
+    BidirectionalStdioTransport, GenericStdioTransport, StdioTransport, SyncStdioTransport,
+};
 
 #[cfg(feature = "http")]
 pub use http::HttpTransport;
