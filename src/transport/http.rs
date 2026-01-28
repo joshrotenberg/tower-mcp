@@ -96,14 +96,14 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::context::{
-    ChannelClientRequester, ClientRequesterHandle, OutgoingRequestReceiver,
-    outgoing_request_channel,
+    ChannelClientRequester, ClientRequesterHandle, OutgoingRequestReceiver, ServerNotification,
+    notification_channel, outgoing_request_channel,
 };
 use crate::error::{Error, JsonRpcError, Result};
 use crate::jsonrpc::JsonRpcService;
 use crate::protocol::{
     JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpNotification, RequestId,
-    SUPPORTED_PROTOCOL_VERSIONS,
+    SUPPORTED_PROTOCOL_VERSIONS, notifications,
 };
 use crate::router::{McpRouter, RouterRequest, RouterResponse};
 use crate::transport::service::{CatchError, McpBoxService, ServiceFactory, identity_factory};
@@ -143,6 +143,44 @@ struct Session {
 impl Session {
     fn new(router: McpRouter, sampling_enabled: bool, service_factory: ServiceFactory) -> Self {
         let (notifications_tx, _) = broadcast::channel(100);
+
+        // Set up notification forwarding: mpsc -> broadcast
+        // The router sends notifications (progress, log, resource updates) to
+        // an mpsc channel. We bridge these to the session's broadcast channel
+        // so they reach connected SSE clients.
+        let (notif_sender, mut notif_receiver) = notification_channel(256);
+        let router = router.with_notification_sender(notif_sender);
+
+        let broadcast_tx = notifications_tx.clone();
+        tokio::spawn(async move {
+            while let Some(notification) = notif_receiver.recv().await {
+                let json = match &notification {
+                    ServerNotification::Progress(params) => {
+                        let notif = JsonRpcNotification::new(notifications::PROGRESS)
+                            .with_params(serde_json::to_value(params).unwrap_or_default());
+                        serde_json::to_string(&notif).ok()
+                    }
+                    ServerNotification::LogMessage(params) => {
+                        let notif = JsonRpcNotification::new(notifications::MESSAGE)
+                            .with_params(serde_json::to_value(params).unwrap_or_default());
+                        serde_json::to_string(&notif).ok()
+                    }
+                    ServerNotification::ResourceUpdated { uri } => {
+                        let notif = JsonRpcNotification::new(notifications::RESOURCE_UPDATED)
+                            .with_params(serde_json::json!({ "uri": uri }));
+                        serde_json::to_string(&notif).ok()
+                    }
+                    ServerNotification::ResourcesListChanged => {
+                        let notif = JsonRpcNotification::new(notifications::RESOURCES_LIST_CHANGED);
+                        serde_json::to_string(&notif).ok()
+                    }
+                };
+                if let Some(json) = json {
+                    // Best effort: if no subscribers, the message is dropped
+                    let _ = broadcast_tx.send(json);
+                }
+            }
+        });
 
         // Set up client requester if sampling is enabled
         let (router, request_rx) = if sampling_enabled {
@@ -585,7 +623,29 @@ impl HttpTransport {
     }
 }
 
+/// Check if an origin is a localhost origin (safe from DNS rebinding).
+fn is_localhost_origin(origin: &str) -> bool {
+    // Parse the origin to extract the host
+    if let Some(rest) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    {
+        // Strip port if present
+        let host = rest.split(':').next().unwrap_or(rest);
+        matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
+    } else {
+        false
+    }
+}
+
 /// Validate Origin header for security.
+///
+/// When origin validation is enabled:
+/// - Requests without an Origin header are allowed (same-origin)
+/// - Localhost origins are always allowed (DNS rebinding protection)
+/// - If `allowed_origins` is non-empty, non-localhost origins must match
+/// - If `allowed_origins` is empty, non-localhost origins are rejected
+///
 /// Returns Some(Response) if validation fails, None if it passes.
 fn validate_origin(headers: &HeaderMap, state: &AppState) -> Option<Response> {
     if !state.validate_origin {
@@ -595,10 +655,13 @@ fn validate_origin(headers: &HeaderMap, state: &AppState) -> Option<Response> {
     if let Some(origin) = headers.get(header::ORIGIN) {
         let origin_str = origin.to_str().unwrap_or("");
 
-        // If allowed_origins is empty and we're validating, reject all cross-origin requests
+        // Always allow localhost origins (DNS rebinding protection allows these)
+        if is_localhost_origin(origin_str) {
+            return None;
+        }
+
+        // Non-localhost origin: check against allowed list
         if state.allowed_origins.is_empty() {
-            // Allow same-origin (no Origin header means same-origin in most cases)
-            // But if Origin is present and we have no whitelist, reject
             return Some(
                 (StatusCode::FORBIDDEN, "Cross-origin requests not allowed").into_response(),
             );

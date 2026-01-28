@@ -2112,6 +2112,74 @@ impl ElicitFormSchema {
                 format: None,
                 min_length: None,
                 max_length: None,
+                default: None,
+            }),
+        );
+        if required {
+            self.required.push(name.to_string());
+        }
+        self
+    }
+
+    /// Add a string field with a default value
+    pub fn string_field_with_default(
+        mut self,
+        name: &str,
+        description: Option<&str>,
+        required: bool,
+        default: &str,
+    ) -> Self {
+        self.properties.insert(
+            name.to_string(),
+            PrimitiveSchemaDefinition::String(StringSchema {
+                schema_type: "string".to_string(),
+                description: description.map(|s| s.to_string()),
+                format: None,
+                min_length: None,
+                max_length: None,
+                default: Some(default.to_string()),
+            }),
+        );
+        if required {
+            self.required.push(name.to_string());
+        }
+        self
+    }
+
+    /// Add an integer field
+    pub fn integer_field(mut self, name: &str, description: Option<&str>, required: bool) -> Self {
+        self.properties.insert(
+            name.to_string(),
+            PrimitiveSchemaDefinition::Integer(IntegerSchema {
+                schema_type: "integer".to_string(),
+                description: description.map(|s| s.to_string()),
+                minimum: None,
+                maximum: None,
+                default: None,
+            }),
+        );
+        if required {
+            self.required.push(name.to_string());
+        }
+        self
+    }
+
+    /// Add an integer field with a default value
+    pub fn integer_field_with_default(
+        mut self,
+        name: &str,
+        description: Option<&str>,
+        required: bool,
+        default: i64,
+    ) -> Self {
+        self.properties.insert(
+            name.to_string(),
+            PrimitiveSchemaDefinition::Integer(IntegerSchema {
+                schema_type: "integer".to_string(),
+                description: description.map(|s| s.to_string()),
+                minimum: None,
+                maximum: None,
+                default: Some(default),
             }),
         );
         if required {
@@ -2129,6 +2197,31 @@ impl ElicitFormSchema {
                 description: description.map(|s| s.to_string()),
                 minimum: None,
                 maximum: None,
+                default: None,
+            }),
+        );
+        if required {
+            self.required.push(name.to_string());
+        }
+        self
+    }
+
+    /// Add a number field with a default value
+    pub fn number_field_with_default(
+        mut self,
+        name: &str,
+        description: Option<&str>,
+        required: bool,
+        default: f64,
+    ) -> Self {
+        self.properties.insert(
+            name.to_string(),
+            PrimitiveSchemaDefinition::Number(NumberSchema {
+                schema_type: "number".to_string(),
+                description: description.map(|s| s.to_string()),
+                minimum: None,
+                maximum: None,
+                default: Some(default),
             }),
         );
         if required {
@@ -2144,6 +2237,29 @@ impl ElicitFormSchema {
             PrimitiveSchemaDefinition::Boolean(BooleanSchema {
                 schema_type: "boolean".to_string(),
                 description: description.map(|s| s.to_string()),
+                default: None,
+            }),
+        );
+        if required {
+            self.required.push(name.to_string());
+        }
+        self
+    }
+
+    /// Add a boolean field with a default value
+    pub fn boolean_field_with_default(
+        mut self,
+        name: &str,
+        description: Option<&str>,
+        required: bool,
+        default: bool,
+    ) -> Self {
+        self.properties.insert(
+            name.to_string(),
+            PrimitiveSchemaDefinition::Boolean(BooleanSchema {
+                schema_type: "boolean".to_string(),
+                description: description.map(|s| s.to_string()),
+                default: Some(default),
             }),
         );
         if required {
@@ -2166,8 +2282,45 @@ impl ElicitFormSchema {
                 schema_type: "string".to_string(),
                 description: description.map(|s| s.to_string()),
                 enum_values: options,
+                default: None,
             }),
         );
+        if required {
+            self.required.push(name.to_string());
+        }
+        self
+    }
+
+    /// Add a single-select enum field with a default value
+    pub fn enum_field_with_default(
+        mut self,
+        name: &str,
+        description: Option<&str>,
+        required: bool,
+        options: &[&str],
+        default: &str,
+    ) -> Self {
+        self.properties.insert(
+            name.to_string(),
+            PrimitiveSchemaDefinition::SingleSelectEnum(SingleSelectEnumSchema {
+                schema_type: "string".to_string(),
+                description: description.map(|s| s.to_string()),
+                enum_values: options.iter().map(|s| s.to_string()).collect(),
+                default: Some(default.to_string()),
+            }),
+        );
+        if required {
+            self.required.push(name.to_string());
+        }
+        self
+    }
+
+    /// Add a raw JSON schema field
+    ///
+    /// Use this for advanced schema features not covered by the typed builders.
+    pub fn raw_field(mut self, name: &str, schema: serde_json::Value, required: bool) -> Self {
+        self.properties
+            .insert(name.to_string(), PrimitiveSchemaDefinition::Raw(schema));
         if required {
             self.required.push(name.to_string());
         }
@@ -2185,11 +2338,20 @@ impl Default for ElicitFormSchema {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum PrimitiveSchemaDefinition {
+    /// String field
     String(StringSchema),
+    /// Integer field
+    Integer(IntegerSchema),
+    /// Number (floating-point) field
     Number(NumberSchema),
+    /// Boolean field
     Boolean(BooleanSchema),
+    /// Single-select enum field
     SingleSelectEnum(SingleSelectEnumSchema),
+    /// Multi-select enum field
     MultiSelectEnum(MultiSelectEnumSchema),
+    /// Raw JSON schema (for advanced/custom schemas)
+    Raw(serde_json::Value),
 }
 
 /// String field schema
@@ -2206,6 +2368,26 @@ pub struct StringSchema {
     pub min_length: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_length: Option<u64>,
+    /// Default value for this field
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+}
+
+/// Integer field schema
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IntegerSchema {
+    #[serde(rename = "type")]
+    pub schema_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minimum: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maximum: Option<i64>,
+    /// Default value for this field
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<i64>,
 }
 
 /// Number field schema
@@ -2220,6 +2402,9 @@ pub struct NumberSchema {
     pub minimum: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub maximum: Option<f64>,
+    /// Default value for this field
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<f64>,
 }
 
 /// Boolean field schema
@@ -2230,6 +2415,9 @@ pub struct BooleanSchema {
     pub schema_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Default value for this field
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<bool>,
 }
 
 /// Single-select enum schema
@@ -2242,6 +2430,9 @@ pub struct SingleSelectEnumSchema {
     pub description: Option<String>,
     #[serde(rename = "enum")]
     pub enum_values: Vec<String>,
+    /// Default value for this field
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
 }
 
 /// Multi-select enum schema

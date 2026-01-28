@@ -1,0 +1,7 @@
+# MCP Conformance Suite -- Expected Failures Baseline
+#
+# All 39 tests currently pass. Add entries here if a conformance test
+# covers a feature that is intentionally unsupported or deferred.
+#
+# Format:
+#   - test_name: "reason for expected failure"

@@ -364,6 +364,31 @@ impl RequestContext {
         let _ = tx.try_send(ServerNotification::Progress(params));
     }
 
+    /// Send a log message notification to the client
+    ///
+    /// This is a no-op if no notification sender is configured.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use tower_mcp::protocol::{LoggingMessageParams, LogLevel};
+    ///
+    /// async fn my_tool(ctx: RequestContext) {
+    ///     ctx.send_log(
+    ///         LoggingMessageParams::new(LogLevel::Info)
+    ///             .with_logger("my-tool")
+    ///             .with_data(serde_json::json!("Processing..."))
+    ///     );
+    /// }
+    /// ```
+    pub fn send_log(&self, params: LoggingMessageParams) {
+        let Some(tx) = &self.notification_tx else {
+            return;
+        };
+
+        let _ = tx.try_send(ServerNotification::LogMessage(params));
+    }
+
     /// Check if sampling is available
     ///
     /// Returns true if a client requester is configured and the transport

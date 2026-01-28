@@ -14,7 +14,7 @@ keywords = ["mcp", "tower", "json-rpc", "ai", "llm"]
 categories = ["network-programming", "asynchronous"]
 
 [workspace]
-members = ["examples/crates-mcp"]
+members = ["examples/crates-mcp", "examples/conformance-server"]
 
 [dependencies]
 # Tower ecosystem
