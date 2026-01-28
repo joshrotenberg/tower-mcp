@@ -104,5 +104,10 @@ path = "examples/http_server_with_auth.rs"
 required-features = ["http"]
 
 [[example]]
+name = "http_server_with_middleware"
+path = "examples/http_server_with_middleware.rs"
+required-features = ["http"]
+
+[[example]]
 name = "client_cli"
 path = "examples/client_cli.rs"
