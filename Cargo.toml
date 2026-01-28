@@ -54,17 +54,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 default = []
 # Transport features
 http = ["dep:axum", "dep:hyper", "dep:http", "dep:http-body-util", "dep:tokio-stream", "dep:uuid"]
-websocket = ["dep:axum", "dep:tokio-tungstenite", "dep:uuid"]
+websocket = ["dep:axum", "dep:uuid"]
 childproc = []
 
 [dependencies.axum]
 version = "0.8"
 optional = true
 features = ["json", "ws"]
-
-[dependencies.tokio-tungstenite]
-version = "0.26"
-optional = true
 
 [dependencies.hyper]
 version = "1"
