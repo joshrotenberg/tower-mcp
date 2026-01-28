@@ -16,7 +16,7 @@ use crate::context::{CancellationToken, NotificationSender, RequestContext, Serv
 use crate::error::{Error, JsonRpcError, Result};
 use crate::prompt::Prompt;
 use crate::protocol::*;
-use crate::resource::Resource;
+use crate::resource::{Resource, ResourceTemplate};
 use crate::session::SessionState;
 use crate::tool::Tool;
 
@@ -71,6 +71,8 @@ struct McpRouterInner {
     instructions: Option<String>,
     tools: HashMap<String, Arc<Tool>>,
     resources: HashMap<String, Arc<Resource>>,
+    /// Resource templates for dynamic resource matching (keyed by uri_template)
+    resource_templates: Vec<Arc<ResourceTemplate>>,
     prompts: HashMap<String, Arc<Prompt>>,
     /// In-flight requests for cancellation tracking (shared across clones)
     in_flight: Arc<RwLock<HashMap<RequestId, CancellationToken>>>,
@@ -90,6 +92,7 @@ impl McpRouter {
                 instructions: None,
                 tools: HashMap::new(),
                 resources: HashMap::new(),
+                resource_templates: Vec::new(),
                 prompts: HashMap::new(),
                 in_flight: Arc::new(RwLock::new(HashMap::new())),
                 notification_tx: None,
@@ -199,6 +202,43 @@ impl McpRouter {
         self
     }
 
+    /// Register a resource template
+    ///
+    /// Resource templates allow dynamic resources to be matched by URI pattern.
+    /// When a client requests a resource URI that doesn't match any static
+    /// resource, the router tries to match it against registered templates.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::{McpRouter, ResourceTemplateBuilder};
+    /// use tower_mcp::protocol::{ReadResourceResult, ResourceContent};
+    /// use std::collections::HashMap;
+    ///
+    /// let template = ResourceTemplateBuilder::new("file:///{path}")
+    ///     .name("Project Files")
+    ///     .handler(|uri: String, vars: HashMap<String, String>| async move {
+    ///         let path = vars.get("path").unwrap_or(&String::new()).clone();
+    ///         Ok(ReadResourceResult {
+    ///             contents: vec![ResourceContent {
+    ///                 uri,
+    ///                 mime_type: Some("text/plain".to_string()),
+    ///                 text: Some(format!("Contents of {}", path)),
+    ///                 blob: None,
+    ///             }],
+    ///         })
+    ///     });
+    ///
+    /// let router = McpRouter::new()
+    ///     .resource_template(template);
+    /// ```
+    pub fn resource_template(mut self, template: ResourceTemplate) -> Self {
+        Arc::make_mut(&mut self.inner)
+            .resource_templates
+            .push(Arc::new(template));
+        self
+    }
+
     /// Register a prompt
     pub fn prompt(mut self, prompt: Prompt) -> Self {
         Arc::make_mut(&mut self.inner)
@@ -278,16 +318,19 @@ impl McpRouter {
 
     /// Get server capabilities based on registered handlers
     fn capabilities(&self) -> ServerCapabilities {
+        let has_resources =
+            !self.inner.resources.is_empty() || !self.inner.resource_templates.is_empty();
+
         ServerCapabilities {
             tools: if self.inner.tools.is_empty() {
                 None
             } else {
                 Some(ToolsCapability::default())
             },
-            resources: if self.inner.resources.is_empty() {
-                None
-            } else {
+            resources: if has_resources {
                 Some(ResourcesCapability::default())
+            } else {
+                None
             },
             prompts: if self.inner.prompts.is_empty() {
                 None
@@ -395,18 +438,48 @@ impl McpRouter {
                 }))
             }
 
+            McpRequest::ListResourceTemplates(_params) => {
+                let resource_templates: Vec<ResourceTemplateDefinition> = self
+                    .inner
+                    .resource_templates
+                    .iter()
+                    .map(|t| t.definition())
+                    .collect();
+
+                Ok(McpResponse::ListResourceTemplates(
+                    ListResourceTemplatesResult {
+                        resource_templates,
+                        next_cursor: None,
+                    },
+                ))
+            }
+
             McpRequest::ReadResource(params) => {
-                let resource = self.inner.resources.get(&params.uri).ok_or_else(|| {
-                    Error::JsonRpc(JsonRpcError::method_not_found(&format!(
-                        "Resource not found: {}",
-                        params.uri
-                    )))
-                })?;
+                // First, try to find a static resource
+                if let Some(resource) = self.inner.resources.get(&params.uri) {
+                    tracing::debug!(uri = %params.uri, "Reading static resource");
+                    let result = resource.read().await?;
+                    return Ok(McpResponse::ReadResource(result));
+                }
 
-                tracing::debug!(uri = %params.uri, "Reading resource");
-                let result = resource.read().await?;
+                // If no static resource found, try to match against templates
+                for template in &self.inner.resource_templates {
+                    if let Some(variables) = template.match_uri(&params.uri) {
+                        tracing::debug!(
+                            uri = %params.uri,
+                            template = %template.uri_template,
+                            "Reading resource via template"
+                        );
+                        let result = template.read(&params.uri, variables).await?;
+                        return Ok(McpResponse::ReadResource(result));
+                    }
+                }
 
-                Ok(McpResponse::ReadResource(result))
+                // No match found
+                Err(Error::JsonRpc(JsonRpcError::method_not_found(&format!(
+                    "Resource not found: {}",
+                    params.uri
+                ))))
             }
 
             McpRequest::SubscribeResource(params) => {
@@ -1156,6 +1229,235 @@ mod tests {
 
         let result = service.call_batch(vec![]).await;
         assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // Resource Template Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_list_resource_templates() {
+        use crate::resource::ResourceTemplateBuilder;
+        use std::collections::HashMap;
+
+        let template = ResourceTemplateBuilder::new("file:///{path}")
+            .name("Project Files")
+            .description("Access project files")
+            .handler(|uri: String, _vars: HashMap<String, String>| async move {
+                Ok(ReadResourceResult {
+                    contents: vec![ResourceContent {
+                        uri,
+                        mime_type: None,
+                        text: None,
+                        blob: None,
+                    }],
+                })
+            });
+
+        let mut router = McpRouter::new().resource_template(template);
+
+        // Initialize session
+        init_router(&mut router).await;
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::ListResourceTemplates(ListResourceTemplatesParams::default()),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::ListResourceTemplates(result)) => {
+                assert_eq!(result.resource_templates.len(), 1);
+                assert_eq!(result.resource_templates[0].uri_template, "file:///{path}");
+                assert_eq!(result.resource_templates[0].name, "Project Files");
+            }
+            _ => panic!("Expected ListResourceTemplates response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_resource_via_template() {
+        use crate::resource::ResourceTemplateBuilder;
+        use std::collections::HashMap;
+
+        let template = ResourceTemplateBuilder::new("db://users/{id}")
+            .name("User Records")
+            .handler(|uri: String, vars: HashMap<String, String>| async move {
+                let id = vars.get("id").unwrap().clone();
+                Ok(ReadResourceResult {
+                    contents: vec![ResourceContent {
+                        uri,
+                        mime_type: Some("application/json".to_string()),
+                        text: Some(format!(r#"{{"id": "{}"}}"#, id)),
+                        blob: None,
+                    }],
+                })
+            });
+
+        let mut router = McpRouter::new().resource_template(template);
+
+        // Initialize session
+        init_router(&mut router).await;
+
+        // Read a resource that matches the template
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::ReadResource(ReadResourceParams {
+                uri: "db://users/123".to_string(),
+            }),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::ReadResource(result)) => {
+                assert_eq!(result.contents.len(), 1);
+                assert_eq!(result.contents[0].uri, "db://users/123");
+                assert!(result.contents[0].text.as_ref().unwrap().contains("123"));
+            }
+            _ => panic!("Expected ReadResource response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_static_resource_takes_precedence_over_template() {
+        use crate::resource::{ResourceBuilder, ResourceTemplateBuilder};
+        use std::collections::HashMap;
+
+        // Template that would match the same URI
+        let template = ResourceTemplateBuilder::new("file:///{path}")
+            .name("Files Template")
+            .handler(|uri: String, _vars: HashMap<String, String>| async move {
+                Ok(ReadResourceResult {
+                    contents: vec![ResourceContent {
+                        uri,
+                        mime_type: None,
+                        text: Some("from template".to_string()),
+                        blob: None,
+                    }],
+                })
+            });
+
+        // Static resource with exact URI
+        let static_resource = ResourceBuilder::new("file:///README.md")
+            .name("README")
+            .text("from static resource");
+
+        let mut router = McpRouter::new()
+            .resource_template(template)
+            .resource(static_resource);
+
+        // Initialize session
+        init_router(&mut router).await;
+
+        // Read the static resource - should NOT go through template
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::ReadResource(ReadResourceParams {
+                uri: "file:///README.md".to_string(),
+            }),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::ReadResource(result)) => {
+                // Should get static resource, not template
+                assert_eq!(
+                    result.contents[0].text.as_deref(),
+                    Some("from static resource")
+                );
+            }
+            _ => panic!("Expected ReadResource response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resource_not_found_when_no_match() {
+        use crate::resource::ResourceTemplateBuilder;
+        use std::collections::HashMap;
+
+        let template = ResourceTemplateBuilder::new("db://users/{id}")
+            .name("Users")
+            .handler(|uri: String, _vars: HashMap<String, String>| async move {
+                Ok(ReadResourceResult {
+                    contents: vec![ResourceContent {
+                        uri,
+                        mime_type: None,
+                        text: None,
+                        blob: None,
+                    }],
+                })
+            });
+
+        let mut router = McpRouter::new().resource_template(template);
+
+        // Initialize session
+        init_router(&mut router).await;
+
+        // Try to read a URI that doesn't match any resource or template
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::ReadResource(ReadResourceParams {
+                uri: "db://posts/123".to_string(),
+            }),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        match resp.inner {
+            Err(err) => {
+                assert!(err.message.contains("not found"));
+            }
+            Ok(_) => panic!("Expected error for non-matching URI"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_capabilities_include_resources_with_only_templates() {
+        use crate::resource::ResourceTemplateBuilder;
+        use std::collections::HashMap;
+
+        let template = ResourceTemplateBuilder::new("file:///{path}")
+            .name("Files")
+            .handler(|uri: String, _vars: HashMap<String, String>| async move {
+                Ok(ReadResourceResult {
+                    contents: vec![ResourceContent {
+                        uri,
+                        mime_type: None,
+                        text: None,
+                        blob: None,
+                    }],
+                })
+            });
+
+        let mut router = McpRouter::new().resource_template(template);
+
+        // Send initialize request and check capabilities
+        let init_req = RouterRequest {
+            id: RequestId::Number(0),
+            inner: McpRequest::Initialize(InitializeParams {
+                protocol_version: "2025-03-26".to_string(),
+                capabilities: ClientCapabilities {
+                    roots: None,
+                    sampling: None,
+                },
+                client_info: Implementation {
+                    name: "test".to_string(),
+                    version: "1.0".to_string(),
+                },
+            }),
+        };
+        let resp = router.ready().await.unwrap().call(init_req).await.unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::Initialize(result)) => {
+                // Should have resources capability even though only templates registered
+                assert!(result.capabilities.resources.is_some());
+            }
+            _ => panic!("Expected Initialize response"),
+        }
     }
 
     // =========================================================================
