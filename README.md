@@ -252,22 +252,22 @@ let app = transport.into_router()
 
 tower-mcp targets the [MCP specification 2025-03-26](https://modelcontextprotocol.io/specification/2025-03-26). Current compliance:
 
-- [x] JSON-RPC 2.0 message format
-- [x] Protocol version negotiation
-- [x] Capability negotiation
-- [x] Initialize/initialized lifecycle
-- [x] tools/list and tools/call
-- [x] Tool annotations
-- [x] Batch requests
-- [x] resources/list, resources/read, resources/subscribe
-- [x] prompts/list, prompts/get
-- [x] Elicitation (user input requests)
-- [x] Session management with reconnection error codes
-- [x] Progress notifications
-- [x] Request cancellation
-- [x] Completion (autocomplete)
-- [x] Roots (filesystem discovery)
-- [x] Sampling runtime (stdio transport)
+- [x] [JSON-RPC 2.0 message format](https://modelcontextprotocol.io/specification/2025-03-26/basic#messages)
+- [x] [Protocol version negotiation](https://modelcontextprotocol.io/specification/2025-03-26/basic/lifecycle#version-negotiation)
+- [x] [Capability negotiation](https://modelcontextprotocol.io/specification/2025-03-26/basic/lifecycle#capability-negotiation)
+- [x] [Initialize/initialized lifecycle](https://modelcontextprotocol.io/specification/2025-03-26/basic/lifecycle)
+- [x] [tools/list and tools/call](https://modelcontextprotocol.io/specification/2025-03-26/server/tools)
+- [x] [Tool annotations](https://modelcontextprotocol.io/specification/2025-03-26/server/tools)
+- [x] [Batch requests](https://modelcontextprotocol.io/specification/2025-03-26/basic#batching)
+- [x] [resources/list, resources/read, resources/subscribe](https://modelcontextprotocol.io/specification/2025-03-26/server/resources)
+- [x] [prompts/list, prompts/get](https://modelcontextprotocol.io/specification/2025-03-26/server/prompts)
+- [x] [Elicitation (user input requests)](https://modelcontextprotocol.io/specification/2025-11-25/client/elicitation)
+- [x] [Session management](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#session-management)
+- [x] [Progress notifications](https://modelcontextprotocol.io/specification/2025-03-26/basic/utilities/progress)
+- [x] [Request cancellation](https://modelcontextprotocol.io/specification/2025-03-26/basic/utilities/cancellation)
+- [x] [Completion (autocomplete)](https://modelcontextprotocol.io/specification/2025-03-26/server/utilities/completion)
+- [x] [Roots (filesystem discovery)](https://modelcontextprotocol.io/specification/2025-03-26/client/roots)
+- [x] [Sampling](https://modelcontextprotocol.io/specification/2025-03-26/client/sampling) (stdio transport)
 
 ## Development
 
