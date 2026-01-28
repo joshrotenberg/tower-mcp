@@ -631,7 +631,7 @@ async fn test_error_resources_not_found() {
 
     match resp {
         JsonRpcResponse::Error(e) => {
-            assert_eq!(e.error.code, -32601); // Method not found (resource not found)
+            assert_eq!(e.error.code, -32002); // MCP ResourceNotFound
         }
         JsonRpcResponse::Result(_) => panic!("Expected error for resource not found"),
     }
@@ -843,7 +843,7 @@ async fn test_resources_read_not_found() {
 
     match resp {
         JsonRpcResponse::Error(e) => {
-            assert_eq!(e.error.code, -32601);
+            assert_eq!(e.error.code, -32002); // MCP ResourceNotFound
             assert!(e.error.message.contains("not found"));
         }
         JsonRpcResponse::Result(_) => panic!("Expected error for non-existent resource"),
