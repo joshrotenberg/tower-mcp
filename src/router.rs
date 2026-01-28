@@ -419,6 +419,8 @@ impl McpRouter {
             },
             // Tasks capability is always available
             tasks: Some(TasksCapability::default()),
+            // Completions: for now always None, completion handlers to be added
+            completions: None,
         }
     }
 

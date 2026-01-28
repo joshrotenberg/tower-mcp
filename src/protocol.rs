@@ -568,8 +568,396 @@ pub struct ListRootsResult {
     pub roots: Vec<Root>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct SamplingCapability {}
+
+/// Server capability for providing completions
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct CompletionsCapability {}
+
+// =============================================================================
+// Completion Types
+// =============================================================================
+
+/// Reference to a prompt for completion
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptReference {
+    /// Type discriminator, always "ref/prompt"
+    #[serde(rename = "type")]
+    pub ref_type: String,
+    /// The name of the prompt or prompt template
+    pub name: String,
+}
+
+impl PromptReference {
+    /// Create a new prompt reference
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            ref_type: "ref/prompt".to_string(),
+            name: name.into(),
+        }
+    }
+}
+
+/// Reference to a resource for completion
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceReference {
+    /// Type discriminator, always "ref/resource"
+    #[serde(rename = "type")]
+    pub ref_type: String,
+    /// The URI or URI template of the resource
+    pub uri: String,
+}
+
+impl ResourceReference {
+    /// Create a new resource reference
+    pub fn new(uri: impl Into<String>) -> Self {
+        Self {
+            ref_type: "ref/resource".to_string(),
+            uri: uri.into(),
+        }
+    }
+}
+
+/// Reference for completion - either a prompt or resource reference
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum CompletionReference {
+    /// Reference to a prompt
+    #[serde(rename = "ref/prompt")]
+    Prompt {
+        /// The name of the prompt
+        name: String,
+    },
+    /// Reference to a resource
+    #[serde(rename = "ref/resource")]
+    Resource {
+        /// The URI of the resource
+        uri: String,
+    },
+}
+
+impl CompletionReference {
+    /// Create a prompt reference
+    pub fn prompt(name: impl Into<String>) -> Self {
+        Self::Prompt { name: name.into() }
+    }
+
+    /// Create a resource reference
+    pub fn resource(uri: impl Into<String>) -> Self {
+        Self::Resource { uri: uri.into() }
+    }
+}
+
+/// Argument being completed
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionArgument {
+    /// The name of the argument
+    pub name: String,
+    /// The current value of the argument (partial input)
+    pub value: String,
+}
+
+impl CompletionArgument {
+    /// Create a new completion argument
+    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+        }
+    }
+}
+
+/// Parameters for completion/complete request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompleteParams {
+    /// The reference (prompt or resource) being completed
+    #[serde(rename = "ref")]
+    pub reference: CompletionReference,
+    /// The argument being completed
+    pub argument: CompletionArgument,
+}
+
+/// Completion suggestions
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Completion {
+    /// Suggested completion values
+    pub values: Vec<String>,
+    /// Total number of available completions (if known)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u32>,
+    /// Whether there are more completions available
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_more: Option<bool>,
+}
+
+impl Completion {
+    /// Create a new completion result
+    pub fn new(values: Vec<String>) -> Self {
+        Self {
+            values,
+            total: None,
+            has_more: None,
+        }
+    }
+
+    /// Create a completion result with pagination info
+    pub fn with_pagination(values: Vec<String>, total: u32, has_more: bool) -> Self {
+        Self {
+            values,
+            total: Some(total),
+            has_more: Some(has_more),
+        }
+    }
+}
+
+/// Result of completion/complete request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompleteResult {
+    /// The completion suggestions
+    pub completion: Completion,
+}
+
+impl CompleteResult {
+    /// Create a new completion result
+    pub fn new(values: Vec<String>) -> Self {
+        Self {
+            completion: Completion::new(values),
+        }
+    }
+
+    /// Create a completion result with pagination info
+    pub fn with_pagination(values: Vec<String>, total: u32, has_more: bool) -> Self {
+        Self {
+            completion: Completion::with_pagination(values, total, has_more),
+        }
+    }
+}
+
+// =============================================================================
+// Sampling Types
+// =============================================================================
+
+/// Hint for model selection
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelHint {
+    /// Suggested model name (partial match allowed)
+    pub name: String,
+}
+
+impl ModelHint {
+    /// Create a new model hint
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+}
+
+/// Preferences for model selection during sampling
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelPreferences {
+    /// Priority for response speed (0.0 to 1.0)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed_priority: Option<f64>,
+    /// Priority for model intelligence/capability (0.0 to 1.0)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intelligence_priority: Option<f64>,
+    /// Priority for cost efficiency (0.0 to 1.0)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_priority: Option<f64>,
+    /// Hints for model selection
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hints: Vec<ModelHint>,
+}
+
+impl ModelPreferences {
+    /// Create new model preferences
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set speed priority (0.0 to 1.0)
+    pub fn speed(mut self, priority: f64) -> Self {
+        self.speed_priority = Some(priority.clamp(0.0, 1.0));
+        self
+    }
+
+    /// Set intelligence priority (0.0 to 1.0)
+    pub fn intelligence(mut self, priority: f64) -> Self {
+        self.intelligence_priority = Some(priority.clamp(0.0, 1.0));
+        self
+    }
+
+    /// Set cost priority (0.0 to 1.0)
+    pub fn cost(mut self, priority: f64) -> Self {
+        self.cost_priority = Some(priority.clamp(0.0, 1.0));
+        self
+    }
+
+    /// Add a model hint
+    pub fn hint(mut self, name: impl Into<String>) -> Self {
+        self.hints.push(ModelHint::new(name));
+        self
+    }
+}
+
+/// Context inclusion mode for sampling
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum IncludeContext {
+    /// Include context from all connected MCP servers
+    AllServers,
+    /// Include context from this server only
+    ThisServer,
+    /// Don't include any additional context
+    #[default]
+    None,
+}
+
+/// Message for sampling request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SamplingMessage {
+    /// The role of the message sender
+    pub role: ContentRole,
+    /// The content of the message
+    pub content: SamplingContent,
+}
+
+impl SamplingMessage {
+    /// Create a user message with text content
+    pub fn user(text: impl Into<String>) -> Self {
+        Self {
+            role: ContentRole::User,
+            content: SamplingContent::Text { text: text.into() },
+        }
+    }
+
+    /// Create an assistant message with text content
+    pub fn assistant(text: impl Into<String>) -> Self {
+        Self {
+            role: ContentRole::Assistant,
+            content: SamplingContent::Text { text: text.into() },
+        }
+    }
+}
+
+/// Content types for sampling messages
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum SamplingContent {
+    /// Text content
+    Text {
+        /// The text content
+        text: String,
+    },
+    /// Image content
+    Image {
+        /// Base64-encoded image data
+        data: String,
+        /// MIME type of the image
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
+    /// Audio content (if supported)
+    Audio {
+        /// Base64-encoded audio data
+        data: String,
+        /// MIME type of the audio
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
+}
+
+/// Parameters for sampling/createMessage request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateMessageParams {
+    /// The messages to send to the LLM
+    pub messages: Vec<SamplingMessage>,
+    /// Maximum number of tokens to generate
+    pub max_tokens: u32,
+    /// Optional system prompt
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    /// Sampling temperature (0.0 to 1.0)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    /// Stop sequences
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stop_sequences: Vec<String>,
+    /// Model preferences
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_preferences: Option<ModelPreferences>,
+    /// Context inclusion mode
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_context: Option<IncludeContext>,
+    /// Additional metadata
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Map<String, Value>>,
+}
+
+impl CreateMessageParams {
+    /// Create a new sampling request
+    pub fn new(messages: Vec<SamplingMessage>, max_tokens: u32) -> Self {
+        Self {
+            messages,
+            max_tokens,
+            system_prompt: None,
+            temperature: None,
+            stop_sequences: Vec::new(),
+            model_preferences: None,
+            include_context: None,
+            metadata: None,
+        }
+    }
+
+    /// Set the system prompt
+    pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.system_prompt = Some(prompt.into());
+        self
+    }
+
+    /// Set the temperature
+    pub fn temperature(mut self, temp: f64) -> Self {
+        self.temperature = Some(temp.clamp(0.0, 1.0));
+        self
+    }
+
+    /// Add a stop sequence
+    pub fn stop_sequence(mut self, seq: impl Into<String>) -> Self {
+        self.stop_sequences.push(seq.into());
+        self
+    }
+
+    /// Set model preferences
+    pub fn model_preferences(mut self, prefs: ModelPreferences) -> Self {
+        self.model_preferences = Some(prefs);
+        self
+    }
+
+    /// Set context inclusion mode
+    pub fn include_context(mut self, mode: IncludeContext) -> Self {
+        self.include_context = Some(mode);
+        self
+    }
+}
+
+/// Result of sampling/createMessage request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateMessageResult {
+    /// The generated content
+    pub content: SamplingContent,
+    /// The model that generated the response
+    pub model: String,
+    /// The role of the response (always assistant)
+    pub role: ContentRole,
+    /// Why the generation stopped
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Implementation {
@@ -603,6 +991,9 @@ pub struct ServerCapabilities {
     pub logging: Option<LoggingCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tasks: Option<TasksCapability>,
+    /// Completion capability - server provides autocomplete suggestions
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completions: Option<CompletionsCapability>,
 }
 
 /// Logging capability declaration
@@ -1832,5 +2223,250 @@ mod tests {
 
         let mcp_notif = McpNotification::from_jsonrpc(&notif).unwrap();
         assert!(matches!(mcp_notif, McpNotification::RootsListChanged));
+    }
+
+    // =========================================================================
+    // Completion Tests
+    // =========================================================================
+
+    #[test]
+    fn test_prompt_reference() {
+        let ref_ = PromptReference::new("my-prompt");
+        assert_eq!(ref_.ref_type, "ref/prompt");
+        assert_eq!(ref_.name, "my-prompt");
+
+        let json = serde_json::to_value(&ref_).unwrap();
+        assert_eq!(json["type"], "ref/prompt");
+        assert_eq!(json["name"], "my-prompt");
+    }
+
+    #[test]
+    fn test_resource_reference() {
+        let ref_ = ResourceReference::new("file:///path/to/file");
+        assert_eq!(ref_.ref_type, "ref/resource");
+        assert_eq!(ref_.uri, "file:///path/to/file");
+
+        let json = serde_json::to_value(&ref_).unwrap();
+        assert_eq!(json["type"], "ref/resource");
+        assert_eq!(json["uri"], "file:///path/to/file");
+    }
+
+    #[test]
+    fn test_completion_reference_prompt() {
+        let ref_ = CompletionReference::prompt("test-prompt");
+        let json = serde_json::to_value(&ref_).unwrap();
+        assert_eq!(json["type"], "ref/prompt");
+        assert_eq!(json["name"], "test-prompt");
+    }
+
+    #[test]
+    fn test_completion_reference_resource() {
+        let ref_ = CompletionReference::resource("file:///test");
+        let json = serde_json::to_value(&ref_).unwrap();
+        assert_eq!(json["type"], "ref/resource");
+        assert_eq!(json["uri"], "file:///test");
+    }
+
+    #[test]
+    fn test_completion_argument() {
+        let arg = CompletionArgument::new("query", "SELECT * FROM");
+        assert_eq!(arg.name, "query");
+        assert_eq!(arg.value, "SELECT * FROM");
+    }
+
+    #[test]
+    fn test_complete_params_serialization() {
+        let params = CompleteParams {
+            reference: CompletionReference::prompt("sql-prompt"),
+            argument: CompletionArgument::new("query", "SEL"),
+        };
+
+        let json = serde_json::to_value(&params).unwrap();
+        assert_eq!(json["ref"]["type"], "ref/prompt");
+        assert_eq!(json["ref"]["name"], "sql-prompt");
+        assert_eq!(json["argument"]["name"], "query");
+        assert_eq!(json["argument"]["value"], "SEL");
+    }
+
+    #[test]
+    fn test_completion_new() {
+        let completion = Completion::new(vec!["SELECT".to_string(), "SET".to_string()]);
+        assert_eq!(completion.values.len(), 2);
+        assert!(completion.total.is_none());
+        assert!(completion.has_more.is_none());
+    }
+
+    #[test]
+    fn test_completion_with_pagination() {
+        let completion =
+            Completion::with_pagination(vec!["a".to_string(), "b".to_string()], 100, true);
+        assert_eq!(completion.values.len(), 2);
+        assert_eq!(completion.total, Some(100));
+        assert_eq!(completion.has_more, Some(true));
+    }
+
+    #[test]
+    fn test_complete_result() {
+        let result = CompleteResult::new(vec!["option1".to_string(), "option2".to_string()]);
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(json["completion"]["values"].is_array());
+        assert_eq!(json["completion"]["values"][0], "option1");
+    }
+
+    // =========================================================================
+    // Sampling Tests
+    // =========================================================================
+
+    #[test]
+    fn test_model_hint() {
+        let hint = ModelHint::new("claude-3-opus");
+        assert_eq!(hint.name, "claude-3-opus");
+    }
+
+    #[test]
+    fn test_model_preferences_builder() {
+        let prefs = ModelPreferences::new()
+            .speed(0.8)
+            .intelligence(0.9)
+            .cost(0.5)
+            .hint("gpt-4")
+            .hint("claude-3");
+
+        assert_eq!(prefs.speed_priority, Some(0.8));
+        assert_eq!(prefs.intelligence_priority, Some(0.9));
+        assert_eq!(prefs.cost_priority, Some(0.5));
+        assert_eq!(prefs.hints.len(), 2);
+    }
+
+    #[test]
+    fn test_model_preferences_clamping() {
+        let prefs = ModelPreferences::new().speed(1.5).cost(-0.5);
+
+        assert_eq!(prefs.speed_priority, Some(1.0)); // Clamped to max
+        assert_eq!(prefs.cost_priority, Some(0.0)); // Clamped to min
+    }
+
+    #[test]
+    fn test_include_context_serialization() {
+        assert_eq!(
+            serde_json::to_string(&IncludeContext::AllServers).unwrap(),
+            "\"allServers\""
+        );
+        assert_eq!(
+            serde_json::to_string(&IncludeContext::ThisServer).unwrap(),
+            "\"thisServer\""
+        );
+        assert_eq!(
+            serde_json::to_string(&IncludeContext::None).unwrap(),
+            "\"none\""
+        );
+    }
+
+    #[test]
+    fn test_sampling_message_user() {
+        let msg = SamplingMessage::user("Hello, how are you?");
+        assert_eq!(msg.role, ContentRole::User);
+        assert!(
+            matches!(msg.content, SamplingContent::Text { text } if text == "Hello, how are you?")
+        );
+    }
+
+    #[test]
+    fn test_sampling_message_assistant() {
+        let msg = SamplingMessage::assistant("I'm doing well!");
+        assert_eq!(msg.role, ContentRole::Assistant);
+    }
+
+    #[test]
+    fn test_sampling_content_text_serialization() {
+        let content = SamplingContent::Text {
+            text: "Hello".to_string(),
+        };
+        let json = serde_json::to_value(&content).unwrap();
+        assert_eq!(json["type"], "text");
+        assert_eq!(json["text"], "Hello");
+    }
+
+    #[test]
+    fn test_sampling_content_image_serialization() {
+        let content = SamplingContent::Image {
+            data: "base64data".to_string(),
+            mime_type: "image/png".to_string(),
+        };
+        let json = serde_json::to_value(&content).unwrap();
+        assert_eq!(json["type"], "image");
+        assert_eq!(json["data"], "base64data");
+        assert_eq!(json["mimeType"], "image/png");
+    }
+
+    #[test]
+    fn test_create_message_params() {
+        let params = CreateMessageParams::new(
+            vec![
+                SamplingMessage::user("What is 2+2?"),
+                SamplingMessage::assistant("4"),
+                SamplingMessage::user("And 3+3?"),
+            ],
+            100,
+        )
+        .system_prompt("You are a math tutor")
+        .temperature(0.7)
+        .stop_sequence("END")
+        .include_context(IncludeContext::ThisServer);
+
+        assert_eq!(params.messages.len(), 3);
+        assert_eq!(params.max_tokens, 100);
+        assert_eq!(
+            params.system_prompt.as_deref(),
+            Some("You are a math tutor")
+        );
+        assert_eq!(params.temperature, Some(0.7));
+        assert_eq!(params.stop_sequences.len(), 1);
+        assert_eq!(params.include_context, Some(IncludeContext::ThisServer));
+    }
+
+    #[test]
+    fn test_create_message_params_serialization() {
+        let params = CreateMessageParams::new(vec![SamplingMessage::user("Hello")], 50);
+
+        let json = serde_json::to_value(&params).unwrap();
+        assert!(json["messages"].is_array());
+        assert_eq!(json["maxTokens"], 50);
+    }
+
+    #[test]
+    fn test_create_message_result_deserialization() {
+        let json = serde_json::json!({
+            "content": {
+                "type": "text",
+                "text": "The answer is 42"
+            },
+            "model": "claude-3-opus",
+            "role": "assistant",
+            "stopReason": "end_turn"
+        });
+
+        let result: CreateMessageResult = serde_json::from_value(json).unwrap();
+        assert_eq!(result.model, "claude-3-opus");
+        assert_eq!(result.role, ContentRole::Assistant);
+        assert_eq!(result.stop_reason.as_deref(), Some("end_turn"));
+    }
+
+    #[test]
+    fn test_completions_capability_serialization() {
+        let cap = CompletionsCapability {};
+        let json = serde_json::to_value(&cap).unwrap();
+        assert!(json.is_object());
+    }
+
+    #[test]
+    fn test_server_capabilities_with_completions() {
+        let caps = ServerCapabilities {
+            completions: Some(CompletionsCapability {}),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_value(&caps).unwrap();
+        assert!(json["completions"].is_object());
     }
 }

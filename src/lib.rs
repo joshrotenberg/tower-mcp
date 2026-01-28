@@ -67,12 +67,15 @@ pub use error::{Error, Result, ToolError};
 pub use jsonrpc::JsonRpcService;
 pub use prompt::{Prompt, PromptBuilder, PromptHandler};
 pub use protocol::{
-    CallToolResult, ElicitAction, ElicitFieldValue, ElicitFormParams, ElicitFormSchema, ElicitMode,
-    ElicitRequestParams, ElicitResult, ElicitUrlParams, ElicitationCapability,
-    ElicitationCompleteParams, GetPromptResult, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
-    JsonRpcResponseMessage, ListRootsParams, ListRootsResult, McpRequest, McpResponse,
-    PrimitiveSchemaDefinition, PromptMessage, PromptRole, ReadResourceResult, ResourceContent,
-    Root, RootsCapability,
+    CallToolResult, CompleteParams, CompleteResult, Completion, CompletionArgument,
+    CompletionReference, CompletionsCapability, ContentRole, CreateMessageParams,
+    CreateMessageResult, ElicitAction, ElicitFieldValue, ElicitFormParams, ElicitFormSchema,
+    ElicitMode, ElicitRequestParams, ElicitResult, ElicitUrlParams, ElicitationCapability,
+    ElicitationCompleteParams, GetPromptResult, IncludeContext, JsonRpcMessage, JsonRpcRequest,
+    JsonRpcResponse, JsonRpcResponseMessage, ListRootsParams, ListRootsResult, McpRequest,
+    McpResponse, ModelHint, ModelPreferences, PrimitiveSchemaDefinition, PromptMessage,
+    PromptReference, PromptRole, ReadResourceResult, ResourceContent, ResourceReference, Root,
+    RootsCapability, SamplingCapability, SamplingContent, SamplingMessage,
 };
 pub use resource::{
     Resource, ResourceBuilder, ResourceHandler, ResourceTemplate, ResourceTemplateBuilder,

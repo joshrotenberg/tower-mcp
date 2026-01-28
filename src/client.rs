@@ -40,11 +40,11 @@ use tokio::process::{Child, Command};
 
 use crate::error::{Error, Result};
 use crate::protocol::{
-    CallToolParams, CallToolResult, ClientCapabilities, GetPromptParams, GetPromptResult,
-    Implementation, InitializeParams, InitializeResult, JsonRpcRequest, JsonRpcResponse,
-    ListPromptsParams, ListPromptsResult, ListResourcesParams, ListResourcesResult,
-    ListRootsResult, ListToolsParams, ListToolsResult, ReadResourceParams, ReadResourceResult,
-    Root, RootsCapability, notifications,
+    CallToolParams, CallToolResult, ClientCapabilities, CompleteParams, CompleteResult,
+    CompletionArgument, CompletionReference, GetPromptParams, GetPromptResult, Implementation,
+    InitializeParams, InitializeResult, JsonRpcRequest, JsonRpcResponse, ListPromptsParams,
+    ListPromptsResult, ListResourcesParams, ListResourcesResult, ListRootsResult, ListToolsParams,
+    ListToolsResult, ReadResourceParams, ReadResourceResult, Root, RootsCapability, notifications,
 };
 
 /// Trait for MCP client transports
@@ -270,6 +270,53 @@ impl<T: ClientTransport> McpClient<T> {
     pub async fn ping(&mut self) -> Result<()> {
         let _: serde_json::Value = self.request("ping", &serde_json::json!({})).await?;
         Ok(())
+    }
+
+    /// Request completion suggestions from the server
+    ///
+    /// This is used to get autocomplete suggestions for prompt arguments or resource URIs.
+    pub async fn complete(
+        &mut self,
+        reference: CompletionReference,
+        argument_name: &str,
+        argument_value: &str,
+    ) -> Result<CompleteResult> {
+        self.ensure_initialized()?;
+        let params = CompleteParams {
+            reference,
+            argument: CompletionArgument::new(argument_name, argument_value),
+        };
+        self.request("completion/complete", &params).await
+    }
+
+    /// Request completion for a prompt argument
+    pub async fn complete_prompt_arg(
+        &mut self,
+        prompt_name: &str,
+        argument_name: &str,
+        argument_value: &str,
+    ) -> Result<CompleteResult> {
+        self.complete(
+            CompletionReference::prompt(prompt_name),
+            argument_name,
+            argument_value,
+        )
+        .await
+    }
+
+    /// Request completion for a resource URI
+    pub async fn complete_resource_uri(
+        &mut self,
+        resource_uri: &str,
+        argument_name: &str,
+        argument_value: &str,
+    ) -> Result<CompleteResult> {
+        self.complete(
+            CompletionReference::resource(resource_uri),
+            argument_name,
+            argument_value,
+        )
+        .await
     }
 
     /// Send a raw request
