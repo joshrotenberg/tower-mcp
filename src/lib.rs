@@ -150,7 +150,8 @@ pub use router::{McpRouter, RouterRequest, RouterResponse};
 pub use session::{SessionPhase, SessionState};
 pub use tool::{Tool, ToolBuilder, ToolHandler};
 pub use transport::{
-    BidirectionalStdioTransport, GenericStdioTransport, StdioTransport, SyncStdioTransport,
+    BidirectionalStdioTransport, CatchError, GenericStdioTransport, StdioTransport,
+    SyncStdioTransport,
 };
 
 #[cfg(feature = "http")]

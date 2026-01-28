@@ -214,13 +214,19 @@ impl WebSocketTransport {
     ///
     /// ```rust,no_run
     /// use std::time::Duration;
+    /// use tower::ServiceBuilder;
     /// use tower::timeout::TimeoutLayer;
     /// use tower_mcp::McpRouter;
     /// use tower_mcp::transport::websocket::WebSocketTransport;
     ///
     /// let router = McpRouter::new().server_info("my-server", "1.0.0");
     /// let transport = WebSocketTransport::new(router)
-    ///     .layer(TimeoutLayer::new(Duration::from_secs(30)));
+    ///     .layer(
+    ///         ServiceBuilder::new()
+    ///             .layer(TimeoutLayer::new(Duration::from_secs(30)))
+    ///             .concurrency_limit(10)
+    ///             .into_inner(),
+    ///     );
     /// ```
     pub fn layer<L>(mut self, layer: L) -> Self
     where
