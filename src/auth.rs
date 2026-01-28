@@ -319,7 +319,7 @@ where
         + Send
         + 'static,
     S::Future: Send,
-    S::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send,
+    S::Error: Into<crate::BoxError> + Send,
     V: Validate,
 {
     type Response = axum::response::Response;

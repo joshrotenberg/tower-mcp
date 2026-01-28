@@ -29,6 +29,13 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Type-erased error type used for middleware composition.
+///
+/// This is the standard error type in the tower ecosystem, used by
+/// [`tower`](https://docs.rs/tower), [`tower-http`](https://docs.rs/tower-http),
+/// and other tower-compatible crates.
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
 /// Standard JSON-RPC error codes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
@@ -205,7 +212,7 @@ pub struct ToolError {
     /// Error message
     pub message: String,
     /// Source error if any
-    pub source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    pub source: Option<BoxError>,
 }
 
 impl std::fmt::Display for ToolError {

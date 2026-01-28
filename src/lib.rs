@@ -125,7 +125,7 @@ pub use context::{
     NotificationSender, OutgoingRequest, OutgoingRequestReceiver, OutgoingRequestSender,
     RequestContext, RequestContextBuilder, ServerNotification, outgoing_request_channel,
 };
-pub use error::{Error, Result, ToolError};
+pub use error::{BoxError, Error, Result, ToolError};
 pub use jsonrpc::{JsonRpcLayer, JsonRpcService};
 pub use prompt::{Prompt, PromptBuilder, PromptHandler};
 pub use protocol::{
