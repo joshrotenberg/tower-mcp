@@ -36,12 +36,9 @@
 
 use std::collections::HashSet;
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use tower::Layer;
-use tower_service::Service;
 
 /// Result of an authentication attempt
 #[derive(Debug, Clone)]
@@ -305,6 +302,7 @@ impl<S, V: Clone> Layer<S> for AuthLayer<V> {
 ///     .service(inner_service);
 /// ```
 #[derive(Clone)]
+#[cfg_attr(not(feature = "http"), allow(dead_code))]
 pub struct AuthService<S, V> {
     inner: S,
     validator: V,
@@ -312,10 +310,12 @@ pub struct AuthService<S, V> {
 }
 
 #[cfg(feature = "http")]
-impl<S, V> Service<axum::http::Request<axum::body::Body>> for AuthService<S, V>
+impl<S, V> tower_service::Service<axum::http::Request<axum::body::Body>> for AuthService<S, V>
 where
-    S: Service<axum::http::Request<axum::body::Body>, Response = axum::response::Response>
-        + Clone
+    S: tower_service::Service<
+            axum::http::Request<axum::body::Body>,
+            Response = axum::response::Response,
+        > + Clone
         + Send
         + 'static,
     S::Future: Send,
@@ -324,9 +324,13 @@ where
 {
     type Response = axum::response::Response;
     type Error = S::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future =
+        std::pin::Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
 
@@ -531,9 +535,13 @@ mod tests {
     #[cfg(feature = "http")]
     mod http_tests {
         use super::*;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
         use tower::ServiceExt;
+        use tower_service::Service;
 
         /// A minimal inner service that returns 200 OK for any request
         #[derive(Clone)]
