@@ -54,13 +54,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [features]
 default = []
 # Enable all optional features
-full = ["http", "websocket", "childproc", "oauth"]
+full = ["http", "websocket", "childproc", "oauth", "testing"]
 # Transport features
 http = ["dep:axum", "dep:hyper", "dep:http", "dep:http-body-util", "dep:tokio-stream", "dep:uuid"]
 websocket = ["dep:axum", "dep:uuid"]
 childproc = []
 # OAuth 2.1 resource server support
 oauth = ["dep:jsonwebtoken", "http"]
+# Test utilities for MCP servers
+testing = []
 
 [dependencies.axum]
 version = "0.8"

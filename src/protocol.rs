@@ -1300,6 +1300,39 @@ impl CallToolResult {
             structured_content: None,
         }
     }
+
+    /// Concatenate all text content items into a single string.
+    ///
+    /// Non-text content items are skipped. Multiple text items are
+    /// joined without a separator.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::CallToolResult;
+    ///
+    /// let result = CallToolResult::text("hello world");
+    /// assert_eq!(result.all_text(), "hello world");
+    /// ```
+    pub fn all_text(&self) -> String {
+        self.content.iter().filter_map(|c| c.as_text()).collect()
+    }
+
+    /// Get the text from the first [`Content::Text`] item.
+    ///
+    /// Returns `None` if there are no text content items.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::CallToolResult;
+    ///
+    /// let result = CallToolResult::text("hello");
+    /// assert_eq!(result.first_text(), Some("hello"));
+    /// ```
+    pub fn first_text(&self) -> Option<&str> {
+        self.content.iter().find_map(|c| c.as_text())
+    }
 }
 
 /// Content types for tool results, resources, and prompts.
@@ -1374,6 +1407,27 @@ pub struct ContentAnnotations {
     /// Priority hint from 0 (optional) to 1 (required)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<f64>,
+}
+
+impl Content {
+    /// Extract the text from a [`Content::Text`] variant.
+    ///
+    /// Returns `None` for non-text content variants.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::Content;
+    ///
+    /// let content = Content::Text { text: "hello".into(), annotations: None };
+    /// assert_eq!(content.as_text(), Some("hello"));
+    /// ```
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Content::Text { text, .. } => Some(text),
+            _ => None,
+        }
+    }
 }
 
 /// Role indicating who content is intended for.
@@ -1569,6 +1623,38 @@ impl ReadResourceResult {
                 blob: Some(encoded),
             }],
         }
+    }
+
+    /// Get the text from the first content item.
+    ///
+    /// Returns `None` if there are no contents or the first item has no text.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::ReadResourceResult;
+    ///
+    /// let result = ReadResourceResult::text("file://readme.md", "# Hello");
+    /// assert_eq!(result.first_text(), Some("# Hello"));
+    /// ```
+    pub fn first_text(&self) -> Option<&str> {
+        self.contents.first().and_then(|c| c.text.as_deref())
+    }
+
+    /// Get the URI from the first content item.
+    ///
+    /// Returns `None` if there are no contents.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::ReadResourceResult;
+    ///
+    /// let result = ReadResourceResult::text("file://readme.md", "# Hello");
+    /// assert_eq!(result.first_uri(), Some("file://readme.md"));
+    /// ```
+    pub fn first_uri(&self) -> Option<&str> {
+        self.contents.first().map(|c| c.uri.as_str())
     }
 }
 
@@ -1770,6 +1856,23 @@ impl GetPromptResult {
     /// ```
     pub fn builder() -> GetPromptResultBuilder {
         GetPromptResultBuilder::new()
+    }
+
+    /// Get the text from the first message's content.
+    ///
+    /// Returns `None` if there are no messages or the first message
+    /// does not contain text content.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::GetPromptResult;
+    ///
+    /// let result = GetPromptResult::user_message("Analyze this code.");
+    /// assert_eq!(result.first_message_text(), Some("Analyze this code."));
+    /// ```
+    pub fn first_message_text(&self) -> Option<&str> {
+        self.messages.first().and_then(|m| m.content.as_text())
     }
 }
 
