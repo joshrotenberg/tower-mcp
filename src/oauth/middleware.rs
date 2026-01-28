@@ -21,7 +21,7 @@ use super::token::TokenValidator;
 ///
 /// Applies [`OAuthService`] middleware that extracts and validates bearer
 /// tokens from the `Authorization` header. On successful validation, injects
-/// [`TokenClaims`] into request extensions for downstream handlers.
+/// [`TokenClaims`](super::token::TokenClaims) into request extensions for downstream handlers.
 ///
 /// # Example
 ///
@@ -90,7 +90,7 @@ impl<S, V: TokenValidator> Layer<S> for OAuthLayer<V> {
 /// 2. Extracts the `Authorization: Bearer <token>` header
 /// 3. Validates the token via [`TokenValidator`]
 /// 4. Checks default scope requirements via [`ScopePolicy`]
-/// 5. On success, injects [`TokenClaims`] into request extensions
+/// 5. On success, injects [`TokenClaims`](super::token::TokenClaims) into request extensions
 /// 6. On failure, returns the appropriate HTTP error with `WWW-Authenticate`
 #[derive(Clone)]
 pub struct OAuthService<S, V: TokenValidator> {
