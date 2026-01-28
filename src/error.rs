@@ -281,6 +281,38 @@ impl Error {
     pub fn tool_with_name(tool: impl Into<String>, message: impl Into<String>) -> Self {
         Error::Tool(ToolError::with_tool(tool, message))
     }
+
+    /// Create a tool error from any `Display` type.
+    ///
+    /// This is useful for converting errors in a `map_err` chain:
+    ///
+    /// ```rust
+    /// # use tower_mcp::Error;
+    /// # fn example() -> Result<(), Error> {
+    /// let result: Result<(), std::io::Error> = Err(std::io::Error::other("oops"));
+    /// result.map_err(Error::tool_from)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn tool_from<E: std::fmt::Display>(err: E) -> Self {
+        Error::Tool(ToolError::new(err.to_string()))
+    }
+
+    /// Create a tool error with context prefix.
+    ///
+    /// This is useful for adding context when converting errors:
+    ///
+    /// ```rust
+    /// # use tower_mcp::Error;
+    /// # fn example() -> Result<(), Error> {
+    /// let result: Result<(), std::io::Error> = Err(std::io::Error::other("connection refused"));
+    /// result.map_err(|e| Error::tool_context("API request failed", e))?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn tool_context<E: std::fmt::Display>(context: impl Into<String>, err: E) -> Self {
+        Error::Tool(ToolError::new(format!("{}: {}", context.into(), err)))
+    }
 }
 
 impl From<JsonRpcError> for Error {

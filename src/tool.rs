@@ -265,10 +265,49 @@ impl ToolBuilder {
         self
     }
 
-    /// Specify input type and handler
+    /// Specify input type and handler.
     ///
     /// The input type must implement `JsonSchema` and `DeserializeOwned`.
     /// The handler receives the deserialized input and returns a `CallToolResult`.
+    ///
+    /// # State Sharing
+    ///
+    /// To share state across tool calls (e.g., database connections, API clients),
+    /// wrap your state in an `Arc` and clone it into the async block:
+    ///
+    /// ```rust
+    /// use std::sync::Arc;
+    /// use tower_mcp::{ToolBuilder, CallToolResult};
+    /// use schemars::JsonSchema;
+    /// use serde::Deserialize;
+    ///
+    /// struct AppState {
+    ///     api_key: String,
+    /// }
+    ///
+    /// #[derive(Debug, Deserialize, JsonSchema)]
+    /// struct MyInput {
+    ///     query: String,
+    /// }
+    ///
+    /// let state = Arc::new(AppState { api_key: "secret".to_string() });
+    ///
+    /// let tool = ToolBuilder::new("my_tool")
+    ///     .description("A tool that uses shared state")
+    ///     .handler(move |input: MyInput| {
+    ///         let state = state.clone(); // Clone Arc for the async block
+    ///         async move {
+    ///             // Use state.api_key here...
+    ///             Ok(CallToolResult::text(format!("Query: {}", input.query)))
+    ///         }
+    ///     })
+    ///     .build()
+    ///     .expect("valid tool name");
+    /// ```
+    ///
+    /// The `move` keyword on the closure captures the `Arc<AppState>`, and
+    /// cloning it inside the closure body allows each async invocation to
+    /// have its own reference to the shared state.
     pub fn handler<I, F, Fut>(self, handler: F) -> ToolBuilderWithHandler<I, F>
     where
         I: JsonSchema + DeserializeOwned + Send + Sync + 'static,

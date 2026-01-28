@@ -69,23 +69,26 @@ pub use jsonrpc::JsonRpcService;
 pub use prompt::{Prompt, PromptBuilder, PromptHandler};
 pub use protocol::{
     CallToolResult, CompleteParams, CompleteResult, Completion, CompletionArgument,
-    CompletionReference, CompletionsCapability, ContentRole, CreateMessageParams,
+    CompletionReference, CompletionsCapability, Content, ContentRole, CreateMessageParams,
     CreateMessageResult, ElicitAction, ElicitFieldValue, ElicitFormParams, ElicitFormSchema,
     ElicitMode, ElicitRequestParams, ElicitResult, ElicitUrlParams, ElicitationCapability,
-    ElicitationCompleteParams, GetPromptResult, IncludeContext, JsonRpcMessage, JsonRpcRequest,
-    JsonRpcResponse, JsonRpcResponseMessage, ListRootsParams, ListRootsResult, McpRequest,
-    McpResponse, ModelHint, ModelPreferences, PrimitiveSchemaDefinition, PromptMessage,
-    PromptReference, PromptRole, ReadResourceResult, ResourceContent, ResourceReference, Root,
-    RootsCapability, SamplingCapability, SamplingContent, SamplingMessage,
+    ElicitationCompleteParams, GetPromptResult, GetPromptResultBuilder, IncludeContext,
+    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, JsonRpcResponseMessage, ListRootsParams,
+    ListRootsResult, McpRequest, McpResponse, ModelHint, ModelPreferences,
+    PrimitiveSchemaDefinition, PromptMessage, PromptReference, PromptRole, ReadResourceResult,
+    ResourceContent, ResourceReference, Root, RootsCapability, SamplingCapability, SamplingContent,
+    SamplingMessage,
 };
 pub use resource::{
     Resource, ResourceBuilder, ResourceHandler, ResourceTemplate, ResourceTemplateBuilder,
     ResourceTemplateHandler,
 };
-pub use router::McpRouter;
+pub use router::{McpRouter, RouterRequest, RouterResponse};
 pub use session::{SessionPhase, SessionState};
 pub use tool::{Tool, ToolBuilder, ToolHandler};
-pub use transport::{BidirectionalStdioTransport, StdioTransport, SyncStdioTransport};
+pub use transport::{
+    BidirectionalStdioTransport, GenericStdioTransport, StdioTransport, SyncStdioTransport,
+};
 
 #[cfg(feature = "http")]
 pub use transport::HttpTransport;

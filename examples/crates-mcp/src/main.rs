@@ -144,13 +144,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_wait_duration(Some(Duration::from_millis(args.bulkhead_timeout_ms)))
         .build();
 
+    // Build middleware stack demonstrating tower-resilience integration.
+    // Note: These layers return custom error types (RateLimiterError, BulkheadError)
+    // which need error mapping for use with GenericStdioTransport. For stdio,
+    // we use the router directly. For HTTP/WebSocket transports, middleware
+    // can be applied at the transport layer where error handling is more flexible.
     let _service = ServiceBuilder::new()
         .layer(rate_limiter)
         .layer(bulkhead)
         .service(router.clone());
 
-    // For now, we use the router directly with StdioTransport
-    // The middleware layer would be used with HTTP/WebSocket transports
     match args.transport {
         Transport::Stdio => {
             tracing::info!("Serving over stdio");

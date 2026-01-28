@@ -20,13 +20,15 @@ use crate::context::{
     ChannelClientRequester, ClientRequesterHandle, OutgoingRequest, OutgoingRequestReceiver,
     outgoing_request_channel,
 };
+use tower_service::Service;
+
 use crate::error::{Error, Result};
 use crate::jsonrpc::JsonRpcService;
 use crate::protocol::{
     JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, JsonRpcResponseMessage,
     McpNotification, RequestId,
 };
-use crate::router::McpRouter;
+use crate::router::{McpRouter, RouterRequest, RouterResponse};
 
 // ============================================================================
 // Shared line processing logic
@@ -180,6 +182,189 @@ impl StdioTransport {
         Ok(())
     }
 }
+
+// ============================================================================
+// Generic stdio transport for middleware-wrapped services
+// ============================================================================
+
+/// Generic stdio transport that works with any tower service.
+///
+/// This transport accepts a middleware-wrapped service instead of an `McpRouter`
+/// directly. Use this when you want to apply tower middleware layers like
+/// rate limiting or bulkhead patterns.
+///
+/// # Notification Handling
+///
+/// Unlike [`StdioTransport`], this transport does not handle notifications
+/// (like cancellation) because it doesn't have access to the underlying router.
+/// Notifications are logged at the debug level and ignored.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use tower::ServiceBuilder;
+/// use tower_mcp::{McpRouter, GenericStdioTransport};
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     let router = McpRouter::new()
+///         .server_info("my-server", "1.0.0");
+///
+///     // Apply tower middleware
+///     let service = ServiceBuilder::new()
+///         // .layer(rate_limiter)
+///         // .layer(bulkhead)
+///         .service(router);
+///
+///     let mut transport = GenericStdioTransport::new(service);
+///     transport.run().await?;
+///     Ok(())
+/// }
+/// ```
+pub struct GenericStdioTransport<S>
+where
+    S: Service<RouterRequest, Response = RouterResponse, Error = std::convert::Infallible>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send,
+{
+    service: JsonRpcService<S>,
+}
+
+impl<S> GenericStdioTransport<S>
+where
+    S: Service<RouterRequest, Response = RouterResponse, Error = std::convert::Infallible>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send,
+{
+    /// Create a new generic stdio transport wrapping any compatible service.
+    ///
+    /// The service must implement `Service<RouterRequest, Response = RouterResponse>`.
+    /// This is typically an `McpRouter` wrapped in tower middleware layers.
+    pub fn new(service: S) -> Self {
+        Self {
+            service: JsonRpcService::new(service),
+        }
+    }
+
+    /// Run the transport, processing messages until EOF or error.
+    pub async fn run(&mut self) -> Result<()> {
+        let stdin = tokio::io::stdin();
+        let mut stdout = tokio::io::stdout();
+        let mut reader = BufReader::new(stdin);
+        let mut line = String::new();
+
+        tracing::info!("Generic stdio transport started, waiting for input");
+
+        loop {
+            line.clear();
+            let bytes_read = reader
+                .read_line(&mut line)
+                .await
+                .map_err(|e| Error::Transport(format!("Failed to read from stdin: {}", e)))?;
+
+            if bytes_read == 0 {
+                tracing::info!("Stdin closed, shutting down");
+                break;
+            }
+
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            tracing::debug!(input = %trimmed, "Received message");
+
+            // Check if it's a notification (no id field)
+            let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.write_error(&mut stdout, None, &e.to_string()).await?;
+                    continue;
+                }
+            };
+
+            if parsed.get("id").is_none() {
+                // Notification - log and ignore since we don't have router access
+                tracing::debug!(
+                    method = parsed.get("method").and_then(|m| m.as_str()),
+                    "Received notification (ignored in generic transport)"
+                );
+                continue;
+            }
+
+            // Parse and process as a request (single or batch)
+            let message: JsonRpcMessage = match serde_json::from_str(trimmed) {
+                Ok(m) => m,
+                Err(e) => {
+                    self.write_error(&mut stdout, None, &e.to_string()).await?;
+                    continue;
+                }
+            };
+
+            match self.service.call_message(message).await {
+                Ok(response) => {
+                    let response_json = serde_json::to_string(&response).map_err(|e| {
+                        Error::Transport(format!("Failed to serialize response: {}", e))
+                    })?;
+                    tracing::debug!(output = %response_json, "Sending response");
+                    stdout
+                        .write_all(response_json.as_bytes())
+                        .await
+                        .map_err(|e| {
+                            Error::Transport(format!("Failed to write to stdout: {}", e))
+                        })?;
+                    stdout
+                        .write_all(b"\n")
+                        .await
+                        .map_err(|e| Error::Transport(format!("Failed to write newline: {}", e)))?;
+                    stdout
+                        .flush()
+                        .await
+                        .map_err(|e| Error::Transport(format!("Failed to flush stdout: {}", e)))?;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Error processing message");
+                    self.write_error(&mut stdout, None, &e.to_string()).await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn write_error(
+        &self,
+        stdout: &mut tokio::io::Stdout,
+        id: Option<crate::protocol::RequestId>,
+        message: &str,
+    ) -> Result<()> {
+        let error_response =
+            JsonRpcResponse::error(id, crate::error::JsonRpcError::parse_error(message));
+        let response_json = serde_json::to_string(&error_response)
+            .map_err(|e| Error::Transport(format!("Failed to serialize error: {}", e)))?;
+        stdout
+            .write_all(response_json.as_bytes())
+            .await
+            .map_err(|e| Error::Transport(format!("Failed to write error: {}", e)))?;
+        stdout
+            .write_all(b"\n")
+            .await
+            .map_err(|e| Error::Transport(format!("Failed to write newline: {}", e)))?;
+        stdout
+            .flush()
+            .await
+            .map_err(|e| Error::Transport(format!("Failed to flush stdout: {}", e)))?;
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Synchronous stdio transport
+// ============================================================================
 
 /// Synchronous stdio transport for simpler use cases
 ///
