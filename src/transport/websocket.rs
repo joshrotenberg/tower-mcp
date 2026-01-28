@@ -92,21 +92,37 @@ use crate::protocol::{
     JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpNotification,
     RequestId,
 };
-use crate::router::McpRouter;
+use crate::router::{McpRouter, RouterRequest, RouterResponse};
+use crate::transport::service::{CatchError, McpBoxService, ServiceFactory, identity_factory};
 
 /// Session state for WebSocket transport
-#[derive(Debug)]
 struct Session {
     id: String,
     router: McpRouter,
+    service_factory: ServiceFactory,
 }
 
 impl Session {
-    fn new(router: McpRouter) -> Self {
+    fn new(router: McpRouter, service_factory: ServiceFactory) -> Self {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             router,
+            service_factory,
         }
+    }
+
+    /// Create a middleware-wrapped service from this session's router.
+    fn make_service(&self) -> McpBoxService {
+        (self.service_factory)(self.router.clone())
+    }
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("id", &self.id)
+            .field("router", &self.router)
+            .finish_non_exhaustive()
     }
 }
 
@@ -121,8 +137,8 @@ impl SessionStore {
         Self::default()
     }
 
-    async fn create(&self, router: McpRouter) -> Arc<Session> {
-        let session = Arc::new(Session::new(router));
+    async fn create(&self, router: McpRouter, service_factory: ServiceFactory) -> Arc<Session> {
+        let session = Arc::new(Session::new(router, service_factory));
         let mut sessions = self.sessions.write().await;
         sessions.insert(session.id.clone(), session.clone());
         tracing::debug!(session_id = %session.id, "Created WebSocket session");
@@ -147,6 +163,7 @@ struct PendingRequest {
 /// Shared state for WebSocket transport
 struct AppState {
     router_template: McpRouter,
+    service_factory: ServiceFactory,
     sessions: SessionStore,
     /// Whether sampling is enabled
     sampling_enabled: bool,
@@ -158,6 +175,7 @@ struct AppState {
 pub struct WebSocketTransport {
     router: McpRouter,
     sampling_enabled: bool,
+    service_factory: ServiceFactory,
 }
 
 impl WebSocketTransport {
@@ -166,6 +184,7 @@ impl WebSocketTransport {
         Self {
             router,
             sampling_enabled: false,
+            service_factory: identity_factory(),
         }
     }
 
@@ -177,13 +196,52 @@ impl WebSocketTransport {
         Self {
             router,
             sampling_enabled: true,
+            service_factory: identity_factory(),
         }
+    }
+
+    /// Apply a tower middleware layer to MCP request processing.
+    ///
+    /// The layer is applied to the [`McpRouter`] service within each session,
+    /// wrapping the `Service<RouterRequest>` pipeline. This allows middleware
+    /// like timeouts, rate limiting, or custom instrumentation to be applied
+    /// at the MCP request level.
+    ///
+    /// Middleware errors are automatically converted into JSON-RPC error
+    /// responses, so the transport's error handling remains unchanged.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use std::time::Duration;
+    /// use tower::timeout::TimeoutLayer;
+    /// use tower_mcp::McpRouter;
+    /// use tower_mcp::transport::websocket::WebSocketTransport;
+    ///
+    /// let router = McpRouter::new().server_info("my-server", "1.0.0");
+    /// let transport = WebSocketTransport::new(router)
+    ///     .layer(TimeoutLayer::new(Duration::from_secs(30)));
+    /// ```
+    pub fn layer<L>(mut self, layer: L) -> Self
+    where
+        L: tower::Layer<McpRouter> + Send + Sync + 'static,
+        L::Service:
+            tower::Service<RouterRequest, Response = RouterResponse> + Clone + Send + 'static,
+        <L::Service as tower::Service<RouterRequest>>::Error: std::fmt::Display + Send,
+        <L::Service as tower::Service<RouterRequest>>::Future: Send,
+    {
+        self.service_factory = Arc::new(move |router: McpRouter| {
+            let wrapped = layer.layer(router);
+            tower::util::BoxCloneService::new(CatchError::new(wrapped))
+        });
+        self
     }
 
     /// Build the axum router for this transport
     pub fn into_router(self) -> Router {
         let state = Arc::new(AppState {
             router_template: self.router,
+            service_factory: self.service_factory,
             sessions: SessionStore::new(),
             sampling_enabled: self.sampling_enabled,
         });
@@ -197,6 +255,7 @@ impl WebSocketTransport {
     pub fn into_router_at(self, path: &str) -> Router {
         let state = Arc::new(AppState {
             router_template: self.router,
+            service_factory: self.service_factory,
             sessions: SessionStore::new(),
             sampling_enabled: self.sampling_enabled,
         });
@@ -232,7 +291,10 @@ async fn handle_websocket(State(state): State<Arc<AppState>>, ws: WebSocketUpgra
 
 /// Handle an individual WebSocket connection
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
-    let session = state.sessions.create(state.router_template.clone()).await;
+    let session = state
+        .sessions
+        .create(state.router_template.clone(), state.service_factory.clone())
+        .await;
     let session_id = session.id.clone();
 
     tracing::info!(session_id = %session_id, "WebSocket connection established");
@@ -250,7 +312,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
 /// Handle WebSocket connection without sampling (simple mode)
 async fn handle_socket_simple(socket: WebSocket, session: Arc<Session>, session_id: &str) {
-    let mut service = JsonRpcService::new(session.router.clone());
+    let mut service = JsonRpcService::new(session.make_service());
     let (mut sender, mut receiver) = socket.split();
 
     // Process incoming messages
@@ -342,7 +404,7 @@ async fn handle_socket_bidirectional(socket: WebSocket, session: Arc<Session>, s
         .router
         .clone()
         .with_client_requester(client_requester);
-    let mut service = JsonRpcService::new(router.clone());
+    let mut service = JsonRpcService::new((session.service_factory)(router.clone()));
 
     // Track pending outgoing requests
     let pending_requests: Arc<Mutex<HashMap<RequestId, PendingRequest>>> =
@@ -426,7 +488,7 @@ async fn handle_socket_bidirectional(socket: WebSocket, session: Arc<Session>, s
 /// Handle an incoming WebSocket message (bidirectional mode)
 async fn handle_incoming_message<S>(
     text: &str,
-    service: &mut JsonRpcService<McpRouter>,
+    service: &mut JsonRpcService<McpBoxService>,
     router: &McpRouter,
     pending_requests: Arc<Mutex<HashMap<RequestId, PendingRequest>>>,
     sender: Arc<Mutex<S>>,
@@ -583,7 +645,7 @@ where
 
 /// Process a JSON-RPC message
 async fn process_message(
-    service: &mut JsonRpcService<McpRouter>,
+    service: &mut JsonRpcService<McpBoxService>,
     router: &McpRouter,
     text: &str,
 ) -> Result<Option<crate::protocol::JsonRpcResponseMessage>> {
@@ -621,5 +683,38 @@ mod tests {
     async fn test_websocket_transport_at_path() {
         let transport = WebSocketTransport::new(create_test_router());
         let _router = transport.into_router_at("/mcp");
+    }
+
+    #[tokio::test]
+    async fn test_layer_with_identity() {
+        // Verify that .layer() compiles and produces a working transport
+        let transport = WebSocketTransport::new(create_test_router())
+            .layer(tower::layer::util::Identity::new());
+        let _router = transport.into_router();
+    }
+
+    #[tokio::test]
+    async fn test_layer_with_timeout() {
+        use std::time::Duration;
+        use tower::timeout::TimeoutLayer;
+
+        let transport = WebSocketTransport::new(create_test_router())
+            .layer(TimeoutLayer::new(Duration::from_secs(30)));
+        let _router = transport.into_router();
+    }
+
+    #[tokio::test]
+    async fn test_layer_with_composed_layers() {
+        use std::time::Duration;
+        use tower::ServiceBuilder;
+        use tower::timeout::TimeoutLayer;
+
+        let transport = WebSocketTransport::new(create_test_router()).layer(
+            ServiceBuilder::new()
+                .layer(TimeoutLayer::new(Duration::from_secs(30)))
+                .concurrency_limit(100)
+                .into_inner(),
+        );
+        let _router = transport.into_router();
     }
 }

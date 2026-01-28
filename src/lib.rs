@@ -157,5 +157,8 @@ pub use transport::HttpTransport;
 #[cfg(feature = "websocket")]
 pub use transport::WebSocketTransport;
 
+#[cfg(any(feature = "http", feature = "websocket"))]
+pub use transport::McpBoxService;
+
 #[cfg(feature = "childproc")]
 pub use transport::{ChildProcessConnection, ChildProcessTransport};

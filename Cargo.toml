@@ -48,6 +48,7 @@ base64 = "0.22.1"
 
 [dev-dependencies]
 tokio-test = "0.4"
+tower = { version = "0.5", features = ["util", "timeout", "limit"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [features]
