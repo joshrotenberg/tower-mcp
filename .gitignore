@@ -4,3 +4,4 @@ Cargo.lock
 *.swp
 *.swo
 .tmp/
+CLAUDE.md
