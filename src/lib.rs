@@ -66,9 +66,11 @@ pub use error::{Error, Result, ToolError};
 pub use jsonrpc::JsonRpcService;
 pub use prompt::{Prompt, PromptBuilder, PromptHandler};
 pub use protocol::{
-    CallToolResult, GetPromptResult, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
-    JsonRpcResponseMessage, McpRequest, McpResponse, PromptMessage, PromptRole, ReadResourceResult,
-    ResourceContent,
+    CallToolResult, ElicitAction, ElicitFieldValue, ElicitFormParams, ElicitFormSchema, ElicitMode,
+    ElicitRequestParams, ElicitResult, ElicitUrlParams, ElicitationCapability,
+    ElicitationCompleteParams, GetPromptResult, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
+    JsonRpcResponseMessage, McpRequest, McpResponse, PrimitiveSchemaDefinition, PromptMessage,
+    PromptRole, ReadResourceResult, ResourceContent,
 };
 pub use resource::{
     Resource, ResourceBuilder, ResourceHandler, ResourceTemplate, ResourceTemplateBuilder,
