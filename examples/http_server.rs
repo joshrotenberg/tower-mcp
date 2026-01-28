@@ -44,7 +44,7 @@ struct EchoInput {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), tower_mcp::BoxError> {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(

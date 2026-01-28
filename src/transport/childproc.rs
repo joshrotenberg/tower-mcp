@@ -9,10 +9,11 @@
 //! # Example
 //!
 //! ```rust,no_run
+//! use tower_mcp::BoxError;
 //! use tower_mcp::transport::childproc::ChildProcessTransport;
 //!
 //! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! async fn main() -> Result<(), BoxError> {
 //!     // Spawn an MCP server as a child process
 //!     let mut transport = ChildProcessTransport::new("my-mcp-server")
 //!         .arg("--some-flag")

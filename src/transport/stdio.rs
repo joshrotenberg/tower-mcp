@@ -76,10 +76,10 @@ fn handle_notification(router: &McpRouter, notification: JsonRpcNotification) ->
 /// # Example
 ///
 /// ```rust,no_run
-/// use tower_mcp::{McpRouter, StdioTransport};
+/// use tower_mcp::{BoxError, McpRouter, StdioTransport};
 ///
 /// #[tokio::main]
-/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// async fn main() -> Result<(), BoxError> {
 ///     let router = McpRouter::new()
 ///         .server_info("my-server", "1.0.0");
 ///
@@ -203,10 +203,10 @@ impl StdioTransport {
 ///
 /// ```rust,no_run
 /// use tower::ServiceBuilder;
-/// use tower_mcp::{McpRouter, GenericStdioTransport};
+/// use tower_mcp::{BoxError, McpRouter, GenericStdioTransport};
 ///
 /// #[tokio::main]
-/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// async fn main() -> Result<(), BoxError> {
 ///     let router = McpRouter::new()
 ///         .server_info("my-server", "1.0.0");
 ///
@@ -459,13 +459,13 @@ struct PendingRequest {
 /// # Example
 ///
 /// ```rust,no_run
-/// use tower_mcp::{McpRouter, ToolBuilder, CallToolResult};
+/// use tower_mcp::{BoxError, McpRouter, ToolBuilder, CallToolResult};
 /// use tower_mcp::transport::stdio::BidirectionalStdioTransport;
 /// use tower_mcp::{CreateMessageParams, SamplingMessage};
 /// use tower_mcp::context::RequestContext;
 ///
 /// #[tokio::main]
-/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// async fn main() -> Result<(), BoxError> {
 ///     let tool = ToolBuilder::new("ai-tool")
 ///         .description("A tool that uses LLM")
 ///         .handler_with_context(|ctx: RequestContext, input: serde_json::Value| async move {
