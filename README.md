@@ -56,6 +56,7 @@ tower-mcp = "0.1"
 
 | Feature | Description |
 |---------|-------------|
+| `full` | Enable all optional features |
 | `http` | HTTP transport with SSE support (adds axum, hyper dependencies) |
 | `websocket` | WebSocket transport for full-duplex communication |
 | `childproc` | Child process transport for spawning subprocess MCP servers |
@@ -65,7 +66,7 @@ Example with features:
 
 ```toml
 [dependencies]
-tower-mcp = { version = "0.1", features = ["http", "client"] }
+tower-mcp = { version = "0.1", features = ["full"] }
 ```
 
 ## Quick Start

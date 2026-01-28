@@ -95,6 +95,7 @@
 //!
 //! ## Feature Flags
 //!
+//! - `full` - Enable all optional features
 //! - `http` - HTTP/SSE transport for web servers
 //! - `websocket` - WebSocket transport for bidirectional communication
 //! - `childproc` - Child process transport for subprocess management
