@@ -1,7 +1,11 @@
 //! JSON-RPC 2.0 service layer
 //!
-//! Provides a Tower service that handles JSON-RPC framing for MCP requests.
-//! This layer wraps an MCP router and handles:
+//! Provides a Tower [`Layer`] and [`Service`] for JSON-RPC framing of MCP requests.
+//!
+//! - [`JsonRpcLayer`] - Tower layer for [`ServiceBuilder`](tower::ServiceBuilder) composition
+//! - [`JsonRpcService`] - Tower service wrapping an MCP router
+//!
+//! The service handles:
 //! - Single request processing
 //! - Batch request processing (concurrent execution)
 //! - JSON-RPC version validation
@@ -11,6 +15,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use tower::Layer;
 use tower_service::Service;
 
 use crate::error::{Error, JsonRpcError, Result};
@@ -19,10 +24,51 @@ use crate::protocol::{
 };
 use crate::router::{RouterRequest, RouterResponse};
 
-/// Service that handles JSON-RPC framing
+/// Tower layer that adds JSON-RPC 2.0 framing to an MCP service.
+///
+/// This is the standard way to compose `JsonRpcService` with other tower
+/// middleware via [`ServiceBuilder`](tower::ServiceBuilder).
+///
+/// # Example
+///
+/// ```rust
+/// use tower::ServiceBuilder;
+/// use tower_mcp::{McpRouter, JsonRpcLayer, JsonRpcService};
+///
+/// let router = McpRouter::new().server_info("my-server", "1.0.0");
+///
+/// // Compose with ServiceBuilder
+/// let service = ServiceBuilder::new()
+///     .layer(JsonRpcLayer::new())
+///     .service(router);
+/// ```
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JsonRpcLayer {
+    _priv: (),
+}
+
+impl JsonRpcLayer {
+    /// Create a new `JsonRpcLayer`.
+    pub fn new() -> Self {
+        Self { _priv: () }
+    }
+}
+
+impl<S> Layer<S> for JsonRpcLayer {
+    type Service = JsonRpcService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        JsonRpcService::new(inner)
+    }
+}
+
+/// Service that handles JSON-RPC framing.
 ///
 /// Wraps an MCP service and handles JSON-RPC request/response conversion.
 /// Supports both single requests and batch requests.
+///
+/// Can be created directly via [`JsonRpcService::new`] or through the
+/// [`JsonRpcLayer`] for [`ServiceBuilder`](tower::ServiceBuilder) composition.
 ///
 /// # Example
 ///
@@ -378,5 +424,59 @@ mod tests {
 
         let result = service.call_batch(vec![]).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_jsonrpc_layer() {
+        use tower::ServiceBuilder;
+
+        let router = create_test_router();
+        let router_clone = router.clone();
+
+        // Build service using the layer via ServiceBuilder
+        let mut service = ServiceBuilder::new()
+            .layer(JsonRpcLayer::new())
+            .service(router);
+
+        // Initialize
+        let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": { "name": "test", "version": "1.0" }
+        }));
+        let resp = Service::<JsonRpcRequest>::call(&mut service, init_req)
+            .await
+            .unwrap();
+        assert!(matches!(resp, JsonRpcResponse::Result(_)));
+
+        router_clone.handle_notification(crate::protocol::McpNotification::Initialized);
+
+        // List tools through the layer-composed service
+        let req = JsonRpcRequest::new(2, "tools/list").with_params(serde_json::json!({}));
+        let resp = Service::<JsonRpcRequest>::call(&mut service, req)
+            .await
+            .unwrap();
+
+        match resp {
+            JsonRpcResponse::Result(r) => {
+                let tools = r.result.get("tools").unwrap().as_array().unwrap();
+                assert_eq!(tools.len(), 1);
+            }
+            JsonRpcResponse::Error(e) => panic!("Expected result, got error: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_jsonrpc_layer_default() {
+        // JsonRpcLayer implements Default
+        let _layer = JsonRpcLayer::default();
+    }
+
+    #[test]
+    fn test_jsonrpc_layer_clone() {
+        // JsonRpcLayer implements Clone and Copy
+        let layer = JsonRpcLayer::new();
+        let _cloned = layer;
+        let _copied = layer;
     }
 }

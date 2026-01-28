@@ -126,7 +126,7 @@ pub use context::{
     RequestContext, RequestContextBuilder, ServerNotification, outgoing_request_channel,
 };
 pub use error::{Error, Result, ToolError};
-pub use jsonrpc::JsonRpcService;
+pub use jsonrpc::{JsonRpcLayer, JsonRpcService};
 pub use prompt::{Prompt, PromptBuilder, PromptHandler};
 pub use protocol::{
     CallToolResult, CompleteParams, CompleteResult, Completion, CompletionArgument,
