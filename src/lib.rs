@@ -45,6 +45,7 @@
 pub mod async_task;
 pub mod context;
 pub mod error;
+pub mod jsonrpc;
 pub mod prompt;
 pub mod protocol;
 pub mod resource;
@@ -60,6 +61,7 @@ pub use context::{
     ServerNotification,
 };
 pub use error::{Error, Result, ToolError};
+pub use jsonrpc::JsonRpcService;
 pub use prompt::{Prompt, PromptBuilder, PromptHandler};
 pub use protocol::{
     CallToolResult, GetPromptResult, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
@@ -70,7 +72,7 @@ pub use resource::{
     Resource, ResourceBuilder, ResourceHandler, ResourceTemplate, ResourceTemplateBuilder,
     ResourceTemplateHandler,
 };
-pub use router::{JsonRpcService, McpRouter};
+pub use router::McpRouter;
 pub use session::{SessionPhase, SessionState};
 pub use tool::{Tool, ToolBuilder, ToolHandler};
 pub use transport::{StdioTransport, SyncStdioTransport};

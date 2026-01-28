@@ -53,11 +53,12 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::error::{Error, JsonRpcError, Result};
+use crate::jsonrpc::JsonRpcService;
 use crate::protocol::{
     JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpNotification,
     SUPPORTED_PROTOCOL_VERSIONS,
 };
-use crate::router::{JsonRpcService, McpRouter};
+use crate::router::McpRouter;
 
 /// Header name for MCP session ID
 pub const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";

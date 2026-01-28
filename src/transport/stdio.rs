@@ -8,10 +8,11 @@ use std::io::{self, BufRead, Write};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::error::{Error, Result};
+use crate::jsonrpc::JsonRpcService;
 use crate::protocol::{
     JsonRpcMessage, JsonRpcNotification, JsonRpcResponse, JsonRpcResponseMessage,
 };
-use crate::router::{JsonRpcService, McpRouter};
+use crate::router::McpRouter;
 
 /// Stdio transport for MCP servers
 ///
