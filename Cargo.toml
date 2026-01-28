@@ -9,6 +9,9 @@ repository = "https://github.com/joshrotenberg/tower-mcp"
 keywords = ["mcp", "tower", "json-rpc", "ai", "agents"]
 categories = ["network-programming", "web-programming"]
 
+[workspace]
+members = ["examples/crates-mcp"]
+
 [dependencies]
 # Tower ecosystem
 tower = { version = "0.5", features = ["util"] }
