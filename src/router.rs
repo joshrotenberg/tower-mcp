@@ -784,6 +784,11 @@ impl McpRouter {
                 );
                 // Progress notifications from client are unusual but valid
             }
+            McpNotification::RootsListChanged => {
+                tracing::info!("Client roots list changed");
+                // Server should re-request roots if needed
+                // This is handled by the application layer
+            }
             McpNotification::Unknown { method, .. } => {
                 tracing::debug!(method = %method, "Unknown notification received");
             }

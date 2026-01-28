@@ -185,6 +185,8 @@ pub mod notifications {
     pub const RESOURCE_UPDATED: &str = "notifications/resources/updated";
     /// Prompt list has changed
     pub const PROMPTS_LIST_CHANGED: &str = "notifications/prompts/list_changed";
+    /// Roots list has changed (client to server)
+    pub const ROOTS_LIST_CHANGED: &str = "notifications/roots/list_changed";
     /// Log message notification
     pub const MESSAGE: &str = "notifications/message";
     /// Task status changed
@@ -391,6 +393,8 @@ pub enum McpNotification {
     Cancelled(CancelledParams),
     /// Progress update
     Progress(ProgressParams),
+    /// Roots list has changed (client to server)
+    RootsListChanged,
     /// Unknown notification
     Unknown {
         method: String,
@@ -507,11 +511,61 @@ pub struct ElicitationFormCapability {}
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ElicitationUrlCapability {}
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// Client capability for roots (filesystem access)
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RootsCapability {
+    /// Whether the client supports roots list changed notifications
     #[serde(default)]
     pub list_changed: bool,
+}
+
+/// Represents a root directory or file that the server can operate on
+///
+/// Roots allow clients to expose filesystem roots to servers, enabling:
+/// - Scoped file access
+/// - Workspace awareness
+/// - Security boundaries
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Root {
+    /// The URI identifying the root. Must start with `file://` for now.
+    pub uri: String,
+    /// Optional human-readable name for the root
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl Root {
+    /// Create a new root with just a URI
+    pub fn new(uri: impl Into<String>) -> Self {
+        Self {
+            uri: uri.into(),
+            name: None,
+        }
+    }
+
+    /// Create a new root with a URI and name
+    pub fn with_name(uri: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            uri: uri.into(),
+            name: Some(name.into()),
+        }
+    }
+}
+
+/// Parameters for roots/list request (server to client)
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ListRootsParams {
+    /// Optional metadata
+    #[serde(default, rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<RequestMeta>,
+}
+
+/// Result of roots/list request
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ListRootsResult {
+    /// The list of roots available to the server
+    pub roots: Vec<Root>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1536,6 +1590,7 @@ impl McpNotification {
                 let p: ProgressParams = serde_json::from_value(params)?;
                 Ok(McpNotification::Progress(p))
             }
+            notifications::ROOTS_LIST_CHANGED => Ok(McpNotification::RootsListChanged),
             method => Ok(McpNotification::Unknown {
                 method: method.to_string(),
                 params: notif.params.clone(),
@@ -1689,5 +1744,93 @@ mod tests {
 
         let json = serde_json::to_value(&params).unwrap();
         assert_eq!(json["elicitationId"], "xyz789");
+    }
+
+    #[test]
+    fn test_root_new() {
+        let root = Root::new("file:///home/user/project");
+        assert_eq!(root.uri, "file:///home/user/project");
+        assert!(root.name.is_none());
+    }
+
+    #[test]
+    fn test_root_with_name() {
+        let root = Root::with_name("file:///home/user/project", "My Project");
+        assert_eq!(root.uri, "file:///home/user/project");
+        assert_eq!(root.name.as_deref(), Some("My Project"));
+    }
+
+    #[test]
+    fn test_root_serialization() {
+        let root = Root::with_name("file:///workspace", "Workspace");
+        let json = serde_json::to_value(&root).unwrap();
+        assert_eq!(json["uri"], "file:///workspace");
+        assert_eq!(json["name"], "Workspace");
+    }
+
+    #[test]
+    fn test_root_serialization_without_name() {
+        let root = Root::new("file:///workspace");
+        let json = serde_json::to_value(&root).unwrap();
+        assert_eq!(json["uri"], "file:///workspace");
+        assert!(json.get("name").is_none());
+    }
+
+    #[test]
+    fn test_root_deserialization() {
+        let json = serde_json::json!({
+            "uri": "file:///home/user",
+            "name": "Home"
+        });
+        let root: Root = serde_json::from_value(json).unwrap();
+        assert_eq!(root.uri, "file:///home/user");
+        assert_eq!(root.name.as_deref(), Some("Home"));
+    }
+
+    #[test]
+    fn test_list_roots_result() {
+        let result = ListRootsResult {
+            roots: vec![
+                Root::new("file:///project1"),
+                Root::with_name("file:///project2", "Project 2"),
+            ],
+        };
+
+        let json = serde_json::to_value(&result).unwrap();
+        let roots = json["roots"].as_array().unwrap();
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0]["uri"], "file:///project1");
+        assert_eq!(roots[1]["name"], "Project 2");
+    }
+
+    #[test]
+    fn test_roots_capability_serialization() {
+        let cap = RootsCapability { list_changed: true };
+        let json = serde_json::to_value(&cap).unwrap();
+        assert_eq!(json["listChanged"], true);
+    }
+
+    #[test]
+    fn test_client_capabilities_with_roots() {
+        let caps = ClientCapabilities {
+            roots: Some(RootsCapability { list_changed: true }),
+            sampling: None,
+            elicitation: None,
+        };
+
+        let json = serde_json::to_value(&caps).unwrap();
+        assert_eq!(json["roots"]["listChanged"], true);
+    }
+
+    #[test]
+    fn test_roots_list_changed_notification_parsing() {
+        let notif = JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: notifications::ROOTS_LIST_CHANGED.to_string(),
+            params: None,
+        };
+
+        let mcp_notif = McpNotification::from_jsonrpc(&notif).unwrap();
+        assert!(matches!(mcp_notif, McpNotification::RootsListChanged));
     }
 }

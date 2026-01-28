@@ -43,7 +43,8 @@ use crate::protocol::{
     CallToolParams, CallToolResult, ClientCapabilities, GetPromptParams, GetPromptResult,
     Implementation, InitializeParams, InitializeResult, JsonRpcRequest, JsonRpcResponse,
     ListPromptsParams, ListPromptsResult, ListResourcesParams, ListResourcesResult,
-    ListToolsParams, ListToolsResult, ReadResourceParams, ReadResourceResult,
+    ListRootsResult, ListToolsParams, ListToolsResult, ReadResourceParams, ReadResourceResult,
+    Root, RootsCapability, notifications,
 };
 
 /// Trait for MCP client transports
@@ -71,6 +72,10 @@ pub struct McpClient<T: ClientTransport> {
     transport: T,
     initialized: bool,
     server_info: Option<InitializeResult>,
+    /// Client capabilities to declare during initialization
+    capabilities: ClientCapabilities,
+    /// Roots available to the server
+    roots: Vec<Root>,
 }
 
 impl<T: ClientTransport> McpClient<T> {
@@ -80,6 +85,35 @@ impl<T: ClientTransport> McpClient<T> {
             transport,
             initialized: false,
             server_info: None,
+            capabilities: ClientCapabilities::default(),
+            roots: Vec::new(),
+        }
+    }
+
+    /// Create a new MCP client with roots capability
+    ///
+    /// The client will declare roots support during initialization.
+    pub fn with_roots(transport: T, roots: Vec<Root>) -> Self {
+        Self {
+            transport,
+            initialized: false,
+            server_info: None,
+            capabilities: ClientCapabilities {
+                roots: Some(RootsCapability { list_changed: true }),
+                ..Default::default()
+            },
+            roots,
+        }
+    }
+
+    /// Create a new MCP client with custom capabilities
+    pub fn with_capabilities(transport: T, capabilities: ClientCapabilities) -> Self {
+        Self {
+            transport,
+            initialized: false,
+            server_info: None,
+            capabilities,
+            roots: Vec::new(),
         }
     }
 
@@ -93,6 +127,58 @@ impl<T: ClientTransport> McpClient<T> {
         self.initialized
     }
 
+    /// Get the current roots
+    pub fn roots(&self) -> &[Root] {
+        &self.roots
+    }
+
+    /// Set roots and notify the server if initialized
+    ///
+    /// If the client is already initialized, sends a roots list changed notification.
+    pub async fn set_roots(&mut self, roots: Vec<Root>) -> Result<()> {
+        self.roots = roots;
+        if self.initialized {
+            self.notify_roots_changed().await?;
+        }
+        Ok(())
+    }
+
+    /// Add a root and notify the server if initialized
+    pub async fn add_root(&mut self, root: Root) -> Result<()> {
+        self.roots.push(root);
+        if self.initialized {
+            self.notify_roots_changed().await?;
+        }
+        Ok(())
+    }
+
+    /// Remove a root by URI and notify the server if initialized
+    pub async fn remove_root(&mut self, uri: &str) -> Result<bool> {
+        let initial_len = self.roots.len();
+        self.roots.retain(|r| r.uri != uri);
+        let removed = self.roots.len() < initial_len;
+        if removed && self.initialized {
+            self.notify_roots_changed().await?;
+        }
+        Ok(removed)
+    }
+
+    /// Send roots list changed notification to the server
+    async fn notify_roots_changed(&mut self) -> Result<()> {
+        self.transport
+            .notify(notifications::ROOTS_LIST_CHANGED, serde_json::json!({}))
+            .await
+    }
+
+    /// Get the roots list result (for responding to server's roots/list request)
+    ///
+    /// Returns a result suitable for responding to a roots/list request from the server.
+    pub fn list_roots(&self) -> ListRootsResult {
+        ListRootsResult {
+            roots: self.roots.clone(),
+        }
+    }
+
     /// Initialize the MCP connection
     pub async fn initialize(
         &mut self,
@@ -101,7 +187,7 @@ impl<T: ClientTransport> McpClient<T> {
     ) -> Result<&InitializeResult> {
         let params = InitializeParams {
             protocol_version: crate::protocol::LATEST_PROTOCOL_VERSION.to_string(),
-            capabilities: ClientCapabilities::default(),
+            capabilities: self.capabilities.clone(),
             client_info: Implementation {
                 name: client_name.to_string(),
                 version: client_version.to_string(),
