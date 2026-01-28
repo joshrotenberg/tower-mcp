@@ -888,6 +888,7 @@ mod tests {
                 capabilities: ClientCapabilities {
                     roots: None,
                     sampling: None,
+                    elicitation: None,
                 },
                 client_info: Implementation {
                     name: "test".to_string(),
@@ -1474,6 +1475,7 @@ mod tests {
                 capabilities: ClientCapabilities {
                     roots: None,
                     sampling: None,
+                    elicitation: None,
                 },
                 client_info: Implementation {
                     name: "test".to_string(),
@@ -1582,6 +1584,7 @@ mod tests {
                 capabilities: ClientCapabilities {
                     roots: None,
                     sampling: None,
+                    elicitation: None,
                 },
                 client_info: Implementation {
                     name: "test".to_string(),
@@ -1612,6 +1615,7 @@ mod tests {
                 capabilities: ClientCapabilities {
                     roots: None,
                     sampling: None,
+                    elicitation: None,
                 },
                 client_info: Implementation {
                     name: "test".to_string(),
@@ -2099,6 +2103,7 @@ mod tests {
                 capabilities: ClientCapabilities {
                     roots: None,
                     sampling: None,
+                    elicitation: None,
                 },
                 client_info: Implementation {
                     name: "test".to_string(),

@@ -189,6 +189,8 @@ pub mod notifications {
     pub const MESSAGE: &str = "notifications/message";
     /// Task status changed
     pub const TASK_STATUS_CHANGED: &str = "notifications/tasks/status_changed";
+    /// Elicitation completed (for URL-based elicitation)
+    pub const ELICITATION_COMPLETE: &str = "notifications/elicitation/complete";
 }
 
 /// Log severity levels following RFC 5424 (syslog)
@@ -482,7 +484,28 @@ pub struct ClientCapabilities {
     pub roots: Option<RootsCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sampling: Option<SamplingCapability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elicitation: Option<ElicitationCapability>,
 }
+
+/// Client capability for elicitation (requesting user input)
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ElicitationCapability {
+    /// Support for form-based elicitation
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form: Option<ElicitationFormCapability>,
+    /// Support for URL-based elicitation
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<ElicitationUrlCapability>,
+}
+
+/// Marker for form-based elicitation support
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ElicitationFormCapability {}
+
+/// Marker for URL-based elicitation support
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ElicitationUrlCapability {}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1092,6 +1115,316 @@ pub struct TaskStatusChangedParams {
 }
 
 // =============================================================================
+// Elicitation (server-to-client user input requests)
+// =============================================================================
+
+/// Parameters for form-based elicitation request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ElicitFormParams {
+    /// The elicitation mode
+    pub mode: ElicitMode,
+    /// Message to present to the user explaining what information is needed
+    pub message: String,
+    /// Schema for the form fields (restricted subset of JSON Schema)
+    pub requested_schema: ElicitFormSchema,
+    /// Request metadata including progress token
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<RequestMeta>,
+}
+
+/// Parameters for URL-based elicitation request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ElicitUrlParams {
+    /// The elicitation mode
+    pub mode: ElicitMode,
+    /// Unique ID for this elicitation (opaque to client)
+    pub elicitation_id: String,
+    /// Message explaining why the user needs to navigate to the URL
+    pub message: String,
+    /// The URL the user should navigate to
+    pub url: String,
+    /// Request metadata including progress token
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<RequestMeta>,
+}
+
+/// Elicitation request parameters (union of form and URL modes)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ElicitRequestParams {
+    Form(ElicitFormParams),
+    Url(ElicitUrlParams),
+}
+
+/// Elicitation mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ElicitMode {
+    /// Form-based elicitation with structured input
+    Form,
+    /// URL-based elicitation (out-of-band)
+    Url,
+}
+
+/// Restricted JSON Schema for elicitation forms
+///
+/// Only allows top-level properties with primitive types.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ElicitFormSchema {
+    /// Must be "object"
+    #[serde(rename = "type")]
+    pub schema_type: String,
+    /// Map of property names to their schema definitions
+    pub properties: std::collections::HashMap<String, PrimitiveSchemaDefinition>,
+    /// List of required property names
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required: Vec<String>,
+}
+
+impl ElicitFormSchema {
+    /// Create a new form schema
+    pub fn new() -> Self {
+        Self {
+            schema_type: "object".to_string(),
+            properties: std::collections::HashMap::new(),
+            required: Vec::new(),
+        }
+    }
+
+    /// Add a string field
+    pub fn string_field(mut self, name: &str, description: Option<&str>, required: bool) -> Self {
+        self.properties.insert(
+            name.to_string(),
+            PrimitiveSchemaDefinition::String(StringSchema {
+                schema_type: "string".to_string(),
+                description: description.map(|s| s.to_string()),
+                format: None,
+                min_length: None,
+                max_length: None,
+            }),
+        );
+        if required {
+            self.required.push(name.to_string());
+        }
+        self
+    }
+
+    /// Add a number field
+    pub fn number_field(mut self, name: &str, description: Option<&str>, required: bool) -> Self {
+        self.properties.insert(
+            name.to_string(),
+            PrimitiveSchemaDefinition::Number(NumberSchema {
+                schema_type: "number".to_string(),
+                description: description.map(|s| s.to_string()),
+                minimum: None,
+                maximum: None,
+            }),
+        );
+        if required {
+            self.required.push(name.to_string());
+        }
+        self
+    }
+
+    /// Add a boolean field
+    pub fn boolean_field(mut self, name: &str, description: Option<&str>, required: bool) -> Self {
+        self.properties.insert(
+            name.to_string(),
+            PrimitiveSchemaDefinition::Boolean(BooleanSchema {
+                schema_type: "boolean".to_string(),
+                description: description.map(|s| s.to_string()),
+            }),
+        );
+        if required {
+            self.required.push(name.to_string());
+        }
+        self
+    }
+
+    /// Add a single-select enum field
+    pub fn enum_field(
+        mut self,
+        name: &str,
+        description: Option<&str>,
+        options: Vec<String>,
+        required: bool,
+    ) -> Self {
+        self.properties.insert(
+            name.to_string(),
+            PrimitiveSchemaDefinition::SingleSelectEnum(SingleSelectEnumSchema {
+                schema_type: "string".to_string(),
+                description: description.map(|s| s.to_string()),
+                enum_values: options,
+            }),
+        );
+        if required {
+            self.required.push(name.to_string());
+        }
+        self
+    }
+}
+
+impl Default for ElicitFormSchema {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Primitive schema definition for form fields
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PrimitiveSchemaDefinition {
+    String(StringSchema),
+    Number(NumberSchema),
+    Boolean(BooleanSchema),
+    SingleSelectEnum(SingleSelectEnumSchema),
+    MultiSelectEnum(MultiSelectEnumSchema),
+}
+
+/// String field schema
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StringSchema {
+    #[serde(rename = "type")]
+    pub schema_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_length: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_length: Option<u64>,
+}
+
+/// Number field schema
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NumberSchema {
+    #[serde(rename = "type")]
+    pub schema_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minimum: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maximum: Option<f64>,
+}
+
+/// Boolean field schema
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BooleanSchema {
+    #[serde(rename = "type")]
+    pub schema_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Single-select enum schema
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SingleSelectEnumSchema {
+    #[serde(rename = "type")]
+    pub schema_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(rename = "enum")]
+    pub enum_values: Vec<String>,
+}
+
+/// Multi-select enum schema
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiSelectEnumSchema {
+    #[serde(rename = "type")]
+    pub schema_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub items: MultiSelectEnumItems,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unique_items: Option<bool>,
+}
+
+/// Items definition for multi-select enum
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiSelectEnumItems {
+    #[serde(rename = "type")]
+    pub schema_type: String,
+    #[serde(rename = "enum")]
+    pub enum_values: Vec<String>,
+}
+
+/// User action in response to elicitation
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ElicitAction {
+    /// User submitted the form/confirmed the action
+    Accept,
+    /// User explicitly declined the action
+    Decline,
+    /// User dismissed without making an explicit choice
+    Cancel,
+}
+
+/// Result of an elicitation request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ElicitResult {
+    /// The user's action
+    pub action: ElicitAction,
+    /// Submitted form data (only present when action is Accept and mode was Form)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<std::collections::HashMap<String, ElicitFieldValue>>,
+}
+
+impl ElicitResult {
+    /// Create an accept result with content
+    pub fn accept(content: std::collections::HashMap<String, ElicitFieldValue>) -> Self {
+        Self {
+            action: ElicitAction::Accept,
+            content: Some(content),
+        }
+    }
+
+    /// Create a decline result
+    pub fn decline() -> Self {
+        Self {
+            action: ElicitAction::Decline,
+            content: None,
+        }
+    }
+
+    /// Create a cancel result
+    pub fn cancel() -> Self {
+        Self {
+            action: ElicitAction::Cancel,
+            content: None,
+        }
+    }
+}
+
+/// Value from an elicitation form field
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ElicitFieldValue {
+    String(String),
+    Number(f64),
+    Integer(i64),
+    Boolean(bool),
+    StringArray(Vec<String>),
+}
+
+/// Parameters for elicitation complete notification
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ElicitationCompleteParams {
+    /// The ID of the elicitation that completed
+    pub elicitation_id: String,
+}
+
+// =============================================================================
 // Common
 // =============================================================================
 
@@ -1208,5 +1541,153 @@ impl McpNotification {
                 params: notif.params.clone(),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_elicit_form_schema_builder() {
+        let schema = ElicitFormSchema::new()
+            .string_field("name", Some("Your name"), true)
+            .number_field("age", Some("Your age"), false)
+            .boolean_field("agree", Some("Do you agree?"), true)
+            .enum_field(
+                "color",
+                Some("Favorite color"),
+                vec!["red".to_string(), "green".to_string(), "blue".to_string()],
+                false,
+            );
+
+        assert_eq!(schema.schema_type, "object");
+        assert_eq!(schema.properties.len(), 4);
+        assert_eq!(schema.required.len(), 2);
+        assert!(schema.required.contains(&"name".to_string()));
+        assert!(schema.required.contains(&"agree".to_string()));
+    }
+
+    #[test]
+    fn test_elicit_form_schema_serialization() {
+        let schema = ElicitFormSchema::new().string_field("username", Some("Enter username"), true);
+
+        let json = serde_json::to_value(&schema).unwrap();
+        assert_eq!(json["type"], "object");
+        assert!(json["properties"]["username"]["type"] == "string");
+        assert!(
+            json["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("username"))
+        );
+    }
+
+    #[test]
+    fn test_elicit_result_accept() {
+        let mut content = std::collections::HashMap::new();
+        content.insert(
+            "name".to_string(),
+            ElicitFieldValue::String("Alice".to_string()),
+        );
+        content.insert("age".to_string(), ElicitFieldValue::Integer(30));
+
+        let result = ElicitResult::accept(content);
+        assert_eq!(result.action, ElicitAction::Accept);
+        assert!(result.content.is_some());
+    }
+
+    #[test]
+    fn test_elicit_result_decline() {
+        let result = ElicitResult::decline();
+        assert_eq!(result.action, ElicitAction::Decline);
+        assert!(result.content.is_none());
+    }
+
+    #[test]
+    fn test_elicit_result_cancel() {
+        let result = ElicitResult::cancel();
+        assert_eq!(result.action, ElicitAction::Cancel);
+        assert!(result.content.is_none());
+    }
+
+    #[test]
+    fn test_elicit_mode_serialization() {
+        assert_eq!(
+            serde_json::to_string(&ElicitMode::Form).unwrap(),
+            "\"form\""
+        );
+        assert_eq!(serde_json::to_string(&ElicitMode::Url).unwrap(), "\"url\"");
+    }
+
+    #[test]
+    fn test_elicit_action_serialization() {
+        assert_eq!(
+            serde_json::to_string(&ElicitAction::Accept).unwrap(),
+            "\"accept\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ElicitAction::Decline).unwrap(),
+            "\"decline\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ElicitAction::Cancel).unwrap(),
+            "\"cancel\""
+        );
+    }
+
+    #[test]
+    fn test_elicitation_capability() {
+        let cap = ElicitationCapability {
+            form: Some(ElicitationFormCapability {}),
+            url: None,
+        };
+
+        let json = serde_json::to_value(&cap).unwrap();
+        assert!(json["form"].is_object());
+        assert!(json.get("url").is_none());
+    }
+
+    #[test]
+    fn test_client_capabilities_with_elicitation() {
+        let caps = ClientCapabilities {
+            roots: None,
+            sampling: None,
+            elicitation: Some(ElicitationCapability {
+                form: Some(ElicitationFormCapability {}),
+                url: Some(ElicitationUrlCapability {}),
+            }),
+        };
+
+        let json = serde_json::to_value(&caps).unwrap();
+        assert!(json["elicitation"]["form"].is_object());
+        assert!(json["elicitation"]["url"].is_object());
+    }
+
+    #[test]
+    fn test_elicit_url_params() {
+        let params = ElicitUrlParams {
+            mode: ElicitMode::Url,
+            elicitation_id: "abc123".to_string(),
+            message: "Please authorize".to_string(),
+            url: "https://example.com/auth".to_string(),
+            meta: None,
+        };
+
+        let json = serde_json::to_value(&params).unwrap();
+        assert_eq!(json["mode"], "url");
+        assert_eq!(json["elicitationId"], "abc123");
+        assert_eq!(json["message"], "Please authorize");
+        assert_eq!(json["url"], "https://example.com/auth");
+    }
+
+    #[test]
+    fn test_elicitation_complete_params() {
+        let params = ElicitationCompleteParams {
+            elicitation_id: "xyz789".to_string(),
+        };
+
+        let json = serde_json::to_value(&params).unwrap();
+        assert_eq!(json["elicitationId"], "xyz789");
     }
 }
