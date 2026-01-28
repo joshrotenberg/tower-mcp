@@ -41,6 +41,33 @@
 //!     Ok(CallToolResult::text(format!("Summary: {:?}", result.content)))
 //! }
 //! ```
+//!
+//! # Elicitation (requesting user input)
+//!
+//! ```rust,ignore
+//! use tower_mcp::context::RequestContext;
+//! use tower_mcp::{ElicitFormParams, ElicitFormSchema, ElicitMode, ElicitAction};
+//!
+//! async fn interactive_tool(ctx: RequestContext, input: MyInput) -> Result<CallToolResult> {
+//!     // Request user input via form
+//!     let params = ElicitFormParams {
+//!         mode: ElicitMode::Form,
+//!         message: "Please provide additional details".to_string(),
+//!         requested_schema: ElicitFormSchema::new()
+//!             .string_field("name", Some("Your name"), true)
+//!             .number_field("age", Some("Your age"), false),
+//!         meta: None,
+//!     };
+//!
+//!     let result = ctx.elicit_form(params).await?;
+//!     if result.action == ElicitAction::Accept {
+//!         // Use the form data
+//!         Ok(CallToolResult::text(format!("Got: {:?}", result.content)))
+//!     } else {
+//!         Ok(CallToolResult::text("User declined"))
+//!     }
+//! }
+//! ```
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -50,8 +77,8 @@ use tokio::sync::mpsc;
 
 use crate::error::{Error, Result};
 use crate::protocol::{
-    CreateMessageParams, CreateMessageResult, LoggingMessageParams, ProgressParams, ProgressToken,
-    RequestId,
+    CreateMessageParams, CreateMessageResult, ElicitFormParams, ElicitRequestParams, ElicitResult,
+    ElicitUrlParams, LoggingMessageParams, ProgressParams, ProgressToken, RequestId,
 };
 
 /// A notification to be sent to the client
@@ -88,13 +115,22 @@ pub fn notification_channel(buffer: usize) -> (NotificationSender, NotificationR
 /// Trait for sending requests from server to client
 ///
 /// This enables bidirectional communication where the server can request
-/// actions from the client, such as sampling (LLM requests).
+/// actions from the client, such as sampling (LLM requests) and elicitation
+/// (user input requests).
 #[async_trait]
 pub trait ClientRequester: Send + Sync {
     /// Send a sampling request to the client
     ///
     /// Returns the LLM completion result from the client.
     async fn sample(&self, params: CreateMessageParams) -> Result<CreateMessageResult>;
+
+    /// Send an elicitation request to the client
+    ///
+    /// This requests user input from the client. The request can be either
+    /// form-based (structured input) or URL-based (redirect to external URL).
+    ///
+    /// Returns the elicitation result with the user's action and any submitted data.
+    async fn elicit(&self, params: ElicitRequestParams) -> Result<ElicitResult>;
 }
 
 /// A clonable handle to a client requester
@@ -158,6 +194,33 @@ impl ClientRequester for ChannelClientRequester {
         let request = OutgoingRequest {
             id: id.clone(),
             method: "sampling/createMessage".to_string(),
+            params: params_json,
+            response_tx,
+        };
+
+        self.request_tx
+            .send(request)
+            .await
+            .map_err(|_| Error::Internal("Failed to send request: channel closed".to_string()))?;
+
+        let response = response_rx.await.map_err(|_| {
+            Error::Internal("Failed to receive response: channel closed".to_string())
+        })??;
+
+        serde_json::from_value(response)
+            .map_err(|e| Error::Internal(format!("Failed to deserialize response: {}", e)))
+    }
+
+    async fn elicit(&self, params: ElicitRequestParams) -> Result<ElicitResult> {
+        let id = self.next_request_id();
+        let params_json = serde_json::to_value(&params)
+            .map_err(|e| Error::Internal(format!("Failed to serialize params: {}", e)))?;
+
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        let request = OutgoingRequest {
+            id: id.clone(),
+            method: "elicitation/create".to_string(),
             params: params_json,
             response_tx,
         };
@@ -338,6 +401,91 @@ impl RequestContext {
         })?;
 
         requester.sample(params).await
+    }
+
+    /// Check if elicitation is available
+    ///
+    /// Returns true if a client requester is configured and the transport
+    /// supports bidirectional communication. Note that this only checks if
+    /// the mechanism is available, not whether the client supports elicitation.
+    pub fn can_elicit(&self) -> bool {
+        self.client_requester.is_some()
+    }
+
+    /// Request user input via a form from the client
+    ///
+    /// This sends an `elicitation/create` request to the client with a form schema.
+    /// The client renders the form to the user and returns their response.
+    ///
+    /// Returns an error if elicitation is not available (no client requester configured).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use tower_mcp::{ElicitFormParams, ElicitFormSchema, ElicitMode, ElicitAction};
+    ///
+    /// async fn my_tool(ctx: RequestContext, input: MyInput) -> Result<CallToolResult> {
+    ///     let params = ElicitFormParams {
+    ///         mode: ElicitMode::Form,
+    ///         message: "Please enter your details".to_string(),
+    ///         requested_schema: ElicitFormSchema::new()
+    ///             .string_field("name", Some("Your name"), true),
+    ///         meta: None,
+    ///     };
+    ///
+    ///     let result = ctx.elicit_form(params).await?;
+    ///     match result.action {
+    ///         ElicitAction::Accept => {
+    ///             // Use result.content
+    ///             Ok(CallToolResult::text("Got your input!"))
+    ///         }
+    ///         _ => Ok(CallToolResult::text("User declined"))
+    ///     }
+    /// }
+    /// ```
+    pub async fn elicit_form(&self, params: ElicitFormParams) -> Result<ElicitResult> {
+        let requester = self.client_requester.as_ref().ok_or_else(|| {
+            Error::Internal("Elicitation not available: no client requester configured".to_string())
+        })?;
+
+        requester.elicit(ElicitRequestParams::Form(params)).await
+    }
+
+    /// Request user input via URL redirect from the client
+    ///
+    /// This sends an `elicitation/create` request to the client with a URL.
+    /// The client directs the user to the URL for out-of-band input collection.
+    /// The server receives the result via a callback notification.
+    ///
+    /// Returns an error if elicitation is not available (no client requester configured).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use tower_mcp::{ElicitUrlParams, ElicitMode, ElicitAction};
+    ///
+    /// async fn my_tool(ctx: RequestContext, input: MyInput) -> Result<CallToolResult> {
+    ///     let params = ElicitUrlParams {
+    ///         mode: ElicitMode::Url,
+    ///         elicitation_id: "unique-id-123".to_string(),
+    ///         message: "Please authorize via the link".to_string(),
+    ///         url: "https://example.com/auth?id=unique-id-123".to_string(),
+    ///         meta: None,
+    ///     };
+    ///
+    ///     let result = ctx.elicit_url(params).await?;
+    ///     match result.action {
+    ///         ElicitAction::Accept => Ok(CallToolResult::text("Authorization complete!")),
+    ///         _ => Ok(CallToolResult::text("Authorization cancelled"))
+    ///     }
+    /// }
+    /// ```
+    pub async fn elicit_url(&self, params: ElicitUrlParams) -> Result<ElicitResult> {
+        let requester = self.client_requester.as_ref().ok_or_else(|| {
+            Error::Internal("Elicitation not available: no client requester configured".to_string())
+        })?;
+
+        requester.elicit(ElicitRequestParams::Url(params)).await
     }
 }
 
@@ -525,5 +673,65 @@ mod tests {
             .build();
 
         assert!(ctx.can_sample());
+    }
+
+    #[test]
+    fn test_can_elicit_without_requester() {
+        let ctx = RequestContext::new(RequestId::Number(1));
+        assert!(!ctx.can_elicit());
+    }
+
+    #[test]
+    fn test_can_elicit_with_requester() {
+        let (request_tx, _rx) = outgoing_request_channel(10);
+        let requester: ClientRequesterHandle = Arc::new(ChannelClientRequester::new(request_tx));
+
+        let ctx = RequestContext::new(RequestId::Number(1)).with_client_requester(requester);
+        assert!(ctx.can_elicit());
+    }
+
+    #[tokio::test]
+    async fn test_elicit_form_without_requester_fails() {
+        use crate::protocol::{ElicitFormSchema, ElicitMode};
+
+        let ctx = RequestContext::new(RequestId::Number(1));
+        let params = ElicitFormParams {
+            mode: ElicitMode::Form,
+            message: "Enter details".to_string(),
+            requested_schema: ElicitFormSchema::new().string_field("name", None, true),
+            meta: None,
+        };
+
+        let result = ctx.elicit_form(params).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Elicitation not available")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_elicit_url_without_requester_fails() {
+        use crate::protocol::ElicitMode;
+
+        let ctx = RequestContext::new(RequestId::Number(1));
+        let params = ElicitUrlParams {
+            mode: ElicitMode::Url,
+            elicitation_id: "test-123".to_string(),
+            message: "Please authorize".to_string(),
+            url: "https://example.com/auth".to_string(),
+            meta: None,
+        };
+
+        let result = ctx.elicit_url(params).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Elicitation not available")
+        );
     }
 }
