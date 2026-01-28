@@ -10,9 +10,47 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use crate::error::{Error, Result};
 use crate::jsonrpc::JsonRpcService;
 use crate::protocol::{
-    JsonRpcMessage, JsonRpcNotification, JsonRpcResponse, JsonRpcResponseMessage,
+    JsonRpcMessage, JsonRpcNotification, JsonRpcResponse, JsonRpcResponseMessage, McpNotification,
 };
 use crate::router::McpRouter;
+
+// ============================================================================
+// Shared line processing logic
+// ============================================================================
+
+/// Process a single line of JSON-RPC input
+///
+/// Returns `Ok(Some(response))` for requests, `Ok(None)` for notifications.
+async fn process_line(
+    service: &mut JsonRpcService<McpRouter>,
+    router: &McpRouter,
+    line: &str,
+) -> Result<Option<JsonRpcResponseMessage>> {
+    // Check if it's a notification (no id field)
+    let parsed: serde_json::Value = serde_json::from_str(line)?;
+    if parsed.get("id").is_none()
+        && let Ok(notification) = serde_json::from_str::<JsonRpcNotification>(line)
+    {
+        handle_notification(router, notification)?;
+        return Ok(None);
+    }
+
+    // Parse and process as a request (single or batch)
+    let message: JsonRpcMessage = serde_json::from_str(line)?;
+    let response = service.call_message(message).await?;
+    Ok(Some(response))
+}
+
+/// Handle a JSON-RPC notification
+fn handle_notification(router: &McpRouter, notification: JsonRpcNotification) -> Result<()> {
+    let mcp_notification = McpNotification::from_jsonrpc(&notification)?;
+    router.handle_notification(mcp_notification);
+    Ok(())
+}
+
+// ============================================================================
+// Async stdio transport
+// ============================================================================
 
 /// Stdio transport for MCP servers
 ///
@@ -75,8 +113,7 @@ impl StdioTransport {
 
             tracing::debug!(input = %trimmed, "Received message");
 
-            // Try to parse as a message (single or batch)
-            match self.process_line(trimmed).await {
+            match process_line(&mut self.service, &self.router, trimmed).await {
                 Ok(Some(response)) => {
                     let response_json = serde_json::to_string(&response).map_err(|e| {
                         Error::Transport(format!("Failed to serialize response: {}", e))
@@ -128,30 +165,6 @@ impl StdioTransport {
 
         Ok(())
     }
-
-    /// Process a single line of input
-    async fn process_line(&mut self, line: &str) -> Result<Option<JsonRpcResponseMessage>> {
-        // Check if it's a notification (no id field)
-        let parsed: serde_json::Value = serde_json::from_str(line)?;
-        if parsed.get("id").is_none()
-            && let Ok(notification) = serde_json::from_str::<JsonRpcNotification>(line)
-        {
-            self.handle_notification(notification)?;
-            return Ok(None);
-        }
-
-        // Try to parse as a message (single request or batch)
-        let message: JsonRpcMessage = serde_json::from_str(line)?;
-        let response = self.service.call_message(message).await?;
-        Ok(Some(response))
-    }
-
-    /// Handle a notification
-    fn handle_notification(&mut self, notification: JsonRpcNotification) -> Result<()> {
-        let mcp_notification = crate::protocol::McpNotification::from_jsonrpc(&notification)?;
-        self.router.handle_notification(mcp_notification);
-        Ok(())
-    }
 }
 
 /// Synchronous stdio transport for simpler use cases
@@ -190,7 +203,7 @@ impl SyncStdioTransport {
 
             tracing::debug!(input = %trimmed, "Received message");
 
-            match rt.block_on(self.process_line(trimmed)) {
+            match rt.block_on(process_line(&mut self.service, &self.router, trimmed)) {
                 Ok(Some(response)) => {
                     let response_json = serde_json::to_string(&response).map_err(|e| {
                         Error::Transport(format!("Failed to serialize response: {}", e))
@@ -225,27 +238,6 @@ impl SyncStdioTransport {
         }
 
         tracing::info!("Stdin closed, shutting down");
-        Ok(())
-    }
-
-    async fn process_line(&mut self, line: &str) -> Result<Option<JsonRpcResponseMessage>> {
-        // Check for notification (no id field)
-        let parsed: serde_json::Value = serde_json::from_str(line)?;
-        if parsed.get("id").is_none()
-            && let Ok(notification) = serde_json::from_str::<JsonRpcNotification>(line)
-        {
-            self.handle_notification(notification)?;
-            return Ok(None);
-        }
-
-        let message: JsonRpcMessage = serde_json::from_str(line)?;
-        let response = self.service.call_message(message).await?;
-        Ok(Some(response))
-    }
-
-    fn handle_notification(&mut self, notification: JsonRpcNotification) -> Result<()> {
-        let mcp_notification = crate::protocol::McpNotification::from_jsonrpc(&notification)?;
-        self.router.handle_notification(mcp_notification);
         Ok(())
     }
 }
