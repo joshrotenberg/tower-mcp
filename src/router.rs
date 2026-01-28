@@ -288,6 +288,85 @@ impl McpRouter {
         self
     }
 
+    /// Register multiple tools at once.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::{McpRouter, ToolBuilder, CallToolResult};
+    /// use schemars::JsonSchema;
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Debug, Deserialize, JsonSchema)]
+    /// struct Input { value: String }
+    ///
+    /// let tools = vec![
+    ///     ToolBuilder::new("a")
+    ///         .description("Tool A")
+    ///         .handler(|i: Input| async move { Ok(CallToolResult::text(&i.value)) })
+    ///         .build().unwrap(),
+    ///     ToolBuilder::new("b")
+    ///         .description("Tool B")
+    ///         .handler(|i: Input| async move { Ok(CallToolResult::text(&i.value)) })
+    ///         .build().unwrap(),
+    /// ];
+    ///
+    /// let router = McpRouter::new().tools(tools);
+    /// ```
+    pub fn tools(self, tools: impl IntoIterator<Item = Tool>) -> Self {
+        tools
+            .into_iter()
+            .fold(self, |router, tool| router.tool(tool))
+    }
+
+    /// Register multiple resources at once.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::{McpRouter, ResourceBuilder};
+    ///
+    /// let resources = vec![
+    ///     ResourceBuilder::new("file:///a.txt")
+    ///         .name("File A")
+    ///         .text("contents a"),
+    ///     ResourceBuilder::new("file:///b.txt")
+    ///         .name("File B")
+    ///         .text("contents b"),
+    /// ];
+    ///
+    /// let router = McpRouter::new().resources(resources);
+    /// ```
+    pub fn resources(self, resources: impl IntoIterator<Item = Resource>) -> Self {
+        resources
+            .into_iter()
+            .fold(self, |router, resource| router.resource(resource))
+    }
+
+    /// Register multiple prompts at once.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::{McpRouter, PromptBuilder};
+    ///
+    /// let prompts = vec![
+    ///     PromptBuilder::new("greet")
+    ///         .description("Greet someone")
+    ///         .user_message("Hello!"),
+    ///     PromptBuilder::new("farewell")
+    ///         .description("Say goodbye")
+    ///         .user_message("Goodbye!"),
+    /// ];
+    ///
+    /// let router = McpRouter::new().prompts(prompts);
+    /// ```
+    pub fn prompts(self, prompts: impl IntoIterator<Item = Prompt>) -> Self {
+        prompts
+            .into_iter()
+            .fold(self, |router, prompt| router.prompt(prompt))
+    }
+
     /// Register a completion handler for `completion/complete` requests.
     ///
     /// The handler receives `CompleteParams` containing the reference (prompt or resource)
@@ -1008,6 +1087,10 @@ impl Service<RouterRequest> for McpRouter {
             router.complete_request(&request_id);
             Ok(RouterResponse {
                 id: request_id,
+                // Map tower-mcp errors to JSON-RPC errors:
+                // - Error::JsonRpc: forwarded as-is (preserves original code)
+                // - Error::Tool: mapped to -32603 (Internal Error)
+                // - All others: mapped to -32603 (Internal Error)
                 inner: result.map_err(|e| match e {
                     Error::JsonRpc(err) => err,
                     Error::Tool(err) => JsonRpcError::internal_error(err.to_string()),
