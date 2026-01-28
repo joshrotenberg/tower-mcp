@@ -28,13 +28,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::mpsc;
 
-use crate::protocol::{ProgressParams, ProgressToken, RequestId};
+use crate::protocol::{LoggingMessageParams, ProgressParams, ProgressToken, RequestId};
 
 /// A notification to be sent to the client
 #[derive(Debug, Clone)]
 pub enum ServerNotification {
     /// Progress update for a request
     Progress(ProgressParams),
+    /// Log message notification
+    LogMessage(LoggingMessageParams),
 }
 
 /// Sender for server notifications
@@ -265,6 +267,7 @@ mod tests {
                 assert_eq!(params.total, Some(100.0));
                 assert_eq!(params.message.as_deref(), Some("Halfway"));
             }
+            _ => panic!("Expected Progress notification"),
         }
     }
 

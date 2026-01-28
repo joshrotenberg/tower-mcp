@@ -185,6 +185,91 @@ pub mod notifications {
     pub const RESOURCE_UPDATED: &str = "notifications/resources/updated";
     /// Prompt list has changed
     pub const PROMPTS_LIST_CHANGED: &str = "notifications/prompts/list_changed";
+    /// Log message notification
+    pub const MESSAGE: &str = "notifications/message";
+}
+
+/// Log severity levels following RFC 5424 (syslog)
+///
+/// Levels are ordered from most severe (emergency) to least severe (debug).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    /// System is unusable
+    Emergency,
+    /// Action must be taken immediately
+    Alert,
+    /// Critical conditions
+    Critical,
+    /// Error conditions
+    Error,
+    /// Warning conditions
+    Warning,
+    /// Normal but significant events
+    Notice,
+    /// General informational messages
+    #[default]
+    Info,
+    /// Detailed debugging information
+    Debug,
+}
+
+impl std::fmt::Display for LogLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LogLevel::Emergency => write!(f, "emergency"),
+            LogLevel::Alert => write!(f, "alert"),
+            LogLevel::Critical => write!(f, "critical"),
+            LogLevel::Error => write!(f, "error"),
+            LogLevel::Warning => write!(f, "warning"),
+            LogLevel::Notice => write!(f, "notice"),
+            LogLevel::Info => write!(f, "info"),
+            LogLevel::Debug => write!(f, "debug"),
+        }
+    }
+}
+
+/// Parameters for logging message notification
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoggingMessageParams {
+    /// Severity level of the message
+    pub level: LogLevel,
+    /// Optional logger name (e.g., "database", "auth", "tools")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logger: Option<String>,
+    /// Optional structured data
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+}
+
+impl LoggingMessageParams {
+    /// Create a new logging message with the given level
+    pub fn new(level: LogLevel) -> Self {
+        Self {
+            level,
+            logger: None,
+            data: None,
+        }
+    }
+
+    /// Set the logger name
+    pub fn with_logger(mut self, logger: impl Into<String>) -> Self {
+        self.logger = Some(logger.into());
+        self
+    }
+
+    /// Set the structured data
+    pub fn with_data(mut self, data: Value) -> Self {
+        self.data = Some(data);
+        self
+    }
+}
+
+/// Parameters for setting log level
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetLogLevelParams {
+    /// Minimum log level to receive
+    pub level: LogLevel,
 }
 
 /// Request ID - can be string or number per JSON-RPC spec
@@ -404,7 +489,14 @@ pub struct ServerCapabilities {
     pub resources: Option<ResourcesCapability>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompts: Option<PromptsCapability>,
+    /// Logging capability - servers that emit log notifications declare this
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logging: Option<LoggingCapability>,
 }
+
+/// Logging capability declaration
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LoggingCapability {}
 
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]

@@ -11,7 +11,7 @@ use std::task::{Context, Poll};
 
 use tower_service::Service;
 
-use crate::context::{CancellationToken, NotificationSender, RequestContext};
+use crate::context::{CancellationToken, NotificationSender, RequestContext, ServerNotification};
 use crate::error::{Error, JsonRpcError, Result};
 use crate::prompt::Prompt;
 use crate::protocol::*;
@@ -203,6 +203,70 @@ impl McpRouter {
         &self.session
     }
 
+    /// Send a log message notification to the client
+    ///
+    /// This sends a `notifications/message` notification with the given parameters.
+    /// Returns `true` if the notification was sent, `false` if no notification channel
+    /// is configured.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use tower_mcp::protocol::{LogLevel, LoggingMessageParams};
+    ///
+    /// // Simple info message
+    /// router.log(LoggingMessageParams::new(LogLevel::Info).with_data(
+    ///     serde_json::json!({"message": "Operation completed"})
+    /// ));
+    ///
+    /// // Error with logger name
+    /// router.log(LoggingMessageParams::new(LogLevel::Error)
+    ///     .with_logger("database")
+    ///     .with_data(serde_json::json!({"error": "Connection failed"})));
+    /// ```
+    pub fn log(&self, params: LoggingMessageParams) -> bool {
+        if let Some(tx) = &self.inner.notification_tx
+            && tx.try_send(ServerNotification::LogMessage(params)).is_ok()
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Send an info-level log message
+    ///
+    /// Convenience method for sending an info log with optional data.
+    pub fn log_info(&self, message: &str) -> bool {
+        self.log(
+            LoggingMessageParams::new(LogLevel::Info)
+                .with_data(serde_json::json!({ "message": message })),
+        )
+    }
+
+    /// Send a warning-level log message
+    pub fn log_warning(&self, message: &str) -> bool {
+        self.log(
+            LoggingMessageParams::new(LogLevel::Warning)
+                .with_data(serde_json::json!({ "message": message })),
+        )
+    }
+
+    /// Send an error-level log message
+    pub fn log_error(&self, message: &str) -> bool {
+        self.log(
+            LoggingMessageParams::new(LogLevel::Error)
+                .with_data(serde_json::json!({ "message": message })),
+        )
+    }
+
+    /// Send a debug-level log message
+    pub fn log_debug(&self, message: &str) -> bool {
+        self.log(
+            LoggingMessageParams::new(LogLevel::Debug)
+                .with_data(serde_json::json!({ "message": message })),
+        )
+    }
+
     /// Get server capabilities based on registered handlers
     fn capabilities(&self) -> ServerCapabilities {
         ServerCapabilities {
@@ -220,6 +284,12 @@ impl McpRouter {
                 None
             } else {
                 Some(PromptsCapability::default())
+            },
+            // Always advertise logging capability when notification channel is configured
+            logging: if self.inner.notification_tx.is_some() {
+                Some(LoggingCapability::default())
+            } else {
+                None
             },
         }
     }
@@ -955,5 +1025,143 @@ mod tests {
 
         let result = service.call_batch(vec![]).await;
         assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // Logging Notification Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_log_sends_notification() {
+        use crate::context::notification_channel;
+
+        let (tx, mut rx) = notification_channel(10);
+        let router = McpRouter::new().with_notification_sender(tx);
+
+        // Send an info log
+        let sent = router.log_info("Test message");
+        assert!(sent);
+
+        // Should receive the notification
+        let notification = rx.try_recv().unwrap();
+        match notification {
+            ServerNotification::LogMessage(params) => {
+                assert_eq!(params.level, LogLevel::Info);
+                let data = params.data.unwrap();
+                assert_eq!(
+                    data.get("message").unwrap().as_str().unwrap(),
+                    "Test message"
+                );
+            }
+            _ => panic!("Expected LogMessage notification"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_log_with_custom_params() {
+        use crate::context::notification_channel;
+
+        let (tx, mut rx) = notification_channel(10);
+        let router = McpRouter::new().with_notification_sender(tx);
+
+        // Send a custom log message
+        let params = LoggingMessageParams::new(LogLevel::Error)
+            .with_logger("database")
+            .with_data(serde_json::json!({
+                "error": "Connection failed",
+                "host": "localhost"
+            }));
+
+        let sent = router.log(params);
+        assert!(sent);
+
+        let notification = rx.try_recv().unwrap();
+        match notification {
+            ServerNotification::LogMessage(params) => {
+                assert_eq!(params.level, LogLevel::Error);
+                assert_eq!(params.logger.as_deref(), Some("database"));
+                let data = params.data.unwrap();
+                assert_eq!(
+                    data.get("error").unwrap().as_str().unwrap(),
+                    "Connection failed"
+                );
+            }
+            _ => panic!("Expected LogMessage notification"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_log_without_channel_returns_false() {
+        // Router without notification channel
+        let router = McpRouter::new();
+
+        // Should return false when no channel configured
+        assert!(!router.log_info("Test"));
+        assert!(!router.log_warning("Test"));
+        assert!(!router.log_error("Test"));
+        assert!(!router.log_debug("Test"));
+    }
+
+    #[tokio::test]
+    async fn test_logging_capability_with_channel() {
+        use crate::context::notification_channel;
+
+        let (tx, _rx) = notification_channel(10);
+        let mut router = McpRouter::new().with_notification_sender(tx);
+
+        // Initialize and check capabilities
+        let init_req = RouterRequest {
+            id: RequestId::Number(0),
+            inner: McpRequest::Initialize(InitializeParams {
+                protocol_version: "2025-03-26".to_string(),
+                capabilities: ClientCapabilities {
+                    roots: None,
+                    sampling: None,
+                },
+                client_info: Implementation {
+                    name: "test".to_string(),
+                    version: "1.0".to_string(),
+                },
+            }),
+        };
+        let resp = router.ready().await.unwrap().call(init_req).await.unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::Initialize(result)) => {
+                // Should have logging capability when notification channel is set
+                assert!(result.capabilities.logging.is_some());
+            }
+            _ => panic!("Expected Initialize response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_no_logging_capability_without_channel() {
+        let mut router = McpRouter::new();
+
+        // Initialize and check capabilities
+        let init_req = RouterRequest {
+            id: RequestId::Number(0),
+            inner: McpRequest::Initialize(InitializeParams {
+                protocol_version: "2025-03-26".to_string(),
+                capabilities: ClientCapabilities {
+                    roots: None,
+                    sampling: None,
+                },
+                client_info: Implementation {
+                    name: "test".to_string(),
+                    version: "1.0".to_string(),
+                },
+            }),
+        };
+        let resp = router.ready().await.unwrap().call(init_req).await.unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::Initialize(result)) => {
+                // Should NOT have logging capability without notification channel
+                assert!(result.capabilities.logging.is_none());
+            }
+            _ => panic!("Expected Initialize response"),
+        }
     }
 }
