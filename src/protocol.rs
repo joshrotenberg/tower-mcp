@@ -1228,6 +1228,45 @@ impl CallToolResult {
         }
     }
 
+    /// Create a JSON result from any serializable value.
+    ///
+    /// This is a fallible alternative to [`json`](Self::json) that accepts any
+    /// `serde::Serialize` type and handles serialization errors gracefully.
+    /// The value is serialized to a `serde_json::Value`, then delegated to `json()`,
+    /// so `structured_content` is populated correctly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the value cannot be serialized to JSON.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::CallToolResult;
+    /// use serde::Serialize;
+    ///
+    /// #[derive(Serialize)]
+    /// struct SearchResult {
+    ///     title: String,
+    ///     score: f64,
+    /// }
+    ///
+    /// let result = SearchResult {
+    ///     title: "Example".to_string(),
+    ///     score: 0.95,
+    /// };
+    /// let tool_result = CallToolResult::from_serialize(&result).unwrap();
+    /// assert!(!tool_result.is_error);
+    /// assert!(tool_result.structured_content.is_some());
+    /// ```
+    pub fn from_serialize(
+        value: &impl serde::Serialize,
+    ) -> std::result::Result<Self, crate::error::Error> {
+        let json_value = serde_json::to_value(value)
+            .map_err(|e| crate::error::Error::tool(format!("Serialization failed: {}", e)))?;
+        Ok(Self::json(json_value))
+    }
+
     /// Create a result with an image
     pub fn image(data: impl Into<String>, mime_type: impl Into<String>) -> Self {
         Self {
