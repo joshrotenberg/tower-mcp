@@ -276,6 +276,11 @@ pub enum Error {
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 
+    /// A tool execution error.
+    ///
+    /// When returned from a tool handler, this variant is mapped to JSON-RPC
+    /// error code `-32603` (Internal Error) in the router's `Service::call`
+    /// implementation. The `ToolError` message becomes the JSON-RPC error message.
     #[error("{0}")]
     Tool(#[from] ToolError),
 
@@ -327,6 +332,30 @@ impl Error {
     /// ```
     pub fn tool_context<E: std::fmt::Display>(context: impl Into<String>, err: E) -> Self {
         Error::Tool(ToolError::new(format!("{}: {}", context.into(), err)))
+    }
+
+    /// Create a JSON-RPC "Invalid params" error (`-32602`).
+    ///
+    /// Shorthand for `Error::JsonRpc(JsonRpcError::invalid_params(msg))`.
+    ///
+    /// ```rust
+    /// # use tower_mcp::Error;
+    /// let err = Error::invalid_params("missing required field 'name'");
+    /// ```
+    pub fn invalid_params(message: impl Into<String>) -> Self {
+        Error::JsonRpc(JsonRpcError::invalid_params(message))
+    }
+
+    /// Create a JSON-RPC "Internal error" error (`-32603`).
+    ///
+    /// Shorthand for `Error::JsonRpc(JsonRpcError::internal_error(msg))`.
+    ///
+    /// ```rust
+    /// # use tower_mcp::Error;
+    /// let err = Error::internal("unexpected state");
+    /// ```
+    pub fn internal(message: impl Into<String>) -> Self {
+        Error::JsonRpc(JsonRpcError::internal_error(message))
     }
 }
 
