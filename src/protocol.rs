@@ -629,6 +629,9 @@ pub struct CallToolParams {
     pub name: String,
     #[serde(default)]
     pub arguments: Value,
+    /// Request metadata including progress token
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<RequestMeta>,
 }
 
 #[derive(Debug, Clone, Serialize)]
