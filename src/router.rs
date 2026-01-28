@@ -3,7 +3,7 @@
 //! The router implements Tower's `Service` trait, making it composable with
 //! standard tower middleware.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
@@ -80,6 +80,8 @@ struct McpRouterInner {
     notification_tx: Option<NotificationSender>,
     /// Task store for async operations
     task_store: TaskStore,
+    /// Subscribed resource URIs
+    subscriptions: Arc<RwLock<HashSet<String>>>,
 }
 
 impl McpRouter {
@@ -97,6 +99,7 @@ impl McpRouter {
                 in_flight: Arc::new(RwLock::new(HashMap::new())),
                 notification_tx: None,
                 task_store: TaskStore::new(),
+                subscriptions: Arc::new(RwLock::new(HashSet::new())),
             }),
             session: SessionState::new(),
         }
@@ -316,6 +319,74 @@ impl McpRouter {
         )
     }
 
+    /// Check if a resource URI is currently subscribed
+    pub fn is_subscribed(&self, uri: &str) -> bool {
+        if let Ok(subs) = self.inner.subscriptions.read() {
+            return subs.contains(uri);
+        }
+        false
+    }
+
+    /// Get a list of all subscribed resource URIs
+    pub fn subscribed_uris(&self) -> Vec<String> {
+        if let Ok(subs) = self.inner.subscriptions.read() {
+            return subs.iter().cloned().collect();
+        }
+        Vec::new()
+    }
+
+    /// Subscribe to a resource URI
+    fn subscribe(&self, uri: &str) -> bool {
+        if let Ok(mut subs) = self.inner.subscriptions.write() {
+            return subs.insert(uri.to_string());
+        }
+        false
+    }
+
+    /// Unsubscribe from a resource URI
+    fn unsubscribe(&self, uri: &str) -> bool {
+        if let Ok(mut subs) = self.inner.subscriptions.write() {
+            return subs.remove(uri);
+        }
+        false
+    }
+
+    /// Notify clients that a subscribed resource has been updated
+    ///
+    /// Only sends the notification if the resource is currently subscribed.
+    /// Returns `true` if the notification was sent.
+    pub fn notify_resource_updated(&self, uri: &str) -> bool {
+        // Only notify if the resource is subscribed
+        if !self.is_subscribed(uri) {
+            return false;
+        }
+
+        if let Some(tx) = &self.inner.notification_tx
+            && tx
+                .try_send(ServerNotification::ResourceUpdated {
+                    uri: uri.to_string(),
+                })
+                .is_ok()
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Notify clients that the list of available resources has changed
+    ///
+    /// Returns `true` if the notification was sent.
+    pub fn notify_resources_list_changed(&self) -> bool {
+        if let Some(tx) = &self.inner.notification_tx
+            && tx
+                .try_send(ServerNotification::ResourcesListChanged)
+                .is_ok()
+        {
+            return true;
+        }
+        false
+    }
+
     /// Get server capabilities based on registered handlers
     fn capabilities(&self) -> ServerCapabilities {
         let has_resources =
@@ -328,7 +399,10 @@ impl McpRouter {
                 Some(ToolsCapability::default())
             },
             resources: if has_resources {
-                Some(ResourcesCapability::default())
+                Some(ResourcesCapability {
+                    subscribe: true,
+                    ..Default::default()
+                })
             } else {
                 None
             },
@@ -483,19 +557,33 @@ impl McpRouter {
             }
 
             McpRequest::SubscribeResource(params) => {
-                // Resource subscriptions not yet implemented
-                Err(Error::JsonRpc(JsonRpcError::method_not_found(&format!(
-                    "Resource subscription not supported: {}",
-                    params.uri
-                ))))
+                // Verify the resource exists
+                if !self.inner.resources.contains_key(&params.uri) {
+                    return Err(Error::JsonRpc(JsonRpcError::invalid_params(format!(
+                        "Resource not found: {}",
+                        params.uri
+                    ))));
+                }
+
+                tracing::debug!(uri = %params.uri, "Subscribing to resource");
+                self.subscribe(&params.uri);
+
+                Ok(McpResponse::SubscribeResource(EmptyResult {}))
             }
 
             McpRequest::UnsubscribeResource(params) => {
-                // Resource subscriptions not yet implemented
-                Err(Error::JsonRpc(JsonRpcError::method_not_found(&format!(
-                    "Resource subscription not supported: {}",
-                    params.uri
-                ))))
+                // Verify the resource exists
+                if !self.inner.resources.contains_key(&params.uri) {
+                    return Err(Error::JsonRpc(JsonRpcError::invalid_params(format!(
+                        "Resource not found: {}",
+                        params.uri
+                    ))));
+                }
+
+                tracing::debug!(uri = %params.uri, "Unsubscribing from resource");
+                self.unsubscribe(&params.uri);
+
+                Ok(McpResponse::UnsubscribeResource(EmptyResult {}))
             }
 
             McpRequest::ListPrompts(_params) => {
@@ -1858,6 +1946,231 @@ mod tests {
                 assert!(e.message.contains("not found"));
             }
             _ => panic!("Expected error response"),
+        }
+    }
+
+    // =========================================================================
+    // Resource Subscription Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_subscribe_to_resource() {
+        use crate::resource::ResourceBuilder;
+
+        let resource = ResourceBuilder::new("file:///test.txt")
+            .name("Test File")
+            .text("Hello");
+
+        let mut router = McpRouter::new().resource(resource);
+        init_router(&mut router).await;
+
+        // Subscribe to the resource
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::SubscribeResource(SubscribeResourceParams {
+                uri: "file:///test.txt".to_string(),
+            }),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::SubscribeResource(_)) => {
+                // Should be subscribed now
+                assert!(router.is_subscribed("file:///test.txt"));
+            }
+            _ => panic!("Expected SubscribeResource response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unsubscribe_from_resource() {
+        use crate::resource::ResourceBuilder;
+
+        let resource = ResourceBuilder::new("file:///test.txt")
+            .name("Test File")
+            .text("Hello");
+
+        let mut router = McpRouter::new().resource(resource);
+        init_router(&mut router).await;
+
+        // Subscribe first
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::SubscribeResource(SubscribeResourceParams {
+                uri: "file:///test.txt".to_string(),
+            }),
+        };
+        let _ = router.ready().await.unwrap().call(req).await.unwrap();
+        assert!(router.is_subscribed("file:///test.txt"));
+
+        // Now unsubscribe
+        let req = RouterRequest {
+            id: RequestId::Number(2),
+            inner: McpRequest::UnsubscribeResource(UnsubscribeResourceParams {
+                uri: "file:///test.txt".to_string(),
+            }),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::UnsubscribeResource(_)) => {
+                // Should no longer be subscribed
+                assert!(!router.is_subscribed("file:///test.txt"));
+            }
+            _ => panic!("Expected UnsubscribeResource response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_nonexistent_resource() {
+        let mut router = McpRouter::new();
+        init_router(&mut router).await;
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::SubscribeResource(SubscribeResourceParams {
+                uri: "file:///nonexistent.txt".to_string(),
+            }),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        match resp.inner {
+            Err(e) => {
+                assert!(e.message.contains("not found"));
+            }
+            _ => panic!("Expected error response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_notify_resource_updated() {
+        use crate::context::notification_channel;
+        use crate::resource::ResourceBuilder;
+
+        let (tx, mut rx) = notification_channel(10);
+
+        let resource = ResourceBuilder::new("file:///test.txt")
+            .name("Test File")
+            .text("Hello");
+
+        let router = McpRouter::new()
+            .resource(resource)
+            .with_notification_sender(tx);
+
+        // First, manually subscribe (simulate subscription)
+        router.subscribe("file:///test.txt");
+
+        // Now notify
+        let sent = router.notify_resource_updated("file:///test.txt");
+        assert!(sent);
+
+        // Check the notification was sent
+        let notification = rx.try_recv().unwrap();
+        match notification {
+            ServerNotification::ResourceUpdated { uri } => {
+                assert_eq!(uri, "file:///test.txt");
+            }
+            _ => panic!("Expected ResourceUpdated notification"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_notify_resource_updated_not_subscribed() {
+        use crate::context::notification_channel;
+        use crate::resource::ResourceBuilder;
+
+        let (tx, mut rx) = notification_channel(10);
+
+        let resource = ResourceBuilder::new("file:///test.txt")
+            .name("Test File")
+            .text("Hello");
+
+        let router = McpRouter::new()
+            .resource(resource)
+            .with_notification_sender(tx);
+
+        // Try to notify without subscribing
+        let sent = router.notify_resource_updated("file:///test.txt");
+        assert!(!sent); // Should not send because not subscribed
+
+        // Channel should be empty
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_notify_resources_list_changed() {
+        use crate::context::notification_channel;
+
+        let (tx, mut rx) = notification_channel(10);
+        let router = McpRouter::new().with_notification_sender(tx);
+
+        let sent = router.notify_resources_list_changed();
+        assert!(sent);
+
+        let notification = rx.try_recv().unwrap();
+        match notification {
+            ServerNotification::ResourcesListChanged => {}
+            _ => panic!("Expected ResourcesListChanged notification"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_subscribed_uris() {
+        use crate::resource::ResourceBuilder;
+
+        let resource1 = ResourceBuilder::new("file:///a.txt").name("A").text("A");
+
+        let resource2 = ResourceBuilder::new("file:///b.txt").name("B").text("B");
+
+        let router = McpRouter::new().resource(resource1).resource(resource2);
+
+        // Subscribe to both
+        router.subscribe("file:///a.txt");
+        router.subscribe("file:///b.txt");
+
+        let uris = router.subscribed_uris();
+        assert_eq!(uris.len(), 2);
+        assert!(uris.contains(&"file:///a.txt".to_string()));
+        assert!(uris.contains(&"file:///b.txt".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_subscription_capability_advertised() {
+        use crate::resource::ResourceBuilder;
+
+        let resource = ResourceBuilder::new("file:///test.txt")
+            .name("Test")
+            .text("Hello");
+
+        let mut router = McpRouter::new().resource(resource);
+
+        // Initialize and check capabilities
+        let init_req = RouterRequest {
+            id: RequestId::Number(0),
+            inner: McpRequest::Initialize(InitializeParams {
+                protocol_version: "2025-03-26".to_string(),
+                capabilities: ClientCapabilities {
+                    roots: None,
+                    sampling: None,
+                },
+                client_info: Implementation {
+                    name: "test".to_string(),
+                    version: "1.0".to_string(),
+                },
+            }),
+        };
+        let resp = router.ready().await.unwrap().call(init_req).await.unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::Initialize(result)) => {
+                // Should have resources capability with subscribe enabled
+                let resources_cap = result.capabilities.resources.unwrap();
+                assert!(resources_cap.subscribe);
+            }
+            _ => panic!("Expected Initialize response"),
         }
     }
 }
