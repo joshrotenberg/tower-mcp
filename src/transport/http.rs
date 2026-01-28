@@ -39,7 +39,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
     Router,
@@ -78,6 +78,8 @@ struct Session {
     router: McpRouter,
     /// Broadcast channel for SSE notifications
     notifications_tx: broadcast::Sender<String>,
+    /// Last time this session was accessed
+    last_accessed: RwLock<Instant>,
 }
 
 impl Session {
@@ -87,36 +89,152 @@ impl Session {
             id: uuid::Uuid::new_v4().to_string(),
             router,
             notifications_tx,
+            last_accessed: RwLock::new(Instant::now()),
+        }
+    }
+
+    /// Update the last accessed time
+    async fn touch(&self) {
+        *self.last_accessed.write().await = Instant::now();
+    }
+
+    /// Check if the session has expired
+    async fn is_expired(&self, ttl: Duration) -> bool {
+        self.last_accessed.read().await.elapsed() > ttl
+    }
+}
+
+/// Default session TTL (30 minutes)
+pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(30 * 60);
+
+/// Default cleanup interval (1 minute)
+const DEFAULT_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Configuration for session management
+#[derive(Debug, Clone)]
+pub struct SessionConfig {
+    /// Time-to-live for inactive sessions
+    pub ttl: Duration,
+    /// Maximum number of sessions (None = unlimited)
+    pub max_sessions: Option<usize>,
+    /// How often to run the cleanup task
+    pub cleanup_interval: Duration,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            ttl: DEFAULT_SESSION_TTL,
+            max_sessions: None,
+            cleanup_interval: DEFAULT_CLEANUP_INTERVAL,
         }
     }
 }
 
+impl SessionConfig {
+    /// Create a new session config with the given TTL
+    pub fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            ..Default::default()
+        }
+    }
+
+    /// Set the maximum number of sessions
+    pub fn max_sessions(mut self, max: usize) -> Self {
+        self.max_sessions = Some(max);
+        self
+    }
+
+    /// Set the cleanup interval
+    pub fn cleanup_interval(mut self, interval: Duration) -> Self {
+        self.cleanup_interval = interval;
+        self
+    }
+}
+
 /// Session store for managing multiple client sessions
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct SessionStore {
     sessions: RwLock<HashMap<String, Arc<Session>>>,
+    config: SessionConfig,
 }
 
 impl SessionStore {
-    fn new() -> Self {
-        Self::default()
+    fn new(config: SessionConfig) -> Self {
+        Self {
+            sessions: RwLock::new(HashMap::new()),
+            config,
+        }
     }
 
-    async fn create(&self, router: McpRouter) -> Arc<Session> {
-        let session = Arc::new(Session::new(router));
+    async fn create(&self, router: McpRouter) -> Option<Arc<Session>> {
         let mut sessions = self.sessions.write().await;
+
+        // Check max sessions limit
+        if let Some(max) = self.config.max_sessions
+            && sessions.len() >= max
+        {
+            tracing::warn!(
+                max_sessions = max,
+                current = sessions.len(),
+                "Session limit reached, rejecting new session"
+            );
+            return None;
+        }
+
+        let session = Arc::new(Session::new(router));
         sessions.insert(session.id.clone(), session.clone());
-        session
+        tracing::debug!(session_id = %session.id, "Created new session");
+        Some(session)
     }
 
     async fn get(&self, id: &str) -> Option<Arc<Session>> {
         let sessions = self.sessions.read().await;
-        sessions.get(id).cloned()
+        let session = sessions.get(id).cloned();
+        if let Some(ref s) = session {
+            // Touch the session to update last_accessed
+            s.touch().await;
+        }
+        session
     }
 
     async fn remove(&self, id: &str) -> bool {
         let mut sessions = self.sessions.write().await;
-        sessions.remove(id).is_some()
+        let removed = sessions.remove(id).is_some();
+        if removed {
+            tracing::debug!(session_id = %id, "Removed session");
+        }
+        removed
+    }
+
+    /// Remove expired sessions, returns count of removed sessions
+    async fn cleanup_expired(&self) -> usize {
+        let mut sessions = self.sessions.write().await;
+        let ttl = self.config.ttl;
+
+        let mut expired = Vec::new();
+        for (id, session) in sessions.iter() {
+            if session.is_expired(ttl).await {
+                expired.push(id.clone());
+            }
+        }
+
+        let count = expired.len();
+        for id in expired {
+            sessions.remove(&id);
+            tracing::debug!(session_id = %id, "Expired session removed");
+        }
+
+        if count > 0 {
+            tracing::info!(
+                expired_count = count,
+                remaining = sessions.len(),
+                "Session cleanup completed"
+            );
+        }
+
+        count
     }
 }
 
@@ -125,7 +243,7 @@ struct AppState {
     /// Template router for creating new sessions
     router_template: McpRouter,
     /// Session store
-    sessions: SessionStore,
+    sessions: Arc<SessionStore>,
     /// Whether to validate Origin header
     validate_origin: bool,
     /// Allowed origins (if validation is enabled)
@@ -139,6 +257,7 @@ pub struct HttpTransport {
     router: McpRouter,
     validate_origin: bool,
     allowed_origins: Vec<String>,
+    session_config: SessionConfig,
 }
 
 impl HttpTransport {
@@ -148,6 +267,7 @@ impl HttpTransport {
             router,
             validate_origin: true,
             allowed_origins: vec![],
+            session_config: SessionConfig::default(),
         }
     }
 
@@ -163,14 +283,48 @@ impl HttpTransport {
         self
     }
 
+    /// Configure session management (TTL, max sessions, cleanup interval)
+    pub fn session_config(mut self, config: SessionConfig) -> Self {
+        self.session_config = config;
+        self
+    }
+
+    /// Set session TTL (convenience method)
+    pub fn session_ttl(mut self, ttl: Duration) -> Self {
+        self.session_config.ttl = ttl;
+        self
+    }
+
+    /// Set maximum number of concurrent sessions (convenience method)
+    pub fn max_sessions(mut self, max: usize) -> Self {
+        self.session_config.max_sessions = Some(max);
+        self
+    }
+
+    fn build_state(&self) -> Arc<AppState> {
+        let sessions = Arc::new(SessionStore::new(self.session_config.clone()));
+
+        // Spawn cleanup task
+        let cleanup_sessions = sessions.clone();
+        let cleanup_interval = self.session_config.cleanup_interval;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(cleanup_interval).await;
+                cleanup_sessions.cleanup_expired().await;
+            }
+        });
+
+        Arc::new(AppState {
+            router_template: self.router.clone(),
+            sessions,
+            validate_origin: self.validate_origin,
+            allowed_origins: self.allowed_origins.clone(),
+        })
+    }
+
     /// Build the axum router for this transport
     pub fn into_router(self) -> Router {
-        let state = Arc::new(AppState {
-            router_template: self.router,
-            sessions: SessionStore::new(),
-            validate_origin: self.validate_origin,
-            allowed_origins: self.allowed_origins,
-        });
+        let state = self.build_state();
 
         Router::new()
             .route("/", post(handle_post))
@@ -181,12 +335,7 @@ impl HttpTransport {
 
     /// Build an axum router mounted at a specific path
     pub fn into_router_at(self, path: &str) -> Router {
-        let state = Arc::new(AppState {
-            router_template: self.router,
-            sessions: SessionStore::new(),
-            validate_origin: self.validate_origin,
-            allowed_origins: self.allowed_origins,
-        });
+        let state = self.build_state();
 
         let mcp_router = Router::new()
             .route("/", post(handle_post))
@@ -299,7 +448,16 @@ async fn handle_post(
     // Get or create session
     let session = if is_init {
         // Create new session for initialize
-        state.sessions.create(state.router_template.clone()).await
+        match state.sessions.create(state.router_template.clone()).await {
+            Some(s) => s,
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Maximum session limit reached",
+                )
+                    .into_response();
+            }
+        }
     } else {
         // Require existing session
         let session_id = match get_session_id(&headers) {
@@ -593,5 +751,136 @@ mod tests {
 
         let response = app.oneshot(list_request).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_session_expiration() {
+        // Create transport with very short TTL
+        let config = SessionConfig::with_ttl(Duration::from_millis(50))
+            .cleanup_interval(Duration::from_millis(10));
+        let transport = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .session_config(config);
+        let app = transport.into_router();
+
+        // Initialize to get a session
+        let init_request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "clientInfo": {
+                            "name": "test-client",
+                            "version": "1.0.0"
+                        }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.clone().oneshot(init_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let session_id = response
+            .headers()
+            .get(MCP_SESSION_ID_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Wait for session to expire and cleanup to run
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Session should be expired now
+        let list_request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header(MCP_SESSION_ID_HEADER, &session_id)
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/list"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(list_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_max_sessions_limit() {
+        // Create transport with max 1 session
+        let config = SessionConfig::default().max_sessions(1);
+        let transport = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .session_config(config);
+        let app = transport.into_router();
+
+        // First initialize should succeed
+        let init_request1 = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "clientInfo": {
+                            "name": "test-client",
+                            "version": "1.0.0"
+                        }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.clone().oneshot(init_request1).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Second initialize should fail (max sessions reached)
+        let init_request2 = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "clientInfo": {
+                            "name": "test-client-2",
+                            "version": "1.0.0"
+                        }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(init_request2).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }
