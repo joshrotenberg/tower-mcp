@@ -66,7 +66,10 @@ pub use protocol::{
     JsonRpcResponseMessage, McpRequest, McpResponse, PromptMessage, PromptRole, ReadResourceResult,
     ResourceContent,
 };
-pub use resource::{Resource, ResourceBuilder, ResourceHandler};
+pub use resource::{
+    Resource, ResourceBuilder, ResourceHandler, ResourceTemplate, ResourceTemplateBuilder,
+    ResourceTemplateHandler,
+};
 pub use router::{JsonRpcService, McpRouter};
 pub use session::{SessionPhase, SessionState};
 pub use tool::{Tool, ToolBuilder, ToolHandler};

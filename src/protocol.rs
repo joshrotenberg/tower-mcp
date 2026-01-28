@@ -321,6 +321,8 @@ pub enum McpRequest {
     CallTool(CallToolParams),
     /// List available resources
     ListResources(ListResourcesParams),
+    /// List resource templates
+    ListResourceTemplates(ListResourceTemplatesParams),
     /// Read a resource
     ReadResource(ReadResourceParams),
     /// Subscribe to resource updates
@@ -358,6 +360,7 @@ impl McpRequest {
             McpRequest::ListTools(_) => "tools/list",
             McpRequest::CallTool(_) => "tools/call",
             McpRequest::ListResources(_) => "resources/list",
+            McpRequest::ListResourceTemplates(_) => "resources/templates/list",
             McpRequest::ReadResource(_) => "resources/read",
             McpRequest::SubscribeResource(_) => "resources/subscribe",
             McpRequest::UnsubscribeResource(_) => "resources/unsubscribe",
@@ -442,6 +445,7 @@ pub enum McpResponse {
     ListTools(ListToolsResult),
     CallTool(CallToolResult),
     ListResources(ListResourcesResult),
+    ListResourceTemplates(ListResourceTemplatesResult),
     ReadResource(ReadResourceResult),
     ListPrompts(ListPromptsResult),
     GetPrompt(GetPromptResult),
@@ -781,6 +785,55 @@ pub struct UnsubscribeResourceParams {
     pub uri: String,
 }
 
+/// Parameters for listing resource templates
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ListResourceTemplatesParams {
+    /// Pagination cursor from previous response
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+/// Result of listing resource templates
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListResourceTemplatesResult {
+    /// Available resource templates
+    pub resource_templates: Vec<ResourceTemplateDefinition>,
+    /// Cursor for next page (if more templates available)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Definition of a resource template as returned by resources/templates/list
+///
+/// Resource templates allow servers to expose parameterized resources using
+/// [URI templates (RFC 6570)](https://datatracker.ietf.org/doc/html/rfc6570).
+///
+/// # Example
+///
+/// ```json
+/// {
+///     "uriTemplate": "file:///{path}",
+///     "name": "Project Files",
+///     "description": "Access files in the project directory",
+///     "mimeType": "application/octet-stream"
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceTemplateDefinition {
+    /// URI template following RFC 6570 (e.g., `file:///{path}`)
+    pub uri_template: String,
+    /// Human-readable name for this template
+    pub name: String,
+    /// Description of what resources this template provides
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// MIME type hint for resources from this template
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+}
+
 // =============================================================================
 // Prompts
 // =============================================================================
@@ -1064,6 +1117,11 @@ impl McpRequest {
             "resources/list" => {
                 let p: ListResourcesParams = serde_json::from_value(params).unwrap_or_default();
                 Ok(McpRequest::ListResources(p))
+            }
+            "resources/templates/list" => {
+                let p: ListResourceTemplatesParams =
+                    serde_json::from_value(params).unwrap_or_default();
+                Ok(McpRequest::ListResourceTemplates(p))
             }
             "resources/read" => {
                 let p: ReadResourceParams = serde_json::from_value(params)?;
