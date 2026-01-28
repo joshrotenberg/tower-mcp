@@ -1,0 +1,43 @@
+name: MCP Conformance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  conformance:
+    name: MCP Conformance Suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build conformance server
+        run: cargo build --manifest-path examples/conformance-server/Cargo.toml
+
+      - name: Start server
+        run: cargo run --manifest-path examples/conformance-server/Cargo.toml &
+
+      - name: Wait for server
+        run: |
+          for i in $(seq 1 30); do
+            if curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3001/mcp | grep -q '200\|405'; then
+              echo "Server is ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Server failed to start"
+          exit 1
+
+      - name: Run conformance suite
+        run: npx @modelcontextprotocol/conformance@0.1.11 server --url http://127.0.0.1:3001/mcp --expected-failures ./conformance-baseline.yml

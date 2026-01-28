@@ -1,0 +1,21 @@
+[package]
+name = "conformance-server"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "MCP conformance test suite server"
+
+[[bin]]
+name = "conformance-server"
+path = "src/main.rs"
+
+[dependencies]
+tower-mcp = { path = "../..", features = ["http"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+base64 = "0.22"
+axum = "0.8"

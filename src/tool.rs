@@ -395,6 +395,29 @@ impl ToolBuilder {
             handler: Arc::new(RawHandler { handler }),
         })
     }
+
+    /// Create a tool with raw JSON handling and request context
+    ///
+    /// The handler receives a `RequestContext` for progress reporting,
+    /// cancellation, sampling, and logging, along with raw JSON arguments.
+    ///
+    /// Returns an error if the tool name is invalid.
+    pub fn raw_handler_with_context<F, Fut>(self, handler: F) -> Result<Tool>
+    where
+        F: Fn(RequestContext, Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
+    {
+        validate_tool_name(&self.name)?;
+        Ok(Tool {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            output_schema: self.output_schema,
+            icons: self.icons,
+            annotations: self.annotations,
+            handler: Arc::new(RawContextHandler { handler }),
+        })
+    }
 }
 
 /// Builder state after handler is specified
@@ -523,6 +546,42 @@ where
 
     fn input_schema(&self) -> Value {
         // Raw handlers accept any JSON
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": true
+        })
+    }
+}
+
+/// Handler that works with raw JSON and request context
+struct RawContextHandler<F> {
+    handler: F,
+}
+
+impl<F, Fut> ToolHandler for RawContextHandler<F>
+where
+    F: Fn(RequestContext, Value) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
+{
+    fn call(&self, args: Value) -> BoxFuture<'_, Result<CallToolResult>> {
+        let ctx = RequestContext::new(crate::protocol::RequestId::Number(0));
+        self.call_with_context(ctx, args)
+    }
+
+    fn call_with_context(
+        &self,
+        ctx: RequestContext,
+        args: Value,
+    ) -> BoxFuture<'_, Result<CallToolResult>> {
+        Box::pin((self.handler)(ctx, args))
+    }
+
+    fn uses_context(&self) -> bool {
+        true
+    }
+
+    fn input_schema(&self) -> Value {
+        // Raw context handlers accept any JSON object
         serde_json::json!({
             "type": "object",
             "additionalProperties": true
