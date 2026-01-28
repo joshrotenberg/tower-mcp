@@ -13,26 +13,29 @@ This means:
 
 ## Status
 
-**Early development** - Core protocol types and routing are implemented. Transports are not yet available.
+**Active development** - Core protocol, routing, and transports are implemented. Used in production for MCP server deployments.
 
 ### Implemented
-- JSON-RPC 2.0 message types and validation
+- JSON-RPC 2.0 message types, validation, and batch request handling
 - MCP protocol types (tools, resources, prompts)
 - Tool builder with type-safe handlers and JSON Schema generation via [schemars](https://crates.io/crates/schemars)
 - `McpTool` trait for complex tools
 - `McpRouter` implementing Tower's `Service` trait
 - `JsonRpcService` layer for protocol framing
-- Session state management (initialization lifecycle)
+- Session state management with reconnection support
 - Protocol version negotiation
 - Tool annotations (behavior hints for trust/safety)
+- **Transports**: stdio, HTTP (with SSE), WebSocket, child process
+- **Resources**: list, read, subscribe/unsubscribe with change notifications
+- **Prompts**: list and get with argument support
+- **Authentication**: API key and Bearer token middleware helpers
+- **Elicitation**: Server-to-client user input requests (form and URL modes)
+- **Client support**: MCP client for connecting to external servers
 
 ### Not Yet Implemented
-- Transports (stdio, HTTP/SSE, WebSocket)
-- Resources (read, subscribe)
-- Prompts
-- Batch request handling
 - Progress notifications
 - Request cancellation
+- Sampling (LLM requests from server to client)
 
 ## Installation
 
@@ -41,6 +44,22 @@ Add to your `Cargo.toml`:
 ```toml
 [dependencies]
 tower-mcp = { git = "https://github.com/joshrotenberg/tower-mcp" }
+```
+
+### Feature Flags
+
+| Feature | Description |
+|---------|-------------|
+| `http` | HTTP transport with SSE support (adds axum, hyper dependencies) |
+| `websocket` | WebSocket transport for full-duplex communication |
+| `childproc` | Child process transport for spawning subprocess MCP servers |
+| `client` | MCP client support for connecting to external servers |
+
+Example with features:
+
+```toml
+[dependencies]
+tower-mcp = { git = "https://github.com/joshrotenberg/tower-mcp", features = ["http", "client"] }
 ```
 
 ## Quick Start
@@ -143,6 +162,49 @@ let echo = ToolBuilder::new("echo")
     });
 ```
 
+## Transports
+
+### Stdio (CLI/local)
+
+```rust
+use tower_mcp::{McpRouter, StdioTransport};
+
+let router = McpRouter::new()
+    .server_info("my-server", "1.0.0")
+    .tool(my_tool);
+
+// Serve over stdin/stdout
+StdioTransport::new(router).serve().await?;
+```
+
+### HTTP with SSE
+
+```rust
+use tower_mcp::{McpRouter, HttpTransport};
+
+let router = McpRouter::new()
+    .server_info("my-server", "1.0.0")
+    .tool(my_tool);
+
+let transport = HttpTransport::new(router);
+let app = transport.into_router();
+
+// Serve with axum
+let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
+axum::serve(listener, app).await?;
+```
+
+### With Authentication Middleware
+
+```rust
+use tower_mcp::auth::extract_api_key;
+use axum::middleware;
+
+// Add auth layer to the HTTP transport
+let app = transport.into_router()
+    .layer(middleware::from_fn(auth_middleware));
+```
+
 ## Architecture
 
 ```
@@ -169,17 +231,15 @@ let echo = ToolBuilder::new("echo")
          +--------+   +--------+   +--------+
 ```
 
-## Comparison with rmcp
+## Design Philosophy
 
-| Aspect | rmcp | tower-mcp |
-|--------|------|-----------|
-| Style | Framework | Library |
-| Tool definition | `#[tool]` macro | Builder or trait |
-| Middleware | Bolt-on | Native tower layers |
-| Transport | Built-in | Pluggable (planned) |
-| Learning curve | Lower | Higher (tower knowledge helpful) |
-| Flexibility | Limited | High |
-| Integration | Standalone | Composable with axum/tonic |
+| Aspect | tower-mcp |
+|--------|-----------|
+| Style | Library, not framework |
+| Tool definition | Builder pattern or trait-based |
+| Middleware | Native tower layers |
+| Transport | Pluggable (stdio, HTTP, WebSocket, child process) |
+| Integration | Composable with axum/tonic |
 
 ## Protocol Compliance
 
@@ -191,11 +251,14 @@ tower-mcp targets the [MCP specification 2025-03-26](https://modelcontextprotoco
 - [x] Initialize/initialized lifecycle
 - [x] tools/list and tools/call
 - [x] Tool annotations
-- [ ] Batch requests (receiving)
-- [ ] resources/list, resources/read, resources/subscribe
-- [ ] prompts/list, prompts/get
+- [x] Batch requests
+- [x] resources/list, resources/read, resources/subscribe
+- [x] prompts/list, prompts/get
+- [x] Elicitation (user input requests)
+- [x] Session management with reconnection error codes
 - [ ] Progress notifications
 - [ ] Request cancellation
+- [ ] Sampling
 
 ## Development
 
