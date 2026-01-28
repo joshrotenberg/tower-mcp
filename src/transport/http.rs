@@ -53,7 +53,7 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use tower_mcp::{McpRouter, ToolBuilder, CallToolResult};
+//! use tower_mcp::{BoxError, McpRouter, ToolBuilder, CallToolResult};
 //! use tower_mcp::transport::http::HttpTransport;
 //! use schemars::JsonSchema;
 //! use serde::Deserialize;
@@ -62,7 +62,7 @@
 //! struct Input { value: String }
 //!
 //! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! async fn main() -> Result<(), BoxError> {
 //!     let tool = ToolBuilder::new("echo")
 //!         .handler(|i: Input| async move { Ok(CallToolResult::text(i.value)) })
 //!         .build()?;
@@ -402,12 +402,12 @@ impl HttpTransport {
     /// # Example
     ///
     /// ```rust,no_run
-    /// use tower_mcp::{McpRouter, ToolBuilder, CallToolResult, CreateMessageParams, SamplingMessage};
+    /// use tower_mcp::{BoxError, McpRouter, ToolBuilder, CallToolResult, CreateMessageParams, SamplingMessage};
     /// use tower_mcp::context::RequestContext;
     /// use tower_mcp::transport::http::HttpTransport;
     ///
     /// #[tokio::main]
-    /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// async fn main() -> Result<(), BoxError> {
     ///     let tool = ToolBuilder::new("ai-tool")
     ///         .handler_with_context(|ctx: RequestContext, _: serde_json::Value| async move {
     ///             // Request LLM completion from client

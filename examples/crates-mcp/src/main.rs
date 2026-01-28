@@ -54,7 +54,7 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), tower_mcp::BoxError> {
     let args = Args::parse();
 
     // Initialize tracing

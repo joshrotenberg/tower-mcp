@@ -19,7 +19,7 @@
 //! Build an MCP server with tools, resources, and prompts:
 //!
 //! ```rust,no_run
-//! use tower_mcp::{McpRouter, ToolBuilder, CallToolResult, StdioTransport};
+//! use tower_mcp::{BoxError, McpRouter, ToolBuilder, CallToolResult, StdioTransport};
 //! use schemars::JsonSchema;
 //! use serde::Deserialize;
 //!
@@ -29,7 +29,7 @@
 //! }
 //!
 //! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! async fn main() -> Result<(), BoxError> {
 //!     // Define a tool
 //!     let greet = ToolBuilder::new("greet")
 //!         .description("Greet someone by name")
@@ -53,10 +53,11 @@
 //! Connect to an MCP server and call tools:
 //!
 //! ```rust,no_run
+//! use tower_mcp::BoxError;
 //! use tower_mcp::client::{McpClient, StdioClientTransport};
 //!
 //! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! async fn main() -> Result<(), BoxError> {
 //!     // Connect to server
 //!     let transport = StdioClientTransport::spawn("my-mcp-server", &[]).await?;
 //!     let mut client = McpClient::new(transport);
@@ -125,7 +126,7 @@ pub use context::{
     NotificationSender, OutgoingRequest, OutgoingRequestReceiver, OutgoingRequestSender,
     RequestContext, RequestContextBuilder, ServerNotification, outgoing_request_channel,
 };
-pub use error::{Error, Result, ToolError};
+pub use error::{BoxError, Error, Result, ToolError};
 pub use jsonrpc::{JsonRpcLayer, JsonRpcService};
 pub use prompt::{Prompt, PromptBuilder, PromptHandler};
 pub use protocol::{

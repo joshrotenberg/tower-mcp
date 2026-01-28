@@ -15,7 +15,7 @@
 use tower_mcp::client::{McpClient, StdioClientTransport};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), tower_mcp::BoxError> {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter("tower_mcp=info,client_cli=debug")

@@ -29,6 +29,13 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Type-erased error type used for middleware composition.
+///
+/// This is the standard error type in the tower ecosystem, used by
+/// [`tower`](https://docs.rs/tower), [`tower-http`](https://docs.rs/tower-http),
+/// and other tower-compatible crates.
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
 /// Standard JSON-RPC error codes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
@@ -205,7 +212,7 @@ pub struct ToolError {
     /// Error message
     pub message: String,
     /// Source error if any
-    pub source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    pub source: Option<BoxError>,
 }
 
 impl std::fmt::Display for ToolError {
@@ -323,3 +330,35 @@ impl From<JsonRpcError> for Error {
 
 /// Result type alias for tower-mcp
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_box_error_from_io_error() {
+        let io_err = std::io::Error::other("disk full");
+        let boxed: BoxError = io_err.into();
+        assert_eq!(boxed.to_string(), "disk full");
+    }
+
+    #[test]
+    fn test_box_error_from_string() {
+        let err: BoxError = "something went wrong".into();
+        assert_eq!(err.to_string(), "something went wrong");
+    }
+
+    #[test]
+    fn test_box_error_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<BoxError>();
+    }
+
+    #[test]
+    fn test_tool_error_source_uses_box_error() {
+        let io_err = std::io::Error::other("timeout");
+        let tool_err = ToolError::new("failed").with_source(io_err);
+        assert!(tool_err.source.is_some());
+        assert_eq!(tool_err.source.unwrap().to_string(), "timeout");
+    }
+}

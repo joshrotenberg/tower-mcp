@@ -28,7 +28,7 @@ impl AppState {
     ///
     /// # Arguments
     /// * `rate_limit` - Minimum interval between crates.io API calls
-    pub fn new(rate_limit: Duration) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn new(rate_limit: Duration) -> Result<Self, tower_mcp::BoxError> {
         let client = AsyncClient::new(
             "crates-mcp (tower-mcp example; https://github.com/joshrotenberg/tower-mcp)",
             rate_limit,

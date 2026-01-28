@@ -5,10 +5,11 @@
 //! # Example
 //!
 //! ```rust,no_run
+//! use tower_mcp::BoxError;
 //! use tower_mcp::client::{McpClient, StdioClientTransport};
 //!
 //! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! async fn main() -> Result<(), BoxError> {
 //!     // Connect to an MCP server via stdio
 //!     let transport = StdioClientTransport::spawn("my-mcp-server", &["--flag"]).await?;
 //!     let mut client = McpClient::new(transport);
