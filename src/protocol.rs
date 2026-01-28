@@ -17,17 +17,22 @@ pub const LATEST_PROTOCOL_VERSION: &str = "2025-03-26";
 /// All supported MCP protocol versions (newest first).
 pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-03-26"];
 
-/// JSON-RPC 2.0 request
+/// JSON-RPC 2.0 request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
+    /// JSON-RPC version, must be "2.0".
     pub jsonrpc: String,
+    /// Request identifier.
     pub id: RequestId,
+    /// Method name to invoke.
     pub method: String,
+    /// Optional parameters for the method.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Value>,
 }
 
 impl JsonRpcRequest {
+    /// Create a new JSON-RPC request.
     pub fn new(id: impl Into<RequestId>, method: impl Into<String>) -> Self {
         Self {
             jsonrpc: JSONRPC_VERSION.to_string(),
@@ -37,6 +42,7 @@ impl JsonRpcRequest {
         }
     }
 
+    /// Add parameters to the request.
     pub fn with_params(mut self, params: Value) -> Self {
         self.params = Some(params);
         self
@@ -55,32 +61,41 @@ impl JsonRpcRequest {
     }
 }
 
-/// JSON-RPC 2.0 response (success)
+/// JSON-RPC 2.0 success response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcResultResponse {
+    /// JSON-RPC version, always "2.0".
     pub jsonrpc: String,
+    /// Request identifier (matches the request).
     pub id: RequestId,
+    /// The result value.
     pub result: Value,
 }
 
-/// JSON-RPC 2.0 response (error)
+/// JSON-RPC 2.0 error response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcErrorResponse {
+    /// JSON-RPC version, always "2.0".
     pub jsonrpc: String,
+    /// Request identifier (may be null for parse errors).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<RequestId>,
+    /// The error details.
     pub error: JsonRpcError,
 }
 
-/// JSON-RPC 2.0 response (either success or error)
+/// JSON-RPC 2.0 response (either success or error).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum JsonRpcResponse {
+    /// Successful response with result.
     Result(JsonRpcResultResponse),
+    /// Error response.
     Error(JsonRpcErrorResponse),
 }
 
 impl JsonRpcResponse {
+    /// Create a success response.
     pub fn result(id: RequestId, result: Value) -> Self {
         Self::Result(JsonRpcResultResponse {
             jsonrpc: JSONRPC_VERSION.to_string(),
@@ -89,6 +104,7 @@ impl JsonRpcResponse {
         })
     }
 
+    /// Create an error response.
     pub fn error(id: Option<RequestId>, error: JsonRpcError) -> Self {
         Self::Error(JsonRpcErrorResponse {
             jsonrpc: JSONRPC_VERSION.to_string(),
@@ -1133,17 +1149,43 @@ pub struct CallToolParams {
     pub meta: Option<RequestMeta>,
 }
 
+/// Result of a tool invocation.
+///
+/// This is the return type for tool handlers. Use the convenience constructors
+/// like [`CallToolResult::text`], [`CallToolResult::json`], or [`CallToolResult::error`]
+/// to create results easily.
+///
+/// # Example
+///
+/// ```rust
+/// use tower_mcp::CallToolResult;
+///
+/// // Simple text result
+/// let result = CallToolResult::text("Hello, world!");
+///
+/// // JSON result with structured content
+/// let result = CallToolResult::json(serde_json::json!({"key": "value"}));
+///
+/// // Error result
+/// let result = CallToolResult::error("Something went wrong");
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CallToolResult {
+    /// The content items returned by the tool.
     pub content: Vec<Content>,
+    /// Whether this result represents an error.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_error: bool,
+    /// Optional structured content for programmatic access.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_content: Option<Value>,
 }
 
 impl CallToolResult {
+    /// Create a text result.
+    ///
+    /// This is the most common result type for tools that return plain text.
     pub fn text(text: impl Into<String>) -> Self {
         Self {
             content: vec![Content::Text {
@@ -1155,6 +1197,10 @@ impl CallToolResult {
         }
     }
 
+    /// Create an error result.
+    ///
+    /// Use this when the tool encounters an error during execution.
+    /// The `is_error` flag will be set to `true`.
     pub fn error(message: impl Into<String>) -> Self {
         Self {
             content: vec![Content::Text {
@@ -1166,6 +1212,10 @@ impl CallToolResult {
         }
     }
 
+    /// Create a JSON result with structured content.
+    ///
+    /// The JSON value is serialized to pretty-printed text for display,
+    /// and also stored in `structured_content` for programmatic access.
     pub fn json(value: Value) -> Self {
         let text = serde_json::to_string_pretty(&value).unwrap_or_default();
         Self {
@@ -1252,31 +1302,48 @@ impl CallToolResult {
     }
 }
 
-/// Content types for tool results
+/// Content types for tool results, resources, and prompts.
+///
+/// Content can be text, images, audio, or embedded resources. Each variant
+/// supports optional annotations for audience targeting and priority hints.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Content {
+    /// Plain text content.
     Text {
+        /// The text content.
         text: String,
+        /// Optional annotations for this content.
         #[serde(skip_serializing_if = "Option::is_none")]
         annotations: Option<ContentAnnotations>,
     },
+    /// Base64-encoded image content.
     Image {
+        /// Base64-encoded image data.
         data: String,
+        /// MIME type (e.g., "image/png", "image/jpeg").
         #[serde(rename = "mimeType")]
         mime_type: String,
+        /// Optional annotations for this content.
         #[serde(skip_serializing_if = "Option::is_none")]
         annotations: Option<ContentAnnotations>,
     },
+    /// Base64-encoded audio content.
     Audio {
+        /// Base64-encoded audio data.
         data: String,
+        /// MIME type (e.g., "audio/wav", "audio/mp3").
         #[serde(rename = "mimeType")]
         mime_type: String,
+        /// Optional annotations for this content.
         #[serde(skip_serializing_if = "Option::is_none")]
         annotations: Option<ContentAnnotations>,
     },
+    /// Embedded resource content.
     Resource {
+        /// The embedded resource.
         resource: ResourceContent,
+        /// Optional annotations for this content.
         #[serde(skip_serializing_if = "Option::is_none")]
         annotations: Option<ContentAnnotations>,
     },
@@ -1309,22 +1376,33 @@ pub struct ContentAnnotations {
     pub priority: Option<f64>,
 }
 
-/// Role indicating who content is intended for
+/// Role indicating who content is intended for.
+///
+/// Used in content annotations to specify the target audience.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ContentRole {
+    /// Content intended for the human user.
     User,
+    /// Content intended for the AI assistant.
     Assistant,
 }
 
+/// Content of an embedded resource.
+///
+/// Contains either text or binary (blob) content along with metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceContent {
+    /// The URI identifying this resource.
     pub uri: String,
+    /// MIME type of the content.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
+    /// Text content (for text-based resources).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// Base64-encoded binary content (for binary resources).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blob: Option<String>,
 }
