@@ -28,9 +28,9 @@ pub fn build(state: Arc<AppState>) -> Tool {
         )
         .read_only()
         .idempotent()
-        .handler(move |input: DependenciesInput| {
-            let state = state.clone();
-            async move {
+        .handler_with_state(
+            state,
+            |state: Arc<AppState>, input: DependenciesInput| async move {
                 // Get crate info first to find version
                 let crate_response = state
                     .client
@@ -93,8 +93,8 @@ pub fn build(state: Arc<AppState>) -> Tool {
                 output.push_str(&format!("**Total: {} dependencies**\n", total));
 
                 Ok(CallToolResult::text(output))
-            }
-        })
+            },
+        )
         .build()
         .expect("valid tool")
 }
