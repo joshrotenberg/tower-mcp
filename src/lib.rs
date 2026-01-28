@@ -99,6 +99,7 @@
 //! - `http` - HTTP/SSE transport for web servers
 //! - `websocket` - WebSocket transport for bidirectional communication
 //! - `childproc` - Child process transport for subprocess management
+//! - `oauth` - OAuth 2.1 resource server support (token validation, metadata endpoint)
 //!
 //! ## MCP Specification
 //!
@@ -111,6 +112,8 @@ pub mod client;
 pub mod context;
 pub mod error;
 pub mod jsonrpc;
+#[cfg(feature = "oauth")]
+pub mod oauth;
 pub mod prompt;
 pub mod protocol;
 pub mod resource;

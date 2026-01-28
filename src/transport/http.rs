@@ -406,6 +406,18 @@ struct AppState {
     sampling_enabled: bool,
 }
 
+/// Configuration for OAuth 2.1 Protected Resource Metadata.
+///
+/// When set on [`HttpTransport`], a `GET /.well-known/oauth-protected-resource`
+/// endpoint is added that returns the metadata JSON, enabling OAuth client
+/// discovery per RFC 9728.
+#[cfg(feature = "oauth")]
+#[derive(Clone)]
+pub struct OAuthConfig {
+    /// Protected Resource Metadata to serve at the well-known endpoint.
+    pub metadata: crate::oauth::ProtectedResourceMetadata,
+}
+
 /// HTTP transport for MCP servers
 ///
 /// Implements the Streamable HTTP transport from the MCP specification.
@@ -416,6 +428,8 @@ pub struct HttpTransport {
     session_config: SessionConfig,
     sampling_enabled: bool,
     service_factory: ServiceFactory,
+    #[cfg(feature = "oauth")]
+    oauth_config: Option<OAuthConfig>,
 }
 
 impl HttpTransport {
@@ -428,6 +442,8 @@ impl HttpTransport {
             session_config: SessionConfig::default(),
             sampling_enabled: false,
             service_factory: identity_factory(),
+            #[cfg(feature = "oauth")]
+            oauth_config: None,
         }
     }
 
@@ -475,6 +491,8 @@ impl HttpTransport {
             session_config: SessionConfig::default(),
             sampling_enabled: true,
             service_factory: identity_factory(),
+            #[cfg(feature = "oauth")]
+            oauth_config: None,
         }
     }
 
@@ -505,6 +523,32 @@ impl HttpTransport {
     /// Set maximum number of concurrent sessions (convenience method)
     pub fn max_sessions(mut self, max: usize) -> Self {
         self.session_config.max_sessions = Some(max);
+        self
+    }
+
+    /// Configure OAuth 2.1 Protected Resource Metadata for this transport.
+    ///
+    /// When set, adds a `GET /.well-known/oauth-protected-resource` endpoint
+    /// that returns the metadata JSON, enabling OAuth client discovery per
+    /// RFC 9728.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use tower_mcp::oauth::ProtectedResourceMetadata;
+    /// use tower_mcp::transport::http::HttpTransport;
+    /// use tower_mcp::McpRouter;
+    ///
+    /// let metadata = ProtectedResourceMetadata::new("https://mcp.example.com")
+    ///     .authorization_server("https://auth.example.com")
+    ///     .scope("mcp:read");
+    ///
+    /// let router = McpRouter::new().server_info("my-server", "1.0.0");
+    /// let transport = HttpTransport::new(router).oauth(metadata);
+    /// ```
+    #[cfg(feature = "oauth")]
+    pub fn oauth(mut self, metadata: crate::oauth::ProtectedResourceMetadata) -> Self {
+        self.oauth_config = Some(OAuthConfig { metadata });
         self
     }
 
@@ -584,11 +628,16 @@ impl HttpTransport {
     pub fn into_router(self) -> Router {
         let state = self.build_state();
 
-        Router::new()
+        let router = Router::new()
             .route("/", post(handle_post))
             .route("/", get(handle_get))
             .route("/", delete(handle_delete))
-            .with_state(state)
+            .with_state(state);
+
+        #[cfg(feature = "oauth")]
+        let router = self.add_oauth_route(router, "");
+
+        router
     }
 
     /// Build an axum router mounted at a specific path
@@ -601,7 +650,12 @@ impl HttpTransport {
             .route("/", delete(handle_delete))
             .with_state(state);
 
-        Router::new().nest(path, mcp_router)
+        let router = Router::new().nest(path, mcp_router);
+
+        #[cfg(feature = "oauth")]
+        let router = self.add_oauth_route(router, path);
+
+        router
     }
 
     /// Serve the transport on the given address
@@ -620,6 +674,32 @@ impl HttpTransport {
             .map_err(|e| Error::Transport(format!("Server error: {}", e)))?;
 
         Ok(())
+    }
+
+    /// Add the OAuth Protected Resource Metadata well-known route if configured.
+    #[cfg(feature = "oauth")]
+    fn add_oauth_route(&self, router: Router, base_path: &str) -> Router {
+        if let Some(ref config) = self.oauth_config {
+            let metadata = config.metadata.clone();
+            let well_known_path = if base_path.is_empty() {
+                crate::oauth::ProtectedResourceMetadata::well_known_path().to_string()
+            } else {
+                format!(
+                    "{}{}",
+                    base_path.trim_end_matches('/'),
+                    crate::oauth::ProtectedResourceMetadata::well_known_path()
+                )
+            };
+            router.route(
+                &well_known_path,
+                get(move || {
+                    let m = metadata.clone();
+                    async move { axum::Json(m) }
+                }),
+            )
+        } else {
+            router
+        }
     }
 }
 
