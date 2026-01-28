@@ -41,9 +41,9 @@ pub fn build(state: Arc<AppState>) -> Tool {
         )
         .read_only()
         .idempotent()
-        .handler(move |input: SearchInput| {
-            let state = state.clone();
-            async move {
+        .handler_with_state(
+            state,
+            |state: Arc<AppState>, input: SearchInput| async move {
                 let sort = parse_sort(&input.sort);
                 let query = CratesQuery::builder()
                     .search(&input.query)
@@ -94,8 +94,8 @@ pub fn build(state: Arc<AppState>) -> Tool {
                 }
 
                 Ok(CallToolResult::text(output))
-            }
-        })
+            },
+        )
         .build()
         .expect("valid tool")
 }

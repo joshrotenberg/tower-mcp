@@ -24,9 +24,9 @@ pub fn build(state: Arc<AppState>) -> Tool {
         )
         .read_only()
         .idempotent()
-        .handler(move |input: DownloadsInput| {
-            let state = state.clone();
-            async move {
+        .handler_with_state(
+            state,
+            |state: Arc<AppState>, input: DownloadsInput| async move {
                 let response = state
                     .client
                     .crate_downloads(&input.name)
@@ -61,8 +61,8 @@ pub fn build(state: Arc<AppState>) -> Tool {
                 }
 
                 Ok(CallToolResult::text(output))
-            }
-        })
+            },
+        )
         .build()
         .expect("valid tool")
 }
