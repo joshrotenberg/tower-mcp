@@ -36,9 +36,12 @@
 
 use std::collections::HashSet;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use tower::Layer;
+use tower_service::Service;
 
 /// Result of an authentication attempt
 #[derive(Debug, Clone)]
@@ -76,14 +79,50 @@ impl std::fmt::Display for AuthError {
 impl std::error::Error for AuthError {}
 
 // =============================================================================
-// API Key Authentication
+// Validation Trait
 // =============================================================================
 
-/// Trait for validating API keys
-pub trait ApiKeyValidation: Clone + Send + Sync + 'static {
-    /// Validate an API key and return auth info if valid
-    fn validate(&self, key: &str) -> impl Future<Output = AuthResult> + Send;
+/// Trait for validating authentication credentials.
+///
+/// Implement this trait to provide custom authentication logic for use
+/// with [`AuthLayer`] and [`AuthService`].
+///
+/// The credential string passed to [`validate`](Validate::validate) is the
+/// value extracted from the configured request header after parsing
+/// (e.g., the token portion of `"Bearer sk-123"`).
+///
+/// # Example
+///
+/// ```rust
+/// use tower_mcp::auth::{Validate, AuthResult, AuthInfo, AuthError};
+///
+/// #[derive(Clone)]
+/// struct MyValidator;
+///
+/// impl Validate for MyValidator {
+///     async fn validate(&self, credential: &str) -> AuthResult {
+///         if credential.starts_with("sk-") {
+///             AuthResult::Authenticated(Some(AuthInfo {
+///                 client_id: credential.to_string(),
+///                 claims: None,
+///             }))
+///         } else {
+///             AuthResult::Failed(AuthError {
+///                 code: "invalid_credential".to_string(),
+///                 message: "Credential must start with sk-".to_string(),
+///             })
+///         }
+///     }
+/// }
+/// ```
+pub trait Validate: Clone + Send + Sync + 'static {
+    /// Validate a credential and return the authentication result.
+    fn validate(&self, credential: &str) -> impl Future<Output = AuthResult> + Send;
 }
+
+// =============================================================================
+// API Key Authentication
+// =============================================================================
 
 /// Simple in-memory API key validator
 ///
@@ -115,7 +154,7 @@ impl ApiKeyValidator {
     }
 }
 
-impl ApiKeyValidation for ApiKeyValidator {
+impl Validate for ApiKeyValidator {
     async fn validate(&self, key: &str) -> AuthResult {
         if self.valid_keys.contains(key) {
             AuthResult::Authenticated(Some(AuthInfo {
@@ -135,15 +174,9 @@ impl ApiKeyValidation for ApiKeyValidator {
 // Bearer Token Authentication
 // =============================================================================
 
-/// Trait for validating bearer tokens (OAuth2, JWT, etc.)
-pub trait BearerTokenValidation: Clone + Send + Sync + 'static {
-    /// Validate a bearer token and return auth info if valid
-    fn validate(&self, token: &str) -> impl Future<Output = AuthResult> + Send;
-}
-
-/// Simple bearer token validator that checks against a static set of tokens
+/// Simple bearer token validator that checks against a static set of tokens.
 ///
-/// For production, implement `BearerTokenValidation` with:
+/// For production, implement [`Validate`] with:
 /// - JWT verification using a signing key
 /// - OAuth2 token introspection
 /// - OIDC ID token validation
@@ -161,7 +194,7 @@ impl StaticBearerValidator {
     }
 }
 
-impl BearerTokenValidation for StaticBearerValidator {
+impl Validate for StaticBearerValidator {
     async fn validate(&self, token: &str) -> AuthResult {
         if self.valid_tokens.contains(token) {
             AuthResult::Authenticated(Some(AuthInfo {
@@ -251,19 +284,100 @@ impl<S, V: Clone> Layer<S> for AuthLayer<V> {
     }
 }
 
-/// The service created by `AuthLayer`
+/// Tower service that performs authentication on incoming requests.
 ///
-/// Note: The actual Service implementation depends on the request/response
-/// types being used. For HTTP, this would typically be implemented for
-/// axum's Request/Response types. See the examples for concrete implementations.
+/// Created by [`AuthLayer`]. Extracts credentials from the configured HTTP
+/// header, validates them using the provided [`Validate`] implementation,
+/// and either forwards the request (injecting [`AuthInfo`] into request
+/// extensions) or returns an HTTP 401 response.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// // Requires the `http` feature
+/// use tower::ServiceBuilder;
+/// use tower_mcp::auth::{AuthLayer, ApiKeyValidator};
+///
+/// let validator = ApiKeyValidator::new(vec!["sk-test-key-123".to_string()]);
+///
+/// let service = ServiceBuilder::new()
+///     .layer(AuthLayer::new(validator))
+///     .service(inner_service);
+/// ```
 #[derive(Clone)]
 pub struct AuthService<S, V> {
-    /// The wrapped inner service
-    pub inner: S,
-    /// The validator used for authentication
-    pub validator: V,
-    /// The header name to extract auth tokens from
-    pub header_name: String,
+    inner: S,
+    validator: V,
+    header_name: String,
+}
+
+#[cfg(feature = "http")]
+impl<S, V> Service<axum::http::Request<axum::body::Body>> for AuthService<S, V>
+where
+    S: Service<axum::http::Request<axum::body::Body>, Response = axum::response::Response>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send,
+    S::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send,
+    V: Validate,
+{
+    type Response = axum::response::Response;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: axum::http::Request<axum::body::Body>) -> Self::Future {
+        let credential = req
+            .headers()
+            .get(&self.header_name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(extract_api_key)
+            .map(|s| s.to_owned());
+
+        let mut inner = self.inner.clone();
+        let validator = self.validator.clone();
+
+        Box::pin(async move {
+            let Some(credential) = credential else {
+                return Ok(unauthorized_response(
+                    "Missing authentication credentials. Provide via Authorization header.",
+                ));
+            };
+
+            match validator.validate(&credential).await {
+                AuthResult::Authenticated(info) => {
+                    let mut req = req;
+                    if let Some(info) = info {
+                        req.extensions_mut().insert(info);
+                    }
+                    inner.call(req).await
+                }
+                AuthResult::Failed(err) => Ok(unauthorized_response(&err.message)),
+            }
+        })
+    }
+}
+
+/// Construct an HTTP 401 Unauthorized response with a JSON-RPC error body.
+#[cfg(feature = "http")]
+fn unauthorized_response(message: &str) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "error": {
+            "code": -32001,
+            "message": message
+        },
+        "id": null
+    });
+
+    (StatusCode::UNAUTHORIZED, axum::Json(body)).into_response()
 }
 
 // =============================================================================
@@ -404,5 +518,160 @@ mod tests {
         assert!(config.is_public("/metrics/cpu"));
         assert!(!config.is_public("/api/tools"));
         assert_eq!(config.header_name, "X-API-Key");
+    }
+
+    #[test]
+    fn test_auth_layer_creates_service() {
+        let validator = ApiKeyValidator::new(vec!["key".to_string()]);
+        let layer = AuthLayer::new(validator);
+        // Wrap a no-op service to verify the Layer impl works
+        let _service: AuthService<(), ApiKeyValidator> = layer.layer(());
+    }
+
+    #[cfg(feature = "http")]
+    mod http_tests {
+        use super::*;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        /// A minimal inner service that returns 200 OK for any request
+        #[derive(Clone)]
+        struct OkService;
+
+        impl Service<Request<Body>> for OkService {
+            type Response = axum::response::Response;
+            type Error = std::convert::Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _req: Request<Body>) -> Self::Future {
+                Box::pin(async {
+                    Ok(axum::response::Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Body::empty())
+                        .unwrap())
+                })
+            }
+        }
+
+        #[tokio::test]
+        async fn test_auth_service_rejects_missing_credentials() {
+            let validator = ApiKeyValidator::new(vec!["sk-test-123".to_string()]);
+            let layer = AuthLayer::new(validator);
+            let mut service = layer.layer(OkService);
+
+            let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+
+            let resp = service.ready().await.unwrap().call(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn test_auth_service_rejects_invalid_key() {
+            let validator = ApiKeyValidator::new(vec!["sk-test-123".to_string()]);
+            let layer = AuthLayer::new(validator);
+            let mut service = layer.layer(OkService);
+
+            let req = Request::builder()
+                .uri("/")
+                .header("Authorization", "Bearer sk-wrong-key")
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = service.ready().await.unwrap().call(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn test_auth_service_accepts_valid_key() {
+            let validator = ApiKeyValidator::new(vec!["sk-test-123".to_string()]);
+            let layer = AuthLayer::new(validator);
+            let mut service = layer.layer(OkService);
+
+            let req = Request::builder()
+                .uri("/")
+                .header("Authorization", "Bearer sk-test-123")
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = service.ready().await.unwrap().call(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn test_auth_service_injects_auth_info() {
+            let validator = ApiKeyValidator::new(vec!["sk-test-123".to_string()]);
+            let layer = AuthLayer::new(validator);
+
+            // Inner service that checks for AuthInfo in extensions
+            #[derive(Clone)]
+            struct CheckAuthInfo;
+
+            impl Service<Request<Body>> for CheckAuthInfo {
+                type Response = axum::response::Response;
+                type Error = std::convert::Infallible;
+                type Future =
+                    Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+                fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                    Poll::Ready(Ok(()))
+                }
+
+                fn call(&mut self, req: Request<Body>) -> Self::Future {
+                    let has_auth = req.extensions().get::<AuthInfo>().is_some();
+                    Box::pin(async move {
+                        let status = if has_auth {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        };
+                        Ok(axum::response::Response::builder()
+                            .status(status)
+                            .body(Body::empty())
+                            .unwrap())
+                    })
+                }
+            }
+
+            let mut service = layer.layer(CheckAuthInfo);
+
+            let req = Request::builder()
+                .uri("/")
+                .header("Authorization", "Bearer sk-test-123")
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = service.ready().await.unwrap().call(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn test_auth_service_custom_header() {
+            let validator = ApiKeyValidator::new(vec!["my-key".to_string()]);
+            let layer = AuthLayer::new(validator).header_name("X-API-Key");
+            let mut service = layer.layer(OkService);
+
+            // Standard Authorization header should not work
+            let req = Request::builder()
+                .uri("/")
+                .header("Authorization", "Bearer my-key")
+                .body(Body::empty())
+                .unwrap();
+            let resp = service.ready().await.unwrap().call(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+            // Custom header should work
+            let req = Request::builder()
+                .uri("/")
+                .header("X-API-Key", "my-key")
+                .body(Body::empty())
+                .unwrap();
+            let resp = service.ready().await.unwrap().call(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
     }
 }
