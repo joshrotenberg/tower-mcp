@@ -1,5 +1,11 @@
 # tower-mcp
 
+[![Crates.io](https://img.shields.io/crates/v/tower-mcp.svg)](https://crates.io/crates/tower-mcp)
+[![Documentation](https://docs.rs/tower-mcp/badge.svg)](https://docs.rs/tower-mcp)
+[![CI](https://github.com/joshrotenberg/tower-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/joshrotenberg/tower-mcp/actions/workflows/ci.yml)
+[![License](https://img.shields.io/crates/l/tower-mcp.svg)](https://github.com/joshrotenberg/tower-mcp#license)
+[![MSRV](https://img.shields.io/crates/msrv/tower-mcp.svg)](https://github.com/joshrotenberg/tower-mcp)
+
 Tower-native [Model Context Protocol](https://modelcontextprotocol.io) (MCP) implementation for Rust.
 
 ## Overview
@@ -43,7 +49,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tower-mcp = { git = "https://github.com/joshrotenberg/tower-mcp" }
+tower-mcp = "0.1"
 ```
 
 ### Feature Flags
@@ -59,7 +65,7 @@ Example with features:
 
 ```toml
 [dependencies]
-tower-mcp = { git = "https://github.com/joshrotenberg/tower-mcp", features = ["http", "client"] }
+tower-mcp = { version = "0.1", features = ["http", "client"] }
 ```
 
 ## Quick Start
