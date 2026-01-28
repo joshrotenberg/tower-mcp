@@ -17,7 +17,7 @@ use serde_json::Value;
 
 use crate::context::RequestContext;
 use crate::error::{Error, Result};
-use crate::protocol::{CallToolResult, ToolAnnotations, ToolDefinition};
+use crate::protocol::{CallToolResult, ToolAnnotations, ToolDefinition, ToolIcon};
 
 /// Validate a tool name according to MCP spec.
 ///
@@ -81,7 +81,10 @@ pub trait ToolHandler: Send + Sync {
 /// A complete tool definition with handler
 pub struct Tool {
     pub name: String,
+    pub title: Option<String>,
     pub description: Option<String>,
+    pub output_schema: Option<Value>,
+    pub icons: Option<Vec<ToolIcon>>,
     pub annotations: Option<ToolAnnotations>,
     handler: Arc<dyn ToolHandler>,
 }
@@ -90,7 +93,10 @@ impl std::fmt::Debug for Tool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Tool")
             .field("name", &self.name)
+            .field("title", &self.title)
             .field("description", &self.description)
+            .field("output_schema", &self.output_schema)
+            .field("icons", &self.icons)
             .field("annotations", &self.annotations)
             .finish_non_exhaustive()
     }
@@ -106,8 +112,11 @@ impl Tool {
     pub fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name.clone(),
+            title: self.title.clone(),
             description: self.description.clone(),
             input_schema: self.handler.input_schema(),
+            output_schema: self.output_schema.clone(),
+            icons: self.icons.clone(),
             annotations: self.annotations.clone(),
         }
     }
@@ -164,7 +173,10 @@ impl Tool {
 /// ```
 pub struct ToolBuilder {
     name: String,
+    title: Option<String>,
     description: Option<String>,
+    output_schema: Option<Value>,
+    icons: Option<Vec<ToolIcon>>,
     annotations: Option<ToolAnnotations>,
 }
 
@@ -172,16 +184,48 @@ impl ToolBuilder {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            title: None,
             description: None,
+            output_schema: None,
+            icons: None,
             annotations: None,
         }
     }
 
-    /// Set a human-readable title for the tool (stored in annotations)
+    /// Set a human-readable title for the tool
     pub fn title(mut self, title: impl Into<String>) -> Self {
-        self.annotations
-            .get_or_insert_with(ToolAnnotations::default)
-            .title = Some(title.into());
+        self.title = Some(title.into());
+        self
+    }
+
+    /// Set the output schema (JSON Schema for structured output)
+    pub fn output_schema(mut self, schema: Value) -> Self {
+        self.output_schema = Some(schema);
+        self
+    }
+
+    /// Add an icon for the tool
+    pub fn icon(mut self, src: impl Into<String>) -> Self {
+        self.icons.get_or_insert_with(Vec::new).push(ToolIcon {
+            src: src.into(),
+            mime_type: None,
+            sizes: None,
+        });
+        self
+    }
+
+    /// Add an icon with metadata
+    pub fn icon_with_meta(
+        mut self,
+        src: impl Into<String>,
+        mime_type: Option<String>,
+        sizes: Option<Vec<String>>,
+    ) -> Self {
+        self.icons.get_or_insert_with(Vec::new).push(ToolIcon {
+            src: src.into(),
+            mime_type,
+            sizes,
+        });
         self
     }
 
@@ -233,7 +277,10 @@ impl ToolBuilder {
     {
         ToolBuilderWithHandler {
             name: self.name,
+            title: self.title,
             description: self.description,
+            output_schema: self.output_schema,
+            icons: self.icons,
             annotations: self.annotations,
             handler,
             _phantom: std::marker::PhantomData,
@@ -280,7 +327,10 @@ impl ToolBuilder {
     {
         ToolBuilderWithContextHandler {
             name: self.name,
+            title: self.title,
             description: self.description,
+            output_schema: self.output_schema,
+            icons: self.icons,
             annotations: self.annotations,
             handler,
             _phantom: std::marker::PhantomData,
@@ -298,7 +348,10 @@ impl ToolBuilder {
         validate_tool_name(&self.name)?;
         Ok(Tool {
             name: self.name,
+            title: self.title,
             description: self.description,
+            output_schema: self.output_schema,
+            icons: self.icons,
             annotations: self.annotations,
             handler: Arc::new(RawHandler { handler }),
         })
@@ -308,7 +361,10 @@ impl ToolBuilder {
 /// Builder state after handler is specified
 pub struct ToolBuilderWithHandler<I, F> {
     name: String,
+    title: Option<String>,
     description: Option<String>,
+    output_schema: Option<Value>,
+    icons: Option<Vec<ToolIcon>>,
     annotations: Option<ToolAnnotations>,
     handler: F,
     _phantom: std::marker::PhantomData<I>,
@@ -327,7 +383,10 @@ where
         validate_tool_name(&self.name)?;
         Ok(Tool {
             name: self.name,
+            title: self.title,
             description: self.description,
+            output_schema: self.output_schema,
+            icons: self.icons,
             annotations: self.annotations,
             handler: Arc::new(TypedHandler {
                 handler: self.handler,
@@ -340,7 +399,10 @@ where
 /// Builder state after context-aware handler is specified
 pub struct ToolBuilderWithContextHandler<I, F> {
     name: String,
+    title: Option<String>,
     description: Option<String>,
+    output_schema: Option<Value>,
+    icons: Option<Vec<ToolIcon>>,
     annotations: Option<ToolAnnotations>,
     handler: F,
     _phantom: std::marker::PhantomData<I>,
@@ -359,7 +421,10 @@ where
         validate_tool_name(&self.name)?;
         Ok(Tool {
             name: self.name,
+            title: self.title,
             description: self.description,
+            output_schema: self.output_schema,
+            icons: self.icons,
             annotations: self.annotations,
             handler: Arc::new(ContextAwareHandler {
                 handler: self.handler,
@@ -536,7 +601,10 @@ pub trait McpTool: Send + Sync + 'static {
         let tool = Arc::new(self);
         Ok(Tool {
             name: Self::NAME.to_string(),
+            title: None,
             description: Some(Self::DESCRIPTION.to_string()),
+            output_schema: None,
+            icons: None,
             annotations,
             handler: Arc::new(McpToolHandler { tool }),
         })
@@ -772,5 +840,44 @@ mod tests {
         // The next iteration (3) checks cancellation and returns
         assert!(result.is_error);
         assert_eq!(iterations_completed.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_tool_builder_with_enhanced_fields() {
+        let output_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "greeting": {"type": "string"}
+            }
+        });
+
+        let tool = ToolBuilder::new("greet")
+            .title("Greeting Tool")
+            .description("Greet someone")
+            .output_schema(output_schema.clone())
+            .icon("https://example.com/icon.png")
+            .icon_with_meta(
+                "https://example.com/icon-large.png",
+                Some("image/png".to_string()),
+                Some(vec!["96x96".to_string()]),
+            )
+            .handler(|input: GreetInput| async move {
+                Ok(CallToolResult::text(format!("Hello, {}!", input.name)))
+            })
+            .build()
+            .expect("valid tool name");
+
+        assert_eq!(tool.name, "greet");
+        assert_eq!(tool.title.as_deref(), Some("Greeting Tool"));
+        assert_eq!(tool.description.as_deref(), Some("Greet someone"));
+        assert_eq!(tool.output_schema, Some(output_schema));
+        assert!(tool.icons.is_some());
+        assert_eq!(tool.icons.as_ref().unwrap().len(), 2);
+
+        // Test definition includes new fields
+        let def = tool.definition();
+        assert_eq!(def.title.as_deref(), Some("Greeting Tool"));
+        assert!(def.output_schema.is_some());
+        assert!(def.icons.is_some());
     }
 }

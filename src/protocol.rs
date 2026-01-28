@@ -1055,13 +1055,36 @@ pub struct ListToolsResult {
 #[serde(rename_all = "camelCase")]
 pub struct ToolDefinition {
     pub name: String,
+    /// Human-readable title for display purposes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub input_schema: Value,
+    /// Optional JSON Schema defining expected output structure
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+    /// Optional icons for display in user interfaces
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icons: Option<Vec<ToolIcon>>,
     /// Optional annotations describing tool behavior.
     /// Note: Clients MUST consider these untrusted unless from a trusted server.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<ToolAnnotations>,
+}
+
+/// Icon for tool display in user interfaces
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolIcon {
+    /// URL or data URI of the icon
+    pub src: String,
+    /// MIME type of the icon (e.g., "image/png", "image/svg+xml")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// Available sizes (e.g., ["48x48", "96x96"])
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sizes: Option<Vec<String>>,
 }
 
 /// Annotations describing tool behavior for trust and safety.
@@ -1150,6 +1173,79 @@ impl CallToolResult {
             structured_content: Some(value),
         }
     }
+
+    /// Create a result with an image
+    pub fn image(data: impl Into<String>, mime_type: impl Into<String>) -> Self {
+        Self {
+            content: vec![Content::Image {
+                data: data.into(),
+                mime_type: mime_type.into(),
+                annotations: None,
+            }],
+            is_error: false,
+            structured_content: None,
+        }
+    }
+
+    /// Create a result with audio
+    pub fn audio(data: impl Into<String>, mime_type: impl Into<String>) -> Self {
+        Self {
+            content: vec![Content::Audio {
+                data: data.into(),
+                mime_type: mime_type.into(),
+                annotations: None,
+            }],
+            is_error: false,
+            structured_content: None,
+        }
+    }
+
+    /// Create a result with a resource link
+    pub fn resource_link(uri: impl Into<String>) -> Self {
+        Self {
+            content: vec![Content::ResourceLink {
+                uri: uri.into(),
+                name: None,
+                description: None,
+                mime_type: None,
+                annotations: None,
+            }],
+            is_error: false,
+            structured_content: None,
+        }
+    }
+
+    /// Create a result with a resource link including metadata
+    pub fn resource_link_with_meta(
+        uri: impl Into<String>,
+        name: Option<String>,
+        description: Option<String>,
+        mime_type: Option<String>,
+    ) -> Self {
+        Self {
+            content: vec![Content::ResourceLink {
+                uri: uri.into(),
+                name,
+                description,
+                mime_type,
+                annotations: None,
+            }],
+            is_error: false,
+            structured_content: None,
+        }
+    }
+
+    /// Create a result with an embedded resource
+    pub fn resource(resource: ResourceContent) -> Self {
+        Self {
+            content: vec![Content::Resource {
+                resource,
+                annotations: None,
+            }],
+            is_error: false,
+            structured_content: None,
+        }
+    }
 }
 
 /// Content types for tool results
@@ -1177,6 +1273,22 @@ pub enum Content {
     },
     Resource {
         resource: ResourceContent,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        annotations: Option<ContentAnnotations>,
+    },
+    /// Link to a resource (without embedding the content)
+    ResourceLink {
+        /// URI of the resource
+        uri: String,
+        /// Human-readable name
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        /// Description of the resource
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        /// MIME type of the resource
+        #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         annotations: Option<ContentAnnotations>,
     },
@@ -2468,5 +2580,63 @@ mod tests {
 
         let json = serde_json::to_value(&caps).unwrap();
         assert!(json["completions"].is_object());
+    }
+
+    #[test]
+    fn test_content_resource_link_serialization() {
+        let content = Content::ResourceLink {
+            uri: "file:///test.txt".to_string(),
+            name: Some("test.txt".to_string()),
+            description: Some("A test file".to_string()),
+            mime_type: Some("text/plain".to_string()),
+            annotations: None,
+        };
+        let json = serde_json::to_value(&content).unwrap();
+        assert_eq!(json["type"], "resource_link");
+        assert_eq!(json["uri"], "file:///test.txt");
+        assert_eq!(json["name"], "test.txt");
+        assert_eq!(json["description"], "A test file");
+        assert_eq!(json["mimeType"], "text/plain");
+    }
+
+    #[test]
+    fn test_call_tool_result_resource_link() {
+        let result = CallToolResult::resource_link("file:///output.json");
+        assert_eq!(result.content.len(), 1);
+        assert!(!result.is_error);
+        match &result.content[0] {
+            Content::ResourceLink { uri, .. } => assert_eq!(uri, "file:///output.json"),
+            _ => panic!("Expected ResourceLink content"),
+        }
+    }
+
+    #[test]
+    fn test_call_tool_result_image() {
+        let result = CallToolResult::image("base64data", "image/png");
+        assert_eq!(result.content.len(), 1);
+        match &result.content[0] {
+            Content::Image {
+                data, mime_type, ..
+            } => {
+                assert_eq!(data, "base64data");
+                assert_eq!(mime_type, "image/png");
+            }
+            _ => panic!("Expected Image content"),
+        }
+    }
+
+    #[test]
+    fn test_call_tool_result_audio() {
+        let result = CallToolResult::audio("audiodata", "audio/wav");
+        assert_eq!(result.content.len(), 1);
+        match &result.content[0] {
+            Content::Audio {
+                data, mime_type, ..
+            } => {
+                assert_eq!(data, "audiodata");
+                assert_eq!(mime_type, "audio/wav");
+            }
+            _ => panic!("Expected Audio content"),
+        }
     }
 }
