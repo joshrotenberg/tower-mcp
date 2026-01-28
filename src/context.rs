@@ -35,6 +35,13 @@ use crate::protocol::{ProgressParams, ProgressToken, RequestId};
 pub enum ServerNotification {
     /// Progress update for a request
     Progress(ProgressParams),
+    /// A subscribed resource has been updated
+    ResourceUpdated {
+        /// The URI of the updated resource
+        uri: String,
+    },
+    /// The list of available resources has changed
+    ResourcesListChanged,
 }
 
 /// Sender for server notifications
@@ -265,6 +272,7 @@ mod tests {
                 assert_eq!(params.total, Some(100.0));
                 assert_eq!(params.message.as_deref(), Some("Halfway"));
             }
+            _ => panic!("Expected Progress notification"),
         }
     }
 
