@@ -1,7 +1,7 @@
 //! MCP protocol types based on JSON-RPC 2.0
 //!
 //! These types follow the MCP specification (2025-03-26):
-//! https://modelcontextprotocol.io/specification/2025-03-26
+//! <https://modelcontextprotocol.io/specification/2025-03-26>
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
