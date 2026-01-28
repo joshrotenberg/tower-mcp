@@ -15,6 +15,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+use crate::context::RequestContext;
 use crate::error::{Error, Result};
 use crate::protocol::{CallToolResult, ToolAnnotations, ToolDefinition};
 
@@ -56,6 +57,23 @@ pub trait ToolHandler: Send + Sync {
     /// Execute the tool with the given arguments
     fn call(&self, args: Value) -> BoxFuture<'_, Result<CallToolResult>>;
 
+    /// Execute the tool with request context for progress/cancellation support
+    ///
+    /// The default implementation ignores the context and calls `call`.
+    /// Override this to receive progress/cancellation context.
+    fn call_with_context(
+        &self,
+        _ctx: RequestContext,
+        args: Value,
+    ) -> BoxFuture<'_, Result<CallToolResult>> {
+        self.call(args)
+    }
+
+    /// Returns true if this handler uses context (for optimization)
+    fn uses_context(&self) -> bool {
+        false
+    }
+
     /// Get the tool's input schema
     fn input_schema(&self) -> Value;
 }
@@ -94,9 +112,25 @@ impl Tool {
         }
     }
 
-    /// Call the tool
+    /// Call the tool without context
     pub fn call(&self, args: Value) -> BoxFuture<'_, Result<CallToolResult>> {
         self.handler.call(args)
+    }
+
+    /// Call the tool with request context
+    ///
+    /// Use this when you have a RequestContext available for progress/cancellation.
+    pub fn call_with_context(
+        &self,
+        ctx: RequestContext,
+        args: Value,
+    ) -> BoxFuture<'_, Result<CallToolResult>> {
+        self.handler.call_with_context(ctx, args)
+    }
+
+    /// Returns true if this tool uses context
+    pub fn uses_context(&self) -> bool {
+        self.handler.uses_context()
     }
 }
 
@@ -206,6 +240,53 @@ impl ToolBuilder {
         }
     }
 
+    /// Specify input type and context-aware handler
+    ///
+    /// The handler receives a `RequestContext` for progress reporting and
+    /// cancellation checking, along with the deserialized input.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::{ToolBuilder, CallToolResult, RequestContext};
+    /// use schemars::JsonSchema;
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Debug, Deserialize, JsonSchema)]
+    /// struct ProcessInput {
+    ///     items: Vec<String>,
+    /// }
+    ///
+    /// let tool = ToolBuilder::new("process")
+    ///     .description("Process items with progress")
+    ///     .handler_with_context(|ctx: RequestContext, input: ProcessInput| async move {
+    ///         for (i, item) in input.items.iter().enumerate() {
+    ///             if ctx.is_cancelled() {
+    ///                 return Ok(CallToolResult::error("Cancelled"));
+    ///             }
+    ///             ctx.report_progress(i as f64, Some(input.items.len() as f64), Some("Processing...")).await;
+    ///             // Process item...
+    ///         }
+    ///         Ok(CallToolResult::text("Done"))
+    ///     })
+    ///     .build()
+    ///     .expect("valid tool name");
+    /// ```
+    pub fn handler_with_context<I, F, Fut>(self, handler: F) -> ToolBuilderWithContextHandler<I, F>
+    where
+        I: JsonSchema + DeserializeOwned + Send + Sync + 'static,
+        F: Fn(RequestContext, I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
+    {
+        ToolBuilderWithContextHandler {
+            name: self.name,
+            description: self.description,
+            annotations: self.annotations,
+            handler,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
     /// Create a tool with raw JSON handling (no automatic deserialization)
     ///
     /// Returns an error if the tool name is invalid.
@@ -249,6 +330,38 @@ where
             description: self.description,
             annotations: self.annotations,
             handler: Arc::new(TypedHandler {
+                handler: self.handler,
+                _phantom: std::marker::PhantomData,
+            }),
+        })
+    }
+}
+
+/// Builder state after context-aware handler is specified
+pub struct ToolBuilderWithContextHandler<I, F> {
+    name: String,
+    description: Option<String>,
+    annotations: Option<ToolAnnotations>,
+    handler: F,
+    _phantom: std::marker::PhantomData<I>,
+}
+
+impl<I, F, Fut> ToolBuilderWithContextHandler<I, F>
+where
+    I: JsonSchema + DeserializeOwned + Send + Sync + 'static,
+    F: Fn(RequestContext, I) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
+{
+    /// Build the tool
+    ///
+    /// Returns an error if the tool name is invalid.
+    pub fn build(self) -> Result<Tool> {
+        validate_tool_name(&self.name)?;
+        Ok(Tool {
+            name: self.name,
+            description: self.description,
+            annotations: self.annotations,
+            handler: Arc::new(ContextAwareHandler {
                 handler: self.handler,
                 _phantom: std::marker::PhantomData,
             }),
@@ -309,6 +422,50 @@ where
         serde_json::json!({
             "type": "object",
             "additionalProperties": true
+        })
+    }
+}
+
+/// Handler that receives request context for progress/cancellation
+struct ContextAwareHandler<I, F> {
+    handler: F,
+    _phantom: std::marker::PhantomData<I>,
+}
+
+impl<I, F, Fut> ToolHandler for ContextAwareHandler<I, F>
+where
+    I: JsonSchema + DeserializeOwned + Send + Sync + 'static,
+    F: Fn(RequestContext, I) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
+{
+    fn call(&self, args: Value) -> BoxFuture<'_, Result<CallToolResult>> {
+        // When called without context, create a dummy context
+        let ctx = RequestContext::new(crate::protocol::RequestId::Number(0));
+        self.call_with_context(ctx, args)
+    }
+
+    fn call_with_context(
+        &self,
+        ctx: RequestContext,
+        args: Value,
+    ) -> BoxFuture<'_, Result<CallToolResult>> {
+        Box::pin(async move {
+            let input: I = serde_json::from_value(args)
+                .map_err(|e| Error::tool(format!("Invalid input: {}", e)))?;
+            (self.handler)(ctx, input).await
+        })
+    }
+
+    fn uses_context(&self) -> bool {
+        true
+    }
+
+    fn input_schema(&self) -> Value {
+        let schema = schemars::schema_for!(I);
+        serde_json::to_value(schema).unwrap_or_else(|_| {
+            serde_json::json!({
+                "type": "object"
+            })
         })
     }
 }
@@ -511,5 +668,109 @@ mod tests {
                 .raw_handler(|args: Value| async move { Ok(CallToolResult::json(args)) });
             assert!(result.is_ok(), "Expected '{}' to be valid", name);
         }
+    }
+
+    #[tokio::test]
+    async fn test_context_aware_handler() {
+        use crate::context::{RequestContext, notification_channel};
+        use crate::protocol::{ProgressToken, RequestId};
+
+        #[derive(Debug, Deserialize, JsonSchema)]
+        struct ProcessInput {
+            count: i32,
+        }
+
+        let tool = ToolBuilder::new("process")
+            .description("Process with context")
+            .handler_with_context(|ctx: RequestContext, input: ProcessInput| async move {
+                // Simulate progress reporting
+                for i in 0..input.count {
+                    if ctx.is_cancelled() {
+                        return Ok(CallToolResult::error("Cancelled"));
+                    }
+                    ctx.report_progress(i as f64, Some(input.count as f64), None)
+                        .await;
+                }
+                Ok(CallToolResult::text(format!(
+                    "Processed {} items",
+                    input.count
+                )))
+            })
+            .build()
+            .expect("valid tool name");
+
+        assert_eq!(tool.name, "process");
+        assert!(tool.uses_context());
+
+        // Test with a context that has progress token and notification sender
+        let (tx, mut rx) = notification_channel(10);
+        let ctx = RequestContext::new(RequestId::Number(1))
+            .with_progress_token(ProgressToken::Number(42))
+            .with_notification_sender(tx);
+
+        let result = tool
+            .call_with_context(ctx, serde_json::json!({"count": 3}))
+            .await
+            .unwrap();
+
+        assert!(!result.is_error);
+
+        // Check that progress notifications were sent
+        let mut progress_count = 0;
+        while rx.try_recv().is_ok() {
+            progress_count += 1;
+        }
+        assert_eq!(progress_count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_context_aware_handler_cancellation() {
+        use crate::context::RequestContext;
+        use crate::protocol::RequestId;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicI32, Ordering};
+
+        #[derive(Debug, Deserialize, JsonSchema)]
+        struct LongRunningInput {
+            iterations: i32,
+        }
+
+        let iterations_completed = Arc::new(AtomicI32::new(0));
+        let iterations_ref = iterations_completed.clone();
+
+        let tool = ToolBuilder::new("long_running")
+            .description("Long running task")
+            .handler_with_context(move |ctx: RequestContext, input: LongRunningInput| {
+                let completed = iterations_ref.clone();
+                async move {
+                    for i in 0..input.iterations {
+                        if ctx.is_cancelled() {
+                            return Ok(CallToolResult::error("Cancelled"));
+                        }
+                        completed.fetch_add(1, Ordering::SeqCst);
+                        // Simulate work
+                        tokio::task::yield_now().await;
+                        // Cancel after iteration 2
+                        if i == 2 {
+                            ctx.cancellation_token().cancel();
+                        }
+                    }
+                    Ok(CallToolResult::text("Done"))
+                }
+            })
+            .build()
+            .expect("valid tool name");
+
+        let ctx = RequestContext::new(RequestId::Number(1));
+
+        let result = tool
+            .call_with_context(ctx, serde_json::json!({"iterations": 10}))
+            .await
+            .unwrap();
+
+        // Should have been cancelled after 3 iterations (0, 1, 2)
+        // The next iteration (3) checks cancellation and returns
+        assert!(result.is_error);
+        assert_eq!(iterations_completed.load(Ordering::SeqCst), 3);
     }
 }
