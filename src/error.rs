@@ -1,4 +1,31 @@
 //! Error types for tower-mcp
+//!
+//! ## JSON-RPC Error Codes
+//!
+//! Standard JSON-RPC 2.0 error codes are defined in the specification:
+//! <https://www.jsonrpc.org/specification#error_object>
+//!
+//! | Code   | Message          | Meaning                                  |
+//! |--------|------------------|------------------------------------------|
+//! | -32700 | Parse error      | Invalid JSON was received                |
+//! | -32600 | Invalid Request  | The JSON sent is not a valid Request     |
+//! | -32601 | Method not found | The method does not exist / is not available |
+//! | -32602 | Invalid params   | Invalid method parameter(s)              |
+//! | -32603 | Internal error   | Internal JSON-RPC error                  |
+//!
+//! ## MCP-Specific Error Codes
+//!
+//! MCP uses the server error range (-32000 to -32099) for protocol-specific errors:
+//!
+//! | Code   | Name            | Meaning                                  |
+//! |--------|-----------------|------------------------------------------|
+//! | -32000 | ConnectionClosed| Transport connection was closed          |
+//! | -32001 | RequestTimeout  | Request exceeded timeout                 |
+//! | -32002 | ResourceNotFound| Resource not found                       |
+//! | -32003 | AlreadySubscribed| Resource already subscribed             |
+//! | -32004 | NotSubscribed   | Resource not subscribed (for unsubscribe)|
+//! | -32005 | SessionNotFound | Session not found or expired             |
+//! | -32006 | SessionRequired | MCP-Session-Id header is required        |
 
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +59,10 @@ pub enum McpErrorCode {
     AlreadySubscribed = -32003,
     /// Resource not subscribed (for unsubscribe)
     NotSubscribed = -32004,
+    /// Session not found or expired - client should re-initialize
+    SessionNotFound = -32005,
+    /// Session ID is required but was not provided
+    SessionRequired = -32006,
 }
 
 impl McpErrorCode {
@@ -132,6 +163,36 @@ impl JsonRpcError {
         Self::mcp_error(
             McpErrorCode::NotSubscribed,
             format!("Not subscribed to: {}", uri),
+        )
+    }
+
+    /// Session not found or expired
+    ///
+    /// Clients receiving this error should re-initialize the connection.
+    /// The session may have expired due to inactivity or server restart.
+    pub fn session_not_found() -> Self {
+        Self::mcp_error(
+            McpErrorCode::SessionNotFound,
+            "Session not found or expired. Please re-initialize the connection.",
+        )
+    }
+
+    /// Session not found with a specific session ID
+    pub fn session_not_found_with_id(session_id: &str) -> Self {
+        Self::mcp_error(
+            McpErrorCode::SessionNotFound,
+            format!(
+                "Session '{}' not found or expired. Please re-initialize the connection.",
+                session_id
+            ),
+        )
+    }
+
+    /// Session ID is required
+    pub fn session_required() -> Self {
+        Self::mcp_error(
+            McpErrorCode::SessionRequired,
+            "MCP-Session-Id header is required for this request.",
         )
     }
 }

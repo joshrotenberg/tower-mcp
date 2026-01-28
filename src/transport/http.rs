@@ -2,10 +2,38 @@
 //!
 //! Implements the Streamable HTTP transport from MCP specification 2025-11-25.
 //!
-//! Features:
+//! ## Features
+//!
 //! - Single endpoint for POST (requests) and GET (SSE notifications)
 //! - Session management via `MCP-Session-Id` header
 //! - SSE streaming for server notifications and progress updates
+//! - Configurable session TTL and cleanup
+//!
+//! ## Session Reconnection
+//!
+//! When a session is not found (e.g., after server restart or session expiration),
+//! the server returns a JSON-RPC error with code `-32005` (SessionNotFound).
+//! Clients should handle this by re-initializing the connection:
+//!
+//! ```text
+//! Client                          Server
+//!   |                               |
+//!   |-- tools/list (old session) -->|
+//!   |<-- error: SessionNotFound ----|
+//!   |                               |
+//!   |-- initialize --------------->|
+//!   |<-- result + new session id ---|
+//!   |                               |
+//!   |-- tools/list (new session) -->|
+//!   |<-- result -------------------|
+//! ```
+//!
+//! ## Error Codes
+//!
+//! | Code    | Name           | Description                              |
+//! |---------|----------------|------------------------------------------|
+//! | -32005  | SessionNotFound| Session expired or server restarted      |
+//! | -32006  | SessionRequired| MCP-Session-Id header missing            |
 //!
 //! # Example
 //!
@@ -463,14 +491,19 @@ async fn handle_post(
         let session_id = match get_session_id(&headers) {
             Some(id) => id,
             None => {
-                return (StatusCode::BAD_REQUEST, "Missing MCP-Session-Id header").into_response();
+                // Return JSON-RPC error so clients can detect and handle this
+                return json_rpc_error_response(None, JsonRpcError::session_required());
             }
         };
 
         match state.sessions.get(&session_id).await {
             Some(s) => s,
             None => {
-                return (StatusCode::NOT_FOUND, "Session not found or expired").into_response();
+                // Return JSON-RPC error with session info so clients know to re-initialize
+                return json_rpc_error_response(
+                    None,
+                    JsonRpcError::session_not_found_with_id(&session_id),
+                );
             }
         }
     };
@@ -556,14 +589,17 @@ async fn handle_get(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
     let session_id = match get_session_id(&headers) {
         Some(id) => id,
         None => {
-            return (StatusCode::BAD_REQUEST, "Missing MCP-Session-Id header").into_response();
+            return json_rpc_error_response(None, JsonRpcError::session_required());
         }
     };
 
     let session = match state.sessions.get(&session_id).await {
         Some(s) => s,
         None => {
-            return (StatusCode::NOT_FOUND, "Session not found or expired").into_response();
+            return json_rpc_error_response(
+                None,
+                JsonRpcError::session_not_found_with_id(&session_id),
+            );
         }
     };
 
@@ -594,7 +630,7 @@ async fn handle_delete(State(state): State<Arc<AppState>>, headers: HeaderMap) -
     let session_id = match get_session_id(&headers) {
         Some(id) => id,
         None => {
-            return (StatusCode::BAD_REQUEST, "Missing MCP-Session-Id header").into_response();
+            return json_rpc_error_response(None, JsonRpcError::session_required());
         }
     };
 
@@ -602,7 +638,10 @@ async fn handle_delete(State(state): State<Arc<AppState>>, headers: HeaderMap) -
         tracing::info!(session_id = %session_id, "Session terminated");
         StatusCode::OK.into_response()
     } else {
-        (StatusCode::NOT_FOUND, "Session not found").into_response()
+        // For DELETE, it's okay if the session doesn't exist - it's already gone
+        // Return OK instead of an error for idempotency
+        tracing::debug!(session_id = %session_id, "Session already removed or never existed");
+        StatusCode::OK.into_response()
     }
 }
 
@@ -681,7 +720,16 @@ mod tests {
 
         let response = app.oneshot(request).await.unwrap();
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // We now return JSON-RPC errors for session issues
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Verify it's a JSON-RPC error response
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("error").is_some());
+        assert_eq!(json["error"]["code"], -32006); // SessionRequired
     }
 
     #[tokio::test]
@@ -750,7 +798,16 @@ mod tests {
             .unwrap();
 
         let response = app.oneshot(list_request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        // We now return JSON-RPC errors for session issues
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Verify it's a JSON-RPC error response
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("error").is_some());
+        assert_eq!(json["error"]["code"], -32005); // SessionNotFound
     }
 
     #[tokio::test]
@@ -817,7 +874,16 @@ mod tests {
             .unwrap();
 
         let response = app.oneshot(list_request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        // We now return JSON-RPC errors for session issues
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Verify it's a JSON-RPC error response
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("error").is_some());
+        assert_eq!(json["error"]["code"], -32005); // SessionNotFound
     }
 
     #[tokio::test]
