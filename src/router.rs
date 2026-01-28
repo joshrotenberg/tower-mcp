@@ -733,6 +733,14 @@ impl McpRouter {
                 }))
             }
 
+            McpRequest::SetLoggingLevel(params) => {
+                // Store the log level for filtering outgoing log notifications
+                // For now, we just accept the request - actual filtering would be
+                // implemented in the notification sending logic
+                tracing::debug!(level = ?params.level, "Client set logging level");
+                Ok(McpResponse::SetLoggingLevel(EmptyResult {}))
+            }
+
             McpRequest::Unknown { method, .. } => {
                 Err(Error::JsonRpc(JsonRpcError::method_not_found(&method)))
             }

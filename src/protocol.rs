@@ -345,6 +345,8 @@ pub enum McpRequest {
     CancelTask(CancelTaskParams),
     /// Ping (keepalive)
     Ping,
+    /// Set logging level
+    SetLoggingLevel(SetLogLevelParams),
     /// Unknown method
     Unknown {
         method: String,
@@ -372,6 +374,7 @@ impl McpRequest {
             McpRequest::GetTaskResult(_) => "tasks/result",
             McpRequest::CancelTask(_) => "tasks/cancel",
             McpRequest::Ping => "ping",
+            McpRequest::SetLoggingLevel(_) => "logging/setLevel",
             McpRequest::Unknown { method, .. } => method,
         }
     }
@@ -456,6 +459,7 @@ pub enum McpResponse {
     GetTaskInfo(TaskInfo),
     GetTaskResult(GetTaskResultResult),
     CancelTask(CancelTaskResult),
+    SetLoggingLevel(EmptyResult),
     Pong(EmptyResult),
     Empty(EmptyResult),
 }
@@ -1169,6 +1173,10 @@ impl McpRequest {
                 Ok(McpRequest::CancelTask(p))
             }
             "ping" => Ok(McpRequest::Ping),
+            "logging/setLevel" => {
+                let p: SetLogLevelParams = serde_json::from_value(params)?;
+                Ok(McpRequest::SetLoggingLevel(p))
+            }
             method => Ok(McpRequest::Unknown {
                 method: method.to_string(),
                 params: req.params.clone(),
