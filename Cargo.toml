@@ -2,12 +2,16 @@
 name = "tower-mcp"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 authors = ["Josh Rotenberg <joshrotenberg@gmail.com>"]
 license = "MIT OR Apache-2.0"
 description = "Tower-native Model Context Protocol (MCP) implementation"
+documentation = "https://docs.rs/tower-mcp"
+homepage = "https://github.com/joshrotenberg/tower-mcp"
 repository = "https://github.com/joshrotenberg/tower-mcp"
-keywords = ["mcp", "tower", "json-rpc", "ai", "agents"]
-categories = ["network-programming", "web-programming"]
+readme = "README.md"
+keywords = ["mcp", "tower", "json-rpc", "ai", "llm"]
+categories = ["network-programming", "asynchronous"]
 
 [workspace]
 members = ["examples/crates-mcp"]
@@ -49,7 +53,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [features]
 default = []
 # Transport features
-stdio = []
 http = ["dep:axum", "dep:hyper", "dep:http", "dep:http-body-util", "dep:tokio-stream", "dep:uuid"]
 websocket = ["dep:axum", "dep:tokio-tungstenite", "dep:uuid"]
 childproc = []
