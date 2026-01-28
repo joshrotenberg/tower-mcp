@@ -43,6 +43,7 @@
 //! ```
 
 pub mod async_task;
+pub mod auth;
 pub mod client;
 pub mod context;
 pub mod error;
