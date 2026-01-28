@@ -42,6 +42,7 @@
 //!     .tool(evaluate);
 //! ```
 
+pub mod context;
 pub mod error;
 pub mod prompt;
 pub mod protocol;
@@ -52,6 +53,10 @@ pub mod tool;
 pub mod transport;
 
 // Re-exports
+pub use context::{
+    CancellationToken, NotificationReceiver, NotificationSender, RequestContext,
+    RequestContextBuilder, ServerNotification,
+};
 pub use error::{Error, Result, ToolError};
 pub use prompt::{Prompt, PromptBuilder, PromptHandler};
 pub use protocol::{

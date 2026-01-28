@@ -6,11 +6,12 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 
 use tower_service::Service;
 
+use crate::context::{CancellationToken, NotificationSender, RequestContext};
 use crate::error::{Error, JsonRpcError, Result};
 use crate::prompt::Prompt;
 use crate::protocol::*;
@@ -70,6 +71,10 @@ struct McpRouterInner {
     tools: HashMap<String, Arc<Tool>>,
     resources: HashMap<String, Arc<Resource>>,
     prompts: HashMap<String, Arc<Prompt>>,
+    /// In-flight requests for cancellation tracking (shared across clones)
+    in_flight: Arc<RwLock<HashMap<RequestId, CancellationToken>>>,
+    /// Channel for sending notifications to connected clients
+    notification_tx: Option<NotificationSender>,
 }
 
 impl McpRouter {
@@ -83,9 +88,76 @@ impl McpRouter {
                 tools: HashMap::new(),
                 resources: HashMap::new(),
                 prompts: HashMap::new(),
+                in_flight: Arc::new(RwLock::new(HashMap::new())),
+                notification_tx: None,
             }),
             session: SessionState::new(),
         }
+    }
+
+    /// Set the notification sender for progress reporting
+    ///
+    /// This is typically called by the transport layer to receive notifications.
+    pub fn with_notification_sender(mut self, tx: NotificationSender) -> Self {
+        Arc::make_mut(&mut self.inner).notification_tx = Some(tx);
+        self
+    }
+
+    /// Get the notification sender (if configured)
+    pub fn notification_sender(&self) -> Option<&NotificationSender> {
+        self.inner.notification_tx.as_ref()
+    }
+
+    /// Create a request context for tracking a request
+    ///
+    /// This registers the request for cancellation tracking and sets up
+    /// progress reporting if configured.
+    pub fn create_context(
+        &self,
+        request_id: RequestId,
+        progress_token: Option<ProgressToken>,
+    ) -> RequestContext {
+        let ctx = RequestContext::new(request_id.clone());
+
+        // Set up progress token if provided
+        let ctx = if let Some(token) = progress_token {
+            ctx.with_progress_token(token)
+        } else {
+            ctx
+        };
+
+        // Set up notification sender if configured
+        let ctx = if let Some(tx) = &self.inner.notification_tx {
+            ctx.with_notification_sender(tx.clone())
+        } else {
+            ctx
+        };
+
+        // Register for cancellation tracking
+        let token = ctx.cancellation_token();
+        if let Ok(mut in_flight) = self.inner.in_flight.write() {
+            in_flight.insert(request_id, token);
+        }
+
+        ctx
+    }
+
+    /// Remove a request from tracking (called when request completes)
+    pub fn complete_request(&self, request_id: &RequestId) {
+        if let Ok(mut in_flight) = self.inner.in_flight.write() {
+            in_flight.remove(request_id);
+        }
+    }
+
+    /// Cancel a tracked request
+    fn cancel_request(&self, request_id: &RequestId) -> bool {
+        if let Ok(in_flight) = self.inner.in_flight.read()
+            && let Some(token) = in_flight.get(request_id)
+        {
+            token.cancel();
+            return true;
+        }
+        false
     }
 
     /// Set server info
@@ -153,7 +225,7 @@ impl McpRouter {
     }
 
     /// Handle an MCP request
-    async fn handle(&self, request: McpRequest) -> Result<McpResponse> {
+    async fn handle(&self, request_id: RequestId, request: McpRequest) -> Result<McpResponse> {
         // Enforce session state - reject requests before initialization
         let method = request.method_name();
         if !self.session.is_request_allowed(method) {
@@ -167,6 +239,10 @@ impl McpRouter {
                 method
             ))));
         }
+
+        // Create request context for tracking (only for potentially long-running requests)
+        // TODO: Extract progress_token from request params._meta.progressToken
+        let ctx = self.create_context(request_id, None);
 
         match request {
             McpRequest::Initialize(params) => {
@@ -217,7 +293,9 @@ impl McpRouter {
                     })?;
 
                 tracing::debug!(tool = %params.name, "Calling tool");
-                let result = tool.call(params.arguments).await?;
+                let result = tool
+                    .call_with_context(ctx.clone(), params.arguments)
+                    .await?;
 
                 Ok(McpResponse::CallTool(result))
             }
@@ -316,12 +394,19 @@ impl McpRouter {
                 }
             }
             McpNotification::Cancelled(params) => {
-                tracing::debug!(
-                    request_id = ?params.request_id,
-                    reason = ?params.reason,
-                    "Request cancellation requested"
-                );
-                // TODO: Implement request cancellation tracking
+                if self.cancel_request(&params.request_id) {
+                    tracing::info!(
+                        request_id = ?params.request_id,
+                        reason = ?params.reason,
+                        "Request cancelled"
+                    );
+                } else {
+                    tracing::debug!(
+                        request_id = ?params.request_id,
+                        reason = ?params.reason,
+                        "Cancellation requested for unknown request"
+                    );
+                }
             }
             McpNotification::Progress(params) => {
                 tracing::trace!(
@@ -394,10 +479,13 @@ impl Service<RouterRequest> for McpRouter {
 
     fn call(&mut self, req: RouterRequest) -> Self::Future {
         let router = self.clone();
+        let request_id = req.id.clone();
         Box::pin(async move {
-            let result = router.handle(req.inner).await;
+            let result = router.handle(req.id, req.inner).await;
+            // Clean up tracking after request completes
+            router.complete_request(&request_id);
             Ok(RouterResponse {
-                id: req.id,
+                id: request_id,
                 inner: result.map_err(|e| match e {
                     Error::JsonRpc(err) => err,
                     Error::Tool(err) => JsonRpcError::internal_error(err.to_string()),
