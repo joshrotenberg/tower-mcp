@@ -43,6 +43,7 @@
 //! ```
 
 pub mod async_task;
+pub mod client;
 pub mod context;
 pub mod error;
 pub mod jsonrpc;
@@ -56,6 +57,7 @@ pub mod transport;
 
 // Re-exports
 pub use async_task::{Task, TaskStore};
+pub use client::{ClientTransport, McpClient, StdioClientTransport};
 pub use context::{
     NotificationReceiver, NotificationSender, RequestContext, RequestContextBuilder,
     ServerNotification,

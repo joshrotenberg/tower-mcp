@@ -29,6 +29,9 @@ schemars = "1.2"
 # Error handling
 thiserror = "2"
 
+# Async traits
+async-trait = "0.1"
+
 # Tracing
 tracing = "0.1"
 
