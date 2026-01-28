@@ -60,8 +60,9 @@ pub mod transport;
 pub use async_task::{Task, TaskStore};
 pub use client::{ClientTransport, McpClient, StdioClientTransport};
 pub use context::{
-    NotificationReceiver, NotificationSender, RequestContext, RequestContextBuilder,
-    ServerNotification,
+    ChannelClientRequester, ClientRequester, ClientRequesterHandle, NotificationReceiver,
+    NotificationSender, OutgoingRequest, OutgoingRequestReceiver, OutgoingRequestSender,
+    RequestContext, RequestContextBuilder, ServerNotification, outgoing_request_channel,
 };
 pub use error::{Error, Result, ToolError};
 pub use jsonrpc::JsonRpcService;
@@ -84,7 +85,7 @@ pub use resource::{
 pub use router::McpRouter;
 pub use session::{SessionPhase, SessionState};
 pub use tool::{Tool, ToolBuilder, ToolHandler};
-pub use transport::{StdioTransport, SyncStdioTransport};
+pub use transport::{BidirectionalStdioTransport, StdioTransport, SyncStdioTransport};
 
 #[cfg(feature = "http")]
 pub use transport::HttpTransport;
