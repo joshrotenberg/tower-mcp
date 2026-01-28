@@ -213,15 +213,17 @@ let tool = ToolBuilder::new("dynamic")
 - [x] McpTool trait for complex tools
 - [x] McpRouter with tower Service impl
 - [x] JsonRpcService layer for protocol framing
-- [x] Basic tests
+- [x] Stdio transport (async and sync)
+- [x] Session management (initialize handshake, capability negotiation)
+- [x] Resources support (list, read) with ResourceBuilder and McpResource trait
+- [x] Prompts support (list, get) with PromptBuilder and McpPrompt trait
+- [x] Batch request support
+- [x] Comprehensive integration tests (29 tests)
 
 ### TODO
-- [ ] Stdio transport (simplest, good for testing)
 - [ ] HTTP transport (with SSE for notifications)
 - [ ] WebSocket transport
-- [ ] Session management (initialize handshake, capability negotiation)
-- [ ] Resources support (read, subscribe)
-- [ ] Prompts support
+- [ ] Resource subscriptions
 - [ ] Progress notifications
 - [ ] Cancellation support
 - [ ] Tower layer examples (tracing, metrics, auth)

@@ -240,10 +240,6 @@ impl McpRouter {
             ))));
         }
 
-        // Create request context for tracking (only for potentially long-running requests)
-        // TODO: Extract progress_token from request params._meta.progressToken
-        let ctx = self.create_context(request_id, None);
-
         match request {
             McpRequest::Initialize(params) => {
                 tracing::info!(
@@ -292,10 +288,12 @@ impl McpRouter {
                         Error::JsonRpc(JsonRpcError::method_not_found(&params.name))
                     })?;
 
+                // Extract progress token from request metadata
+                let progress_token = params.meta.and_then(|m| m.progress_token);
+                let ctx = self.create_context(request_id, progress_token);
+
                 tracing::debug!(tool = %params.name, "Calling tool");
-                let result = tool
-                    .call_with_context(ctx.clone(), params.arguments)
-                    .await?;
+                let result = tool.call_with_context(ctx, params.arguments).await?;
 
                 Ok(McpResponse::CallTool(result))
             }
@@ -547,22 +545,25 @@ impl<S> JsonRpcService<S> {
             .into_iter()
             .map(|req| {
                 let inner = self.inner.clone();
-                async move { process_single_request(inner, req).await }
+                let req_id = req.id.clone();
+                async move {
+                    match process_single_request(inner, req).await {
+                        Ok(resp) => resp,
+                        Err(e) => {
+                            // Convert errors to error responses instead of dropping
+                            JsonRpcResponse::error(
+                                Some(req_id),
+                                JsonRpcError::internal_error(e.to_string()),
+                            )
+                        }
+                    }
+                }
             })
             .collect();
 
-        let results: Vec<JsonRpcResponse> = futures::future::join_all(futures)
-            .await
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .collect();
+        let results: Vec<JsonRpcResponse> = futures::future::join_all(futures).await;
 
-        if results.is_empty() {
-            return Err(Error::JsonRpc(JsonRpcError::internal_error(
-                "All batch requests failed",
-            )));
-        }
-
+        // Results will never be empty since we converted all errors to responses
         Ok(results)
     }
 
@@ -677,17 +678,25 @@ where
                         .into_iter()
                         .map(|req| {
                             let inner = inner.clone();
-                            async move { process_single_request(inner, req).await }
+                            let req_id = req.id.clone();
+                            async move {
+                                match process_single_request(inner, req).await {
+                                    Ok(resp) => resp,
+                                    Err(e) => {
+                                        // Convert errors to error responses instead of dropping
+                                        JsonRpcResponse::error(
+                                            Some(req_id),
+                                            JsonRpcError::internal_error(e.to_string()),
+                                        )
+                                    }
+                                }
+                            }
                         })
                         .collect();
 
-                    let results: Vec<JsonRpcResponse> = futures::future::join_all(futures)
-                        .await
-                        .into_iter()
-                        .filter_map(|r| r.ok())
-                        .collect();
+                    let results: Vec<JsonRpcResponse> = futures::future::join_all(futures).await;
 
-                    // If all requests failed to produce responses, return error
+                    // Empty results only possible if input was empty (already handled above)
                     if results.is_empty() {
                         return Ok(JsonRpcResponseMessage::Single(JsonRpcResponse::error(
                             None,
@@ -829,6 +838,7 @@ mod tests {
             inner: McpRequest::CallTool(CallToolParams {
                 name: "add".to_string(),
                 arguments: serde_json::json!({"a": 2, "b": 3}),
+                meta: None,
             }),
         };
 
@@ -955,5 +965,183 @@ mod tests {
 
         let result = service.call_batch(vec![]).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_progress_token_extraction() {
+        use crate::context::{RequestContext, ServerNotification, notification_channel};
+        use crate::protocol::ProgressToken;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Track whether progress was reported
+        let progress_reported = Arc::new(AtomicBool::new(false));
+        let progress_ref = progress_reported.clone();
+
+        // Create a tool that reports progress
+        let tool = ToolBuilder::new("progress_tool")
+            .description("Tool that reports progress")
+            .handler_with_context(move |ctx: RequestContext, _input: AddInput| {
+                let reported = progress_ref.clone();
+                async move {
+                    // Report progress - this should work if token was extracted
+                    ctx.report_progress(50.0, Some(100.0), Some("Halfway"))
+                        .await;
+                    reported.store(true, Ordering::SeqCst);
+                    Ok(CallToolResult::text("done"))
+                }
+            })
+            .build()
+            .expect("valid tool name");
+
+        // Set up notification channel
+        let (tx, mut rx) = notification_channel(10);
+        let router = McpRouter::new().with_notification_sender(tx).tool(tool);
+        let mut service = JsonRpcService::new(router.clone());
+
+        // Initialize
+        init_jsonrpc_service(&mut service, &router).await;
+
+        // Call tool WITH progress token in _meta
+        let req = JsonRpcRequest::new(1, "tools/call").with_params(serde_json::json!({
+            "name": "progress_tool",
+            "arguments": {"a": 1, "b": 2},
+            "_meta": {
+                "progressToken": "test-token-123"
+            }
+        }));
+
+        let resp = service.call_single(req).await.unwrap();
+
+        // Verify the tool was called successfully
+        match resp {
+            JsonRpcResponse::Result(_) => {}
+            JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+        }
+
+        // Verify progress was reported by handler
+        assert!(progress_reported.load(Ordering::SeqCst));
+
+        // Verify progress notification was sent through channel
+        let notification = rx.try_recv().expect("Expected progress notification");
+        match notification {
+            ServerNotification::Progress(params) => {
+                assert_eq!(
+                    params.progress_token,
+                    ProgressToken::String("test-token-123".to_string())
+                );
+                assert_eq!(params.progress, 50.0);
+                assert_eq!(params.total, Some(100.0));
+                assert_eq!(params.message.as_deref(), Some("Halfway"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_without_progress_token() {
+        use crate::context::{RequestContext, notification_channel};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let progress_attempted = Arc::new(AtomicBool::new(false));
+        let progress_ref = progress_attempted.clone();
+
+        let tool = ToolBuilder::new("no_token_tool")
+            .description("Tool that tries to report progress without token")
+            .handler_with_context(move |ctx: RequestContext, _input: AddInput| {
+                let attempted = progress_ref.clone();
+                async move {
+                    // Try to report progress - should be a no-op without token
+                    ctx.report_progress(50.0, Some(100.0), None).await;
+                    attempted.store(true, Ordering::SeqCst);
+                    Ok(CallToolResult::text("done"))
+                }
+            })
+            .build()
+            .expect("valid tool name");
+
+        let (tx, mut rx) = notification_channel(10);
+        let router = McpRouter::new().with_notification_sender(tx).tool(tool);
+        let mut service = JsonRpcService::new(router.clone());
+
+        init_jsonrpc_service(&mut service, &router).await;
+
+        // Call tool WITHOUT progress token
+        let req = JsonRpcRequest::new(1, "tools/call").with_params(serde_json::json!({
+            "name": "no_token_tool",
+            "arguments": {"a": 1, "b": 2}
+        }));
+
+        let resp = service.call_single(req).await.unwrap();
+        assert!(matches!(resp, JsonRpcResponse::Result(_)));
+
+        // Handler was called
+        assert!(progress_attempted.load(Ordering::SeqCst));
+
+        // But no notification was sent (no progress token)
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_batch_errors_returned_not_dropped() {
+        let add_tool = ToolBuilder::new("add")
+            .description("Add two numbers")
+            .handler(|input: AddInput| async move {
+                Ok(CallToolResult::text(format!("{}", input.a + input.b)))
+            })
+            .build()
+            .expect("valid tool name");
+
+        let router = McpRouter::new().tool(add_tool);
+        let mut service = JsonRpcService::new(router.clone());
+
+        init_jsonrpc_service(&mut service, &router).await;
+
+        // Create a batch with one valid and one invalid request
+        let requests = vec![
+            // Valid request
+            JsonRpcRequest::new(1, "tools/call").with_params(serde_json::json!({
+                "name": "add",
+                "arguments": {"a": 10, "b": 20}
+            })),
+            // Invalid request - tool doesn't exist
+            JsonRpcRequest::new(2, "tools/call").with_params(serde_json::json!({
+                "name": "nonexistent_tool",
+                "arguments": {}
+            })),
+            // Another valid request
+            JsonRpcRequest::new(3, "ping"),
+        ];
+
+        let responses = service.call_batch(requests).await.unwrap();
+
+        // All three requests should have responses (errors are not dropped)
+        assert_eq!(responses.len(), 3);
+
+        // First should be success
+        match &responses[0] {
+            JsonRpcResponse::Result(r) => {
+                assert_eq!(r.id, RequestId::Number(1));
+            }
+            JsonRpcResponse::Error(_) => panic!("Expected success for first request"),
+        }
+
+        // Second should be an error (tool not found)
+        match &responses[1] {
+            JsonRpcResponse::Error(e) => {
+                assert_eq!(e.id, Some(RequestId::Number(2)));
+                // Error should indicate method not found
+                assert!(e.error.message.contains("not found") || e.error.code == -32601);
+            }
+            JsonRpcResponse::Result(_) => panic!("Expected error for second request"),
+        }
+
+        // Third should be success
+        match &responses[2] {
+            JsonRpcResponse::Result(r) => {
+                assert_eq!(r.id, RequestId::Number(3));
+            }
+            JsonRpcResponse::Error(_) => panic!("Expected success for third request"),
+        }
     }
 }

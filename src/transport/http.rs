@@ -39,7 +39,8 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
     Router,
@@ -77,6 +78,8 @@ struct Session {
     router: McpRouter,
     /// Broadcast channel for SSE notifications
     notifications_tx: broadcast::Sender<String>,
+    /// Timestamp of last activity (seconds since UNIX epoch)
+    last_accessed: AtomicU64,
 }
 
 impl Session {
@@ -86,14 +89,56 @@ impl Session {
             id: uuid::Uuid::new_v4().to_string(),
             router,
             notifications_tx,
+            last_accessed: AtomicU64::new(current_timestamp_ms()),
         }
+    }
+
+    /// Update the last accessed timestamp
+    fn touch(&self) {
+        self.last_accessed
+            .store(current_timestamp_ms(), Ordering::Relaxed);
+    }
+
+    /// Check if the session has expired
+    fn is_expired(&self, ttl_ms: u64) -> bool {
+        let last = self.last_accessed.load(Ordering::Relaxed);
+        let now = current_timestamp_ms();
+        now.saturating_sub(last) > ttl_ms
     }
 }
 
+/// Get current timestamp in milliseconds since UNIX epoch
+fn current_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Default session TTL: 30 minutes
+pub const DEFAULT_SESSION_TTL_SECS: u64 = 30 * 60;
+
+/// Default maximum number of sessions
+pub const DEFAULT_MAX_SESSIONS: usize = 10_000;
+
 /// Session store for managing multiple client sessions
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct SessionStore {
     sessions: RwLock<HashMap<String, Arc<Session>>>,
+    /// Session time-to-live in milliseconds
+    ttl_ms: u64,
+    /// Maximum number of sessions
+    max_sessions: usize,
+}
+
+impl Default for SessionStore {
+    fn default() -> Self {
+        Self {
+            sessions: RwLock::new(HashMap::new()),
+            ttl_ms: DEFAULT_SESSION_TTL_SECS * 1000,
+            max_sessions: DEFAULT_MAX_SESSIONS,
+        }
+    }
 }
 
 impl SessionStore {
@@ -101,21 +146,86 @@ impl SessionStore {
         Self::default()
     }
 
-    async fn create(&self, router: McpRouter) -> Arc<Session> {
-        let session = Arc::new(Session::new(router));
+    fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl_ms = ttl.as_millis() as u64;
+        self
+    }
+
+    fn with_max_sessions(mut self, max: usize) -> Self {
+        self.max_sessions = max;
+        self
+    }
+
+    async fn create(&self, router: McpRouter) -> Option<Arc<Session>> {
         let mut sessions = self.sessions.write().await;
+
+        // Check capacity
+        if sessions.len() >= self.max_sessions {
+            tracing::warn!(
+                max = self.max_sessions,
+                current = sessions.len(),
+                "Session limit reached, rejecting new session"
+            );
+            return None;
+        }
+
+        let session = Arc::new(Session::new(router));
         sessions.insert(session.id.clone(), session.clone());
-        session
+        tracing::debug!(session_id = %session.id, total = sessions.len(), "Created new session");
+        Some(session)
     }
 
     async fn get(&self, id: &str) -> Option<Arc<Session>> {
         let sessions = self.sessions.read().await;
-        sessions.get(id).cloned()
+        if let Some(session) = sessions.get(id) {
+            // Check if expired
+            if session.is_expired(self.ttl_ms) {
+                tracing::debug!(session_id = %id, "Session expired on access");
+                return None;
+            }
+            // Update last accessed time
+            session.touch();
+            Some(session.clone())
+        } else {
+            None
+        }
     }
 
     async fn remove(&self, id: &str) -> bool {
         let mut sessions = self.sessions.write().await;
-        sessions.remove(id).is_some()
+        let removed = sessions.remove(id).is_some();
+        if removed {
+            tracing::debug!(session_id = %id, total = sessions.len(), "Removed session");
+        }
+        removed
+    }
+
+    /// Remove all expired sessions
+    async fn cleanup_expired(&self) -> usize {
+        let mut sessions = self.sessions.write().await;
+        let before = sessions.len();
+        sessions.retain(|id, session| {
+            let expired = session.is_expired(self.ttl_ms);
+            if expired {
+                tracing::debug!(session_id = %id, "Removing expired session");
+            }
+            !expired
+        });
+        let removed = before - sessions.len();
+        if removed > 0 {
+            tracing::info!(
+                removed = removed,
+                remaining = sessions.len(),
+                "Cleaned up expired sessions"
+            );
+        }
+        removed
+    }
+
+    /// Get the number of active sessions
+    #[cfg(test)]
+    async fn len(&self) -> usize {
+        self.sessions.read().await.len()
     }
 }
 
@@ -134,10 +244,27 @@ struct AppState {
 /// HTTP transport for MCP servers
 ///
 /// Implements the Streamable HTTP transport from the MCP specification.
+///
+/// # Session Management
+///
+/// Sessions are automatically cleaned up after the configured TTL (default 30 minutes).
+/// Use [`session_ttl`](Self::session_ttl) and [`max_sessions`](Self::max_sessions) to configure.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// # use tower_mcp::{McpRouter, transport::http::HttpTransport};
+/// # use std::time::Duration;
+/// let transport = HttpTransport::new(McpRouter::new())
+///     .session_ttl(Duration::from_secs(60 * 60))  // 1 hour
+///     .max_sessions(1000);
+/// ```
 pub struct HttpTransport {
     router: McpRouter,
     validate_origin: bool,
     allowed_origins: Vec<String>,
+    session_ttl: Duration,
+    max_sessions: usize,
 }
 
 impl HttpTransport {
@@ -147,7 +274,27 @@ impl HttpTransport {
             router,
             validate_origin: true,
             allowed_origins: vec![],
+            session_ttl: Duration::from_secs(DEFAULT_SESSION_TTL_SECS),
+            max_sessions: DEFAULT_MAX_SESSIONS,
         }
+    }
+
+    /// Set the session time-to-live
+    ///
+    /// Sessions that are inactive for longer than this duration will be
+    /// automatically removed. Default is 30 minutes.
+    pub fn session_ttl(mut self, ttl: Duration) -> Self {
+        self.session_ttl = ttl;
+        self
+    }
+
+    /// Set the maximum number of concurrent sessions
+    ///
+    /// Once this limit is reached, new session requests will be rejected
+    /// with a 503 Service Unavailable response. Default is 10,000.
+    pub fn max_sessions(mut self, max: usize) -> Self {
+        self.max_sessions = max;
+        self
     }
 
     /// Disable Origin header validation (not recommended for production)
@@ -163,13 +310,10 @@ impl HttpTransport {
     }
 
     /// Build the axum router for this transport
+    ///
+    /// This also starts a background task that periodically cleans up expired sessions.
     pub fn into_router(self) -> Router {
-        let state = Arc::new(AppState {
-            router_template: self.router,
-            sessions: SessionStore::new(),
-            validate_origin: self.validate_origin,
-            allowed_origins: self.allowed_origins,
-        });
+        let state = self.create_app_state();
 
         Router::new()
             .route("/", post(handle_post))
@@ -179,13 +323,10 @@ impl HttpTransport {
     }
 
     /// Build an axum router mounted at a specific path
+    ///
+    /// This also starts a background task that periodically cleans up expired sessions.
     pub fn into_router_at(self, path: &str) -> Router {
-        let state = Arc::new(AppState {
-            router_template: self.router,
-            sessions: SessionStore::new(),
-            validate_origin: self.validate_origin,
-            allowed_origins: self.allowed_origins,
-        });
+        let state = self.create_app_state();
 
         let mcp_router = Router::new()
             .route("/", post(handle_post))
@@ -194,6 +335,33 @@ impl HttpTransport {
             .with_state(state);
 
         Router::new().nest(path, mcp_router)
+    }
+
+    /// Create app state and start background cleanup task
+    fn create_app_state(self) -> Arc<AppState> {
+        let sessions = SessionStore::new()
+            .with_ttl(self.session_ttl)
+            .with_max_sessions(self.max_sessions);
+
+        let state = Arc::new(AppState {
+            router_template: self.router,
+            sessions,
+            validate_origin: self.validate_origin,
+            allowed_origins: self.allowed_origins,
+        });
+
+        // Start background session cleanup task
+        let cleanup_state = state.clone();
+        let cleanup_interval = self.session_ttl / 2; // Run cleanup at half the TTL interval
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(cleanup_interval.max(Duration::from_secs(60)));
+            loop {
+                interval.tick().await;
+                cleanup_state.sessions.cleanup_expired().await;
+            }
+        });
+
+        state
     }
 
     /// Serve the transport on the given address
@@ -298,7 +466,16 @@ async fn handle_post(
     // Get or create session
     let session = if is_init {
         // Create new session for initialize
-        state.sessions.create(state.router_template.clone()).await
+        match state.sessions.create(state.router_template.clone()).await {
+            Some(s) => s,
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Server at capacity, try again later",
+                )
+                    .into_response();
+            }
+        }
     } else {
         // Require existing session
         let session_id = match get_session_id(&headers) {
@@ -592,5 +769,113 @@ mod tests {
 
         let response = app.oneshot(list_request).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_session_expiration() {
+        // Create a session store with very short TTL
+        let store = SessionStore::new().with_ttl(Duration::from_millis(50));
+
+        let router = create_test_router();
+        let session = store.create(router.clone()).await.unwrap();
+        let session_id = session.id.clone();
+
+        // Session should be accessible immediately
+        assert!(store.get(&session_id).await.is_some());
+
+        // Wait for expiration
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Session should now be expired
+        assert!(store.get(&session_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_session_touch_extends_lifetime() {
+        let store = SessionStore::new().with_ttl(Duration::from_millis(100));
+
+        let router = create_test_router();
+        let session = store.create(router.clone()).await.unwrap();
+        let session_id = session.id.clone();
+
+        // Wait a bit but not enough to expire
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // Access session (should touch and extend lifetime)
+        let session = store.get(&session_id).await.unwrap();
+        assert_eq!(session.id, session_id);
+
+        // Wait again
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // Session should still be valid because we touched it
+        assert!(store.get(&session_id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_max_sessions_limit() {
+        let store = SessionStore::new().with_max_sessions(2);
+
+        let router = create_test_router();
+
+        // Create two sessions - should succeed
+        let s1 = store.create(router.clone()).await;
+        let s2 = store.create(router.clone()).await;
+        assert!(s1.is_some());
+        assert!(s2.is_some());
+
+        // Third session should fail
+        let s3 = store.create(router.clone()).await;
+        assert!(s3.is_none());
+
+        // Remove one session
+        store.remove(&s1.unwrap().id).await;
+
+        // Now we can create another
+        let s4 = store.create(router.clone()).await;
+        assert!(s4.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_expired_sessions() {
+        let store = SessionStore::new().with_ttl(Duration::from_millis(50));
+
+        let router = create_test_router();
+
+        // Create multiple sessions
+        let s1 = store.create(router.clone()).await.unwrap();
+        let s2 = store.create(router.clone()).await.unwrap();
+        let s3 = store.create(router.clone()).await.unwrap();
+
+        assert_eq!(store.len().await, 3);
+
+        // Wait for expiration
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Touch one session to keep it alive
+        s2.touch();
+
+        // Run cleanup
+        let removed = store.cleanup_expired().await;
+
+        // Two sessions should have been removed
+        assert_eq!(removed, 2);
+        assert_eq!(store.len().await, 1);
+
+        // The touched session should still exist
+        assert!(store.get(&s2.id).await.is_some());
+        assert!(store.get(&s1.id).await.is_none());
+        assert!(store.get(&s3.id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_session_ttl_config() {
+        let transport = HttpTransport::new(create_test_router())
+            .session_ttl(Duration::from_secs(3600))
+            .max_sessions(500);
+
+        // Verify config is stored
+        assert_eq!(transport.session_ttl, Duration::from_secs(3600));
+        assert_eq!(transport.max_sessions, 500);
     }
 }

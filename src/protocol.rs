@@ -323,11 +323,32 @@ pub enum ProgressToken {
     Number(i64),
 }
 
-/// Request metadata that can include progress token
+/// Request metadata that can include progress token.
+///
+/// This is sent by clients in the `_meta` field of requests to enable
+/// progress reporting for long-running operations.
+///
+/// # Example
+///
+/// ```json
+/// {
+///   "method": "tools/call",
+///   "params": {
+///     "name": "long_running_tool",
+///     "arguments": {},
+///     "_meta": {
+///       "progressToken": "token-123"
+///     }
+///   }
+/// }
+/// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestMeta {
-    /// Progress token for receiving progress notifications
+    /// Progress token for receiving progress notifications.
+    ///
+    /// When provided, the server can send `notifications/progress` messages
+    /// back to the client with updates on the operation's progress.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress_token: Option<ProgressToken>,
 }
@@ -494,10 +515,14 @@ fn is_true(v: &bool) -> bool {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CallToolParams {
     pub name: String,
     #[serde(default)]
     pub arguments: Value,
+    /// Optional metadata including progress token
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<RequestMeta>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -636,9 +661,15 @@ pub struct ResourceDefinition {
     pub mime_type: Option<String>,
 }
 
+/// Parameters for reading a resource
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReadResourceParams {
+    /// The URI of the resource to read
     pub uri: String,
+    /// Optional metadata including progress token
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<RequestMeta>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -692,11 +723,18 @@ pub struct PromptArgument {
     pub required: bool,
 }
 
+/// Parameters for getting a prompt
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GetPromptParams {
+    /// The name of the prompt to get
     pub name: String,
+    /// Arguments to substitute into the prompt template
     #[serde(default)]
     pub arguments: std::collections::HashMap<String, String>,
+    /// Optional metadata including progress token
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<RequestMeta>,
 }
 
 #[derive(Debug, Clone, Serialize)]
