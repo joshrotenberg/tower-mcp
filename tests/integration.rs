@@ -1101,3 +1101,164 @@ async fn test_capabilities_all() {
         JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
     }
 }
+
+// =============================================================================
+// TestClient tests (#124)
+// =============================================================================
+
+#[cfg(feature = "testing")]
+mod test_client_tests {
+    use super::*;
+    use tower_mcp::TestClient;
+
+    #[tokio::test]
+    async fn test_client_initialize_and_list_tools() {
+        let router = create_test_router();
+        let mut client = TestClient::from_router(router);
+
+        let init = client.initialize().await;
+        assert!(init.get("protocolVersion").is_some());
+        assert!(init.get("serverInfo").is_some());
+
+        let tools = client.list_tools().await;
+        assert_eq!(tools.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_client_call_tool_text() {
+        let router = create_test_router();
+        let mut client = TestClient::from_router(router);
+        client.initialize().await;
+
+        let result = client
+            .call_tool("echo", serde_json::json!({"message": "hello"}))
+            .await;
+        assert_eq!(result.all_text(), "hello");
+        assert_eq!(result.first_text(), Some("hello"));
+        assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn test_client_call_tool_add() {
+        let router = create_test_router();
+        let mut client = TestClient::from_router(router);
+        client.initialize().await;
+
+        let result = client
+            .call_tool("add", serde_json::json!({"a": 17, "b": 25}))
+            .await;
+        assert_eq!(result.all_text(), "42");
+    }
+
+    #[tokio::test]
+    async fn test_client_call_tool_expect_error() {
+        let router = create_test_router();
+        let mut client = TestClient::from_router(router);
+        client.initialize().await;
+
+        // Non-existent tool returns JSON-RPC error
+        let error = client
+            .call_tool_expect_error("nonexistent", serde_json::json!({}))
+            .await;
+        assert!(error.get("code").is_some() || error.get("message").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_client_resources() {
+        let router = create_router_with_resources_and_prompts();
+        let mut client = TestClient::from_router(router);
+        client.initialize().await;
+
+        let resources = client.list_resources().await;
+        assert_eq!(resources.len(), 3);
+
+        let result = client.read_resource("file:///README.md").await;
+        assert_eq!(
+            result.first_text(),
+            Some("# Test Project\n\nThis is a test project.")
+        );
+        assert_eq!(result.first_uri(), Some("file:///README.md"));
+    }
+
+    #[tokio::test]
+    async fn test_client_prompts() {
+        let router = create_router_with_resources_and_prompts();
+        let mut client = TestClient::from_router(router);
+        client.initialize().await;
+
+        let prompts = client.list_prompts().await;
+        assert_eq!(prompts.len(), 3);
+
+        let mut args = HashMap::new();
+        args.insert("name".to_string(), "Alice".to_string());
+        let result = client.get_prompt("greet", args).await;
+        let text = result.first_message_text().unwrap();
+        assert!(text.contains("Alice"));
+    }
+
+    #[tokio::test]
+    async fn test_client_send_request_expect_error() {
+        let router = create_test_router();
+        let mut client = TestClient::from_router(router);
+        client.initialize().await;
+
+        let error = client
+            .send_request_expect_error("unknown/method", None)
+            .await;
+        let code = error.get("code").and_then(|v| v.as_i64()).unwrap();
+        assert_eq!(code, -32601); // Method not found
+    }
+
+    #[tokio::test]
+    async fn test_client_raw_request() {
+        let router = create_test_router();
+        let mut client = TestClient::from_router(router);
+        client.initialize().await;
+
+        let raw = client
+            .call_tool_raw("echo", serde_json::json!({"message": "raw"}))
+            .await;
+        let content = raw.get("content").unwrap().as_array().unwrap();
+        assert_eq!(content[0].get("text").unwrap().as_str().unwrap(), "raw");
+    }
+
+    #[tokio::test]
+    async fn test_client_ping() {
+        let router = create_test_router();
+        let mut client = TestClient::from_router(router);
+
+        // Ping works even before initialization
+        let _result = client.send_request("ping", None).await;
+    }
+
+    #[tokio::test]
+    async fn test_content_as_text() {
+        use tower_mcp::Content;
+
+        let text_content = Content::Text {
+            text: "hello".to_string(),
+            annotations: None,
+        };
+        assert_eq!(text_content.as_text(), Some("hello"));
+
+        let image_content = Content::Image {
+            data: "abc".to_string(),
+            mime_type: "image/png".to_string(),
+            annotations: None,
+        };
+        assert_eq!(image_content.as_text(), None);
+    }
+
+    #[tokio::test]
+    async fn test_read_resource_result_accessors() {
+        let result = ReadResourceResult::text("file://test.txt", "content here");
+        assert_eq!(result.first_text(), Some("content here"));
+        assert_eq!(result.first_uri(), Some("file://test.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_get_prompt_result_accessor() {
+        let result = GetPromptResult::user_message("Analyze this.");
+        assert_eq!(result.first_message_text(), Some("Analyze this."));
+    }
+}

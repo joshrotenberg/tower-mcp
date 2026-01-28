@@ -100,6 +100,7 @@
 //! - `websocket` - WebSocket transport for bidirectional communication
 //! - `childproc` - Child process transport for subprocess management
 //! - `oauth` - OAuth 2.1 resource server support (token validation, metadata endpoint)
+//! - `testing` - Test utilities ([`TestClient`]) for ergonomic MCP server testing
 //!
 //! ## MCP Specification
 //!
@@ -119,6 +120,8 @@ pub mod protocol;
 pub mod resource;
 pub mod router;
 pub mod session;
+#[cfg(feature = "testing")]
+pub mod testing;
 pub mod tool;
 pub mod transport;
 
@@ -168,3 +171,6 @@ pub use transport::McpBoxService;
 
 #[cfg(feature = "childproc")]
 pub use transport::{ChildProcessConnection, ChildProcessTransport};
+
+#[cfg(feature = "testing")]
+pub use testing::TestClient;
