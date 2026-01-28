@@ -7,7 +7,8 @@
 //!
 //! ## API Key Authentication
 //!
-//! ```rust,no_run
+//! ```rust,ignore
+//! // Requires the `http` feature
 //! use tower_mcp::auth::{AuthConfig, ApiKeyValidator};
 //! use tower_mcp::{McpRouter, HttpTransport};
 //! use std::sync::Arc;
