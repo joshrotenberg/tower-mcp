@@ -22,7 +22,7 @@ use crate::error::{Error, JsonRpcError, Result};
 use crate::protocol::{
     JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, JsonRpcResponseMessage, McpRequest,
 };
-use crate::router::{RouterRequest, RouterResponse};
+use crate::router::{Extensions, RouterRequest, RouterResponse};
 
 /// Tower layer that adds JSON-RPC 2.0 framing to an MCP service.
 ///
@@ -80,12 +80,25 @@ impl<S> Layer<S> for JsonRpcLayer {
 /// ```
 pub struct JsonRpcService<S> {
     inner: S,
+    extensions: Extensions,
 }
 
 impl<S> JsonRpcService<S> {
     /// Create a new JSON-RPC service wrapping the given inner service
     pub fn new(inner: S) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            extensions: Extensions::new(),
+        }
+    }
+
+    /// Set extensions to inject into every `RouterRequest` created by this service.
+    ///
+    /// This is used by transports to bridge data (e.g., `TokenClaims`) from the
+    /// HTTP/WebSocket layer into the MCP request pipeline.
+    pub fn with_extensions(mut self, ext: Extensions) -> Self {
+        self.extensions = ext;
+        self
     }
 
     /// Process a single JSON-RPC request
@@ -97,7 +110,7 @@ impl<S> JsonRpcService<S> {
             + 'static,
         S::Future: Send,
     {
-        process_single_request(self.inner.clone(), req).await
+        process_single_request(self.inner.clone(), req, self.extensions.clone()).await
     }
 
     /// Process a batch of JSON-RPC requests concurrently
@@ -123,9 +136,10 @@ impl<S> JsonRpcService<S> {
             .into_iter()
             .map(|req| {
                 let inner = self.inner.clone();
+                let extensions = self.extensions.clone();
                 let req_id = req.id.clone();
                 async move {
-                    match process_single_request(inner, req).await {
+                    match process_single_request(inner, req, extensions).await {
                         Ok(resp) => resp,
                         Err(e) => {
                             // Convert errors to error responses instead of dropping
@@ -174,6 +188,7 @@ where
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
+            extensions: self.extensions.clone(),
         }
     }
 }
@@ -197,6 +212,7 @@ where
 
     fn call(&mut self, req: JsonRpcRequest) -> Self::Future {
         let mut inner = self.inner.clone();
+        let extensions = self.extensions.clone();
         Box::pin(async move {
             // Parse the MCP request from JSON-RPC
             let mcp_request = McpRequest::from_jsonrpc(&req)?;
@@ -205,6 +221,7 @@ where
             let router_req = RouterRequest {
                 id: req.id,
                 inner: mcp_request,
+                extensions,
             };
 
             // Call the inner service
@@ -236,10 +253,11 @@ where
 
     fn call(&mut self, msg: JsonRpcMessage) -> Self::Future {
         let inner = self.inner.clone();
+        let extensions = self.extensions.clone();
         Box::pin(async move {
             match msg {
                 JsonRpcMessage::Single(req) => {
-                    let response = process_single_request(inner, req).await?;
+                    let response = process_single_request(inner, req, extensions).await?;
                     Ok(JsonRpcResponseMessage::Single(response))
                 }
                 JsonRpcMessage::Batch(requests) => {
@@ -256,9 +274,10 @@ where
                         .into_iter()
                         .map(|req| {
                             let inner = inner.clone();
+                            let extensions = extensions.clone();
                             let req_id = req.id.clone();
                             async move {
-                                match process_single_request(inner, req).await {
+                                match process_single_request(inner, req, extensions).await {
                                     Ok(resp) => resp,
                                     Err(e) => {
                                         // Convert errors to error responses instead of dropping
@@ -293,6 +312,7 @@ where
 async fn process_single_request<S>(
     mut inner: S,
     req: JsonRpcRequest,
+    extensions: Extensions,
 ) -> std::result::Result<JsonRpcResponse, Error>
 where
     S: Service<RouterRequest, Response = RouterResponse, Error = std::convert::Infallible>
@@ -320,6 +340,7 @@ where
     let router_req = RouterRequest {
         id: req.id,
         inner: mcp_request,
+        extensions,
     };
 
     // Call the inner service

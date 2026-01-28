@@ -26,6 +26,7 @@
 //! | -32004 | NotSubscribed   | Resource not subscribed (for unsubscribe)|
 //! | -32005 | SessionNotFound | Session not found or expired             |
 //! | -32006 | SessionRequired | MCP-Session-Id header is required        |
+//! | -32007 | Forbidden       | Access forbidden (insufficient scope)    |
 
 use serde::{Deserialize, Serialize};
 
@@ -70,6 +71,8 @@ pub enum McpErrorCode {
     SessionNotFound = -32005,
     /// Session ID is required but was not provided
     SessionRequired = -32006,
+    /// Access forbidden (insufficient scope or authorization)
+    Forbidden = -32007,
 }
 
 impl McpErrorCode {
@@ -201,6 +204,11 @@ impl JsonRpcError {
             McpErrorCode::SessionRequired,
             "MCP-Session-Id header is required for this request.",
         )
+    }
+
+    /// Access forbidden (insufficient scope or authorization)
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self::mcp_error(McpErrorCode::Forbidden, message)
     }
 }
 

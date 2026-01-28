@@ -200,6 +200,135 @@ impl ScopePolicy {
     }
 }
 
+// =============================================================================
+// ScopeEnforcementLayer -- tower middleware at the MCP RouterRequest level
+// =============================================================================
+
+use std::convert::Infallible;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use tower::Layer;
+use tower_service::Service;
+
+use crate::error::JsonRpcError;
+use crate::protocol::McpRequest;
+use crate::router::{RouterRequest, RouterResponse};
+
+/// Tower layer that enforces OAuth scope requirements at the MCP request level.
+///
+/// Unlike [`OAuthLayer`](super::OAuthLayer) which operates at the HTTP transport
+/// level, `ScopeEnforcementLayer` operates on [`RouterRequest`] and can perform
+/// per-operation scope checks (e.g., different scopes for different tools).
+///
+/// The middleware extracts [`TokenClaims`] from [`RouterRequest::extensions`]. If
+/// no claims are present, the request is passed through unchanged -- this allows
+/// the middleware to compose gracefully without OAuth.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use std::time::Duration;
+/// use tower_mcp::McpRouter;
+/// use tower_mcp::oauth::{ScopePolicy, ScopeEnforcementLayer};
+/// use tower_mcp::transport::http::HttpTransport;
+///
+/// let policy = ScopePolicy::new()
+///     .default_scope("mcp:read")
+///     .tool_scope("admin_tool", "mcp:admin");
+///
+/// let router = McpRouter::new().server_info("my-server", "1.0.0");
+/// let transport = HttpTransport::new(router)
+///     .layer(ScopeEnforcementLayer::new(policy));
+/// ```
+#[derive(Debug, Clone)]
+pub struct ScopeEnforcementLayer {
+    policy: ScopePolicy,
+}
+
+impl ScopeEnforcementLayer {
+    /// Create a new scope enforcement layer with the given policy.
+    pub fn new(policy: ScopePolicy) -> Self {
+        Self { policy }
+    }
+}
+
+impl<S> Layer<S> for ScopeEnforcementLayer {
+    type Service = ScopeEnforcementService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        ScopeEnforcementService {
+            inner,
+            policy: self.policy.clone(),
+        }
+    }
+}
+
+/// Tower service that enforces OAuth scope requirements on MCP requests.
+///
+/// Created by [`ScopeEnforcementLayer`]. For each incoming `RouterRequest`:
+///
+/// 1. Extracts [`TokenClaims`] from `req.extensions`
+/// 2. If no claims are present, passes the request through (composable without OAuth)
+/// 3. Matches the request type (`CallTool`, `ReadResource`, `GetPrompt`, etc.)
+/// 4. Checks the appropriate scope requirement from the [`ScopePolicy`]
+/// 5. On failure, returns a `RouterResponse` with a JSON-RPC forbidden error
+/// 6. On success, forwards to the inner service
+#[derive(Debug, Clone)]
+pub struct ScopeEnforcementService<S> {
+    inner: S,
+    policy: ScopePolicy,
+}
+
+impl<S> Service<RouterRequest> for ScopeEnforcementService<S>
+where
+    S: Service<RouterRequest, Response = RouterResponse, Error = Infallible>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send,
+{
+    type Response = RouterResponse;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<RouterResponse, Infallible>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: RouterRequest) -> Self::Future {
+        // Extract claims from extensions; if absent, pass through
+        let claims = req.extensions.get::<TokenClaims>().cloned();
+
+        let Some(claims) = claims else {
+            // No OAuth context -- pass through
+            let fut = self.inner.call(req);
+            return Box::pin(fut);
+        };
+
+        // Check scope based on request type
+        let check_result = match &req.inner {
+            McpRequest::CallTool(params) => self.policy.check_tool(&params.name, &claims),
+            McpRequest::ReadResource(params) => self.policy.check_resource(&params.uri, &claims),
+            McpRequest::GetPrompt(params) => self.policy.check_prompt(&params.name, &claims),
+            // All other request types use the default scope check
+            _ => self.policy.check_default(&claims),
+        };
+
+        if let Err(err) = check_result {
+            let response = RouterResponse {
+                id: req.id,
+                inner: Err(JsonRpcError::forbidden(err.to_string())),
+            };
+            return Box::pin(async move { Ok(response) });
+        }
+
+        let fut = self.inner.call(req);
+        Box::pin(fut)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

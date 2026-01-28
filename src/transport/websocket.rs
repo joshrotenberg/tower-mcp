@@ -290,13 +290,45 @@ impl WebSocketTransport {
     }
 }
 
-/// Handle WebSocket upgrade
-async fn handle_websocket(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+/// Handle WebSocket upgrade.
+///
+/// Uses a raw `Request` extractor and performs the WebSocket upgrade manually
+/// so we can access HTTP request extensions (e.g., `TokenClaims` from OAuth
+/// middleware) before upgrading.
+async fn handle_websocket(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+) -> Response {
+    use axum::extract::FromRequestParts;
+    use axum::response::IntoResponse;
+
+    let (mut parts, _body) = request.into_parts();
+
+    // Bridge TokenClaims from HTTP extensions to MCP extensions
+    #[allow(unused_mut)]
+    let mut mcp_extensions = crate::router::Extensions::new();
+    #[cfg(feature = "oauth")]
+    {
+        if let Some(claims) = parts.extensions.get::<crate::oauth::token::TokenClaims>() {
+            mcp_extensions.insert(claims.clone());
+        }
+    }
+
+    // Perform the WebSocket upgrade from request parts
+    let ws: WebSocketUpgrade = match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
+        Ok(ws) => ws,
+        Err(e) => return e.into_response(),
+    };
+
+    ws.on_upgrade(move |socket| handle_socket(socket, state, mcp_extensions))
 }
 
 /// Handle an individual WebSocket connection
-async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
+async fn handle_socket(
+    socket: WebSocket,
+    state: Arc<AppState>,
+    mcp_extensions: crate::router::Extensions,
+) {
     let session = state
         .sessions
         .create(state.router_template.clone(), state.service_factory.clone())
@@ -306,9 +338,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     tracing::info!(session_id = %session_id, "WebSocket connection established");
 
     if state.sampling_enabled {
-        handle_socket_bidirectional(socket, session, &session_id).await;
+        handle_socket_bidirectional(socket, session, &session_id, mcp_extensions).await;
     } else {
-        handle_socket_simple(socket, session, &session_id).await;
+        handle_socket_simple(socket, session, &session_id, mcp_extensions).await;
     }
 
     // Cleanup session
@@ -317,8 +349,13 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 }
 
 /// Handle WebSocket connection without sampling (simple mode)
-async fn handle_socket_simple(socket: WebSocket, session: Arc<Session>, session_id: &str) {
-    let mut service = JsonRpcService::new(session.make_service());
+async fn handle_socket_simple(
+    socket: WebSocket,
+    session: Arc<Session>,
+    session_id: &str,
+    mcp_extensions: crate::router::Extensions,
+) {
+    let mut service = JsonRpcService::new(session.make_service()).with_extensions(mcp_extensions);
     let (mut sender, mut receiver) = socket.split();
 
     // Process incoming messages
@@ -397,7 +434,12 @@ async fn handle_socket_simple(socket: WebSocket, session: Arc<Session>, session_
 }
 
 /// Handle WebSocket connection with sampling support (bidirectional mode)
-async fn handle_socket_bidirectional(socket: WebSocket, session: Arc<Session>, session_id: &str) {
+async fn handle_socket_bidirectional(
+    socket: WebSocket,
+    session: Arc<Session>,
+    session_id: &str,
+    _mcp_extensions: crate::router::Extensions,
+) {
     // Create channels for outgoing requests
     let (request_tx, mut request_rx): (OutgoingRequestSender, OutgoingRequestReceiver) =
         outgoing_request_channel(32);
@@ -410,7 +452,8 @@ async fn handle_socket_bidirectional(socket: WebSocket, session: Arc<Session>, s
         .router
         .clone()
         .with_client_requester(client_requester);
-    let mut service = JsonRpcService::new((session.service_factory)(router.clone()));
+    let mut service = JsonRpcService::new((session.service_factory)(router.clone()))
+        .with_extensions(_mcp_extensions);
 
     // Track pending outgoing requests
     let pending_requests: Arc<Mutex<HashMap<RequestId, PendingRequest>>> =

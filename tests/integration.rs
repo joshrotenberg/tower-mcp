@@ -7,9 +7,9 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use std::collections::HashMap;
 use tower_mcp::{
-    CallToolResult, GetPromptResult, JsonRpcRequest, JsonRpcResponse, JsonRpcService, McpRouter,
-    PromptBuilder, PromptMessage, PromptRole, ReadResourceResult, ResourceBuilder, ResourceContent,
-    ToolBuilder,
+    CallToolResult, Extensions, GetPromptResult, JsonRpcRequest, JsonRpcResponse, JsonRpcService,
+    McpRouter, PromptBuilder, PromptMessage, PromptRole, ReadResourceResult, ResourceBuilder,
+    ResourceContent, ToolBuilder,
 };
 
 // =============================================================================
@@ -1260,5 +1260,230 @@ mod test_client_tests {
     async fn test_get_prompt_result_accessor() {
         let result = GetPromptResult::user_message("Analyze this.");
         assert_eq!(result.first_message_text(), Some("Analyze this."));
+    }
+}
+
+// =============================================================================
+// Scope enforcement tests (#127)
+// =============================================================================
+
+#[cfg(feature = "oauth")]
+mod scope_enforcement_tests {
+    use super::*;
+    use tower_mcp::oauth::{ScopeEnforcementLayer, ScopePolicy, TokenClaims};
+    use tower_mcp::transport::service::CatchError;
+
+    /// Helper: create a JsonRpcService with a scope enforcement middleware,
+    /// optionally injecting TokenClaims into extensions.
+    fn make_service_with_scope(
+        router: McpRouter,
+        policy: ScopePolicy,
+        claims: Option<TokenClaims>,
+    ) -> JsonRpcService<
+        CatchError<
+            tower::util::BoxCloneService<
+                tower_mcp::RouterRequest,
+                tower_mcp::RouterResponse,
+                std::convert::Infallible,
+            >,
+        >,
+    > {
+        use tower::ServiceBuilder;
+
+        let svc = ServiceBuilder::new()
+            .layer_fn(CatchError::new)
+            .layer(ScopeEnforcementLayer::new(policy))
+            .service(router);
+
+        let boxed = tower::util::BoxCloneService::new(svc);
+        let wrapped = CatchError::new(boxed);
+
+        let mut ext = Extensions::new();
+        if let Some(c) = claims {
+            ext.insert(c);
+        }
+
+        JsonRpcService::new(wrapped).with_extensions(ext)
+    }
+
+    fn test_claims(scopes: &str) -> TokenClaims {
+        TokenClaims {
+            sub: Some("test-user".to_string()),
+            iss: None,
+            aud: None,
+            exp: None,
+            scope: Some(scopes.to_string()),
+            client_id: None,
+            extra: HashMap::new(),
+        }
+    }
+
+    async fn initialize(
+        router: &McpRouter,
+        service: &mut JsonRpcService<
+            CatchError<
+                tower::util::BoxCloneService<
+                    tower_mcp::RouterRequest,
+                    tower_mcp::RouterResponse,
+                    std::convert::Infallible,
+                >,
+            >,
+        >,
+    ) {
+        let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": { "name": "test", "version": "1.0" }
+        }));
+        service.call_single(init_req).await.unwrap();
+        router.handle_notification(tower_mcp::protocol::McpNotification::Initialized);
+    }
+
+    #[tokio::test]
+    async fn test_scope_enforcement_blocks_tool_without_required_scope() {
+        let router = create_test_router();
+        let policy = ScopePolicy::new().tool_scope("echo", "mcp:admin");
+        let claims = test_claims("mcp:read");
+        let mut service = make_service_with_scope(router.clone(), policy, Some(claims));
+
+        initialize(&router, &mut service).await;
+
+        let call_req = JsonRpcRequest::new(2, "tools/call").with_params(serde_json::json!({
+            "name": "echo",
+            "arguments": { "message": "hello" }
+        }));
+        let resp = service.call_single(call_req).await.unwrap();
+
+        match resp {
+            JsonRpcResponse::Error(e) => {
+                assert_eq!(e.error.code, -32007); // Forbidden
+                assert!(
+                    e.error.message.contains("insufficient"),
+                    "Expected 'insufficient' in error message, got: {}",
+                    e.error.message
+                );
+            }
+            JsonRpcResponse::Result(_) => panic!("Expected forbidden error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scope_enforcement_allows_tool_with_required_scope() {
+        let router = create_test_router();
+        let policy = ScopePolicy::new().tool_scope("echo", "mcp:read");
+        let claims = test_claims("mcp:read mcp:write");
+        let mut service = make_service_with_scope(router.clone(), policy, Some(claims));
+
+        initialize(&router, &mut service).await;
+
+        let call_req = JsonRpcRequest::new(2, "tools/call").with_params(serde_json::json!({
+            "name": "echo",
+            "arguments": { "message": "hello" }
+        }));
+        let resp = service.call_single(call_req).await.unwrap();
+
+        match resp {
+            JsonRpcResponse::Result(r) => {
+                let content = r.result.get("content").unwrap().as_array().unwrap();
+                let text = content[0].get("text").unwrap().as_str().unwrap();
+                assert_eq!(text, "hello");
+            }
+            JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scope_enforcement_pass_through_without_claims() {
+        let router = create_test_router();
+        let policy = ScopePolicy::new().tool_scope("echo", "mcp:admin");
+        // No claims -- should pass through
+        let mut service = make_service_with_scope(router.clone(), policy, None);
+
+        initialize(&router, &mut service).await;
+
+        let call_req = JsonRpcRequest::new(2, "tools/call").with_params(serde_json::json!({
+            "name": "echo",
+            "arguments": { "message": "no auth" }
+        }));
+        let resp = service.call_single(call_req).await.unwrap();
+
+        match resp {
+            JsonRpcResponse::Result(r) => {
+                let content = r.result.get("content").unwrap().as_array().unwrap();
+                let text = content[0].get("text").unwrap().as_str().unwrap();
+                assert_eq!(text, "no auth");
+            }
+            JsonRpcResponse::Error(e) => panic!("Expected pass-through, got error: {:?}", e),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scope_enforcement_resource_scope() {
+        let router = create_router_with_resources_and_prompts();
+        let policy = ScopePolicy::new().resource_scope("file:///config.json", "mcp:config");
+        let claims = test_claims("mcp:read");
+        let mut service = make_service_with_scope(router.clone(), policy, Some(claims));
+
+        initialize(&router, &mut service).await;
+
+        let read_req = JsonRpcRequest::new(2, "resources/read").with_params(serde_json::json!({
+            "uri": "file:///config.json"
+        }));
+        let resp = service.call_single(read_req).await.unwrap();
+
+        match resp {
+            JsonRpcResponse::Error(e) => {
+                assert_eq!(e.error.code, -32007);
+            }
+            JsonRpcResponse::Result(_) => panic!("Expected forbidden error for resource"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scope_enforcement_prompt_scope() {
+        let router = create_router_with_resources_and_prompts();
+        let policy = ScopePolicy::new().prompt_scope("greet", "mcp:prompt");
+        let claims = test_claims("mcp:read");
+        let mut service = make_service_with_scope(router.clone(), policy, Some(claims));
+
+        initialize(&router, &mut service).await;
+
+        let get_req = JsonRpcRequest::new(2, "prompts/get").with_params(serde_json::json!({
+            "name": "greet",
+            "arguments": { "name": "Alice" }
+        }));
+        let resp = service.call_single(get_req).await.unwrap();
+
+        match resp {
+            JsonRpcResponse::Error(e) => {
+                assert_eq!(e.error.code, -32007);
+            }
+            JsonRpcResponse::Result(_) => panic!("Expected forbidden error for prompt"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scope_enforcement_default_scope() {
+        let router = create_test_router();
+        let policy = ScopePolicy::new().default_scope("mcp:base");
+        let claims = test_claims("mcp:other");
+        let mut service = make_service_with_scope(router.clone(), policy, Some(claims));
+
+        // Even initialization should require the default scope since
+        // it goes through the middleware. But initialize uses McpRequest::Initialize
+        // which falls into the default check.
+        let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": { "name": "test", "version": "1.0" }
+        }));
+        let resp = service.call_single(init_req).await.unwrap();
+
+        match resp {
+            JsonRpcResponse::Error(e) => {
+                assert_eq!(e.error.code, -32007);
+            }
+            JsonRpcResponse::Result(_) => panic!("Expected forbidden error for default scope"),
+        }
     }
 }
