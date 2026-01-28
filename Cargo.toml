@@ -96,6 +96,10 @@ name = "stdio_server"
 path = "examples/stdio_server.rs"
 
 [[example]]
+name = "stdio_server_with_middleware"
+path = "examples/stdio_server_with_middleware.rs"
+
+[[example]]
 name = "http_server"
 path = "examples/http_server.rs"
 required-features = ["http"]

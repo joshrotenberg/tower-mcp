@@ -202,19 +202,24 @@ impl StdioTransport {
 /// # Example
 ///
 /// ```rust,no_run
+/// use std::time::Duration;
 /// use tower::ServiceBuilder;
-/// use tower_mcp::{BoxError, McpRouter, GenericStdioTransport};
+/// use tower::timeout::TimeoutLayer;
+/// use tower_mcp::{BoxError, CatchError, McpRouter, GenericStdioTransport};
 ///
 /// #[tokio::main]
 /// async fn main() -> Result<(), BoxError> {
 ///     let router = McpRouter::new()
 ///         .server_info("my-server", "1.0.0");
 ///
-///     // Apply tower middleware
-///     let service = ServiceBuilder::new()
-///         // .layer(rate_limiter)
-///         // .layer(bulkhead)
-///         .service(router);
+///     // Apply tower middleware via ServiceBuilder, then wrap in CatchError
+///     // to convert middleware errors into JSON-RPC error responses.
+///     let service = CatchError::new(
+///         ServiceBuilder::new()
+///             .layer(TimeoutLayer::new(Duration::from_secs(5)))
+///             .concurrency_limit(10)
+///             .service(router),
+///     );
 ///
 ///     let mut transport = GenericStdioTransport::new(service);
 ///     transport.run().await?;

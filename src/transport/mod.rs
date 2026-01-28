@@ -17,9 +17,9 @@ pub mod websocket;
 #[cfg(feature = "childproc")]
 pub mod childproc;
 
-#[cfg(any(feature = "http", feature = "websocket"))]
 pub mod service;
 
+pub use service::CatchError;
 pub use stdio::{
     BidirectionalStdioTransport, GenericStdioTransport, StdioTransport, SyncStdioTransport,
 };
