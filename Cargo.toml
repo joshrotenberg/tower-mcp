@@ -54,11 +54,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [features]
 default = []
 # Enable all optional features
-full = ["http", "websocket", "childproc"]
+full = ["http", "websocket", "childproc", "oauth"]
 # Transport features
 http = ["dep:axum", "dep:hyper", "dep:http", "dep:http-body-util", "dep:tokio-stream", "dep:uuid"]
 websocket = ["dep:axum", "dep:uuid"]
 childproc = []
+# OAuth 2.1 resource server support
+oauth = ["dep:jsonwebtoken", "http"]
 
 [dependencies.axum]
 version = "0.8"
@@ -87,6 +89,10 @@ version = "1"
 optional = true
 features = ["v4"]
 
+[dependencies.jsonwebtoken]
+version = "9"
+optional = true
+
 [[example]]
 name = "basic"
 path = "examples/basic.rs"
@@ -113,6 +119,11 @@ required-features = ["http"]
 name = "http_server_with_middleware"
 path = "examples/http_server_with_middleware.rs"
 required-features = ["http"]
+
+[[example]]
+name = "http_server_with_oauth"
+path = "examples/http_server_with_oauth.rs"
+required-features = ["oauth"]
 
 [[example]]
 name = "client_cli"
