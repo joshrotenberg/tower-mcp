@@ -548,19 +548,17 @@ impl McpRouter {
                 }
 
                 // No match found
-                Err(Error::JsonRpc(JsonRpcError::method_not_found(&format!(
-                    "Resource not found: {}",
-                    params.uri
-                ))))
+                Err(Error::JsonRpc(JsonRpcError::resource_not_found(
+                    &params.uri,
+                )))
             }
 
             McpRequest::SubscribeResource(params) => {
                 // Verify the resource exists
                 if !self.inner.resources.contains_key(&params.uri) {
-                    return Err(Error::JsonRpc(JsonRpcError::invalid_params(format!(
-                        "Resource not found: {}",
-                        params.uri
-                    ))));
+                    return Err(Error::JsonRpc(JsonRpcError::resource_not_found(
+                        &params.uri,
+                    )));
                 }
 
                 tracing::debug!(uri = %params.uri, "Subscribing to resource");
@@ -572,10 +570,9 @@ impl McpRouter {
             McpRequest::UnsubscribeResource(params) => {
                 // Verify the resource exists
                 if !self.inner.resources.contains_key(&params.uri) {
-                    return Err(Error::JsonRpc(JsonRpcError::invalid_params(format!(
-                        "Resource not found: {}",
-                        params.uri
-                    ))));
+                    return Err(Error::JsonRpc(JsonRpcError::resource_not_found(
+                        &params.uri,
+                    )));
                 }
 
                 tracing::debug!(uri = %params.uri, "Unsubscribing from resource");
