@@ -31,11 +31,13 @@ This means:
 - **Authentication**: API key and Bearer token middleware helpers
 - **Elicitation**: Server-to-client user input requests (form and URL modes)
 - **Client support**: MCP client for connecting to external servers
+- **Progress notifications**: Via `RequestContext` in tool handlers
+- **Request cancellation**: Via `CancellationToken` in tool handlers
+- **Completion**: Autocomplete for prompt arguments and resource URIs
+- **Sampling types**: `CreateMessageParams`/`CreateMessageResult` for LLM requests
 
 ### Not Yet Implemented
-- Progress notifications
-- Request cancellation
-- Sampling (LLM requests from server to client)
+- Sampling runtime (bidirectional server-to-client requests)
 
 ## Installation
 
@@ -256,9 +258,11 @@ tower-mcp targets the [MCP specification 2025-03-26](https://modelcontextprotoco
 - [x] prompts/list, prompts/get
 - [x] Elicitation (user input requests)
 - [x] Session management with reconnection error codes
-- [ ] Progress notifications
-- [ ] Request cancellation
-- [ ] Sampling
+- [x] Progress notifications
+- [x] Request cancellation
+- [x] Completion (autocomplete)
+- [x] Roots (filesystem discovery)
+- [ ] Sampling runtime (server-to-client LLM requests)
 
 ## Development
 
