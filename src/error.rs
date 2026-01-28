@@ -18,6 +18,28 @@ pub enum ErrorCode {
     InternalError = -32603,
 }
 
+/// MCP-specific error codes (in the -32000 to -32099 range)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum McpErrorCode {
+    /// Transport connection was closed
+    ConnectionClosed = -32000,
+    /// Request exceeded timeout
+    RequestTimeout = -32001,
+    /// Resource not found
+    ResourceNotFound = -32002,
+    /// Resource already subscribed
+    AlreadySubscribed = -32003,
+    /// Resource not subscribed (for unsubscribe)
+    NotSubscribed = -32004,
+}
+
+impl McpErrorCode {
+    pub fn code(self) -> i32 {
+        self as i32
+    }
+}
+
 impl ErrorCode {
     pub fn code(self) -> i32 {
         self as i32
@@ -68,6 +90,49 @@ impl JsonRpcError {
 
     pub fn internal_error(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::InternalError, message)
+    }
+
+    /// Create an MCP-specific error
+    pub fn mcp_error(code: McpErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code: code.code(),
+            message: message.into(),
+            data: None,
+        }
+    }
+
+    /// Connection was closed
+    pub fn connection_closed(message: impl Into<String>) -> Self {
+        Self::mcp_error(McpErrorCode::ConnectionClosed, message)
+    }
+
+    /// Request timed out
+    pub fn request_timeout(message: impl Into<String>) -> Self {
+        Self::mcp_error(McpErrorCode::RequestTimeout, message)
+    }
+
+    /// Resource not found
+    pub fn resource_not_found(uri: &str) -> Self {
+        Self::mcp_error(
+            McpErrorCode::ResourceNotFound,
+            format!("Resource not found: {}", uri),
+        )
+    }
+
+    /// Resource already subscribed
+    pub fn already_subscribed(uri: &str) -> Self {
+        Self::mcp_error(
+            McpErrorCode::AlreadySubscribed,
+            format!("Already subscribed to: {}", uri),
+        )
+    }
+
+    /// Resource not subscribed
+    pub fn not_subscribed(uri: &str) -> Self {
+        Self::mcp_error(
+            McpErrorCode::NotSubscribed,
+            format!("Not subscribed to: {}", uri),
+        )
     }
 }
 
