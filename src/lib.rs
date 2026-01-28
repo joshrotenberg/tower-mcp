@@ -1,9 +1,9 @@
 //! # tower-mcp
 //!
-//! Tower-native Model Context Protocol (MCP) implementation.
+//! Tower-native Model Context Protocol (MCP) implementation for Rust.
 //!
 //! This crate provides a composable, middleware-friendly approach to building
-//! MCP servers and clients using the Tower service abstraction.
+//! MCP servers and clients using the [Tower](https://docs.rs/tower) service abstraction.
 //!
 //! ## Philosophy
 //!
@@ -14,33 +14,94 @@
 //! - Same service can be exposed over multiple transports (stdio, HTTP, WebSocket)
 //! - Easy integration with existing tower-based applications (axum, tonic, etc.)
 //!
-//! ## Example
+//! ## Quick Start: Server
 //!
-//! ```rust
-//! use tower_mcp::{McpRouter, ToolBuilder, CallToolResult};
+//! Build an MCP server with tools, resources, and prompts:
+//!
+//! ```rust,no_run
+//! use tower_mcp::{McpRouter, ToolBuilder, CallToolResult, StdioTransport};
 //! use schemars::JsonSchema;
 //! use serde::Deserialize;
 //!
 //! #[derive(Debug, Deserialize, JsonSchema)]
-//! struct EvaluateInput {
-//!     expression: String,
-//!     data: serde_json::Value,
+//! struct GreetInput {
+//!     name: String,
 //! }
 //!
-//! // Define a tool using the builder - type is inferred from handler
-//! let evaluate = ToolBuilder::new("evaluate")
-//!     .description("Evaluate a JMESPath expression")
-//!     .handler(|input: EvaluateInput| async move {
-//!         Ok(CallToolResult::text(format!("Evaluated: {}", input.expression)))
-//!     })
-//!     .build()
-//!     .expect("valid tool name");
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     // Define a tool
+//!     let greet = ToolBuilder::new("greet")
+//!         .description("Greet someone by name")
+//!         .handler(|input: GreetInput| async move {
+//!             Ok(CallToolResult::text(format!("Hello, {}!", input.name)))
+//!         })
+//!         .build()?;
 //!
-//! // Create router with tools
-//! let router = McpRouter::new()
-//!     .server_info("my-server", "1.0.0")
-//!     .tool(evaluate);
+//!     // Create router and run over stdio
+//!     let router = McpRouter::new()
+//!         .server_info("my-server", "1.0.0")
+//!         .tool(greet);
+//!
+//!     StdioTransport::new(router).run().await?;
+//!     Ok(())
+//! }
 //! ```
+//!
+//! ## Quick Start: Client
+//!
+//! Connect to an MCP server and call tools:
+//!
+//! ```rust,no_run
+//! use tower_mcp::client::{McpClient, StdioClientTransport};
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     // Connect to server
+//!     let transport = StdioClientTransport::spawn("my-mcp-server", &[]).await?;
+//!     let mut client = McpClient::new(transport);
+//!
+//!     // Initialize and list tools
+//!     client.initialize("my-client", "1.0.0").await?;
+//!     let tools = client.list_tools().await?;
+//!
+//!     // Call a tool
+//!     let result = client.call_tool("greet", serde_json::json!({"name": "World"})).await?;
+//!     println!("{:?}", result);
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ## Key Types
+//!
+//! ### Server
+//! - [`McpRouter`] - Routes MCP requests to tools, resources, and prompts
+//! - [`ToolBuilder`] - Builder for defining tools with type-safe handlers
+//! - [`ResourceBuilder`] - Builder for defining resources
+//! - [`PromptBuilder`] - Builder for defining prompts
+//! - [`StdioTransport`] - Stdio transport for CLI servers
+//!
+//! ### Client
+//! - [`McpClient`] - Client for connecting to MCP servers
+//! - [`StdioClientTransport`] - Spawn and connect to server subprocesses
+//!
+//! ### Protocol
+//! - [`CallToolResult`] - Tool execution result with content
+//! - [`ReadResourceResult`] - Resource read result
+//! - [`GetPromptResult`] - Prompt expansion result
+//! - [`Content`] - Text, image, audio, or resource content
+//!
+//! ## Feature Flags
+//!
+//! - `http` - HTTP/SSE transport for web servers
+//! - `websocket` - WebSocket transport for bidirectional communication
+//! - `childproc` - Child process transport for subprocess management
+//!
+//! ## MCP Specification
+//!
+//! This crate implements the MCP specification (2025-03-26):
+//! <https://modelcontextprotocol.io/specification/2025-03-26>
 
 pub mod async_task;
 pub mod auth;

@@ -521,36 +521,338 @@ impl ClientTransport for StdioClientTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
 
-    #[tokio::test]
-    async fn test_client_not_initialized() {
-        // Create a mock transport for testing
-        struct MockTransport;
+    /// Mock transport that returns preconfigured responses
+    struct MockTransport {
+        responses: Arc<Mutex<VecDeque<serde_json::Value>>>,
+        requests: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+        notifications: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+        connected: bool,
+    }
 
-        #[async_trait]
-        impl ClientTransport for MockTransport {
-            async fn request(
-                &mut self,
-                _: &str,
-                _: serde_json::Value,
-            ) -> Result<serde_json::Value> {
-                Ok(serde_json::json!({}))
-            }
-            async fn notify(&mut self, _: &str, _: serde_json::Value) -> Result<()> {
-                Ok(())
-            }
-            fn is_connected(&self) -> bool {
-                true
-            }
-            async fn close(self: Box<Self>) -> Result<()> {
-                Ok(())
+    impl MockTransport {
+        fn new() -> Self {
+            Self {
+                responses: Arc::new(Mutex::new(VecDeque::new())),
+                requests: Arc::new(Mutex::new(Vec::new())),
+                notifications: Arc::new(Mutex::new(Vec::new())),
+                connected: true,
             }
         }
 
-        let mut client = McpClient::new(MockTransport);
+        fn with_responses(responses: Vec<serde_json::Value>) -> Self {
+            Self {
+                responses: Arc::new(Mutex::new(responses.into())),
+                requests: Arc::new(Mutex::new(Vec::new())),
+                notifications: Arc::new(Mutex::new(Vec::new())),
+                connected: true,
+            }
+        }
+
+        #[allow(dead_code)]
+        fn get_requests(&self) -> Vec<(String, serde_json::Value)> {
+            self.requests.lock().unwrap().clone()
+        }
+
+        #[allow(dead_code)]
+        fn get_notifications(&self) -> Vec<(String, serde_json::Value)> {
+            self.notifications.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ClientTransport for MockTransport {
+        async fn request(
+            &mut self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<serde_json::Value> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push((method.to_string(), params));
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| Error::Transport("No more mock responses".to_string()))
+        }
+
+        async fn notify(&mut self, method: &str, params: serde_json::Value) -> Result<()> {
+            self.notifications
+                .lock()
+                .unwrap()
+                .push((method.to_string(), params));
+            Ok(())
+        }
+
+        fn is_connected(&self) -> bool {
+            self.connected
+        }
+
+        async fn close(self: Box<Self>) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn mock_initialize_response() -> serde_json::Value {
+        serde_json::json!({
+            "protocolVersion": "2025-03-26",
+            "serverInfo": {
+                "name": "test-server",
+                "version": "1.0.0"
+            },
+            "capabilities": {
+                "tools": {}
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn test_client_not_initialized() {
+        let mut client = McpClient::new(MockTransport::new());
 
         // Should fail because not initialized
         let result = client.list_tools().await;
         assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not initialized"));
+    }
+
+    #[tokio::test]
+    async fn test_client_initialize() {
+        let transport = MockTransport::with_responses(vec![mock_initialize_response()]);
+        let mut client = McpClient::new(transport);
+
+        assert!(!client.is_initialized());
+
+        let result = client.initialize("test-client", "1.0.0").await;
+        assert!(result.is_ok());
+        assert!(client.is_initialized());
+
+        let server_info = client.server_info().unwrap();
+        assert_eq!(server_info.server_info.name, "test-server");
+    }
+
+    #[tokio::test]
+    async fn test_list_tools() {
+        let transport = MockTransport::with_responses(vec![
+            mock_initialize_response(),
+            serde_json::json!({
+                "tools": [
+                    {
+                        "name": "test_tool",
+                        "description": "A test tool",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {}
+                        }
+                    }
+                ]
+            }),
+        ]);
+        let mut client = McpClient::new(transport);
+
+        client.initialize("test-client", "1.0.0").await.unwrap();
+        let tools = client.list_tools().await.unwrap();
+
+        assert_eq!(tools.tools.len(), 1);
+        assert_eq!(tools.tools[0].name, "test_tool");
+    }
+
+    #[tokio::test]
+    async fn test_call_tool() {
+        let transport = MockTransport::with_responses(vec![
+            mock_initialize_response(),
+            serde_json::json!({
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Tool result"
+                    }
+                ]
+            }),
+        ]);
+        let mut client = McpClient::new(transport);
+
+        client.initialize("test-client", "1.0.0").await.unwrap();
+        let result = client
+            .call_tool("test_tool", serde_json::json!({"arg": "value"}))
+            .await
+            .unwrap();
+
+        assert!(!result.content.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_resources() {
+        let transport = MockTransport::with_responses(vec![
+            mock_initialize_response(),
+            serde_json::json!({
+                "resources": [
+                    {
+                        "uri": "file://test.txt",
+                        "name": "Test File"
+                    }
+                ]
+            }),
+        ]);
+        let mut client = McpClient::new(transport);
+
+        client.initialize("test-client", "1.0.0").await.unwrap();
+        let resources = client.list_resources().await.unwrap();
+
+        assert_eq!(resources.resources.len(), 1);
+        assert_eq!(resources.resources[0].uri, "file://test.txt");
+    }
+
+    #[tokio::test]
+    async fn test_read_resource() {
+        let transport = MockTransport::with_responses(vec![
+            mock_initialize_response(),
+            serde_json::json!({
+                "contents": [
+                    {
+                        "uri": "file://test.txt",
+                        "text": "File contents"
+                    }
+                ]
+            }),
+        ]);
+        let mut client = McpClient::new(transport);
+
+        client.initialize("test-client", "1.0.0").await.unwrap();
+        let result = client.read_resource("file://test.txt").await.unwrap();
+
+        assert_eq!(result.contents.len(), 1);
+        assert_eq!(result.contents[0].text.as_deref(), Some("File contents"));
+    }
+
+    #[tokio::test]
+    async fn test_list_prompts() {
+        let transport = MockTransport::with_responses(vec![
+            mock_initialize_response(),
+            serde_json::json!({
+                "prompts": [
+                    {
+                        "name": "test_prompt",
+                        "description": "A test prompt"
+                    }
+                ]
+            }),
+        ]);
+        let mut client = McpClient::new(transport);
+
+        client.initialize("test-client", "1.0.0").await.unwrap();
+        let prompts = client.list_prompts().await.unwrap();
+
+        assert_eq!(prompts.prompts.len(), 1);
+        assert_eq!(prompts.prompts[0].name, "test_prompt");
+    }
+
+    #[tokio::test]
+    async fn test_get_prompt() {
+        let transport = MockTransport::with_responses(vec![
+            mock_initialize_response(),
+            serde_json::json!({
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": {
+                            "type": "text",
+                            "text": "Prompt message"
+                        }
+                    }
+                ]
+            }),
+        ]);
+        let mut client = McpClient::new(transport);
+
+        client.initialize("test-client", "1.0.0").await.unwrap();
+        let result = client.get_prompt("test_prompt", None).await.unwrap();
+
+        assert_eq!(result.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_ping() {
+        let transport =
+            MockTransport::with_responses(vec![mock_initialize_response(), serde_json::json!({})]);
+        let mut client = McpClient::new(transport);
+
+        client.initialize("test-client", "1.0.0").await.unwrap();
+        let result = client.ping().await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_roots_management() {
+        let transport = MockTransport::with_responses(vec![mock_initialize_response()]);
+        let notifications = transport.notifications.clone();
+        let mut client = McpClient::new(transport);
+
+        // Initially no roots
+        assert!(client.roots().is_empty());
+
+        // Add a root before initialization (no notification)
+        client.add_root(Root::new("file:///project")).await.unwrap();
+        assert_eq!(client.roots().len(), 1);
+        assert!(notifications.lock().unwrap().is_empty());
+
+        // Initialize
+        client.initialize("test-client", "1.0.0").await.unwrap();
+
+        // Add another root after initialization (should notify)
+        client.add_root(Root::new("file:///other")).await.unwrap();
+        assert_eq!(client.roots().len(), 2);
+        assert_eq!(notifications.lock().unwrap().len(), 2); // initialized + roots changed
+
+        // Remove a root
+        let removed = client.remove_root("file:///project").await.unwrap();
+        assert!(removed);
+        assert_eq!(client.roots().len(), 1);
+
+        // Try to remove non-existent root
+        let not_removed = client.remove_root("file:///nonexistent").await.unwrap();
+        assert!(!not_removed);
+    }
+
+    #[tokio::test]
+    async fn test_with_roots() {
+        let roots = vec![Root::new("file:///test")];
+        let transport = MockTransport::with_responses(vec![mock_initialize_response()]);
+        let client = McpClient::with_roots(transport, roots);
+
+        assert_eq!(client.roots().len(), 1);
+        assert!(client.capabilities.roots.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_with_capabilities() {
+        let capabilities = ClientCapabilities {
+            sampling: Some(Default::default()),
+            ..Default::default()
+        };
+
+        let transport = MockTransport::with_responses(vec![mock_initialize_response()]);
+        let client = McpClient::with_capabilities(transport, capabilities);
+
+        assert!(client.capabilities.sampling.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_list_roots() {
+        let roots = vec![
+            Root::new("file:///project1"),
+            Root::with_name("file:///project2", "Project 2"),
+        ];
+        let transport = MockTransport::new();
+        let client = McpClient::with_roots(transport, roots);
+
+        let result = client.list_roots();
+        assert_eq!(result.roots.len(), 2);
+        assert_eq!(result.roots[1].name, Some("Project 2".to_string()));
     }
 }
