@@ -185,6 +185,8 @@ pub mod notifications {
     pub const RESOURCE_UPDATED: &str = "notifications/resources/updated";
     /// Prompt list has changed
     pub const PROMPTS_LIST_CHANGED: &str = "notifications/prompts/list_changed";
+    /// Task status changed
+    pub const TASK_STATUS_CHANGED: &str = "notifications/tasks/status_changed";
 }
 
 /// Request ID - can be string or number per JSON-RPC spec
@@ -244,6 +246,16 @@ pub enum McpRequest {
     ListPrompts(ListPromptsParams),
     /// Get a prompt
     GetPrompt(GetPromptParams),
+    /// Enqueue an async task
+    EnqueueTask(EnqueueTaskParams),
+    /// List tasks
+    ListTasks(ListTasksParams),
+    /// Get task info
+    GetTaskInfo(GetTaskInfoParams),
+    /// Get task result
+    GetTaskResult(GetTaskResultParams),
+    /// Cancel a task
+    CancelTask(CancelTaskParams),
     /// Ping (keepalive)
     Ping,
     /// Unknown method
@@ -266,6 +278,11 @@ impl McpRequest {
             McpRequest::UnsubscribeResource(_) => "resources/unsubscribe",
             McpRequest::ListPrompts(_) => "prompts/list",
             McpRequest::GetPrompt(_) => "prompts/get",
+            McpRequest::EnqueueTask(_) => "tasks/enqueue",
+            McpRequest::ListTasks(_) => "tasks/list",
+            McpRequest::GetTaskInfo(_) => "tasks/get",
+            McpRequest::GetTaskResult(_) => "tasks/result",
+            McpRequest::CancelTask(_) => "tasks/cancel",
             McpRequest::Ping => "ping",
             McpRequest::Unknown { method, .. } => method,
         }
@@ -343,6 +360,11 @@ pub enum McpResponse {
     ReadResource(ReadResourceResult),
     ListPrompts(ListPromptsResult),
     GetPrompt(GetPromptResult),
+    EnqueueTask(EnqueueTaskResult),
+    ListTasks(ListTasksResult),
+    GetTaskInfo(TaskInfo),
+    GetTaskResult(GetTaskResultResult),
+    CancelTask(CancelTaskResult),
     Pong(EmptyResult),
     Empty(EmptyResult),
 }
@@ -404,6 +426,17 @@ pub struct ServerCapabilities {
     pub resources: Option<ResourcesCapability>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompts: Option<PromptsCapability>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tasks: Option<TasksCapability>,
+}
+
+/// Capability for async task management
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TasksCapability {
+    /// Default poll interval suggestion in seconds
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_poll_interval: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -720,6 +753,191 @@ pub enum PromptRole {
 }
 
 // =============================================================================
+// Tasks (async operations)
+// =============================================================================
+
+/// Status of an async task
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    /// Task is actively being processed
+    Working,
+    /// Task requires user input to continue
+    InputRequired,
+    /// Task completed successfully
+    Completed,
+    /// Task failed with an error
+    Failed,
+    /// Task was cancelled by user request
+    Cancelled,
+}
+
+impl std::fmt::Display for TaskStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TaskStatus::Working => write!(f, "working"),
+            TaskStatus::InputRequired => write!(f, "input_required"),
+            TaskStatus::Completed => write!(f, "completed"),
+            TaskStatus::Failed => write!(f, "failed"),
+            TaskStatus::Cancelled => write!(f, "cancelled"),
+        }
+    }
+}
+
+impl TaskStatus {
+    /// Check if this status represents a terminal state
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+        )
+    }
+}
+
+/// Information about a task
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskInfo {
+    /// Unique task identifier
+    pub task_id: String,
+    /// Current task status
+    pub status: TaskStatus,
+    /// ISO 8601 timestamp when the task was created
+    pub created_at: String,
+    /// Time-to-live in seconds (how long to keep the result after completion)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<u64>,
+    /// Suggested polling interval in seconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll_interval: Option<u64>,
+    /// Progress percentage (0-100) if available
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<f64>,
+    /// Human-readable status message
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Parameters for enqueuing a task
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnqueueTaskParams {
+    /// Tool name to execute
+    pub tool_name: String,
+    /// Arguments to pass to the tool
+    #[serde(default)]
+    pub arguments: Value,
+    /// Optional time-to-live for the task result in seconds
+    #[serde(default)]
+    pub ttl: Option<u64>,
+}
+
+/// Result of enqueuing a task
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnqueueTaskResult {
+    /// The task ID for tracking
+    pub task_id: String,
+    /// Initial status (should be Working)
+    pub status: TaskStatus,
+    /// Suggested polling interval in seconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll_interval: Option<u64>,
+}
+
+/// Parameters for listing tasks
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListTasksParams {
+    /// Filter by status (optional)
+    #[serde(default)]
+    pub status: Option<TaskStatus>,
+    /// Pagination cursor
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+/// Result of listing tasks
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListTasksResult {
+    /// List of tasks
+    pub tasks: Vec<TaskInfo>,
+    /// Next cursor for pagination
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Parameters for getting task info
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTaskInfoParams {
+    /// Task ID to query
+    pub task_id: String,
+}
+
+/// Result of getting task info
+pub type GetTaskInfoResult = TaskInfo;
+
+/// Parameters for getting task result
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTaskResultParams {
+    /// Task ID to get result for
+    pub task_id: String,
+}
+
+/// Result of getting task result
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTaskResultResult {
+    /// Task ID
+    pub task_id: String,
+    /// Task status
+    pub status: TaskStatus,
+    /// The tool call result (if completed)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<CallToolResult>,
+    /// Error message (if failed)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Parameters for cancelling a task
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelTaskParams {
+    /// Task ID to cancel
+    pub task_id: String,
+    /// Optional reason for cancellation
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Result of cancelling a task
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelTaskResult {
+    /// Whether the cancellation was successful
+    pub cancelled: bool,
+    /// Updated task status
+    pub status: TaskStatus,
+}
+
+/// Notification params when task status changes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskStatusChangedParams {
+    /// Task ID
+    pub task_id: String,
+    /// New status
+    pub status: TaskStatus,
+    /// Human-readable message
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+// =============================================================================
 // Common
 // =============================================================================
 
@@ -774,6 +992,26 @@ impl McpRequest {
             "prompts/get" => {
                 let p: GetPromptParams = serde_json::from_value(params)?;
                 Ok(McpRequest::GetPrompt(p))
+            }
+            "tasks/enqueue" => {
+                let p: EnqueueTaskParams = serde_json::from_value(params)?;
+                Ok(McpRequest::EnqueueTask(p))
+            }
+            "tasks/list" => {
+                let p: ListTasksParams = serde_json::from_value(params).unwrap_or_default();
+                Ok(McpRequest::ListTasks(p))
+            }
+            "tasks/get" => {
+                let p: GetTaskInfoParams = serde_json::from_value(params)?;
+                Ok(McpRequest::GetTaskInfo(p))
+            }
+            "tasks/result" => {
+                let p: GetTaskResultParams = serde_json::from_value(params)?;
+                Ok(McpRequest::GetTaskResult(p))
+            }
+            "tasks/cancel" => {
+                let p: CancelTaskParams = serde_json::from_value(params)?;
+                Ok(McpRequest::CancelTask(p))
             }
             "ping" => Ok(McpRequest::Ping),
             method => Ok(McpRequest::Unknown {

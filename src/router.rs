@@ -11,6 +11,7 @@ use std::task::{Context, Poll};
 
 use tower_service::Service;
 
+use crate::async_task::TaskStore;
 use crate::context::{CancellationToken, NotificationSender, RequestContext};
 use crate::error::{Error, JsonRpcError, Result};
 use crate::prompt::Prompt;
@@ -75,6 +76,8 @@ struct McpRouterInner {
     in_flight: Arc<RwLock<HashMap<RequestId, CancellationToken>>>,
     /// Channel for sending notifications to connected clients
     notification_tx: Option<NotificationSender>,
+    /// Task store for async operations
+    task_store: TaskStore,
 }
 
 impl McpRouter {
@@ -90,9 +93,15 @@ impl McpRouter {
                 prompts: HashMap::new(),
                 in_flight: Arc::new(RwLock::new(HashMap::new())),
                 notification_tx: None,
+                task_store: TaskStore::new(),
             }),
             session: SessionState::new(),
         }
+    }
+
+    /// Get access to the task store for async operations
+    pub fn task_store(&self) -> &TaskStore {
+        &self.inner.task_store
     }
 
     /// Set the notification sender for progress reporting
@@ -221,6 +230,8 @@ impl McpRouter {
             } else {
                 Some(PromptsCapability::default())
             },
+            // Tasks capability is always available
+            tasks: Some(TasksCapability::default()),
         }
     }
 
@@ -373,6 +384,126 @@ impl McpRouter {
             }
 
             McpRequest::Ping => Ok(McpResponse::Pong(EmptyResult {})),
+
+            McpRequest::EnqueueTask(params) => {
+                // Verify the tool exists
+                let tool = self.inner.tools.get(&params.tool_name).ok_or_else(|| {
+                    Error::JsonRpc(JsonRpcError::method_not_found(&format!(
+                        "Tool not found: {}",
+                        params.tool_name
+                    )))
+                })?;
+
+                // Create the task
+                let (task_id, cancellation_token) = self.inner.task_store.create_task(
+                    &params.tool_name,
+                    params.arguments.clone(),
+                    params.ttl,
+                );
+
+                tracing::info!(task_id = %task_id, tool = %params.tool_name, "Enqueued async task");
+
+                // Spawn the task execution in the background
+                let task_store = self.inner.task_store.clone();
+                let tool = tool.clone();
+                let arguments = params.arguments;
+                let task_id_clone = task_id.clone();
+                let ctx = ctx.clone();
+
+                tokio::spawn(async move {
+                    // Check for cancellation before starting
+                    if cancellation_token.is_cancelled() {
+                        tracing::debug!(task_id = %task_id_clone, "Task cancelled before execution");
+                        return;
+                    }
+
+                    // Execute the tool
+                    match tool.call_with_context(ctx, arguments).await {
+                        Ok(result) => {
+                            if cancellation_token.is_cancelled() {
+                                tracing::debug!(task_id = %task_id_clone, "Task cancelled during execution");
+                            } else {
+                                task_store.complete_task(&task_id_clone, result);
+                                tracing::debug!(task_id = %task_id_clone, "Task completed successfully");
+                            }
+                        }
+                        Err(e) => {
+                            task_store.fail_task(&task_id_clone, &e.to_string());
+                            tracing::warn!(task_id = %task_id_clone, error = %e, "Task failed");
+                        }
+                    }
+                });
+
+                Ok(McpResponse::EnqueueTask(EnqueueTaskResult {
+                    task_id,
+                    status: TaskStatus::Working,
+                    poll_interval: Some(2),
+                }))
+            }
+
+            McpRequest::ListTasks(params) => {
+                let tasks = self.inner.task_store.list_tasks(params.status);
+
+                Ok(McpResponse::ListTasks(ListTasksResult {
+                    tasks,
+                    next_cursor: None,
+                }))
+            }
+
+            McpRequest::GetTaskInfo(params) => {
+                let task = self
+                    .inner
+                    .task_store
+                    .get_task(&params.task_id)
+                    .ok_or_else(|| {
+                        Error::JsonRpc(JsonRpcError::invalid_params(format!(
+                            "Task not found: {}",
+                            params.task_id
+                        )))
+                    })?;
+
+                Ok(McpResponse::GetTaskInfo(task))
+            }
+
+            McpRequest::GetTaskResult(params) => {
+                let (status, result, error) = self
+                    .inner
+                    .task_store
+                    .get_task_full(&params.task_id)
+                    .ok_or_else(|| {
+                        Error::JsonRpc(JsonRpcError::invalid_params(format!(
+                            "Task not found: {}",
+                            params.task_id
+                        )))
+                    })?;
+
+                Ok(McpResponse::GetTaskResult(GetTaskResultResult {
+                    task_id: params.task_id,
+                    status,
+                    result,
+                    error,
+                }))
+            }
+
+            McpRequest::CancelTask(params) => {
+                let status = self
+                    .inner
+                    .task_store
+                    .cancel_task(&params.task_id, params.reason.as_deref())
+                    .ok_or_else(|| {
+                        Error::JsonRpc(JsonRpcError::invalid_params(format!(
+                            "Task not found: {}",
+                            params.task_id
+                        )))
+                    })?;
+
+                let cancelled = status == TaskStatus::Cancelled;
+
+                Ok(McpResponse::CancelTask(CancelTaskResult {
+                    cancelled,
+                    status,
+                }))
+            }
 
             McpRequest::Unknown { method, .. } => {
                 Err(Error::JsonRpc(JsonRpcError::method_not_found(&method)))
@@ -955,5 +1086,264 @@ mod tests {
 
         let result = service.call_batch(vec![]).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_task() {
+        let add_tool = ToolBuilder::new("add")
+            .description("Add two numbers")
+            .handler(|input: AddInput| async move {
+                Ok(CallToolResult::text(format!("{}", input.a + input.b)))
+            })
+            .build()
+            .expect("valid tool name");
+
+        let mut router = McpRouter::new().tool(add_tool);
+        init_router(&mut router).await;
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::EnqueueTask(EnqueueTaskParams {
+                tool_name: "add".to_string(),
+                arguments: serde_json::json!({"a": 5, "b": 10}),
+                ttl: None,
+            }),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::EnqueueTask(result)) => {
+                assert!(result.task_id.starts_with("task-"));
+                assert_eq!(result.status, TaskStatus::Working);
+            }
+            _ => panic!("Expected EnqueueTask response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_tasks_empty() {
+        let mut router = McpRouter::new();
+        init_router(&mut router).await;
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::ListTasks(ListTasksParams::default()),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::ListTasks(result)) => {
+                assert!(result.tasks.is_empty());
+            }
+            _ => panic!("Expected ListTasks response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_task_lifecycle_complete() {
+        let add_tool = ToolBuilder::new("add")
+            .description("Add two numbers")
+            .handler(|input: AddInput| async move {
+                Ok(CallToolResult::text(format!("{}", input.a + input.b)))
+            })
+            .build()
+            .expect("valid tool name");
+
+        let mut router = McpRouter::new().tool(add_tool);
+        init_router(&mut router).await;
+
+        // Enqueue task
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::EnqueueTask(EnqueueTaskParams {
+                tool_name: "add".to_string(),
+                arguments: serde_json::json!({"a": 7, "b": 8}),
+                ttl: None,
+            }),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+        let task_id = match resp.inner {
+            Ok(McpResponse::EnqueueTask(result)) => result.task_id,
+            _ => panic!("Expected EnqueueTask response"),
+        };
+
+        // Wait for task to complete
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Get task result
+        let req = RouterRequest {
+            id: RequestId::Number(2),
+            inner: McpRequest::GetTaskResult(GetTaskResultParams {
+                task_id: task_id.clone(),
+            }),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::GetTaskResult(result)) => {
+                assert_eq!(result.task_id, task_id);
+                assert_eq!(result.status, TaskStatus::Completed);
+                assert!(result.result.is_some());
+                assert!(result.error.is_none());
+
+                // Check the result content
+                let tool_result = result.result.unwrap();
+                match &tool_result.content[0] {
+                    Content::Text { text, .. } => assert_eq!(text, "15"),
+                    _ => panic!("Expected text content"),
+                }
+            }
+            _ => panic!("Expected GetTaskResult response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_task_cancellation() {
+        // Use a slow tool to test cancellation
+        let slow_tool = ToolBuilder::new("slow")
+            .description("Slow tool")
+            .handler(|_input: serde_json::Value| async move {
+                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                Ok(CallToolResult::text("done"))
+            })
+            .build()
+            .expect("valid tool name");
+
+        let mut router = McpRouter::new().tool(slow_tool);
+        init_router(&mut router).await;
+
+        // Enqueue task
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::EnqueueTask(EnqueueTaskParams {
+                tool_name: "slow".to_string(),
+                arguments: serde_json::json!({}),
+                ttl: None,
+            }),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+        let task_id = match resp.inner {
+            Ok(McpResponse::EnqueueTask(result)) => result.task_id,
+            _ => panic!("Expected EnqueueTask response"),
+        };
+
+        // Cancel the task
+        let req = RouterRequest {
+            id: RequestId::Number(2),
+            inner: McpRequest::CancelTask(CancelTaskParams {
+                task_id: task_id.clone(),
+                reason: Some("Test cancellation".to_string()),
+            }),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::CancelTask(result)) => {
+                assert!(result.cancelled);
+                assert_eq!(result.status, TaskStatus::Cancelled);
+            }
+            _ => panic!("Expected CancelTask response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_task_info() {
+        let add_tool = ToolBuilder::new("add")
+            .description("Add two numbers")
+            .handler(|input: AddInput| async move {
+                Ok(CallToolResult::text(format!("{}", input.a + input.b)))
+            })
+            .build()
+            .expect("valid tool name");
+
+        let mut router = McpRouter::new().tool(add_tool);
+        init_router(&mut router).await;
+
+        // Enqueue task
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::EnqueueTask(EnqueueTaskParams {
+                tool_name: "add".to_string(),
+                arguments: serde_json::json!({"a": 1, "b": 2}),
+                ttl: Some(600),
+            }),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+        let task_id = match resp.inner {
+            Ok(McpResponse::EnqueueTask(result)) => result.task_id,
+            _ => panic!("Expected EnqueueTask response"),
+        };
+
+        // Get task info
+        let req = RouterRequest {
+            id: RequestId::Number(2),
+            inner: McpRequest::GetTaskInfo(GetTaskInfoParams {
+                task_id: task_id.clone(),
+            }),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::GetTaskInfo(info)) => {
+                assert_eq!(info.task_id, task_id);
+                assert!(info.created_at.contains('T')); // ISO 8601
+                assert_eq!(info.ttl, Some(600));
+            }
+            _ => panic!("Expected GetTaskInfo response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_nonexistent_tool() {
+        let mut router = McpRouter::new();
+        init_router(&mut router).await;
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::EnqueueTask(EnqueueTaskParams {
+                tool_name: "nonexistent".to_string(),
+                arguments: serde_json::json!({}),
+                ttl: None,
+            }),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        match resp.inner {
+            Err(e) => {
+                assert!(e.message.contains("not found"));
+            }
+            _ => panic!("Expected error response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_nonexistent_task() {
+        let mut router = McpRouter::new();
+        init_router(&mut router).await;
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::GetTaskInfo(GetTaskInfoParams {
+                task_id: "task-999".to_string(),
+            }),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        match resp.inner {
+            Err(e) => {
+                assert!(e.message.contains("not found"));
+            }
+            _ => panic!("Expected error response"),
+        }
     }
 }
