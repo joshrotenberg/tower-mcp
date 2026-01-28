@@ -12,7 +12,10 @@ use std::task::{Context, Poll};
 use tower_service::Service;
 
 use crate::async_task::TaskStore;
-use crate::context::{CancellationToken, NotificationSender, RequestContext, ServerNotification};
+use crate::context::{
+    CancellationToken, ClientRequesterHandle, NotificationSender, RequestContext,
+    ServerNotification,
+};
 use crate::error::{Error, JsonRpcError, Result};
 use crate::prompt::Prompt;
 use crate::protocol::*;
@@ -78,6 +81,8 @@ struct McpRouterInner {
     in_flight: Arc<RwLock<HashMap<RequestId, CancellationToken>>>,
     /// Channel for sending notifications to connected clients
     notification_tx: Option<NotificationSender>,
+    /// Handle for sending requests to the client (for sampling, etc.)
+    client_requester: Option<ClientRequesterHandle>,
     /// Task store for async operations
     task_store: TaskStore,
     /// Subscribed resource URIs
@@ -98,6 +103,7 @@ impl McpRouter {
                 prompts: HashMap::new(),
                 in_flight: Arc::new(RwLock::new(HashMap::new())),
                 notification_tx: None,
+                client_requester: None,
                 task_store: TaskStore::new(),
                 subscriptions: Arc::new(RwLock::new(HashSet::new())),
             }),
@@ -123,10 +129,24 @@ impl McpRouter {
         self.inner.notification_tx.as_ref()
     }
 
+    /// Set the client requester for server-to-client requests (sampling, etc.)
+    ///
+    /// This is typically called by bidirectional transports (WebSocket, stdio)
+    /// to enable tool handlers to send requests to the client.
+    pub fn with_client_requester(mut self, requester: ClientRequesterHandle) -> Self {
+        Arc::make_mut(&mut self.inner).client_requester = Some(requester);
+        self
+    }
+
+    /// Get the client requester (if configured)
+    pub fn client_requester(&self) -> Option<&ClientRequesterHandle> {
+        self.inner.client_requester.as_ref()
+    }
+
     /// Create a request context for tracking a request
     ///
     /// This registers the request for cancellation tracking and sets up
-    /// progress reporting if configured.
+    /// progress reporting and client requests if configured.
     pub fn create_context(
         &self,
         request_id: RequestId,
@@ -144,6 +164,13 @@ impl McpRouter {
         // Set up notification sender if configured
         let ctx = if let Some(tx) = &self.inner.notification_tx {
             ctx.with_notification_sender(tx.clone())
+        } else {
+            ctx
+        };
+
+        // Set up client requester if configured (for sampling support)
+        let ctx = if let Some(requester) = &self.inner.client_requester {
+            ctx.with_client_requester(requester.clone())
         } else {
             ctx
         };

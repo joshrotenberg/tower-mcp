@@ -8,7 +8,7 @@
 //! ## API Key Authentication
 //!
 //! ```rust,no_run
-//! use tower_mcp::auth::{ApiKeyLayer, ApiKeyValidator};
+//! use tower_mcp::auth::{AuthConfig, ApiKeyValidator};
 //! use tower_mcp::{McpRouter, HttpTransport};
 //! use std::sync::Arc;
 //!
@@ -19,7 +19,7 @@
 //! let router = McpRouter::new().server_info("my-server", "1.0.0");
 //! let transport = HttpTransport::new(router);
 //!
-//! // The ApiKeyLayer extracts the key from the Authorization header
+//! // The auth layer extracts the key from the Authorization header
 //! // and validates it using the provided validator
 //! ```
 //!

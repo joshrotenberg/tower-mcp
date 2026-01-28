@@ -283,7 +283,7 @@ struct PendingRequest {
 /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///     let tool = ToolBuilder::new("ai-tool")
 ///         .description("A tool that uses LLM")
-///         .context_handler(|ctx: RequestContext, input: serde_json::Value| async move {
+///         .handler_with_context(|ctx: RequestContext, input: serde_json::Value| async move {
 ///             // Request LLM completion from the client
 ///             let params = CreateMessageParams::new(
 ///                 vec![SamplingMessage::user("Help me with: ...")],
