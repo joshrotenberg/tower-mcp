@@ -1,6 +1,7 @@
 //! Request context for MCP handlers
 //!
-//! Provides progress reporting and cancellation support for long-running operations.
+//! Provides progress reporting, cancellation support, and client request capabilities
+//! for long-running operations.
 //!
 //! # Example
 //!
@@ -22,13 +23,36 @@
 //!     Ok(CallToolResult::text("Done!"))
 //! }
 //! ```
+//!
+//! # Sampling (LLM requests to client)
+//!
+//! ```rust,ignore
+//! use tower_mcp::context::RequestContext;
+//! use tower_mcp::{CreateMessageParams, SamplingMessage};
+//!
+//! async fn ai_tool(ctx: RequestContext, input: MyInput) -> Result<CallToolResult> {
+//!     // Request LLM completion from the client
+//!     let params = CreateMessageParams::new(
+//!         vec![SamplingMessage::user("Summarize this text...")],
+//!         500,
+//!     );
+//!
+//!     let result = ctx.sample(params).await?;
+//!     Ok(CallToolResult::text(format!("Summary: {:?}", result.content)))
+//! }
+//! ```
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
+use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-use crate::protocol::{LoggingMessageParams, ProgressParams, ProgressToken, RequestId};
+use crate::error::{Error, Result};
+use crate::protocol::{
+    CreateMessageParams, CreateMessageResult, LoggingMessageParams, ProgressParams, ProgressToken,
+    RequestId,
+};
 
 /// A notification to be sent to the client
 #[derive(Debug, Clone)]
@@ -57,7 +81,102 @@ pub fn notification_channel(buffer: usize) -> (NotificationSender, NotificationR
     mpsc::channel(buffer)
 }
 
-/// Context for a request, providing progress and cancellation support
+// =============================================================================
+// Client Requests (Server -> Client)
+// =============================================================================
+
+/// Trait for sending requests from server to client
+///
+/// This enables bidirectional communication where the server can request
+/// actions from the client, such as sampling (LLM requests).
+#[async_trait]
+pub trait ClientRequester: Send + Sync {
+    /// Send a sampling request to the client
+    ///
+    /// Returns the LLM completion result from the client.
+    async fn sample(&self, params: CreateMessageParams) -> Result<CreateMessageResult>;
+}
+
+/// A clonable handle to a client requester
+pub type ClientRequesterHandle = Arc<dyn ClientRequester>;
+
+/// Outgoing request to be sent to the client
+#[derive(Debug)]
+pub struct OutgoingRequest {
+    /// The JSON-RPC request ID
+    pub id: RequestId,
+    /// The method name
+    pub method: String,
+    /// The request parameters as JSON
+    pub params: serde_json::Value,
+    /// Channel to send the response back
+    pub response_tx: tokio::sync::oneshot::Sender<Result<serde_json::Value>>,
+}
+
+/// Sender for outgoing requests to the client
+pub type OutgoingRequestSender = mpsc::Sender<OutgoingRequest>;
+
+/// Receiver for outgoing requests (used by transport)
+pub type OutgoingRequestReceiver = mpsc::Receiver<OutgoingRequest>;
+
+/// Create a new outgoing request channel
+pub fn outgoing_request_channel(buffer: usize) -> (OutgoingRequestSender, OutgoingRequestReceiver) {
+    mpsc::channel(buffer)
+}
+
+/// A client requester implementation that sends requests through a channel
+#[derive(Clone)]
+pub struct ChannelClientRequester {
+    request_tx: OutgoingRequestSender,
+    next_id: Arc<AtomicI64>,
+}
+
+impl ChannelClientRequester {
+    /// Create a new channel-based client requester
+    pub fn new(request_tx: OutgoingRequestSender) -> Self {
+        Self {
+            request_tx,
+            next_id: Arc::new(AtomicI64::new(1)),
+        }
+    }
+
+    fn next_request_id(&self) -> RequestId {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        RequestId::Number(id)
+    }
+}
+
+#[async_trait]
+impl ClientRequester for ChannelClientRequester {
+    async fn sample(&self, params: CreateMessageParams) -> Result<CreateMessageResult> {
+        let id = self.next_request_id();
+        let params_json = serde_json::to_value(&params)
+            .map_err(|e| Error::Internal(format!("Failed to serialize params: {}", e)))?;
+
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        let request = OutgoingRequest {
+            id: id.clone(),
+            method: "sampling/createMessage".to_string(),
+            params: params_json,
+            response_tx,
+        };
+
+        self.request_tx
+            .send(request)
+            .await
+            .map_err(|_| Error::Internal("Failed to send request: channel closed".to_string()))?;
+
+        let response = response_rx.await.map_err(|_| {
+            Error::Internal("Failed to receive response: channel closed".to_string())
+        })??;
+
+        serde_json::from_value(response)
+            .map_err(|e| Error::Internal(format!("Failed to deserialize response: {}", e)))
+    }
+}
+
+/// Context for a request, providing progress, cancellation, and client request support
 #[derive(Clone)]
 pub struct RequestContext {
     /// The request ID
@@ -68,6 +187,8 @@ pub struct RequestContext {
     cancelled: Arc<AtomicBool>,
     /// Channel for sending notifications
     notification_tx: Option<NotificationSender>,
+    /// Handle for sending requests to the client (for sampling, etc.)
+    client_requester: Option<ClientRequesterHandle>,
 }
 
 impl std::fmt::Debug for RequestContext {
@@ -88,6 +209,7 @@ impl RequestContext {
             progress_token: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             notification_tx: None,
+            client_requester: None,
         }
     }
 
@@ -100,6 +222,12 @@ impl RequestContext {
     /// Set the notification sender
     pub fn with_notification_sender(mut self, tx: NotificationSender) -> Self {
         self.notification_tx = Some(tx);
+        self
+    }
+
+    /// Set the client requester for server-to-client requests
+    pub fn with_client_requester(mut self, requester: ClientRequesterHandle) -> Self {
+        self.client_requester = Some(requester);
         self
     }
 
@@ -172,6 +300,45 @@ impl RequestContext {
 
         let _ = tx.try_send(ServerNotification::Progress(params));
     }
+
+    /// Check if sampling is available
+    ///
+    /// Returns true if a client requester is configured and the transport
+    /// supports bidirectional communication.
+    pub fn can_sample(&self) -> bool {
+        self.client_requester.is_some()
+    }
+
+    /// Request an LLM completion from the client
+    ///
+    /// This sends a `sampling/createMessage` request to the client and waits
+    /// for the response. The client is expected to forward this to an LLM
+    /// and return the result.
+    ///
+    /// Returns an error if sampling is not available (no client requester configured).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use tower_mcp::{CreateMessageParams, SamplingMessage};
+    ///
+    /// async fn my_tool(ctx: RequestContext, input: MyInput) -> Result<CallToolResult> {
+    ///     let params = CreateMessageParams::new(
+    ///         vec![SamplingMessage::user("Summarize: ...")],
+    ///         500,
+    ///     );
+    ///
+    ///     let result = ctx.sample(params).await?;
+    ///     Ok(CallToolResult::text(format!("{:?}", result.content)))
+    /// }
+    /// ```
+    pub async fn sample(&self, params: CreateMessageParams) -> Result<CreateMessageResult> {
+        let requester = self.client_requester.as_ref().ok_or_else(|| {
+            Error::Internal("Sampling not available: no client requester configured".to_string())
+        })?;
+
+        requester.sample(params).await
+    }
 }
 
 /// A token that can be used to check for cancellation
@@ -198,6 +365,7 @@ pub struct RequestContextBuilder {
     request_id: Option<RequestId>,
     progress_token: Option<ProgressToken>,
     notification_tx: Option<NotificationSender>,
+    client_requester: Option<ClientRequesterHandle>,
 }
 
 impl RequestContextBuilder {
@@ -224,6 +392,12 @@ impl RequestContextBuilder {
         self
     }
 
+    /// Set the client requester for server-to-client requests
+    pub fn client_requester(mut self, requester: ClientRequesterHandle) -> Self {
+        self.client_requester = Some(requester);
+        self
+    }
+
     /// Build the request context
     ///
     /// Panics if request_id is not set.
@@ -234,6 +408,9 @@ impl RequestContextBuilder {
         }
         if let Some(tx) = self.notification_tx {
             ctx = ctx.with_notification_sender(tx);
+        }
+        if let Some(requester) = self.client_requester {
+            ctx = ctx.with_client_requester(requester);
         }
         ctx
     }
@@ -303,5 +480,50 @@ mod tests {
 
         assert_eq!(ctx.request_id(), &RequestId::String("req-1".to_string()));
         assert!(ctx.progress_token().is_some());
+    }
+
+    #[test]
+    fn test_can_sample_without_requester() {
+        let ctx = RequestContext::new(RequestId::Number(1));
+        assert!(!ctx.can_sample());
+    }
+
+    #[test]
+    fn test_can_sample_with_requester() {
+        let (request_tx, _rx) = outgoing_request_channel(10);
+        let requester: ClientRequesterHandle = Arc::new(ChannelClientRequester::new(request_tx));
+
+        let ctx = RequestContext::new(RequestId::Number(1)).with_client_requester(requester);
+        assert!(ctx.can_sample());
+    }
+
+    #[tokio::test]
+    async fn test_sample_without_requester_fails() {
+        use crate::protocol::{CreateMessageParams, SamplingMessage};
+
+        let ctx = RequestContext::new(RequestId::Number(1));
+        let params = CreateMessageParams::new(vec![SamplingMessage::user("test")], 100);
+
+        let result = ctx.sample(params).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Sampling not available")
+        );
+    }
+
+    #[test]
+    fn test_builder_with_client_requester() {
+        let (request_tx, _rx) = outgoing_request_channel(10);
+        let requester: ClientRequesterHandle = Arc::new(ChannelClientRequester::new(request_tx));
+
+        let ctx = RequestContextBuilder::new()
+            .request_id(RequestId::Number(1))
+            .client_requester(requester)
+            .build();
+
+        assert!(ctx.can_sample());
     }
 }

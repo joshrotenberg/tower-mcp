@@ -35,9 +35,7 @@ This means:
 - **Request cancellation**: Via `CancellationToken` in tool handlers
 - **Completion**: Autocomplete for prompt arguments and resource URIs
 - **Sampling types**: `CreateMessageParams`/`CreateMessageResult` for LLM requests
-
-### Not Yet Implemented
-- Sampling runtime (bidirectional server-to-client requests)
+- **Sampling runtime**: Via `BidirectionalStdioTransport` for stdio (WebSocket/HTTP coming soon)
 
 ## Installation
 
@@ -262,7 +260,7 @@ tower-mcp targets the [MCP specification 2025-03-26](https://modelcontextprotoco
 - [x] Request cancellation
 - [x] Completion (autocomplete)
 - [x] Roots (filesystem discovery)
-- [ ] Sampling runtime (server-to-client LLM requests)
+- [x] Sampling runtime (stdio transport)
 
 ## Development
 
