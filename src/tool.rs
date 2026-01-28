@@ -376,6 +376,146 @@ impl ToolBuilder {
         }
     }
 
+    /// Specify input type, shared state, and handler.
+    ///
+    /// The state is cloned for each invocation, so wrapping it in an `Arc`
+    /// is recommended for expensive-to-clone types. This eliminates the
+    /// boilerplate of cloning state inside a `move` closure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::sync::Arc;
+    /// use tower_mcp::{ToolBuilder, CallToolResult};
+    /// use schemars::JsonSchema;
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Debug, Deserialize, JsonSchema)]
+    /// struct QueryInput { query: String }
+    ///
+    /// struct Db { connection_string: String }
+    ///
+    /// let db = Arc::new(Db { connection_string: "postgres://...".to_string() });
+    ///
+    /// let tool = ToolBuilder::new("search")
+    ///     .description("Search the database")
+    ///     .handler_with_state(db, |db: Arc<Db>, input: QueryInput| async move {
+    ///         Ok(CallToolResult::text(format!("Queried: {}", input.query)))
+    ///     })
+    ///     .build()
+    ///     .expect("valid tool name");
+    /// ```
+    pub fn handler_with_state<S, I, F, Fut>(
+        self,
+        state: S,
+        handler: F,
+    ) -> ToolBuilderWithHandler<
+        I,
+        impl Fn(I) -> BoxFuture<'static, Result<CallToolResult>> + Send + Sync + 'static,
+    >
+    where
+        S: Clone + Send + Sync + 'static,
+        I: JsonSchema + DeserializeOwned + Send + Sync + 'static,
+        F: Fn(S, I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
+    {
+        let handler = Arc::new(handler);
+        self.handler(move |input: I| {
+            let state = state.clone();
+            let handler = handler.clone();
+            Box::pin(async move { handler(state, input).await })
+                as BoxFuture<'static, Result<CallToolResult>>
+        })
+    }
+
+    /// Specify input type, shared state, and context-aware handler.
+    ///
+    /// Combines state injection with `RequestContext` access for progress
+    /// reporting, cancellation, sampling, and logging.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::sync::Arc;
+    /// use tower_mcp::{ToolBuilder, CallToolResult, RequestContext};
+    /// use schemars::JsonSchema;
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Debug, Deserialize, JsonSchema)]
+    /// struct QueryInput { query: String }
+    ///
+    /// struct Db { connection_string: String }
+    ///
+    /// let db = Arc::new(Db { connection_string: "postgres://...".to_string() });
+    ///
+    /// let tool = ToolBuilder::new("search")
+    ///     .description("Search the database with progress")
+    ///     .handler_with_state_and_context(db, |db: Arc<Db>, ctx: RequestContext, input: QueryInput| async move {
+    ///         ctx.report_progress(0.0, Some(1.0), Some("Searching...")).await;
+    ///         Ok(CallToolResult::text(format!("Queried: {}", input.query)))
+    ///     })
+    ///     .build()
+    ///     .expect("valid tool name");
+    /// ```
+    pub fn handler_with_state_and_context<S, I, F, Fut>(
+        self,
+        state: S,
+        handler: F,
+    ) -> ToolBuilderWithContextHandler<
+        I,
+        impl Fn(RequestContext, I) -> BoxFuture<'static, Result<CallToolResult>> + Send + Sync + 'static,
+    >
+    where
+        S: Clone + Send + Sync + 'static,
+        I: JsonSchema + DeserializeOwned + Send + Sync + 'static,
+        F: Fn(S, RequestContext, I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
+    {
+        let handler = Arc::new(handler);
+        self.handler_with_context(move |ctx: RequestContext, input: I| {
+            let state = state.clone();
+            let handler = handler.clone();
+            Box::pin(async move { handler(state, ctx, input).await })
+                as BoxFuture<'static, Result<CallToolResult>>
+        })
+    }
+
+    /// Create a tool that takes no parameters.
+    ///
+    /// The handler receives no input arguments. An empty object input schema
+    /// is generated automatically. Returns `Result<Tool>` directly.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::{ToolBuilder, CallToolResult};
+    ///
+    /// let tool = ToolBuilder::new("server_time")
+    ///     .description("Get the current server time")
+    ///     .handler_no_params(|| async {
+    ///         Ok(CallToolResult::text("2025-01-01T00:00:00Z"))
+    ///     })
+    ///     .expect("valid tool name");
+    ///
+    /// assert_eq!(tool.name, "server_time");
+    /// ```
+    pub fn handler_no_params<F, Fut>(self, handler: F) -> Result<Tool>
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
+    {
+        validate_tool_name(&self.name)?;
+        Ok(Tool {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            output_schema: self.output_schema,
+            icons: self.icons,
+            annotations: self.annotations,
+            handler: Arc::new(NoParamsHandler { handler }),
+        })
+    }
+
     /// Create a tool with raw JSON handling (no automatic deserialization)
     ///
     /// Returns an error if the tool name is invalid.
@@ -629,6 +769,28 @@ where
             serde_json::json!({
                 "type": "object"
             })
+        })
+    }
+}
+
+/// Handler that takes no parameters
+struct NoParamsHandler<F> {
+    handler: F,
+}
+
+impl<F, Fut> ToolHandler for NoParamsHandler<F>
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
+{
+    fn call(&self, _args: Value) -> BoxFuture<'_, Result<CallToolResult>> {
+        Box::pin((self.handler)())
+    }
+
+    fn input_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {}
         })
     }
 }
@@ -977,5 +1139,91 @@ mod tests {
         assert_eq!(def.title.as_deref(), Some("Greeting Tool"));
         assert!(def.output_schema.is_some());
         assert!(def.icons.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_handler_with_state() {
+        let shared = Arc::new("shared-state".to_string());
+
+        let tool = ToolBuilder::new("stateful")
+            .description("Uses shared state")
+            .handler_with_state(shared, |state: Arc<String>, input: GreetInput| async move {
+                Ok(CallToolResult::text(format!(
+                    "{}: Hello, {}!",
+                    state, input.name
+                )))
+            })
+            .build()
+            .expect("valid tool name");
+
+        let result = tool
+            .call(serde_json::json!({"name": "World"}))
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn test_handler_with_state_and_context() {
+        use crate::context::RequestContext;
+        use crate::protocol::RequestId;
+
+        let shared = Arc::new(42_i32);
+
+        let tool = ToolBuilder::new("stateful_ctx")
+            .description("Uses state and context")
+            .handler_with_state_and_context(
+                shared,
+                |state: Arc<i32>, _ctx: RequestContext, input: GreetInput| async move {
+                    Ok(CallToolResult::text(format!(
+                        "{}: Hello, {}!",
+                        state, input.name
+                    )))
+                },
+            )
+            .build()
+            .expect("valid tool name");
+
+        assert!(tool.uses_context());
+
+        let ctx = RequestContext::new(RequestId::Number(1));
+        let result = tool
+            .call_with_context(ctx, serde_json::json!({"name": "World"}))
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn test_handler_no_params() {
+        let tool = ToolBuilder::new("no_params")
+            .description("Takes no parameters")
+            .handler_no_params(|| async { Ok(CallToolResult::text("no params result")) })
+            .expect("valid tool name");
+
+        assert_eq!(tool.name, "no_params");
+
+        // Should work with empty args
+        let result = tool.call(serde_json::json!({})).await.unwrap();
+        assert!(!result.is_error);
+
+        // Should also work with unexpected args (ignored)
+        let result = tool
+            .call(serde_json::json!({"unexpected": "value"}))
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+
+        // Check input schema is an empty-properties object
+        let schema = tool.definition().input_schema;
+        assert_eq!(schema.get("type").unwrap().as_str().unwrap(), "object");
+        assert!(
+            schema
+                .get("properties")
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
     }
 }
