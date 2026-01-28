@@ -70,8 +70,9 @@ pub use protocol::{
     CallToolResult, ElicitAction, ElicitFieldValue, ElicitFormParams, ElicitFormSchema, ElicitMode,
     ElicitRequestParams, ElicitResult, ElicitUrlParams, ElicitationCapability,
     ElicitationCompleteParams, GetPromptResult, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
-    JsonRpcResponseMessage, McpRequest, McpResponse, PrimitiveSchemaDefinition, PromptMessage,
-    PromptRole, ReadResourceResult, ResourceContent,
+    JsonRpcResponseMessage, ListRootsParams, ListRootsResult, McpRequest, McpResponse,
+    PrimitiveSchemaDefinition, PromptMessage, PromptRole, ReadResourceResult, ResourceContent,
+    Root, RootsCapability,
 };
 pub use resource::{
     Resource, ResourceBuilder, ResourceHandler, ResourceTemplate, ResourceTemplateBuilder,
