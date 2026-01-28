@@ -42,6 +42,7 @@
 //!     .tool(evaluate);
 //! ```
 
+pub mod async_task;
 pub mod context;
 pub mod error;
 pub mod prompt;
@@ -53,9 +54,10 @@ pub mod tool;
 pub mod transport;
 
 // Re-exports
+pub use async_task::{Task, TaskStore};
 pub use context::{
-    CancellationToken, NotificationReceiver, NotificationSender, RequestContext,
-    RequestContextBuilder, ServerNotification,
+    NotificationReceiver, NotificationSender, RequestContext, RequestContextBuilder,
+    ServerNotification,
 };
 pub use error::{Error, Result, ToolError};
 pub use prompt::{Prompt, PromptBuilder, PromptHandler};
