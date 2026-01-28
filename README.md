@@ -35,7 +35,7 @@ This means:
 - **Request cancellation**: Via `CancellationToken` in tool handlers
 - **Completion**: Autocomplete for prompt arguments and resource URIs
 - **Sampling types**: `CreateMessageParams`/`CreateMessageResult` for LLM requests
-- **Sampling runtime**: Via `BidirectionalStdioTransport` for stdio (WebSocket/HTTP coming soon)
+- **Sampling runtime**: Full support on stdio, WebSocket, and HTTP transports
 
 ## Installation
 

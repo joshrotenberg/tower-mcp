@@ -8,6 +8,21 @@
 //! - Session management via `MCP-Session-Id` header
 //! - SSE streaming for server notifications and progress updates
 //! - Configurable session TTL and cleanup
+//! - **Sampling support**: Server-to-client LLM requests via SSE + POST
+//!
+//! ## Sampling (Server-to-Client Requests)
+//!
+//! When using `HttpTransport::with_sampling()`, tool handlers can request
+//! LLM completions from the client. The flow is:
+//!
+//! 1. Tool handler calls `ctx.sample(params)`
+//! 2. Server sends the sampling request on the SSE stream
+//! 3. Client receives the request and processes it
+//! 4. Client sends the response as a POST to the MCP endpoint
+//! 5. Server routes the response back to the waiting handler
+//!
+//! This follows the MCP spec which states servers MAY send JSON-RPC requests
+//! on the SSE stream.
 //!
 //! ## Session Reconnection
 //!
@@ -76,14 +91,18 @@ use axum::{
     response::{IntoResponse, Response, Sse, sse::Event},
     routing::{delete, get, post},
 };
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock, broadcast, oneshot};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
+use crate::context::{
+    ChannelClientRequester, ClientRequesterHandle, OutgoingRequestReceiver,
+    outgoing_request_channel,
+};
 use crate::error::{Error, JsonRpcError, Result};
 use crate::jsonrpc::JsonRpcService;
 use crate::protocol::{
-    JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpNotification,
+    JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpNotification, RequestId,
     SUPPORTED_PROTOCOL_VERSIONS,
 };
 use crate::router::McpRouter;
@@ -97,27 +116,49 @@ pub const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 /// SSE event type for JSON-RPC messages
 const SSE_MESSAGE_EVENT: &str = "message";
 
+/// Pending request waiting for a response from the client
+struct PendingRequest {
+    response_tx: oneshot::Sender<Result<serde_json::Value>>,
+}
+
 /// Session state for HTTP transport
-#[derive(Debug)]
 struct Session {
     /// Session ID
     id: String,
     /// The MCP router for this session
     router: McpRouter,
-    /// Broadcast channel for SSE notifications
+    /// Broadcast channel for SSE notifications and outgoing requests
     notifications_tx: broadcast::Sender<String>,
     /// Last time this session was accessed
     last_accessed: RwLock<Instant>,
+    /// Pending outgoing requests waiting for responses
+    pending_requests: Mutex<HashMap<RequestId, PendingRequest>>,
+    /// Receiver for outgoing requests (used by SSE stream)
+    request_rx: Mutex<Option<OutgoingRequestReceiver>>,
 }
 
 impl Session {
-    fn new(router: McpRouter) -> Self {
+    fn new(router: McpRouter, sampling_enabled: bool) -> Self {
         let (notifications_tx, _) = broadcast::channel(100);
+
+        // Set up client requester if sampling is enabled
+        let (router, request_rx) = if sampling_enabled {
+            let (request_tx, request_rx) = outgoing_request_channel(32);
+            let client_requester: ClientRequesterHandle =
+                Arc::new(ChannelClientRequester::new(request_tx));
+            let router = router.with_client_requester(client_requester);
+            (router, Some(request_rx))
+        } else {
+            (router, None)
+        };
+
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             router,
             notifications_tx,
             last_accessed: RwLock::new(Instant::now()),
+            pending_requests: Mutex::new(HashMap::new()),
+            request_rx: Mutex::new(request_rx),
         }
     }
 
@@ -129,6 +170,37 @@ impl Session {
     /// Check if the session has expired
     async fn is_expired(&self, ttl: Duration) -> bool {
         self.last_accessed.read().await.elapsed() > ttl
+    }
+
+    /// Store a pending request
+    async fn add_pending_request(
+        &self,
+        id: RequestId,
+        response_tx: oneshot::Sender<Result<serde_json::Value>>,
+    ) {
+        let mut pending = self.pending_requests.lock().await;
+        pending.insert(id, PendingRequest { response_tx });
+    }
+
+    /// Complete a pending request with a response
+    async fn complete_pending_request(
+        &self,
+        id: &RequestId,
+        result: Result<serde_json::Value>,
+    ) -> bool {
+        let pending = {
+            let mut pending_requests = self.pending_requests.lock().await;
+            pending_requests.remove(id)
+        };
+
+        match pending {
+            Some(pending) => {
+                // Send result to waiter (ignore if they've dropped the receiver)
+                let _ = pending.response_tx.send(result);
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -182,17 +254,18 @@ impl SessionConfig {
 }
 
 /// Session store for managing multiple client sessions
-#[derive(Debug)]
 struct SessionStore {
     sessions: RwLock<HashMap<String, Arc<Session>>>,
     config: SessionConfig,
+    sampling_enabled: bool,
 }
 
 impl SessionStore {
-    fn new(config: SessionConfig) -> Self {
+    fn new(config: SessionConfig, sampling_enabled: bool) -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
             config,
+            sampling_enabled,
         }
     }
 
@@ -211,9 +284,9 @@ impl SessionStore {
             return None;
         }
 
-        let session = Arc::new(Session::new(router));
+        let session = Arc::new(Session::new(router, self.sampling_enabled));
         sessions.insert(session.id.clone(), session.clone());
-        tracing::debug!(session_id = %session.id, "Created new session");
+        tracing::debug!(session_id = %session.id, sampling = self.sampling_enabled, "Created new session");
         Some(session)
     }
 
@@ -276,6 +349,8 @@ struct AppState {
     validate_origin: bool,
     /// Allowed origins (if validation is enabled)
     allowed_origins: Vec<String>,
+    /// Whether sampling is enabled
+    sampling_enabled: bool,
 }
 
 /// HTTP transport for MCP servers
@@ -286,6 +361,7 @@ pub struct HttpTransport {
     validate_origin: bool,
     allowed_origins: Vec<String>,
     session_config: SessionConfig,
+    sampling_enabled: bool,
 }
 
 impl HttpTransport {
@@ -296,6 +372,53 @@ impl HttpTransport {
             validate_origin: true,
             allowed_origins: vec![],
             session_config: SessionConfig::default(),
+            sampling_enabled: false,
+        }
+    }
+
+    /// Create a new HTTP transport with sampling support enabled
+    ///
+    /// When sampling is enabled, tool handlers can use `ctx.sample()` to
+    /// request LLM completions from connected clients. The server sends
+    /// sampling requests on the SSE stream, and clients respond via POST.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use tower_mcp::{McpRouter, ToolBuilder, CallToolResult, CreateMessageParams, SamplingMessage};
+    /// use tower_mcp::context::RequestContext;
+    /// use tower_mcp::transport::http::HttpTransport;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let tool = ToolBuilder::new("ai-tool")
+    ///         .handler_with_context(|ctx: RequestContext, _: serde_json::Value| async move {
+    ///             // Request LLM completion from client
+    ///             let params = CreateMessageParams::new(
+    ///                 vec![SamplingMessage::user("Summarize this...")],
+    ///                 500,
+    ///             );
+    ///             let result = ctx.sample(params).await?;
+    ///             Ok(CallToolResult::text(format!("{:?}", result.content)))
+    ///         })
+    ///         .build()?;
+    ///
+    ///     let router = McpRouter::new()
+    ///         .server_info("my-server", "1.0.0")
+    ///         .tool(tool);
+    ///
+    ///     let transport = HttpTransport::with_sampling(router);
+    ///     transport.serve("127.0.0.1:3000").await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn with_sampling(router: McpRouter) -> Self {
+        Self {
+            router,
+            validate_origin: true,
+            allowed_origins: vec![],
+            session_config: SessionConfig::default(),
+            sampling_enabled: true,
         }
     }
 
@@ -330,7 +453,10 @@ impl HttpTransport {
     }
 
     fn build_state(&self) -> Arc<AppState> {
-        let sessions = Arc::new(SessionStore::new(self.session_config.clone()));
+        let sessions = Arc::new(SessionStore::new(
+            self.session_config.clone(),
+            self.sampling_enabled,
+        ));
 
         // Spawn cleanup task
         let cleanup_sessions = sessions.clone();
@@ -347,6 +473,7 @@ impl HttpTransport {
             sessions,
             validate_origin: self.validate_origin,
             allowed_origins: self.allowed_origins.clone(),
+            sampling_enabled: self.sampling_enabled,
         })
     }
 
@@ -448,6 +575,23 @@ fn is_initialize_request(body: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Check if this is a response to one of our outgoing requests
+fn is_response(parsed: &serde_json::Value) -> bool {
+    parsed.get("method").is_none()
+        && (parsed.get("result").is_some() || parsed.get("error").is_some())
+}
+
+/// Extract request ID from a JSON value
+fn extract_request_id(parsed: &serde_json::Value) -> Option<RequestId> {
+    parsed.get("id").and_then(|id| {
+        if let Some(n) = id.as_i64() {
+            Some(RequestId::Number(n))
+        } else {
+            id.as_str().map(|s| RequestId::String(s.to_string()))
+        }
+    })
+}
+
 /// Handle POST requests (JSON-RPC messages from client)
 async fn handle_post(
     State(state): State<Arc<AppState>>,
@@ -520,6 +664,36 @@ async fn handle_post(
             .into_response();
     }
 
+    // Check if this is a response to one of our outgoing requests (sampling)
+    if is_response(&parsed) {
+        if let Some(id) = extract_request_id(&parsed) {
+            let result = if let Some(error) = parsed.get("error") {
+                let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+                let message = error
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("Unknown error");
+                Err(Error::Internal(format!(
+                    "Client error ({}): {}",
+                    code, message
+                )))
+            } else if let Some(result) = parsed.get("result") {
+                Ok(result.clone())
+            } else {
+                Err(Error::Internal(
+                    "Response has neither result nor error".to_string(),
+                ))
+            };
+
+            if session.complete_pending_request(&id, result).await {
+                tracing::debug!(request_id = ?id, "Completed pending request");
+            } else {
+                tracing::warn!(request_id = ?id, "Received response for unknown request");
+            }
+        }
+        return StatusCode::ACCEPTED.into_response();
+    }
+
     // Check if this is a notification (no id field)
     if parsed.get("id").is_none() {
         // Handle notification
@@ -564,7 +738,7 @@ async fn handle_post(
     resp
 }
 
-/// Handle GET requests (SSE stream for server notifications)
+/// Handle GET requests (SSE stream for server notifications and outgoing requests)
 async fn handle_get(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     // Validate Origin
     if let Some(resp) = validate_origin(&headers, &state) {
@@ -603,13 +777,118 @@ async fn handle_get(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
         }
     };
 
-    // Create SSE stream from broadcast channel
+    // If sampling is enabled, use bidirectional stream
+    if state.sampling_enabled {
+        return handle_get_bidirectional(session).await;
+    }
+
+    // Simple mode: just notifications
     let rx = session.notifications_tx.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(|result: std::result::Result<String, _>| {
         result
             .ok()
             .map(|msg| Ok::<_, Infallible>(Event::default().event(SSE_MESSAGE_EVENT).data(msg)))
     });
+
+    Sse::new(stream)
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(Duration::from_secs(30))
+                .text("ping"),
+        )
+        .into_response()
+}
+
+/// Handle GET requests with bidirectional support (sampling enabled)
+async fn handle_get_bidirectional(session: Arc<Session>) -> Response {
+    // Take ownership of the request receiver for this SSE connection
+    let request_rx = {
+        let mut rx_guard = session.request_rx.lock().await;
+        rx_guard.take()
+    };
+
+    // Create a channel for the stream
+    let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<Event, Infallible>>(100);
+
+    // Spawn task to multiplex notifications and outgoing requests
+    let session_clone = session.clone();
+    tokio::spawn(async move {
+        let mut notification_rx = session_clone.notifications_tx.subscribe();
+
+        // If we have a request receiver, use select! to handle both
+        if let Some(mut req_rx) = request_rx {
+            loop {
+                tokio::select! {
+                    // Handle notifications
+                    result = notification_rx.recv() => {
+                        match result {
+                            Ok(msg) => {
+                                let event = Event::default().event(SSE_MESSAGE_EVENT).data(msg);
+                                if tx.send(Ok(event)).await.is_err() {
+                                    break; // Client disconnected
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        }
+                    }
+
+                    // Handle outgoing requests (sampling)
+                    Some(outgoing) = req_rx.recv() => {
+                        // Build JSON-RPC request
+                        let request = JsonRpcRequest {
+                            jsonrpc: "2.0".to_string(),
+                            id: outgoing.id.clone(),
+                            method: outgoing.method,
+                            params: Some(outgoing.params),
+                        };
+
+                        match serde_json::to_string(&request) {
+                            Ok(request_json) => {
+                                tracing::debug!(output = %request_json, "Sending request to client via SSE");
+
+                                // Store pending request
+                                session_clone.add_pending_request(
+                                    outgoing.id,
+                                    outgoing.response_tx,
+                                ).await;
+
+                                // Send on SSE stream
+                                let event = Event::default().event(SSE_MESSAGE_EVENT).data(request_json);
+                                if tx.send(Ok(event)).await.is_err() {
+                                    break; // Client disconnected
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "Failed to serialize outgoing request");
+                                // Notify the waiter of the error
+                                let _ = outgoing.response_tx.send(Err(Error::Internal(
+                                    format!("Failed to serialize request: {}", e),
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // No request receiver, just handle notifications
+            loop {
+                match notification_rx.recv().await {
+                    Ok(msg) => {
+                        let event = Event::default().event(SSE_MESSAGE_EVENT).data(msg);
+                        if tx.send(Ok(event)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+        }
+    });
+
+    // Convert the receiver into a stream
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
 
     Sse::new(stream)
         .keep_alive(
