@@ -803,13 +803,39 @@ fn extract_request_id(parsed: &serde_json::Value) -> Option<RequestId> {
 /// Handle POST requests (JSON-RPC messages from client)
 async fn handle_post(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: String,
+    request: axum::extract::Request,
 ) -> Response {
+    let (parts, body_bytes) = request.into_parts();
+    let headers = parts.headers;
+
     // Validate Origin
     if let Some(resp) = validate_origin(&headers, &state) {
         return resp;
     }
+
+    let body = match axum::body::to_bytes(body_bytes, usize::MAX).await {
+        Ok(bytes) => match String::from_utf8(bytes.to_vec()) {
+            Ok(s) => s,
+            Err(e) => {
+                return json_rpc_error_response(
+                    None,
+                    JsonRpcError::parse_error(format!("Invalid UTF-8: {}", e)),
+                );
+            }
+        },
+        Err(e) => {
+            return json_rpc_error_response(
+                None,
+                JsonRpcError::parse_error(format!("Failed to read body: {}", e)),
+            );
+        }
+    };
+
+    // Bridge TokenClaims from HTTP extensions to MCP extensions (if present)
+    #[cfg(feature = "oauth")]
+    let http_extensions = parts.extensions;
+    #[cfg(not(feature = "oauth"))]
+    let _ = parts.extensions;
 
     // Parse the request body
     let parsed: serde_json::Value = match serde_json::from_str(&body) {
@@ -930,6 +956,16 @@ async fn handle_post(
 
     // Process the request through the middleware-wrapped service
     let mut service = JsonRpcService::new(session.make_service());
+
+    // Bridge TokenClaims from HTTP request extensions to MCP extensions
+    #[cfg(feature = "oauth")]
+    {
+        if let Some(claims) = http_extensions.get::<crate::oauth::token::TokenClaims>() {
+            let mut ext = crate::router::Extensions::new();
+            ext.insert(claims.clone());
+            service = service.with_extensions(ext);
+        }
+    }
     let response = match service.call_single(request).await {
         Ok(resp) => resp,
         Err(e) => {

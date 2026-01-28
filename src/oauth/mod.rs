@@ -94,5 +94,5 @@ pub mod token;
 pub use error::OAuthError;
 pub use metadata::ProtectedResourceMetadata;
 pub use middleware::{OAuthLayer, OAuthService};
-pub use scope::{ScopePolicy, ScopeRequirement};
+pub use scope::{ScopeEnforcementLayer, ScopeEnforcementService, ScopePolicy, ScopeRequirement};
 pub use token::{JwtValidator, TokenAudience, TokenClaims, TokenValidator, ValidateAdapter};

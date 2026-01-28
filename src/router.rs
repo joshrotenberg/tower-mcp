@@ -3,6 +3,7 @@
 //! The router implements Tower's `Service` trait, making it composable with
 //! standard tower middleware.
 
+use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -902,11 +903,64 @@ impl Default for McpRouter {
 // Tower Service implementation
 // =============================================================================
 
+/// A minimal type-map for passing data through middleware.
+///
+/// Uses `Arc<dyn Any>` internally so `Clone` is cheap, which is needed for
+/// batch requests that create multiple `RouterRequest`s from the same HTTP
+/// request.
+///
+/// # Example
+///
+/// ```rust
+/// use tower_mcp::Extensions;
+///
+/// let mut ext = Extensions::new();
+/// ext.insert(42u32);
+/// assert_eq!(ext.get::<u32>(), Some(&42));
+/// ```
+#[derive(Default, Clone)]
+pub struct Extensions {
+    map: HashMap<TypeId, Arc<dyn Any + Send + Sync>>,
+}
+
+impl Extensions {
+    /// Create an empty extensions map.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert a value into the extensions map.
+    ///
+    /// If a value of the same type already exists, it is replaced.
+    pub fn insert<T: Send + Sync + 'static>(&mut self, val: T) {
+        self.map.insert(TypeId::of::<T>(), Arc::new(val));
+    }
+
+    /// Get a reference to a value in the extensions map.
+    ///
+    /// Returns `None` if no value of the given type has been inserted.
+    pub fn get<T: Send + Sync + 'static>(&self) -> Option<&T> {
+        self.map
+            .get(&TypeId::of::<T>())
+            .and_then(|val| val.downcast_ref::<T>())
+    }
+}
+
+impl std::fmt::Debug for Extensions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Extensions")
+            .field("len", &self.map.len())
+            .finish()
+    }
+}
+
 /// Request type for the tower Service implementation
 #[derive(Debug)]
 pub struct RouterRequest {
     pub id: RequestId,
     pub inner: McpRequest,
+    /// Type-map for passing data (e.g., `TokenClaims`) through middleware.
+    pub extensions: Extensions,
 }
 
 /// Response type for the tower Service implementation
@@ -996,6 +1050,7 @@ mod tests {
                     version: "1.0".to_string(),
                 },
             }),
+            extensions: Extensions::new(),
         };
         let _ = router.ready().await.unwrap().call(init_req).await.unwrap();
         // Send initialized notification
@@ -1020,6 +1075,7 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(1),
             inner: McpRequest::ListTools(ListToolsParams::default()),
+            extensions: Extensions::new(),
         };
 
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
@@ -1055,6 +1111,7 @@ mod tests {
                 arguments: serde_json::json!({"a": 2, "b": 3}),
                 meta: None,
             }),
+            extensions: Extensions::new(),
         };
 
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
@@ -1396,6 +1453,7 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(1),
             inner: McpRequest::ListResourceTemplates(ListResourceTemplatesParams::default()),
+            extensions: Extensions::new(),
         };
 
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
@@ -1440,6 +1498,7 @@ mod tests {
             inner: McpRequest::ReadResource(ReadResourceParams {
                 uri: "db://users/123".to_string(),
             }),
+            extensions: Extensions::new(),
         };
 
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
@@ -1491,6 +1550,7 @@ mod tests {
             inner: McpRequest::ReadResource(ReadResourceParams {
                 uri: "file:///README.md".to_string(),
             }),
+            extensions: Extensions::new(),
         };
 
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
@@ -1536,6 +1596,7 @@ mod tests {
             inner: McpRequest::ReadResource(ReadResourceParams {
                 uri: "db://posts/123".to_string(),
             }),
+            extensions: Extensions::new(),
         };
 
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
@@ -1583,6 +1644,7 @@ mod tests {
                     version: "1.0".to_string(),
                 },
             }),
+            extensions: Extensions::new(),
         };
         let resp = router.ready().await.unwrap().call(init_req).await.unwrap();
 
@@ -1692,6 +1754,7 @@ mod tests {
                     version: "1.0".to_string(),
                 },
             }),
+            extensions: Extensions::new(),
         };
         let resp = router.ready().await.unwrap().call(init_req).await.unwrap();
 
@@ -1723,6 +1786,7 @@ mod tests {
                     version: "1.0".to_string(),
                 },
             }),
+            extensions: Extensions::new(),
         };
         let resp = router.ready().await.unwrap().call(init_req).await.unwrap();
 
@@ -1759,6 +1823,7 @@ mod tests {
                 arguments: serde_json::json!({"a": 5, "b": 10}),
                 ttl: None,
             }),
+            extensions: Extensions::new(),
         };
 
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
@@ -1780,6 +1845,7 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(1),
             inner: McpRequest::ListTasks(ListTasksParams::default()),
+            extensions: Extensions::new(),
         };
 
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
@@ -1813,6 +1879,7 @@ mod tests {
                 arguments: serde_json::json!({"a": 7, "b": 8}),
                 ttl: None,
             }),
+            extensions: Extensions::new(),
         };
 
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
@@ -1830,6 +1897,7 @@ mod tests {
             inner: McpRequest::GetTaskResult(GetTaskResultParams {
                 task_id: task_id.clone(),
             }),
+            extensions: Extensions::new(),
         };
 
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
@@ -1875,6 +1943,7 @@ mod tests {
                 arguments: serde_json::json!({}),
                 ttl: None,
             }),
+            extensions: Extensions::new(),
         };
 
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
@@ -1890,6 +1959,7 @@ mod tests {
                 task_id: task_id.clone(),
                 reason: Some("Test cancellation".to_string()),
             }),
+            extensions: Extensions::new(),
         };
 
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
@@ -1924,6 +1994,7 @@ mod tests {
                 arguments: serde_json::json!({"a": 1, "b": 2}),
                 ttl: Some(600),
             }),
+            extensions: Extensions::new(),
         };
 
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
@@ -1938,6 +2009,7 @@ mod tests {
             inner: McpRequest::GetTaskInfo(GetTaskInfoParams {
                 task_id: task_id.clone(),
             }),
+            extensions: Extensions::new(),
         };
 
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
@@ -1964,6 +2036,7 @@ mod tests {
                 arguments: serde_json::json!({}),
                 ttl: None,
             }),
+            extensions: Extensions::new(),
         };
 
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
@@ -1986,6 +2059,7 @@ mod tests {
             inner: McpRequest::GetTaskInfo(GetTaskInfoParams {
                 task_id: "task-999".to_string(),
             }),
+            extensions: Extensions::new(),
         };
 
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
@@ -2019,6 +2093,7 @@ mod tests {
             inner: McpRequest::SubscribeResource(SubscribeResourceParams {
                 uri: "file:///test.txt".to_string(),
             }),
+            extensions: Extensions::new(),
         };
 
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
@@ -2049,6 +2124,7 @@ mod tests {
             inner: McpRequest::SubscribeResource(SubscribeResourceParams {
                 uri: "file:///test.txt".to_string(),
             }),
+            extensions: Extensions::new(),
         };
         let _ = router.ready().await.unwrap().call(req).await.unwrap();
         assert!(router.is_subscribed("file:///test.txt"));
@@ -2059,6 +2135,7 @@ mod tests {
             inner: McpRequest::UnsubscribeResource(UnsubscribeResourceParams {
                 uri: "file:///test.txt".to_string(),
             }),
+            extensions: Extensions::new(),
         };
 
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
@@ -2082,6 +2159,7 @@ mod tests {
             inner: McpRequest::SubscribeResource(SubscribeResourceParams {
                 uri: "file:///nonexistent.txt".to_string(),
             }),
+            extensions: Extensions::new(),
         };
 
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
@@ -2211,6 +2289,7 @@ mod tests {
                     version: "1.0".to_string(),
                 },
             }),
+            extensions: Extensions::new(),
         };
         let resp = router.ready().await.unwrap().call(init_req).await.unwrap();
 
@@ -2250,6 +2329,7 @@ mod tests {
                     version: "1.0".to_string(),
                 },
             }),
+            extensions: Extensions::new(),
         };
         let resp = router
             .clone()
@@ -2278,6 +2358,7 @@ mod tests {
                 reference: CompletionReference::prompt("test-prompt"),
                 argument: CompletionArgument::new("query", "al"),
             }),
+            extensions: Extensions::new(),
         };
         let resp = router
             .clone()
@@ -2311,6 +2392,7 @@ mod tests {
                     version: "1.0".to_string(),
                 },
             }),
+            extensions: Extensions::new(),
         };
         let resp = router
             .clone()
@@ -2339,6 +2421,7 @@ mod tests {
                 reference: CompletionReference::prompt("test-prompt"),
                 argument: CompletionArgument::new("query", "al"),
             }),
+            extensions: Extensions::new(),
         };
         let resp = router
             .clone()

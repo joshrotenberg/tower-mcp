@@ -139,6 +139,7 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(1),
             inner: crate::protocol::McpRequest::Ping,
+            extensions: crate::router::Extensions::new(),
         };
 
         let result = Service::call(&mut service, req).await;

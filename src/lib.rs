@@ -152,7 +152,7 @@ pub use resource::{
     Resource, ResourceBuilder, ResourceHandler, ResourceTemplate, ResourceTemplateBuilder,
     ResourceTemplateHandler,
 };
-pub use router::{McpRouter, RouterRequest, RouterResponse};
+pub use router::{Extensions, McpRouter, RouterRequest, RouterResponse};
 pub use session::{SessionPhase, SessionState};
 pub use tool::{Tool, ToolBuilder, ToolHandler};
 pub use transport::{
@@ -171,6 +171,9 @@ pub use transport::McpBoxService;
 
 #[cfg(feature = "childproc")]
 pub use transport::{ChildProcessConnection, ChildProcessTransport};
+
+#[cfg(feature = "oauth")]
+pub use oauth::{ScopeEnforcementLayer, ScopeEnforcementService};
 
 #[cfg(feature = "testing")]
 pub use testing::TestClient;
