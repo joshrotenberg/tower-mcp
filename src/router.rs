@@ -23,6 +23,13 @@ use crate::resource::{Resource, ResourceTemplate};
 use crate::session::SessionState;
 use crate::tool::Tool;
 
+/// Type alias for completion handler function
+pub type CompletionHandler = Arc<
+    dyn Fn(CompleteParams) -> Pin<Box<dyn Future<Output = Result<CompleteResult>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// MCP Router that dispatches requests to registered handlers
 ///
 /// Implements `tower::Service<McpRequest>` for middleware composition.
@@ -87,6 +94,8 @@ struct McpRouterInner {
     task_store: TaskStore,
     /// Subscribed resource URIs
     subscriptions: Arc<RwLock<HashSet<String>>>,
+    /// Handler for completion requests
+    completion_handler: Option<CompletionHandler>,
 }
 
 impl McpRouter {
@@ -106,6 +115,7 @@ impl McpRouter {
                 client_requester: None,
                 task_store: TaskStore::new(),
                 subscriptions: Arc::new(RwLock::new(HashSet::new())),
+                completion_handler: None,
             }),
             session: SessionState::new(),
         }
@@ -274,6 +284,42 @@ impl McpRouter {
         Arc::make_mut(&mut self.inner)
             .prompts
             .insert(prompt.name.clone(), Arc::new(prompt));
+        self
+    }
+
+    /// Register a completion handler for `completion/complete` requests.
+    ///
+    /// The handler receives `CompleteParams` containing the reference (prompt or resource)
+    /// and the argument being completed, and should return completion suggestions.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::{McpRouter, CompleteResult};
+    /// use tower_mcp::protocol::{CompleteParams, CompletionReference};
+    ///
+    /// let router = McpRouter::new()
+    ///     .completion_handler(|params: CompleteParams| async move {
+    ///         // Provide completions based on the reference and argument
+    ///         match params.reference {
+    ///             CompletionReference::Prompt { name } => {
+    ///                 // Return prompt argument completions
+    ///                 Ok(CompleteResult::new(vec!["option1".to_string(), "option2".to_string()]))
+    ///             }
+    ///             CompletionReference::Resource { uri } => {
+    ///                 // Return resource URI completions
+    ///                 Ok(CompleteResult::new(vec![]))
+    ///             }
+    ///         }
+    ///     });
+    /// ```
+    pub fn completion_handler<F, Fut>(mut self, handler: F) -> Self
+    where
+        F: Fn(CompleteParams) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<CompleteResult>> + Send + 'static,
+    {
+        Arc::make_mut(&mut self.inner).completion_handler =
+            Some(Arc::new(move |params| Box::pin(handler(params))));
         self
     }
 
@@ -446,8 +492,12 @@ impl McpRouter {
             },
             // Tasks capability is always available
             tasks: Some(TasksCapability::default()),
-            // Completions: for now always None, completion handlers to be added
-            completions: None,
+            // Completions capability when a handler is registered
+            completions: if self.inner.completion_handler.is_some() {
+                Some(CompletionsCapability::default())
+            } else {
+                None
+            },
         }
     }
 
@@ -768,6 +818,23 @@ impl McpRouter {
                 // implemented in the notification sending logic
                 tracing::debug!(level = ?params.level, "Client set logging level");
                 Ok(McpResponse::SetLoggingLevel(EmptyResult {}))
+            }
+
+            McpRequest::Complete(params) => {
+                tracing::debug!(
+                    reference = ?params.reference,
+                    argument = %params.argument.name,
+                    "Completion request"
+                );
+
+                // Delegate to registered completion handler if available
+                if let Some(ref handler) = self.inner.completion_handler {
+                    let result = handler(params).await?;
+                    Ok(McpResponse::Complete(result))
+                } else {
+                    // No completion handler registered, return empty completions
+                    Ok(McpResponse::Complete(CompleteResult::new(vec![])))
+                }
             }
 
             McpRequest::Unknown { method, .. } => {
@@ -2154,6 +2221,139 @@ mod tests {
                 assert!(resources_cap.subscribe);
             }
             _ => panic!("Expected Initialize response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_completion_handler() {
+        let router = McpRouter::new()
+            .server_info("test", "1.0")
+            .completion_handler(|params: CompleteParams| async move {
+                // Return suggestions based on the argument value
+                let prefix = &params.argument.value;
+                let suggestions: Vec<String> = vec!["alpha", "beta", "gamma"]
+                    .into_iter()
+                    .filter(|s| s.starts_with(prefix))
+                    .map(String::from)
+                    .collect();
+                Ok(CompleteResult::new(suggestions))
+            });
+
+        // Initialize
+        let init_req = RouterRequest {
+            id: RequestId::Number(0),
+            inner: McpRequest::Initialize(InitializeParams {
+                protocol_version: "2025-03-26".to_string(),
+                capabilities: ClientCapabilities::default(),
+                client_info: Implementation {
+                    name: "test".to_string(),
+                    version: "1.0".to_string(),
+                },
+            }),
+        };
+        let resp = router
+            .clone()
+            .ready()
+            .await
+            .unwrap()
+            .call(init_req)
+            .await
+            .unwrap();
+
+        // Check that completions capability is advertised
+        match resp.inner {
+            Ok(McpResponse::Initialize(result)) => {
+                assert!(result.capabilities.completions.is_some());
+            }
+            _ => panic!("Expected Initialize response"),
+        }
+
+        // Send initialized notification
+        router.handle_notification(McpNotification::Initialized);
+
+        // Test completion request
+        let complete_req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::Complete(CompleteParams {
+                reference: CompletionReference::prompt("test-prompt"),
+                argument: CompletionArgument::new("query", "al"),
+            }),
+        };
+        let resp = router
+            .clone()
+            .ready()
+            .await
+            .unwrap()
+            .call(complete_req)
+            .await
+            .unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::Complete(result)) => {
+                assert_eq!(result.completion.values, vec!["alpha"]);
+            }
+            _ => panic!("Expected Complete response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_completion_without_handler_returns_empty() {
+        let router = McpRouter::new().server_info("test", "1.0");
+
+        // Initialize
+        let init_req = RouterRequest {
+            id: RequestId::Number(0),
+            inner: McpRequest::Initialize(InitializeParams {
+                protocol_version: "2025-03-26".to_string(),
+                capabilities: ClientCapabilities::default(),
+                client_info: Implementation {
+                    name: "test".to_string(),
+                    version: "1.0".to_string(),
+                },
+            }),
+        };
+        let resp = router
+            .clone()
+            .ready()
+            .await
+            .unwrap()
+            .call(init_req)
+            .await
+            .unwrap();
+
+        // Check that completions capability is NOT advertised
+        match resp.inner {
+            Ok(McpResponse::Initialize(result)) => {
+                assert!(result.capabilities.completions.is_none());
+            }
+            _ => panic!("Expected Initialize response"),
+        }
+
+        // Send initialized notification
+        router.handle_notification(McpNotification::Initialized);
+
+        // Test completion request still works but returns empty
+        let complete_req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::Complete(CompleteParams {
+                reference: CompletionReference::prompt("test-prompt"),
+                argument: CompletionArgument::new("query", "al"),
+            }),
+        };
+        let resp = router
+            .clone()
+            .ready()
+            .await
+            .unwrap()
+            .call(complete_req)
+            .await
+            .unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::Complete(result)) => {
+                assert!(result.completion.values.is_empty());
+            }
+            _ => panic!("Expected Complete response"),
         }
     }
 }
