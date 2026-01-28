@@ -23,8 +23,11 @@
 //!   -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"add","arguments":{"a":10,"b":32}}}'
 //! ```
 
+use std::time::Duration;
+
 use schemars::JsonSchema;
 use serde::Deserialize;
+use tower::timeout::TimeoutLayer;
 use tower_mcp::{
     CallToolResult, HttpTransport, McpRouter, PromptBuilder, ResourceBuilder, ToolBuilder,
 };
@@ -104,7 +107,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let transport = HttpTransport::new(router)
         // For local development, disable origin validation
         // In production, use .allowed_origins(vec!["https://your-domain.com".to_string()])
-        .disable_origin_validation();
+        .disable_origin_validation()
+        // Apply a 30-second timeout to MCP request processing.
+        // This is separate from any axum-level middleware on into_router().
+        .layer(TimeoutLayer::new(Duration::from_secs(30)));
 
     // Serve on localhost:3000
     tracing::info!("Starting HTTP MCP server on http://127.0.0.1:3000");

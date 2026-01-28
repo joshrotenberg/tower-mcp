@@ -17,6 +17,9 @@ pub mod websocket;
 #[cfg(feature = "childproc")]
 pub mod childproc;
 
+#[cfg(any(feature = "http", feature = "websocket"))]
+pub mod service;
+
 pub use stdio::{
     BidirectionalStdioTransport, GenericStdioTransport, StdioTransport, SyncStdioTransport,
 };
@@ -29,3 +32,6 @@ pub use websocket::WebSocketTransport;
 
 #[cfg(feature = "childproc")]
 pub use childproc::{ChildProcessConnection, ChildProcessTransport};
+
+#[cfg(any(feature = "http", feature = "websocket"))]
+pub use service::McpBoxService;

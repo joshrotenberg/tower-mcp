@@ -105,7 +105,8 @@ use crate::protocol::{
     JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpNotification, RequestId,
     SUPPORTED_PROTOCOL_VERSIONS,
 };
-use crate::router::McpRouter;
+use crate::router::{McpRouter, RouterRequest, RouterResponse};
+use crate::transport::service::{CatchError, McpBoxService, ServiceFactory, identity_factory};
 
 /// Header name for MCP session ID
 pub const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
@@ -127,6 +128,8 @@ struct Session {
     id: String,
     /// The MCP router for this session
     router: McpRouter,
+    /// Factory for creating middleware-wrapped services
+    service_factory: ServiceFactory,
     /// Broadcast channel for SSE notifications and outgoing requests
     notifications_tx: broadcast::Sender<String>,
     /// Last time this session was accessed
@@ -138,7 +141,7 @@ struct Session {
 }
 
 impl Session {
-    fn new(router: McpRouter, sampling_enabled: bool) -> Self {
+    fn new(router: McpRouter, sampling_enabled: bool, service_factory: ServiceFactory) -> Self {
         let (notifications_tx, _) = broadcast::channel(100);
 
         // Set up client requester if sampling is enabled
@@ -155,11 +158,17 @@ impl Session {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             router,
+            service_factory,
             notifications_tx,
             last_accessed: RwLock::new(Instant::now()),
             pending_requests: Mutex::new(HashMap::new()),
             request_rx: Mutex::new(request_rx),
         }
+    }
+
+    /// Create a middleware-wrapped service from this session's router.
+    fn make_service(&self) -> McpBoxService {
+        (self.service_factory)(self.router.clone())
     }
 
     /// Update the last accessed time
@@ -269,7 +278,11 @@ impl SessionStore {
         }
     }
 
-    async fn create(&self, router: McpRouter) -> Option<Arc<Session>> {
+    async fn create(
+        &self,
+        router: McpRouter,
+        service_factory: ServiceFactory,
+    ) -> Option<Arc<Session>> {
         let mut sessions = self.sessions.write().await;
 
         // Check max sessions limit
@@ -284,7 +297,7 @@ impl SessionStore {
             return None;
         }
 
-        let session = Arc::new(Session::new(router, self.sampling_enabled));
+        let session = Arc::new(Session::new(router, self.sampling_enabled, service_factory));
         sessions.insert(session.id.clone(), session.clone());
         tracing::debug!(session_id = %session.id, sampling = self.sampling_enabled, "Created new session");
         Some(session)
@@ -343,6 +356,8 @@ impl SessionStore {
 struct AppState {
     /// Template router for creating new sessions
     router_template: McpRouter,
+    /// Factory for creating middleware-wrapped services
+    service_factory: ServiceFactory,
     /// Session store
     sessions: Arc<SessionStore>,
     /// Whether to validate Origin header
@@ -362,6 +377,7 @@ pub struct HttpTransport {
     allowed_origins: Vec<String>,
     session_config: SessionConfig,
     sampling_enabled: bool,
+    service_factory: ServiceFactory,
 }
 
 impl HttpTransport {
@@ -373,6 +389,7 @@ impl HttpTransport {
             allowed_origins: vec![],
             session_config: SessionConfig::default(),
             sampling_enabled: false,
+            service_factory: identity_factory(),
         }
     }
 
@@ -419,6 +436,7 @@ impl HttpTransport {
             allowed_origins: vec![],
             session_config: SessionConfig::default(),
             sampling_enabled: true,
+            service_factory: identity_factory(),
         }
     }
 
@@ -452,6 +470,46 @@ impl HttpTransport {
         self
     }
 
+    /// Apply a tower middleware layer to MCP request processing.
+    ///
+    /// The layer is applied to the [`McpRouter`] service within each session,
+    /// wrapping the `Service<RouterRequest>` pipeline. This allows middleware
+    /// like timeouts, rate limiting, or custom instrumentation to be applied
+    /// at the MCP request level.
+    ///
+    /// Middleware errors are automatically converted into JSON-RPC error
+    /// responses, so the transport's error handling remains unchanged.
+    ///
+    /// Note: this is separate from axum-level middleware on `into_router()`.
+    /// Axum middleware operates on HTTP requests; this operates on MCP requests.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use std::time::Duration;
+    /// use tower::timeout::TimeoutLayer;
+    /// use tower_mcp::McpRouter;
+    /// use tower_mcp::transport::http::HttpTransport;
+    ///
+    /// let router = McpRouter::new().server_info("my-server", "1.0.0");
+    /// let transport = HttpTransport::new(router)
+    ///     .layer(TimeoutLayer::new(Duration::from_secs(30)));
+    /// ```
+    pub fn layer<L>(mut self, layer: L) -> Self
+    where
+        L: tower::Layer<McpRouter> + Send + Sync + 'static,
+        L::Service:
+            tower::Service<RouterRequest, Response = RouterResponse> + Clone + Send + 'static,
+        <L::Service as tower::Service<RouterRequest>>::Error: std::fmt::Display + Send,
+        <L::Service as tower::Service<RouterRequest>>::Future: Send,
+    {
+        self.service_factory = Arc::new(move |router: McpRouter| {
+            let wrapped = layer.layer(router);
+            tower::util::BoxCloneService::new(CatchError::new(wrapped))
+        });
+        self
+    }
+
     fn build_state(&self) -> Arc<AppState> {
         let sessions = Arc::new(SessionStore::new(
             self.session_config.clone(),
@@ -470,6 +528,7 @@ impl HttpTransport {
 
         Arc::new(AppState {
             router_template: self.router.clone(),
+            service_factory: self.service_factory.clone(),
             sessions,
             validate_origin: self.validate_origin,
             allowed_origins: self.allowed_origins.clone(),
@@ -620,7 +679,11 @@ async fn handle_post(
     // Get or create session
     let session = if is_init {
         // Create new session for initialize
-        match state.sessions.create(state.router_template.clone()).await {
+        match state
+            .sessions
+            .create(state.router_template.clone(), state.service_factory.clone())
+            .await
+        {
             Some(s) => s,
             None => {
                 return (
@@ -716,8 +779,8 @@ async fn handle_post(
         }
     };
 
-    // Process the request
-    let mut service = JsonRpcService::new(session.router.clone());
+    // Process the request through the middleware-wrapped service
+    let mut service = JsonRpcService::new(session.make_service());
     let response = match service.call_single(request).await {
         Ok(resp) => resp,
         Err(e) => {
@@ -1163,6 +1226,176 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json.get("error").is_some());
         assert_eq!(json["error"]["code"], -32005); // SessionNotFound
+    }
+
+    #[tokio::test]
+    async fn test_layer_with_identity() {
+        // Verify that .layer() compiles and produces a working transport
+        // using a no-op layer (tower::layer::Identity)
+        let transport = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .layer(tower::layer::util::Identity::new());
+        let app = transport.into_router();
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "clientInfo": {
+                            "name": "test-client",
+                            "version": "1.0.0"
+                        }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().contains_key(MCP_SESSION_ID_HEADER));
+    }
+
+    #[tokio::test]
+    async fn test_layer_with_timeout() {
+        // Verify that .layer() works with TimeoutLayer
+        use std::time::Duration;
+        use tower::timeout::TimeoutLayer;
+
+        let transport = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .layer(TimeoutLayer::new(Duration::from_secs(30)));
+        let app = transport.into_router();
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "clientInfo": {
+                            "name": "test-client",
+                            "version": "1.0.0"
+                        }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().contains_key(MCP_SESSION_ID_HEADER));
+    }
+
+    #[tokio::test]
+    async fn test_layer_middleware_error_produces_jsonrpc_error() {
+        // Use an extremely short timeout to force an error.
+        // The CatchError wrapper should convert it to a JSON-RPC error response.
+        use std::time::Duration;
+        use tower::timeout::TimeoutLayer;
+
+        let slow_tool = crate::tool::ToolBuilder::new("slow")
+            .description("A slow tool")
+            .handler(|_: serde_json::Value| async move {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                Ok(crate::CallToolResult::text("done"))
+            })
+            .build()
+            .unwrap();
+
+        let router = McpRouter::new()
+            .server_info("test-server", "1.0.0")
+            .tool(slow_tool);
+
+        // 1ms timeout will definitely expire before the tool completes
+        let transport = HttpTransport::new(router)
+            .disable_origin_validation()
+            .layer(TimeoutLayer::new(Duration::from_millis(1)));
+        let app = transport.into_router();
+
+        // Initialize first
+        let init_request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "clientInfo": {
+                            "name": "test-client",
+                            "version": "1.0.0"
+                        }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.clone().oneshot(init_request).await.unwrap();
+        let session_id = response
+            .headers()
+            .get(MCP_SESSION_ID_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Call the slow tool -- should timeout and return a JSON-RPC error
+        let tool_request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header(MCP_SESSION_ID_HEADER, &session_id)
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "slow",
+                        "arguments": {}
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(tool_request).await.unwrap();
+        // Should still return 200 with a JSON-RPC error body
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json.get("error").is_some(),
+            "Expected JSON-RPC error response, got: {}",
+            json
+        );
     }
 
     #[tokio::test]
