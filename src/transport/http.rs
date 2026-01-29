@@ -495,6 +495,9 @@ struct AppState {
     allowed_origins: Vec<String>,
     /// Whether sampling is enabled
     sampling_enabled: bool,
+    /// SEP-1442 stateless mode configuration
+    #[cfg(feature = "stateless")]
+    stateless_config: Option<crate::stateless::StatelessConfig>,
 }
 
 /// Configuration for OAuth 2.1 Protected Resource Metadata.
@@ -521,6 +524,8 @@ pub struct HttpTransport {
     service_factory: ServiceFactory,
     #[cfg(feature = "oauth")]
     oauth_config: Option<OAuthConfig>,
+    #[cfg(feature = "stateless")]
+    stateless_config: Option<crate::stateless::StatelessConfig>,
 }
 
 impl HttpTransport {
@@ -535,6 +540,8 @@ impl HttpTransport {
             service_factory: identity_factory(),
             #[cfg(feature = "oauth")]
             oauth_config: None,
+            #[cfg(feature = "stateless")]
+            stateless_config: None,
         }
     }
 
@@ -584,6 +591,8 @@ impl HttpTransport {
             service_factory: identity_factory(),
             #[cfg(feature = "oauth")]
             oauth_config: None,
+            #[cfg(feature = "stateless")]
+            stateless_config: None,
         }
     }
 
@@ -640,6 +649,30 @@ impl HttpTransport {
     #[cfg(feature = "oauth")]
     pub fn oauth(mut self, metadata: crate::oauth::ProtectedResourceMetadata) -> Self {
         self.oauth_config = Some(OAuthConfig { metadata });
+        self
+    }
+
+    /// Enable SEP-1442 stateless mode.
+    ///
+    /// In stateless mode:
+    /// - `server/discover` RPC is available before initialization
+    /// - Protocol version is validated on each request
+    /// - Sessions become optional (depending on configuration)
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use tower_mcp::stateless::StatelessConfig;
+    /// use tower_mcp::transport::http::HttpTransport;
+    /// use tower_mcp::McpRouter;
+    ///
+    /// let router = McpRouter::new().server_info("my-server", "1.0.0");
+    /// let transport = HttpTransport::new(router)
+    ///     .stateless(StatelessConfig::new());
+    /// ```
+    #[cfg(feature = "stateless")]
+    pub fn stateless(mut self, config: crate::stateless::StatelessConfig) -> Self {
+        self.stateless_config = Some(config);
         self
     }
 
@@ -712,6 +745,8 @@ impl HttpTransport {
             validate_origin: self.validate_origin,
             allowed_origins: self.allowed_origins.clone(),
             sampling_enabled: self.sampling_enabled,
+            #[cfg(feature = "stateless")]
+            stateless_config: self.stateless_config.clone(),
         })
     }
 
@@ -949,11 +984,56 @@ async fn handle_post(
         }
     };
 
+    // SEP-1442: Validate protocol version if stateless mode requires it
+    #[cfg(feature = "stateless")]
+    if let Some(ref config) = state.stateless_config {
+        if config.require_protocol_version {
+            let protocol_version = get_protocol_version(&headers);
+            if let Some(version) = protocol_version {
+                if !crate::protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&version.as_str()) {
+                    let error_data = crate::stateless::UnsupportedVersionData {
+                        supported_versions: crate::protocol::SUPPORTED_PROTOCOL_VERSIONS
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect(),
+                    };
+                    return json_rpc_error_response(
+                        extract_request_id(&parsed),
+                        JsonRpcError {
+                            code: crate::stateless::error_codes::UNSUPPORTED_VERSION,
+                            message: "Unsupported protocol version".to_string(),
+                            data: Some(serde_json::to_value(error_data).unwrap()),
+                        },
+                    );
+                }
+            } else {
+                // Protocol version header is required but missing
+                return json_rpc_error_response(
+                    extract_request_id(&parsed),
+                    JsonRpcError::invalid_request(format!(
+                        "Missing required header: {}",
+                        MCP_PROTOCOL_VERSION_HEADER
+                    )),
+                );
+            }
+        }
+    }
+
     // Check if this is an initialize request (creates new session)
     let is_init = is_initialize_request(&parsed);
 
+    // SEP-1442: Check if this is a server/discover request (works without session)
+    #[cfg(feature = "stateless")]
+    let is_discover = parsed
+        .get("method")
+        .and_then(|m| m.as_str())
+        .map(|m| m == "server/discover")
+        .unwrap_or(false);
+    #[cfg(not(feature = "stateless"))]
+    let is_discover = false;
+
     // Get or create session
-    let session = if is_init {
+    let session = if is_init || is_discover {
         // Create new session for initialize
         match state
             .sessions
