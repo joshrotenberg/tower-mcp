@@ -34,20 +34,17 @@ jobs:
           echo "Waiting for server to be ready..."
           sleep 10
 
+          # Save response headers to a file so we can extract session ID
           echo "Sending initialize request..."
-          INIT_RESPONSE=$(curl -s -X POST https://crates-mcp-demo.fly.dev/ \
+          INIT_RESPONSE=$(curl -s -D /tmp/headers.txt -X POST https://crates-mcp-demo.fly.dev/ \
             -H "Content-Type: application/json" \
             -H "Accept: application/json" \
             -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"deploy-check","version":"1.0"}}}')
 
           echo "Init response: $INIT_RESPONSE"
 
-          # Extract session ID from response header (need to capture headers)
-          SESSION_ID=$(curl -s -i -X POST https://crates-mcp-demo.fly.dev/ \
-            -H "Content-Type: application/json" \
-            -H "Accept: application/json" \
-            -d '{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"deploy-check","version":"1.0"}}}' \
-            | grep -i "mcp-session-id" | cut -d' ' -f2 | tr -d '\r')
+          # Extract session ID from response headers
+          SESSION_ID=$(grep -i "mcp-session-id" /tmp/headers.txt | cut -d' ' -f2 | tr -d '\r')
 
           echo "Session ID: $SESSION_ID"
 
@@ -56,12 +53,20 @@ jobs:
             exit 1
           fi
 
+          # Send initialized notification (required by MCP protocol before other requests)
+          echo "Sending initialized notification..."
+          curl -s -X POST https://crates-mcp-demo.fly.dev/ \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -H "MCP-Session-Id: $SESSION_ID" \
+            -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+
           echo "Sending test tool call..."
           TOOL_RESPONSE=$(curl -s -X POST https://crates-mcp-demo.fly.dev/ \
             -H "Content-Type: application/json" \
             -H "Accept: application/json" \
             -H "MCP-Session-Id: $SESSION_ID" \
-            -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search_crates","arguments":{"query":"tower"}}}')
+            -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_crates","arguments":{"query":"tower"}}}')
 
           echo "Tool response: $TOOL_RESPONSE"
 
