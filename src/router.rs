@@ -18,7 +18,7 @@ use crate::context::{
     ServerNotification,
 };
 use crate::error::{Error, JsonRpcError, Result};
-use crate::filter::{ResourceFilter, ToolFilter};
+use crate::filter::{PromptFilter, ResourceFilter, ToolFilter};
 use crate::prompt::Prompt;
 use crate::protocol::*;
 use crate::resource::{Resource, ResourceTemplate};
@@ -110,6 +110,8 @@ struct McpRouterInner {
     tool_filter: Option<ToolFilter>,
     /// Filter for resources based on session state
     resource_filter: Option<ResourceFilter>,
+    /// Filter for prompts based on session state
+    prompt_filter: Option<PromptFilter>,
 }
 
 impl McpRouter {
@@ -136,6 +138,7 @@ impl McpRouter {
                 completion_handler: None,
                 tool_filter: None,
                 resource_filter: None,
+                prompt_filter: None,
             }),
             session: SessionState::new(),
         }
@@ -523,6 +526,39 @@ impl McpRouter {
         self
     }
 
+    /// Set a filter for prompts based on session state.
+    ///
+    /// The filter receives the current session state and each prompt, returning
+    /// `true` if the prompt should be visible to this session. Prompts that
+    /// don't pass the filter will not appear in `prompts/list` responses and will
+    /// return an error if accessed directly.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::{McpRouter, PromptBuilder, CapabilityFilter, Prompt, Filterable};
+    ///
+    /// let public_prompt = PromptBuilder::new("greeting")
+    ///     .description("A friendly greeting")
+    ///     .user_message("Hello!");
+    ///
+    /// let admin_prompt = PromptBuilder::new("system_debug")
+    ///     .description("Admin debugging prompt")
+    ///     .user_message("Debug info");
+    ///
+    /// let router = McpRouter::new()
+    ///     .prompt(public_prompt)
+    ///     .prompt(admin_prompt)
+    ///     .prompt_filter(CapabilityFilter::new(|_session, prompt: &Prompt| {
+    ///         // In real code, check session.extensions() for auth claims
+    ///         !prompt.name().contains("system")
+    ///     }));
+    /// ```
+    pub fn prompt_filter(mut self, filter: PromptFilter) -> Self {
+        Arc::make_mut(&mut self.inner).prompt_filter = Some(filter);
+        self
+    }
+
     /// Get access to the session state
     pub fn session(&self) -> &SessionState {
         &self.session
@@ -895,6 +931,14 @@ impl McpRouter {
                     .inner
                     .prompts
                     .values()
+                    .filter(|p| {
+                        // Apply prompt filter if configured
+                        self.inner
+                            .prompt_filter
+                            .as_ref()
+                            .map(|f| f.is_visible(&self.session, p))
+                            .unwrap_or(true)
+                    })
                     .map(|p| p.definition())
                     .collect();
 
@@ -911,6 +955,13 @@ impl McpRouter {
                         params.name
                     )))
                 })?;
+
+                // Check prompt filter if configured
+                if let Some(filter) = &self.inner.prompt_filter {
+                    if !filter.is_visible(&self.session, prompt) {
+                        return Err(filter.denial_error(&params.name));
+                    }
+                }
 
                 tracing::debug!(name = %params.name, "Getting prompt");
                 let result = prompt.get(params.arguments).await?;
@@ -2975,6 +3026,159 @@ mod tests {
             id: RequestId::Number(1),
             inner: McpRequest::ReadResource(ReadResourceParams {
                 uri: "file:///secret.txt".to_string(),
+            }),
+            extensions: Extensions::new(),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        // Should get forbidden error
+        match resp.inner {
+            Err(e) => {
+                assert_eq!(e.code, -32007); // Forbidden
+                assert!(e.message.contains("Unauthorized"));
+            }
+            _ => panic!("Expected JsonRpc error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_prompt_filter_list() {
+        use crate::filter::CapabilityFilter;
+        use crate::prompt::{Prompt, PromptBuilder};
+
+        let public_prompt = PromptBuilder::new("greeting")
+            .description("A greeting")
+            .user_message("Hello!");
+
+        let admin_prompt = PromptBuilder::new("system_debug")
+            .description("Admin prompt")
+            .user_message("Debug");
+
+        let mut router = McpRouter::new()
+            .prompt(public_prompt)
+            .prompt(admin_prompt)
+            .prompt_filter(CapabilityFilter::new(|_, p: &Prompt| {
+                !p.name.contains("system")
+            }));
+
+        // Initialize session
+        init_router(&mut router).await;
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::ListPrompts(ListPromptsParams::default()),
+            extensions: Extensions::new(),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::ListPrompts(result)) => {
+                // Should only see public prompt
+                assert_eq!(result.prompts.len(), 1);
+                assert_eq!(result.prompts[0].name, "greeting");
+            }
+            _ => panic!("Expected ListPrompts response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_prompt_filter_get_denied() {
+        use crate::filter::CapabilityFilter;
+        use crate::prompt::{Prompt, PromptBuilder};
+        use std::collections::HashMap;
+
+        let admin_prompt = PromptBuilder::new("system_debug")
+            .description("Admin prompt")
+            .user_message("Debug");
+
+        let mut router = McpRouter::new()
+            .prompt(admin_prompt)
+            .prompt_filter(CapabilityFilter::new(|_, _: &Prompt| false)); // Deny all
+
+        // Initialize session
+        init_router(&mut router).await;
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::GetPrompt(GetPromptParams {
+                name: "system_debug".to_string(),
+                arguments: HashMap::new(),
+            }),
+            extensions: Extensions::new(),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        // Should get method not found error (default denial behavior)
+        match resp.inner {
+            Err(e) => {
+                assert_eq!(e.code, -32601); // Method not found
+            }
+            _ => panic!("Expected JsonRpc error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_prompt_filter_get_allowed() {
+        use crate::filter::CapabilityFilter;
+        use crate::prompt::{Prompt, PromptBuilder};
+        use std::collections::HashMap;
+
+        let public_prompt = PromptBuilder::new("greeting")
+            .description("A greeting")
+            .user_message("Hello!");
+
+        let mut router = McpRouter::new()
+            .prompt(public_prompt)
+            .prompt_filter(CapabilityFilter::new(|_, _: &Prompt| true)); // Allow all
+
+        // Initialize session
+        init_router(&mut router).await;
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::GetPrompt(GetPromptParams {
+                name: "greeting".to_string(),
+                arguments: HashMap::new(),
+            }),
+            extensions: Extensions::new(),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::GetPrompt(result)) => {
+                assert_eq!(result.messages.len(), 1);
+            }
+            _ => panic!("Expected GetPrompt response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_prompt_filter_custom_denial() {
+        use crate::filter::{CapabilityFilter, DenialBehavior};
+        use crate::prompt::{Prompt, PromptBuilder};
+        use std::collections::HashMap;
+
+        let admin_prompt = PromptBuilder::new("system_debug")
+            .description("Admin prompt")
+            .user_message("Debug");
+
+        let mut router = McpRouter::new().prompt(admin_prompt).prompt_filter(
+            CapabilityFilter::new(|_, _: &Prompt| false)
+                .denial_behavior(DenialBehavior::Unauthorized),
+        );
+
+        // Initialize session
+        init_router(&mut router).await;
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::GetPrompt(GetPromptParams {
+                name: "system_debug".to_string(),
+                arguments: HashMap::new(),
             }),
             extensions: Extensions::new(),
         };

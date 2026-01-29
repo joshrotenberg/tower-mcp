@@ -135,7 +135,9 @@ pub use context::{
     RequestContext, RequestContextBuilder, ServerNotification, outgoing_request_channel,
 };
 pub use error::{BoxError, Error, Result, ToolError};
-pub use filter::{CapabilityFilter, DenialBehavior, Filterable, ResourceFilter, ToolFilter};
+pub use filter::{
+    CapabilityFilter, DenialBehavior, Filterable, PromptFilter, ResourceFilter, ToolFilter,
+};
 pub use jsonrpc::{JsonRpcLayer, JsonRpcService};
 pub use prompt::{Prompt, PromptBuilder, PromptHandler};
 pub use protocol::{
