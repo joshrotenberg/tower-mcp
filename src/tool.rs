@@ -6,11 +6,12 @@
 //! 2. **Trait-based** - Implement `McpTool` for full control
 //! 3. **Function-based** - Quick tools from async functions
 
+use std::borrow::Cow;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use schemars::JsonSchema;
+use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -18,6 +19,96 @@ use serde_json::Value;
 use crate::context::RequestContext;
 use crate::error::{Error, Result};
 use crate::protocol::{CallToolResult, ToolAnnotations, ToolDefinition, ToolIcon};
+
+/// A marker type for tools that take no parameters.
+///
+/// Use this instead of `()` when defining tools with no input parameters.
+/// The unit type `()` generates `"type": "null"` in JSON Schema, which many
+/// MCP clients reject. `NoParams` generates `"type": "object"` with no
+/// required properties, which is the correct schema for parameterless tools.
+///
+/// # Example
+///
+/// ```rust
+/// use tower_mcp::{ToolBuilder, CallToolResult, NoParams};
+///
+/// let tool = ToolBuilder::new("get_status")
+///     .description("Get current status")
+///     .handler(|_input: NoParams| async move {
+///         Ok(CallToolResult::text("OK"))
+///     })
+///     .build()
+///     .unwrap();
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NoParams;
+
+impl<'de> serde::Deserialize<'de> for NoParams {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Accept null, empty object, or any object (ignoring all fields)
+        struct NoParamsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for NoParamsVisitor {
+            type Value = NoParams;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("null or an object")
+            }
+
+            fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(NoParams)
+            }
+
+            fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(NoParams)
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                serde::Deserialize::deserialize(deserializer)
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                // Drain the map, ignoring all entries
+                while map
+                    .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                    .is_some()
+                {}
+                Ok(NoParams)
+            }
+        }
+
+        deserializer.deserialize_any(NoParamsVisitor)
+    }
+}
+
+impl JsonSchema for NoParams {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("NoParams")
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        serde_json::json!({
+            "type": "object"
+        })
+        .try_into()
+        .expect("valid schema")
+    }
+}
 
 /// Validate a tool name according to MCP spec.
 ///
@@ -1225,5 +1316,54 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn test_no_params_schema() {
+        // NoParams should produce a schema with type: "object"
+        let schema = schemars::schema_for!(NoParams);
+        let schema_value = serde_json::to_value(&schema).unwrap();
+        assert_eq!(
+            schema_value.get("type").and_then(|v| v.as_str()),
+            Some("object"),
+            "NoParams should generate type: object schema"
+        );
+    }
+
+    #[test]
+    fn test_no_params_deserialize() {
+        // NoParams should deserialize from various inputs
+        let from_empty_object: NoParams = serde_json::from_str("{}").unwrap();
+        assert_eq!(from_empty_object, NoParams);
+
+        let from_null: NoParams = serde_json::from_str("null").unwrap();
+        assert_eq!(from_null, NoParams);
+
+        // Should also accept objects with unexpected fields (ignored)
+        let from_object_with_fields: NoParams =
+            serde_json::from_str(r#"{"unexpected": "value"}"#).unwrap();
+        assert_eq!(from_object_with_fields, NoParams);
+    }
+
+    #[tokio::test]
+    async fn test_no_params_type_in_handler() {
+        // NoParams can be used as a handler input type
+        let tool = ToolBuilder::new("status")
+            .description("Get status")
+            .handler(|_input: NoParams| async move { Ok(CallToolResult::text("OK")) })
+            .build()
+            .expect("valid tool name");
+
+        // Check schema has type: object (not type: null like () would produce)
+        let schema = tool.definition().input_schema;
+        assert_eq!(
+            schema.get("type").and_then(|v| v.as_str()),
+            Some("object"),
+            "NoParams handler should produce type: object schema"
+        );
+
+        // Should work with empty input
+        let result = tool.call(serde_json::json!({})).await.unwrap();
+        assert!(!result.is_error);
     }
 }
