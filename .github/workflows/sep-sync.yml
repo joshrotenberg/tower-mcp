@@ -1,0 +1,160 @@
+name: Sync SEPs
+
+on:
+  schedule:
+    # Run weekly on Mondays at 9am UTC
+    - cron: '0 9 * * 1'
+  workflow_dispatch: # Allow manual trigger
+
+permissions:
+  issues: write
+
+jobs:
+  sync-seps:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync SEP tracking issues
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const UPSTREAM_REPO = 'modelcontextprotocol/specification';
+
+            // Map upstream labels to our status labels
+            const STATUS_MAP = {
+              'draft': 'sep:draft',
+              'proposal': 'sep:proposal',
+              'in-review': 'sep:in-review',
+              'accepted': 'sep:accepted',
+              'accepted-with-changes': 'sep:accepted',
+              'final': 'sep:final',
+              'dormant': 'sep:dormant',
+              'rejected': 'sep:rejected',
+            };
+
+            // Fetch all SEPs from upstream
+            console.log('Fetching SEPs from upstream...');
+            const upstreamIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: 'modelcontextprotocol',
+              repo: 'specification',
+              labels: 'SEP',
+              state: 'all',
+              per_page: 100,
+            });
+
+            console.log(`Found ${upstreamIssues.length} SEPs upstream`);
+
+            // Fetch our existing SEP tracking issues
+            const ourIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'sep',
+              state: 'all',
+              per_page: 100,
+            });
+
+            console.log(`Found ${ourIssues.length} SEP tracking issues locally`);
+
+            // Build a map of SEP number -> our issue
+            const sepToIssue = new Map();
+            for (const issue of ourIssues) {
+              // Extract SEP number from title (e.g., "SEP-1699" or "tracking: SEP-1699")
+              const match = issue.title.match(/SEP-(\d+)/i);
+              if (match) {
+                sepToIssue.set(match[1], issue);
+              }
+            }
+
+            // Process each upstream SEP
+            for (const sep of upstreamIssues) {
+              const sepMatch = sep.title.match(/SEP-(\d+)/i);
+              if (!sepMatch) continue;
+
+              const sepNumber = sepMatch[1];
+              const sepTitle = sep.title.replace(/^SEP-\d+:\s*/, '').trim();
+              const upstreamLabels = sep.labels.map(l => l.name);
+
+              // Determine status from upstream labels
+              let status = 'sep:proposal'; // default
+              for (const [upstreamLabel, ourLabel] of Object.entries(STATUS_MAP)) {
+                if (upstreamLabels.includes(upstreamLabel)) {
+                  status = ourLabel;
+                  break;
+                }
+              }
+
+              // Check if SEP is closed/final upstream
+              const isFinal = sep.state === 'closed' || upstreamLabels.includes('final');
+              const statusEmoji = isFinal ? '[final]' :
+                                  status === 'sep:accepted' ? '[accepted]' :
+                                  status === 'sep:in-review' ? '[in-review]' :
+                                  status === 'sep:draft' ? '[draft]' :
+                                  status === 'sep:dormant' ? '[dormant]' :
+                                  status === 'sep:rejected' ? '[rejected]' :
+                                  '[proposal]';
+
+              const newTitle = `${statusEmoji} SEP-${sepNumber}: ${sepTitle}`;
+
+              if (sepToIssue.has(sepNumber)) {
+                // Update existing issue
+                const existing = sepToIssue.get(sepNumber);
+                const existingLabels = existing.labels.map(l => l.name);
+
+                // Check if we need to update
+                const needsTitleUpdate = existing.title !== newTitle;
+                const needsLabelUpdate = !existingLabels.includes(status);
+
+                if (needsTitleUpdate || needsLabelUpdate) {
+                  console.log(`Updating SEP-${sepNumber}: ${existing.title} -> ${newTitle}`);
+
+                  // Remove old status labels, add new one
+                  const labelsToRemove = existingLabels.filter(l => l.startsWith('sep:'));
+                  const newLabels = existingLabels
+                    .filter(l => !l.startsWith('sep:'))
+                    .concat(['sep', status]);
+
+                  await github.rest.issues.update({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: existing.number,
+                    title: newTitle,
+                    labels: newLabels,
+                  });
+                }
+              } else {
+                // Create new issue
+                console.log(`Creating new issue for SEP-${sepNumber}: ${sepTitle}`);
+
+                const body = `## SEP-${sepNumber}: ${sepTitle}
+
+**Upstream Issue:** https://github.com/${UPSTREAM_REPO}/issues/${sep.number}
+**Status:** ${statusEmoji.replace(/[\[\]]/g, '')}
+**Upstream State:** ${sep.state}
+
+### Description
+
+${sep.body ? sep.body.slice(0, 500) + (sep.body.length > 500 ? '...' : '') : 'See upstream issue for details.'}
+
+### Implementation Status
+
+- [ ] Researched/understood the SEP
+- [ ] Determined relevance to tower-mcp
+- [ ] Implementation planned
+- [ ] Implementation complete
+- [ ] Tests added
+- [ ] Documentation updated
+
+---
+*This issue is automatically synced from the MCP specification repository.*
+*Last synced: ${new Date().toISOString().split('T')[0]}*`;
+
+                await github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title: newTitle,
+                  body: body,
+                  labels: ['sep', status],
+                });
+              }
+            }
+
+            console.log('SEP sync complete!');
