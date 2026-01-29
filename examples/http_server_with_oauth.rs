@@ -16,7 +16,7 @@
 //! # 2. Attempt without token (returns 401 with WWW-Authenticate header)
 //! curl -v -X POST http://localhost:3000/ \
 //!   -H "Content-Type: application/json" \
-//!   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"curl","version":"1.0"}}}'
+//!   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"curl","version":"1.0"}}}'
 //!
 //! # 3. Generate a test JWT (in a real app, obtained from the auth server):
 //! #    The example uses the shared secret "demo-secret-do-not-use-in-production"
@@ -29,7 +29,7 @@
 //! curl -X POST http://localhost:3000/ \
 //!   -H "Content-Type: application/json" \
 //!   -H "Authorization: Bearer <your-jwt-here>" \
-//!   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"curl","version":"1.0"}}}'
+//!   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"curl","version":"1.0"}}}'
 //! ```
 
 use schemars::JsonSchema;

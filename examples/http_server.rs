@@ -8,7 +8,7 @@
 //! curl -X POST http://localhost:3000/ \
 //!   -H "Content-Type: application/json" \
 //!   -H "Accept: application/json, text/event-stream" \
-//!   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"curl","version":"1.0"}}}'
+//!   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"curl","version":"1.0"}}}'
 //!
 //! # List tools (use session ID from initialize response)
 //! curl -X POST http://localhost:3000/ \

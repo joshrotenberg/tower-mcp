@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::error::Result;
 use crate::protocol::{
-    Content, GetPromptResult, PromptArgument, PromptDefinition, PromptMessage, PromptRole,
+    Content, GetPromptResult, PromptArgument, PromptDefinition, PromptMessage, PromptRole, ToolIcon,
 };
 
 /// A boxed future for prompt handlers
@@ -27,7 +27,9 @@ pub trait PromptHandler: Send + Sync {
 /// A complete prompt definition with handler
 pub struct Prompt {
     pub name: String,
+    pub title: Option<String>,
     pub description: Option<String>,
+    pub icons: Option<Vec<ToolIcon>>,
     pub arguments: Vec<PromptArgument>,
     handler: Arc<dyn PromptHandler>,
 }
@@ -36,7 +38,9 @@ impl Clone for Prompt {
     fn clone(&self) -> Self {
         Self {
             name: self.name.clone(),
+            title: self.title.clone(),
             description: self.description.clone(),
+            icons: self.icons.clone(),
             arguments: self.arguments.clone(),
             handler: self.handler.clone(),
         }
@@ -47,7 +51,9 @@ impl std::fmt::Debug for Prompt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Prompt")
             .field("name", &self.name)
+            .field("title", &self.title)
             .field("description", &self.description)
+            .field("icons", &self.icons)
             .field("arguments", &self.arguments)
             .finish_non_exhaustive()
     }
@@ -63,7 +69,9 @@ impl Prompt {
     pub fn definition(&self) -> PromptDefinition {
         PromptDefinition {
             name: self.name.clone(),
+            title: self.title.clone(),
             description: self.description.clone(),
+            icons: self.icons.clone(),
             arguments: self.arguments.clone(),
         }
     }
@@ -110,7 +118,9 @@ impl Prompt {
 /// ```
 pub struct PromptBuilder {
     name: String,
+    title: Option<String>,
     description: Option<String>,
+    icons: Option<Vec<ToolIcon>>,
     arguments: Vec<PromptArgument>,
 }
 
@@ -118,14 +128,47 @@ impl PromptBuilder {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            title: None,
             description: None,
+            icons: None,
             arguments: Vec::new(),
         }
+    }
+
+    /// Set a human-readable title for the prompt
+    pub fn title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
     }
 
     /// Set the prompt description
     pub fn description(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
+        self
+    }
+
+    /// Add an icon for the prompt
+    pub fn icon(mut self, src: impl Into<String>) -> Self {
+        self.icons.get_or_insert_with(Vec::new).push(ToolIcon {
+            src: src.into(),
+            mime_type: None,
+            sizes: None,
+        });
+        self
+    }
+
+    /// Add an icon with metadata
+    pub fn icon_with_meta(
+        mut self,
+        src: impl Into<String>,
+        mime_type: Option<String>,
+        sizes: Option<Vec<String>>,
+    ) -> Self {
+        self.icons.get_or_insert_with(Vec::new).push(ToolIcon {
+            src: src.into(),
+            mime_type,
+            sizes,
+        });
         self
     }
 
@@ -163,7 +206,9 @@ impl PromptBuilder {
     {
         Prompt {
             name: self.name,
+            title: self.title,
             description: self.description,
+            icons: self.icons,
             arguments: self.arguments,
             handler: Arc::new(FnHandler { handler }),
         }
@@ -308,7 +353,9 @@ pub trait McpPrompt: Send + Sync + 'static {
         let prompt = Arc::new(self);
         Prompt {
             name: Self::NAME.to_string(),
+            title: None,
             description: Some(Self::DESCRIPTION.to_string()),
+            icons: None,
             arguments,
             handler: Arc::new(McpPromptHandler { prompt }),
         }

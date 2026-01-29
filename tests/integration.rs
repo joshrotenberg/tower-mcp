@@ -457,7 +457,7 @@ async fn test_protocol_version_negotiation_unsupported() {
         JsonRpcResponse::Result(r) => {
             // Server responds with its latest supported version
             let version = r.result.get("protocolVersion").unwrap().as_str().unwrap();
-            assert_eq!(version, "2025-03-26");
+            assert_eq!(version, "2025-11-25");
         }
         JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
     }
