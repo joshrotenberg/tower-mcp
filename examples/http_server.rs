@@ -4,11 +4,22 @@
 //!
 //! Test with curl:
 //! ```bash
-//! # Initialize session
+//! # Initialize session (client sends protocolVersion)
 //! curl -X POST http://localhost:3000/ \
 //!   -H "Content-Type: application/json" \
 //!   -H "Accept: application/json, text/event-stream" \
 //!   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"curl","version":"1.0"}}}'
+//!
+//! # Server responds with negotiated protocolVersion and its capabilities:
+//! # {
+//! #   "jsonrpc": "2.0",
+//! #   "id": 1,
+//! #   "result": {
+//! #     "protocolVersion": "2025-11-25",
+//! #     "serverInfo": { "name": "http-example", "version": "1.0.0" },
+//! #     "capabilities": { "tools": {}, "resources": {}, "prompts": {} }
+//! #   }
+//! # }
 //!
 //! # List tools (use session ID from initialize response)
 //! curl -X POST http://localhost:3000/ \
