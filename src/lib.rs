@@ -104,8 +104,8 @@
 //!
 //! ## MCP Specification
 //!
-//! This crate implements the MCP specification (2025-03-26):
-//! <https://modelcontextprotocol.io/specification/2025-03-26>
+//! This crate implements the MCP specification (2025-11-25):
+//! <https://modelcontextprotocol.io/specification/2025-11-25>
 
 pub mod async_task;
 pub mod auth;

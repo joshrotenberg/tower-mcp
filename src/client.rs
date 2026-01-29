@@ -601,7 +601,7 @@ mod tests {
 
     fn mock_initialize_response() -> serde_json::Value {
         serde_json::json!({
-            "protocolVersion": "2025-03-26",
+            "protocolVersion": "2025-11-25",
             "serverInfo": {
                 "name": "test-server",
                 "version": "1.0.0"

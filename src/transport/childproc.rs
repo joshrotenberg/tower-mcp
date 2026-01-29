@@ -24,7 +24,7 @@
 //!     let response = transport.send_request(
 //!         "initialize",
 //!         serde_json::json!({
-//!             "protocolVersion": "2025-03-26",
+//!             "protocolVersion": "2025-11-25",
 //!             "capabilities": {},
 //!             "clientInfo": { "name": "my-client", "version": "1.0" }
 //!         })
@@ -225,7 +225,7 @@ impl ChildProcessConnection {
         self.send_request(
             "initialize",
             serde_json::json!({
-                "protocolVersion": "2025-03-26",
+                "protocolVersion": "2025-11-25",
                 "capabilities": {},
                 "clientInfo": {
                     "name": client_name,
