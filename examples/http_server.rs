@@ -32,6 +32,21 @@
 //!   -H "Content-Type: application/json" \
 //!   -H "MCP-Session-Id: <session-id>" \
 //!   -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"add","arguments":{"a":10,"b":32}}}'
+//!
+//! # Subscribe to SSE stream for notifications (progress, logs, etc.)
+//! # Each event includes an ID for stream resumption (SEP-1699):
+//! #   id: 0
+//! #   event: message
+//! #   data: {"jsonrpc":"2.0","method":"notifications/progress",...}
+//! curl -N http://localhost:3000/ \
+//!   -H "Accept: text/event-stream" \
+//!   -H "MCP-Session-Id: <session-id>"
+//!
+//! # Reconnect with Last-Event-ID to replay missed events:
+//! curl -N http://localhost:3000/ \
+//!   -H "Accept: text/event-stream" \
+//!   -H "MCP-Session-Id: <session-id>" \
+//!   -H "Last-Event-ID: 5"
 //! ```
 
 use std::time::Duration;
@@ -41,6 +56,7 @@ use serde::Deserialize;
 use tower::timeout::TimeoutLayer;
 use tower_mcp::{
     CallToolResult, HttpTransport, McpRouter, PromptBuilder, ResourceBuilder, ToolBuilder,
+    context::RequestContext,
 };
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -52,6 +68,25 @@ struct AddInput {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct EchoInput {
     message: String,
+}
+
+/// Input for the slow_task tool
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SlowTaskInput {
+    /// Number of steps to simulate (default: 5)
+    #[serde(default = "default_steps")]
+    steps: u32,
+    /// Delay between steps in milliseconds (default: 500)
+    #[serde(default = "default_delay_ms")]
+    delay_ms: u64,
+}
+
+fn default_steps() -> u32 {
+    5
+}
+
+fn default_delay_ms() -> u64 {
+    500
 }
 
 #[tokio::main]
@@ -75,6 +110,37 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     let echo = ToolBuilder::new("echo")
         .description("Echo a message back")
         .handler(|input: EchoInput| async move { Ok(CallToolResult::text(input.message)) })
+        .build()?;
+
+    // A tool that simulates work and sends progress notifications
+    // Useful for demonstrating SSE event streaming and Last-Event-ID resumption
+    let slow_task = ToolBuilder::new("slow_task")
+        .description("Simulate a slow task that sends progress notifications (for SSE demo)")
+        .handler_with_context(|ctx: RequestContext, input: SlowTaskInput| async move {
+            let steps = input.steps.min(20); // Cap at 20 steps
+            let delay = Duration::from_millis(input.delay_ms.min(2000)); // Cap delay at 2s
+
+            for i in 0..steps {
+                // Send progress notification (appears on SSE stream with event ID)
+                ctx.report_progress(
+                    i as f64,
+                    Some(steps as f64),
+                    Some(&format!("Step {}/{}", i + 1, steps)),
+                )
+                .await;
+
+                tokio::time::sleep(delay).await;
+            }
+
+            // Final progress
+            ctx.report_progress(steps as f64, Some(steps as f64), Some("Complete!"))
+                .await;
+
+            Ok(CallToolResult::text(format!(
+                "Completed {} steps (each SSE event has a unique ID for resumption)",
+                steps
+            )))
+        })
         .build()?;
 
     // Create resources
@@ -108,9 +174,10 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     // Create the MCP router
     let router = McpRouter::new()
         .server_info("http-example", "1.0.0")
-        .instructions("A simple HTTP MCP server example with add and echo tools.")
+        .instructions("A simple HTTP MCP server example with add, echo, and slow_task tools.")
         .tool(add)
         .tool(echo)
+        .tool(slow_task)
         .resource(config)
         .prompt(greet);
 

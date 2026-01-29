@@ -52,7 +52,7 @@ The demo includes 7 tools (search, info, versions, dependencies, reverse deps, d
 - Session state management with reconnection support
 - Protocol version negotiation
 - Tool annotations (behavior hints for trust/safety)
-- **Transports**: stdio, HTTP (with SSE), WebSocket, child process
+- **Transports**: stdio, HTTP (with SSE and stream resumption), WebSocket, child process
 - **Resources**: list, read, subscribe/unsubscribe with change notifications
 - **Prompts**: list and get with argument support
 - **Authentication**: API key and Bearer token middleware helpers
@@ -322,7 +322,7 @@ tower-mcp targets the [MCP specification 2025-11-25](https://modelcontextprotoco
 - [x] [Roots (filesystem discovery)](https://modelcontextprotocol.io/specification/2025-11-25/client/roots)
 - [x] [Sampling](https://modelcontextprotocol.io/specification/2025-11-25/client/sampling) (all transports)
 - [x] [Async tasks](https://modelcontextprotocol.io/specification/2025-11-25/server/utilities/async) (task ID, status tracking, TTL cleanup)
-- [ ] SSE event IDs and stream resumption (SEP-1699) - future work
+- [x] SSE event IDs and stream resumption (SEP-1699)
 
 ## Development
 

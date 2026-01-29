@@ -50,7 +50,7 @@ base64 = "0.22.1"
 tokio-test = "0.4"
 tower = { version = "0.5", features = ["util", "timeout", "limit"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
 
 [features]
 default = []
@@ -145,3 +145,8 @@ path = "examples/client_cli.rs"
 [[example]]
 name = "weather_server"
 path = "examples/weather_server.rs"
+
+[[example]]
+name = "http_sse_client"
+path = "examples/http_sse_client.rs"
+required-features = ["http"]
