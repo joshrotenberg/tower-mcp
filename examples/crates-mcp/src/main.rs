@@ -57,6 +57,12 @@ struct Args {
     /// Request timeout in seconds (for HTTP transport)
     #[arg(long, default_value = "30")]
     request_timeout_secs: u64,
+
+    /// Minimal mode - only register tools (no prompts, resources, or completions).
+    /// Use this to work around Claude Code MCP tool discovery issues.
+    /// See: https://github.com/anthropics/claude-code/issues/2682
+    #[arg(long, default_value = "false")]
+    minimal: bool,
 }
 
 #[tokio::main]
@@ -97,73 +103,44 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     let authors_tool = tools::authors::build(state.clone());
     let user_tool = tools::user::build(state.clone());
 
-    // Build resources
-    let recent_searches = resources::recent_searches::build(state.clone());
-    let crate_info_template = resources::crate_info::build(state.clone());
+    // Create base router with tools (always registered)
+    let instructions = if args.minimal {
+        "MCP server for querying crates.io - the Rust package registry.\n\n\
+         Available tools:\n\
+         - search_crates: Find crates by name/keywords\n\
+         - get_crate_info: Get detailed crate information\n\
+         - get_crate_versions: Get version history\n\
+         - get_dependencies: Get dependencies for a version\n\
+         - get_reverse_dependencies: Find crates that depend on this crate\n\
+         - get_downloads: Get download statistics\n\
+         - get_owners: Get crate owners/maintainers\n\
+         - get_summary: Get crates.io global statistics\n\
+         - get_crate_authors: Get authors for a crate version\n\
+         - get_user: Get a user's profile\n\n\
+         (Running in minimal mode - resources, prompts, and completions disabled)"
+    } else {
+        "MCP server for querying crates.io - the Rust package registry.\n\n\
+         Available tools:\n\
+         - search_crates: Find crates by name/keywords\n\
+         - get_crate_info: Get detailed crate information\n\
+         - get_crate_versions: Get version history\n\
+         - get_dependencies: Get dependencies for a version\n\
+         - get_reverse_dependencies: Find crates that depend on this crate\n\
+         - get_downloads: Get download statistics\n\
+         - get_owners: Get crate owners/maintainers\n\
+         - get_summary: Get crates.io global statistics\n\
+         - get_crate_authors: Get authors for a crate version\n\
+         - get_user: Get a user's profile\n\n\
+         Resources:\n\
+         - crates://{name}/info: Get crate info as a resource\n\n\
+         Use the prompts for guided analysis:\n\
+         - analyze_crate: Comprehensive crate analysis\n\
+         - compare_crates: Compare multiple crates"
+    };
 
-    // Build prompts
-    let analyze_prompt = prompts::analyze::build();
-    let compare_prompt = prompts::compare::build();
-
-    // Popular crates for completion suggestions
-    let popular_crates = vec![
-        "serde",
-        "tokio",
-        "anyhow",
-        "thiserror",
-        "clap",
-        "tracing",
-        "reqwest",
-        "axum",
-        "tower",
-        "hyper",
-        "futures",
-        "async-trait",
-        "rand",
-        "regex",
-        "chrono",
-        "uuid",
-        "log",
-        "env_logger",
-        "syn",
-        "quote",
-        "proc-macro2",
-        "bytes",
-        "http",
-        "tonic",
-        "prost",
-        "sqlx",
-        "diesel",
-        "actix-web",
-        "rocket",
-        "warp",
-        "tide",
-        "poem",
-        "salvo",
-    ];
-
-    // Create router with all capabilities
-    let router = McpRouter::new()
+    let mut router = McpRouter::new()
         .server_info("crates-mcp", env!("CARGO_PKG_VERSION"))
-        .instructions(
-            "MCP server for querying crates.io - the Rust package registry.\n\n\
-             Available tools:\n\
-             - search_crates: Find crates by name/keywords\n\
-             - get_crate_info: Get detailed crate information\n\
-             - get_crate_versions: Get version history\n\
-             - get_dependencies: Get dependencies for a version\n\
-             - get_reverse_dependencies: Find crates that depend on this crate\n\
-             - get_downloads: Get download statistics\n\
-             - get_owners: Get crate owners/maintainers\n\
-             - get_summary: Get crates.io global statistics\n\
-             - get_crate_authors: Get authors for a crate version\n\
-             - get_user: Get a user's profile\n\n\
-             Resources:\n\
-             - crates://{name}/info: Get crate info as a resource\n\n\
-             Use the prompts for guided analysis:\n\
-             - analyze_crate: Comprehensive crate analysis\n\
-             - compare_crates: Compare multiple crates",
-        )
+        .instructions(instructions)
         .tool(search_tool)
         .tool(info_tool)
         .tool(versions_tool)
@@ -173,44 +150,104 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .tool(owners_tool)
         .tool(summary_tool)
         .tool(authors_tool)
-        .tool(user_tool)
-        .resource(recent_searches)
-        .resource_template(crate_info_template)
-        .prompt(analyze_prompt)
-        .prompt(compare_prompt)
-        // Completion handler for crate name suggestions
-        .completion_handler(move |params: CompleteParams| {
-            let popular = popular_crates.clone();
-            async move {
-                let prefix = params.argument.value.to_lowercase();
+        .tool(user_tool);
 
-                // Filter popular crates by prefix
-                let suggestions: Vec<String> = popular
-                    .iter()
-                    .filter(|name| name.starts_with(&prefix))
-                    .take(10)
-                    .map(|name| name.to_string())
-                    .collect();
+    // Add resources, prompts, and completions unless in minimal mode
+    // Minimal mode works around Claude Code MCP tool discovery issues
+    // See: https://github.com/anthropics/claude-code/issues/2682
+    if !args.minimal {
+        // Build resources
+        let recent_searches = resources::recent_searches::build(state.clone());
+        let crate_info_template = resources::crate_info::build(state.clone());
 
-                // Log what we're completing for
-                match &params.reference {
-                    CompletionReference::Prompt { name } => {
-                        tracing::debug!(%name, %prefix, "Completing prompt argument");
+        // Build prompts
+        let analyze_prompt = prompts::analyze::build();
+        let compare_prompt = prompts::compare::build();
+
+        // Popular crates for completion suggestions
+        let popular_crates = vec![
+            "serde",
+            "tokio",
+            "anyhow",
+            "thiserror",
+            "clap",
+            "tracing",
+            "reqwest",
+            "axum",
+            "tower",
+            "hyper",
+            "futures",
+            "async-trait",
+            "rand",
+            "regex",
+            "chrono",
+            "uuid",
+            "log",
+            "env_logger",
+            "syn",
+            "quote",
+            "proc-macro2",
+            "bytes",
+            "http",
+            "tonic",
+            "prost",
+            "sqlx",
+            "diesel",
+            "actix-web",
+            "rocket",
+            "warp",
+            "tide",
+            "poem",
+            "salvo",
+        ];
+
+        router = router
+            .resource(recent_searches)
+            .resource_template(crate_info_template)
+            .prompt(analyze_prompt)
+            .prompt(compare_prompt)
+            // Completion handler for crate name suggestions
+            .completion_handler(move |params: CompleteParams| {
+                let popular = popular_crates.clone();
+                async move {
+                    let prefix = params.argument.value.to_lowercase();
+
+                    // Filter popular crates by prefix
+                    let suggestions: Vec<String> = popular
+                        .iter()
+                        .filter(|name| name.starts_with(&prefix))
+                        .take(10)
+                        .map(|name| name.to_string())
+                        .collect();
+
+                    // Log what we're completing for
+                    match &params.reference {
+                        CompletionReference::Prompt { name } => {
+                            tracing::debug!(%name, %prefix, "Completing prompt argument");
+                        }
+                        CompletionReference::Resource { uri } => {
+                            tracing::debug!(%uri, %prefix, "Completing resource URI");
+                        }
                     }
-                    CompletionReference::Resource { uri } => {
-                        tracing::debug!(%uri, %prefix, "Completing resource URI");
-                    }
+
+                    Ok(CompleteResult {
+                        completion: Completion {
+                            values: suggestions,
+                            total: None,
+                            has_more: Some(false),
+                        },
+                    })
                 }
+            });
 
-                Ok(CompleteResult {
-                    completion: Completion {
-                        values: suggestions,
-                        total: None,
-                        has_more: Some(false),
-                    },
-                })
-            }
-        });
+        tracing::info!("Full mode: resources, prompts, and completions enabled");
+    } else {
+        tracing::info!(
+            "Minimal mode: only tools registered (workaround for Claude Code MCP issues)"
+        );
+    }
+
+    let router = router;
 
     match args.transport {
         Transport::Stdio => {
