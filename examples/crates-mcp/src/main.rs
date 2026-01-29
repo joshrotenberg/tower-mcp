@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use tower::ServiceBuilder;
-use tower_mcp::{McpRouter, StdioTransport};
+use tower::timeout::TimeoutLayer;
+use tower_mcp::{HttpTransport, McpRouter, StdioTransport};
 use tower_resilience_bulkhead::BulkheadLayer;
 use tower_resilience_ratelimiter::RateLimiterLayer;
 
@@ -21,7 +22,7 @@ use crate::state::AppState;
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Transport {
     Stdio,
-    // Future: Http, WebSocket
+    Http,
 }
 
 #[derive(Parser, Debug)]
@@ -32,17 +33,9 @@ struct Args {
     #[arg(short, long, default_value = "stdio")]
     transport: Transport,
 
-    /// Maximum concurrent tool calls (bulkhead pattern)
-    #[arg(long, default_value = "5")]
-    max_concurrent: usize,
-
-    /// Maximum wait time for bulkhead permit (in milliseconds)
-    #[arg(long, default_value = "100")]
-    bulkhead_timeout_ms: u64,
-
-    /// Maximum requests per second (rate limiting)
+    /// Maximum concurrent requests (concurrency limit)
     #[arg(long, default_value = "10")]
-    requests_per_second: usize,
+    max_concurrent: usize,
 
     /// Rate limit interval between crates.io API calls (in milliseconds)
     #[arg(long, default_value = "1000")]
@@ -51,6 +44,18 @@ struct Args {
     /// Log level
     #[arg(short, long, default_value = "info")]
     log_level: String,
+
+    /// HTTP host to bind to (use 0.0.0.0 for public access)
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+
+    /// HTTP port to bind to
+    #[arg(short, long, default_value = "3000")]
+    port: u16,
+
+    /// Request timeout in seconds (for HTTP transport)
+    #[arg(long, default_value = "30")]
+    request_timeout_secs: u64,
 }
 
 #[tokio::main]
@@ -70,7 +75,6 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     tracing::info!(
         transport = ?args.transport,
         max_concurrent = args.max_concurrent,
-        requests_per_second = args.requests_per_second,
         rate_limit_ms = args.rate_limit_ms,
         "Starting crates-mcp server"
     );
@@ -124,40 +128,54 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .prompt(analyze_prompt)
         .prompt(compare_prompt);
 
-    // Build tower middleware stack demonstrating resilience patterns:
-    //
-    // 1. RateLimiterLayer (tower-resilience) - Limits requests per second
-    //    Token bucket algorithm, protects against request floods
-    //
-    // 2. BulkheadLayer (tower-resilience) - Limits concurrent in-flight requests
-    //    Isolates resources with configurable wait timeout
-    //
-    // These layers compose naturally with tower-mcp's Service implementation.
-    let rate_limiter = RateLimiterLayer::builder()
-        .limit_for_period(args.requests_per_second)
-        .refresh_period(Duration::from_secs(1))
-        .timeout_duration(Duration::from_millis(500))
-        .build();
-
-    let bulkhead = BulkheadLayer::builder()
-        .max_concurrent_calls(args.max_concurrent)
-        .max_wait_duration(Some(Duration::from_millis(args.bulkhead_timeout_ms)))
-        .build();
-
-    // Build middleware stack demonstrating tower-resilience integration.
-    // Note: These layers return custom error types (RateLimiterError, BulkheadError)
-    // which need error mapping for use with GenericStdioTransport. For stdio,
-    // we use the router directly. For HTTP/WebSocket transports, middleware
-    // can be applied at the transport layer where error handling is more flexible.
-    let _service = ServiceBuilder::new()
-        .layer(rate_limiter)
-        .layer(bulkhead)
-        .service(router.clone());
-
     match args.transport {
         Transport::Stdio => {
+            // For stdio, we serve directly without middleware since error handling
+            // is more complex (would need error type conversion).
             tracing::info!("Serving over stdio");
             StdioTransport::new(router).run().await?;
+        }
+        Transport::Http => {
+            let addr = format!("{}:{}", args.host, args.port);
+            tracing::info!(%addr, "Serving over HTTP");
+
+            // Build tower middleware stack for request protection:
+            //
+            // 1. TimeoutLayer - Request timeout protection
+            // 2. RateLimiterLayer - Limits requests per second (token bucket)
+            // 3. BulkheadLayer - Limits concurrent in-flight requests
+            //
+            // These layers compose naturally with tower-mcp's Service implementation.
+            // The HTTP transport's CatchError wrapper converts middleware errors
+            // to JSON-RPC error responses.
+            //
+            // tower-resilience layers use composite error types that wrap both
+            // the layer's own errors and the inner service error, making them
+            // compatible with tower-mcp's Infallible error type.
+            let rate_limiter = RateLimiterLayer::builder()
+                .limit_for_period(5) // 5 requests per period
+                .refresh_period(Duration::from_secs(1))
+                .timeout_duration(Duration::from_millis(500))
+                .build();
+
+            let bulkhead = BulkheadLayer::builder()
+                .max_concurrent_calls(args.max_concurrent)
+                .max_wait_duration(Duration::from_millis(500))
+                .build();
+
+            let transport = HttpTransport::new(router)
+                .disable_origin_validation() // Allow any origin for public demo
+                .layer(
+                    ServiceBuilder::new()
+                        .layer(TimeoutLayer::new(Duration::from_secs(
+                            args.request_timeout_secs,
+                        )))
+                        .layer(rate_limiter)
+                        .layer(bulkhead)
+                        .into_inner(),
+                );
+
+            transport.serve(&addr).await?;
         }
     }
 
