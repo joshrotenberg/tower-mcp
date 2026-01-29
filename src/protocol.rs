@@ -369,6 +369,9 @@ pub enum McpRequest {
     SetLoggingLevel(SetLogLevelParams),
     /// Request completion suggestions
     Complete(CompleteParams),
+    /// Server discovery (SEP-1442 stateless mode)
+    #[cfg(feature = "stateless")]
+    Discover,
     /// Unknown method
     Unknown {
         method: String,
@@ -398,6 +401,8 @@ impl McpRequest {
             McpRequest::Ping => "ping",
             McpRequest::SetLoggingLevel(_) => "logging/setLevel",
             McpRequest::Complete(_) => "completion/complete",
+            #[cfg(feature = "stateless")]
+            McpRequest::Discover => "server/discover",
             McpRequest::Unknown { method, .. } => method,
         }
     }
@@ -487,6 +492,9 @@ pub enum McpResponse {
     SetLoggingLevel(EmptyResult),
     Complete(CompleteResult),
     Pong(EmptyResult),
+    /// Server discovery result (SEP-1442 stateless mode)
+    #[cfg(feature = "stateless")]
+    Discover(crate::stateless::DiscoverResult),
     Empty(EmptyResult),
 }
 
@@ -2924,6 +2932,8 @@ impl McpRequest {
                 let p: CompleteParams = serde_json::from_value(params)?;
                 Ok(McpRequest::Complete(p))
             }
+            #[cfg(feature = "stateless")]
+            "server/discover" => Ok(McpRequest::Discover),
             method => Ok(McpRequest::Unknown {
                 method: method.to_string(),
                 params: req.params.clone(),
