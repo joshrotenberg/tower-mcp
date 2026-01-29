@@ -146,7 +146,7 @@ pub use protocol::{
     ListRootsResult, McpRequest, McpResponse, ModelHint, ModelPreferences,
     PrimitiveSchemaDefinition, PromptMessage, PromptReference, PromptRole, ReadResourceResult,
     ResourceContent, ResourceReference, Root, RootsCapability, SamplingCapability, SamplingContent,
-    SamplingMessage,
+    SamplingContentOrArray, SamplingMessage, SamplingTool, ToolChoice,
 };
 pub use resource::{
     Resource, ResourceBuilder, ResourceHandler, ResourceTemplate, ResourceTemplateBuilder,

@@ -94,7 +94,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     // 1. Initialize
     println!("1. Initialize request:");
     let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
-        "protocolVersion": "2025-03-26",
+        "protocolVersion": "2025-11-25",
         "capabilities": {},
         "clientInfo": {
             "name": "example-client",

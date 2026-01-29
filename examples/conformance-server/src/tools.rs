@@ -199,9 +199,11 @@ fn build_sampling() -> Tool {
                 CreateMessageParams::new(vec![SamplingMessage::user("Test sampling request")], 100);
             match ctx.sample(params).await {
                 Ok(result) => {
-                    let text = match &result.content {
-                        tower_mcp::SamplingContent::Text { text } => text.clone(),
-                        _ => format!("{:?}", result.content),
+                    // Get the first content item
+                    let text = match result.content_items().first() {
+                        Some(tower_mcp::SamplingContent::Text { text }) => text.clone(),
+                        Some(content) => format!("{:?}", content),
+                        None => "No content".to_string(),
                     };
                     Ok(CallToolResult::text(text))
                 }

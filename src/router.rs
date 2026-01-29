@@ -79,6 +79,14 @@ impl std::fmt::Debug for McpRouter {
 struct McpRouterInner {
     server_name: String,
     server_version: String,
+    /// Human-readable title for the server
+    server_title: Option<String>,
+    /// Description of the server
+    server_description: Option<String>,
+    /// Icons for the server
+    server_icons: Option<Vec<ToolIcon>>,
+    /// URL of the server's website
+    server_website_url: Option<String>,
     instructions: Option<String>,
     tools: HashMap<String, Arc<Tool>>,
     resources: HashMap<String, Arc<Resource>>,
@@ -106,6 +114,10 @@ impl McpRouter {
             inner: Arc::new(McpRouterInner {
                 server_name: "tower-mcp".to_string(),
                 server_version: env!("CARGO_PKG_VERSION").to_string(),
+                server_title: None,
+                server_description: None,
+                server_icons: None,
+                server_website_url: None,
                 instructions: None,
                 tools: HashMap::new(),
                 resources: HashMap::new(),
@@ -224,6 +236,30 @@ impl McpRouter {
     /// Set instructions for LLMs describing how to use this server
     pub fn instructions(mut self, instructions: impl Into<String>) -> Self {
         Arc::make_mut(&mut self.inner).instructions = Some(instructions.into());
+        self
+    }
+
+    /// Set a human-readable title for the server
+    pub fn server_title(mut self, title: impl Into<String>) -> Self {
+        Arc::make_mut(&mut self.inner).server_title = Some(title.into());
+        self
+    }
+
+    /// Set the server description
+    pub fn server_description(mut self, description: impl Into<String>) -> Self {
+        Arc::make_mut(&mut self.inner).server_description = Some(description.into());
+        self
+    }
+
+    /// Set icons for the server
+    pub fn server_icons(mut self, icons: Vec<ToolIcon>) -> Self {
+        Arc::make_mut(&mut self.inner).server_icons = Some(icons);
+        self
+    }
+
+    /// Set the server's website URL
+    pub fn server_website_url(mut self, url: impl Into<String>) -> Self {
+        Arc::make_mut(&mut self.inner).server_website_url = Some(url.into());
         self
     }
 
@@ -624,6 +660,10 @@ impl McpRouter {
                     server_info: Implementation {
                         name: self.inner.server_name.clone(),
                         version: self.inner.server_version.clone(),
+                        title: self.inner.server_title.clone(),
+                        description: self.inner.server_description.clone(),
+                        icons: self.inner.server_icons.clone(),
+                        website_url: self.inner.server_website_url.clone(),
                     },
                     instructions: self.inner.instructions.clone(),
                 }))
@@ -1131,6 +1171,7 @@ mod tests {
                 client_info: Implementation {
                     name: "test".to_string(),
                     version: "1.0".to_string(),
+                    ..Default::default()
                 },
             }),
             extensions: Extensions::new(),
@@ -1725,6 +1766,7 @@ mod tests {
                 client_info: Implementation {
                     name: "test".to_string(),
                     version: "1.0".to_string(),
+                    ..Default::default()
                 },
             }),
             extensions: Extensions::new(),
@@ -1835,6 +1877,7 @@ mod tests {
                 client_info: Implementation {
                     name: "test".to_string(),
                     version: "1.0".to_string(),
+                    ..Default::default()
                 },
             }),
             extensions: Extensions::new(),
@@ -1867,6 +1910,7 @@ mod tests {
                 client_info: Implementation {
                     name: "test".to_string(),
                     version: "1.0".to_string(),
+                    ..Default::default()
                 },
             }),
             extensions: Extensions::new(),
@@ -2370,6 +2414,7 @@ mod tests {
                 client_info: Implementation {
                     name: "test".to_string(),
                     version: "1.0".to_string(),
+                    ..Default::default()
                 },
             }),
             extensions: Extensions::new(),
@@ -2410,6 +2455,7 @@ mod tests {
                 client_info: Implementation {
                     name: "test".to_string(),
                     version: "1.0".to_string(),
+                    ..Default::default()
                 },
             }),
             extensions: Extensions::new(),
@@ -2473,6 +2519,7 @@ mod tests {
                 client_info: Implementation {
                     name: "test".to_string(),
                     version: "1.0".to_string(),
+                    ..Default::default()
                 },
             }),
             extensions: Extensions::new(),

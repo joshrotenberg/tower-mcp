@@ -1,7 +1,7 @@
 //! MCP protocol types based on JSON-RPC 2.0
 //!
-//! These types follow the MCP specification (2025-03-26):
-//! <https://modelcontextprotocol.io/specification/2025-03-26>
+//! These types follow the MCP specification (2025-11-25):
+//! <https://modelcontextprotocol.io/specification/2025-11-25>
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -12,10 +12,10 @@ use crate::error::JsonRpcError;
 pub const JSONRPC_VERSION: &str = "2.0";
 
 /// The latest supported MCP protocol version.
-pub const LATEST_PROTOCOL_VERSION: &str = "2025-03-26";
+pub const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 
 /// All supported MCP protocol versions (newest first).
-pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-03-26"];
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-03-26"];
 
 /// JSON-RPC 2.0 request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -863,6 +863,58 @@ impl SamplingMessage {
     }
 }
 
+/// Tool definition for use in sampling requests (SEP-1577)
+///
+/// Describes a tool that can be used during a sampling request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SamplingTool {
+    /// The name of the tool
+    pub name: String,
+    /// Description of what the tool does
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// JSON Schema describing the tool's input parameters
+    pub input_schema: Value,
+}
+
+/// Tool choice mode for sampling requests (SEP-1577)
+///
+/// Controls how the LLM should use the available tools.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolChoice {
+    /// The tool choice mode:
+    /// - "auto": Model decides whether to use tools
+    /// - "required": Model must use a tool
+    /// - "none": Model should not use tools
+    #[serde(rename = "type")]
+    pub mode: String,
+}
+
+impl ToolChoice {
+    /// Model decides whether to use tools
+    pub fn auto() -> Self {
+        Self {
+            mode: "auto".to_string(),
+        }
+    }
+
+    /// Model must use a tool
+    pub fn required() -> Self {
+        Self {
+            mode: "required".to_string(),
+        }
+    }
+
+    /// Model should not use tools
+    pub fn none() -> Self {
+        Self {
+            mode: "none".to_string(),
+        }
+    }
+}
+
 /// Content types for sampling messages
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -888,6 +940,58 @@ pub enum SamplingContent {
         #[serde(rename = "mimeType")]
         mime_type: String,
     },
+    /// Tool use request from the model (SEP-1577)
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        /// Unique identifier for this tool use
+        id: String,
+        /// Name of the tool being called
+        name: String,
+        /// Input arguments for the tool
+        input: Value,
+    },
+    /// Result of a tool invocation (SEP-1577)
+    #[serde(rename = "tool_result")]
+    ToolResult {
+        /// ID of the tool use this result corresponds to
+        tool_use_id: String,
+        /// The tool result content
+        content: Vec<SamplingContent>,
+        /// Whether the tool execution resulted in an error
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        is_error: Option<bool>,
+    },
+}
+
+/// Content that can be either a single item or an array (for CreateMessageResult)
+///
+/// The MCP spec allows CreateMessageResult.content to be either a single
+/// SamplingContent or an array of SamplingContent items.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SamplingContentOrArray {
+    /// Single content item
+    Single(SamplingContent),
+    /// Array of content items
+    Array(Vec<SamplingContent>),
+}
+
+impl SamplingContentOrArray {
+    /// Get content items as a slice
+    pub fn items(&self) -> Vec<&SamplingContent> {
+        match self {
+            Self::Single(c) => vec![c],
+            Self::Array(arr) => arr.iter().collect(),
+        }
+    }
+
+    /// Get owned content items
+    pub fn into_items(self) -> Vec<SamplingContent> {
+        match self {
+            Self::Single(c) => vec![c],
+            Self::Array(arr) => arr,
+        }
+    }
 }
 
 /// Parameters for sampling/createMessage request
@@ -916,6 +1020,12 @@ pub struct CreateMessageParams {
     /// Additional metadata
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Map<String, Value>>,
+    /// Tools available for the model to use (SEP-1577)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<SamplingTool>>,
+    /// Tool choice mode (SEP-1577)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
 }
 
 impl CreateMessageParams {
@@ -930,6 +1040,8 @@ impl CreateMessageParams {
             model_preferences: None,
             include_context: None,
             metadata: None,
+            tools: None,
+            tool_choice: None,
         }
     }
 
@@ -962,14 +1074,26 @@ impl CreateMessageParams {
         self.include_context = Some(mode);
         self
     }
+
+    /// Set tools available for the model to use (SEP-1577)
+    pub fn tools(mut self, tools: Vec<SamplingTool>) -> Self {
+        self.tools = Some(tools);
+        self
+    }
+
+    /// Set tool choice mode (SEP-1577)
+    pub fn tool_choice(mut self, choice: ToolChoice) -> Self {
+        self.tool_choice = Some(choice);
+        self
+    }
 }
 
 /// Result of sampling/createMessage request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateMessageResult {
-    /// The generated content
-    pub content: SamplingContent,
+    /// The generated content (single item or array)
+    pub content: SamplingContentOrArray,
     /// The model that generated the response
     pub model: String,
     /// The role of the response (always assistant)
@@ -979,10 +1103,33 @@ pub struct CreateMessageResult {
     pub stop_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+impl CreateMessageResult {
+    /// Get content items as a vector of references
+    pub fn content_items(&self) -> Vec<&SamplingContent> {
+        self.content.items()
+    }
+}
+
+/// Information about a client or server implementation
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Implementation {
+    /// Name of the implementation
     pub name: String,
+    /// Version of the implementation
     pub version: String,
+    /// Human-readable title for display purposes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Description of the implementation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Icons for the implementation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icons: Option<Vec<ToolIcon>>,
+    /// URL of the implementation's website
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub website_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1523,10 +1670,19 @@ pub struct ListResourcesResult {
 pub struct ResourceDefinition {
     pub uri: String,
     pub name: String,
+    /// Human-readable title for display purposes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
+    /// Optional icons for display in user interfaces
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icons: Option<Vec<ToolIcon>>,
+    /// Size of the resource in bytes (if known)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1748,12 +1904,18 @@ pub struct ResourceTemplateDefinition {
     pub uri_template: String,
     /// Human-readable name for this template
     pub name: String,
+    /// Human-readable title for display purposes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// Description of what resources this template provides
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// MIME type hint for resources from this template
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
+    /// Optional icons for display in user interfaces
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icons: Option<Vec<ToolIcon>>,
 }
 
 // =============================================================================
@@ -1777,8 +1939,14 @@ pub struct ListPromptsResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptDefinition {
     pub name: String,
+    /// Human-readable title for display purposes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Optional icons for display in user interfaces
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icons: Option<Vec<ToolIcon>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub arguments: Vec<PromptArgument>,
 }
@@ -3327,5 +3495,130 @@ mod tests {
             }
             _ => panic!("Expected Audio content"),
         }
+    }
+
+    #[test]
+    fn test_sampling_tool_serialization() {
+        let tool = SamplingTool {
+            name: "get_weather".to_string(),
+            description: Some("Get current weather".to_string()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "location": { "type": "string" }
+                }
+            }),
+        };
+        let json = serde_json::to_value(&tool).unwrap();
+        assert_eq!(json["name"], "get_weather");
+        assert_eq!(json["description"], "Get current weather");
+        assert!(json["inputSchema"]["properties"]["location"].is_object());
+    }
+
+    #[test]
+    fn test_tool_choice_modes() {
+        let auto = ToolChoice::auto();
+        assert_eq!(auto.mode, "auto");
+
+        let required = ToolChoice::required();
+        assert_eq!(required.mode, "required");
+
+        let none = ToolChoice::none();
+        assert_eq!(none.mode, "none");
+
+        // Test serialization
+        let json = serde_json::to_value(&auto).unwrap();
+        assert_eq!(json["type"], "auto");
+    }
+
+    #[test]
+    fn test_sampling_content_tool_use() {
+        let content = SamplingContent::ToolUse {
+            id: "tool_123".to_string(),
+            name: "get_weather".to_string(),
+            input: serde_json::json!({"location": "San Francisco"}),
+        };
+        let json = serde_json::to_value(&content).unwrap();
+        assert_eq!(json["type"], "tool_use");
+        assert_eq!(json["id"], "tool_123");
+        assert_eq!(json["name"], "get_weather");
+        assert_eq!(json["input"]["location"], "San Francisco");
+    }
+
+    #[test]
+    fn test_sampling_content_tool_result() {
+        let content = SamplingContent::ToolResult {
+            tool_use_id: "tool_123".to_string(),
+            content: vec![SamplingContent::Text {
+                text: "72F, sunny".to_string(),
+            }],
+            is_error: None,
+        };
+        let json = serde_json::to_value(&content).unwrap();
+        assert_eq!(json["type"], "tool_result");
+        assert_eq!(json["tool_use_id"], "tool_123");
+        assert_eq!(json["content"][0]["type"], "text");
+    }
+
+    #[test]
+    fn test_sampling_content_or_array_single() {
+        let json = serde_json::json!({
+            "type": "text",
+            "text": "Hello"
+        });
+        let content: SamplingContentOrArray = serde_json::from_value(json).unwrap();
+        let items = content.items();
+        assert_eq!(items.len(), 1);
+        match items[0] {
+            SamplingContent::Text { text } => assert_eq!(text, "Hello"),
+            _ => panic!("Expected text content"),
+        }
+    }
+
+    #[test]
+    fn test_sampling_content_or_array_multiple() {
+        let json = serde_json::json!([
+            { "type": "text", "text": "Hello" },
+            { "type": "text", "text": "World" }
+        ]);
+        let content: SamplingContentOrArray = serde_json::from_value(json).unwrap();
+        let items = content.items();
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn test_create_message_params_with_tools() {
+        let tool = SamplingTool {
+            name: "calculator".to_string(),
+            description: Some("Do math".to_string()),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        let params = CreateMessageParams::new(vec![], 100)
+            .tools(vec![tool])
+            .tool_choice(ToolChoice::auto());
+
+        let json = serde_json::to_value(&params).unwrap();
+        assert!(json["tools"].is_array());
+        assert_eq!(json["tools"][0]["name"], "calculator");
+        assert_eq!(json["toolChoice"]["type"], "auto");
+    }
+
+    #[test]
+    fn test_create_message_result_content_items() {
+        let result = CreateMessageResult {
+            content: SamplingContentOrArray::Array(vec![
+                SamplingContent::Text {
+                    text: "First".to_string(),
+                },
+                SamplingContent::Text {
+                    text: "Second".to_string(),
+                },
+            ]),
+            model: "test".to_string(),
+            role: ContentRole::Assistant,
+            stop_reason: None,
+        };
+        let items = result.content_items();
+        assert_eq!(items.len(), 2);
     }
 }

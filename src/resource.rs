@@ -40,7 +40,7 @@ use std::sync::Arc;
 
 use crate::error::Result;
 use crate::protocol::{
-    ReadResourceResult, ResourceContent, ResourceDefinition, ResourceTemplateDefinition,
+    ReadResourceResult, ResourceContent, ResourceDefinition, ResourceTemplateDefinition, ToolIcon,
 };
 
 /// A boxed future for resource handlers
@@ -56,8 +56,11 @@ pub trait ResourceHandler: Send + Sync {
 pub struct Resource {
     pub uri: String,
     pub name: String,
+    pub title: Option<String>,
     pub description: Option<String>,
     pub mime_type: Option<String>,
+    pub icons: Option<Vec<ToolIcon>>,
+    pub size: Option<u64>,
     handler: Arc<dyn ResourceHandler>,
 }
 
@@ -66,8 +69,11 @@ impl Clone for Resource {
         Self {
             uri: self.uri.clone(),
             name: self.name.clone(),
+            title: self.title.clone(),
             description: self.description.clone(),
             mime_type: self.mime_type.clone(),
+            icons: self.icons.clone(),
+            size: self.size,
             handler: self.handler.clone(),
         }
     }
@@ -78,8 +84,11 @@ impl std::fmt::Debug for Resource {
         f.debug_struct("Resource")
             .field("uri", &self.uri)
             .field("name", &self.name)
+            .field("title", &self.title)
             .field("description", &self.description)
             .field("mime_type", &self.mime_type)
+            .field("icons", &self.icons)
+            .field("size", &self.size)
             .finish_non_exhaustive()
     }
 }
@@ -95,8 +104,11 @@ impl Resource {
         ResourceDefinition {
             uri: self.uri.clone(),
             name: self.name.clone(),
+            title: self.title.clone(),
             description: self.description.clone(),
             mime_type: self.mime_type.clone(),
+            icons: self.icons.clone(),
+            size: self.size,
         }
     }
 
@@ -138,8 +150,11 @@ impl Resource {
 pub struct ResourceBuilder {
     uri: String,
     name: Option<String>,
+    title: Option<String>,
     description: Option<String>,
     mime_type: Option<String>,
+    icons: Option<Vec<ToolIcon>>,
+    size: Option<u64>,
 }
 
 impl ResourceBuilder {
@@ -147,14 +162,23 @@ impl ResourceBuilder {
         Self {
             uri: uri.into(),
             name: None,
+            title: None,
             description: None,
             mime_type: None,
+            icons: None,
+            size: None,
         }
     }
 
     /// Set the resource name (human-readable)
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
+        self
+    }
+
+    /// Set a human-readable title for the resource
+    pub fn title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
         self
     }
 
@@ -170,6 +194,37 @@ impl ResourceBuilder {
         self
     }
 
+    /// Add an icon for the resource
+    pub fn icon(mut self, src: impl Into<String>) -> Self {
+        self.icons.get_or_insert_with(Vec::new).push(ToolIcon {
+            src: src.into(),
+            mime_type: None,
+            sizes: None,
+        });
+        self
+    }
+
+    /// Add an icon with metadata
+    pub fn icon_with_meta(
+        mut self,
+        src: impl Into<String>,
+        mime_type: Option<String>,
+        sizes: Option<Vec<String>>,
+    ) -> Self {
+        self.icons.get_or_insert_with(Vec::new).push(ToolIcon {
+            src: src.into(),
+            mime_type,
+            sizes,
+        });
+        self
+    }
+
+    /// Set the size of the resource in bytes
+    pub fn size(mut self, size: u64) -> Self {
+        self.size = Some(size);
+        self
+    }
+
     /// Set the handler function for reading the resource
     pub fn handler<F, Fut>(self, handler: F) -> Resource
     where
@@ -182,8 +237,11 @@ impl ResourceBuilder {
         Resource {
             uri: self.uri.clone(),
             name,
+            title: self.title,
             description: self.description,
             mime_type: self.mime_type,
+            icons: self.icons,
+            size: self.size,
             handler: Arc::new(FnHandler { handler }),
         }
     }
@@ -311,8 +369,11 @@ pub trait McpResource: Send + Sync + 'static {
         Resource {
             uri: Self::URI.to_string(),
             name: Self::NAME.to_string(),
+            title: None,
             description: Self::DESCRIPTION.map(|s| s.to_string()),
             mime_type: Self::MIME_TYPE.map(|s| s.to_string()),
+            icons: None,
+            size: None,
             handler: Arc::new(McpResourceHandler { resource }),
         }
     }
@@ -379,10 +440,14 @@ pub struct ResourceTemplate {
     pub uri_template: String,
     /// Human-readable name
     pub name: String,
+    /// Human-readable title for display purposes
+    pub title: Option<String>,
     /// Optional description
     pub description: Option<String>,
     /// Optional MIME type hint
     pub mime_type: Option<String>,
+    /// Optional icons for display in user interfaces
+    pub icons: Option<Vec<ToolIcon>>,
     /// Compiled regex for matching URIs
     pattern: regex::Regex,
     /// Variable names in order of appearance
@@ -396,8 +461,10 @@ impl Clone for ResourceTemplate {
         Self {
             uri_template: self.uri_template.clone(),
             name: self.name.clone(),
+            title: self.title.clone(),
             description: self.description.clone(),
             mime_type: self.mime_type.clone(),
+            icons: self.icons.clone(),
             pattern: self.pattern.clone(),
             variables: self.variables.clone(),
             handler: self.handler.clone(),
@@ -410,8 +477,10 @@ impl std::fmt::Debug for ResourceTemplate {
         f.debug_struct("ResourceTemplate")
             .field("uri_template", &self.uri_template)
             .field("name", &self.name)
+            .field("title", &self.title)
             .field("description", &self.description)
             .field("mime_type", &self.mime_type)
+            .field("icons", &self.icons)
             .field("variables", &self.variables)
             .finish_non_exhaustive()
     }
@@ -428,8 +497,10 @@ impl ResourceTemplate {
         ResourceTemplateDefinition {
             uri_template: self.uri_template.clone(),
             name: self.name.clone(),
+            title: self.title.clone(),
             description: self.description.clone(),
             mime_type: self.mime_type.clone(),
+            icons: self.icons.clone(),
         }
     }
 
@@ -492,8 +563,10 @@ impl ResourceTemplate {
 pub struct ResourceTemplateBuilder {
     uri_template: String,
     name: Option<String>,
+    title: Option<String>,
     description: Option<String>,
     mime_type: Option<String>,
+    icons: Option<Vec<ToolIcon>>,
 }
 
 impl ResourceTemplateBuilder {
@@ -513,14 +586,22 @@ impl ResourceTemplateBuilder {
         Self {
             uri_template: uri_template.into(),
             name: None,
+            title: None,
             description: None,
             mime_type: None,
+            icons: None,
         }
     }
 
     /// Set the human-readable name for this template
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
+        self
+    }
+
+    /// Set a human-readable title for the template
+    pub fn title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
         self
     }
 
@@ -533,6 +614,31 @@ impl ResourceTemplateBuilder {
     /// Set the MIME type hint for resources from this template
     pub fn mime_type(mut self, mime_type: impl Into<String>) -> Self {
         self.mime_type = Some(mime_type.into());
+        self
+    }
+
+    /// Add an icon for the template
+    pub fn icon(mut self, src: impl Into<String>) -> Self {
+        self.icons.get_or_insert_with(Vec::new).push(ToolIcon {
+            src: src.into(),
+            mime_type: None,
+            sizes: None,
+        });
+        self
+    }
+
+    /// Add an icon with metadata
+    pub fn icon_with_meta(
+        mut self,
+        src: impl Into<String>,
+        mime_type: Option<String>,
+        sizes: Option<Vec<String>>,
+    ) -> Self {
+        self.icons.get_or_insert_with(Vec::new).push(ToolIcon {
+            src: src.into(),
+            mime_type,
+            sizes,
+        });
         self
     }
 
@@ -552,8 +658,10 @@ impl ResourceTemplateBuilder {
         ResourceTemplate {
             uri_template: self.uri_template,
             name,
+            title: self.title,
             description: self.description,
             mime_type: self.mime_type,
+            icons: self.icons,
             pattern,
             variables,
             handler: Arc::new(FnTemplateHandler { handler }),

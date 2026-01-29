@@ -250,24 +250,28 @@ let app = transport.into_router()
 
 ## Protocol Compliance
 
-tower-mcp targets the [MCP specification 2025-03-26](https://modelcontextprotocol.io/specification/2025-03-26). Current compliance:
+tower-mcp targets the [MCP specification 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25). Current compliance:
 
-- [x] [JSON-RPC 2.0 message format](https://modelcontextprotocol.io/specification/2025-03-26/basic#messages)
-- [x] [Protocol version negotiation](https://modelcontextprotocol.io/specification/2025-03-26/basic/lifecycle#version-negotiation)
-- [x] [Capability negotiation](https://modelcontextprotocol.io/specification/2025-03-26/basic/lifecycle#capability-negotiation)
-- [x] [Initialize/initialized lifecycle](https://modelcontextprotocol.io/specification/2025-03-26/basic/lifecycle)
-- [x] [tools/list and tools/call](https://modelcontextprotocol.io/specification/2025-03-26/server/tools)
-- [x] [Tool annotations](https://modelcontextprotocol.io/specification/2025-03-26/server/tools)
-- [x] [Batch requests](https://modelcontextprotocol.io/specification/2025-03-26/basic#batching)
-- [x] [resources/list, resources/read, resources/subscribe](https://modelcontextprotocol.io/specification/2025-03-26/server/resources)
-- [x] [prompts/list, prompts/get](https://modelcontextprotocol.io/specification/2025-03-26/server/prompts)
+- [x] [JSON-RPC 2.0 message format](https://modelcontextprotocol.io/specification/2025-11-25/basic#messages)
+- [x] [Protocol version negotiation](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle#version-negotiation)
+- [x] [Capability negotiation](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle#capability-negotiation)
+- [x] [Initialize/initialized lifecycle](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle)
+- [x] [tools/list and tools/call](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)
+- [x] [Tool annotations](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)
+- [x] [Batch requests](https://modelcontextprotocol.io/specification/2025-11-25/basic#batching)
+- [x] [resources/list, resources/read, resources/subscribe](https://modelcontextprotocol.io/specification/2025-11-25/server/resources)
+- [x] [prompts/list, prompts/get](https://modelcontextprotocol.io/specification/2025-11-25/server/prompts)
+- [x] [Icons on tools/resources/prompts (SEP-973)](https://modelcontextprotocol.io/specification/2025-11-25)
+- [x] [Implementation metadata](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle)
+- [x] [Sampling with tools/toolChoice (SEP-1577)](https://modelcontextprotocol.io/specification/2025-11-25/client/sampling)
 - [x] [Elicitation (user input requests)](https://modelcontextprotocol.io/specification/2025-11-25/client/elicitation)
-- [x] [Session management](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#session-management)
-- [x] [Progress notifications](https://modelcontextprotocol.io/specification/2025-03-26/basic/utilities/progress)
-- [x] [Request cancellation](https://modelcontextprotocol.io/specification/2025-03-26/basic/utilities/cancellation)
-- [x] [Completion (autocomplete)](https://modelcontextprotocol.io/specification/2025-03-26/server/utilities/completion)
-- [x] [Roots (filesystem discovery)](https://modelcontextprotocol.io/specification/2025-03-26/client/roots)
-- [x] [Sampling](https://modelcontextprotocol.io/specification/2025-03-26/client/sampling) (stdio transport)
+- [x] [Session management](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#session-management)
+- [x] [Progress notifications](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/progress)
+- [x] [Request cancellation](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/cancellation)
+- [x] [Completion (autocomplete)](https://modelcontextprotocol.io/specification/2025-11-25/server/utilities/completion)
+- [x] [Roots (filesystem discovery)](https://modelcontextprotocol.io/specification/2025-11-25/client/roots)
+- [x] [Sampling](https://modelcontextprotocol.io/specification/2025-11-25/client/sampling) (all transports)
+- [ ] SSE event IDs and stream resumption (SEP-1699) - future work
 
 ## Development
 

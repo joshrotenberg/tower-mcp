@@ -192,6 +192,7 @@ impl<T: ClientTransport> McpClient<T> {
             client_info: Implementation {
                 name: client_name.to_string(),
                 version: client_version.to_string(),
+                ..Default::default()
             },
         };
 
