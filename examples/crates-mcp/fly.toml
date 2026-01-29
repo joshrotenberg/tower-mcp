@@ -5,7 +5,8 @@ app = "crates-mcp-demo"
 primary_region = "sjc"
 
 [build]
-  dockerfile = "examples/crates-mcp/Dockerfile"
+  context = "../.."
+  dockerfile = "Dockerfile"
 
 [http_service]
   internal_port = 3000
