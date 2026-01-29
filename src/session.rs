@@ -2,9 +2,15 @@
 //!
 //! Tracks the lifecycle state of an MCP connection as per the specification.
 //! The session progresses through phases: Uninitialized -> Initializing -> Initialized.
+//!
+//! Sessions also support type-safe extensions for storing arbitrary data like
+//! authentication claims, user roles, or other session-scoped state.
 
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU8, Ordering};
+
+use crate::router::Extensions;
 
 /// Session lifecycle phase
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,10 +37,37 @@ impl From<u8> for SessionPhase {
 
 /// Shared session state that can be cloned across requests.
 ///
-/// Uses atomic operations for thread-safe state transitions.
+/// Uses atomic operations for thread-safe state transitions. Includes a type-safe
+/// extensions map for storing session-scoped data like authentication claims.
+///
+/// # Example
+///
+/// ```rust
+/// use tower_mcp::SessionState;
+///
+/// #[derive(Debug, Clone)]
+/// struct UserClaims {
+///     user_id: String,
+///     role: String,
+/// }
+///
+/// let session = SessionState::new();
+///
+/// // Store auth claims in the session
+/// session.insert(UserClaims {
+///     user_id: "user123".to_string(),
+///     role: "admin".to_string(),
+/// });
+///
+/// // Retrieve claims later
+/// if let Some(claims) = session.get::<UserClaims>() {
+///     assert_eq!(claims.role, "admin");
+/// }
+/// ```
 #[derive(Clone)]
 pub struct SessionState {
     phase: Arc<AtomicU8>,
+    extensions: Arc<RwLock<Extensions>>,
 }
 
 impl Default for SessionState {
@@ -48,7 +81,50 @@ impl SessionState {
     pub fn new() -> Self {
         Self {
             phase: Arc::new(AtomicU8::new(SessionPhase::Uninitialized as u8)),
+            extensions: Arc::new(RwLock::new(Extensions::new())),
         }
+    }
+
+    /// Insert a value into the session extensions.
+    ///
+    /// This is typically used by auth middleware to store claims that can
+    /// be checked by capability filters.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::SessionState;
+    ///
+    /// let session = SessionState::new();
+    /// session.insert(42u32);
+    /// assert_eq!(session.get::<u32>(), Some(42));
+    /// ```
+    pub fn insert<T: Send + Sync + Clone + 'static>(&self, val: T) {
+        if let Ok(mut ext) = self.extensions.write() {
+            ext.insert(val);
+        }
+    }
+
+    /// Get a cloned value from the session extensions.
+    ///
+    /// Returns `None` if no value of the given type has been inserted or if
+    /// the lock cannot be acquired.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::SessionState;
+    ///
+    /// let session = SessionState::new();
+    /// session.insert("hello".to_string());
+    /// assert_eq!(session.get::<String>(), Some("hello".to_string()));
+    /// assert_eq!(session.get::<u32>(), None);
+    /// ```
+    pub fn get<T: Send + Sync + Clone + 'static>(&self) -> Option<T> {
+        self.extensions
+            .read()
+            .ok()
+            .and_then(|ext| ext.get::<T>().cloned())
     }
 
     /// Get the current session phase
@@ -150,5 +226,82 @@ mod tests {
 
         session2.mark_initialized();
         assert_eq!(session1.phase(), SessionPhase::Initialized);
+    }
+
+    #[test]
+    fn test_session_extensions_insert_and_get() {
+        let session = SessionState::new();
+
+        // Insert and retrieve a value
+        session.insert(42u32);
+        assert_eq!(session.get::<u32>(), Some(42));
+
+        // Different type returns None
+        assert_eq!(session.get::<String>(), None);
+    }
+
+    #[test]
+    fn test_session_extensions_overwrite() {
+        let session = SessionState::new();
+
+        session.insert(42u32);
+        assert_eq!(session.get::<u32>(), Some(42));
+
+        // Overwrite with new value
+        session.insert(100u32);
+        assert_eq!(session.get::<u32>(), Some(100));
+    }
+
+    #[test]
+    fn test_session_extensions_multiple_types() {
+        let session = SessionState::new();
+
+        session.insert(42u32);
+        session.insert("hello".to_string());
+        session.insert(true);
+
+        assert_eq!(session.get::<u32>(), Some(42));
+        assert_eq!(session.get::<String>(), Some("hello".to_string()));
+        assert_eq!(session.get::<bool>(), Some(true));
+    }
+
+    #[test]
+    fn test_session_extensions_shared_across_clones() {
+        let session1 = SessionState::new();
+        let session2 = session1.clone();
+
+        // Insert in one clone
+        session1.insert(42u32);
+
+        // Should be visible in the other
+        assert_eq!(session2.get::<u32>(), Some(42));
+
+        // Insert in the second clone
+        session2.insert("world".to_string());
+
+        // Should be visible in the first
+        assert_eq!(session1.get::<String>(), Some("world".to_string()));
+    }
+
+    #[test]
+    fn test_session_extensions_custom_type() {
+        #[derive(Debug, Clone, PartialEq)]
+        struct UserClaims {
+            user_id: String,
+            role: String,
+        }
+
+        let session = SessionState::new();
+
+        session.insert(UserClaims {
+            user_id: "user123".to_string(),
+            role: "admin".to_string(),
+        });
+
+        let claims = session.get::<UserClaims>();
+        assert!(claims.is_some());
+        let claims = claims.unwrap();
+        assert_eq!(claims.user_id, "user123");
+        assert_eq!(claims.role, "admin");
     }
 }
