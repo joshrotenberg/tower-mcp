@@ -632,6 +632,7 @@ impl HttpTransport {
             .route("/", post(handle_post))
             .route("/", get(handle_get))
             .route("/", delete(handle_delete))
+            .route("/health", get(handle_health))
             .with_state(state);
 
         #[cfg(feature = "oauth")]
@@ -648,6 +649,7 @@ impl HttpTransport {
             .route("/", post(handle_post))
             .route("/", get(handle_get))
             .route("/", delete(handle_delete))
+            .route("/health", get(handle_health))
             .with_state(state);
 
         let router = Router::new().nest(path, mcp_router);
@@ -1171,6 +1173,14 @@ async fn handle_delete(State(state): State<Arc<AppState>>, headers: HeaderMap) -
         tracing::debug!(session_id = %session_id, "Session already removed or never existed");
         StatusCode::OK.into_response()
     }
+}
+
+/// Handle GET /health requests
+///
+/// Returns a simple 200 OK response for health checks.
+/// Does not require authentication or session state.
+async fn handle_health() -> Response {
+    StatusCode::OK.into_response()
 }
 
 /// Create a JSON-RPC error response
