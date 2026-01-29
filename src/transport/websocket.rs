@@ -176,6 +176,8 @@ pub struct WebSocketTransport {
     router: McpRouter,
     sampling_enabled: bool,
     service_factory: ServiceFactory,
+    #[cfg(feature = "oauth")]
+    oauth_config: Option<crate::oauth::ProtectedResourceMetadata>,
 }
 
 impl WebSocketTransport {
@@ -185,6 +187,8 @@ impl WebSocketTransport {
             router,
             sampling_enabled: false,
             service_factory: identity_factory(),
+            #[cfg(feature = "oauth")]
+            oauth_config: None,
         }
     }
 
@@ -197,7 +201,35 @@ impl WebSocketTransport {
             router,
             sampling_enabled: true,
             service_factory: identity_factory(),
+            #[cfg(feature = "oauth")]
+            oauth_config: None,
         }
+    }
+
+    /// Configure OAuth 2.1 Protected Resource Metadata for this transport.
+    ///
+    /// When set, adds a `GET /.well-known/oauth-protected-resource` endpoint
+    /// that returns the metadata JSON, enabling OAuth client discovery per
+    /// RFC 9728.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use tower_mcp::oauth::ProtectedResourceMetadata;
+    /// use tower_mcp::transport::websocket::WebSocketTransport;
+    /// use tower_mcp::McpRouter;
+    ///
+    /// let metadata = ProtectedResourceMetadata::new("https://mcp.example.com")
+    ///     .authorization_server("https://auth.example.com")
+    ///     .scope("mcp:read");
+    ///
+    /// let router = McpRouter::new().server_info("my-server", "1.0.0");
+    /// let transport = WebSocketTransport::new(router).oauth(metadata);
+    /// ```
+    #[cfg(feature = "oauth")]
+    pub fn oauth(mut self, metadata: crate::oauth::ProtectedResourceMetadata) -> Self {
+        self.oauth_config = Some(metadata);
+        self
     }
 
     /// Apply a tower middleware layer to MCP request processing.
@@ -245,6 +277,9 @@ impl WebSocketTransport {
 
     /// Build the axum router for this transport
     pub fn into_router(self) -> Router {
+        #[cfg(feature = "oauth")]
+        let oauth_config = self.oauth_config;
+
         let state = Arc::new(AppState {
             router_template: self.router,
             service_factory: self.service_factory,
@@ -252,13 +287,21 @@ impl WebSocketTransport {
             sampling_enabled: self.sampling_enabled,
         });
 
-        Router::new()
+        let router = Router::new()
             .route("/", get(handle_websocket))
-            .with_state(state)
+            .with_state(state);
+
+        #[cfg(feature = "oauth")]
+        let router = add_oauth_route(router, "", oauth_config.as_ref());
+
+        router
     }
 
     /// Build an axum router mounted at a specific path
     pub fn into_router_at(self, path: &str) -> Router {
+        #[cfg(feature = "oauth")]
+        let oauth_config = self.oauth_config;
+
         let state = Arc::new(AppState {
             router_template: self.router,
             service_factory: self.service_factory,
@@ -270,7 +313,12 @@ impl WebSocketTransport {
             .route("/", get(handle_websocket))
             .with_state(state);
 
-        Router::new().nest(path, ws_router)
+        let router = Router::new().nest(path, ws_router);
+
+        #[cfg(feature = "oauth")]
+        let router = add_oauth_route(router, path, oauth_config.as_ref());
+
+        router
     }
 
     /// Serve the transport on the given address
@@ -287,6 +335,36 @@ impl WebSocketTransport {
             .map_err(|e| Error::Transport(format!("Server error: {}", e)))?;
 
         Ok(())
+    }
+}
+
+/// Add the OAuth Protected Resource Metadata well-known route if configured.
+#[cfg(feature = "oauth")]
+fn add_oauth_route(
+    router: Router,
+    base_path: &str,
+    metadata: Option<&crate::oauth::ProtectedResourceMetadata>,
+) -> Router {
+    if let Some(metadata) = metadata {
+        let metadata = metadata.clone();
+        let well_known_path = if base_path.is_empty() {
+            crate::oauth::ProtectedResourceMetadata::well_known_path().to_string()
+        } else {
+            format!(
+                "{}{}",
+                base_path.trim_end_matches('/'),
+                crate::oauth::ProtectedResourceMetadata::well_known_path()
+            )
+        };
+        router.route(
+            &well_known_path,
+            get(move || {
+                let m = metadata.clone();
+                async move { axum::Json(m) }
+            }),
+        )
+    } else {
+        router
     }
 }
 
