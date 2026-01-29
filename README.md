@@ -42,6 +42,7 @@ This means:
 - **Completion**: Autocomplete for prompt arguments and resource URIs
 - **Sampling types**: `CreateMessageParams`/`CreateMessageResult` for LLM requests
 - **Sampling runtime**: Full support on stdio, WebSocket, and HTTP transports
+- **Async tasks**: Task ID generation, status tracking, TTL-based cleanup for long-running operations
 
 ## Installation
 
@@ -159,6 +160,34 @@ let calc = Calculator { precision: 10 };
 let router = McpRouter::new().tool(calc.into_tool());
 ```
 
+### Handler with Context (Progress/Sampling)
+
+```rust
+use tower_mcp::{ToolBuilder, CallToolResult, RequestContext};
+
+let search = ToolBuilder::new("search")
+    .description("Search with progress updates")
+    .handler_with_context(|input: SearchInput, ctx: RequestContext| async move {
+        ctx.send_progress(0.5, Some(10.0), None).await?;
+        // ... do work ...
+        ctx.send_progress(1.0, Some(10.0), None).await?;
+        Ok(CallToolResult::text("Done"))
+    })
+    .build();
+```
+
+### Tool with Icons and Title
+
+```rust
+let tool = ToolBuilder::new("analyze")
+    .title("Code Analyzer")          // Human-readable display name
+    .description("Analyze code quality")
+    .icon("https://example.com/icon.svg")
+    .read_only()
+    .idempotent()
+    .build();
+```
+
 ### Raw JSON Handler (Escape Hatch)
 
 ```rust
@@ -271,6 +300,7 @@ tower-mcp targets the [MCP specification 2025-11-25](https://modelcontextprotoco
 - [x] [Completion (autocomplete)](https://modelcontextprotocol.io/specification/2025-11-25/server/utilities/completion)
 - [x] [Roots (filesystem discovery)](https://modelcontextprotocol.io/specification/2025-11-25/client/roots)
 - [x] [Sampling](https://modelcontextprotocol.io/specification/2025-11-25/client/sampling) (all transports)
+- [x] [Async tasks](https://modelcontextprotocol.io/specification/2025-11-25/server/utilities/async) (task ID, status tracking, TTL cleanup)
 - [ ] SSE event IDs and stream resumption (SEP-1699) - future work
 
 ## Development
