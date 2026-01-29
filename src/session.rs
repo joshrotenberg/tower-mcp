@@ -169,9 +169,14 @@ impl SessionState {
     /// Per spec:
     /// - Before initialization: only `initialize` and `ping` are valid
     /// - During all phases: `ping` is always valid
+    /// - With SEP-1442 stateless mode: `server/discover` is also valid before init
     pub fn is_request_allowed(&self, method: &str) -> bool {
         match self.phase() {
             SessionPhase::Uninitialized => {
+                #[cfg(feature = "stateless")]
+                if method == "server/discover" {
+                    return true;
+                }
                 matches!(method, "initialize" | "ping")
             }
             SessionPhase::Initializing | SessionPhase::Initialized => true,
