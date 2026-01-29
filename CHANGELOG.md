@@ -4,6 +4,42 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+## [0.2.0] - 2026-01-29
+
+### Documentation
+
+- Add badges and update install instructions ([#103](https://github.com/joshrotenberg/tower-mcp/pull/103))
+- Add spec section links to README compliance matrix ([#122](https://github.com/joshrotenberg/tower-mcp/pull/122))
+- Use handler_with_state in crates-mcp example ([#139](https://github.com/joshrotenberg/tower-mcp/pull/139))
+- Add async tasks and more ToolBuilder examples to README ([#156](https://github.com/joshrotenberg/tower-mcp/pull/156))
+- Show server protocol version response in http_server example ([#157](https://github.com/joshrotenberg/tower-mcp/pull/157))
+
+### Features
+
+- Add JsonRpcLayer for ServiceBuilder composition ([#116](https://github.com/joshrotenberg/tower-mcp/pull/116))
+- Implement tower::Service for AuthService ([#117](https://github.com/joshrotenberg/tower-mcp/pull/117))
+- Add .layer() to HTTP and WebSocket transports ([#118](https://github.com/joshrotenberg/tower-mcp/pull/118))
+- Add BoxError type alias ([#119](https://github.com/joshrotenberg/tower-mcp/pull/119))
+- Add full feature flag ([#120](https://github.com/joshrotenberg/tower-mcp/pull/120))
+- Add tower middleware composition examples ([#121](https://github.com/joshrotenberg/tower-mcp/pull/121))
+- Add MCP conformance test suite ([#123](https://github.com/joshrotenberg/tower-mcp/pull/123))
+- Add OAuth 2.1 resource server support ([#129](https://github.com/joshrotenberg/tower-mcp/pull/129))
+- Add MCP test harness with TestClient ([#124](https://github.com/joshrotenberg/tower-mcp/pull/124)) ([#130](https://github.com/joshrotenberg/tower-mcp/pull/130))
+- Add ScopeEnforcementLayer for per-operation OAuth scope checks ([#127](https://github.com/joshrotenberg/tower-mcp/pull/127)) ([#132](https://github.com/joshrotenberg/tower-mcp/pull/132))
+- API ergonomics quick wins (#133-#137) ([#138](https://github.com/joshrotenberg/tower-mcp/pull/138))
+- OAuth follow-ups -- WebSocket well-known endpoint and JWKS fetching (#126, #128) ([#140](https://github.com/joshrotenberg/tower-mcp/pull/140))
+- Bump MCP protocol version to 2025-11-25 ([#142](https://github.com/joshrotenberg/tower-mcp/pull/142))
+- Add weather server example ([#158](https://github.com/joshrotenberg/tower-mcp/pull/158))
+
+### Miscellaneous Tasks
+
+- Release v0.1.0 ([#101](https://github.com/joshrotenberg/tower-mcp/pull/101))
+- Remove unused tokio-tungstenite direct dependency ([#104](https://github.com/joshrotenberg/tower-mcp/pull/104))
+- Bump jsonwebtoken to v10 and reqwest to v0.13 ([#141](https://github.com/joshrotenberg/tower-mcp/pull/141))
+- 0.2.0 release readiness ([#159](https://github.com/joshrotenberg/tower-mcp/pull/159))
+
+
+
 ## [0.1.0] - 2026-01-28
 
 ### Bug Fixes
