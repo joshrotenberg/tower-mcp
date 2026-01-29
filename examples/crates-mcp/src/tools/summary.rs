@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use tower_mcp::{CallToolResult, Error, Tool, ToolBuilder};
+use tower_mcp::{CallToolResult, Error, NoParams, Tool, ToolBuilder};
 
 use crate::state::{AppState, format_number};
 
@@ -15,7 +15,7 @@ pub fn build(state: Arc<AppState>) -> Tool {
         .read_only()
         .idempotent()
         .icon("https://crates.io/assets/cargo.png")
-        .handler_with_state(state, |state: Arc<AppState>, _input: ()| async move {
+        .handler_with_state(state, |state: Arc<AppState>, _input: NoParams| async move {
             let summary = state
                 .client
                 .summary()
