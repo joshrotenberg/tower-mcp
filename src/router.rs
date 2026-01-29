@@ -18,7 +18,7 @@ use crate::context::{
     ServerNotification,
 };
 use crate::error::{Error, JsonRpcError, Result};
-use crate::filter::ToolFilter;
+use crate::filter::{ResourceFilter, ToolFilter};
 use crate::prompt::Prompt;
 use crate::protocol::*;
 use crate::resource::{Resource, ResourceTemplate};
@@ -108,6 +108,8 @@ struct McpRouterInner {
     completion_handler: Option<CompletionHandler>,
     /// Filter for tools based on session state
     tool_filter: Option<ToolFilter>,
+    /// Filter for resources based on session state
+    resource_filter: Option<ResourceFilter>,
 }
 
 impl McpRouter {
@@ -133,6 +135,7 @@ impl McpRouter {
                 subscriptions: Arc::new(RwLock::new(HashSet::new())),
                 completion_handler: None,
                 tool_filter: None,
+                resource_filter: None,
             }),
             session: SessionState::new(),
         }
@@ -485,6 +488,41 @@ impl McpRouter {
         self
     }
 
+    /// Set a filter for resources based on session state.
+    ///
+    /// The filter receives the current session state and each resource, returning
+    /// `true` if the resource should be visible to this session. Resources that
+    /// don't pass the filter will not appear in `resources/list` responses and will
+    /// return an error if read directly.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::{McpRouter, ResourceBuilder, ReadResourceResult, CapabilityFilter, Resource, Filterable};
+    ///
+    /// let public_resource = ResourceBuilder::new("file:///public.txt")
+    ///     .name("Public File")
+    ///     .description("Available to everyone")
+    ///     .text("public content");
+    ///
+    /// let secret_resource = ResourceBuilder::new("file:///secret.txt")
+    ///     .name("Secret File")
+    ///     .description("Admin only")
+    ///     .text("secret content");
+    ///
+    /// let router = McpRouter::new()
+    ///     .resource(public_resource)
+    ///     .resource(secret_resource)
+    ///     .resource_filter(CapabilityFilter::new(|_session, resource: &Resource| {
+    ///         // In real code, check session.extensions() for auth claims
+    ///         !resource.name().contains("Secret")
+    ///     }));
+    /// ```
+    pub fn resource_filter(mut self, filter: ResourceFilter) -> Self {
+        Arc::make_mut(&mut self.inner).resource_filter = Some(filter);
+        self
+    }
+
     /// Get access to the session state
     pub fn session(&self) -> &SessionState {
         &self.session
@@ -757,6 +795,14 @@ impl McpRouter {
                     .inner
                     .resources
                     .values()
+                    .filter(|r| {
+                        // Apply resource filter if configured
+                        self.inner
+                            .resource_filter
+                            .as_ref()
+                            .map(|f| f.is_visible(&self.session, r))
+                            .unwrap_or(true)
+                    })
                     .map(|r| r.definition())
                     .collect();
 
@@ -785,6 +831,13 @@ impl McpRouter {
             McpRequest::ReadResource(params) => {
                 // First, try to find a static resource
                 if let Some(resource) = self.inner.resources.get(&params.uri) {
+                    // Check resource filter if configured
+                    if let Some(filter) = &self.inner.resource_filter {
+                        if !filter.is_visible(&self.session, resource) {
+                            return Err(filter.denial_error(&params.uri));
+                        }
+                    }
+
                     tracing::debug!(uri = %params.uri, "Reading static resource");
                     let result = resource.read().await?;
                     return Ok(McpResponse::ReadResource(result));
@@ -2774,6 +2827,154 @@ mod tests {
                 name: "admin".to_string(),
                 arguments: serde_json::json!({"a": 1, "b": 2}),
                 meta: None,
+            }),
+            extensions: Extensions::new(),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        // Should get forbidden error
+        match resp.inner {
+            Err(e) => {
+                assert_eq!(e.code, -32007); // Forbidden
+                assert!(e.message.contains("Unauthorized"));
+            }
+            _ => panic!("Expected JsonRpc error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resource_filter_list() {
+        use crate::filter::CapabilityFilter;
+        use crate::resource::{Resource, ResourceBuilder};
+
+        let public_resource = ResourceBuilder::new("file:///public.txt")
+            .name("Public File")
+            .text("public content");
+
+        let secret_resource = ResourceBuilder::new("file:///secret.txt")
+            .name("Secret File")
+            .text("secret content");
+
+        let mut router = McpRouter::new()
+            .resource(public_resource)
+            .resource(secret_resource)
+            .resource_filter(CapabilityFilter::new(|_, r: &Resource| {
+                !r.name.contains("Secret")
+            }));
+
+        // Initialize session
+        init_router(&mut router).await;
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::ListResources(ListResourcesParams::default()),
+            extensions: Extensions::new(),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::ListResources(result)) => {
+                // Should only see public resource
+                assert_eq!(result.resources.len(), 1);
+                assert_eq!(result.resources[0].name, "Public File");
+            }
+            _ => panic!("Expected ListResources response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resource_filter_read_denied() {
+        use crate::filter::CapabilityFilter;
+        use crate::resource::{Resource, ResourceBuilder};
+
+        let secret_resource = ResourceBuilder::new("file:///secret.txt")
+            .name("Secret File")
+            .text("secret content");
+
+        let mut router = McpRouter::new()
+            .resource(secret_resource)
+            .resource_filter(CapabilityFilter::new(|_, _: &Resource| false)); // Deny all
+
+        // Initialize session
+        init_router(&mut router).await;
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::ReadResource(ReadResourceParams {
+                uri: "file:///secret.txt".to_string(),
+            }),
+            extensions: Extensions::new(),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        // Should get method not found error (default denial behavior)
+        match resp.inner {
+            Err(e) => {
+                assert_eq!(e.code, -32601); // Method not found
+            }
+            _ => panic!("Expected JsonRpc error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resource_filter_read_allowed() {
+        use crate::filter::CapabilityFilter;
+        use crate::resource::{Resource, ResourceBuilder};
+
+        let public_resource = ResourceBuilder::new("file:///public.txt")
+            .name("Public File")
+            .text("public content");
+
+        let mut router = McpRouter::new()
+            .resource(public_resource)
+            .resource_filter(CapabilityFilter::new(|_, _: &Resource| true)); // Allow all
+
+        // Initialize session
+        init_router(&mut router).await;
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::ReadResource(ReadResourceParams {
+                uri: "file:///public.txt".to_string(),
+            }),
+            extensions: Extensions::new(),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::ReadResource(result)) => {
+                assert_eq!(result.contents.len(), 1);
+                assert_eq!(result.contents[0].text.as_deref(), Some("public content"));
+            }
+            _ => panic!("Expected ReadResource response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resource_filter_custom_denial() {
+        use crate::filter::{CapabilityFilter, DenialBehavior};
+        use crate::resource::{Resource, ResourceBuilder};
+
+        let secret_resource = ResourceBuilder::new("file:///secret.txt")
+            .name("Secret File")
+            .text("secret content");
+
+        let mut router = McpRouter::new().resource(secret_resource).resource_filter(
+            CapabilityFilter::new(|_, _: &Resource| false)
+                .denial_behavior(DenialBehavior::Unauthorized),
+        );
+
+        // Initialize session
+        init_router(&mut router).await;
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::ReadResource(ReadResourceParams {
+                uri: "file:///secret.txt".to_string(),
             }),
             extensions: Extensions::new(),
         };
