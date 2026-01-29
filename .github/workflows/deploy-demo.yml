@@ -29,11 +29,23 @@ jobs:
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
-      - name: Verify deployment
+      - name: Verify deployment (health check)
         run: |
           echo "Waiting for server to be ready..."
           sleep 10
 
+          echo "Checking health endpoint..."
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://crates-mcp-demo.fly.dev/health)
+
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "Health check passed!"
+          else
+            echo "Health check failed with status: $HTTP_STATUS"
+            exit 1
+          fi
+
+      - name: Verify deployment (MCP protocol)
+        run: |
           # Save response headers to a file so we can extract session ID
           echo "Sending initialize request..."
           INIT_RESPONSE=$(curl -s -D /tmp/headers.txt -X POST https://crates-mcp-demo.fly.dev/ \
@@ -72,8 +84,8 @@ jobs:
 
           # Check for successful response (should contain "result" not "error")
           if echo "$TOOL_RESPONSE" | grep -q '"result"'; then
-            echo "Deployment verification successful!"
+            echo "MCP protocol verification successful!"
           else
-            echo "Deployment verification failed - unexpected response"
+            echo "MCP protocol verification failed - unexpected response"
             exit 1
           fi
