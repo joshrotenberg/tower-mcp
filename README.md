@@ -50,7 +50,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tower-mcp = "0.1"
+tower-mcp = "0.2"
 ```
 
 ### Feature Flags
@@ -67,7 +67,7 @@ Example with features:
 
 ```toml
 [dependencies]
-tower-mcp = { version = "0.1", features = ["full"] }
+tower-mcp = { version = "0.2", features = ["full"] }
 ```
 
 ## Quick Start
