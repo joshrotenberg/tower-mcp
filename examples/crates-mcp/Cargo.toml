@@ -39,5 +39,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Tower middleware
 tower = { version = "0.5", features = ["util", "timeout", "limit"] }
-tower-resilience-ratelimiter = "0.6"
 tower-resilience-bulkhead = "0.6"
+tower-resilience-ratelimiter = "0.6"
