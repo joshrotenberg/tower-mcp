@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+## [0.2.1] - 2026-01-29
+
+### Bug Fixes
+
+- Correct Dockerfile path in fly.toml with build context ([#165](https://github.com/joshrotenberg/tower-mcp/pull/165))
+- Dockerfile path should be relative to fly.toml location ([#166](https://github.com/joshrotenberg/tower-mcp/pull/166))
+- Use latest stable Rust in Dockerfile for let-chains support ([#167](https://github.com/joshrotenberg/tower-mcp/pull/167))
+- Add initialized notification to deploy verification ([#171](https://github.com/joshrotenberg/tower-mcp/pull/171))
+- **crates-mcp:** Add --minimal flag to workaround Claude Code MCP issues ([#174](https://github.com/joshrotenberg/tower-mcp/pull/174))
+
+### Documentation
+
+- Update version references to 0.2 ([#163](https://github.com/joshrotenberg/tower-mcp/pull/163))
+- Add live demo section to README and bump rate limits ([#168](https://github.com/joshrotenberg/tower-mcp/pull/168))
+
+### Features
+
+- Add HTTP transport and Fly.io deployment for crates-mcp demo ([#164](https://github.com/joshrotenberg/tower-mcp/pull/164))
+- **http:** Add /health endpoint for simple health checks ([#173](https://github.com/joshrotenberg/tower-mcp/pull/173))
+- **crates-mcp:** Add comprehensive MCP feature showcase ([#170](https://github.com/joshrotenberg/tower-mcp/pull/170))
+- **tool:** Add NoParams type for parameterless tools ([#175](https://github.com/joshrotenberg/tower-mcp/pull/175))
+
+### Miscellaneous Tasks
+
+- Expand CI testing matrix with platforms and Rust versions ([#161](https://github.com/joshrotenberg/tower-mcp/pull/161))
+- Add deployment verification step to deploy workflow ([#169](https://github.com/joshrotenberg/tower-mcp/pull/169))
+
+
+
 ## [0.2.0] - 2026-01-29
 
 ### Documentation
