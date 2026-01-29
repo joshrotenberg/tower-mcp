@@ -1,23 +1,22 @@
-//! Capability filtering example - name-based access control
+//! Capability filtering example - name-based and role-based access control
 //!
-//! This example demonstrates how to use capability filtering to control which
-//! tools, resources, and prompts are visible based on naming conventions.
+//! This example demonstrates two approaches to capability filtering:
 //!
-//! In this example:
-//! - Tools/resources/prompts prefixed with `admin_` are hidden by default
-//! - Tools/resources/prompts prefixed with `internal_` are also hidden
-//! - All other capabilities are visible
-//!
-//! This pattern is useful for:
+//! ## 1. Name-Based Filtering
+//! Capabilities prefixed with `admin_` or `internal_` are hidden by default.
+//! This is useful for:
 //! - Hiding administrative functions from regular users
 //! - Hiding internal/debugging tools from production clients
 //! - Creating tiered access based on capability naming conventions
 //!
-//! ## Future: Session-Based Auth
+//! ## 2. Session-Based Role Filtering
+//! The filter functions receive `&SessionState` which supports `get::<T>()` for
+//! retrieving typed data stored in the session. This enables dynamic role-based
+//! filtering based on auth claims, JWT tokens, user roles, etc.
 //!
-//! The filter functions receive `&SessionState` which will support `extensions()`
-//! for storing auth claims (JWT tokens, user roles, etc.) per-session. This will
-//! enable dynamic role-based filtering. See issue #268 for progress.
+//! In a real application, auth middleware would validate credentials and store
+//! claims in the session using `session.insert(UserClaims { ... })`. The filter
+//! functions then check these claims to decide visibility.
 //!
 //! Run with: cargo run --example capability_filtering --features http
 //!
@@ -57,7 +56,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tower_mcp::{
     CallToolResult, CapabilityFilter, DenialBehavior, Filterable, HttpTransport, McpRouter, Prompt,
-    PromptBuilder, Resource, ResourceBuilder, Tool, ToolBuilder,
+    PromptBuilder, Resource, ResourceBuilder, SessionState, Tool, ToolBuilder,
 };
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -70,22 +69,74 @@ struct UserIdInput {
     user_id: String,
 }
 
-/// Filter that hides capabilities with admin_ or internal_ prefix.
-/// The session parameter is available for future integration with
-/// session-based auth (e.g., checking JWT claims stored in session extensions).
-fn is_public_tool(_session: &tower_mcp::SessionState, tool: &Tool) -> bool {
-    let name = tool.name();
-    !name.starts_with("admin_") && !name.starts_with("internal_")
+// === SESSION-BASED AUTH CLAIMS ===
+//
+// In a real application, auth middleware would:
+// 1. Validate credentials (JWT, API key, OAuth token, etc.)
+// 2. Extract claims from the validated token
+// 3. Store claims in the session: `session.insert(UserClaims { ... })`
+//
+// The filter functions then retrieve these claims to make access decisions.
+
+/// User claims that would be stored in the session by auth middleware.
+#[derive(Debug, Clone)]
+struct UserClaims {
+    #[allow(dead_code)]
+    user_id: String,
+    role: UserRole,
 }
 
-fn is_public_resource(_session: &tower_mcp::SessionState, resource: &Resource) -> bool {
-    let name = resource.name();
-    !name.starts_with("admin_") && !name.starts_with("internal_")
+/// User roles for access control.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+enum UserRole {
+    /// Regular user - no admin access
+    User,
+    /// Admin user - can access admin_ prefixed capabilities
+    Admin,
+    /// Internal/developer - can access both admin_ and internal_ prefixed capabilities
+    Developer,
 }
 
-fn is_public_prompt(_session: &tower_mcp::SessionState, prompt: &Prompt) -> bool {
-    let name = prompt.name();
-    !name.starts_with("admin_") && !name.starts_with("internal_")
+// === FILTER FUNCTIONS ===
+
+/// Check if a capability should be visible based on name prefix and session claims.
+///
+/// This demonstrates the recommended pattern:
+/// 1. Check name-based rules (admin_, internal_ prefixes)
+/// 2. If restricted, check session claims for elevated access
+fn is_visible(session: &SessionState, name: &str) -> bool {
+    let is_admin = name.starts_with("admin_");
+    let is_internal = name.starts_with("internal_");
+
+    if !is_admin && !is_internal {
+        // Public capability - always visible
+        return true;
+    }
+
+    // Check session for user claims
+    if let Some(claims) = session.get::<UserClaims>() {
+        match claims.role {
+            UserRole::Developer => true,     // Developers see everything
+            UserRole::Admin => !is_internal, // Admins see admin_ but not internal_
+            UserRole::User => false,         // Users see neither
+        }
+    } else {
+        // No claims in session - treat as anonymous, hide restricted
+        false
+    }
+}
+
+fn is_visible_tool(session: &SessionState, tool: &Tool) -> bool {
+    is_visible(session, tool.name())
+}
+
+fn is_visible_resource(session: &SessionState, resource: &Resource) -> bool {
+    is_visible(session, resource.name())
+}
+
+fn is_visible_prompt(session: &SessionState, prompt: &Prompt) -> bool {
+    is_visible(session, prompt.name())
 }
 
 #[tokio::main]
@@ -119,7 +170,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         })
         .build()?;
 
-    // === ADMIN TOOLS (will be filtered out) ===
+    // === ADMIN TOOLS (visible to Admin and Developer roles) ===
 
     let admin_stats = ToolBuilder::new("admin_get_stats")
         .description("Get system statistics (admin only)")
@@ -140,7 +191,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         })
         .build()?;
 
-    // === INTERNAL TOOLS (will be filtered out) ===
+    // === INTERNAL TOOLS (visible only to Developer role) ===
 
     let internal_debug = ToolBuilder::new("internal_debug_info")
         .description("Get internal debug information")
@@ -204,15 +255,15 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .server_info("capability-filtering-example", "1.0.0")
         .instructions(
             "This server demonstrates capability filtering. Tools, resources, and prompts \
-             prefixed with 'admin_' or 'internal_' are hidden from clients.",
+             prefixed with 'admin_' or 'internal_' require elevated permissions.",
         )
         // Public tools
         .tool(echo)
         .tool(get_time)
-        // Admin tools (filtered)
+        // Admin tools (filtered by role)
         .tool(admin_stats)
         .tool(admin_delete)
-        // Internal tools (filtered)
+        // Internal tools (filtered by role)
         .tool(internal_debug)
         // Resources
         .resource(public_docs)
@@ -226,16 +277,16 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .prompt(internal_test)
         // Apply filters
         .tool_filter(
-            CapabilityFilter::new(is_public_tool)
+            CapabilityFilter::new(is_visible_tool)
                 // NotFound (default) - don't reveal that hidden tools exist
                 .denial_behavior(DenialBehavior::NotFound),
         )
         .resource_filter(
-            CapabilityFilter::new(is_public_resource)
+            CapabilityFilter::new(is_visible_resource)
                 // Unauthorized - hint that auth might help (useful for debugging)
                 .denial_behavior(DenialBehavior::Unauthorized),
         )
-        .prompt_filter(CapabilityFilter::new(is_public_prompt));
+        .prompt_filter(CapabilityFilter::new(is_visible_prompt));
 
     // Create HTTP transport
     let transport = HttpTransport::new(mcp_router).disable_origin_validation();
@@ -244,15 +295,17 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
     tracing::info!("Starting capability filtering example on http://127.0.0.1:3000");
     tracing::info!("");
-    tracing::info!("Visible capabilities:");
-    tracing::info!("  Tools: echo, get_time");
-    tracing::info!("  Resources: readme, api_reference");
-    tracing::info!("  Prompts: greeting, code_review");
+    tracing::info!("Access control by role:");
+    tracing::info!(
+        "  Anonymous/User: echo, get_time, readme, api_reference, greeting, code_review"
+    );
+    tracing::info!(
+        "  Admin: + admin_get_stats, admin_delete_user, admin_system_config, admin_debug_assistant"
+    );
+    tracing::info!("  Developer: + internal_debug_info, internal_metrics, internal_test_prompt");
     tracing::info!("");
-    tracing::info!("Hidden capabilities (admin_* and internal_*):");
-    tracing::info!("  Tools: admin_get_stats, admin_delete_user, internal_debug_info");
-    tracing::info!("  Resources: admin_system_config, internal_metrics");
-    tracing::info!("  Prompts: admin_debug_assistant, internal_test_prompt");
+    tracing::info!("Note: This example shows role-based filtering. In production, auth middleware");
+    tracing::info!("would validate credentials and store UserClaims in the session.");
 
     axum::serve(listener, transport.into_router()).await?;
 
