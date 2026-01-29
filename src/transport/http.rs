@@ -1988,4 +1988,135 @@ mod tests {
         // Events after 0 should be 1-9 (9 events)
         assert_eq!(events.len(), 9);
     }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn test_stateless_server_discover() {
+        // SEP-1442: server/discover should work without session
+        let transport = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .stateless(crate::stateless::StatelessConfig::backward_compatible());
+        let app = transport.into_router();
+
+        // Call server/discover without session - should work
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "server/discover"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Should get a successful result with server capabilities
+        assert!(
+            json.get("result").is_some(),
+            "Expected result, got: {:?}",
+            json
+        );
+        let result = &json["result"];
+        assert!(result["supportedVersions"].is_array());
+        assert_eq!(result["serverInfo"]["name"], "test-server");
+    }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn test_stateless_protocol_version_validation() {
+        // SEP-1442: Protocol version validation when required
+        let transport = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .stateless(crate::stateless::StatelessConfig::new()); // requires protocol version
+        let app = transport.into_router();
+
+        // Request without protocol version header should fail
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "server/discover"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Should get error about missing header
+        assert!(
+            json.get("error").is_some(),
+            "Expected error, got: {:?}",
+            json
+        );
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Missing required header")
+        );
+    }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn test_stateless_unsupported_version() {
+        // SEP-1442: Unsupported protocol version returns supportedVersions
+        let transport = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .stateless(crate::stateless::StatelessConfig::new());
+        let app = transport.into_router();
+
+        // Request with unsupported version
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header(MCP_PROTOCOL_VERSION_HEADER, "1999-01-01") // invalid version
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "server/discover"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Should get error with supportedVersions
+        assert!(
+            json.get("error").is_some(),
+            "Expected error, got: {:?}",
+            json
+        );
+        assert_eq!(
+            json["error"]["code"],
+            crate::stateless::error_codes::UNSUPPORTED_VERSION
+        );
+        assert!(json["error"]["data"]["supportedVersions"].is_array());
+    }
 }
