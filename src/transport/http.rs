@@ -1077,8 +1077,22 @@ async fn handle_post(
         }
     }
 
+    // SEP-1442: Check if optional sessions are enabled
+    #[cfg(feature = "stateless")]
+    let optional_sessions = state
+        .stateless_config
+        .as_ref()
+        .map(|c| c.optional_sessions)
+        .unwrap_or(false);
+    #[cfg(not(feature = "stateless"))]
+    let optional_sessions = false;
+
+    // Track if this is an ephemeral (sessionless) request
+    let is_ephemeral;
+
     // Get or create session
     let session = if is_init {
+        is_ephemeral = false;
         // Create new session for initialize
         match state
             .sessions
@@ -1095,23 +1109,50 @@ async fn handle_post(
             }
         }
     } else {
-        // Require existing session
-        let session_id = match get_session_id(&headers) {
-            Some(id) => id,
-            None => {
-                // Return JSON-RPC error so clients can detect and handle this
-                return json_rpc_error_response(None, JsonRpcError::session_required());
-            }
-        };
+        // Try to get existing session
+        let session_id = get_session_id(&headers);
 
-        match state.sessions.get(&session_id).await {
-            Some(s) => s,
+        match session_id {
+            Some(id) => {
+                is_ephemeral = false;
+                match state.sessions.get(&id).await {
+                    Some(s) => s,
+                    None => {
+                        // Return JSON-RPC error with session info so clients know to re-initialize
+                        return json_rpc_error_response(
+                            None,
+                            JsonRpcError::session_not_found_with_id(&id),
+                        );
+                    }
+                }
+            }
             None => {
-                // Return JSON-RPC error with session info so clients know to re-initialize
-                return json_rpc_error_response(
-                    None,
-                    JsonRpcError::session_not_found_with_id(&session_id),
-                );
+                if optional_sessions {
+                    // SEP-1442: Create ephemeral session for stateless request
+                    is_ephemeral = true;
+                    match state
+                        .sessions
+                        .create(state.router_template.clone(), state.service_factory.clone())
+                        .await
+                    {
+                        Some(s) => {
+                            // Mark session as initialized for stateless requests
+                            s.router.session().mark_initializing();
+                            s.router.session().mark_initialized();
+                            s
+                        }
+                        None => {
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "Maximum session limit reached",
+                            )
+                                .into_response();
+                        }
+                    }
+                } else {
+                    // Return JSON-RPC error so clients can detect and handle this
+                    return json_rpc_error_response(None, JsonRpcError::session_required());
+                }
             }
         }
     };
@@ -1200,14 +1241,19 @@ async fn handle_post(
         }
     };
 
-    // Build response with session ID header for initialize
+    // Build response with session ID header for initialize (not for ephemeral sessions)
     let mut resp = axum::Json(response).into_response();
 
-    if is_init {
+    if is_init && !is_ephemeral {
         resp.headers_mut().insert(
             MCP_SESSION_ID_HEADER,
             HeaderValue::from_str(&session.id).unwrap(),
         );
+    }
+
+    // SEP-1442: Clean up ephemeral session after request
+    if is_ephemeral {
+        state.sessions.remove(&session.id).await;
     }
 
     resp
@@ -2163,5 +2209,67 @@ mod tests {
             crate::stateless::error_codes::UNSUPPORTED_VERSION
         );
         assert!(json["error"]["data"]["supportedVersions"].is_array());
+    }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn test_stateless_optional_sessions() {
+        // SEP-1442: Requests without session should work with optional_sessions
+        use crate::tool::ToolBuilder;
+
+        let tool = ToolBuilder::new("ping")
+            .description("Simple ping tool")
+            .handler(|_: serde_json::Value| async { Ok(crate::CallToolResult::text("pong")) })
+            .build()
+            .unwrap();
+
+        let router = McpRouter::new()
+            .server_info("test-server", "1.0.0")
+            .tool(tool);
+
+        let transport = HttpTransport::new(router)
+            .disable_origin_validation()
+            .stateless(crate::stateless::StatelessConfig::backward_compatible());
+        let app = transport.into_router();
+
+        // Call tools/list without session - should work with optional sessions
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Should NOT have session ID header (ephemeral session)
+        assert!(
+            response.headers().get(MCP_SESSION_ID_HEADER).is_none(),
+            "Ephemeral request should not return session ID"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Should get successful result with tools
+        assert!(
+            json.get("result").is_some(),
+            "Expected result, got: {:?}",
+            json
+        );
+        let tools = &json["result"]["tools"];
+        assert!(tools.is_array());
+        assert_eq!(tools.as_array().unwrap().len(), 1);
+        assert_eq!(tools[0]["name"], "ping");
     }
 }
