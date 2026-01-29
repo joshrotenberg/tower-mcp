@@ -82,6 +82,9 @@ module.exports = async ({ github, context, core }) => {
 
     // Check if SEP is closed/final upstream
     const isFinal = sep.state === 'closed' || upstreamLabels.includes('final');
+    if (isFinal) {
+      status = 'sep:final';
+    }
     const statusPrefix = isFinal ? '[final]' :
                          status === 'sep:accepted' ? '[accepted]' :
                          status === 'sep:in-review' ? '[in-review]' :
