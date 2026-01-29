@@ -206,7 +206,7 @@ impl TestClient {
     pub async fn initialize(&mut self) -> Value {
         let id = self.next_id();
         let req = JsonRpcRequest::new(id, "initialize").with_params(serde_json::json!({
-            "protocolVersion": "2025-03-26",
+            "protocolVersion": "2025-11-25",
             "capabilities": {},
             "clientInfo": {
                 "name": "test-client",
@@ -443,5 +443,241 @@ impl TestClient {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CallToolResult, GetPromptResult, PromptBuilder, ResourceBuilder, ToolBuilder};
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+    use serde_json::json;
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    struct EchoInput {
+        message: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    struct AddInput {
+        a: i64,
+        b: i64,
+    }
+
+    fn create_test_router() -> McpRouter {
+        let echo = ToolBuilder::new("echo")
+            .description("Echo a message")
+            .handler(|input: EchoInput| async move { Ok(CallToolResult::text(input.message)) })
+            .build()
+            .unwrap();
+
+        let add = ToolBuilder::new("add")
+            .description("Add two numbers")
+            .handler(|input: AddInput| async move {
+                Ok(CallToolResult::text(format!("{}", input.a + input.b)))
+            })
+            .build()
+            .unwrap();
+
+        let readme = ResourceBuilder::new("file:///README.md")
+            .name("README")
+            .description("Project readme")
+            .text("# My Project");
+
+        let greet = PromptBuilder::new("greet")
+            .description("Greet someone")
+            .required_arg("name", "Name to greet")
+            .handler(|args: HashMap<String, String>| async move {
+                let name = args.get("name").map(|s| s.as_str()).unwrap_or("World");
+                Ok(GetPromptResult::user_message(format!(
+                    "Please greet {} warmly.",
+                    name
+                )))
+            });
+
+        McpRouter::new()
+            .server_info("test-server", "1.0.0")
+            .tool(echo)
+            .tool(add)
+            .resource(readme)
+            .prompt(greet)
+    }
+
+    #[tokio::test]
+    async fn test_client_initialize() {
+        let router = create_test_router();
+        let mut client = TestClient::from_router(router);
+
+        let init = client.initialize().await;
+
+        assert!(init.get("protocolVersion").is_some());
+        assert!(init.get("serverInfo").is_some());
+        assert_eq!(
+            init.get("serverInfo")
+                .and_then(|s| s.get("name"))
+                .and_then(|n| n.as_str()),
+            Some("test-server")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_client_list_tools() {
+        let router = create_test_router();
+        let mut client = TestClient::from_router(router);
+        client.initialize().await;
+
+        let tools = client.list_tools().await;
+
+        assert_eq!(tools.len(), 2);
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert!(names.contains(&"echo"));
+        assert!(names.contains(&"add"));
+    }
+
+    #[tokio::test]
+    async fn test_client_call_tool() {
+        let router = create_test_router();
+        let mut client = TestClient::from_router(router);
+        client.initialize().await;
+
+        let result = client.call_tool("echo", json!({"message": "hello"})).await;
+
+        assert_eq!(result.all_text(), "hello");
+        assert_eq!(result.first_text(), Some("hello"));
+        assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn test_client_call_tool_with_computation() {
+        let router = create_test_router();
+        let mut client = TestClient::from_router(router);
+        client.initialize().await;
+
+        let result = client.call_tool("add", json!({"a": 40, "b": 2})).await;
+
+        assert_eq!(result.all_text(), "42");
+    }
+
+    #[tokio::test]
+    async fn test_client_call_tool_expect_error() {
+        let router = create_test_router();
+        let mut client = TestClient::from_router(router);
+        client.initialize().await;
+
+        let error = client
+            .call_tool_expect_error("nonexistent", json!({}))
+            .await;
+
+        assert!(error.get("code").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_client_list_resources() {
+        let router = create_test_router();
+        let mut client = TestClient::from_router(router);
+        client.initialize().await;
+
+        let resources = client.list_resources().await;
+
+        assert_eq!(resources.len(), 1);
+        assert_eq!(
+            resources[0].get("uri").and_then(|u| u.as_str()),
+            Some("file:///README.md")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_client_read_resource() {
+        let router = create_test_router();
+        let mut client = TestClient::from_router(router);
+        client.initialize().await;
+
+        let result = client.read_resource("file:///README.md").await;
+
+        assert_eq!(result.first_text(), Some("# My Project"));
+        assert_eq!(result.first_uri(), Some("file:///README.md"));
+    }
+
+    #[tokio::test]
+    async fn test_client_list_prompts() {
+        let router = create_test_router();
+        let mut client = TestClient::from_router(router);
+        client.initialize().await;
+
+        let prompts = client.list_prompts().await;
+
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(
+            prompts[0].get("name").and_then(|n| n.as_str()),
+            Some("greet")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_client_get_prompt() {
+        let router = create_test_router();
+        let mut client = TestClient::from_router(router);
+        client.initialize().await;
+
+        let mut args = HashMap::new();
+        args.insert("name".to_string(), "Alice".to_string());
+        let result = client.get_prompt("greet", args).await;
+
+        assert!(result.first_message_text().unwrap().contains("Alice"));
+    }
+
+    #[tokio::test]
+    async fn test_client_send_request_expect_error() {
+        let router = create_test_router();
+        let mut client = TestClient::from_router(router);
+        client.initialize().await;
+
+        let error = client
+            .send_request_expect_error("unknown/method", None)
+            .await;
+
+        // -32601 is "Method not found"
+        assert_eq!(error.get("code").and_then(|v| v.as_i64()), Some(-32601));
+    }
+
+    #[tokio::test]
+    async fn test_client_ping() {
+        let router = create_test_router();
+        let mut client = TestClient::from_router(router);
+        client.initialize().await;
+
+        let pong = client.send_request("ping", None).await;
+
+        assert_eq!(pong, json!({}));
+    }
+
+    #[tokio::test]
+    async fn test_client_id_increments() {
+        let router = create_test_router();
+        let mut client = TestClient::from_router(router);
+
+        // Each call should increment the ID
+        assert_eq!(client.next_id(), 1);
+        assert_eq!(client.next_id(), 2);
+        assert_eq!(client.next_id(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_client_call_tool_raw() {
+        let router = create_test_router();
+        let mut client = TestClient::from_router(router);
+        client.initialize().await;
+
+        let raw = client
+            .call_tool_raw("echo", json!({"message": "test"}))
+            .await;
+
+        // Raw response should have content array
+        assert!(raw.get("content").is_some());
+        assert!(raw.get("content").unwrap().is_array());
     }
 }

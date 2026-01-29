@@ -1162,7 +1162,7 @@ mod tests {
         let init_req = RouterRequest {
             id: RequestId::Number(0),
             inner: McpRequest::Initialize(InitializeParams {
-                protocol_version: "2025-03-26".to_string(),
+                protocol_version: "2025-11-25".to_string(),
                 capabilities: ClientCapabilities {
                     roots: None,
                     sampling: None,
@@ -1256,7 +1256,7 @@ mod tests {
     /// Helper to initialize a JsonRpcService for testing
     async fn init_jsonrpc_service(service: &mut JsonRpcService<McpRouter>, router: &McpRouter) {
         let init_req = JsonRpcRequest::new(0, "initialize").with_params(serde_json::json!({
-            "protocolVersion": "2025-03-26",
+            "protocolVersion": "2025-11-25",
             "capabilities": {},
             "clientInfo": { "name": "test", "version": "1.0" }
         }));
@@ -1757,7 +1757,7 @@ mod tests {
         let init_req = RouterRequest {
             id: RequestId::Number(0),
             inner: McpRequest::Initialize(InitializeParams {
-                protocol_version: "2025-03-26".to_string(),
+                protocol_version: "2025-11-25".to_string(),
                 capabilities: ClientCapabilities {
                     roots: None,
                     sampling: None,
@@ -1868,7 +1868,7 @@ mod tests {
         let init_req = RouterRequest {
             id: RequestId::Number(0),
             inner: McpRequest::Initialize(InitializeParams {
-                protocol_version: "2025-03-26".to_string(),
+                protocol_version: "2025-11-25".to_string(),
                 capabilities: ClientCapabilities {
                     roots: None,
                     sampling: None,
@@ -1901,7 +1901,7 @@ mod tests {
         let init_req = RouterRequest {
             id: RequestId::Number(0),
             inner: McpRequest::Initialize(InitializeParams {
-                protocol_version: "2025-03-26".to_string(),
+                protocol_version: "2025-11-25".to_string(),
                 capabilities: ClientCapabilities {
                     roots: None,
                     sampling: None,
@@ -2405,7 +2405,7 @@ mod tests {
         let init_req = RouterRequest {
             id: RequestId::Number(0),
             inner: McpRequest::Initialize(InitializeParams {
-                protocol_version: "2025-03-26".to_string(),
+                protocol_version: "2025-11-25".to_string(),
                 capabilities: ClientCapabilities {
                     roots: None,
                     sampling: None,
@@ -2450,7 +2450,7 @@ mod tests {
         let init_req = RouterRequest {
             id: RequestId::Number(0),
             inner: McpRequest::Initialize(InitializeParams {
-                protocol_version: "2025-03-26".to_string(),
+                protocol_version: "2025-11-25".to_string(),
                 capabilities: ClientCapabilities::default(),
                 client_info: Implementation {
                     name: "test".to_string(),
@@ -2514,7 +2514,7 @@ mod tests {
         let init_req = RouterRequest {
             id: RequestId::Number(0),
             inner: McpRequest::Initialize(InitializeParams {
-                protocol_version: "2025-03-26".to_string(),
+                protocol_version: "2025-11-25".to_string(),
                 capabilities: ClientCapabilities::default(),
                 client_info: Implementation {
                     name: "test".to_string(),

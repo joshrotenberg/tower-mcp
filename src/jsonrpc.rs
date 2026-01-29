@@ -388,7 +388,7 @@ mod tests {
 
         // Initialize first
         let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
-            "protocolVersion": "2025-03-26",
+            "protocolVersion": "2025-11-25",
             "capabilities": {},
             "clientInfo": { "name": "test", "version": "1.0" }
         }));
@@ -418,7 +418,7 @@ mod tests {
 
         // Initialize first
         let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
-            "protocolVersion": "2025-03-26",
+            "protocolVersion": "2025-11-25",
             "capabilities": {},
             "clientInfo": { "name": "test", "version": "1.0" }
         }));
@@ -461,7 +461,7 @@ mod tests {
 
         // Initialize
         let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
-            "protocolVersion": "2025-03-26",
+            "protocolVersion": "2025-11-25",
             "capabilities": {},
             "clientInfo": { "name": "test", "version": "1.0" }
         }));
