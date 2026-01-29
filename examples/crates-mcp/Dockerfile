@@ -34,4 +34,4 @@ USER app
 EXPOSE 3000
 
 # Run the server
-CMD ["crates-mcp", "--transport", "http", "--host", "0.0.0.0", "--port", "3000", "--max-concurrent", "5", "--request-timeout-secs", "30"]
+CMD ["crates-mcp", "--transport", "http", "--host", "0.0.0.0", "--port", "3000", "--max-concurrent", "10", "--request-timeout-secs", "30"]

@@ -152,8 +152,12 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
             // tower-resilience layers use composite error types that wrap both
             // the layer's own errors and the inner service error, making them
             // compatible with tower-mcp's Infallible error type.
+            //
+            // Note: CircuitBreakerLayer could be added for downstream service failures
+            // (e.g., crates.io API), but McpRouter returns Infallible so the breaker
+            // would need a custom failure classifier to inspect response content.
             let rate_limiter = RateLimiterLayer::builder()
-                .limit_for_period(5) // 5 requests per period
+                .limit_for_period(10) // 10 requests per second
                 .refresh_period(Duration::from_secs(1))
                 .timeout_duration(Duration::from_millis(500))
                 .build();

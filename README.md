@@ -17,6 +17,27 @@ This means:
 - Same service can be exposed over multiple transports (stdio, HTTP, WebSocket)
 - Easy integration with existing tower-based applications (axum, tonic)
 
+## Live Demo
+
+A demo MCP server for querying [crates.io](https://crates.io) is deployed at:
+
+**https://crates-mcp-demo.fly.dev**
+
+Connect with any MCP client that supports HTTP transport, or add to Claude Code's `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "crates": {
+      "type": "http",
+      "url": "https://crates-mcp-demo.fly.dev"
+    }
+  }
+}
+```
+
+The demo includes 7 tools (search, info, versions, dependencies, reverse deps, downloads, owners), 2 prompts (analyze, compare), and 1 resource (recent searches). See [`examples/crates-mcp`](examples/crates-mcp) for the full source.
+
 ## Status
 
 **Active development** - Core protocol, routing, and transports are implemented. Used in production for MCP server deployments.
