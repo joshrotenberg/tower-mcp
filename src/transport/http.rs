@@ -324,15 +324,15 @@ impl SessionStore {
         let mut sessions = self.sessions.write().await;
 
         // Check max sessions limit
-        if let Some(max) = self.config.max_sessions
-            && sessions.len() >= max
-        {
-            tracing::warn!(
-                max_sessions = max,
-                current = sessions.len(),
-                "Session limit reached, rejecting new session"
-            );
-            return None;
+        if let Some(max) = self.config.max_sessions {
+            if sessions.len() >= max {
+                tracing::warn!(
+                    max_sessions = max,
+                    current = sessions.len(),
+                    "Session limit reached, rejecting new session"
+                );
+                return None;
+            }
         }
 
         let session = Arc::new(Session::new(router, self.sampling_enabled, service_factory));
@@ -891,15 +891,16 @@ async fn handle_post(
     };
 
     // Validate protocol version (if present and not init request)
-    if !is_init
-        && let Some(version) = get_protocol_version(&headers)
-        && !SUPPORTED_PROTOCOL_VERSIONS.contains(&version.as_str())
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!("Unsupported protocol version: {}", version),
-        )
-            .into_response();
+    if !is_init {
+        if let Some(version) = get_protocol_version(&headers) {
+            if !SUPPORTED_PROTOCOL_VERSIONS.contains(&version.as_str()) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("Unsupported protocol version: {}", version),
+                )
+                    .into_response();
+            }
+        }
     }
 
     // Check if this is a response to one of our outgoing requests (sampling)
@@ -935,10 +936,10 @@ async fn handle_post(
     // Check if this is a notification (no id field)
     if parsed.get("id").is_none() {
         // Handle notification
-        if let Ok(notification) = serde_json::from_value::<JsonRpcNotification>(parsed)
-            && let Ok(mcp_notification) = McpNotification::from_jsonrpc(&notification)
-        {
-            session.router.handle_notification(mcp_notification);
+        if let Ok(notification) = serde_json::from_value::<JsonRpcNotification>(parsed) {
+            if let Ok(mcp_notification) = McpNotification::from_jsonrpc(&notification) {
+                session.router.handle_notification(mcp_notification);
+            }
         }
         return StatusCode::ACCEPTED.into_response();
     }
