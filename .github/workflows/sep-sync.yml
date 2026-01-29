@@ -124,28 +124,32 @@ jobs:
                 // Create new issue
                 console.log(`Creating new issue for SEP-${sepNumber}: ${sepTitle}`);
 
-                const body = `## SEP-${sepNumber}: ${sepTitle}
-
-**Upstream Issue:** https://github.com/${UPSTREAM_REPO}/issues/${sep.number}
-**Status:** ${statusEmoji.replace(/[\[\]]/g, '')}
-**Upstream State:** ${sep.state}
-
-### Description
-
-${sep.body ? sep.body.slice(0, 500) + (sep.body.length > 500 ? '...' : '') : 'See upstream issue for details.'}
-
-### Implementation Status
-
-- [ ] Researched/understood the SEP
-- [ ] Determined relevance to tower-mcp
-- [ ] Implementation planned
-- [ ] Implementation complete
-- [ ] Tests added
-- [ ] Documentation updated
-
----
-*This issue is automatically synced from the MCP specification repository.*
-*Last synced: ${new Date().toISOString().split('T')[0]}*`;
+                // Build body with array join to avoid YAML parsing issues with * at line starts
+                const bodyLines = [
+                  `## SEP-${sepNumber}: ${sepTitle}`,
+                  '',
+                  `**Upstream Issue:** https://github.com/${UPSTREAM_REPO}/issues/${sep.number}`,
+                  `**Status:** ${statusEmoji.replace(/[\[\]]/g, '')}`,
+                  `**Upstream State:** ${sep.state}`,
+                  '',
+                  '### Description',
+                  '',
+                  sep.body ? sep.body.slice(0, 500) + (sep.body.length > 500 ? '...' : '') : 'See upstream issue for details.',
+                  '',
+                  '### Implementation Status',
+                  '',
+                  '- [ ] Researched/understood the SEP',
+                  '- [ ] Determined relevance to tower-mcp',
+                  '- [ ] Implementation planned',
+                  '- [ ] Implementation complete',
+                  '- [ ] Tests added',
+                  '- [ ] Documentation updated',
+                  '',
+                  '---',
+                  '_This issue is automatically synced from the MCP specification repository._',
+                  `_Last synced: ${new Date().toISOString().split('T')[0]}_`,
+                ];
+                const body = bodyLines.join('\n');
 
                 await github.rest.issues.create({
                   owner: context.repo.owner,
