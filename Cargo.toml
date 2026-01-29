@@ -94,14 +94,16 @@ optional = true
 features = ["v4"]
 
 [dependencies.jsonwebtoken]
-version = "9"
-optional = true
-
-[dependencies.reqwest]
-version = "0.12"
+version = "10"
 optional = true
 default-features = false
-features = ["rustls-tls", "json"]
+features = ["aws_lc_rs", "use_pem"]
+
+[dependencies.reqwest]
+version = "0.13"
+optional = true
+default-features = false
+features = ["rustls", "json"]
 
 [[example]]
 name = "basic"
