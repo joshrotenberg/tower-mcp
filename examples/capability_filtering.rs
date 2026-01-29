@@ -13,6 +13,12 @@
 //! - Hiding internal/debugging tools from production clients
 //! - Creating tiered access based on capability naming conventions
 //!
+//! ## Future: Session-Based Auth
+//!
+//! The filter functions receive `&SessionState` which will support `extensions()`
+//! for storing auth claims (JWT tokens, user roles, etc.) per-session. This will
+//! enable dynamic role-based filtering. See issue #268 for progress.
+//!
 //! Run with: cargo run --example capability_filtering --features http
 //!
 //! Test with curl:
