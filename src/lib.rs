@@ -119,6 +119,7 @@ pub mod prompt;
 pub mod protocol;
 pub mod resource;
 pub mod router;
+pub mod secret;
 pub mod session;
 #[cfg(feature = "testing")]
 pub mod testing;
@@ -153,6 +154,7 @@ pub use resource::{
     ResourceTemplateHandler,
 };
 pub use router::{Extensions, McpRouter, RouterRequest, RouterResponse};
+pub use secret::SecretString;
 pub use session::{SessionPhase, SessionState};
 pub use tool::{NoParams, Tool, ToolBuilder, ToolHandler};
 pub use transport::{
