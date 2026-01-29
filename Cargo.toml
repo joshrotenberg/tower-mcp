@@ -54,13 +54,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [features]
 default = []
 # Enable all optional features
-full = ["http", "websocket", "childproc", "oauth", "testing"]
+full = ["http", "websocket", "childproc", "oauth", "jwks", "testing"]
 # Transport features
 http = ["dep:axum", "dep:hyper", "dep:http", "dep:http-body-util", "dep:tokio-stream", "dep:uuid"]
 websocket = ["dep:axum", "dep:uuid"]
 childproc = []
 # OAuth 2.1 resource server support
 oauth = ["dep:jsonwebtoken", "http"]
+# JWKS endpoint fetching for JWT validation (requires oauth)
+jwks = ["oauth", "dep:reqwest"]
 # Test utilities for MCP servers
 testing = []
 
@@ -94,6 +96,12 @@ features = ["v4"]
 [dependencies.jsonwebtoken]
 version = "9"
 optional = true
+
+[dependencies.reqwest]
+version = "0.12"
+optional = true
+default-features = false
+features = ["rustls-tls", "json"]
 
 [[example]]
 name = "basic"

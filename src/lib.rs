@@ -175,5 +175,8 @@ pub use transport::{ChildProcessConnection, ChildProcessTransport};
 #[cfg(feature = "oauth")]
 pub use oauth::{ScopeEnforcementLayer, ScopeEnforcementService};
 
+#[cfg(feature = "jwks")]
+pub use oauth::{JwksError, JwksValidator, JwksValidatorBuilder};
+
 #[cfg(feature = "testing")]
 pub use testing::TestClient;
