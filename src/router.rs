@@ -689,7 +689,7 @@ impl McpRouter {
     }
 
     /// Get server capabilities based on registered handlers
-    fn capabilities(&self) -> ServerCapabilities {
+    pub fn capabilities(&self) -> ServerCapabilities {
         let has_resources =
             !self.inner.resources.is_empty() || !self.inner.resource_templates.is_empty();
 
@@ -727,6 +727,41 @@ impl McpRouter {
                 None
             },
         }
+    }
+
+    /// Get server name
+    pub fn get_server_name(&self) -> &str {
+        &self.inner.server_name
+    }
+
+    /// Get server version
+    pub fn get_server_version(&self) -> &str {
+        &self.inner.server_version
+    }
+
+    /// Get server title (optional)
+    pub fn get_server_title(&self) -> Option<&str> {
+        self.inner.server_title.as_deref()
+    }
+
+    /// Get server description (optional)
+    pub fn get_server_description(&self) -> Option<&str> {
+        self.inner.server_description.as_deref()
+    }
+
+    /// Get server icons (optional)
+    pub fn get_server_icons(&self) -> Option<&Vec<ToolIcon>> {
+        self.inner.server_icons.as_ref()
+    }
+
+    /// Get server website URL (optional)
+    pub fn get_server_website_url(&self) -> Option<&str> {
+        self.inner.server_website_url.as_deref()
+    }
+
+    /// Get server instructions (optional)
+    pub fn get_instructions(&self) -> Option<&str> {
+        self.inner.instructions.as_deref()
     }
 
     /// Handle an MCP request

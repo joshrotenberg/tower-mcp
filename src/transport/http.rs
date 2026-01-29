@@ -1022,18 +1022,63 @@ async fn handle_post(
     // Check if this is an initialize request (creates new session)
     let is_init = is_initialize_request(&parsed);
 
-    // SEP-1442: Check if this is a server/discover request (works without session)
+    // SEP-1442: Handle server/discover directly without creating a session
     #[cfg(feature = "stateless")]
-    let is_discover = parsed
-        .get("method")
-        .and_then(|m| m.as_str())
-        .map(|m| m == "server/discover")
-        .unwrap_or(false);
-    #[cfg(not(feature = "stateless"))]
-    let is_discover = false;
+    {
+        let is_discover = parsed
+            .get("method")
+            .and_then(|m| m.as_str())
+            .map(|m| m == "server/discover")
+            .unwrap_or(false);
+
+        if is_discover {
+            // Handle discover without session - use the template router directly
+            let request_id = extract_request_id(&parsed);
+            let discover_result = crate::stateless::DiscoverResult {
+                supported_versions: crate::protocol::SUPPORTED_PROTOCOL_VERSIONS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                capabilities: state.router_template.capabilities(),
+                server_info: crate::protocol::Implementation {
+                    name: state.router_template.get_server_name().to_string(),
+                    version: state.router_template.get_server_version().to_string(),
+                    title: state
+                        .router_template
+                        .get_server_title()
+                        .map(|s| s.to_string()),
+                    description: state
+                        .router_template
+                        .get_server_description()
+                        .map(|s| s.to_string()),
+                    icons: state.router_template.get_server_icons().cloned(),
+                    website_url: state
+                        .router_template
+                        .get_server_website_url()
+                        .map(|s| s.to_string()),
+                },
+                instructions: state
+                    .router_template
+                    .get_instructions()
+                    .map(|s| s.to_string()),
+            };
+
+            let response = JsonRpcResponse::result(
+                request_id.unwrap_or(RequestId::Number(0)),
+                serde_json::to_value(discover_result).unwrap(),
+            );
+
+            return (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::to_string(&response).unwrap(),
+            )
+                .into_response();
+        }
+    }
 
     // Get or create session
-    let session = if is_init || is_discover {
+    let session = if is_init {
         // Create new session for initialize
         match state
             .sessions
