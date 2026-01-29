@@ -18,6 +18,7 @@ use crate::context::{
     ServerNotification,
 };
 use crate::error::{Error, JsonRpcError, Result};
+use crate::filter::ToolFilter;
 use crate::prompt::Prompt;
 use crate::protocol::*;
 use crate::resource::{Resource, ResourceTemplate};
@@ -105,6 +106,8 @@ struct McpRouterInner {
     subscriptions: Arc<RwLock<HashSet<String>>>,
     /// Handler for completion requests
     completion_handler: Option<CompletionHandler>,
+    /// Filter for tools based on session state
+    tool_filter: Option<ToolFilter>,
 }
 
 impl McpRouter {
@@ -129,6 +132,7 @@ impl McpRouter {
                 task_store: TaskStore::new(),
                 subscriptions: Arc::new(RwLock::new(HashSet::new())),
                 completion_handler: None,
+                tool_filter: None,
             }),
             session: SessionState::new(),
         }
@@ -440,6 +444,47 @@ impl McpRouter {
         self
     }
 
+    /// Set a filter for tools based on session state.
+    ///
+    /// The filter determines which tools are visible to each session. Tools that
+    /// don't pass the filter will not appear in `tools/list` responses and will
+    /// return an error if called directly.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::{McpRouter, ToolBuilder, CallToolResult, CapabilityFilter, Tool, Filterable};
+    /// use schemars::JsonSchema;
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Debug, Deserialize, JsonSchema)]
+    /// struct Input { value: String }
+    ///
+    /// let public_tool = ToolBuilder::new("public")
+    ///     .description("Available to everyone")
+    ///     .handler(|i: Input| async move { Ok(CallToolResult::text(&i.value)) })
+    ///     .build()
+    ///     .unwrap();
+    ///
+    /// let admin_tool = ToolBuilder::new("admin")
+    ///     .description("Admin only")
+    ///     .handler(|i: Input| async move { Ok(CallToolResult::text(&i.value)) })
+    ///     .build()
+    ///     .unwrap();
+    ///
+    /// let router = McpRouter::new()
+    ///     .tool(public_tool)
+    ///     .tool(admin_tool)
+    ///     .tool_filter(CapabilityFilter::new(|_session, tool: &Tool| {
+    ///         // In real code, check session.extensions() for auth claims
+    ///         tool.name() != "admin"
+    ///     }));
+    /// ```
+    pub fn tool_filter(mut self, filter: ToolFilter) -> Self {
+        Arc::make_mut(&mut self.inner).tool_filter = Some(filter);
+        self
+    }
+
     /// Get access to the session state
     pub fn session(&self) -> &SessionState {
         &self.session
@@ -663,8 +708,20 @@ impl McpRouter {
             }
 
             McpRequest::ListTools(_params) => {
-                let tools: Vec<ToolDefinition> =
-                    self.inner.tools.values().map(|t| t.definition()).collect();
+                let tools: Vec<ToolDefinition> = self
+                    .inner
+                    .tools
+                    .values()
+                    .filter(|t| {
+                        // Apply tool filter if configured
+                        self.inner
+                            .tool_filter
+                            .as_ref()
+                            .map(|f| f.is_visible(&self.session, t))
+                            .unwrap_or(true)
+                    })
+                    .map(|t| t.definition())
+                    .collect();
 
                 Ok(McpResponse::ListTools(ListToolsResult {
                     tools,
@@ -677,6 +734,13 @@ impl McpRouter {
                     self.inner.tools.get(&params.name).ok_or_else(|| {
                         Error::JsonRpc(JsonRpcError::method_not_found(&params.name))
                     })?;
+
+                // Check tool filter if configured
+                if let Some(filter) = &self.inner.tool_filter {
+                    if !filter.is_visible(&self.session, tool) {
+                        return Err(filter.denial_error(&params.name));
+                    }
+                }
 
                 // Extract progress token from request metadata
                 let progress_token = params.meta.and_then(|m| m.progress_token);
@@ -2560,6 +2624,169 @@ mod tests {
                 assert!(result.completion.values.is_empty());
             }
             _ => panic!("Expected Complete response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_filter_list() {
+        use crate::filter::CapabilityFilter;
+        use crate::tool::Tool;
+
+        let public_tool = ToolBuilder::new("public")
+            .description("Public tool")
+            .handler(|_: AddInput| async move { Ok(CallToolResult::text("public")) })
+            .build()
+            .expect("valid tool name");
+
+        let admin_tool = ToolBuilder::new("admin")
+            .description("Admin tool")
+            .handler(|_: AddInput| async move { Ok(CallToolResult::text("admin")) })
+            .build()
+            .expect("valid tool name");
+
+        let mut router = McpRouter::new()
+            .tool(public_tool)
+            .tool(admin_tool)
+            .tool_filter(CapabilityFilter::new(|_, tool: &Tool| tool.name != "admin"));
+
+        // Initialize session
+        init_router(&mut router).await;
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::ListTools(ListToolsParams::default()),
+            extensions: Extensions::new(),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::ListTools(result)) => {
+                // Only public tool should be visible
+                assert_eq!(result.tools.len(), 1);
+                assert_eq!(result.tools[0].name, "public");
+            }
+            _ => panic!("Expected ListTools response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_filter_call_denied() {
+        use crate::filter::CapabilityFilter;
+        use crate::tool::Tool;
+
+        let admin_tool = ToolBuilder::new("admin")
+            .description("Admin tool")
+            .handler(|_: AddInput| async move { Ok(CallToolResult::text("admin")) })
+            .build()
+            .expect("valid tool name");
+
+        let mut router = McpRouter::new()
+            .tool(admin_tool)
+            .tool_filter(CapabilityFilter::new(|_, _: &Tool| false)); // Deny all
+
+        // Initialize session
+        init_router(&mut router).await;
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::CallTool(CallToolParams {
+                name: "admin".to_string(),
+                arguments: serde_json::json!({"a": 1, "b": 2}),
+                meta: None,
+            }),
+            extensions: Extensions::new(),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        // Should get method not found error (default denial behavior)
+        match resp.inner {
+            Err(e) => {
+                assert_eq!(e.code, -32601); // Method not found
+            }
+            _ => panic!("Expected JsonRpc error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_filter_call_allowed() {
+        use crate::filter::CapabilityFilter;
+        use crate::tool::Tool;
+
+        let public_tool = ToolBuilder::new("public")
+            .description("Public tool")
+            .handler(|input: AddInput| async move {
+                Ok(CallToolResult::text(format!("{}", input.a + input.b)))
+            })
+            .build()
+            .expect("valid tool name");
+
+        let mut router = McpRouter::new()
+            .tool(public_tool)
+            .tool_filter(CapabilityFilter::new(|_, _: &Tool| true)); // Allow all
+
+        // Initialize session
+        init_router(&mut router).await;
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::CallTool(CallToolParams {
+                name: "public".to_string(),
+                arguments: serde_json::json!({"a": 1, "b": 2}),
+                meta: None,
+            }),
+            extensions: Extensions::new(),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::CallTool(result)) => {
+                assert!(!result.is_error);
+            }
+            _ => panic!("Expected CallTool response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_filter_custom_denial() {
+        use crate::filter::{CapabilityFilter, DenialBehavior};
+        use crate::tool::Tool;
+
+        let admin_tool = ToolBuilder::new("admin")
+            .description("Admin tool")
+            .handler(|_: AddInput| async move { Ok(CallToolResult::text("admin")) })
+            .build()
+            .expect("valid tool name");
+
+        let mut router = McpRouter::new().tool(admin_tool).tool_filter(
+            CapabilityFilter::new(|_, _: &Tool| false)
+                .denial_behavior(DenialBehavior::Unauthorized),
+        );
+
+        // Initialize session
+        init_router(&mut router).await;
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::CallTool(CallToolParams {
+                name: "admin".to_string(),
+                arguments: serde_json::json!({"a": 1, "b": 2}),
+                meta: None,
+            }),
+            extensions: Extensions::new(),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        // Should get forbidden error
+        match resp.inner {
+            Err(e) => {
+                assert_eq!(e.code, -32007); // Forbidden
+                assert!(e.message.contains("Unauthorized"));
+            }
+            _ => panic!("Expected JsonRpc error"),
         }
     }
 }

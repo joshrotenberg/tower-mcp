@@ -112,6 +112,7 @@ pub mod auth;
 pub mod client;
 pub mod context;
 pub mod error;
+pub mod filter;
 pub mod jsonrpc;
 #[cfg(feature = "oauth")]
 pub mod oauth;
@@ -134,6 +135,7 @@ pub use context::{
     RequestContext, RequestContextBuilder, ServerNotification, outgoing_request_channel,
 };
 pub use error::{BoxError, Error, Result, ToolError};
+pub use filter::{CapabilityFilter, DenialBehavior, Filterable, ToolFilter};
 pub use jsonrpc::{JsonRpcLayer, JsonRpcService};
 pub use prompt::{Prompt, PromptBuilder, PromptHandler};
 pub use protocol::{
