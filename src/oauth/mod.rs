@@ -95,4 +95,6 @@ pub use error::OAuthError;
 pub use metadata::ProtectedResourceMetadata;
 pub use middleware::{OAuthLayer, OAuthService};
 pub use scope::{ScopeEnforcementLayer, ScopeEnforcementService, ScopePolicy, ScopeRequirement};
+#[cfg(feature = "jwks")]
+pub use token::{JwksError, JwksValidator, JwksValidatorBuilder};
 pub use token::{JwtValidator, TokenAudience, TokenClaims, TokenValidator, ValidateAdapter};
