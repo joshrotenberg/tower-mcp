@@ -5,6 +5,8 @@
 [![CI](https://github.com/joshrotenberg/tower-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/joshrotenberg/tower-mcp/actions/workflows/ci.yml)
 [![License](https://img.shields.io/crates/l/tower-mcp.svg)](https://github.com/joshrotenberg/tower-mcp#license)
 [![MSRV](https://img.shields.io/crates/msrv/tower-mcp.svg)](https://github.com/joshrotenberg/tower-mcp)
+[![MCP](https://img.shields.io/badge/MCP-2025--11--25-blue)](https://modelcontextprotocol.io/specification/2025-11-25)
+[![Conformance](https://img.shields.io/badge/conformance-39%2F39-brightgreen)](https://github.com/joshrotenberg/tower-mcp/actions/workflows/mcp-conformance.yml)
 
 Tower-native [Model Context Protocol](https://modelcontextprotocol.io) (MCP) implementation for Rust.
 
@@ -219,6 +221,63 @@ let echo = ToolBuilder::new("echo")
     });
 ```
 
+## Resource Definition
+
+```rust
+use tower_mcp::ResourceBuilder;
+
+// Static resource with inline content
+let config = ResourceBuilder::new("file:///config.json")
+    .name("Configuration")
+    .description("Server configuration")
+    .json(serde_json::json!({
+        "version": "1.0.0",
+        "debug": true
+    }));
+
+// Dynamic resource with handler
+let status = ResourceBuilder::new("app:///status")
+    .name("Server Status")
+    .description("Current server status")
+    .handler(|| async {
+        Ok("Running".to_string())
+    });
+
+let router = McpRouter::new()
+    .resource(config)
+    .resource(status);
+```
+
+## Prompt Definition
+
+```rust
+use tower_mcp::{PromptBuilder, GetPromptResult, PromptMessage, PromptRole, protocol::Content};
+
+let greet = PromptBuilder::new("greet")
+    .description("Generate a greeting")
+    .required_arg("name", "Name to greet")
+    .optional_arg("style", "Greeting style (formal/casual)")
+    .handler(|args| async move {
+        let name = args.get("name").map(|s| s.as_str()).unwrap_or("World");
+        let style = args.get("style").map(|s| s.as_str()).unwrap_or("casual");
+
+        let text = match style {
+            "formal" => format!("Good day, {}. How may I assist you?", name),
+            _ => format!("Hey {}!", name),
+        };
+
+        Ok(GetPromptResult {
+            description: Some("A friendly greeting".to_string()),
+            messages: vec![PromptMessage {
+                role: PromptRole::User,
+                content: Content::Text { text, annotations: None },
+            }],
+        })
+    });
+
+let router = McpRouter::new().prompt(greet);
+```
+
 ## Transports
 
 ### Stdio (CLI/local)
@@ -322,7 +381,9 @@ tower-mcp targets the [MCP specification 2025-11-25](https://modelcontextprotoco
 - [x] [Roots (filesystem discovery)](https://modelcontextprotocol.io/specification/2025-11-25/client/roots)
 - [x] [Sampling](https://modelcontextprotocol.io/specification/2025-11-25/client/sampling) (all transports)
 - [x] [Async tasks](https://modelcontextprotocol.io/specification/2025-11-25/server/utilities/async) (task ID, status tracking, TTL cleanup)
-- [x] SSE event IDs and stream resumption (SEP-1699)
+- [x] [SSE event IDs and stream resumption](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#resumability-and-redelivery) (SEP-1699)
+
+We track all MCP Specification Enhancement Proposals (SEPs) as [GitHub issues](https://github.com/joshrotenberg/tower-mcp/issues?q=label%3Asep). A weekly workflow syncs status from the upstream spec repository.
 
 ## Development
 
