@@ -233,6 +233,51 @@ impl StatelessConfig {
     }
 }
 
+// =============================================================================
+// Helper functions for extracting stateless metadata
+// =============================================================================
+
+impl StatelessRequestMeta {
+    /// Extract stateless request metadata from JSON-RPC request params.
+    ///
+    /// The metadata is expected to be in the `_meta` field of the params object.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::stateless::StatelessRequestMeta;
+    /// use serde_json::json;
+    ///
+    /// let params = json!({
+    ///     "name": "my-tool",
+    ///     "_meta": {
+    ///         "modelcontextprotocol.io/mcpProtocolVersion": "2025-06-18",
+    ///         "modelcontextprotocol.io/sessionId": "abc123"
+    ///     }
+    /// });
+    ///
+    /// let meta = StatelessRequestMeta::from_params(&params);
+    /// assert!(meta.is_some());
+    /// let meta = meta.unwrap();
+    /// assert_eq!(meta.protocol_version, Some("2025-06-18".to_string()));
+    /// ```
+    pub fn from_params(params: &serde_json::Value) -> Option<Self> {
+        params
+            .get("_meta")
+            .and_then(|meta| serde_json::from_value(meta.clone()).ok())
+    }
+
+    /// Check if this request includes client capabilities.
+    pub fn has_client_capabilities(&self) -> bool {
+        self.client_capabilities.is_some()
+    }
+
+    /// Check if this request includes roots.
+    pub fn has_roots(&self) -> bool {
+        self.roots.is_some()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,5 +358,48 @@ mod tests {
         let config = StatelessConfig::backward_compatible();
         assert!(!config.require_protocol_version);
         assert!(config.optional_sessions);
+    }
+
+    #[test]
+    fn test_from_params() {
+        let params = serde_json::json!({
+            "name": "test-tool",
+            "_meta": {
+                "modelcontextprotocol.io/mcpProtocolVersion": "2025-06-18",
+                "modelcontextprotocol.io/sessionId": "session-123",
+                "modelcontextprotocol.io/logLevel": "debug"
+            }
+        });
+
+        let meta = StatelessRequestMeta::from_params(&params).unwrap();
+        assert_eq!(meta.protocol_version, Some("2025-06-18".to_string()));
+        assert_eq!(meta.session_id, Some("session-123".to_string()));
+        assert_eq!(meta.log_level, Some(LogLevel::Debug));
+    }
+
+    #[test]
+    fn test_from_params_no_meta() {
+        let params = serde_json::json!({
+            "name": "test-tool"
+        });
+
+        let meta = StatelessRequestMeta::from_params(&params);
+        assert!(meta.is_none());
+    }
+
+    #[test]
+    fn test_has_client_capabilities() {
+        let meta = StatelessRequestMeta {
+            progress_token: None,
+            protocol_version: None,
+            session_id: None,
+            client_capabilities: Some(ClientCapabilities::default()),
+            roots: None,
+            log_level: None,
+        };
+        assert!(meta.has_client_capabilities());
+
+        let meta_without = StatelessRequestMeta::default();
+        assert!(!meta_without.has_client_capabilities());
     }
 }
