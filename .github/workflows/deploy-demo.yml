@@ -46,46 +46,72 @@ jobs:
 
       - name: Verify deployment (MCP protocol)
         run: |
-          # Save response headers to a file so we can extract session ID
-          echo "Sending initialize request..."
-          INIT_RESPONSE=$(curl -s -D /tmp/headers.txt -X POST https://crates-mcp-demo.fly.dev/ \
-            -H "Content-Type: application/json" \
-            -H "Accept: application/json" \
-            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"deploy-check","version":"1.0"}}}')
+          # Retry logic for session-based verification
+          # Fly.io edge routing can sometimes cause requests to hit different instances
+          MAX_RETRIES=3
+          RETRY_DELAY=5
 
-          echo "Init response: $INIT_RESPONSE"
+          for attempt in $(seq 1 $MAX_RETRIES); do
+            echo "=== Attempt $attempt of $MAX_RETRIES ==="
 
-          # Extract session ID from response headers
-          SESSION_ID=$(grep -i "mcp-session-id" /tmp/headers.txt | cut -d' ' -f2 | tr -d '\r')
+            # Save response headers to a file so we can extract session ID
+            echo "Sending initialize request..."
+            INIT_RESPONSE=$(curl -s -D /tmp/headers.txt -X POST https://crates-mcp-demo.fly.dev/ \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json" \
+              -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"deploy-check","version":"1.0"}}}')
 
-          echo "Session ID: $SESSION_ID"
+            echo "Init response: $INIT_RESPONSE"
 
-          if [ -z "$SESSION_ID" ]; then
-            echo "Failed to get session ID"
-            exit 1
-          fi
+            # Extract session ID from response headers
+            SESSION_ID=$(grep -i "mcp-session-id" /tmp/headers.txt | cut -d' ' -f2 | tr -d '\r')
 
-          # Send initialized notification (required by MCP protocol before other requests)
-          echo "Sending initialized notification..."
-          curl -s -X POST https://crates-mcp-demo.fly.dev/ \
-            -H "Content-Type: application/json" \
-            -H "Accept: application/json" \
-            -H "MCP-Session-Id: $SESSION_ID" \
-            -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+            echo "Session ID: $SESSION_ID"
 
-          echo "Sending test tool call..."
-          TOOL_RESPONSE=$(curl -s -X POST https://crates-mcp-demo.fly.dev/ \
-            -H "Content-Type: application/json" \
-            -H "Accept: application/json" \
-            -H "MCP-Session-Id: $SESSION_ID" \
-            -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_crates","arguments":{"query":"tower"}}}')
+            if [ -z "$SESSION_ID" ]; then
+              echo "Failed to get session ID"
+              if [ $attempt -lt $MAX_RETRIES ]; then
+                echo "Retrying in ${RETRY_DELAY}s..."
+                sleep $RETRY_DELAY
+                continue
+              fi
+              exit 1
+            fi
 
-          echo "Tool response: $TOOL_RESPONSE"
+            # Small delay to ensure session is fully registered
+            sleep 1
 
-          # Check for successful response (should contain "result" not "error")
-          if echo "$TOOL_RESPONSE" | grep -q '"result"'; then
-            echo "MCP protocol verification successful!"
-          else
-            echo "MCP protocol verification failed - unexpected response"
-            exit 1
-          fi
+            # Send initialized notification (required by MCP protocol before other requests)
+            echo "Sending initialized notification..."
+            curl -s -X POST https://crates-mcp-demo.fly.dev/ \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json" \
+              -H "MCP-Session-Id: $SESSION_ID" \
+              -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+
+            # Small delay after initialized
+            sleep 1
+
+            echo "Sending test tool call..."
+            TOOL_RESPONSE=$(curl -s -X POST https://crates-mcp-demo.fly.dev/ \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json" \
+              -H "MCP-Session-Id: $SESSION_ID" \
+              -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_crates","arguments":{"query":"tower"}}}')
+
+            echo "Tool response: $TOOL_RESPONSE"
+
+            # Check for successful response (should contain "result" not "error")
+            if echo "$TOOL_RESPONSE" | grep -q '"result"'; then
+              echo "MCP protocol verification successful!"
+              exit 0
+            else
+              echo "MCP protocol verification failed - unexpected response"
+              if [ $attempt -lt $MAX_RETRIES ]; then
+                echo "Retrying in ${RETRY_DELAY}s..."
+                sleep $RETRY_DELAY
+                continue
+              fi
+              exit 1
+            fi
+          done
