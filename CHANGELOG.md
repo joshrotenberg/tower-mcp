@@ -4,6 +4,34 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+## [0.2.2] - 2026-01-29
+
+### Bug Fixes
+
+- Restructure JS template to fix YAML parsing ([#180](https://github.com/joshrotenberg/tower-mcp/pull/180))
+- Update SEP status label when issue is final ([#259](https://github.com/joshrotenberg/tower-mcp/pull/259))
+
+### Documentation
+
+- Add resource/prompt examples, badges, SEP tracking ([#255](https://github.com/joshrotenberg/tower-mcp/pull/255))
+- Add capability filtering example ([#267](https://github.com/joshrotenberg/tower-mcp/pull/267))
+
+### Features
+
+- **http:** Add SSE event IDs and stream resumption (SEP-1699) ([#176](https://github.com/joshrotenberg/tower-mcp/pull/176))
+- Add automated SEP tracking workflow ([#179](https://github.com/joshrotenberg/tower-mcp/pull/179))
+- **examples:** Add external API authentication patterns ([#260](https://github.com/joshrotenberg/tower-mcp/pull/260))
+- **filter:** Add session-specific capability filtering ([#264](https://github.com/joshrotenberg/tower-mcp/pull/264))
+- **filter:** Add session-specific resource filtering ([#265](https://github.com/joshrotenberg/tower-mcp/pull/265))
+- **filter:** Add session-specific prompt filtering ([#266](https://github.com/joshrotenberg/tower-mcp/pull/266))
+- **session:** Add type-safe extensions to SessionState ([#269](https://github.com/joshrotenberg/tower-mcp/pull/269))
+
+### Refactor
+
+- Extract SEP sync script to separate file ([#254](https://github.com/joshrotenberg/tower-mcp/pull/254))
+
+
+
 ## [0.2.1] - 2026-01-29
 
 ### Bug Fixes
