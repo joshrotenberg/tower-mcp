@@ -21,12 +21,12 @@ This is a comprehensive example demonstrating tower-mcp features including tools
   - `analyze_crate` - Comprehensive crate analysis
   - `compare_crates` - Compare multiple crates for a use case
 
-- **Tower Middleware** - Demonstrates concurrency limiting
+- **Tower Middleware** - Demonstrates timeout and concurrency limiting
 
 ## Building
 
 ```bash
-cargo build -p crates-mcp
+cargo build -p crates-mcp --release
 ```
 
 ## Running
@@ -37,12 +37,21 @@ cargo build -p crates-mcp
 cargo run -p crates-mcp
 ```
 
+### HTTP Transport
+
+```bash
+cargo run -p crates-mcp -- --transport http --host 127.0.0.1 --port 3000
+```
+
 ### With Options
 
 ```bash
 cargo run -p crates-mcp -- \
-  --max-concurrent 3 \
-  --rate-limit-ms 2000 \
+  --transport http \
+  --host 0.0.0.0 \
+  --port 3000 \
+  --max-concurrent 5 \
+  --request-timeout-secs 30 \
   --log-level debug
 ```
 
@@ -50,18 +59,19 @@ cargo run -p crates-mcp -- \
 
 ```
 Options:
-  -t, --transport <TRANSPORT>        Transport to use [default: stdio]
-      --max-concurrent <N>           Maximum concurrent tool calls [default: 5]
-      --bulkhead-timeout-ms <MS>     Max wait time for bulkhead permit [default: 100]
-      --requests-per-second <N>      Maximum requests per second [default: 10]
-      --rate-limit-ms <MS>           Rate limit interval for crates.io API [default: 1000]
-  -l, --log-level <LEVEL>            Log level [default: info]
-  -h, --help                         Print help
+  -t, --transport <TRANSPORT>          Transport to use [default: stdio] [possible values: stdio, http]
+      --max-concurrent <N>             Maximum concurrent requests [default: 10]
+      --rate-limit-ms <MS>             Rate limit interval for crates.io API [default: 1000]
+  -l, --log-level <LEVEL>              Log level [default: info]
+      --host <HOST>                    HTTP host to bind to [default: 127.0.0.1]
+  -p, --port <PORT>                    HTTP port to bind to [default: 3000]
+      --request-timeout-secs <SECS>    Request timeout in seconds [default: 30]
+  -h, --help                           Print help
 ```
 
 ## MCP Client Configuration
 
-### Claude Desktop
+### Claude Desktop (stdio)
 
 Add to your `claude_desktop_config.json`:
 
@@ -82,11 +92,51 @@ Or if you've built the binary:
 {
   "mcpServers": {
     "crates": {
-      "command": "/path/to/tower-mcp/target/debug/crates-mcp"
+      "command": "/path/to/tower-mcp/target/release/crates-mcp"
     }
   }
 }
 ```
+
+### HTTP Client
+
+Test with curl:
+
+```bash
+# Initialize
+curl -X POST http://localhost:3000/ \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"curl","version":"1.0"}}}'
+
+# Search for crates
+curl -X POST http://localhost:3000/ \
+  -H "Content-Type: application/json" \
+  -H "MCP-Session-Id: <session-id-from-init>" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_crates","arguments":{"query":"async http"}}}'
+```
+
+## Deployment
+
+### Docker
+
+```bash
+docker build -f examples/crates-mcp/Dockerfile -t crates-mcp .
+docker run -p 3000:3000 crates-mcp
+```
+
+### Fly.io
+
+```bash
+# First time setup
+fly apps create crates-mcp-demo
+fly secrets set # if needed
+
+# Deploy
+fly deploy --config examples/crates-mcp/fly.toml
+```
+
+The GitHub Actions workflow automatically deploys on pushes to main.
 
 ## Example Usage
 
@@ -130,50 +180,24 @@ src/
 
 ## Tower Middleware
 
-This example demonstrates tower middleware integration with [tower-resilience](https://crates.io/crates/tower-resilience-ratelimiter) layers:
+This example demonstrates tower middleware integration for HTTP transport:
 
 ```rust
-use tower::ServiceBuilder;
-use tower_resilience_bulkhead::BulkheadLayer;
-use tower_resilience_ratelimiter::RateLimiterLayer;
-
-// Rate limiter: token bucket algorithm
-let rate_limiter = RateLimiterLayer::builder()
-    .limit_for_period(10)              // 10 requests
-    .refresh_period(Duration::from_secs(1))  // per second
-    .timeout_duration(Duration::from_millis(500))
-    .build();
-
-// Bulkhead: isolate concurrent requests with timeout
-let bulkhead = BulkheadLayer::builder()
-    .max_concurrent_calls(5)           // max 5 in-flight
-    .max_wait_duration(Some(Duration::from_millis(100)))
-    .build();
-
-// Stack multiple middleware layers
-let service = ServiceBuilder::new()
-    .layer(rate_limiter)
-    .layer(bulkhead)
-    .service(router);
+let transport = HttpTransport::new(router)
+    .layer(
+        ServiceBuilder::new()
+            // Request timeout protection
+            .layer(TimeoutLayer::new(Duration::from_secs(30)))
+            // Limit concurrent requests
+            .concurrency_limit(10)
+            .into_inner(),
+    );
 ```
 
-### Middleware Stack
-
-| Layer | Crate | Purpose |
-|-------|-------|---------|
-| RateLimiterLayer | tower-resilience-ratelimiter | Token bucket rate limiting (N/sec) |
-| BulkheadLayer | tower-resilience-bulkhead | Concurrent request isolation with wait timeout |
-
-### Why Both?
-
-- **RateLimiter**: Smooths traffic over time, prevents burst flooding
-- **Bulkhead**: Isolates resources, fails fast when overloaded
-
-Together they protect against:
-- Request floods and DoS
-- Resource exhaustion (memory, file handles)
+The middleware protects against:
+- Long-running requests (timeout)
+- Resource exhaustion (concurrency limit)
 - Downstream service overload (crates.io has rate limits)
-- Cascading failures
 
 ## License
 

@@ -1,0 +1,21 @@
+# Fly.io configuration for crates-mcp demo server
+# Deploy with: fly deploy --config examples/crates-mcp/fly.toml
+
+app = "crates-mcp-demo"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "examples/crates-mcp/Dockerfile"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = "suspend"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+[[vm]]
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1
