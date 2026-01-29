@@ -41,6 +41,7 @@ pub fn build(state: Arc<AppState>) -> Tool {
         )
         .read_only()
         .idempotent()
+        .icon("https://crates.io/assets/cargo.png")
         .handler_with_state(
             state,
             |state: Arc<AppState>, input: SearchInput| async move {

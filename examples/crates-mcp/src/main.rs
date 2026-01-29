@@ -13,6 +13,7 @@ use std::time::Duration;
 use clap::{Parser, ValueEnum};
 use tower::ServiceBuilder;
 use tower::timeout::TimeoutLayer;
+use tower_mcp::protocol::{CompleteParams, CompleteResult, Completion, CompletionReference};
 use tower_mcp::{HttpTransport, McpRouter, StdioTransport};
 use tower_resilience_bulkhead::BulkheadLayer;
 use tower_resilience_ratelimiter::RateLimiterLayer;
@@ -92,13 +93,54 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     let reverse_deps_tool = tools::reverse_deps::build(state.clone());
     let downloads_tool = tools::downloads::build(state.clone());
     let owners_tool = tools::owners::build(state.clone());
+    let summary_tool = tools::summary::build(state.clone());
+    let authors_tool = tools::authors::build(state.clone());
+    let user_tool = tools::user::build(state.clone());
 
     // Build resources
     let recent_searches = resources::recent_searches::build(state.clone());
+    let crate_info_template = resources::crate_info::build(state.clone());
 
     // Build prompts
     let analyze_prompt = prompts::analyze::build();
     let compare_prompt = prompts::compare::build();
+
+    // Popular crates for completion suggestions
+    let popular_crates = vec![
+        "serde",
+        "tokio",
+        "anyhow",
+        "thiserror",
+        "clap",
+        "tracing",
+        "reqwest",
+        "axum",
+        "tower",
+        "hyper",
+        "futures",
+        "async-trait",
+        "rand",
+        "regex",
+        "chrono",
+        "uuid",
+        "log",
+        "env_logger",
+        "syn",
+        "quote",
+        "proc-macro2",
+        "bytes",
+        "http",
+        "tonic",
+        "prost",
+        "sqlx",
+        "diesel",
+        "actix-web",
+        "rocket",
+        "warp",
+        "tide",
+        "poem",
+        "salvo",
+    ];
 
     // Create router with all capabilities
     let router = McpRouter::new()
@@ -112,7 +154,12 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
              - get_dependencies: Get dependencies for a version\n\
              - get_reverse_dependencies: Find crates that depend on this crate\n\
              - get_downloads: Get download statistics\n\
-             - get_owners: Get crate owners/maintainers\n\n\
+             - get_owners: Get crate owners/maintainers\n\
+             - get_summary: Get crates.io global statistics\n\
+             - get_crate_authors: Get authors for a crate version\n\
+             - get_user: Get a user's profile\n\n\
+             Resources:\n\
+             - crates://{name}/info: Get crate info as a resource\n\n\
              Use the prompts for guided analysis:\n\
              - analyze_crate: Comprehensive crate analysis\n\
              - compare_crates: Compare multiple crates",
@@ -124,9 +171,46 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .tool(reverse_deps_tool)
         .tool(downloads_tool)
         .tool(owners_tool)
+        .tool(summary_tool)
+        .tool(authors_tool)
+        .tool(user_tool)
         .resource(recent_searches)
+        .resource_template(crate_info_template)
         .prompt(analyze_prompt)
-        .prompt(compare_prompt);
+        .prompt(compare_prompt)
+        // Completion handler for crate name suggestions
+        .completion_handler(move |params: CompleteParams| {
+            let popular = popular_crates.clone();
+            async move {
+                let prefix = params.argument.value.to_lowercase();
+
+                // Filter popular crates by prefix
+                let suggestions: Vec<String> = popular
+                    .iter()
+                    .filter(|name| name.starts_with(&prefix))
+                    .take(10)
+                    .map(|name| name.to_string())
+                    .collect();
+
+                // Log what we're completing for
+                match &params.reference {
+                    CompletionReference::Prompt { name } => {
+                        tracing::debug!(%name, %prefix, "Completing prompt argument");
+                    }
+                    CompletionReference::Resource { uri } => {
+                        tracing::debug!(%uri, %prefix, "Completing resource URI");
+                    }
+                }
+
+                Ok(CompleteResult {
+                    completion: Completion {
+                        values: suggestions,
+                        total: None,
+                        has_more: Some(false),
+                    },
+                })
+            }
+        });
 
     match args.transport {
         Transport::Stdio => {

@@ -6,22 +6,35 @@ This is a comprehensive example demonstrating tower-mcp features including tools
 
 ## Features
 
-- **7 Tools** - One per crates.io API endpoint:
+- **10 Tools** - Complete crates.io API coverage:
   - `search_crates` - Find crates by name/keywords
   - `get_crate_info` - Get detailed crate information
   - `get_crate_versions` - Get version history
   - `get_dependencies` - Get dependencies for a version
-  - `get_reverse_dependencies` - Find crates that depend on this crate
+  - `get_reverse_dependencies` - Find crates that depend on this crate (with progress notifications)
   - `get_downloads` - Get download statistics
   - `get_owners` - Get crate owners/maintainers
+  - `get_summary` - Get crates.io global statistics (new crates, popular, trending)
+  - `get_crate_authors` - Get authors for a specific crate version
+  - `get_user` - Get a user's profile information
 
-- **1 Resource** - `crates://recent-searches` tracks recent queries
+- **2 Resources**:
+  - `crates://recent-searches` - Tracks recent search queries
+  - `crates://{name}/info` - Resource template for crate information
 
 - **2 Prompts** - Guided analysis workflows:
   - `analyze_crate` - Comprehensive crate analysis
   - `compare_crates` - Compare multiple crates for a use case
 
-- **Tower Middleware** - Demonstrates timeout and concurrency limiting
+- **Completions** - Autocomplete suggestions for popular crate names
+
+- **Progress Notifications** - Real-time progress updates during reverse dependency lookups
+
+- **Logging** - Structured logging of API calls for debugging
+
+- **Icons** - Visual icons on all tools
+
+- **Tower Middleware** - Rate limiting and concurrency control
 
 ## Building
 

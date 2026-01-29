@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tower_mcp::{CallToolResult, Error, Tool, ToolBuilder};
+use tower_mcp::protocol::{LogLevel, LoggingMessageParams};
+use tower_mcp::{CallToolResult, Error, RequestContext, Tool, ToolBuilder};
 
 use crate::state::AppState;
 
@@ -23,14 +24,44 @@ pub fn build(state: Arc<AppState>) -> Tool {
         )
         .read_only()
         .idempotent()
-        .handler_with_state(
+        .icon("https://crates.io/assets/cargo.png")
+        .handler_with_state_and_context(
             state,
-            |state: Arc<AppState>, input: ReverseDepsInput| async move {
+            |state: Arc<AppState>, ctx: RequestContext, input: ReverseDepsInput| async move {
+                // Log the request
+                ctx.send_log(LoggingMessageParams {
+                    level: LogLevel::Info,
+                    logger: Some("crates-mcp".to_string()),
+                    data: Some(serde_json::json!({
+                        "action": "fetch_reverse_deps",
+                        "crate": input.name
+                    })),
+                });
+
+                // Send initial progress
+                ctx.report_progress(0.1, Some(1.0), Some("Fetching reverse dependencies..."))
+                    .await;
+
                 let response = state
                     .client
                     .crate_reverse_dependencies(&input.name)
                     .await
                     .map_err(|e| Error::tool(format!("Crates.io API error: {}", e)))?;
+
+                // Update progress
+                ctx.report_progress(0.8, Some(1.0), Some("Processing results..."))
+                    .await;
+
+                // Log the result count
+                ctx.send_log(LoggingMessageParams {
+                    level: LogLevel::Info,
+                    logger: Some("crates-mcp".to_string()),
+                    data: Some(serde_json::json!({
+                        "action": "fetch_reverse_deps_complete",
+                        "crate": input.name,
+                        "count": response.meta.total
+                    })),
+                });
 
                 let mut output = format!(
                     "# {} - Reverse Dependencies\n\n\
@@ -46,6 +77,9 @@ pub fn build(state: Arc<AppState>) -> Tool {
                         dep.crate_version.crate_name, dep.crate_version.num, dep.dependency.req
                     ));
                 }
+
+                // Complete progress
+                ctx.report_progress(1.0, Some(1.0), Some("Done")).await;
 
                 Ok(CallToolResult::text(output))
             },
