@@ -216,13 +216,14 @@ impl McpRouter {
 
     /// Cancel a tracked request
     fn cancel_request(&self, request_id: &RequestId) -> bool {
-        if let Ok(in_flight) = self.inner.in_flight.read()
-            && let Some(token) = in_flight.get(request_id)
-        {
-            token.cancel();
-            return true;
-        }
-        false
+        let Ok(in_flight) = self.inner.in_flight.read() else {
+            return false;
+        };
+        let Some(token) = in_flight.get(request_id) else {
+            return false;
+        };
+        token.cancel();
+        true
     }
 
     /// Set server info
@@ -466,12 +467,10 @@ impl McpRouter {
     ///     .with_data(serde_json::json!({"error": "Connection failed"})));
     /// ```
     pub fn log(&self, params: LoggingMessageParams) -> bool {
-        if let Some(tx) = &self.inner.notification_tx
-            && tx.try_send(ServerNotification::LogMessage(params)).is_ok()
-        {
-            return true;
-        }
-        false
+        let Some(tx) = &self.inner.notification_tx else {
+            return false;
+        };
+        tx.try_send(ServerNotification::LogMessage(params)).is_ok()
     }
 
     /// Send an info-level log message
@@ -550,30 +549,24 @@ impl McpRouter {
             return false;
         }
 
-        if let Some(tx) = &self.inner.notification_tx
-            && tx
-                .try_send(ServerNotification::ResourceUpdated {
-                    uri: uri.to_string(),
-                })
-                .is_ok()
-        {
-            return true;
-        }
-        false
+        let Some(tx) = &self.inner.notification_tx else {
+            return false;
+        };
+        tx.try_send(ServerNotification::ResourceUpdated {
+            uri: uri.to_string(),
+        })
+        .is_ok()
     }
 
     /// Notify clients that the list of available resources has changed
     ///
     /// Returns `true` if the notification was sent.
     pub fn notify_resources_list_changed(&self) -> bool {
-        if let Some(tx) = &self.inner.notification_tx
-            && tx
-                .try_send(ServerNotification::ResourcesListChanged)
-                .is_ok()
-        {
-            return true;
-        }
-        false
+        let Some(tx) = &self.inner.notification_tx else {
+            return false;
+        };
+        tx.try_send(ServerNotification::ResourcesListChanged)
+            .is_ok()
     }
 
     /// Get server capabilities based on registered handlers

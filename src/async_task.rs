@@ -223,84 +223,94 @@ impl TaskStore {
 
     /// Update task progress
     pub fn update_progress(&self, task_id: &str, progress: f64, message: Option<String>) -> bool {
-        if let Ok(mut tasks) = self.tasks.write()
-            && let Some(task) = tasks.get_mut(task_id)
-            && !task.status.is_terminal()
-        {
-            task.progress = Some(progress);
-            if let Some(msg) = message {
-                task.message = Some(msg);
-            }
-            return true;
+        let Ok(mut tasks) = self.tasks.write() else {
+            return false;
+        };
+        let Some(task) = tasks.get_mut(task_id) else {
+            return false;
+        };
+        if task.status.is_terminal() {
+            return false;
         }
-        false
+        task.progress = Some(progress);
+        if let Some(msg) = message {
+            task.message = Some(msg);
+        }
+        true
     }
 
     /// Mark a task as requiring input
     pub fn require_input(&self, task_id: &str, message: &str) -> bool {
-        if let Ok(mut tasks) = self.tasks.write()
-            && let Some(task) = tasks.get_mut(task_id)
-            && !task.status.is_terminal()
-        {
-            task.status = TaskStatus::InputRequired;
-            task.message = Some(message.to_string());
-            return true;
+        let Ok(mut tasks) = self.tasks.write() else {
+            return false;
+        };
+        let Some(task) = tasks.get_mut(task_id) else {
+            return false;
+        };
+        if task.status.is_terminal() {
+            return false;
         }
-        false
+        task.status = TaskStatus::InputRequired;
+        task.message = Some(message.to_string());
+        true
     }
 
     /// Mark a task as completed with a result
     pub fn complete_task(&self, task_id: &str, result: CallToolResult) -> bool {
-        if let Ok(mut tasks) = self.tasks.write()
-            && let Some(task) = tasks.get_mut(task_id)
-            && !task.status.is_terminal()
-        {
-            task.status = TaskStatus::Completed;
-            task.progress = Some(100.0);
-            task.message = Some("Task completed".to_string());
-            task.result = Some(result);
-            task.completed_at = Some(Instant::now());
-            return true;
+        let Ok(mut tasks) = self.tasks.write() else {
+            return false;
+        };
+        let Some(task) = tasks.get_mut(task_id) else {
+            return false;
+        };
+        if task.status.is_terminal() {
+            return false;
         }
-        false
+        task.status = TaskStatus::Completed;
+        task.progress = Some(100.0);
+        task.message = Some("Task completed".to_string());
+        task.result = Some(result);
+        task.completed_at = Some(Instant::now());
+        true
     }
 
     /// Mark a task as failed with an error
     pub fn fail_task(&self, task_id: &str, error: &str) -> bool {
-        if let Ok(mut tasks) = self.tasks.write()
-            && let Some(task) = tasks.get_mut(task_id)
-            && !task.status.is_terminal()
-        {
-            task.status = TaskStatus::Failed;
-            task.message = Some(format!("Task failed: {}", error));
-            task.error = Some(error.to_string());
-            task.completed_at = Some(Instant::now());
-            return true;
+        let Ok(mut tasks) = self.tasks.write() else {
+            return false;
+        };
+        let Some(task) = tasks.get_mut(task_id) else {
+            return false;
+        };
+        if task.status.is_terminal() {
+            return false;
         }
-        false
+        task.status = TaskStatus::Failed;
+        task.message = Some(format!("Task failed: {}", error));
+        task.error = Some(error.to_string());
+        task.completed_at = Some(Instant::now());
+        true
     }
 
     /// Cancel a task
     pub fn cancel_task(&self, task_id: &str, reason: Option<&str>) -> Option<TaskStatus> {
-        if let Ok(mut tasks) = self.tasks.write()
-            && let Some(task) = tasks.get_mut(task_id)
-        {
-            // Signal cancellation
-            task.cancellation_token.cancel();
+        let mut tasks = self.tasks.write().ok()?;
+        let task = tasks.get_mut(task_id)?;
 
-            // If not already terminal, mark as cancelled
-            if !task.status.is_terminal() {
-                task.status = TaskStatus::Cancelled;
-                task.message = Some(
-                    reason
-                        .map(|r| format!("Cancelled: {}", r))
-                        .unwrap_or_else(|| "Task cancelled".to_string()),
-                );
-                task.completed_at = Some(Instant::now());
-            }
-            return Some(task.status);
+        // Signal cancellation
+        task.cancellation_token.cancel();
+
+        // If not already terminal, mark as cancelled
+        if !task.status.is_terminal() {
+            task.status = TaskStatus::Cancelled;
+            task.message = Some(
+                reason
+                    .map(|r| format!("Cancelled: {}", r))
+                    .unwrap_or_else(|| "Task cancelled".to_string()),
+            );
+            task.completed_at = Some(Instant::now());
         }
-        None
+        Some(task.status)
     }
 
     /// Remove expired tasks (call periodically for cleanup)
