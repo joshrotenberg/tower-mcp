@@ -1176,6 +1176,16 @@ impl McpRouter {
                 }))
             }
 
+            #[cfg(feature = "stateless")]
+            McpRequest::MessagesListen(_) => {
+                // SEP-1442: messages/listen is handled specially by HTTP transport
+                // which returns an SSE stream. If called directly via router, return success.
+                tracing::debug!("Messages listen request (SEP-1442)");
+                Ok(McpResponse::MessagesListen(
+                    crate::stateless::MessagesListenNotification {},
+                ))
+            }
+
             McpRequest::Unknown { method, .. } => {
                 Err(Error::JsonRpc(JsonRpcError::method_not_found(&method)))
             }

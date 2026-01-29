@@ -1075,6 +1075,21 @@ async fn handle_post(
             )
                 .into_response();
         }
+
+        // SEP-1442: Handle messages/listen - returns SSE stream via POST
+        let is_messages_listen = parsed
+            .get("method")
+            .and_then(|m| m.as_str())
+            .map(|m| m == "messages/listen")
+            .unwrap_or(false);
+
+        if is_messages_listen {
+            if let Some(ref config) = state.stateless_config {
+                if config.enable_messages_listen {
+                    return handle_messages_listen(State(state.clone()), headers, &parsed).await;
+                }
+            }
+        }
     }
 
     // SEP-1442: Check if optional sessions are enabled
@@ -1506,6 +1521,150 @@ async fn handle_get_bidirectional(session: Arc<Session>, last_event_id: Option<u
 
     // Convert the receiver into a stream
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+
+    Sse::new(stream)
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(Duration::from_secs(30))
+                .text("ping"),
+        )
+        .into_response()
+}
+
+/// Handle messages/listen RPC - opens SSE stream for server notifications (SEP-1442)
+///
+/// This is called via POST but returns an SSE stream. The flow is:
+/// 1. Client sends POST with `messages/listen` JSON-RPC request
+/// 2. Server returns SSE stream with first event being the response
+/// 3. Subsequent events are server notifications (progress, log, etc.)
+#[cfg(feature = "stateless")]
+async fn handle_messages_listen(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    parsed: &serde_json::Value,
+) -> Response {
+    use axum::response::sse::Event;
+    use std::convert::Infallible;
+    use tokio_stream::StreamExt;
+    use tokio_stream::wrappers::BroadcastStream;
+
+    let request_id = extract_request_id(parsed);
+
+    // Try to get session ID from header or request _meta
+    let session_id = get_session_id(&headers).or_else(|| {
+        parsed
+            .get("params")
+            .and_then(|p| p.get("_meta"))
+            .and_then(|m| m.get("modelcontextprotocol.io/sessionId"))
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string())
+    });
+
+    // Check if optional sessions are enabled
+    let optional_sessions = state
+        .stateless_config
+        .as_ref()
+        .map(|c| c.optional_sessions)
+        .unwrap_or(false);
+
+    // Get or create session
+    let (session, is_ephemeral) = if let Some(id) = session_id {
+        match state.sessions.get(&id).await {
+            Some(s) => (s, false),
+            None => {
+                return json_rpc_error_response(
+                    request_id,
+                    JsonRpcError::session_not_found_with_id(&id),
+                );
+            }
+        }
+    } else if optional_sessions {
+        // Create ephemeral session for stateless mode
+        match state
+            .sessions
+            .create(state.router_template.clone(), state.service_factory.clone())
+            .await
+        {
+            Some(s) => {
+                // Mark session as initialized for stateless requests
+                s.router.session().mark_initializing();
+                s.router.session().mark_initialized();
+                (s, true)
+            }
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Maximum session limit reached",
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        return json_rpc_error_response(request_id, JsonRpcError::session_required());
+    };
+
+    // Subscribe to session notifications
+    let notification_rx = session.notifications_tx.subscribe();
+
+    // Build the first event: messages/listen response
+    let listen_notification = crate::stateless::MessagesListenNotification {};
+    let response = JsonRpcResponse::result(
+        request_id.unwrap_or(RequestId::Number(0)),
+        serde_json::to_value(listen_notification).unwrap(),
+    );
+    let first_event_data = serde_json::to_string(&response).unwrap();
+
+    let session_clone = session.clone();
+    let session_id_for_cleanup = if is_ephemeral {
+        Some(session.id.clone())
+    } else {
+        None
+    };
+    let state_for_cleanup = state.clone();
+
+    // Build the SSE stream
+    let first_event_id = session.next_event_id();
+    let first_event = std::iter::once(Ok::<_, Infallible>(
+        Event::default()
+            .id(first_event_id.to_string())
+            .event(SSE_MESSAGE_EVENT)
+            .data(first_event_data),
+    ));
+
+    // Create live stream for notifications
+    let live_stream = BroadcastStream::new(notification_rx)
+        .then(move |result: std::result::Result<String, _>| {
+            let session = session_clone.clone();
+            async move {
+                match result {
+                    Ok(msg) => {
+                        let event_id = session.next_event_id();
+                        session.buffer_event(event_id, msg.clone()).await;
+                        Some(Ok::<_, Infallible>(
+                            Event::default()
+                                .id(event_id.to_string())
+                                .event(SSE_MESSAGE_EVENT)
+                                .data(msg),
+                        ))
+                    }
+                    Err(_) => None,
+                }
+            }
+        })
+        .filter_map(|x| x);
+
+    // Wrap the stream to handle cleanup on disconnect
+    let stream = tokio_stream::iter(first_event).chain(live_stream);
+
+    // Spawn cleanup task if ephemeral (runs when stream ends)
+    if let Some(session_id) = session_id_for_cleanup {
+        let state = state_for_cleanup;
+        tokio::spawn(async move {
+            // Wait a bit for the stream to finish
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            state.sessions.remove(&session_id).await;
+        });
+    }
 
     Sse::new(stream)
         .keep_alive(
@@ -2271,5 +2430,52 @@ mod tests {
         assert!(tools.is_array());
         assert_eq!(tools.as_array().unwrap().len(), 1);
         assert_eq!(tools[0]["name"], "ping");
+    }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn test_stateless_messages_listen() {
+        // SEP-1442: messages/listen returns an SSE stream
+
+        let router = McpRouter::new().server_info("test-server", "1.0.0");
+
+        let mut config = crate::stateless::StatelessConfig::backward_compatible();
+        config.enable_messages_listen = true;
+
+        let transport = HttpTransport::new(router)
+            .disable_origin_validation()
+            .stateless(config);
+        let app = transport.into_router();
+
+        // Call messages/listen without session (should create ephemeral)
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "messages/listen"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        // Should return SSE stream (text/event-stream)
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .map(|v| v.to_str().unwrap_or(""));
+        assert!(
+            content_type
+                .map(|ct| ct.contains("text/event-stream"))
+                .unwrap_or(false),
+            "Expected text/event-stream, got: {:?}",
+            content_type
+        );
     }
 }
