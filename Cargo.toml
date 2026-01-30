@@ -153,3 +153,8 @@ path = "examples/weather_server.rs"
 name = "http_sse_client"
 path = "examples/http_sse_client.rs"
 required-features = ["http"]
+
+[[example]]
+name = "capability_filtering"
+path = "examples/capability_filtering.rs"
+required-features = ["http"]
