@@ -15,8 +15,8 @@ use tower::ServiceBuilder;
 use tower::timeout::TimeoutLayer;
 use tower_mcp::protocol::{CompleteParams, CompleteResult, Completion, CompletionReference};
 use tower_mcp::{HttpTransport, McpRouter, StdioTransport};
-use tower_resilience_bulkhead::BulkheadLayer;
-use tower_resilience_ratelimiter::RateLimiterLayer;
+use tower_resilience::bulkhead::BulkheadLayer;
+use tower_resilience::ratelimiter::RateLimiterLayer;
 
 use crate::state::AppState;
 
