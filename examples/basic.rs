@@ -9,7 +9,7 @@
 //! It shows how to manually process requests for testing.
 
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tower_mcp::{CallToolResult, JsonRpcRequest, JsonRpcService, McpRouter, ToolBuilder};
 
 // Input types for our tools - schemars generates JSON Schema automatically
@@ -25,6 +25,13 @@ struct AddInput {
     a: i64,
     /// Second number
     b: i64,
+}
+
+/// Output type for the add tool - demonstrates structured JSON output
+#[derive(Debug, Serialize)]
+struct AddOutput {
+    result: i64,
+    expression: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -56,13 +63,18 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         })
         .build()?;
 
+    // Demonstrates returning structured JSON using from_serialize
     let add = ToolBuilder::new("add")
         .description("Add two numbers together")
         .read_only()
         .idempotent() // Same inputs always produce same output
         .handler(|input: AddInput| async move {
-            let result = input.a + input.b;
-            Ok(CallToolResult::text(format!("{}", result)))
+            let output = AddOutput {
+                result: input.a + input.b,
+                expression: format!("{} + {} = {}", input.a, input.b, input.a + input.b),
+            };
+            // Use from_serialize for structured JSON output from any Serialize type
+            CallToolResult::from_serialize(&output)
         })
         .build()?;
 
