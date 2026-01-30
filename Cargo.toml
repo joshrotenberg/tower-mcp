@@ -16,6 +16,9 @@ categories = ["network-programming", "asynchronous"]
 [workspace]
 members = ["examples/crates-mcp", "examples/conformance-server"]
 
+[workspace.dependencies]
+tower-resilience = { version = "0.7", default-features = false, features = ["bulkhead", "ratelimiter"] }
+
 [dependencies]
 # Tower ecosystem
 tower = { version = "0.5", features = ["util"] }
