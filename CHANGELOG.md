@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+## [0.2.3] - 2026-01-30
+
+### Bug Fixes
+
+- Improve deploy verification reliability ([#271](https://github.com/joshrotenberg/tower-mcp/pull/271))
+- Add required-features for capability_filtering example ([#274](https://github.com/joshrotenberg/tower-mcp/pull/274))
+
+### Documentation
+
+- Add from_serialize reference to CallToolResult::json docs ([#276](https://github.com/joshrotenberg/tower-mcp/pull/276))
+
+### Features
+
+- **tool:** Add handler_no_params_with_state for stateful parameterless tools ([#275](https://github.com/joshrotenberg/tower-mcp/pull/275))
+
+
+
 ## [0.2.2] - 2026-01-29
 
 ### Bug Fixes
