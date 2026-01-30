@@ -607,6 +607,50 @@ impl ToolBuilder {
         })
     }
 
+    /// Create a tool with no parameters but with shared state
+    ///
+    /// Use this for tools that need access to shared state (e.g., a connection pool,
+    /// configuration, or shared registry) but don't take any input parameters.
+    ///
+    /// Returns an error if the tool name is invalid.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::sync::Arc;
+    /// use tower_mcp::{ToolBuilder, CallToolResult};
+    ///
+    /// struct Config { version: String }
+    ///
+    /// let config = Arc::new(Config { version: "1.0.0".to_string() });
+    ///
+    /// let tool = ToolBuilder::new("get_version")
+    ///     .description("Get the server version")
+    ///     .handler_no_params_with_state(config, |config: Arc<Config>| async move {
+    ///         Ok(CallToolResult::text(&config.version))
+    ///     })
+    ///     .expect("valid tool name");
+    ///
+    /// assert_eq!(tool.name, "get_version");
+    /// ```
+    pub fn handler_no_params_with_state<S, F, Fut>(self, state: S, handler: F) -> Result<Tool>
+    where
+        S: Clone + Send + Sync + 'static,
+        F: Fn(S) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
+    {
+        validate_tool_name(&self.name)?;
+        Ok(Tool {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            output_schema: self.output_schema,
+            icons: self.icons,
+            annotations: self.annotations,
+            handler: Arc::new(NoParamsWithStateHandler { state, handler }),
+        })
+    }
+
     /// Create a tool with raw JSON handling (no automatic deserialization)
     ///
     /// Returns an error if the tool name is invalid.
@@ -876,6 +920,32 @@ where
 {
     fn call(&self, _args: Value) -> BoxFuture<'_, Result<CallToolResult>> {
         Box::pin((self.handler)())
+    }
+
+    fn input_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {}
+        })
+    }
+}
+
+/// Handler that takes no parameters but has shared state
+struct NoParamsWithStateHandler<S, F> {
+    state: S,
+    handler: F,
+}
+
+impl<S, F, Fut> ToolHandler for NoParamsWithStateHandler<S, F>
+where
+    S: Clone + Send + Sync + 'static,
+    F: Fn(S) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
+{
+    fn call(&self, _args: Value) -> BoxFuture<'_, Result<CallToolResult>> {
+        let state = self.state.clone();
+        let fut = (self.handler)(state);
+        Box::pin(fut)
     }
 
     fn input_schema(&self) -> Value {
@@ -1304,6 +1374,37 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.is_error);
+
+        // Check input schema is an empty-properties object
+        let schema = tool.definition().input_schema;
+        assert_eq!(schema.get("type").unwrap().as_str().unwrap(), "object");
+        assert!(
+            schema
+                .get("properties")
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handler_no_params_with_state() {
+        let shared = Arc::new("shared_value".to_string());
+
+        let tool = ToolBuilder::new("no_params_with_state")
+            .description("Takes no parameters but has state")
+            .handler_no_params_with_state(shared, |state: Arc<String>| async move {
+                Ok(CallToolResult::text(format!("state: {}", state)))
+            })
+            .expect("valid tool name");
+
+        assert_eq!(tool.name, "no_params_with_state");
+
+        // Should work with empty args
+        let result = tool.call(serde_json::json!({})).await.unwrap();
+        assert!(!result.is_error);
+        assert_eq!(result.first_text().unwrap(), "state: shared_value");
 
         // Check input schema is an empty-properties object
         let schema = tool.definition().input_schema;
