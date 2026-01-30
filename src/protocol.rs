@@ -1359,10 +1359,13 @@ impl CallToolResult {
         }
     }
 
-    /// Create a JSON result with structured content.
+    /// Create a JSON result with structured content from a [`serde_json::Value`].
     ///
     /// The JSON value is serialized to pretty-printed text for display,
     /// and also stored in `structured_content` for programmatic access.
+    ///
+    /// If you have a type that implements [`serde::Serialize`], use
+    /// [`from_serialize`](Self::from_serialize) instead to avoid manual `to_value()` calls.
     pub fn json(value: Value) -> Self {
         let text = serde_json::to_string_pretty(&value).unwrap_or_default();
         Self {
