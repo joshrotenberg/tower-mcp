@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+## [0.3.0] - 2026-01-31
+
+### Features
+
+- API consistency audit for 0.3.0 ([#278](https://github.com/joshrotenberg/tower-mcp/pull/278))
+
+
+
 ## [0.2.3] - 2026-01-30
 
 ### Bug Fixes
