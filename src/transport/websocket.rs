@@ -36,7 +36,7 @@
 //! # Sampling Support
 //!
 //! The WebSocket transport supports server-to-client requests like sampling.
-//! Use [`WebSocketTransport::with_sampling`] to enable this feature:
+//! Use [`WebSocketTransport::new`] with [`with_sampling`](WebSocketTransport::with_sampling) to enable:
 //!
 //! ```rust,no_run
 //! use tower_mcp::{BoxError, McpRouter, ToolBuilder, CallToolResult, CreateMessageParams, SamplingMessage};
@@ -61,7 +61,7 @@
 //!         .server_info("my-server", "1.0.0")
 //!         .tool(tool);
 //!
-//!     let transport = WebSocketTransport::with_sampling(router);
+//!     let transport = WebSocketTransport::new(router).with_sampling();
 //!     transport.serve("127.0.0.1:3000").await?;
 //!     Ok(())
 //! }
@@ -192,18 +192,13 @@ impl WebSocketTransport {
         }
     }
 
-    /// Create a new WebSocket transport with sampling support enabled
+    /// Enable sampling support for this transport.
     ///
     /// When sampling is enabled, tool handlers can use `ctx.sample()` to
     /// request LLM completions from connected clients.
-    pub fn with_sampling(router: McpRouter) -> Self {
-        Self {
-            router,
-            sampling_enabled: true,
-            service_factory: identity_factory(),
-            #[cfg(feature = "oauth")]
-            oauth_config: None,
-        }
+    pub fn with_sampling(mut self) -> Self {
+        self.sampling_enabled = true;
+        self
     }
 
     /// Configure OAuth 2.1 Protected Resource Metadata for this transport.

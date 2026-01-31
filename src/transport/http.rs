@@ -13,7 +13,7 @@
 //!
 //! ## Sampling (Server-to-Client Requests)
 //!
-//! When using `HttpTransport::with_sampling()`, tool handlers can request
+//! When using `HttpTransport::new(router).with_sampling()`, tool handlers can request
 //! LLM completions from the client. The flow is:
 //!
 //! 1. Tool handler calls `ctx.sample(params)`
@@ -538,7 +538,7 @@ impl HttpTransport {
         }
     }
 
-    /// Create a new HTTP transport with sampling support enabled
+    /// Enable sampling support for this transport.
     ///
     /// When sampling is enabled, tool handlers can use `ctx.sample()` to
     /// request LLM completions from connected clients. The server sends
@@ -569,22 +569,14 @@ impl HttpTransport {
     ///         .server_info("my-server", "1.0.0")
     ///         .tool(tool);
     ///
-    ///     let transport = HttpTransport::with_sampling(router);
+    ///     let transport = HttpTransport::new(router).with_sampling();
     ///     transport.serve("127.0.0.1:3000").await?;
     ///     Ok(())
     /// }
     /// ```
-    pub fn with_sampling(router: McpRouter) -> Self {
-        Self {
-            router,
-            validate_origin: true,
-            allowed_origins: vec![],
-            session_config: SessionConfig::default(),
-            sampling_enabled: true,
-            service_factory: identity_factory(),
-            #[cfg(feature = "oauth")]
-            oauth_config: None,
-        }
+    pub fn with_sampling(mut self) -> Self {
+        self.sampling_enabled = true;
+        self
     }
 
     /// Disable Origin header validation (not recommended for production)

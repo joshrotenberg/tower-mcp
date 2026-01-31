@@ -34,7 +34,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         router = router.prompt(prompt);
     }
 
-    let transport = HttpTransport::with_sampling(router);
+    let transport = HttpTransport::new(router).with_sampling();
 
     let app = transport.into_router_at("/mcp");
 

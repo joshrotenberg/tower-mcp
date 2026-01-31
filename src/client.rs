@@ -91,31 +91,51 @@ impl<T: ClientTransport> McpClient<T> {
         }
     }
 
-    /// Create a new MCP client with roots capability
+    /// Configure roots for this client.
     ///
-    /// The client will declare roots support during initialization.
-    pub fn with_roots(transport: T, roots: Vec<Root>) -> Self {
-        Self {
-            transport,
-            initialized: false,
-            server_info: None,
-            capabilities: ClientCapabilities {
-                roots: Some(RootsCapability { list_changed: true }),
-                ..Default::default()
-            },
-            roots,
-        }
+    /// The client will declare roots support during initialization and
+    /// provide these roots when requested by the server.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use tower_mcp::client::{McpClient, StdioClientTransport};
+    /// use tower_mcp::protocol::Root;
+    ///
+    /// # async fn example() -> Result<(), tower_mcp::BoxError> {
+    /// let transport = StdioClientTransport::spawn("server", &[]).await?;
+    /// let client = McpClient::new(transport)
+    ///     .with_roots(vec![Root { uri: "file:///project".into(), name: Some("Project".into()) }]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_roots(mut self, roots: Vec<Root>) -> Self {
+        self.roots = roots;
+        self.capabilities.roots = Some(RootsCapability { list_changed: true });
+        self
     }
 
-    /// Create a new MCP client with custom capabilities
-    pub fn with_capabilities(transport: T, capabilities: ClientCapabilities) -> Self {
-        Self {
-            transport,
-            initialized: false,
-            server_info: None,
-            capabilities,
-            roots: Vec::new(),
-        }
+    /// Configure custom capabilities for this client.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use tower_mcp::client::{McpClient, StdioClientTransport};
+    /// use tower_mcp::protocol::ClientCapabilities;
+    ///
+    /// # async fn example() -> Result<(), tower_mcp::BoxError> {
+    /// let transport = StdioClientTransport::spawn("server", &[]).await?;
+    /// let client = McpClient::new(transport)
+    ///     .with_capabilities(ClientCapabilities {
+    ///         sampling: Some(Default::default()),
+    ///         ..Default::default()
+    ///     });
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_capabilities(mut self, capabilities: ClientCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
     }
 
     /// Get the server info (available after initialization)
@@ -825,7 +845,7 @@ mod tests {
     async fn test_with_roots() {
         let roots = vec![Root::new("file:///test")];
         let transport = MockTransport::with_responses(vec![mock_initialize_response()]);
-        let client = McpClient::with_roots(transport, roots);
+        let client = McpClient::new(transport).with_roots(roots);
 
         assert_eq!(client.roots().len(), 1);
         assert!(client.capabilities.roots.is_some());
@@ -839,7 +859,7 @@ mod tests {
         };
 
         let transport = MockTransport::with_responses(vec![mock_initialize_response()]);
-        let client = McpClient::with_capabilities(transport, capabilities);
+        let client = McpClient::new(transport).with_capabilities(capabilities);
 
         assert!(client.capabilities.sampling.is_some());
     }
@@ -851,7 +871,7 @@ mod tests {
             Root::with_name("file:///project2", "Project 2"),
         ];
         let transport = MockTransport::new();
-        let client = McpClient::with_roots(transport, roots);
+        let client = McpClient::new(transport).with_roots(roots);
 
         let result = client.list_roots();
         assert_eq!(result.roots.len(), 2);

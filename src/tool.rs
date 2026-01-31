@@ -607,7 +607,7 @@ impl ToolBuilder {
         })
     }
 
-    /// Create a tool with no parameters but with shared state
+    /// Create a tool with shared state but no parameters.
     ///
     /// Use this for tools that need access to shared state (e.g., a connection pool,
     /// configuration, or shared registry) but don't take any input parameters.
@@ -626,14 +626,14 @@ impl ToolBuilder {
     ///
     /// let tool = ToolBuilder::new("get_version")
     ///     .description("Get the server version")
-    ///     .handler_no_params_with_state(config, |config: Arc<Config>| async move {
+    ///     .handler_with_state_no_params(config, |config: Arc<Config>| async move {
     ///         Ok(CallToolResult::text(&config.version))
     ///     })
     ///     .expect("valid tool name");
     ///
     /// assert_eq!(tool.name, "get_version");
     /// ```
-    pub fn handler_no_params_with_state<S, F, Fut>(self, state: S, handler: F) -> Result<Tool>
+    pub fn handler_with_state_no_params<S, F, Fut>(self, state: S, handler: F) -> Result<Tool>
     where
         S: Clone + Send + Sync + 'static,
         F: Fn(S) -> Fut + Send + Sync + 'static,
@@ -648,6 +648,108 @@ impl ToolBuilder {
             icons: self.icons,
             annotations: self.annotations,
             handler: Arc::new(NoParamsWithStateHandler { state, handler }),
+        })
+    }
+
+    /// Deprecated: Use [`handler_with_state_no_params`](Self::handler_with_state_no_params) instead.
+    #[deprecated(
+        since = "0.3.0",
+        note = "renamed to handler_with_state_no_params for consistency"
+    )]
+    pub fn handler_no_params_with_state<S, F, Fut>(self, state: S, handler: F) -> Result<Tool>
+    where
+        S: Clone + Send + Sync + 'static,
+        F: Fn(S) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
+    {
+        self.handler_with_state_no_params(state, handler)
+    }
+
+    /// Create a tool with no parameters but with request context.
+    ///
+    /// Use this for tools that need access to `RequestContext` for progress
+    /// reporting, cancellation, sampling, and logging, but don't take any
+    /// input parameters.
+    ///
+    /// Returns an error if the tool name is invalid.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::{ToolBuilder, CallToolResult, RequestContext};
+    ///
+    /// let tool = ToolBuilder::new("health_check")
+    ///     .description("Check server health")
+    ///     .handler_no_params_with_context(|ctx: RequestContext| async move {
+    ///         // Can use ctx for progress, cancellation, sampling, logging
+    ///         if ctx.is_cancelled() {
+    ///             return Ok(CallToolResult::error("Cancelled"));
+    ///         }
+    ///         Ok(CallToolResult::text("OK"))
+    ///     })
+    ///     .expect("valid tool name");
+    /// ```
+    pub fn handler_no_params_with_context<F, Fut>(self, handler: F) -> Result<Tool>
+    where
+        F: Fn(RequestContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
+    {
+        validate_tool_name(&self.name)?;
+        Ok(Tool {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            output_schema: self.output_schema,
+            icons: self.icons,
+            annotations: self.annotations,
+            handler: Arc::new(NoParamsWithContextHandler { handler }),
+        })
+    }
+
+    /// Create a tool with shared state and request context but no parameters.
+    ///
+    /// Combines state injection with `RequestContext` access for tools that need
+    /// both but don't take any input parameters.
+    ///
+    /// Returns an error if the tool name is invalid.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::sync::Arc;
+    /// use tower_mcp::{ToolBuilder, CallToolResult, RequestContext};
+    ///
+    /// struct Config { version: String }
+    ///
+    /// let config = Arc::new(Config { version: "1.0.0".to_string() });
+    ///
+    /// let tool = ToolBuilder::new("version_with_progress")
+    ///     .description("Get version with progress reporting")
+    ///     .handler_with_state_and_context_no_params(config, |config: Arc<Config>, ctx: RequestContext| async move {
+    ///         ctx.report_progress(1.0, Some(1.0), Some("Done")).await;
+    ///         Ok(CallToolResult::text(&config.version))
+    ///     })
+    ///     .expect("valid tool name");
+    /// ```
+    pub fn handler_with_state_and_context_no_params<S, F, Fut>(
+        self,
+        state: S,
+        handler: F,
+    ) -> Result<Tool>
+    where
+        S: Clone + Send + Sync + 'static,
+        F: Fn(S, RequestContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
+    {
+        validate_tool_name(&self.name)?;
+        Ok(Tool {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            output_schema: self.output_schema,
+            icons: self.icons,
+            annotations: self.annotations,
+            handler: Arc::new(NoParamsWithStateAndContextHandler { state, handler }),
         })
     }
 
@@ -691,6 +793,92 @@ impl ToolBuilder {
             icons: self.icons,
             annotations: self.annotations,
             handler: Arc::new(RawContextHandler { handler }),
+        })
+    }
+
+    /// Create a tool with raw JSON handling and shared state.
+    ///
+    /// The handler receives raw JSON arguments along with shared state.
+    /// No automatic deserialization is performed.
+    ///
+    /// Returns an error if the tool name is invalid.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::sync::Arc;
+    /// use tower_mcp::{ToolBuilder, CallToolResult};
+    /// use serde_json::Value;
+    ///
+    /// struct Config { prefix: String }
+    ///
+    /// let config = Arc::new(Config { prefix: "result:".to_string() });
+    ///
+    /// let tool = ToolBuilder::new("process_raw")
+    ///     .description("Process raw JSON with config")
+    ///     .raw_handler_with_state(config, |config: Arc<Config>, args: Value| async move {
+    ///         Ok(CallToolResult::text(format!("{} {}", config.prefix, args)))
+    ///     })
+    ///     .expect("valid tool name");
+    /// ```
+    pub fn raw_handler_with_state<S, F, Fut>(self, state: S, handler: F) -> Result<Tool>
+    where
+        S: Clone + Send + Sync + 'static,
+        F: Fn(S, Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
+    {
+        validate_tool_name(&self.name)?;
+        Ok(Tool {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            output_schema: self.output_schema,
+            icons: self.icons,
+            annotations: self.annotations,
+            handler: Arc::new(RawWithStateHandler { state, handler }),
+        })
+    }
+
+    /// Create a tool with raw JSON handling, shared state, and request context.
+    ///
+    /// Combines raw JSON handling with state injection and `RequestContext` access.
+    ///
+    /// Returns an error if the tool name is invalid.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::sync::Arc;
+    /// use tower_mcp::{ToolBuilder, CallToolResult, RequestContext};
+    /// use serde_json::Value;
+    ///
+    /// struct Config { prefix: String }
+    ///
+    /// let config = Arc::new(Config { prefix: "result:".to_string() });
+    ///
+    /// let tool = ToolBuilder::new("process_raw_logged")
+    ///     .description("Process raw JSON with config and logging")
+    ///     .raw_handler_with_state_and_context(config, |config: Arc<Config>, ctx: RequestContext, args: Value| async move {
+    ///         ctx.report_progress(0.5, Some(1.0), Some("Processing...")).await;
+    ///         Ok(CallToolResult::text(format!("{} {}", config.prefix, args)))
+    ///     })
+    ///     .expect("valid tool name");
+    /// ```
+    pub fn raw_handler_with_state_and_context<S, F, Fut>(self, state: S, handler: F) -> Result<Tool>
+    where
+        S: Clone + Send + Sync + 'static,
+        F: Fn(S, RequestContext, Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
+    {
+        validate_tool_name(&self.name)?;
+        Ok(Tool {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            output_schema: self.output_schema,
+            icons: self.icons,
+            annotations: self.annotations,
+            handler: Arc::new(RawWithStateAndContextHandler { state, handler }),
         })
     }
 }
@@ -952,6 +1140,142 @@ where
         serde_json::json!({
             "type": "object",
             "properties": {}
+        })
+    }
+}
+
+/// Handler that takes no parameters but has request context
+struct NoParamsWithContextHandler<F> {
+    handler: F,
+}
+
+impl<F, Fut> ToolHandler for NoParamsWithContextHandler<F>
+where
+    F: Fn(RequestContext) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
+{
+    fn call(&self, _args: Value) -> BoxFuture<'_, Result<CallToolResult>> {
+        let ctx = RequestContext::new(crate::protocol::RequestId::Number(0));
+        self.call_with_context(ctx, _args)
+    }
+
+    fn call_with_context(
+        &self,
+        ctx: RequestContext,
+        _args: Value,
+    ) -> BoxFuture<'_, Result<CallToolResult>> {
+        Box::pin((self.handler)(ctx))
+    }
+
+    fn uses_context(&self) -> bool {
+        true
+    }
+
+    fn input_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {}
+        })
+    }
+}
+
+/// Handler that takes no parameters but has shared state and request context
+struct NoParamsWithStateAndContextHandler<S, F> {
+    state: S,
+    handler: F,
+}
+
+impl<S, F, Fut> ToolHandler for NoParamsWithStateAndContextHandler<S, F>
+where
+    S: Clone + Send + Sync + 'static,
+    F: Fn(S, RequestContext) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
+{
+    fn call(&self, _args: Value) -> BoxFuture<'_, Result<CallToolResult>> {
+        let ctx = RequestContext::new(crate::protocol::RequestId::Number(0));
+        self.call_with_context(ctx, _args)
+    }
+
+    fn call_with_context(
+        &self,
+        ctx: RequestContext,
+        _args: Value,
+    ) -> BoxFuture<'_, Result<CallToolResult>> {
+        let state = self.state.clone();
+        Box::pin((self.handler)(state, ctx))
+    }
+
+    fn uses_context(&self) -> bool {
+        true
+    }
+
+    fn input_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {}
+        })
+    }
+}
+
+/// Handler that works with raw JSON and shared state
+struct RawWithStateHandler<S, F> {
+    state: S,
+    handler: F,
+}
+
+impl<S, F, Fut> ToolHandler for RawWithStateHandler<S, F>
+where
+    S: Clone + Send + Sync + 'static,
+    F: Fn(S, Value) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
+{
+    fn call(&self, args: Value) -> BoxFuture<'_, Result<CallToolResult>> {
+        let state = self.state.clone();
+        Box::pin((self.handler)(state, args))
+    }
+
+    fn input_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": true
+        })
+    }
+}
+
+/// Handler that works with raw JSON, shared state, and request context
+struct RawWithStateAndContextHandler<S, F> {
+    state: S,
+    handler: F,
+}
+
+impl<S, F, Fut> ToolHandler for RawWithStateAndContextHandler<S, F>
+where
+    S: Clone + Send + Sync + 'static,
+    F: Fn(S, RequestContext, Value) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
+{
+    fn call(&self, args: Value) -> BoxFuture<'_, Result<CallToolResult>> {
+        let ctx = RequestContext::new(crate::protocol::RequestId::Number(0));
+        self.call_with_context(ctx, args)
+    }
+
+    fn call_with_context(
+        &self,
+        ctx: RequestContext,
+        args: Value,
+    ) -> BoxFuture<'_, Result<CallToolResult>> {
+        let state = self.state.clone();
+        Box::pin((self.handler)(state, ctx, args))
+    }
+
+    fn uses_context(&self) -> bool {
+        true
+    }
+
+    fn input_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": true
         })
     }
 }
@@ -1389,17 +1713,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handler_no_params_with_state() {
+    async fn test_handler_with_state_no_params() {
         let shared = Arc::new("shared_value".to_string());
 
-        let tool = ToolBuilder::new("no_params_with_state")
+        let tool = ToolBuilder::new("with_state_no_params")
             .description("Takes no parameters but has state")
-            .handler_no_params_with_state(shared, |state: Arc<String>| async move {
+            .handler_with_state_no_params(shared, |state: Arc<String>| async move {
                 Ok(CallToolResult::text(format!("state: {}", state)))
             })
             .expect("valid tool name");
 
-        assert_eq!(tool.name, "no_params_with_state");
+        assert_eq!(tool.name, "with_state_no_params");
 
         // Should work with empty args
         let result = tool.call(serde_json::json!({})).await.unwrap();
@@ -1417,6 +1741,91 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn test_handler_no_params_with_context() {
+        let tool = ToolBuilder::new("no_params_with_context")
+            .description("Takes no parameters but has context")
+            .handler_no_params_with_context(|_ctx: RequestContext| async move {
+                Ok(CallToolResult::text("context available"))
+            })
+            .expect("valid tool name");
+
+        assert_eq!(tool.name, "no_params_with_context");
+        assert!(tool.uses_context());
+
+        let result = tool.call(serde_json::json!({})).await.unwrap();
+        assert!(!result.is_error);
+        assert_eq!(result.first_text().unwrap(), "context available");
+    }
+
+    #[tokio::test]
+    async fn test_handler_with_state_and_context_no_params() {
+        let shared = Arc::new("shared".to_string());
+
+        let tool = ToolBuilder::new("state_context_no_params")
+            .description("Has state and context, no params")
+            .handler_with_state_and_context_no_params(
+                shared,
+                |state: Arc<String>, _ctx: RequestContext| async move {
+                    Ok(CallToolResult::text(format!("state: {}", state)))
+                },
+            )
+            .expect("valid tool name");
+
+        assert_eq!(tool.name, "state_context_no_params");
+        assert!(tool.uses_context());
+
+        let result = tool.call(serde_json::json!({})).await.unwrap();
+        assert!(!result.is_error);
+        assert_eq!(result.first_text().unwrap(), "state: shared");
+    }
+
+    #[tokio::test]
+    async fn test_raw_handler_with_state() {
+        let prefix = Arc::new("prefix:".to_string());
+
+        let tool = ToolBuilder::new("raw_with_state")
+            .description("Raw handler with state")
+            .raw_handler_with_state(prefix, |state: Arc<String>, args: Value| async move {
+                Ok(CallToolResult::text(format!("{} {}", state, args)))
+            })
+            .expect("valid tool name");
+
+        assert_eq!(tool.name, "raw_with_state");
+
+        let result = tool
+            .call(serde_json::json!({"key": "value"}))
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(result.first_text().unwrap().starts_with("prefix:"));
+    }
+
+    #[tokio::test]
+    async fn test_raw_handler_with_state_and_context() {
+        let prefix = Arc::new("prefix:".to_string());
+
+        let tool = ToolBuilder::new("raw_state_context")
+            .description("Raw handler with state and context")
+            .raw_handler_with_state_and_context(
+                prefix,
+                |state: Arc<String>, _ctx: RequestContext, args: Value| async move {
+                    Ok(CallToolResult::text(format!("{} {}", state, args)))
+                },
+            )
+            .expect("valid tool name");
+
+        assert_eq!(tool.name, "raw_state_context");
+        assert!(tool.uses_context());
+
+        let result = tool
+            .call(serde_json::json!({"key": "value"}))
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(result.first_text().unwrap().starts_with("prefix:"));
     }
 
     #[test]
