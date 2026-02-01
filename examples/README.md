@@ -185,6 +185,9 @@ The codegen-mcp server can help. Here's the workflow:
 
 Ask your agent to help you build:
 
+- **A Hacker News server** - The [HN API](https://github.com/HackerNews/API)
+  is perfect for learning: no auth required, simple JSON responses, and
+  lots of tool ideas (top stories, new stories, get item, get user, etc.)
 - **A Git MCP server** - Wrap git commands (status, diff, log, blame)
 - **A Docker MCP server** - Container and image management
 - **A database MCP server** - Query SQLite, PostgreSQL, or Redis
