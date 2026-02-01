@@ -133,6 +133,18 @@ impl From<Violation> for ViolationInfo {
     }
 }
 
+/// Result of listing available rules.
+///
+/// Wraps the rules array in an object for MCP structuredContent compatibility.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RulesListResult {
+    /// List of available lint rules
+    pub rules: Vec<RuleInfo>,
+
+    /// Total number of rules
+    pub total: usize,
+}
+
 /// Result of applying automatic fixes to content.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct FixResult {
