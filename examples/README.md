@@ -77,14 +77,50 @@ notifications, sampling, and elicitation.
 ### 5. tower-mcp-example
 
 The simplest possible MCP server - echo, add, and reverse tools. Good
-starting point for understanding the basics.
+starting point for understanding the basics. This server is
+self-documenting: it serves its own source code as a resource!
 
 **Try these:**
 
 - "Echo 'Hello World' using tower-mcp-example"
 - "Reverse the string 'tower-mcp'"
+- "Read the source://stdio_server.rs resource from tower-mcp-example"
 
 **Source:** `examples/stdio_server.rs`
+
+## How It's Built
+
+Ask your agent to read the `source://stdio_server.rs` resource from
+tower-mcp-example. You'll see the complete server in ~90 lines.
+
+Here's the key pattern - defining a tool:
+
+```rust
+let echo = ToolBuilder::new("echo")
+    .description("Echo a message back")
+    .handler(|input: EchoInput| async move {
+        Ok(CallToolResult::text(input.message))
+    })
+    .build()?;
+```
+
+And the input type with automatic JSON Schema generation:
+
+```rust
+#[derive(Debug, Deserialize, JsonSchema)]
+struct EchoInput {
+    /// The message to echo back  <-- becomes the schema description
+    message: String,
+}
+```
+
+That's the core pattern. For more complex examples:
+
+- **Shared state**: `examples/markdownlint-mcp/src/tools.rs` - tools
+  sharing a lint engine via `Arc<LintState>`
+- **External APIs**: `examples/weather_server.rs` - calling the NWS API
+- **Resources**: `examples/crates-mcp/src/resources/` - dynamic content
+- **Full application**: `examples/crates-mcp/` - tools, resources, prompts
 
 ## What You Just Explored
 
