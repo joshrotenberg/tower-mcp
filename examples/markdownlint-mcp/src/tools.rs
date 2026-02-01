@@ -57,7 +57,7 @@ use serde::Deserialize;
 use tower_mcp::protocol::{Content, GetPromptResult, PromptMessage, PromptRole};
 use tower_mcp::{CallToolResult, Prompt, PromptBuilder, Tool, ToolBuilder};
 
-use crate::engine::LintState;
+use crate::engine::{LintState, RulesListResult};
 
 // =============================================================================
 // Tool Input Types
@@ -256,7 +256,11 @@ fn build_list_rules_tool(state: Arc<LintState>) -> Tool {
         .description("List all available lint rules with their descriptions")
         .handler_with_state_no_params(state, |state: Arc<LintState>| async move {
             let rules = state.rules();
-            CallToolResult::from_serialize(&rules)
+            let result = RulesListResult {
+                total: rules.len(),
+                rules,
+            };
+            CallToolResult::from_serialize(&result)
         })
         .expect("valid tool")
 }
