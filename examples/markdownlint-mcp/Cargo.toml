@@ -1,0 +1,40 @@
+[package]
+name = "markdownlint-mcp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"  # Required by mdbook-lint
+description = "MCP server for markdown linting using mdbook-lint"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+# MCP server
+tower-mcp = { path = "../..", features = ["http"] }
+
+# Markdown linting
+mdbook-lint-core = "0.13"
+mdbook-lint-rulesets = "0.13"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1.2"
+
+# HTTP client for URL fetching
+reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "2"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Web server (for HTTP transport)
+axum = "0.8"
