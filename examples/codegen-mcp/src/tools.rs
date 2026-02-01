@@ -102,6 +102,7 @@ pub fn build_tools(state: Arc<CodegenState>) -> Vec<Tool> {
         build_add_tool(state.clone()),
         build_get_project(state.clone()),
         build_generate(state.clone()),
+        build_validate(state.clone()),
         build_reset(state.clone()),
     ]
 }
@@ -250,6 +251,87 @@ fn build_generate(state: Arc<CodegenState>) -> Tool {
                     Ok(CallToolResult::text(output))
                 }
                 Err(e) => Ok(CallToolResult::error(e)),
+            }
+        })
+        .expect("valid tool")
+}
+
+fn build_validate(state: Arc<CodegenState>) -> Tool {
+    ToolBuilder::new("validate")
+        .description("Validate the generated code compiles (runs cargo check)")
+        .read_only()
+        .handler_with_state_no_params(state, |state: Arc<CodegenState>| async move {
+            let project = state.project.read().await;
+
+            // Generate the code
+            let code = match generate_code(&project) {
+                Ok(code) => code,
+                Err(e) => return Ok(CallToolResult::error(e)),
+            };
+
+            // Create temp directory
+            let temp_dir = match tempfile::tempdir() {
+                Ok(dir) => dir,
+                Err(e) => {
+                    return Ok(CallToolResult::error(format!(
+                        "Failed to create temp dir: {}",
+                        e
+                    )));
+                }
+            };
+
+            let project_dir = temp_dir.path();
+            let src_dir = project_dir.join("src");
+
+            // Create src directory
+            if let Err(e) = std::fs::create_dir_all(&src_dir) {
+                return Ok(CallToolResult::error(format!(
+                    "Failed to create src dir: {}",
+                    e
+                )));
+            }
+
+            // Write Cargo.toml
+            if let Err(e) = std::fs::write(project_dir.join("Cargo.toml"), &code.cargo_toml) {
+                return Ok(CallToolResult::error(format!(
+                    "Failed to write Cargo.toml: {}",
+                    e
+                )));
+            }
+
+            // Write main.rs
+            if let Err(e) = std::fs::write(src_dir.join("main.rs"), &code.main_rs) {
+                return Ok(CallToolResult::error(format!(
+                    "Failed to write main.rs: {}",
+                    e
+                )));
+            }
+
+            // Run cargo check
+            let output = match std::process::Command::new("cargo")
+                .arg("check")
+                .current_dir(project_dir)
+                .output()
+            {
+                Ok(output) => output,
+                Err(e) => {
+                    return Ok(CallToolResult::error(format!(
+                        "Failed to run cargo check: {}",
+                        e
+                    )));
+                }
+            };
+
+            if output.status.success() {
+                Ok(CallToolResult::text(
+                    "Validation successful! Generated code compiles.",
+                ))
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                Ok(CallToolResult::error(format!(
+                    "Compilation failed:\n{}",
+                    stderr
+                )))
             }
         })
         .expect("valid tool")
