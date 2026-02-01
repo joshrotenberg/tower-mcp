@@ -96,12 +96,19 @@ self-documenting: it serves its own source code as a resource!
 An MCP server that helps you build MCP servers. Define your server
 incrementally through tool calls, then generate complete Rust code.
 
-**Try these:**
+**Try these (tools):**
 
 - "Initialize a project called my-server with stdio transport"
 - "Add an echo tool that takes a message string"
-- "Generate the code for my server"
+- "Remove the echo tool"
 - "Validate that the generated code compiles"
+- "Generate the code for my server"
+
+**Try these (resources):**
+
+- "Read project://Cargo.toml from codegen-mcp"
+- "Read project://src/main.rs from codegen-mcp"
+- "Read project://state.json from codegen-mcp"
 
 **Source:** `examples/codegen-mcp/`
 
