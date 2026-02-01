@@ -287,8 +287,8 @@ fn build_generate(state: Arc<CodegenState>) -> Tool {
             match generate_code(&project) {
                 Ok(code) => {
                     let output = format!(
-                        "# Generated Code\n\n## Cargo.toml\n\n```toml\n{}\n```\n\n## src/main.rs\n\n```rust\n{}\n```",
-                        code.cargo_toml, code.main_rs
+                        "# Generated Code\n\n## Cargo.toml\n\n```toml\n{}\n```\n\n## src/main.rs\n\n```rust\n{}\n```\n\n## README.md\n\n{}\n\n---\n\n**What's next?** You can stop here and implement the handlers manually, or keep using codegen-mcp to add more tools. Read `project://README.md` for details.",
+                        code.cargo_toml, code.main_rs, code.readme_md
                     );
                     Ok(CallToolResult::text(output))
                 }

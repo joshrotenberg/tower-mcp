@@ -14,6 +14,7 @@ pub fn build_resources(state: Arc<CodegenState>) -> Vec<Resource> {
     vec![
         build_cargo_toml_resource(state.clone()),
         build_main_rs_resource(state.clone()),
+        build_readme_resource(state.clone()),
         build_state_resource(state.clone()),
     ]
 }
@@ -72,6 +73,37 @@ fn build_main_rs_resource(state: Arc<CodegenState>) -> Resource {
                     contents: vec![ResourceContent {
                         uri: "project://src/main.rs".to_string(),
                         mime_type: Some("text/x-rust".to_string()),
+                        text: Some(text),
+                        blob: None,
+                    }],
+                })
+            }
+        })
+}
+
+fn build_readme_resource(state: Arc<CodegenState>) -> Resource {
+    ResourceBuilder::new("project://README.md")
+        .name("Generated README.md")
+        .description("A README with getting started instructions")
+        .mime_type("text/markdown")
+        .handler(move || {
+            let state = state.clone();
+            async move {
+                let project = state.project.read().await;
+
+                let text = if !project.initialized {
+                    "# Project not initialized\n\nCall `init_project` first.".to_string()
+                } else {
+                    match generate_code(&project) {
+                        Ok(code) => code.readme_md,
+                        Err(e) => format!("# Error\n\n{}", e),
+                    }
+                };
+
+                Ok(ReadResourceResult {
+                    contents: vec![ResourceContent {
+                        uri: "project://README.md".to_string(),
+                        mime_type: Some("text/markdown".to_string()),
                         text: Some(text),
                         blob: None,
                     }],

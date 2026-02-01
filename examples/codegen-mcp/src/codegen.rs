@@ -15,6 +15,7 @@ pub fn generate_code(state: &ProjectState) -> Result<GeneratedCode, String> {
     Ok(GeneratedCode {
         cargo_toml: generate_cargo_toml(state, name),
         main_rs: generate_main_rs(state),
+        readme_md: generate_readme(state, name),
     })
 }
 
@@ -22,6 +23,7 @@ pub fn generate_code(state: &ProjectState) -> Result<GeneratedCode, String> {
 pub struct GeneratedCode {
     pub cargo_toml: String,
     pub main_rs: String,
+    pub readme_md: String,
 }
 
 /// Generate Cargo.toml content.
@@ -67,6 +69,119 @@ serde = {{ version = "1", features = ["derive"] }}
 schemars = "1.2"
 tracing = "0.1"
 tracing-subscriber = {{ version = "0.3", features = ["env-filter"] }}
+"#
+    )
+}
+
+/// Generate README.md content.
+fn generate_readme(state: &ProjectState, name: &str) -> String {
+    let description = state
+        .description
+        .as_deref()
+        .unwrap_or("An MCP server built with tower-mcp");
+
+    let tool_list = if state.tools.is_empty() {
+        "No tools defined yet.".to_string()
+    } else {
+        state
+            .tools
+            .iter()
+            .map(|t| format!("- **{}** - {}", t.name, t.description))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let transport_info =
+        if state.transports.is_empty() || state.transports.contains(&Transport::Stdio) {
+            "stdio (run as a child process)"
+        } else if state.transports.contains(&Transport::Http) {
+            "HTTP (run as a web server)"
+        } else {
+            "WebSocket"
+        };
+
+    format!(
+        r#"# {name}
+
+{description}
+
+## Tools
+
+{tool_list}
+
+## Getting Started
+
+1. **Build the server:**
+   ```bash
+   cargo build --release
+   ```
+
+2. **Run the server:**
+   ```bash
+   cargo run
+   ```
+
+   Transport: {transport_info}
+
+3. **Add to your MCP client** (e.g., Claude Code's `.mcp.json`):
+   ```json
+   {{
+     "{name}": {{
+       "command": "cargo",
+       "args": ["run", "--manifest-path", "path/to/{name}/Cargo.toml"]
+     }}
+   }}
+   ```
+
+## What's Next?
+
+You now have a working MCP server skeleton. You can:
+
+**Option A: Stop here and implement manually**
+
+The generated code compiles and runs. Open `src/main.rs`, find the
+`// TODO: implement` comments, and add your logic. You have everything
+you need.
+
+**Option B: Keep using codegen-mcp**
+
+Continue adding tools, resources, or prompts interactively. The server
+will regenerate as you make changes.
+
+## Implementing Handlers
+
+The generated handlers return debug output. To add real functionality:
+
+1. Open `src/main.rs`
+2. Find the `// TODO: implement` comments
+3. Replace the placeholder with your logic
+
+### Common patterns:
+
+**HTTP requests** - Add `reqwest` to Cargo.toml:
+```toml
+reqwest = {{ version = "0.12", features = ["json"] }}
+```
+
+**Error handling:**
+```rust
+match do_something().await {{
+    Ok(result) => Ok(CallToolResult::text(result)),
+    Err(e) => Ok(CallToolResult::text(format!("Error: {{}}", e))),
+}}
+```
+
+**Returning structured data:**
+```rust
+let data = serde_json::json!({{ "count": 42, "items": ["a", "b"] }});
+Ok(CallToolResult::text(data.to_string()))
+```
+
+## Learn More
+
+- [tower-mcp documentation](https://docs.rs/tower-mcp)
+- [MCP specification](https://modelcontextprotocol.io)
+- [Example servers](https://github.com/joshrotenberg/tower-mcp/tree/main/examples)
 "#
     )
 }
@@ -292,19 +407,22 @@ fn generate_tool_builder(tool: &ToolDef, _has_state: bool) -> String {
 
     match tool.handler_type {
         HandlerType::Simple => {
-            if let Some(input) = input_type {
+            if let Some(ref input) = input_type {
+                let example = generate_example_impl(tool, false, false);
                 code.push_str(&format!(
                     r#"        .handler(|input: {}| async move {{
             // TODO: implement {}
+{}
             Ok(CallToolResult::text(format!("{{:?}}", input)))
         }})
 "#,
-                    input, tool.name
+                    input, tool.name, example
                 ));
             } else {
                 code.push_str(&format!(
                     r#"        .handler_no_params(|| async move {{
             // TODO: implement {}
+            // Example: Ok(CallToolResult::text("Done!"))
             Ok(CallToolResult::text("OK"))
         }})
 "#,
@@ -313,19 +431,22 @@ fn generate_tool_builder(tool: &ToolDef, _has_state: bool) -> String {
             }
         }
         HandlerType::WithState => {
-            if let Some(input) = input_type {
+            if let Some(ref input) = input_type {
+                let example = generate_example_impl(tool, true, false);
                 code.push_str(&format!(
-                    r#"        .handler_with_state(state.clone(), |_state: Arc<AppState>, input: {}| async move {{
-            // TODO: implement {} (use _state for shared state)
+                    r#"        .handler_with_state(state.clone(), |state: Arc<AppState>, input: {}| async move {{
+            // TODO: implement {}
+{}
             Ok(CallToolResult::text(format!("{{:?}}", input)))
         }})
 "#,
-                    input, tool.name
+                    input, tool.name, example
                 ));
             } else {
                 code.push_str(&format!(
-                    r#"        .handler_with_state_no_params(state.clone(), |_state: Arc<AppState>| async move {{
-            // TODO: implement {} (use _state for shared state)
+                    r#"        .handler_with_state_no_params(state.clone(), |state: Arc<AppState>| async move {{
+            // TODO: implement {}
+            // Example: let data = state.db.query(...).await?;
             Ok(CallToolResult::text("OK"))
         }})
 "#,
@@ -334,19 +455,22 @@ fn generate_tool_builder(tool: &ToolDef, _has_state: bool) -> String {
             }
         }
         HandlerType::WithContext => {
-            if let Some(input) = input_type {
+            if let Some(ref input) = input_type {
+                let example = generate_example_impl(tool, false, true);
                 code.push_str(&format!(
-                    r#"        .handler_with_context(|_ctx: RequestContext, input: {}| async move {{
-            // TODO: implement {} (use _ctx for notifications, sampling, etc.)
+                    r#"        .handler_with_context(|ctx: RequestContext, input: {}| async move {{
+            // TODO: implement {}
+{}
             Ok(CallToolResult::text(format!("{{:?}}", input)))
         }})
 "#,
-                    input, tool.name
+                    input, tool.name, example
                 ));
             } else {
                 code.push_str(&format!(
-                    r#"        .handler_no_params_with_context(|_ctx: RequestContext| async move {{
-            // TODO: implement {} (use _ctx for notifications, sampling, etc.)
+                    r#"        .handler_no_params_with_context(|ctx: RequestContext| async move {{
+            // TODO: implement {}
+            // Example: ctx.send_progress(0.5, Some(50), Some("Halfway done")).await;
             Ok(CallToolResult::text("OK"))
         }})
 "#,
@@ -355,19 +479,25 @@ fn generate_tool_builder(tool: &ToolDef, _has_state: bool) -> String {
             }
         }
         HandlerType::WithStateAndContext => {
-            if let Some(input) = input_type {
+            if let Some(ref input) = input_type {
+                let example = generate_example_impl(tool, true, true);
                 code.push_str(&format!(
-                    r#"        .handler_with_state_and_context(state.clone(), |_state: Arc<AppState>, _ctx: RequestContext, input: {}| async move {{
+                    r#"        .handler_with_state_and_context(state.clone(), |state: Arc<AppState>, ctx: RequestContext, input: {}| async move {{
             // TODO: implement {}
+{}
             Ok(CallToolResult::text(format!("{{:?}}", input)))
         }})
 "#,
-                    input, tool.name
+                    input, tool.name, example
                 ));
             } else {
                 code.push_str(&format!(
-                    r#"        .handler_with_state_and_context_no_params(state.clone(), |_state: Arc<AppState>, _ctx: RequestContext| async move {{
+                    r#"        .handler_with_state_and_context_no_params(state.clone(), |state: Arc<AppState>, ctx: RequestContext| async move {{
             // TODO: implement {}
+            // Example:
+            //   ctx.send_progress(0.0, Some(0), Some("Starting")).await;
+            //   let result = state.client.fetch(...).await?;
+            //   ctx.send_progress(1.0, Some(100), Some("Done")).await;
             Ok(CallToolResult::text("OK"))
         }})
 "#,
@@ -379,6 +509,9 @@ fn generate_tool_builder(tool: &ToolDef, _has_state: bool) -> String {
             code.push_str(&format!(
                 r#"        .raw_handler(|args: serde_json::Value| async move {{
             // TODO: implement {}
+            // Example:
+            //   let id = args.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+            //   Ok(CallToolResult::text(format!("Got id: {{}}", id)))
             Ok(CallToolResult::text(format!("{{}}", args)))
         }})
 "#,
@@ -389,6 +522,7 @@ fn generate_tool_builder(tool: &ToolDef, _has_state: bool) -> String {
             code.push_str(&format!(
                 r#"        .handler_no_params(|| async move {{
             // TODO: implement {}
+            // Example: Ok(CallToolResult::text("Done!"))
             Ok(CallToolResult::text("OK"))
         }})
 "#,
@@ -399,6 +533,49 @@ fn generate_tool_builder(tool: &ToolDef, _has_state: bool) -> String {
 
     code.push_str("        .build()?;\n");
     code
+}
+
+/// Generate example implementation comments based on input fields.
+fn generate_example_impl(tool: &ToolDef, has_state: bool, has_context: bool) -> String {
+    let mut lines = vec!["            // Example:".to_string()];
+
+    // Add context example if available
+    if has_context {
+        lines.push(
+            "            //   ctx.send_progress(0.5, Some(50), Some(\"Processing\")).await;"
+                .to_string(),
+        );
+    }
+
+    // Generate field usage examples
+    if !tool.input_fields.is_empty() {
+        let field = &tool.input_fields[0];
+        let field_example = match field.field_type.to_lowercase().as_str() {
+            "string" => format!(
+                "            //   let result = format!(\"Got: {{}}\", input.{});",
+                field.name
+            ),
+            "i64" | "int" | "integer" => {
+                format!("            //   let doubled = input.{} * 2;", field.name)
+            }
+            "bool" | "boolean" => format!(
+                "            //   if input.{} {{ /* do something */ }}",
+                field.name
+            ),
+            _ => format!("            //   let value = &input.{};", field.name),
+        };
+        lines.push(field_example);
+    }
+
+    // Add state example if available
+    if has_state {
+        lines.push("            //   let data = state.client.fetch(...).await?;".to_string());
+    }
+
+    // Add return example
+    lines.push("            //   Ok(CallToolResult::text(result))".to_string());
+
+    lines.join("\n")
 }
 
 /// Convert snake_case to PascalCase.
