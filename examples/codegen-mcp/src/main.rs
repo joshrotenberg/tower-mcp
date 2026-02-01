@@ -5,9 +5,16 @@
 //!
 //! 1. `init_project` - Initialize a new project with name and transports
 //! 2. `add_tool` - Add tools with input fields and handler types
-//! 3. `get_project` - Inspect the current project state
-//! 4. `generate` - Generate complete, compilable Rust code
-//! 5. `reset` - Start over with a new project
+//! 3. `get_project` - Inspect the current project state (or read project:// resources)
+//! 4. `validate` - Verify the generated code compiles
+//! 5. `generate` - Generate complete, compilable Rust code
+//! 6. `reset` - Start over with a new project
+//!
+//! ## Resources
+//!
+//! - `project://Cargo.toml` - Generated Cargo.toml content
+//! - `project://src/main.rs` - Generated main.rs content
+//! - `project://state.json` - Current project state as JSON
 //!
 //! ## Example
 //!
@@ -20,10 +27,12 @@
 //!      description="Echo a message back",
 //!      input_fields=[{name: "message", type: "String", description: "Message to echo"}]
 //!    )
-//! 3. generate() -> Complete Cargo.toml and main.rs
+//! 3. validate() -> Check it compiles
+//! 4. generate() -> Complete Cargo.toml and main.rs
 //! ```
 
 mod codegen;
+mod resources;
 mod state;
 mod tools;
 
@@ -32,6 +41,7 @@ use std::sync::Arc;
 use clap::Parser;
 use tower_mcp::{McpRouter, StdioTransport};
 
+use resources::build_resources;
 use tools::{CodegenState, build_tools};
 
 #[derive(Parser)]
@@ -55,20 +65,26 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     // Create shared state
     let state = Arc::new(CodegenState::new());
 
-    // Build tools
-    let tools = build_tools(state);
+    // Build tools and resources
+    let tools = build_tools(state.clone());
+    let resources = build_resources(state);
 
     // Create router
     let mut router = McpRouter::new()
         .server_info("codegen-mcp", env!("CARGO_PKG_VERSION"))
         .instructions(
             "This server helps you build tower-mcp servers. Use init_project to start, \
-             add_tool to define tools, and generate to get the code. Call get_project \
-             to see current state, or reset to start over.",
+             add_tool to define tools, and generate to get the code. Read project:// \
+             resources to see generated files, or call get_project for the full state. \
+             Use validate to check the code compiles, or reset to start over.",
         );
 
     for tool in tools {
         router = router.tool(tool);
+    }
+
+    for resource in resources {
+        router = router.resource(resource);
     }
 
     // Run transport
