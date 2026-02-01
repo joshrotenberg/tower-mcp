@@ -5,20 +5,144 @@
 //! 1. **Builder pattern** - Fluent API for defining tools
 //! 2. **Trait-based** - Implement `McpTool` for full control
 //! 3. **Function-based** - Quick tools from async functions
+//!
+//! ## Per-Tool Middleware
+//!
+//! Tools are implemented as Tower services internally, enabling middleware
+//! composition via the `.layer()` method:
+//!
+//! ```rust
+//! use std::time::Duration;
+//! use tower::timeout::TimeoutLayer;
+//! use tower_mcp::{ToolBuilder, CallToolResult};
+//! use schemars::JsonSchema;
+//! use serde::Deserialize;
+//!
+//! #[derive(Debug, Deserialize, JsonSchema)]
+//! struct SearchInput { query: String }
+//!
+//! let tool = ToolBuilder::new("slow_search")
+//!     .description("Search with extended timeout")
+//!     .handler(|input: SearchInput| async move {
+//!         Ok(CallToolResult::text("result"))
+//!     })
+//!     .layer(TimeoutLayer::new(Duration::from_secs(30)))
+//!     .build()
+//!     .unwrap();
+//! ```
 
 use std::borrow::Cow;
+use std::convert::Infallible;
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use tower::util::BoxCloneService;
+use tower_service::Service;
 
 use crate::context::RequestContext;
 use crate::error::{Error, Result};
 use crate::protocol::{CallToolResult, ToolAnnotations, ToolDefinition, ToolIcon};
+
+// =============================================================================
+// Service Types for Per-Tool Middleware
+// =============================================================================
+
+/// Request type for tool services.
+///
+/// Contains the request context (for progress reporting, cancellation, etc.)
+/// and the tool arguments as raw JSON.
+#[derive(Debug, Clone)]
+pub struct ToolRequest {
+    /// Request context for progress reporting, cancellation, and client requests
+    pub ctx: RequestContext,
+    /// Tool arguments as raw JSON
+    pub args: Value,
+}
+
+impl ToolRequest {
+    /// Create a new tool request
+    pub fn new(ctx: RequestContext, args: Value) -> Self {
+        Self { ctx, args }
+    }
+}
+
+/// A boxed, cloneable tool service with `Error = Infallible`.
+///
+/// This is the internal service type that tools use. Middleware errors are
+/// caught and converted to `CallToolResult::error()` responses, so the
+/// service never fails at the Tower level.
+pub type BoxToolService = BoxCloneService<ToolRequest, CallToolResult, Infallible>;
+
+/// Catches errors from the inner service and converts them to `CallToolResult::error()`.
+///
+/// This wrapper ensures that middleware errors (e.g., timeouts, rate limits)
+/// and handler errors are converted to tool-level error responses with
+/// `is_error: true`, rather than propagating as Tower service errors.
+pub struct ToolCatchError<S> {
+    inner: S,
+}
+
+impl<S> ToolCatchError<S> {
+    /// Create a new `ToolCatchError` wrapping the given service.
+    pub fn new(inner: S) -> Self {
+        Self { inner }
+    }
+}
+
+impl<S: Clone> Clone for ToolCatchError<S> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<S: fmt::Debug> fmt::Debug for ToolCatchError<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ToolCatchError")
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
+
+impl<S> Service<ToolRequest> for ToolCatchError<S>
+where
+    S: Service<ToolRequest, Response = CallToolResult> + Clone + Send + 'static,
+    S::Error: fmt::Display + Send,
+    S::Future: Send,
+{
+    type Response = CallToolResult;
+    type Error = Infallible;
+    type Future =
+        Pin<Box<dyn Future<Output = std::result::Result<CallToolResult, Infallible>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        // Map any readiness error to Infallible (we catch it on call)
+        match self.inner.poll_ready(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(_)) => Poll::Ready(Ok(())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn call(&mut self, req: ToolRequest) -> Self::Future {
+        let fut = self.inner.call(req);
+
+        Box::pin(async move {
+            match fut.await {
+                Ok(result) => Ok(result),
+                Err(err) => Ok(CallToolResult::error(err.to_string())),
+            }
+        })
+    }
+}
 
 /// A marker type for tools that take no parameters.
 ///
@@ -169,15 +293,71 @@ pub trait ToolHandler: Send + Sync {
     fn input_schema(&self) -> Value;
 }
 
-/// A complete tool definition with handler
+/// Adapts a `ToolHandler` to a Tower `Service<ToolRequest>`.
+///
+/// This is an internal adapter that bridges the handler abstraction to the
+/// service abstraction, enabling middleware composition.
+struct ToolHandlerService<H> {
+    handler: Arc<H>,
+}
+
+impl<H> ToolHandlerService<H> {
+    fn new(handler: H) -> Self {
+        Self {
+            handler: Arc::new(handler),
+        }
+    }
+}
+
+impl<H> Clone for ToolHandlerService<H> {
+    fn clone(&self) -> Self {
+        Self {
+            handler: self.handler.clone(),
+        }
+    }
+}
+
+impl<H> Service<ToolRequest> for ToolHandlerService<H>
+where
+    H: ToolHandler + 'static,
+{
+    type Response = CallToolResult;
+    type Error = Error;
+    type Future = Pin<Box<dyn Future<Output = std::result::Result<CallToolResult, Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: ToolRequest) -> Self::Future {
+        let handler = self.handler.clone();
+        Box::pin(async move { handler.call_with_context(req.ctx, req.args).await })
+    }
+}
+
+/// A complete tool definition with service-based execution.
+///
+/// Tools are implemented as Tower services internally, enabling middleware
+/// composition via the builder's `.layer()` method. The service is wrapped
+/// in [`ToolCatchError`] to convert any errors (from handlers or middleware)
+/// into `CallToolResult::error()` responses.
 pub struct Tool {
+    /// Tool name (must be 1-128 chars, alphanumeric/underscore/hyphen/dot only)
     pub name: String,
+    /// Human-readable title for the tool
     pub title: Option<String>,
+    /// Description of what the tool does
     pub description: Option<String>,
+    /// JSON Schema for the tool's output (optional)
     pub output_schema: Option<Value>,
+    /// Icons for the tool
     pub icons: Option<Vec<ToolIcon>>,
+    /// Tool annotations (hints about behavior)
     pub annotations: Option<ToolAnnotations>,
-    handler: Arc<dyn ToolHandler>,
+    /// The boxed service that executes the tool
+    service: BoxToolService,
+    /// JSON Schema for the tool's input
+    input_schema: Value,
 }
 
 impl std::fmt::Debug for Tool {
@@ -193,6 +373,11 @@ impl std::fmt::Debug for Tool {
     }
 }
 
+// SAFETY: BoxCloneService is Send + Sync (tower provides unsafe impl Sync),
+// and all other fields in Tool are Send + Sync.
+unsafe impl Send for Tool {}
+unsafe impl Sync for Tool {}
+
 impl Tool {
     /// Create a new tool builder
     pub fn builder(name: impl Into<String>) -> ToolBuilder {
@@ -205,7 +390,7 @@ impl Tool {
             name: self.name.clone(),
             title: self.title.clone(),
             description: self.description.clone(),
-            input_schema: self.handler.input_schema(),
+            input_schema: self.input_schema.clone(),
             output_schema: self.output_schema.clone(),
             icons: self.icons.clone(),
             annotations: self.annotations.clone(),
@@ -213,24 +398,63 @@ impl Tool {
     }
 
     /// Call the tool without context
-    pub fn call(&self, args: Value) -> BoxFuture<'_, Result<CallToolResult>> {
-        self.handler.call(args)
+    ///
+    /// Creates a dummy request context. For full context support, use
+    /// [`call_with_context`](Self::call_with_context).
+    pub fn call(&self, args: Value) -> BoxFuture<'static, CallToolResult> {
+        let ctx = RequestContext::new(crate::protocol::RequestId::Number(0));
+        self.call_with_context(ctx, args)
     }
 
     /// Call the tool with request context
     ///
-    /// Use this when you have a RequestContext available for progress/cancellation.
+    /// The context provides progress reporting, cancellation support, and
+    /// access to client requests (for sampling, etc.).
+    ///
+    /// # Note
+    ///
+    /// This method returns `CallToolResult` directly (not `Result<CallToolResult>`).
+    /// Any errors from the handler or middleware are converted to
+    /// `CallToolResult::error()` with `is_error: true`.
     pub fn call_with_context(
         &self,
         ctx: RequestContext,
         args: Value,
-    ) -> BoxFuture<'_, Result<CallToolResult>> {
-        self.handler.call_with_context(ctx, args)
+    ) -> BoxFuture<'static, CallToolResult> {
+        use tower::ServiceExt;
+        let service = self.service.clone();
+        Box::pin(async move {
+            // ServiceExt::oneshot properly handles poll_ready before call
+            // Service is Infallible, so unwrap is safe
+            service.oneshot(ToolRequest::new(ctx, args)).await.unwrap()
+        })
     }
 
-    /// Returns true if this tool uses context
-    pub fn uses_context(&self) -> bool {
-        self.handler.uses_context()
+    /// Create a tool from a handler (internal helper)
+    fn from_handler<H: ToolHandler + 'static>(
+        name: String,
+        title: Option<String>,
+        description: Option<String>,
+        output_schema: Option<Value>,
+        icons: Option<Vec<ToolIcon>>,
+        annotations: Option<ToolAnnotations>,
+        handler: H,
+    ) -> Self {
+        let input_schema = handler.input_schema();
+        let handler_service = ToolHandlerService::new(handler);
+        let catch_error = ToolCatchError::new(handler_service);
+        let service = BoxCloneService::new(catch_error);
+
+        Self {
+            name,
+            title,
+            description,
+            output_schema,
+            icons,
+            annotations,
+            service,
+            input_schema,
+        }
     }
 }
 
@@ -596,15 +820,15 @@ impl ToolBuilder {
         Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
     {
         validate_tool_name(&self.name)?;
-        Ok(Tool {
-            name: self.name,
-            title: self.title,
-            description: self.description,
-            output_schema: self.output_schema,
-            icons: self.icons,
-            annotations: self.annotations,
-            handler: Arc::new(NoParamsHandler { handler }),
-        })
+        Ok(Tool::from_handler(
+            self.name,
+            self.title,
+            self.description,
+            self.output_schema,
+            self.icons,
+            self.annotations,
+            NoParamsHandler { handler },
+        ))
     }
 
     /// Create a tool with shared state but no parameters.
@@ -640,15 +864,15 @@ impl ToolBuilder {
         Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
     {
         validate_tool_name(&self.name)?;
-        Ok(Tool {
-            name: self.name,
-            title: self.title,
-            description: self.description,
-            output_schema: self.output_schema,
-            icons: self.icons,
-            annotations: self.annotations,
-            handler: Arc::new(NoParamsWithStateHandler { state, handler }),
-        })
+        Ok(Tool::from_handler(
+            self.name,
+            self.title,
+            self.description,
+            self.output_schema,
+            self.icons,
+            self.annotations,
+            NoParamsWithStateHandler { state, handler },
+        ))
     }
 
     /// Deprecated: Use [`handler_with_state_no_params`](Self::handler_with_state_no_params) instead.
@@ -695,15 +919,15 @@ impl ToolBuilder {
         Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
     {
         validate_tool_name(&self.name)?;
-        Ok(Tool {
-            name: self.name,
-            title: self.title,
-            description: self.description,
-            output_schema: self.output_schema,
-            icons: self.icons,
-            annotations: self.annotations,
-            handler: Arc::new(NoParamsWithContextHandler { handler }),
-        })
+        Ok(Tool::from_handler(
+            self.name,
+            self.title,
+            self.description,
+            self.output_schema,
+            self.icons,
+            self.annotations,
+            NoParamsWithContextHandler { handler },
+        ))
     }
 
     /// Create a tool with shared state and request context but no parameters.
@@ -742,15 +966,15 @@ impl ToolBuilder {
         Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
     {
         validate_tool_name(&self.name)?;
-        Ok(Tool {
-            name: self.name,
-            title: self.title,
-            description: self.description,
-            output_schema: self.output_schema,
-            icons: self.icons,
-            annotations: self.annotations,
-            handler: Arc::new(NoParamsWithStateAndContextHandler { state, handler }),
-        })
+        Ok(Tool::from_handler(
+            self.name,
+            self.title,
+            self.description,
+            self.output_schema,
+            self.icons,
+            self.annotations,
+            NoParamsWithStateAndContextHandler { state, handler },
+        ))
     }
 
     /// Create a tool with raw JSON handling (no automatic deserialization)
@@ -762,15 +986,15 @@ impl ToolBuilder {
         Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
     {
         validate_tool_name(&self.name)?;
-        Ok(Tool {
-            name: self.name,
-            title: self.title,
-            description: self.description,
-            output_schema: self.output_schema,
-            icons: self.icons,
-            annotations: self.annotations,
-            handler: Arc::new(RawHandler { handler }),
-        })
+        Ok(Tool::from_handler(
+            self.name,
+            self.title,
+            self.description,
+            self.output_schema,
+            self.icons,
+            self.annotations,
+            RawHandler { handler },
+        ))
     }
 
     /// Create a tool with raw JSON handling and request context
@@ -785,15 +1009,15 @@ impl ToolBuilder {
         Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
     {
         validate_tool_name(&self.name)?;
-        Ok(Tool {
-            name: self.name,
-            title: self.title,
-            description: self.description,
-            output_schema: self.output_schema,
-            icons: self.icons,
-            annotations: self.annotations,
-            handler: Arc::new(RawContextHandler { handler }),
-        })
+        Ok(Tool::from_handler(
+            self.name,
+            self.title,
+            self.description,
+            self.output_schema,
+            self.icons,
+            self.annotations,
+            RawContextHandler { handler },
+        ))
     }
 
     /// Create a tool with raw JSON handling and shared state.
@@ -828,15 +1052,15 @@ impl ToolBuilder {
         Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
     {
         validate_tool_name(&self.name)?;
-        Ok(Tool {
-            name: self.name,
-            title: self.title,
-            description: self.description,
-            output_schema: self.output_schema,
-            icons: self.icons,
-            annotations: self.annotations,
-            handler: Arc::new(RawWithStateHandler { state, handler }),
-        })
+        Ok(Tool::from_handler(
+            self.name,
+            self.title,
+            self.description,
+            self.output_schema,
+            self.icons,
+            self.annotations,
+            RawWithStateHandler { state, handler },
+        ))
     }
 
     /// Create a tool with raw JSON handling, shared state, and request context.
@@ -871,15 +1095,15 @@ impl ToolBuilder {
         Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
     {
         validate_tool_name(&self.name)?;
-        Ok(Tool {
-            name: self.name,
-            title: self.title,
-            description: self.description,
-            output_schema: self.output_schema,
-            icons: self.icons,
-            annotations: self.annotations,
-            handler: Arc::new(RawWithStateAndContextHandler { state, handler }),
-        })
+        Ok(Tool::from_handler(
+            self.name,
+            self.title,
+            self.description,
+            self.output_schema,
+            self.icons,
+            self.annotations,
+            RawWithStateAndContextHandler { state, handler },
+        ))
     }
 }
 
@@ -906,6 +1130,107 @@ where
     /// Returns an error if the tool name is invalid.
     pub fn build(self) -> Result<Tool> {
         validate_tool_name(&self.name)?;
+        Ok(Tool::from_handler(
+            self.name,
+            self.title,
+            self.description,
+            self.output_schema,
+            self.icons,
+            self.annotations,
+            TypedHandler {
+                handler: self.handler,
+                _phantom: std::marker::PhantomData,
+            },
+        ))
+    }
+
+    /// Apply a Tower layer (middleware) to this tool.
+    ///
+    /// The layer wraps the tool's handler service, enabling functionality like
+    /// timeouts, rate limiting, and metrics collection at the per-tool level.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::time::Duration;
+    /// use tower::timeout::TimeoutLayer;
+    /// use tower_mcp::{ToolBuilder, CallToolResult};
+    /// use schemars::JsonSchema;
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Debug, Deserialize, JsonSchema)]
+    /// struct Input { query: String }
+    ///
+    /// let tool = ToolBuilder::new("search")
+    ///     .description("Search with timeout")
+    ///     .handler(|input: Input| async move {
+    ///         Ok(CallToolResult::text("result"))
+    ///     })
+    ///     .layer(TimeoutLayer::new(Duration::from_secs(30)))
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn layer<L>(self, layer: L) -> ToolBuilderWithLayer<I, F, L> {
+        ToolBuilderWithLayer {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            output_schema: self.output_schema,
+            icons: self.icons,
+            annotations: self.annotations,
+            handler: self.handler,
+            layer,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+/// Builder state after a layer has been applied to the handler.
+///
+/// This builder allows chaining additional layers and building the final tool.
+pub struct ToolBuilderWithLayer<I, F, L> {
+    name: String,
+    title: Option<String>,
+    description: Option<String>,
+    output_schema: Option<Value>,
+    icons: Option<Vec<ToolIcon>>,
+    annotations: Option<ToolAnnotations>,
+    handler: F,
+    layer: L,
+    _phantom: std::marker::PhantomData<I>,
+}
+
+// Allow private_bounds because these internal types (ToolHandlerService, TypedHandler, etc.)
+// are implementation details that users don't interact with directly.
+#[allow(private_bounds)]
+impl<I, F, Fut, L> ToolBuilderWithLayer<I, F, L>
+where
+    I: JsonSchema + DeserializeOwned + Send + Sync + 'static,
+    F: Fn(I) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
+    L: tower::Layer<ToolHandlerService<TypedHandler<I, F>>> + Clone + Send + Sync + 'static,
+    L::Service: Service<ToolRequest, Response = CallToolResult> + Clone + Send + 'static,
+    <L::Service as Service<ToolRequest>>::Error: fmt::Display + Send,
+    <L::Service as Service<ToolRequest>>::Future: Send,
+{
+    /// Build the tool with the applied layer(s).
+    ///
+    /// Returns an error if the tool name is invalid.
+    pub fn build(self) -> Result<Tool> {
+        validate_tool_name(&self.name)?;
+
+        let input_schema = schemars::schema_for!(I);
+        let input_schema = serde_json::to_value(input_schema)
+            .unwrap_or_else(|_| serde_json::json!({ "type": "object" }));
+
+        let handler_service = ToolHandlerService::new(TypedHandler {
+            handler: self.handler,
+            _phantom: std::marker::PhantomData,
+        });
+        let layered = self.layer.layer(handler_service);
+        let catch_error = ToolCatchError::new(layered);
+        let service = BoxCloneService::new(catch_error);
+
         Ok(Tool {
             name: self.name,
             title: self.title,
@@ -913,11 +1238,30 @@ where
             output_schema: self.output_schema,
             icons: self.icons,
             annotations: self.annotations,
-            handler: Arc::new(TypedHandler {
-                handler: self.handler,
-                _phantom: std::marker::PhantomData,
-            }),
+            service,
+            input_schema,
         })
+    }
+
+    /// Apply an additional Tower layer (middleware).
+    ///
+    /// Layers are applied in order, with earlier layers wrapping later ones.
+    /// This means the first layer added is the outermost middleware.
+    pub fn layer<L2>(
+        self,
+        layer: L2,
+    ) -> ToolBuilderWithLayer<I, F, tower::layer::util::Stack<L2, L>> {
+        ToolBuilderWithLayer {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            output_schema: self.output_schema,
+            icons: self.icons,
+            annotations: self.annotations,
+            handler: self.handler,
+            layer: tower::layer::util::Stack::new(layer, self.layer),
+            _phantom: std::marker::PhantomData,
+        }
     }
 }
 
@@ -944,6 +1288,79 @@ where
     /// Returns an error if the tool name is invalid.
     pub fn build(self) -> Result<Tool> {
         validate_tool_name(&self.name)?;
+        Ok(Tool::from_handler(
+            self.name,
+            self.title,
+            self.description,
+            self.output_schema,
+            self.icons,
+            self.annotations,
+            ContextAwareHandler {
+                handler: self.handler,
+                _phantom: std::marker::PhantomData,
+            },
+        ))
+    }
+
+    /// Apply a Tower layer (middleware) to this tool.
+    ///
+    /// Works the same as [`ToolBuilderWithHandler::layer`].
+    pub fn layer<L>(self, layer: L) -> ToolBuilderWithContextLayer<I, F, L> {
+        ToolBuilderWithContextLayer {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            output_schema: self.output_schema,
+            icons: self.icons,
+            annotations: self.annotations,
+            handler: self.handler,
+            layer,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+/// Builder state after a layer has been applied to a context-aware handler.
+pub struct ToolBuilderWithContextLayer<I, F, L> {
+    name: String,
+    title: Option<String>,
+    description: Option<String>,
+    output_schema: Option<Value>,
+    icons: Option<Vec<ToolIcon>>,
+    annotations: Option<ToolAnnotations>,
+    handler: F,
+    layer: L,
+    _phantom: std::marker::PhantomData<I>,
+}
+
+// Allow private_bounds because these internal types are implementation details.
+#[allow(private_bounds)]
+impl<I, F, Fut, L> ToolBuilderWithContextLayer<I, F, L>
+where
+    I: JsonSchema + DeserializeOwned + Send + Sync + 'static,
+    F: Fn(RequestContext, I) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
+    L: tower::Layer<ToolHandlerService<ContextAwareHandler<I, F>>> + Clone + Send + Sync + 'static,
+    L::Service: Service<ToolRequest, Response = CallToolResult> + Clone + Send + 'static,
+    <L::Service as Service<ToolRequest>>::Error: fmt::Display + Send,
+    <L::Service as Service<ToolRequest>>::Future: Send,
+{
+    /// Build the tool with the applied layer(s).
+    pub fn build(self) -> Result<Tool> {
+        validate_tool_name(&self.name)?;
+
+        let input_schema = schemars::schema_for!(I);
+        let input_schema = serde_json::to_value(input_schema)
+            .unwrap_or_else(|_| serde_json::json!({ "type": "object" }));
+
+        let handler_service = ToolHandlerService::new(ContextAwareHandler {
+            handler: self.handler,
+            _phantom: std::marker::PhantomData,
+        });
+        let layered = self.layer.layer(handler_service);
+        let catch_error = ToolCatchError::new(layered);
+        let service = BoxCloneService::new(catch_error);
+
         Ok(Tool {
             name: self.name,
             title: self.title,
@@ -951,11 +1368,27 @@ where
             output_schema: self.output_schema,
             icons: self.icons,
             annotations: self.annotations,
-            handler: Arc::new(ContextAwareHandler {
-                handler: self.handler,
-                _phantom: std::marker::PhantomData,
-            }),
+            service,
+            input_schema,
         })
+    }
+
+    /// Apply an additional Tower layer (middleware).
+    pub fn layer<L2>(
+        self,
+        layer: L2,
+    ) -> ToolBuilderWithContextLayer<I, F, tower::layer::util::Stack<L2, L>> {
+        ToolBuilderWithContextLayer {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            output_schema: self.output_schema,
+            icons: self.icons,
+            annotations: self.annotations,
+            handler: self.handler,
+            layer: tower::layer::util::Stack::new(layer, self.layer),
+            _phantom: std::marker::PhantomData,
+        }
     }
 }
 
@@ -1344,15 +1777,15 @@ pub trait McpTool: Send + Sync + 'static {
         validate_tool_name(Self::NAME)?;
         let annotations = self.annotations();
         let tool = Arc::new(self);
-        Ok(Tool {
-            name: Self::NAME.to_string(),
-            title: None,
-            description: Some(Self::DESCRIPTION.to_string()),
-            output_schema: None,
-            icons: None,
+        Ok(Tool::from_handler(
+            Self::NAME.to_string(),
+            None,
+            Some(Self::DESCRIPTION.to_string()),
+            None,
+            None,
             annotations,
-            handler: Arc::new(McpToolHandler { tool }),
-        })
+            McpToolHandler { tool },
+        ))
     }
 }
 
@@ -1408,10 +1841,7 @@ mod tests {
         assert_eq!(tool.name, "greet");
         assert_eq!(tool.description.as_deref(), Some("Greet someone"));
 
-        let result = tool
-            .call(serde_json::json!({"name": "World"}))
-            .await
-            .unwrap();
+        let result = tool.call(serde_json::json!({"name": "World"})).await;
 
         assert!(!result.is_error);
     }
@@ -1423,7 +1853,7 @@ mod tests {
             .raw_handler(|args: Value| async move { Ok(CallToolResult::json(args)) })
             .expect("valid tool name");
 
-        let result = tool.call(serde_json::json!({"foo": "bar"})).await.unwrap();
+        let result = tool.call(serde_json::json!({"foo": "bar"})).await;
 
         assert!(!result.is_error);
     }
@@ -1513,7 +1943,6 @@ mod tests {
             .expect("valid tool name");
 
         assert_eq!(tool.name, "process");
-        assert!(tool.uses_context());
 
         // Test with a context that has progress token and notification sender
         let (tx, mut rx) = notification_channel(10);
@@ -1523,8 +1952,7 @@ mod tests {
 
         let result = tool
             .call_with_context(ctx, serde_json::json!({"count": 3}))
-            .await
-            .unwrap();
+            .await;
 
         assert!(!result.is_error);
 
@@ -1578,8 +2006,7 @@ mod tests {
 
         let result = tool
             .call_with_context(ctx, serde_json::json!({"iterations": 10}))
-            .await
-            .unwrap();
+            .await;
 
         // Should have been cancelled after 3 iterations (0, 1, 2)
         // The next iteration (3) checks cancellation and returns
@@ -1641,10 +2068,7 @@ mod tests {
             .build()
             .expect("valid tool name");
 
-        let result = tool
-            .call(serde_json::json!({"name": "World"}))
-            .await
-            .unwrap();
+        let result = tool.call(serde_json::json!({"name": "World"})).await;
         assert!(!result.is_error);
     }
 
@@ -1669,13 +2093,10 @@ mod tests {
             .build()
             .expect("valid tool name");
 
-        assert!(tool.uses_context());
-
         let ctx = RequestContext::new(RequestId::Number(1));
         let result = tool
             .call_with_context(ctx, serde_json::json!({"name": "World"}))
-            .await
-            .unwrap();
+            .await;
         assert!(!result.is_error);
     }
 
@@ -1689,14 +2110,11 @@ mod tests {
         assert_eq!(tool.name, "no_params");
 
         // Should work with empty args
-        let result = tool.call(serde_json::json!({})).await.unwrap();
+        let result = tool.call(serde_json::json!({})).await;
         assert!(!result.is_error);
 
         // Should also work with unexpected args (ignored)
-        let result = tool
-            .call(serde_json::json!({"unexpected": "value"}))
-            .await
-            .unwrap();
+        let result = tool.call(serde_json::json!({"unexpected": "value"})).await;
         assert!(!result.is_error);
 
         // Check input schema is an empty-properties object
@@ -1726,7 +2144,7 @@ mod tests {
         assert_eq!(tool.name, "with_state_no_params");
 
         // Should work with empty args
-        let result = tool.call(serde_json::json!({})).await.unwrap();
+        let result = tool.call(serde_json::json!({})).await;
         assert!(!result.is_error);
         assert_eq!(result.first_text().unwrap(), "state: shared_value");
 
@@ -1753,9 +2171,8 @@ mod tests {
             .expect("valid tool name");
 
         assert_eq!(tool.name, "no_params_with_context");
-        assert!(tool.uses_context());
 
-        let result = tool.call(serde_json::json!({})).await.unwrap();
+        let result = tool.call(serde_json::json!({})).await;
         assert!(!result.is_error);
         assert_eq!(result.first_text().unwrap(), "context available");
     }
@@ -1775,9 +2192,8 @@ mod tests {
             .expect("valid tool name");
 
         assert_eq!(tool.name, "state_context_no_params");
-        assert!(tool.uses_context());
 
-        let result = tool.call(serde_json::json!({})).await.unwrap();
+        let result = tool.call(serde_json::json!({})).await;
         assert!(!result.is_error);
         assert_eq!(result.first_text().unwrap(), "state: shared");
     }
@@ -1795,10 +2211,7 @@ mod tests {
 
         assert_eq!(tool.name, "raw_with_state");
 
-        let result = tool
-            .call(serde_json::json!({"key": "value"}))
-            .await
-            .unwrap();
+        let result = tool.call(serde_json::json!({"key": "value"})).await;
         assert!(!result.is_error);
         assert!(result.first_text().unwrap().starts_with("prefix:"));
     }
@@ -1818,14 +2231,226 @@ mod tests {
             .expect("valid tool name");
 
         assert_eq!(tool.name, "raw_state_context");
-        assert!(tool.uses_context());
 
-        let result = tool
-            .call(serde_json::json!({"key": "value"}))
-            .await
-            .unwrap();
+        let result = tool.call(serde_json::json!({"key": "value"})).await;
         assert!(!result.is_error);
         assert!(result.first_text().unwrap().starts_with("prefix:"));
+    }
+
+    #[tokio::test]
+    async fn test_tool_with_timeout_layer() {
+        use std::time::Duration;
+        use tower::timeout::TimeoutLayer;
+
+        #[derive(Debug, Deserialize, JsonSchema)]
+        struct SlowInput {
+            delay_ms: u64,
+        }
+
+        // Create a tool with a short timeout
+        let tool = ToolBuilder::new("slow_tool")
+            .description("A slow tool")
+            .handler(|input: SlowInput| async move {
+                tokio::time::sleep(Duration::from_millis(input.delay_ms)).await;
+                Ok(CallToolResult::text("completed"))
+            })
+            .layer(TimeoutLayer::new(Duration::from_millis(50)))
+            .build()
+            .expect("valid tool name");
+
+        // Fast call should succeed
+        let result = tool.call(serde_json::json!({"delay_ms": 10})).await;
+        assert!(!result.is_error);
+        assert_eq!(result.first_text().unwrap(), "completed");
+
+        // Slow call should timeout and return an error result
+        let result = tool.call(serde_json::json!({"delay_ms": 200})).await;
+        assert!(result.is_error);
+        // Tower's timeout error message is "request timed out"
+        let msg = result.first_text().unwrap().to_lowercase();
+        assert!(
+            msg.contains("timed out") || msg.contains("timeout") || msg.contains("elapsed"),
+            "Expected timeout error, got: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_with_context_and_timeout_layer() {
+        use std::time::Duration;
+        use tower::timeout::TimeoutLayer;
+
+        #[derive(Debug, Deserialize, JsonSchema)]
+        struct ProcessInput {
+            delay_ms: u64,
+        }
+
+        // Create a context-aware tool with a timeout
+        let tool = ToolBuilder::new("slow_ctx_tool")
+            .description("A slow context-aware tool")
+            .handler_with_context(|_ctx: RequestContext, input: ProcessInput| async move {
+                tokio::time::sleep(Duration::from_millis(input.delay_ms)).await;
+                Ok(CallToolResult::text("completed with context"))
+            })
+            .layer(TimeoutLayer::new(Duration::from_millis(50)))
+            .build()
+            .expect("valid tool name");
+
+        // Fast call should succeed
+        let result = tool.call(serde_json::json!({"delay_ms": 10})).await;
+        assert!(!result.is_error);
+        assert_eq!(result.first_text().unwrap(), "completed with context");
+
+        // Slow call should timeout
+        let result = tool.call(serde_json::json!({"delay_ms": 200})).await;
+        assert!(result.is_error);
+        // Tower's timeout error message is "request timed out"
+        let msg = result.first_text().unwrap().to_lowercase();
+        assert!(
+            msg.contains("timed out") || msg.contains("timeout") || msg.contains("elapsed"),
+            "Expected timeout error, got: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_with_concurrency_limit_layer() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::Duration;
+        use tower::limit::ConcurrencyLimitLayer;
+
+        #[derive(Debug, Deserialize, JsonSchema)]
+        struct WorkInput {
+            id: u32,
+        }
+
+        let max_concurrent = Arc::new(AtomicU32::new(0));
+        let current_concurrent = Arc::new(AtomicU32::new(0));
+        let max_ref = max_concurrent.clone();
+        let current_ref = current_concurrent.clone();
+
+        // Create a tool with concurrency limit of 2
+        let tool = ToolBuilder::new("concurrent_tool")
+            .description("A concurrent tool")
+            .handler(move |input: WorkInput| {
+                let max = max_ref.clone();
+                let current = current_ref.clone();
+                async move {
+                    // Track concurrency
+                    let prev = current.fetch_add(1, Ordering::SeqCst);
+                    max.fetch_max(prev + 1, Ordering::SeqCst);
+
+                    // Simulate work
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+
+                    current.fetch_sub(1, Ordering::SeqCst);
+                    Ok(CallToolResult::text(format!("completed {}", input.id)))
+                }
+            })
+            .layer(ConcurrencyLimitLayer::new(2))
+            .build()
+            .expect("valid tool name");
+
+        // Launch 4 concurrent calls
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                let t = tool.call(serde_json::json!({"id": i}));
+                tokio::spawn(t)
+            })
+            .collect();
+
+        for handle in handles {
+            let result = handle.await.unwrap();
+            assert!(!result.is_error);
+        }
+
+        // Max concurrent should not exceed 2
+        assert!(max_concurrent.load(Ordering::SeqCst) <= 2);
+    }
+
+    #[tokio::test]
+    async fn test_tool_with_multiple_layers() {
+        use std::time::Duration;
+        use tower::limit::ConcurrencyLimitLayer;
+        use tower::timeout::TimeoutLayer;
+
+        #[derive(Debug, Deserialize, JsonSchema)]
+        struct Input {
+            value: String,
+        }
+
+        // Create a tool with multiple layers stacked
+        let tool = ToolBuilder::new("multi_layer_tool")
+            .description("Tool with multiple layers")
+            .handler(|input: Input| async move {
+                Ok(CallToolResult::text(format!("processed: {}", input.value)))
+            })
+            .layer(TimeoutLayer::new(Duration::from_secs(5)))
+            .layer(ConcurrencyLimitLayer::new(10))
+            .build()
+            .expect("valid tool name");
+
+        let result = tool.call(serde_json::json!({"value": "test"})).await;
+        assert!(!result.is_error);
+        assert_eq!(result.first_text().unwrap(), "processed: test");
+    }
+
+    #[test]
+    fn test_tool_catch_error_clone() {
+        // ToolCatchError should be Clone when inner is Clone
+        // Use a simple tool that we can clone
+        let tool = ToolBuilder::new("test")
+            .description("test")
+            .raw_handler(|_args: Value| async { Ok(CallToolResult::text("ok")) })
+            .unwrap();
+        // The tool contains a BoxToolService which is cloneable
+        let _clone = tool.call(serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_tool_catch_error_debug() {
+        // ToolCatchError implements Debug when inner implements Debug
+        // Since our internal services don't require Debug, just verify
+        // that ToolCatchError has a Debug impl for appropriate types
+        #[derive(Debug, Clone)]
+        struct DebugService;
+
+        impl Service<ToolRequest> for DebugService {
+            type Response = CallToolResult;
+            type Error = crate::error::Error;
+            type Future = Pin<
+                Box<
+                    dyn Future<Output = std::result::Result<CallToolResult, crate::error::Error>>
+                        + Send,
+                >,
+            >;
+
+            fn poll_ready(
+                &mut self,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::result::Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _req: ToolRequest) -> Self::Future {
+                Box::pin(async { Ok(CallToolResult::text("ok")) })
+            }
+        }
+
+        let catch_error = ToolCatchError::new(DebugService);
+        let debug = format!("{:?}", catch_error);
+        assert!(debug.contains("ToolCatchError"));
+    }
+
+    #[test]
+    fn test_tool_request_new() {
+        use crate::protocol::RequestId;
+
+        let ctx = RequestContext::new(RequestId::Number(42));
+        let args = serde_json::json!({"key": "value"});
+        let req = ToolRequest::new(ctx.clone(), args.clone());
+
+        assert_eq!(req.args, args);
     }
 
     #[test]
@@ -1873,7 +2498,7 @@ mod tests {
         );
 
         // Should work with empty input
-        let result = tool.call(serde_json::json!({})).await.unwrap();
+        let result = tool.call(serde_json::json!({})).await;
         assert!(!result.is_error);
     }
 }

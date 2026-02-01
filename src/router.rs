@@ -821,7 +821,7 @@ impl McpRouter {
                 let ctx = self.create_context(request_id, progress_token);
 
                 tracing::debug!(tool = %params.name, "Calling tool");
-                let result = tool.call_with_context(ctx, params.arguments).await?;
+                let result = tool.call_with_context(ctx, params.arguments).await;
 
                 Ok(McpResponse::CallTool(result))
             }
@@ -1006,19 +1006,18 @@ impl McpRouter {
                     }
 
                     // Execute the tool
-                    match tool.call_with_context(ctx, arguments).await {
-                        Ok(result) => {
-                            if cancellation_token.is_cancelled() {
-                                tracing::debug!(task_id = %task_id_clone, "Task cancelled during execution");
-                            } else {
-                                task_store.complete_task(&task_id_clone, result);
-                                tracing::debug!(task_id = %task_id_clone, "Task completed successfully");
-                            }
-                        }
-                        Err(e) => {
-                            task_store.fail_task(&task_id_clone, &e.to_string());
-                            tracing::warn!(task_id = %task_id_clone, error = %e, "Task failed");
-                        }
+                    let result = tool.call_with_context(ctx, arguments).await;
+
+                    if cancellation_token.is_cancelled() {
+                        tracing::debug!(task_id = %task_id_clone, "Task cancelled during execution");
+                    } else if result.is_error {
+                        // Tool returned an error result
+                        let error_msg = result.first_text().unwrap_or("Tool execution failed");
+                        task_store.fail_task(&task_id_clone, error_msg);
+                        tracing::warn!(task_id = %task_id_clone, error = %error_msg, "Task failed");
+                    } else {
+                        task_store.complete_task(&task_id_clone, result);
+                        tracing::debug!(task_id = %task_id_clone, "Task completed successfully");
                     }
                 });
 
