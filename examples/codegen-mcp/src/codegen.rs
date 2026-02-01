@@ -61,7 +61,7 @@ edition = "2024"
 description = "{description}"
 
 [dependencies]
-tower-mcp = {{ version = "0.3"{features_str} }}
+tower-mcp = {{ version = "0.2"{features_str} }}
 tokio = {{ version = "1", features = ["full"] }}
 serde = {{ version = "1", features = ["derive"] }}
 schemars = "1.2"
@@ -226,6 +226,10 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         code.push_str(&format!("        .tool({})\n", tool.name));
     }
 
+    // Remove trailing newline and add semicolon
+    if code.ends_with('\n') {
+        code.pop();
+    }
     code.push_str(";\n\n");
 
     // Transport setup
