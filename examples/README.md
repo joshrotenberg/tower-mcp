@@ -1,7 +1,7 @@
 # tower-mcp Examples Tour
 
-Welcome! This guide walks through the example MCP servers in tower-mcp.
 
+Welcome! This guide walks through the example MCP servers in tower-mcp.
 
 ## Getting Started
 
@@ -27,7 +27,7 @@ example, demonstrating tools, resources, and prompts.
 
 **Try these (tools):**
 
-- "Search for async HTTP client crates"
+-  "Search for async HTTP client crates"
 - "What are tokio's dependencies?"
 - "Get download stats for tower-mcp"
 
@@ -58,7 +58,7 @@ with different input types and auto-fix capabilities.
 
 **Try these:**
 
--  "Lint this file: examples/README.md"
+- "Lint this file: examples/README.md"
 - "What does rule MD001 check for?"
 - "List all available markdown lint rules"
 
@@ -77,28 +77,7 @@ example showing external API integration.
 
 **Source:** `examples/weather_server.rs`
 
-### 4. conformance
-
-Full MCP protocol conformance server that passes all 39 official tests.
-Demonstrates every protocol feature: tools, resources, prompts, progress
-notifications, sampling, and elicitation.
-
-**Try these:**
-
-- "Call test_simple_text from the conformance server"
-- "Call test_tool_with_progress to see progress notifications"
-- "Call test_tool_with_logging to see log notifications"
-- "Call test_embedded_resource to see resource content"
-
-**Note:** The conformance server includes `test_image_content` and
-`test_audio_content` tools that return binary content. These work
-correctly per the MCP spec but may cause API errors in some hosts
-(including Claude Code) that don't support displaying binary content
-in conversations.
-
-**Source:** `examples/conformance-server/`
-
-### 5. tower-mcp-example
+### 4. tower-mcp-example
 
 The simplest possible MCP server - echo, add, and reverse tools. Good
 starting point for understanding the basics. This server is

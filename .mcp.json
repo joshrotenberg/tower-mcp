@@ -31,13 +31,6 @@
       "env": {
         "RUST_LOG": "tower_mcp=info"
       }
-    },
-    "conformance": {
-      "command": "cargo",
-      "args": ["run", "-p", "conformance-server", "--", "--transport", "stdio"],
-      "env": {
-        "RUST_LOG": "conformance_server=info"
-      }
     }
   }
 }
