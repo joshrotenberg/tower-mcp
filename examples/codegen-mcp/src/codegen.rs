@@ -142,7 +142,7 @@ fn generate_input_struct(tool: &ToolDef) -> String {
     let struct_name = to_pascal_case(&tool.name) + "Input";
 
     let mut code = format!(
-        "#[derive(Debug, Deserialize, JsonSchema)]\nstruct {} {{\n",
+        "#[allow(dead_code)]\n#[derive(Debug, Deserialize, JsonSchema)]\nstruct {} {{\n",
         struct_name
     );
 
@@ -294,12 +294,20 @@ fn generate_tool_builder(tool: &ToolDef, _has_state: bool) -> String {
         HandlerType::Simple => {
             if let Some(input) = input_type {
                 code.push_str(&format!(
-                    "        .handler(|input: {}| async move {{\n            todo!(\"implement {}\")\n        }})\n",
+                    r#"        .handler(|input: {}| async move {{
+            // TODO: implement {}
+            Ok(CallToolResult::text(format!("{{:?}}", input)))
+        }})
+"#,
                     input, tool.name
                 ));
             } else {
                 code.push_str(&format!(
-                    "        .handler_no_params(|| async move {{\n            todo!(\"implement {}\")\n        }})\n",
+                    r#"        .handler_no_params(|| async move {{
+            // TODO: implement {}
+            Ok(CallToolResult::text("OK"))
+        }})
+"#,
                     tool.name
                 ));
             }
@@ -307,12 +315,20 @@ fn generate_tool_builder(tool: &ToolDef, _has_state: bool) -> String {
         HandlerType::WithState => {
             if let Some(input) = input_type {
                 code.push_str(&format!(
-                    "        .handler_with_state(state.clone(), |state: Arc<AppState>, input: {}| async move {{\n            todo!(\"implement {}\")\n        }})\n",
+                    r#"        .handler_with_state(state.clone(), |_state: Arc<AppState>, input: {}| async move {{
+            // TODO: implement {} (use _state for shared state)
+            Ok(CallToolResult::text(format!("{{:?}}", input)))
+        }})
+"#,
                     input, tool.name
                 ));
             } else {
                 code.push_str(&format!(
-                    "        .handler_with_state_no_params(state.clone(), |state: Arc<AppState>| async move {{\n            todo!(\"implement {}\")\n        }})\n",
+                    r#"        .handler_with_state_no_params(state.clone(), |_state: Arc<AppState>| async move {{
+            // TODO: implement {} (use _state for shared state)
+            Ok(CallToolResult::text("OK"))
+        }})
+"#,
                     tool.name
                 ));
             }
@@ -320,12 +336,20 @@ fn generate_tool_builder(tool: &ToolDef, _has_state: bool) -> String {
         HandlerType::WithContext => {
             if let Some(input) = input_type {
                 code.push_str(&format!(
-                    "        .handler_with_context(|ctx: RequestContext, input: {}| async move {{\n            todo!(\"implement {}\")\n        }})\n",
+                    r#"        .handler_with_context(|_ctx: RequestContext, input: {}| async move {{
+            // TODO: implement {} (use _ctx for notifications, sampling, etc.)
+            Ok(CallToolResult::text(format!("{{:?}}", input)))
+        }})
+"#,
                     input, tool.name
                 ));
             } else {
                 code.push_str(&format!(
-                    "        .handler_no_params_with_context(|ctx: RequestContext| async move {{\n            todo!(\"implement {}\")\n        }})\n",
+                    r#"        .handler_no_params_with_context(|_ctx: RequestContext| async move {{
+            // TODO: implement {} (use _ctx for notifications, sampling, etc.)
+            Ok(CallToolResult::text("OK"))
+        }})
+"#,
                     tool.name
                 ));
             }
@@ -333,25 +357,41 @@ fn generate_tool_builder(tool: &ToolDef, _has_state: bool) -> String {
         HandlerType::WithStateAndContext => {
             if let Some(input) = input_type {
                 code.push_str(&format!(
-                    "        .handler_with_state_and_context(state.clone(), |state: Arc<AppState>, ctx: RequestContext, input: {}| async move {{\n            todo!(\"implement {}\")\n        }})\n",
+                    r#"        .handler_with_state_and_context(state.clone(), |_state: Arc<AppState>, _ctx: RequestContext, input: {}| async move {{
+            // TODO: implement {}
+            Ok(CallToolResult::text(format!("{{:?}}", input)))
+        }})
+"#,
                     input, tool.name
                 ));
             } else {
                 code.push_str(&format!(
-                    "        .handler_with_state_and_context_no_params(state.clone(), |state: Arc<AppState>, ctx: RequestContext| async move {{\n            todo!(\"implement {}\")\n        }})\n",
+                    r#"        .handler_with_state_and_context_no_params(state.clone(), |_state: Arc<AppState>, _ctx: RequestContext| async move {{
+            // TODO: implement {}
+            Ok(CallToolResult::text("OK"))
+        }})
+"#,
                     tool.name
                 ));
             }
         }
         HandlerType::Raw => {
             code.push_str(&format!(
-                "        .raw_handler(|args: serde_json::Value| async move {{\n            todo!(\"implement {}\")\n        }})\n",
+                r#"        .raw_handler(|args: serde_json::Value| async move {{
+            // TODO: implement {}
+            Ok(CallToolResult::text(format!("{{}}", args)))
+        }})
+"#,
                 tool.name
             ));
         }
         HandlerType::NoParams => {
             code.push_str(&format!(
-                "        .handler_no_params(|| async move {{\n            todo!(\"implement {}\")\n        }})\n",
+                r#"        .handler_no_params(|| async move {{
+            // TODO: implement {}
+            Ok(CallToolResult::text("OK"))
+        }})
+"#,
                 tool.name
             ));
         }
