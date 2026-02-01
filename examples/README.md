@@ -68,9 +68,16 @@ notifications, sampling, and elicitation.
 
 **Try these:**
 
-- "Use the conformance server to add 17 and 25"
-- "Echo 'Hello MCP' using the conformance server"
-- "Run the long-running operation tool and watch for progress"
+- "Call test_simple_text from the conformance server"
+- "Call test_tool_with_progress to see progress notifications"
+- "Call test_tool_with_logging to see log notifications"
+- "Call test_embedded_resource to see resource content"
+
+**Note:** The conformance server includes `test_image_content` and
+`test_audio_content` tools that return binary content. These work
+correctly per the MCP spec but may cause API errors in some hosts
+(including Claude Code) that don't support displaying binary content
+in conversations.
 
 **Source:** `examples/conformance-server/`
 
