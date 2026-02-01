@@ -96,7 +96,8 @@ fn create_router_with_resources_and_prompts() -> McpRouter {
                     blob: None,
                 }],
             })
-        });
+        })
+        .build();
 
     // Prompts
     let greet_prompt = PromptBuilder::new("greet")

@@ -153,8 +153,8 @@ pub use protocol::{
     SamplingContentOrArray, SamplingMessage, SamplingTool, ToolChoice,
 };
 pub use resource::{
-    Resource, ResourceBuilder, ResourceHandler, ResourceTemplate, ResourceTemplateBuilder,
-    ResourceTemplateHandler,
+    BoxResourceService, Resource, ResourceBuilder, ResourceHandler, ResourceRequest,
+    ResourceTemplate, ResourceTemplateBuilder, ResourceTemplateHandler,
 };
 pub use router::{Extensions, McpRouter, RouterRequest, RouterResponse};
 pub use session::{SessionPhase, SessionState};
