@@ -9,7 +9,7 @@
 
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tower_mcp::{CallToolResult, McpRouter, StdioTransport, ToolBuilder};
+use tower_mcp::{CallToolResult, McpRouter, ResourceBuilder, StdioTransport, ToolBuilder};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct EchoInput {
@@ -66,13 +66,24 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         })
         .build()?;
 
+    // Create a resource that serves this file's own source code
+    let source = ResourceBuilder::new("source://stdio_server.rs")
+        .name("Server Source Code")
+        .description("The complete source code for this example server")
+        .mime_type("text/x-rust")
+        .text(include_str!("stdio_server.rs"));
+
     // Create router
     let router = McpRouter::new()
         .server_info("tower-mcp-example", env!("CARGO_PKG_VERSION"))
-        .instructions("A simple example MCP server with echo, add, and reverse tools.")
+        .instructions(
+            "A simple example MCP server with echo, add, and reverse tools. \
+             Read the source://stdio_server.rs resource to see how it's built.",
+        )
         .tool(echo)
         .tool(add)
-        .tool(reverse);
+        .tool(reverse)
+        .resource(source);
 
     // Create and run stdio transport
     let mut transport = StdioTransport::new(router);
