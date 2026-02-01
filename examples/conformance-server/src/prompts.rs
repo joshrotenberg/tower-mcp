@@ -97,6 +97,7 @@ fn build_prompt_with_arguments() -> Prompt {
                 }],
             })
         })
+        .build()
 }
 
 fn build_prompt_with_embedded_resource() -> Prompt {
@@ -124,6 +125,7 @@ fn build_prompt_with_embedded_resource() -> Prompt {
                 }],
             })
         })
+        .build()
 }
 
 fn build_prompt_with_image() -> Prompt {

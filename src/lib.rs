@@ -139,7 +139,7 @@ pub use filter::{
     CapabilityFilter, DenialBehavior, Filterable, PromptFilter, ResourceFilter, ToolFilter,
 };
 pub use jsonrpc::{JsonRpcLayer, JsonRpcService};
-pub use prompt::{Prompt, PromptBuilder, PromptHandler};
+pub use prompt::{BoxPromptService, Prompt, PromptBuilder, PromptHandler, PromptRequest};
 pub use protocol::{
     CallToolResult, CompleteParams, CompleteResult, Completion, CompletionArgument,
     CompletionReference, CompletionsCapability, Content, ContentRole, CreateMessageParams,

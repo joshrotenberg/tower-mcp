@@ -114,7 +114,8 @@ fn create_router_with_resources_and_prompts() -> McpRouter {
                     },
                 }],
             })
-        });
+        })
+        .build();
 
     let code_review_prompt = PromptBuilder::new("code_review")
         .description("Review code for issues")
@@ -139,7 +140,8 @@ fn create_router_with_resources_and_prompts() -> McpRouter {
                     },
                 }],
             })
-        });
+        })
+        .build();
 
     let static_prompt = PromptBuilder::new("help")
         .description("Get help")

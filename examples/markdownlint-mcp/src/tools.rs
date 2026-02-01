@@ -357,4 +357,5 @@ pub fn build_fix_suggestions_prompt() -> Prompt {
                 }],
             })
         })
+        .build()
 }
