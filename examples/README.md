@@ -91,6 +91,20 @@ self-documenting: it serves its own source code as a resource!
 
 **Source:** `examples/stdio_server.rs`
 
+### 6. codegen-mcp
+
+An MCP server that helps you build MCP servers. Define your server
+incrementally through tool calls, then generate complete Rust code.
+
+**Try these:**
+
+- "Initialize a project called my-server with stdio transport"
+- "Add an echo tool that takes a message string"
+- "Generate the code for my server"
+- "Validate that the generated code compiles"
+
+**Source:** `examples/codegen-mcp/`
+
 ## How It's Built
 
 Ask your agent to read the `source://stdio_server.rs` resource from
@@ -140,8 +154,56 @@ The intentional errors were:
 - Skipped heading level - jumped from h2 to h4 (MD001)
 - Extra space before a list item (MD030)
 
-## Next Steps
+## Build Your Own
+
+Now that you've seen what's possible, want to build your own MCP server?
+
+The codegen-mcp server can help. Here's the workflow:
+
+1. **Find something to wrap** - Use crates-mcp to explore crates.io:
+   - "Search for crates that do X"
+   - "What are the dependencies for crate Y?"
+   - "Use the analyze_crate prompt to evaluate Z"
+
+2. **Design your server** - Tell codegen-mcp what you want:
+   - "Initialize a project called my-server"
+   - "Add a tool that does X with inputs Y and Z"
+   - "Validate the generated code compiles"
+
+3. **Generate and iterate** - Get complete Rust code:
+   - "Generate the code for my server"
+   - Write it to disk, customize the handlers, run it
+
+### Ideas to Get Started
+
+Ask your agent to help you build:
+
+- **A Git MCP server** - Wrap git commands (status, diff, log, blame)
+- **A Docker MCP server** - Container and image management
+- **A database MCP server** - Query SQLite, PostgreSQL, or Redis
+- **A file search server** - Ripgrep or fd wrapper
+- **An API client** - Wrap any REST API you use frequently
+
+Or tell your agent what problem you're trying to solve and let it
+suggest what tools your server should have.
+
+### Example Session
+
+```
+You: "I want to build an MCP server that searches my notes"
+
+Agent: [uses crates-mcp to find tantivy, walkdir]
+Agent: [uses codegen-mcp to design tools: index_directory, search, get_document]
+Agent: [generates and validates the code]
+Agent: "Here's your server. The search tool uses tantivy for full-text
+        search. Want me to write this to examples/notes-mcp/?"
+```
+
+The combination of crates-mcp (for research) and codegen-mcp (for
+scaffolding) lets you go from idea to working server quickly.
+
+## Learn More
 
 - Browse the source code in `examples/` to see how each server is built
 - Check the main [README](../README.md) for API documentation
-- Try building your own MCP server with tower-mcp!
+- Read the generated code from codegen-mcp to understand the patterns
