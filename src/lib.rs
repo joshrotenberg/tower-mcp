@@ -102,6 +102,102 @@
 //! - `oauth` - OAuth 2.1 resource server support (token validation, metadata endpoint)
 //! - `testing` - Test utilities ([`TestClient`]) for ergonomic MCP server testing
 //!
+//! ## Middleware Placement Guide
+//!
+//! tower-mcp supports Tower middleware at multiple levels. Choose based on scope:
+//!
+//! | Level | Method | Scope | Use Cases |
+//! |-------|--------|-------|-----------|
+//! | **Transport** | `HttpTransport::layer()` | All MCP requests | Global timeout, rate limit, metrics |
+//! | **axum** | `.into_router().layer()` | HTTP layer only | CORS, compression, request logging |
+//! | **Per-tool** | `ToolBuilder::...layer()` | Single tool | Tool-specific timeout, concurrency |
+//! | **Per-resource** | `ResourceBuilder::...layer()` | Single resource | Caching, read timeout |
+//! | **Per-prompt** | `PromptBuilder::...layer()` | Single prompt | Generation timeout |
+//!
+//! ### Decision Tree
+//!
+//! ```text
+//! Where should my middleware go?
+//! │
+//! ├─ Affects ALL MCP requests?
+//! │  └─ Yes → Transport: HttpTransport::layer() or WebSocketTransport::layer()
+//! │
+//! ├─ HTTP-specific (CORS, compression, headers)?
+//! │  └─ Yes → axum: transport.into_router().layer(...)
+//! │
+//! ├─ Only one specific tool?
+//! │  └─ Yes → Per-tool: ToolBuilder::...handler(...).layer(...)
+//! │
+//! ├─ Only one specific resource?
+//! │  └─ Yes → Per-resource: ResourceBuilder::...handler(...).layer(...)
+//! │
+//! └─ Only one specific prompt?
+//!    └─ Yes → Per-prompt: PromptBuilder::...handler(...).layer(...)
+//! ```
+//!
+//! ### Example: Layered Timeouts
+//!
+//! ```rust,ignore
+//! use std::time::Duration;
+//! use tower::timeout::TimeoutLayer;
+//! use tower_mcp::{McpRouter, ToolBuilder, CallToolResult, HttpTransport};
+//! use schemars::JsonSchema;
+//! use serde::Deserialize;
+//!
+//! #[derive(Debug, Deserialize, JsonSchema)]
+//! struct SearchInput { query: String }
+//!
+//! // This tool gets a longer timeout than the global default
+//! let slow_search = ToolBuilder::new("slow_search")
+//!     .description("Thorough search (may take a while)")
+//!     .handler(|input: SearchInput| async move {
+//!         // ... slow operation ...
+//!         Ok(CallToolResult::text("results"))
+//!     })
+//!     .layer(TimeoutLayer::new(Duration::from_secs(60)))  // 60s for this tool
+//!     .build()
+//!     .unwrap();
+//!
+//! let router = McpRouter::new()
+//!     .server_info("example", "1.0.0")
+//!     .tool(slow_search);
+//!
+//! // Global 30s timeout for all OTHER requests
+//! let transport = HttpTransport::new(router)
+//!     .layer(TimeoutLayer::new(Duration::from_secs(30)));
+//! ```
+//!
+//! In this example:
+//! - `slow_search` tool has a 60-second timeout (per-tool layer)
+//! - All other MCP requests have a 30-second timeout (transport layer)
+//! - The per-tool layer is **inner** to the transport layer
+//!
+//! ### Layer Ordering
+//!
+//! Layers wrap from outside in. The first layer added is the outermost:
+//!
+//! ```text
+//! Request → [Transport Layer] → [Per-tool Layer] → Handler → Response
+//! ```
+//!
+//! For per-tool/resource/prompt, chained `.layer()` calls also wrap outside-in:
+//!
+//! ```rust,ignore
+//! ToolBuilder::new("api")
+//!     .handler(...)
+//!     .layer(TimeoutLayer::new(...))      // Outer: timeout checked first
+//!     .layer(ConcurrencyLimitLayer::new(5)) // Inner: concurrency after timeout
+//!     .build()
+//! ```
+//!
+//! ### Full Example
+//!
+//! See [`examples/tool_middleware.rs`](https://github.com/joshrotenberg/tower-mcp/blob/main/examples/tool_middleware.rs)
+//! for a complete example demonstrating:
+//! - Different timeouts per tool
+//! - Concurrency limiting for expensive operations
+//! - Multiple layers combined on a single tool
+//!
 //! ## MCP Specification
 //!
 //! This crate implements the MCP specification (2025-11-25):
