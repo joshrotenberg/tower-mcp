@@ -25,12 +25,29 @@ The markdownlint-mcp server will find them. Then try:
 Query the Rust crate registry (crates.io). The most feature-complete
 example, demonstrating tools, resources, and prompts.
 
-**Try these:**
+**Try these (tools):**
 
 - "Search for async HTTP client crates"
 - "What are tokio's dependencies?"
-- "Compare serde and rkyv crates"
 - "Get download stats for tower-mcp"
+
+**Try these (resources):**
+
+- "Read the crates://tokio/info resource from crates-mcp-local"
+- "Read crates://recent-searches to see my search history"
+
+**Try these (prompts):**
+
+- "Use the analyze_crate prompt for tower-mcp"
+- "Use the compare_crates prompt to compare serde and rkyv"
+
+**Local vs Remote:** This example runs as two servers in `.mcp.json`:
+
+- `crates-mcp-local` - stdio transport (spawned as child process)
+- `crates-mcp-remote` - HTTP transport (deployed at Fly.io)
+
+Same code, different transports. Try calling the same tool on both to see
+they work identically.
 
 **Source:** `examples/crates-mcp/`
 
