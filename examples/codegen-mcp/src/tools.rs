@@ -100,6 +100,7 @@ pub fn build_tools(state: Arc<CodegenState>) -> Vec<Tool> {
     vec![
         build_init_project(state.clone()),
         build_add_tool(state.clone()),
+        build_remove_tool(state.clone()),
         build_get_project(state.clone()),
         build_generate(state.clone()),
         build_validate(state.clone()),
@@ -218,6 +219,47 @@ fn build_add_tool(state: Arc<CodegenState>) -> Tool {
                     input.name,
                     project.tools.len()
                 )))
+            },
+        )
+        .build()
+        .expect("valid tool")
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RemoveToolInput {
+    /// Name of the tool to remove
+    pub name: String,
+}
+
+fn build_remove_tool(state: Arc<CodegenState>) -> Tool {
+    ToolBuilder::new("remove_tool")
+        .description("Remove a tool from the project")
+        .handler_with_state(
+            state,
+            |state: Arc<CodegenState>, input: RemoveToolInput| async move {
+                let mut project = state.project.write().await;
+
+                if !project.initialized {
+                    return Ok(CallToolResult::error(
+                        "Project not initialized. Call init_project first.",
+                    ));
+                }
+
+                let initial_len = project.tools.len();
+                project.tools.retain(|t| t.name != input.name);
+
+                if project.tools.len() == initial_len {
+                    Ok(CallToolResult::error(format!(
+                        "Tool '{}' not found",
+                        input.name
+                    )))
+                } else {
+                    Ok(CallToolResult::text(format!(
+                        "Removed tool '{}'. Project now has {} tool(s).",
+                        input.name,
+                        project.tools.len()
+                    )))
+                }
             },
         )
         .build()
