@@ -41,6 +41,7 @@
 //! }
 //! ```
 
+use mdbook_lint_core::violation::Fix;
 use mdbook_lint_core::{LintEngine, PluginRegistry, Severity, Violation};
 use mdbook_lint_rulesets::{MdBookRuleProvider, StandardRuleProvider};
 use schemars::JsonSchema;
@@ -300,9 +301,8 @@ impl LintState {
     ///
     /// # Note
     ///
-    /// Fixes are applied sequentially. If a fix changes line numbers,
-    /// subsequent fixes may not apply correctly. For best results,
-    /// run lint-fix cycles iteratively until no more fixes are available.
+    /// Fixes are applied in reverse order (bottom to top) to preserve
+    /// line/column positions for subsequent fixes.
     pub fn fix_violations(
         &self,
         content: &str,
@@ -311,9 +311,17 @@ impl LintState {
         let mut fixed_content = content.to_string();
         let mut remaining = Vec::new();
 
-        for violation in violations {
-            if let Some(rule) = self.engine.registry().get_rule(&violation.rule_id) {
-                if let Some(fixed) = rule.fix(&fixed_content, violation) {
+        // Sort violations by position (reverse order - bottom to top, right to left)
+        // This ensures earlier fixes don't invalidate positions of later fixes
+        let mut sorted_violations: Vec<_> = violations.iter().collect();
+        sorted_violations.sort_by(|a, b| match b.line.cmp(&a.line) {
+            std::cmp::Ordering::Equal => b.column.cmp(&a.column),
+            other => other,
+        });
+
+        for violation in sorted_violations {
+            if let Some(fix) = &violation.fix {
+                if let Some(fixed) = Self::apply_fix(&fixed_content, fix) {
                     fixed_content = fixed;
                 } else {
                     remaining.push(violation.clone());
@@ -324,6 +332,76 @@ impl LintState {
         }
 
         (fixed_content, remaining)
+    }
+
+    /// Apply a single fix to content.
+    ///
+    /// Converts line/column positions to byte offsets and performs the replacement.
+    fn apply_fix(content: &str, fix: &Fix) -> Option<String> {
+        let lines: Vec<&str> = content.lines().collect();
+
+        // Convert start position to byte offset
+        let start_offset = Self::position_to_offset(&lines, fix.start.line, fix.start.column)?;
+
+        // Convert end position to byte offset
+        let mut end_offset = Self::position_to_offset(&lines, fix.end.line, fix.end.column)?;
+
+        // If the replacement ends with a newline and the end position is at a newline,
+        // skip the original newline to avoid duplication
+        if let Some(replacement) = &fix.replacement
+            && replacement.ends_with('\n')
+            && content.as_bytes().get(end_offset) == Some(&b'\n')
+        {
+            end_offset += 1;
+        }
+
+        // Build the fixed content
+        let mut result = String::new();
+        result.push_str(&content[..start_offset]);
+        if let Some(replacement) = &fix.replacement {
+            result.push_str(replacement);
+        }
+        result.push_str(&content[end_offset..]);
+
+        Some(result)
+    }
+
+    /// Convert a line/column position to a byte offset.
+    ///
+    /// Lines and columns are 1-based. Column values beyond the line length
+    /// can extend into the newline character (column = len + 1 means the newline).
+    fn position_to_offset(lines: &[&str], line: usize, column: usize) -> Option<usize> {
+        if line == 0 || column == 0 {
+            return None;
+        }
+
+        let mut offset = 0;
+
+        // Add bytes for all complete lines before the target line
+        for (i, line_content) in lines.iter().enumerate() {
+            if i + 1 == line {
+                // Found our line, add the column offset
+                // Column is 1-based, so column 1 = offset 0
+                let col_offset = column.saturating_sub(1);
+                // Allow column to extend one past line content to include newline
+                // (but not further - we don't want to skip to next line)
+                let max_offset = if i + 1 < lines.len() {
+                    line_content.len() + 1 // Can include the newline
+                } else {
+                    line_content.len() // Last line has no newline to include
+                };
+                let clamped = col_offset.min(max_offset);
+                return Some(offset + clamped);
+            }
+            offset += line_content.len() + 1; // +1 for newline
+        }
+
+        // If line is past the end, return the end of content
+        if line > lines.len() {
+            Some(offset.saturating_sub(1))
+        } else {
+            None
+        }
     }
 
     /// Apply fixes and return a structured result.
@@ -390,4 +468,82 @@ pub fn create_engine() -> Result<LintEngine, tower_mcp::Error> {
     registry
         .create_engine()
         .map_err(|e| tower_mcp::Error::internal(format!("Failed to create engine: {}", e)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fix_extra_blank_lines() {
+        let state = LintState::new().unwrap();
+        let content = "# Test\n\n\nHello";
+        let result = state.fix_content(content, "test.md").unwrap();
+
+        println!("Original: {:?}", content);
+        println!("Fixed: {:?}", result.fixed_content);
+        println!("Changed: {}", result.content_changed);
+        println!("Remaining: {:?}", result.remaining_violations);
+
+        // Should remove the extra blank line and add trailing newline
+        assert!(result.content_changed, "Content should have changed");
+        // MD012 removes extra blank, MD047 adds trailing newline
+        assert_eq!(result.fixed_content, "# Test\n\nHello\n");
+    }
+
+    #[test]
+    fn test_lint_has_fixes() {
+        let state = LintState::new().unwrap();
+        let content = "# Test\n\n\nHello";
+        let violations = state.lint(content, "test.md").unwrap();
+
+        for v in &violations {
+            println!(
+                "Violation: {} at {}:{}, fix: {:?}",
+                v.rule_id, v.line, v.column, v.fix
+            );
+        }
+
+        // MD012 should have a fix
+        let md012 = violations.iter().find(|v| v.rule_id == "MD012");
+        assert!(md012.is_some(), "Should have MD012 violation");
+        assert!(md012.unwrap().fix.is_some(), "MD012 should have a fix");
+    }
+
+    #[test]
+    fn test_fix_heading_level() {
+        let state = LintState::new().unwrap();
+        // h2 followed by h4 - should be fixed to h3
+        let content = "## Heading\n\n#### Subheading\n\nText";
+        let result = state.fix_content(content, "test.md").unwrap();
+
+        println!("Original: {:?}", content);
+        println!("Fixed: {:?}", result.fixed_content);
+        println!("Changed: {}", result.content_changed);
+        for v in &result.remaining_violations {
+            println!("Remaining: {:?}", v);
+        }
+
+        assert!(result.content_changed);
+        // Should change #### to ###
+        assert!(result.fixed_content.contains("### Subheading"));
+        assert!(!result.fixed_content.contains("#### Subheading"));
+    }
+
+    #[test]
+    fn test_fix_list_spacing() {
+        let state = LintState::new().unwrap();
+        // Extra space after list marker
+        let content = "-  Item 1\n- Item 2\n";
+        let result = state.fix_content(content, "test.md").unwrap();
+
+        println!("Original: {:?}", content);
+        println!("Fixed: {:?}", result.fixed_content);
+        println!("Changed: {}", result.content_changed);
+
+        assert!(result.content_changed);
+        // Should have single space after dash
+        assert!(result.fixed_content.contains("- Item 1"));
+        assert!(!result.fixed_content.contains("-  Item 1"));
+    }
 }
