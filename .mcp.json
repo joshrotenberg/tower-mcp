@@ -9,7 +9,7 @@
     },
     "crates-mcp-local": {
       "command": "cargo",
-      "args": ["run", "--manifest-path", "examples/crates-mcp/Cargo.toml", "--", "--transport", "stdio", "--minimal"],
+      "args": ["run", "--manifest-path", "examples/crates-mcp/Cargo.toml", "--", "--transport", "stdio"],
       "env": {
         "RUST_LOG": "crates_mcp=info"
       }
@@ -17,6 +17,34 @@
     "crates-mcp-remote": {
       "type": "http",
       "url": "https://crates-mcp-demo.fly.dev/"
+    },
+    "markdownlint-mcp": {
+      "command": "cargo",
+      "args": ["run", "--manifest-path", "examples/markdownlint-mcp/Cargo.toml", "--", "--transport", "stdio"],
+      "env": {
+        "RUST_LOG": "markdownlint_mcp=info"
+      }
+    },
+    "weather": {
+      "command": "cargo",
+      "args": ["run", "--example", "weather_server"],
+      "env": {
+        "RUST_LOG": "tower_mcp=info"
+      }
+    },
+    "conformance": {
+      "command": "cargo",
+      "args": ["run", "-p", "conformance-server", "--", "--transport", "stdio"],
+      "env": {
+        "RUST_LOG": "conformance_server=info"
+      }
+    },
+    "guide": {
+      "command": "cargo",
+      "args": ["run", "-p", "tower-mcp-guide"],
+      "env": {
+        "RUST_LOG": "tower_mcp=info"
+      }
     }
   }
 }

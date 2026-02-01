@@ -10,7 +10,55 @@ pub fn build_prompts() -> Vec<Prompt> {
         build_prompt_with_arguments(),
         build_prompt_with_embedded_resource(),
         build_prompt_with_image(),
+        build_exercise_conformance_prompt(),
     ]
+}
+
+/// A prompt that guides an agent to exercise all conformance server features.
+fn build_exercise_conformance_prompt() -> Prompt {
+    PromptBuilder::new("exercise_conformance")
+        .description("Exercise all MCP features to verify the server works correctly")
+        .handler(|_args| async move {
+            Ok(GetPromptResult {
+                description: Some(
+                    "Guide for exercising all MCP conformance server features".to_string(),
+                ),
+                messages: vec![PromptMessage {
+                    role: PromptRole::User,
+                    content: Content::Text {
+                        text: r#"Please exercise all features of this MCP conformance server to verify it's working correctly.
+
+## Tools to test:
+
+1. **echo** - Echo back a message
+2. **add** - Add two numbers together
+3. **longRunningOperation** - Test progress notifications (watch for progress updates)
+4. **sampleLLM** - Test sampling (makes a request back to you)
+5. **getTinyImage** - Returns a small PNG image
+
+## Resources to read:
+
+1. **test://static/resource** - A static test resource
+2. **test://static/resource/binary** - A binary resource
+
+## Resource templates to try:
+
+1. **test://dynamic/resource/{id}** - Try with different IDs like "hello" or "123"
+
+## Prompts to get:
+
+1. **test_simple_prompt** - A simple prompt with no arguments
+2. **test_prompt_with_arguments** - Needs arg1 and arg2
+3. **test_prompt_with_embedded_resource** - Embeds a resource
+4. **test_prompt_with_image** - Contains an image
+
+After testing each feature, summarize what worked and any issues found."#
+                            .to_string(),
+                        annotations: None,
+                    },
+                }],
+            })
+        })
 }
 
 fn build_simple_prompt() -> Prompt {

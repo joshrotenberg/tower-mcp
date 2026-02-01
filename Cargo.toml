@@ -14,7 +14,7 @@ keywords = ["mcp", "tower", "json-rpc", "ai", "llm"]
 categories = ["network-programming", "asynchronous"]
 
 [workspace]
-members = ["examples/crates-mcp", "examples/conformance-server", "examples/markdownlint-mcp"]
+members = ["examples/crates-mcp", "examples/conformance-server", "examples/markdownlint-mcp", "examples/tower-mcp-guide"]
 
 [workspace.dependencies]
 tower-resilience = { version = "0.7", default-features = false, features = ["bulkhead", "ratelimiter"] }

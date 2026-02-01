@@ -40,6 +40,33 @@ Connect with any MCP client that supports HTTP transport, or add to Claude Code'
 
 The demo includes 7 tools (search, info, versions, dependencies, reverse deps, downloads, owners), 2 prompts (analyze, compare), and 1 resource (recent searches). See [`examples/crates-mcp`](examples/crates-mcp) for the full source.
 
+## Try the Examples
+
+Clone the repo and run your MCP-enabled agent (like Claude Code) in the tower-mcp directory. The included `.mcp.json` configures several example servers:
+
+| Server | Description |
+|--------|-------------|
+| `guide` | Meta server with prompts explaining all examples |
+| `crates-mcp-local` | Query crates.io for Rust crate info |
+| `markdownlint-mcp` | Lint markdown with 66 rules |
+| `weather` | Weather forecasts via NWS API |
+| `conformance` | Full MCP spec conformance server (39/39 tests) |
+
+**Quick start:**
+
+```bash
+git clone https://github.com/joshrotenberg/tower-mcp
+cd tower-mcp
+# Run your MCP agent here - servers will be available automatically
+```
+
+Then ask your agent to use the `explore_examples` prompt from the guide server for an overview, or jump straight in:
+
+- "Search for async runtime crates" (uses crates-mcp)
+- "Lint this README for issues" (uses markdownlint-mcp)
+- "What's the weather in Seattle?" (uses weather)
+- "Use the exercise_conformance prompt" (uses conformance)
+
 ## Status
 
 **Active development** - Core protocol, routing, and transports are implemented. Used in production for MCP server deployments.
