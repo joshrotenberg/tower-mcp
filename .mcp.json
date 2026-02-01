@@ -38,13 +38,6 @@
       "env": {
         "RUST_LOG": "conformance_server=info"
       }
-    },
-    "guide": {
-      "command": "cargo",
-      "args": ["run", "-p", "tower-mcp-guide"],
-      "env": {
-        "RUST_LOG": "tower_mcp=info"
-      }
     }
   }
 }
