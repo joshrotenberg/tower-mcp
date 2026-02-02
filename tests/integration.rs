@@ -335,11 +335,22 @@ async fn test_tool_invalid_arguments() {
     }));
     let resp = service.call_single(call_req).await.unwrap();
 
+    // Tool input validation errors are now returned as CallToolResult with is_error: true
     match resp {
-        JsonRpcResponse::Error(e) => {
-            assert!(e.error.message.contains("Invalid input") || e.error.code == -32603);
+        JsonRpcResponse::Result(r) => {
+            let result: CallToolResult = serde_json::from_value(r.result).unwrap();
+            assert!(result.is_error, "Expected is_error to be true");
+            let text = result.first_text().expect("Expected error text");
+            assert!(
+                text.contains("Invalid input"),
+                "Expected 'Invalid input' error, got: {}",
+                text
+            );
         }
-        JsonRpcResponse::Result(_) => panic!("Expected error for invalid arguments"),
+        JsonRpcResponse::Error(e) => panic!(
+            "Expected CallToolResult with is_error, got JSON-RPC error: {:?}",
+            e
+        ),
     }
 }
 
@@ -364,11 +375,22 @@ async fn test_tool_execution_error() {
     }));
     let resp = service.call_single(call_req).await.unwrap();
 
+    // Tool execution errors are now returned as CallToolResult with is_error: true
     match resp {
-        JsonRpcResponse::Error(e) => {
-            assert!(e.error.message.contains("Intentional failure"));
+        JsonRpcResponse::Result(r) => {
+            let result: CallToolResult = serde_json::from_value(r.result).unwrap();
+            assert!(result.is_error, "Expected is_error to be true");
+            let text = result.first_text().expect("Expected error text");
+            assert!(
+                text.contains("Intentional failure"),
+                "Expected 'Intentional failure' error, got: {}",
+                text
+            );
         }
-        JsonRpcResponse::Result(_) => panic!("Expected error from failing tool"),
+        JsonRpcResponse::Error(e) => panic!(
+            "Expected CallToolResult with is_error, got JSON-RPC error: {:?}",
+            e
+        ),
     }
 }
 
@@ -542,12 +564,22 @@ async fn test_error_malformed_tool_arguments() {
     }));
     let resp = service.call_single(call_req).await.unwrap();
 
+    // Tool input validation errors are now returned as CallToolResult with is_error: true
     match resp {
-        JsonRpcResponse::Error(e) => {
-            assert_eq!(e.error.code, -32603); // Internal error (tool error)
-            assert!(e.error.message.contains("Invalid input"));
+        JsonRpcResponse::Result(r) => {
+            let result: CallToolResult = serde_json::from_value(r.result).unwrap();
+            assert!(result.is_error, "Expected is_error to be true");
+            let text = result.first_text().expect("Expected error text");
+            assert!(
+                text.contains("Invalid input"),
+                "Expected 'Invalid input' error, got: {}",
+                text
+            );
         }
-        JsonRpcResponse::Result(_) => panic!("Expected error for malformed arguments"),
+        JsonRpcResponse::Error(e) => panic!(
+            "Expected CallToolResult with is_error, got JSON-RPC error: {:?}",
+            e
+        ),
     }
 }
 
@@ -600,12 +632,17 @@ async fn test_error_missing_required_params() {
     }));
     let resp = service.call_single(call_req).await.unwrap();
 
+    // Tool input validation errors are now returned as CallToolResult with is_error: true
     match resp {
-        JsonRpcResponse::Error(e) => {
-            // Tool expects message field in arguments
-            assert!(e.error.code == -32603 || e.error.code == -32602);
+        JsonRpcResponse::Result(r) => {
+            let result: CallToolResult = serde_json::from_value(r.result).unwrap();
+            assert!(result.is_error, "Expected is_error to be true");
+            // The error will be about invalid input or missing fields
         }
-        JsonRpcResponse::Result(_) => panic!("Expected error for missing arguments"),
+        JsonRpcResponse::Error(e) => panic!(
+            "Expected CallToolResult with is_error, got JSON-RPC error: {:?}",
+            e
+        ),
     }
 }
 
