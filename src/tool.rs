@@ -430,6 +430,46 @@ impl Tool {
         })
     }
 
+    /// Create a new tool with a prefixed name.
+    ///
+    /// This creates a copy of the tool with its name prefixed by the given
+    /// string and a dot separator. For example, if the tool is named "query"
+    /// and the prefix is "db", the new tool will be named "db.query".
+    ///
+    /// This is used internally by `McpRouter::nest()` to namespace tools.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::{ToolBuilder, CallToolResult};
+    /// use schemars::JsonSchema;
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Debug, Deserialize, JsonSchema)]
+    /// struct Input { value: String }
+    ///
+    /// let tool = ToolBuilder::new("query")
+    ///     .description("Query the database")
+    ///     .handler(|i: Input| async move { Ok(CallToolResult::text(&i.value)) })
+    ///     .build()
+    ///     .unwrap();
+    ///
+    /// let prefixed = tool.with_name_prefix("db");
+    /// assert_eq!(prefixed.name, "db.query");
+    /// ```
+    pub fn with_name_prefix(&self, prefix: &str) -> Self {
+        Self {
+            name: format!("{}.{}", prefix, self.name),
+            title: self.title.clone(),
+            description: self.description.clone(),
+            output_schema: self.output_schema.clone(),
+            icons: self.icons.clone(),
+            annotations: self.annotations.clone(),
+            service: self.service.clone(),
+            input_schema: self.input_schema.clone(),
+        }
+    }
+
     /// Create a tool from a handler (internal helper)
     fn from_handler<H: ToolHandler + 'static>(
         name: String,
@@ -1820,6 +1860,7 @@ impl<T: McpTool> ToolHandler for McpToolHandler<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::Content;
     use schemars::JsonSchema;
     use serde::Deserialize;
 
@@ -2500,5 +2541,56 @@ mod tests {
         // Should work with empty input
         let result = tool.call(serde_json::json!({})).await;
         assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn test_tool_with_name_prefix() {
+        #[derive(Debug, Deserialize, JsonSchema)]
+        struct Input {
+            value: String,
+        }
+
+        let tool = ToolBuilder::new("query")
+            .description("Query something")
+            .title("Query Tool")
+            .handler(|input: Input| async move { Ok(CallToolResult::text(&input.value)) })
+            .build()
+            .expect("valid tool name");
+
+        // Create prefixed version
+        let prefixed = tool.with_name_prefix("db");
+
+        // Check name is prefixed
+        assert_eq!(prefixed.name, "db.query");
+
+        // Check other fields are preserved
+        assert_eq!(prefixed.description.as_deref(), Some("Query something"));
+        assert_eq!(prefixed.title.as_deref(), Some("Query Tool"));
+
+        // Check the tool still works
+        let result = prefixed
+            .call(serde_json::json!({"value": "test input"}))
+            .await;
+        assert!(!result.is_error);
+        match &result.content[0] {
+            Content::Text { text, .. } => assert_eq!(text, "test input"),
+            _ => panic!("Expected text content"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_with_name_prefix_multiple_levels() {
+        let tool = ToolBuilder::new("action")
+            .description("Do something")
+            .handler(|_: NoParams| async move { Ok(CallToolResult::text("done")) })
+            .build()
+            .expect("valid tool name");
+
+        // Apply multiple prefixes
+        let prefixed = tool.with_name_prefix("level1");
+        assert_eq!(prefixed.name, "level1.action");
+
+        let double_prefixed = prefixed.with_name_prefix("level0");
+        assert_eq!(double_prefixed.name, "level0.level1.action");
     }
 }
