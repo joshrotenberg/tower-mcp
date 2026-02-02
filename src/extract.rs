@@ -86,10 +86,16 @@ use crate::context::RequestContext;
 use crate::error::{Error, Result};
 use crate::protocol::CallToolResult;
 
-/// A rejection returned by an extractor.
+// =============================================================================
+// Rejection Types
+// =============================================================================
+
+/// A simple rejection with a message string.
 ///
-/// Rejections are converted to tool errors via the `Into<Error>` implementation.
-#[derive(Debug)]
+/// This is a general-purpose rejection type for custom extractors.
+/// For more specific error information, use the typed rejection types
+/// like [`JsonRejection`] or [`ExtensionRejection`].
+#[derive(Debug, Clone)]
 pub struct Rejection {
     message: String,
 }
@@ -100,6 +106,11 @@ impl Rejection {
         Self {
             message: message.into(),
         }
+    }
+
+    /// Get the rejection message.
+    pub fn message(&self) -> &str {
+        &self.message
     }
 }
 
@@ -114,6 +125,140 @@ impl std::error::Error for Rejection {}
 impl From<Rejection> for Error {
     fn from(rejection: Rejection) -> Self {
         Error::tool(rejection.message)
+    }
+}
+
+/// Rejection returned when JSON deserialization fails.
+///
+/// This rejection provides structured information about the deserialization
+/// error, including the path to the failing field when available.
+///
+/// # Example
+///
+/// ```rust
+/// use tower_mcp::extract::JsonRejection;
+///
+/// let rejection = JsonRejection::new("missing field `name`");
+/// assert!(rejection.message().contains("name"));
+/// ```
+#[derive(Debug, Clone)]
+pub struct JsonRejection {
+    message: String,
+    /// The serde error path, if available (e.g., "users[0].name")
+    path: Option<String>,
+}
+
+impl JsonRejection {
+    /// Create a new JSON rejection from a serde error.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            path: None,
+        }
+    }
+
+    /// Create a JSON rejection with a path to the failing field.
+    pub fn with_path(message: impl Into<String>, path: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            path: Some(path.into()),
+        }
+    }
+
+    /// Get the error message.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// Get the path to the failing field, if available.
+    pub fn path(&self) -> Option<&str> {
+        self.path.as_deref()
+    }
+}
+
+impl std::fmt::Display for JsonRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(path) = &self.path {
+            write!(f, "Invalid input at `{}`: {}", path, self.message)
+        } else {
+            write!(f, "Invalid input: {}", self.message)
+        }
+    }
+}
+
+impl std::error::Error for JsonRejection {}
+
+impl From<JsonRejection> for Error {
+    fn from(rejection: JsonRejection) -> Self {
+        Error::tool(rejection.to_string())
+    }
+}
+
+impl From<serde_json::Error> for JsonRejection {
+    fn from(err: serde_json::Error) -> Self {
+        // Try to extract path information from serde error
+        let path = if err.is_data() {
+            // serde_json provides line/column but not field path in the error itself
+            // The path is embedded in the message for some error types
+            None
+        } else {
+            None
+        };
+
+        Self {
+            message: err.to_string(),
+            path,
+        }
+    }
+}
+
+/// Rejection returned when an extension is not found.
+///
+/// This rejection is returned by the [`Extension`] extractor when the
+/// requested type is not present in the router's extensions.
+///
+/// # Example
+///
+/// ```rust
+/// use tower_mcp::extract::ExtensionRejection;
+///
+/// let rejection = ExtensionRejection::not_found::<String>();
+/// assert!(rejection.type_name().contains("String"));
+/// ```
+#[derive(Debug, Clone)]
+pub struct ExtensionRejection {
+    type_name: &'static str,
+}
+
+impl ExtensionRejection {
+    /// Create a rejection for a missing extension type.
+    pub fn not_found<T>() -> Self {
+        Self {
+            type_name: std::any::type_name::<T>(),
+        }
+    }
+
+    /// Get the type name of the missing extension.
+    pub fn type_name(&self) -> &'static str {
+        self.type_name
+    }
+}
+
+impl std::fmt::Display for ExtensionRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Extension of type `{}` not found. Did you call `router.with_state()` or `router.with_extension()`?",
+            self.type_name
+        )
+    }
+}
+
+impl std::error::Error for ExtensionRejection {}
+
+impl From<ExtensionRejection> for Error {
+    fn from(rejection: ExtensionRejection) -> Self {
+        Error::tool(rejection.to_string())
     }
 }
 
@@ -193,8 +338,8 @@ pub trait FromToolRequest<S = ()>: Sized {
 ///
 /// # Rejection
 ///
-/// Returns a [`Rejection`] if deserialization fails, with a message describing
-/// the JSON error.
+/// Returns a [`JsonRejection`] if deserialization fails. The rejection contains
+/// the error message and potentially the path to the failing field.
 #[derive(Debug, Clone, Copy)]
 pub struct Json<T>(pub T);
 
@@ -210,7 +355,7 @@ impl<S, T> FromToolRequest<S> for Json<T>
 where
     T: DeserializeOwned,
 {
-    type Rejection = Rejection;
+    type Rejection = JsonRejection;
 
     fn from_tool_request(
         _ctx: &RequestContext,
@@ -219,7 +364,7 @@ where
     ) -> std::result::Result<Self, Self::Rejection> {
         serde_json::from_value(args.clone())
             .map(Json)
-            .map_err(|e| Rejection::new(format!("Invalid input: {}", e)))
+            .map_err(JsonRejection::from)
     }
 }
 
@@ -405,7 +550,8 @@ impl<S> FromToolRequest<S> for RawArgs {
 ///
 /// # Rejection
 ///
-/// Returns a [`Rejection`] if the requested type is not found in the extensions.
+/// Returns an [`ExtensionRejection`] if the requested type is not found in the extensions.
+/// The rejection contains the type name of the missing extension.
 #[derive(Debug, Clone)]
 pub struct Extension<T>(pub T);
 
@@ -421,7 +567,7 @@ impl<S, T> FromToolRequest<S> for Extension<T>
 where
     T: Clone + Send + Sync + 'static,
 {
-    type Rejection = Rejection;
+    type Rejection = ExtensionRejection;
 
     fn from_tool_request(
         ctx: &RequestContext,
@@ -431,12 +577,7 @@ where
         ctx.extension::<T>()
             .cloned()
             .map(Extension)
-            .ok_or_else(|| {
-                Rejection::new(format!(
-                    "Extension of type `{}` not found. Did you call `router.with_state()` or `router.with_extension()`?",
-                    std::any::type_name::<T>()
-                ))
-            })
+            .ok_or_else(ExtensionRejection::not_found::<T>)
     }
 }
 
@@ -976,7 +1117,9 @@ mod tests {
 
         let result = Json::<TestInput>::from_tool_request(&ctx, &(), &args);
         assert!(result.is_err());
-        assert!(result.unwrap_err().message.contains("Invalid input"));
+        let rejection = result.unwrap_err();
+        // JsonRejection contains the serde error message
+        assert!(rejection.message().contains("count"));
     }
 
     #[test]
@@ -1052,7 +1195,9 @@ mod tests {
         // Try to extract something that's not in extensions
         let result = Extension::<NotPresent>::from_tool_request(&ctx, &(), &args);
         assert!(result.is_err());
-        assert!(result.unwrap_err().message.contains("not found"));
+        let rejection = result.unwrap_err();
+        // ExtensionRejection contains the type name
+        assert!(rejection.type_name().contains("NotPresent"));
     }
 
     #[tokio::test]
@@ -1134,6 +1279,55 @@ mod tests {
         let rejection = Rejection::new("test error");
         let error: Error = rejection.into();
         assert!(error.to_string().contains("test error"));
+    }
+
+    #[test]
+    fn test_json_rejection() {
+        // Test basic JsonRejection
+        let rejection = JsonRejection::new("missing field `name`");
+        assert_eq!(rejection.message(), "missing field `name`");
+        assert!(rejection.path().is_none());
+        assert!(rejection.to_string().contains("Invalid input"));
+
+        // Test JsonRejection with path
+        let rejection = JsonRejection::with_path("expected string", "users[0].name");
+        assert_eq!(rejection.message(), "expected string");
+        assert_eq!(rejection.path(), Some("users[0].name"));
+        assert!(rejection.to_string().contains("users[0].name"));
+
+        // Test conversion to Error
+        let error: Error = rejection.into();
+        assert!(error.to_string().contains("users[0].name"));
+    }
+
+    #[test]
+    fn test_json_rejection_from_serde_error() {
+        // Create a real serde error by deserializing invalid JSON
+        #[derive(Debug, serde::Deserialize)]
+        struct TestStruct {
+            #[allow(dead_code)]
+            name: String,
+        }
+
+        let result: std::result::Result<TestStruct, _> =
+            serde_json::from_value(serde_json::json!({"count": 42}));
+        assert!(result.is_err());
+
+        let rejection: JsonRejection = result.unwrap_err().into();
+        assert!(rejection.message().contains("name"));
+    }
+
+    #[test]
+    fn test_extension_rejection() {
+        // Test ExtensionRejection
+        let rejection = ExtensionRejection::not_found::<String>();
+        assert!(rejection.type_name().contains("String"));
+        assert!(rejection.to_string().contains("not found"));
+        assert!(rejection.to_string().contains("with_state"));
+
+        // Test conversion to Error
+        let error: Error = rejection.into();
+        assert!(error.to_string().contains("not found"));
     }
 
     #[tokio::test]
