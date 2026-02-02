@@ -28,4 +28,5 @@ pub fn build(state: Arc<AppState>) -> Resource {
                 })
             }
         })
+        .build()
 }
