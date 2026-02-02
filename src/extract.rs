@@ -363,7 +363,7 @@ impl<S> FromToolRequest<S> for RawArgs {
 /// Extract typed data from router extensions.
 ///
 /// This extractor retrieves data that was added to the router via
-/// [`McpRouter::with_state()`] or [`McpRouter::with_extension()`], or
+/// [`crate::McpRouter::with_state()`] or [`crate::McpRouter::with_extension()`], or
 /// inserted by middleware into the request context's extensions.
 ///
 /// # Example
