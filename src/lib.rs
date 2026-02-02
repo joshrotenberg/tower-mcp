@@ -269,9 +269,10 @@ pub mod transport;
 pub use async_task::{Task, TaskStore};
 pub use client::{ClientTransport, McpClient, StdioClientTransport};
 pub use context::{
-    ChannelClientRequester, ClientRequester, ClientRequesterHandle, NotificationReceiver,
-    NotificationSender, OutgoingRequest, OutgoingRequestReceiver, OutgoingRequestSender,
-    RequestContext, RequestContextBuilder, ServerNotification, outgoing_request_channel,
+    ChannelClientRequester, ClientRequester, ClientRequesterHandle, Extensions,
+    NotificationReceiver, NotificationSender, OutgoingRequest, OutgoingRequestReceiver,
+    OutgoingRequestSender, RequestContext, RequestContextBuilder, ServerNotification,
+    outgoing_request_channel,
 };
 pub use error::{BoxError, Error, Result, ToolError};
 pub use filter::{
@@ -295,7 +296,7 @@ pub use resource::{
     BoxResourceService, Resource, ResourceBuilder, ResourceHandler, ResourceRequest,
     ResourceTemplate, ResourceTemplateBuilder, ResourceTemplateHandler,
 };
-pub use router::{Extensions, McpRouter, RouterRequest, RouterResponse};
+pub use router::{McpRouter, RouterRequest, RouterResponse};
 pub use session::{SessionPhase, SessionState};
 pub use tool::{BoxToolService, NoParams, Tool, ToolBuilder, ToolHandler, ToolRequest};
 pub use transport::{

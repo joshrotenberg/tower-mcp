@@ -3,7 +3,6 @@
 //! The router implements Tower's `Service` trait, making it composable with
 //! standard tower middleware.
 
-use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -112,6 +111,8 @@ struct McpRouterInner {
     resource_filter: Option<ResourceFilter>,
     /// Filter for prompts based on session state
     prompt_filter: Option<PromptFilter>,
+    /// Router-level extensions (for state and middleware data)
+    extensions: Arc<crate::context::Extensions>,
 }
 
 impl McpRouter {
@@ -135,6 +136,7 @@ impl McpRouter {
                 client_requester: None,
                 task_store: TaskStore::new(),
                 subscriptions: Arc::new(RwLock::new(HashSet::new())),
+                extensions: Arc::new(crate::context::Extensions::new()),
                 completion_handler: None,
                 tool_filter: None,
                 resource_filter: None,
@@ -176,10 +178,72 @@ impl McpRouter {
         self.inner.client_requester.as_ref()
     }
 
+    /// Add router-level state that handlers can access via the `Extension<T>` extractor.
+    ///
+    /// This is the recommended way to share state across all tools, resources, and prompts
+    /// in a router. The state is available to handlers via the [`crate::extract::Extension`]
+    /// extractor.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::sync::Arc;
+    /// use tower_mcp::{McpRouter, ToolBuilder, CallToolResult};
+    /// use tower_mcp::extract::{Extension, Json};
+    /// use schemars::JsonSchema;
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Clone)]
+    /// struct AppState {
+    ///     db_url: String,
+    /// }
+    ///
+    /// #[derive(Deserialize, JsonSchema)]
+    /// struct QueryInput {
+    ///     sql: String,
+    /// }
+    ///
+    /// let state = Arc::new(AppState { db_url: "postgres://...".into() });
+    ///
+    /// // Tool extracts state via Extension<T>
+    /// let query_tool = ToolBuilder::new("query")
+    ///     .description("Run a database query")
+    ///     .extractor_handler_typed::<_, _, _, QueryInput>(
+    ///         (),
+    ///         |Extension(state): Extension<Arc<AppState>>, Json(input): Json<QueryInput>| async move {
+    ///             Ok(CallToolResult::text(format!("Query on {}: {}", state.db_url, input.sql)))
+    ///         },
+    ///     )
+    ///     .build()
+    ///     .unwrap();
+    ///
+    /// let router = McpRouter::new()
+    ///     .with_state(state)  // State is now available to all handlers
+    ///     .tool(query_tool);
+    /// ```
+    pub fn with_state<T: Clone + Send + Sync + 'static>(mut self, state: T) -> Self {
+        let inner = Arc::make_mut(&mut self.inner);
+        Arc::make_mut(&mut inner.extensions).insert(state);
+        self
+    }
+
+    /// Add an extension value that handlers can access via the `Extension<T>` extractor.
+    ///
+    /// This is a more general form of `with_state()` for when you need multiple
+    /// typed values available to handlers.
+    pub fn with_extension<T: Clone + Send + Sync + 'static>(self, value: T) -> Self {
+        self.with_state(value)
+    }
+
+    /// Get the router's extensions.
+    pub fn extensions(&self) -> &crate::context::Extensions {
+        &self.inner.extensions
+    }
+
     /// Create a request context for tracking a request
     ///
     /// This registers the request for cancellation tracking and sets up
-    /// progress reporting and client requests if configured.
+    /// progress reporting, client requests, and router extensions if configured.
     pub fn create_context(
         &self,
         request_id: RequestId,
@@ -207,6 +271,9 @@ impl McpRouter {
         } else {
             ctx
         };
+
+        // Include router extensions (for with_state() and middleware data)
+        let ctx = ctx.with_extensions(self.inner.extensions.clone());
 
         // Register for cancellation tracking
         let token = ctx.cancellation_token();
@@ -1328,56 +1395,8 @@ impl Default for McpRouter {
 // Tower Service implementation
 // =============================================================================
 
-/// A minimal type-map for passing data through middleware.
-///
-/// Uses `Arc<dyn Any>` internally so `Clone` is cheap, which is needed for
-/// batch requests that create multiple `RouterRequest`s from the same HTTP
-/// request.
-///
-/// # Example
-///
-/// ```rust
-/// use tower_mcp::Extensions;
-///
-/// let mut ext = Extensions::new();
-/// ext.insert(42u32);
-/// assert_eq!(ext.get::<u32>(), Some(&42));
-/// ```
-#[derive(Default, Clone)]
-pub struct Extensions {
-    map: HashMap<TypeId, Arc<dyn Any + Send + Sync>>,
-}
-
-impl Extensions {
-    /// Create an empty extensions map.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Insert a value into the extensions map.
-    ///
-    /// If a value of the same type already exists, it is replaced.
-    pub fn insert<T: Send + Sync + 'static>(&mut self, val: T) {
-        self.map.insert(TypeId::of::<T>(), Arc::new(val));
-    }
-
-    /// Get a reference to a value in the extensions map.
-    ///
-    /// Returns `None` if no value of the given type has been inserted.
-    pub fn get<T: Send + Sync + 'static>(&self) -> Option<&T> {
-        self.map
-            .get(&TypeId::of::<T>())
-            .and_then(|val| val.downcast_ref::<T>())
-    }
-}
-
-impl std::fmt::Debug for Extensions {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Extensions")
-            .field("len", &self.map.len())
-            .finish()
-    }
-}
+// Re-export Extensions from context for backwards compatibility
+pub use crate::context::Extensions;
 
 /// Request type for the tower Service implementation
 #[derive(Debug)]
