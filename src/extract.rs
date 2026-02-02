@@ -526,7 +526,7 @@ where
 // Schema Extraction Helper
 // =============================================================================
 
-/// Helper trait to get schema from Json<T> extractor
+/// Helper trait to get schema from `Json<T>` extractor
 pub trait HasSchema {
     fn schema() -> Option<Value>;
 }
