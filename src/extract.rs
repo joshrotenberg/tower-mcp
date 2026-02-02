@@ -12,9 +12,15 @@
 //! # Built-in Extractors
 //!
 //! - [`Json<T>`] - Extract typed input from args (deserializes JSON)
-//! - [`State<T>`] - Extract shared state (cloned for each request)
+//! - [`State<T>`] - Extract shared state from per-tool state (cloned for each request)
+//! - [`Extension<T>`] - Extract data from router extensions (via `router.with_state()`)
 //! - [`Context`] - Extract the [`RequestContext`] for progress, cancellation, etc.
 //! - [`RawArgs`] - Extract raw `serde_json::Value` arguments
+//!
+//! ## State vs Extension
+//!
+//! - Use **`State<T>`** when state is passed directly to `extractor_handler()` (per-tool state)
+//! - Use **`Extension<T>`** when state is set via `McpRouter::with_state()` (router-level state)
 //!
 //! # Example
 //!
@@ -351,6 +357,86 @@ impl<S> FromToolRequest<S> for RawArgs {
         args: &Value,
     ) -> std::result::Result<Self, Self::Rejection> {
         Ok(RawArgs(args.clone()))
+    }
+}
+
+/// Extract typed data from router extensions.
+///
+/// This extractor retrieves data that was added to the router via
+/// [`crate::McpRouter::with_state()`] or [`crate::McpRouter::with_extension()`], or
+/// inserted by middleware into the request context's extensions.
+///
+/// # Example
+///
+/// ```rust
+/// use std::sync::Arc;
+/// use tower_mcp::{McpRouter, ToolBuilder, CallToolResult};
+/// use tower_mcp::extract::{Extension, Json};
+/// use schemars::JsonSchema;
+/// use serde::Deserialize;
+///
+/// #[derive(Clone)]
+/// struct DatabasePool {
+///     url: String,
+/// }
+///
+/// #[derive(Deserialize, JsonSchema)]
+/// struct QueryInput {
+///     sql: String,
+/// }
+///
+/// let pool = Arc::new(DatabasePool { url: "postgres://...".into() });
+///
+/// let tool = ToolBuilder::new("query")
+///     .description("Run a query")
+///     .extractor_handler_typed::<_, _, _, QueryInput>(
+///         (),
+///         |Extension(db): Extension<Arc<DatabasePool>>, Json(input): Json<QueryInput>| async move {
+///             Ok(CallToolResult::text(format!("Query on {}: {}", db.url, input.sql)))
+///         },
+///     )
+///     .build()
+///     .unwrap();
+///
+/// let router = McpRouter::new()
+///     .with_state(pool)
+///     .tool(tool);
+/// ```
+///
+/// # Rejection
+///
+/// Returns a [`Rejection`] if the requested type is not found in the extensions.
+#[derive(Debug, Clone)]
+pub struct Extension<T>(pub T);
+
+impl<T> Deref for Extension<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<S, T> FromToolRequest<S> for Extension<T>
+where
+    T: Clone + Send + Sync + 'static,
+{
+    type Rejection = Rejection;
+
+    fn from_tool_request(
+        ctx: &RequestContext,
+        _state: &S,
+        _args: &Value,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        ctx.extension::<T>()
+            .cloned()
+            .map(Extension)
+            .ok_or_else(|| {
+                Rejection::new(format!(
+                    "Extension of type `{}` not found. Did you call `router.with_state()` or `router.with_extension()`?",
+                    std::any::type_name::<T>()
+                ))
+            })
     }
 }
 
@@ -926,6 +1012,47 @@ mod tests {
         let RawArgs(extracted) = result.unwrap();
         assert_eq!(extracted["foo"], "bar");
         assert_eq!(extracted["baz"], 123);
+    }
+
+    #[test]
+    fn test_extension_extraction() {
+        use crate::context::Extensions;
+
+        #[derive(Clone, Debug, PartialEq)]
+        struct DatabasePool {
+            url: String,
+        }
+
+        let args = serde_json::json!({});
+
+        // Create extensions with a value
+        let mut extensions = Extensions::new();
+        extensions.insert(Arc::new(DatabasePool {
+            url: "postgres://localhost".to_string(),
+        }));
+
+        // Create context with extensions
+        let ctx = RequestContext::new(RequestId::Number(1)).with_extensions(Arc::new(extensions));
+
+        // Extract the extension
+        let result = Extension::<Arc<DatabasePool>>::from_tool_request(&ctx, &(), &args);
+        assert!(result.is_ok());
+        let Extension(pool) = result.unwrap();
+        assert_eq!(pool.url, "postgres://localhost");
+    }
+
+    #[test]
+    fn test_extension_extraction_missing() {
+        #[derive(Clone, Debug)]
+        struct NotPresent;
+
+        let args = serde_json::json!({});
+        let ctx = RequestContext::new(RequestId::Number(1));
+
+        // Try to extract something that's not in extensions
+        let result = Extension::<NotPresent>::from_tool_request(&ctx, &(), &args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("not found"));
     }
 
     #[tokio::test]

@@ -252,6 +252,62 @@ pub struct RequestContext {
     notification_tx: Option<NotificationSender>,
     /// Handle for sending requests to the client (for sampling, etc.)
     client_requester: Option<ClientRequesterHandle>,
+    /// Extensions for passing data from router/middleware to handlers
+    extensions: Arc<Extensions>,
+}
+
+/// Type-erased extensions map for passing data to handlers.
+///
+/// Extensions allow router-level state and middleware-injected data to flow
+/// to tool handlers via the `Extension<T>` extractor.
+#[derive(Clone, Default)]
+pub struct Extensions {
+    map: std::collections::HashMap<std::any::TypeId, Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+impl Extensions {
+    /// Create an empty extensions map.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert a value into the extensions map.
+    ///
+    /// If a value of the same type already exists, it is replaced.
+    pub fn insert<T: Send + Sync + 'static>(&mut self, val: T) {
+        self.map.insert(std::any::TypeId::of::<T>(), Arc::new(val));
+    }
+
+    /// Get a reference to a value in the extensions map.
+    ///
+    /// Returns `None` if no value of the given type has been inserted.
+    pub fn get<T: Send + Sync + 'static>(&self) -> Option<&T> {
+        self.map
+            .get(&std::any::TypeId::of::<T>())
+            .and_then(|val| val.downcast_ref::<T>())
+    }
+
+    /// Check if the extensions map contains a value of the given type.
+    pub fn contains<T: Send + Sync + 'static>(&self) -> bool {
+        self.map.contains_key(&std::any::TypeId::of::<T>())
+    }
+
+    /// Merge another extensions map into this one.
+    ///
+    /// Values from `other` will overwrite existing values of the same type.
+    pub fn merge(&mut self, other: &Extensions) {
+        for (k, v) in &other.map {
+            self.map.insert(*k, v.clone());
+        }
+    }
+}
+
+impl std::fmt::Debug for Extensions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Extensions")
+            .field("len", &self.map.len())
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for RequestContext {
@@ -273,6 +329,7 @@ impl RequestContext {
             cancelled: Arc::new(AtomicBool::new(false)),
             notification_tx: None,
             client_requester: None,
+            extensions: Arc::new(Extensions::new()),
         }
     }
 
@@ -292,6 +349,46 @@ impl RequestContext {
     pub fn with_client_requester(mut self, requester: ClientRequesterHandle) -> Self {
         self.client_requester = Some(requester);
         self
+    }
+
+    /// Set the extensions for this request context.
+    ///
+    /// Extensions allow router-level state and middleware data to flow to handlers.
+    pub fn with_extensions(mut self, extensions: Arc<Extensions>) -> Self {
+        self.extensions = extensions;
+        self
+    }
+
+    /// Get a reference to a value from the extensions map.
+    ///
+    /// Returns `None` if no value of the given type has been inserted.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// #[derive(Clone)]
+    /// struct CurrentUser { id: String }
+    ///
+    /// // In a handler:
+    /// if let Some(user) = ctx.extension::<CurrentUser>() {
+    ///     println!("User: {}", user.id);
+    /// }
+    /// ```
+    pub fn extension<T: Send + Sync + 'static>(&self) -> Option<&T> {
+        self.extensions.get::<T>()
+    }
+
+    /// Get a mutable reference to the extensions.
+    ///
+    /// This allows middleware to insert data that handlers can access via
+    /// the `Extension<T>` extractor.
+    pub fn extensions_mut(&mut self) -> &mut Extensions {
+        Arc::make_mut(&mut self.extensions)
+    }
+
+    /// Get a reference to the extensions.
+    pub fn extensions(&self) -> &Extensions {
+        &self.extensions
     }
 
     /// Get the request ID
