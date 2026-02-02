@@ -87,6 +87,7 @@ fn build_rules_overview_resource() -> Resource {
                 }],
             })
         })
+        .build()
 }
 
 fn build_rule_detail_template() -> ResourceTemplate {

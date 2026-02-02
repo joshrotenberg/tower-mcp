@@ -48,6 +48,7 @@ fn build_cargo_toml_resource(state: Arc<CodegenState>) -> Resource {
                 })
             }
         })
+        .build()
 }
 
 fn build_main_rs_resource(state: Arc<CodegenState>) -> Resource {
@@ -79,6 +80,7 @@ fn build_main_rs_resource(state: Arc<CodegenState>) -> Resource {
                 })
             }
         })
+        .build()
 }
 
 fn build_readme_resource(state: Arc<CodegenState>) -> Resource {
@@ -110,6 +112,7 @@ fn build_readme_resource(state: Arc<CodegenState>) -> Resource {
                 })
             }
         })
+        .build()
 }
 
 fn build_state_resource(state: Arc<CodegenState>) -> Resource {
@@ -135,4 +138,5 @@ fn build_state_resource(state: Arc<CodegenState>) -> Resource {
                 })
             }
         })
+        .build()
 }
