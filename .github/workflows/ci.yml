@@ -83,3 +83,18 @@ jobs:
       - run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: -Dwarnings
+
+  examples:
+    name: Examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build all examples
+        run: |
+          cargo build --examples --all-features
+          cargo build --manifest-path examples/crates-mcp/Cargo.toml
+          cargo build --manifest-path examples/conformance-server/Cargo.toml
+          cargo build --manifest-path examples/codegen-mcp/Cargo.toml
+          cargo build --manifest-path examples/markdownlint-mcp/Cargo.toml
