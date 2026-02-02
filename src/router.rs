@@ -414,6 +414,152 @@ impl McpRouter {
             .fold(self, |router, prompt| router.prompt(prompt))
     }
 
+    /// Merge another router's capabilities into this one.
+    ///
+    /// This combines all tools, resources, resource templates, and prompts from
+    /// the other router into this router. Uses "last wins" semantics for conflicts,
+    /// meaning if both routers have a tool/resource/prompt with the same name,
+    /// the one from `other` will replace the one in `self`.
+    ///
+    /// Server info, instructions, filters, and other router-level configuration
+    /// are NOT merged - only the root router's settings are used.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::{McpRouter, ToolBuilder, CallToolResult, ResourceBuilder};
+    /// use schemars::JsonSchema;
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Debug, Deserialize, JsonSchema)]
+    /// struct Input { value: String }
+    ///
+    /// // Create a router with database tools
+    /// let db_tools = McpRouter::new()
+    ///     .tool(
+    ///         ToolBuilder::new("query")
+    ///             .description("Query the database")
+    ///             .handler(|i: Input| async move { Ok(CallToolResult::text(&i.value)) })
+    ///             .build()
+    ///             .unwrap()
+    ///     );
+    ///
+    /// // Create a router with API tools
+    /// let api_tools = McpRouter::new()
+    ///     .tool(
+    ///         ToolBuilder::new("fetch")
+    ///             .description("Fetch from API")
+    ///             .handler(|i: Input| async move { Ok(CallToolResult::text(&i.value)) })
+    ///             .build()
+    ///             .unwrap()
+    ///     );
+    ///
+    /// // Merge them together
+    /// let router = McpRouter::new()
+    ///     .server_info("combined", "1.0")
+    ///     .merge(db_tools)
+    ///     .merge(api_tools);
+    /// ```
+    pub fn merge(mut self, other: McpRouter) -> Self {
+        let inner = Arc::make_mut(&mut self.inner);
+        let other_inner = other.inner;
+
+        // Merge tools (last wins)
+        for (name, tool) in &other_inner.tools {
+            inner.tools.insert(name.clone(), tool.clone());
+        }
+
+        // Merge resources (last wins)
+        for (uri, resource) in &other_inner.resources {
+            inner.resources.insert(uri.clone(), resource.clone());
+        }
+
+        // Merge resource templates (append - no deduplication since templates
+        // can have complex matching behavior)
+        for template in &other_inner.resource_templates {
+            inner.resource_templates.push(template.clone());
+        }
+
+        // Merge prompts (last wins)
+        for (name, prompt) in &other_inner.prompts {
+            inner.prompts.insert(name.clone(), prompt.clone());
+        }
+
+        self
+    }
+
+    /// Nest another router's capabilities under a prefix.
+    ///
+    /// This is similar to `merge()`, but all tool names from the nested router
+    /// are prefixed with the given string and a dot separator. For example,
+    /// nesting with prefix "db" will turn a tool named "query" into "db.query".
+    ///
+    /// Resources, resource templates, and prompts are merged without modification
+    /// since they use URIs rather than simple names for identification.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::{McpRouter, ToolBuilder, CallToolResult};
+    /// use schemars::JsonSchema;
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Debug, Deserialize, JsonSchema)]
+    /// struct Input { value: String }
+    ///
+    /// // Create a router with database tools
+    /// let db_tools = McpRouter::new()
+    ///     .tool(
+    ///         ToolBuilder::new("query")
+    ///             .description("Query the database")
+    ///             .handler(|i: Input| async move { Ok(CallToolResult::text(&i.value)) })
+    ///             .build()
+    ///             .unwrap()
+    ///     )
+    ///     .tool(
+    ///         ToolBuilder::new("insert")
+    ///             .description("Insert into database")
+    ///             .handler(|i: Input| async move { Ok(CallToolResult::text(&i.value)) })
+    ///             .build()
+    ///             .unwrap()
+    ///     );
+    ///
+    /// // Nest under "db" prefix - tools become "db.query" and "db.insert"
+    /// let router = McpRouter::new()
+    ///     .server_info("combined", "1.0")
+    ///     .nest("db", db_tools);
+    /// ```
+    pub fn nest(mut self, prefix: impl Into<String>, other: McpRouter) -> Self {
+        let prefix = prefix.into();
+        let inner = Arc::make_mut(&mut self.inner);
+        let other_inner = other.inner;
+
+        // Nest tools with prefix
+        for tool in other_inner.tools.values() {
+            let prefixed_tool = tool.with_name_prefix(&prefix);
+            inner
+                .tools
+                .insert(prefixed_tool.name.clone(), Arc::new(prefixed_tool));
+        }
+
+        // Merge resources (no prefix - URIs are already namespaced)
+        for (uri, resource) in &other_inner.resources {
+            inner.resources.insert(uri.clone(), resource.clone());
+        }
+
+        // Merge resource templates (no prefix)
+        for template in &other_inner.resource_templates {
+            inner.resource_templates.push(template.clone());
+        }
+
+        // Merge prompts (no prefix - could be added in future if needed)
+        for (name, prompt) in &other_inner.prompts {
+            inner.prompts.insert(name.clone(), prompt.clone());
+        }
+
+        self
+    }
+
     /// Register a completion handler for `completion/complete` requests.
     ///
     /// The handler receives `CompleteParams` containing the reference (prompt or resource)
@@ -3191,6 +3337,401 @@ mod tests {
                 assert!(e.message.contains("Unauthorized"));
             }
             _ => panic!("Expected JsonRpc error"),
+        }
+    }
+
+    // =========================================================================
+    // Router Composition Tests (merge/nest)
+    // =========================================================================
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    struct StringInput {
+        value: String,
+    }
+
+    #[tokio::test]
+    async fn test_router_merge_tools() {
+        // Create first router with a tool
+        let tool_a = ToolBuilder::new("tool_a")
+            .description("Tool A")
+            .handler(|_: StringInput| async move { Ok(CallToolResult::text("A")) })
+            .build()
+            .unwrap();
+
+        let router_a = McpRouter::new().tool(tool_a);
+
+        // Create second router with different tools
+        let tool_b = ToolBuilder::new("tool_b")
+            .description("Tool B")
+            .handler(|_: StringInput| async move { Ok(CallToolResult::text("B")) })
+            .build()
+            .unwrap();
+        let tool_c = ToolBuilder::new("tool_c")
+            .description("Tool C")
+            .handler(|_: StringInput| async move { Ok(CallToolResult::text("C")) })
+            .build()
+            .unwrap();
+
+        let router_b = McpRouter::new().tool(tool_b).tool(tool_c);
+
+        // Merge them
+        let mut merged = McpRouter::new()
+            .server_info("merged", "1.0")
+            .merge(router_a)
+            .merge(router_b);
+
+        init_router(&mut merged).await;
+
+        // List tools
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::ListTools(ListToolsParams::default()),
+            extensions: Extensions::new(),
+        };
+
+        let resp = merged.ready().await.unwrap().call(req).await.unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::ListTools(result)) => {
+                assert_eq!(result.tools.len(), 3);
+                let names: Vec<&str> = result.tools.iter().map(|t| t.name.as_str()).collect();
+                assert!(names.contains(&"tool_a"));
+                assert!(names.contains(&"tool_b"));
+                assert!(names.contains(&"tool_c"));
+            }
+            _ => panic!("Expected ListTools response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_router_merge_overwrites_duplicates() {
+        // Create first router with a tool
+        let tool_v1 = ToolBuilder::new("shared")
+            .description("Version 1")
+            .handler(|_: StringInput| async move { Ok(CallToolResult::text("v1")) })
+            .build()
+            .unwrap();
+
+        let router_a = McpRouter::new().tool(tool_v1);
+
+        // Create second router with same tool name but different description
+        let tool_v2 = ToolBuilder::new("shared")
+            .description("Version 2")
+            .handler(|_: StringInput| async move { Ok(CallToolResult::text("v2")) })
+            .build()
+            .unwrap();
+
+        let router_b = McpRouter::new().tool(tool_v2);
+
+        // Merge - second should win
+        let mut merged = McpRouter::new().merge(router_a).merge(router_b);
+
+        init_router(&mut merged).await;
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::ListTools(ListToolsParams::default()),
+            extensions: Extensions::new(),
+        };
+
+        let resp = merged.ready().await.unwrap().call(req).await.unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::ListTools(result)) => {
+                assert_eq!(result.tools.len(), 1);
+                assert_eq!(result.tools[0].name, "shared");
+                assert_eq!(result.tools[0].description.as_deref(), Some("Version 2"));
+            }
+            _ => panic!("Expected ListTools response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_router_merge_resources() {
+        use crate::resource::ResourceBuilder;
+
+        // Create routers with different resources
+        let router_a = McpRouter::new().resource(
+            ResourceBuilder::new("file:///a.txt")
+                .name("File A")
+                .text("content a"),
+        );
+
+        let router_b = McpRouter::new().resource(
+            ResourceBuilder::new("file:///b.txt")
+                .name("File B")
+                .text("content b"),
+        );
+
+        let mut merged = McpRouter::new().merge(router_a).merge(router_b);
+
+        init_router(&mut merged).await;
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::ListResources(ListResourcesParams::default()),
+            extensions: Extensions::new(),
+        };
+
+        let resp = merged.ready().await.unwrap().call(req).await.unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::ListResources(result)) => {
+                assert_eq!(result.resources.len(), 2);
+                let uris: Vec<&str> = result.resources.iter().map(|r| r.uri.as_str()).collect();
+                assert!(uris.contains(&"file:///a.txt"));
+                assert!(uris.contains(&"file:///b.txt"));
+            }
+            _ => panic!("Expected ListResources response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_router_merge_prompts() {
+        use crate::prompt::PromptBuilder;
+
+        let router_a =
+            McpRouter::new().prompt(PromptBuilder::new("prompt_a").user_message("Hello A"));
+
+        let router_b =
+            McpRouter::new().prompt(PromptBuilder::new("prompt_b").user_message("Hello B"));
+
+        let mut merged = McpRouter::new().merge(router_a).merge(router_b);
+
+        init_router(&mut merged).await;
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::ListPrompts(ListPromptsParams::default()),
+            extensions: Extensions::new(),
+        };
+
+        let resp = merged.ready().await.unwrap().call(req).await.unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::ListPrompts(result)) => {
+                assert_eq!(result.prompts.len(), 2);
+                let names: Vec<&str> = result.prompts.iter().map(|p| p.name.as_str()).collect();
+                assert!(names.contains(&"prompt_a"));
+                assert!(names.contains(&"prompt_b"));
+            }
+            _ => panic!("Expected ListPrompts response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_router_nest_prefixes_tools() {
+        // Create a router with tools
+        let tool_query = ToolBuilder::new("query")
+            .description("Query the database")
+            .handler(|_: StringInput| async move { Ok(CallToolResult::text("query result")) })
+            .build()
+            .unwrap();
+        let tool_insert = ToolBuilder::new("insert")
+            .description("Insert into database")
+            .handler(|_: StringInput| async move { Ok(CallToolResult::text("insert result")) })
+            .build()
+            .unwrap();
+
+        let db_router = McpRouter::new().tool(tool_query).tool(tool_insert);
+
+        // Nest under "db" prefix
+        let mut router = McpRouter::new()
+            .server_info("nested", "1.0")
+            .nest("db", db_router);
+
+        init_router(&mut router).await;
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::ListTools(ListToolsParams::default()),
+            extensions: Extensions::new(),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::ListTools(result)) => {
+                assert_eq!(result.tools.len(), 2);
+                let names: Vec<&str> = result.tools.iter().map(|t| t.name.as_str()).collect();
+                assert!(names.contains(&"db.query"));
+                assert!(names.contains(&"db.insert"));
+            }
+            _ => panic!("Expected ListTools response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_router_nest_call_prefixed_tool() {
+        let tool = ToolBuilder::new("echo")
+            .description("Echo input")
+            .handler(|input: StringInput| async move { Ok(CallToolResult::text(&input.value)) })
+            .build()
+            .unwrap();
+
+        let nested_router = McpRouter::new().tool(tool);
+
+        let mut router = McpRouter::new().nest("api", nested_router);
+
+        init_router(&mut router).await;
+
+        // Call the prefixed tool
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::CallTool(CallToolParams {
+                name: "api.echo".to_string(),
+                arguments: serde_json::json!({"value": "hello world"}),
+                meta: None,
+            }),
+            extensions: Extensions::new(),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::CallTool(result)) => {
+                assert!(!result.is_error);
+                match &result.content[0] {
+                    Content::Text { text, .. } => assert_eq!(text, "hello world"),
+                    _ => panic!("Expected text content"),
+                }
+            }
+            _ => panic!("Expected CallTool response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_router_multiple_nests() {
+        let db_tool = ToolBuilder::new("query")
+            .description("Database query")
+            .handler(|_: StringInput| async move { Ok(CallToolResult::text("db")) })
+            .build()
+            .unwrap();
+
+        let api_tool = ToolBuilder::new("fetch")
+            .description("API fetch")
+            .handler(|_: StringInput| async move { Ok(CallToolResult::text("api")) })
+            .build()
+            .unwrap();
+
+        let db_router = McpRouter::new().tool(db_tool);
+        let api_router = McpRouter::new().tool(api_tool);
+
+        let mut router = McpRouter::new()
+            .nest("db", db_router)
+            .nest("api", api_router);
+
+        init_router(&mut router).await;
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::ListTools(ListToolsParams::default()),
+            extensions: Extensions::new(),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::ListTools(result)) => {
+                assert_eq!(result.tools.len(), 2);
+                let names: Vec<&str> = result.tools.iter().map(|t| t.name.as_str()).collect();
+                assert!(names.contains(&"db.query"));
+                assert!(names.contains(&"api.fetch"));
+            }
+            _ => panic!("Expected ListTools response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_router_merge_and_nest_combined() {
+        // Test combining merge and nest
+        let tool_a = ToolBuilder::new("local")
+            .description("Local tool")
+            .handler(|_: StringInput| async move { Ok(CallToolResult::text("local")) })
+            .build()
+            .unwrap();
+
+        let nested_tool = ToolBuilder::new("remote")
+            .description("Remote tool")
+            .handler(|_: StringInput| async move { Ok(CallToolResult::text("remote")) })
+            .build()
+            .unwrap();
+
+        let nested_router = McpRouter::new().tool(nested_tool);
+
+        let mut router = McpRouter::new()
+            .tool(tool_a)
+            .nest("external", nested_router);
+
+        init_router(&mut router).await;
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::ListTools(ListToolsParams::default()),
+            extensions: Extensions::new(),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::ListTools(result)) => {
+                assert_eq!(result.tools.len(), 2);
+                let names: Vec<&str> = result.tools.iter().map(|t| t.name.as_str()).collect();
+                assert!(names.contains(&"local"));
+                assert!(names.contains(&"external.remote"));
+            }
+            _ => panic!("Expected ListTools response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_router_merge_preserves_server_info() {
+        let child_router = McpRouter::new()
+            .server_info("child", "2.0")
+            .instructions("Child instructions");
+
+        let mut router = McpRouter::new()
+            .server_info("parent", "1.0")
+            .instructions("Parent instructions")
+            .merge(child_router);
+
+        init_router(&mut router).await;
+
+        // Initialize response should have parent's server info
+        let init_req = RouterRequest {
+            id: RequestId::Number(99),
+            inner: McpRequest::Initialize(InitializeParams {
+                protocol_version: "2025-11-25".to_string(),
+                capabilities: ClientCapabilities::default(),
+                client_info: Implementation {
+                    name: "test".to_string(),
+                    version: "1.0".to_string(),
+                    ..Default::default()
+                },
+            }),
+            extensions: Extensions::new(),
+        };
+
+        // Create fresh router for this test since we need to call initialize
+        let child_router2 = McpRouter::new().server_info("child", "2.0");
+        let mut fresh_router = McpRouter::new()
+            .server_info("parent", "1.0")
+            .merge(child_router2);
+
+        let resp = fresh_router
+            .ready()
+            .await
+            .unwrap()
+            .call(init_req)
+            .await
+            .unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::Initialize(result)) => {
+                assert_eq!(result.server_info.name, "parent");
+                assert_eq!(result.server_info.version, "1.0");
+            }
+            _ => panic!("Expected Initialize response"),
         }
     }
 }
