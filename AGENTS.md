@@ -22,6 +22,14 @@ Weather forecasts via NWS API (US only).
 
 Tools: `get_forecast` (lat/lon), `get_alerts` (state code)
 
+### codegen-mcp
+MCP server that helps build MCP servers (meta!).
+
+Tools: `init_project`, `add_tool`, `remove_tool`, `get_project`,
+`generate`, `validate`, `reset`
+
+Resources: `project://Cargo.toml`, `project://src/main.rs`, `project://state.json`
+
 ### conformance
 Full MCP protocol conformance server (39/39 tests passing).
 
@@ -47,6 +55,8 @@ Before committing, run:
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --lib --all-features
+cargo test --test '*' --all-features
+cargo test --doc --all-features
 ```
 
 ## Project Structure
@@ -55,6 +65,7 @@ cargo test --lib --all-features
 - `examples/` - Example MCP servers
   - `crates-mcp/` - Full-featured crates.io server
   - `markdownlint-mcp/` - Markdown linting server
+  - `codegen-mcp/` - MCP server builder (generates tower-mcp code)
   - `conformance-server/` - MCP spec conformance tests
   - `stdio_server.rs` - Minimal example
   - `weather_server.rs` - External API example
