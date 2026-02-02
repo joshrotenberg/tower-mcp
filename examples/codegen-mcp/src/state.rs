@@ -99,7 +99,7 @@ fn default_true() -> bool {
 }
 
 /// Handler type variants.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum HandlerType {
     /// Simple handler: `handler(|input: T| async move { ... })`

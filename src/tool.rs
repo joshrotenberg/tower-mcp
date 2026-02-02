@@ -681,471 +681,6 @@ impl ToolBuilder {
         }
     }
 
-    /// Specify input type and context-aware handler
-    ///
-    /// The handler receives a `RequestContext` for progress reporting and
-    /// cancellation checking, along with the deserialized input.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use tower_mcp::{ToolBuilder, CallToolResult, RequestContext};
-    /// use schemars::JsonSchema;
-    /// use serde::Deserialize;
-    ///
-    /// #[derive(Debug, Deserialize, JsonSchema)]
-    /// struct ProcessInput {
-    ///     items: Vec<String>,
-    /// }
-    ///
-    /// let tool = ToolBuilder::new("process")
-    ///     .description("Process items with progress")
-    ///     .handler_with_context(|ctx: RequestContext, input: ProcessInput| async move {
-    ///         for (i, item) in input.items.iter().enumerate() {
-    ///             if ctx.is_cancelled() {
-    ///                 return Ok(CallToolResult::error("Cancelled"));
-    ///             }
-    ///             ctx.report_progress(i as f64, Some(input.items.len() as f64), Some("Processing...")).await;
-    ///             // Process item...
-    ///         }
-    ///         Ok(CallToolResult::text("Done"))
-    ///     })
-    ///     .build()
-    ///     .expect("valid tool name");
-    /// ```
-    pub fn handler_with_context<I, F, Fut>(self, handler: F) -> ToolBuilderWithContextHandler<I, F>
-    where
-        I: JsonSchema + DeserializeOwned + Send + Sync + 'static,
-        F: Fn(RequestContext, I) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
-    {
-        ToolBuilderWithContextHandler {
-            name: self.name,
-            title: self.title,
-            description: self.description,
-            output_schema: self.output_schema,
-            icons: self.icons,
-            annotations: self.annotations,
-            handler,
-            _phantom: std::marker::PhantomData,
-        }
-    }
-
-    /// Specify input type, shared state, and handler.
-    ///
-    /// The state is cloned for each invocation, so wrapping it in an `Arc`
-    /// is recommended for expensive-to-clone types. This eliminates the
-    /// boilerplate of cloning state inside a `move` closure.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use std::sync::Arc;
-    /// use tower_mcp::{ToolBuilder, CallToolResult};
-    /// use schemars::JsonSchema;
-    /// use serde::Deserialize;
-    ///
-    /// #[derive(Debug, Deserialize, JsonSchema)]
-    /// struct QueryInput { query: String }
-    ///
-    /// struct Db { connection_string: String }
-    ///
-    /// let db = Arc::new(Db { connection_string: "postgres://...".to_string() });
-    ///
-    /// let tool = ToolBuilder::new("search")
-    ///     .description("Search the database")
-    ///     .handler_with_state(db, |db: Arc<Db>, input: QueryInput| async move {
-    ///         Ok(CallToolResult::text(format!("Queried: {}", input.query)))
-    ///     })
-    ///     .build()
-    ///     .expect("valid tool name");
-    /// ```
-    pub fn handler_with_state<S, I, F, Fut>(
-        self,
-        state: S,
-        handler: F,
-    ) -> ToolBuilderWithHandler<
-        I,
-        impl Fn(I) -> BoxFuture<'static, Result<CallToolResult>> + Send + Sync + 'static,
-    >
-    where
-        S: Clone + Send + Sync + 'static,
-        I: JsonSchema + DeserializeOwned + Send + Sync + 'static,
-        F: Fn(S, I) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
-    {
-        let handler = Arc::new(handler);
-        self.handler(move |input: I| {
-            let state = state.clone();
-            let handler = handler.clone();
-            Box::pin(async move { handler(state, input).await })
-                as BoxFuture<'static, Result<CallToolResult>>
-        })
-    }
-
-    /// Specify input type, shared state, and context-aware handler.
-    ///
-    /// Combines state injection with `RequestContext` access for progress
-    /// reporting, cancellation, sampling, and logging.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use std::sync::Arc;
-    /// use tower_mcp::{ToolBuilder, CallToolResult, RequestContext};
-    /// use schemars::JsonSchema;
-    /// use serde::Deserialize;
-    ///
-    /// #[derive(Debug, Deserialize, JsonSchema)]
-    /// struct QueryInput { query: String }
-    ///
-    /// struct Db { connection_string: String }
-    ///
-    /// let db = Arc::new(Db { connection_string: "postgres://...".to_string() });
-    ///
-    /// let tool = ToolBuilder::new("search")
-    ///     .description("Search the database with progress")
-    ///     .handler_with_state_and_context(db, |db: Arc<Db>, ctx: RequestContext, input: QueryInput| async move {
-    ///         ctx.report_progress(0.0, Some(1.0), Some("Searching...")).await;
-    ///         Ok(CallToolResult::text(format!("Queried: {}", input.query)))
-    ///     })
-    ///     .build()
-    ///     .expect("valid tool name");
-    /// ```
-    pub fn handler_with_state_and_context<S, I, F, Fut>(
-        self,
-        state: S,
-        handler: F,
-    ) -> ToolBuilderWithContextHandler<
-        I,
-        impl Fn(RequestContext, I) -> BoxFuture<'static, Result<CallToolResult>> + Send + Sync + 'static,
-    >
-    where
-        S: Clone + Send + Sync + 'static,
-        I: JsonSchema + DeserializeOwned + Send + Sync + 'static,
-        F: Fn(S, RequestContext, I) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
-    {
-        let handler = Arc::new(handler);
-        self.handler_with_context(move |ctx: RequestContext, input: I| {
-            let state = state.clone();
-            let handler = handler.clone();
-            Box::pin(async move { handler(state, ctx, input).await })
-                as BoxFuture<'static, Result<CallToolResult>>
-        })
-    }
-
-    /// Create a tool that takes no parameters.
-    ///
-    /// The handler receives no input arguments. An empty object input schema
-    /// is generated automatically. Returns `Result<Tool>` directly.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use tower_mcp::{ToolBuilder, CallToolResult};
-    ///
-    /// let tool = ToolBuilder::new("server_time")
-    ///     .description("Get the current server time")
-    ///     .handler_no_params(|| async {
-    ///         Ok(CallToolResult::text("2025-01-01T00:00:00Z"))
-    ///     })
-    ///     .expect("valid tool name");
-    ///
-    /// assert_eq!(tool.name, "server_time");
-    /// ```
-    pub fn handler_no_params<F, Fut>(self, handler: F) -> Result<Tool>
-    where
-        F: Fn() -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
-    {
-        validate_tool_name(&self.name)?;
-        Ok(Tool::from_handler(
-            self.name,
-            self.title,
-            self.description,
-            self.output_schema,
-            self.icons,
-            self.annotations,
-            NoParamsHandler { handler },
-        ))
-    }
-
-    /// Create a tool with shared state but no parameters.
-    ///
-    /// Use this for tools that need access to shared state (e.g., a connection pool,
-    /// configuration, or shared registry) but don't take any input parameters.
-    ///
-    /// Returns an error if the tool name is invalid.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use std::sync::Arc;
-    /// use tower_mcp::{ToolBuilder, CallToolResult};
-    ///
-    /// struct Config { version: String }
-    ///
-    /// let config = Arc::new(Config { version: "1.0.0".to_string() });
-    ///
-    /// let tool = ToolBuilder::new("get_version")
-    ///     .description("Get the server version")
-    ///     .handler_with_state_no_params(config, |config: Arc<Config>| async move {
-    ///         Ok(CallToolResult::text(&config.version))
-    ///     })
-    ///     .expect("valid tool name");
-    ///
-    /// assert_eq!(tool.name, "get_version");
-    /// ```
-    pub fn handler_with_state_no_params<S, F, Fut>(self, state: S, handler: F) -> Result<Tool>
-    where
-        S: Clone + Send + Sync + 'static,
-        F: Fn(S) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
-    {
-        validate_tool_name(&self.name)?;
-        Ok(Tool::from_handler(
-            self.name,
-            self.title,
-            self.description,
-            self.output_schema,
-            self.icons,
-            self.annotations,
-            NoParamsWithStateHandler { state, handler },
-        ))
-    }
-
-    /// Deprecated: Use [`handler_with_state_no_params`](Self::handler_with_state_no_params) instead.
-    #[deprecated(
-        since = "0.3.0",
-        note = "renamed to handler_with_state_no_params for consistency"
-    )]
-    pub fn handler_no_params_with_state<S, F, Fut>(self, state: S, handler: F) -> Result<Tool>
-    where
-        S: Clone + Send + Sync + 'static,
-        F: Fn(S) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
-    {
-        self.handler_with_state_no_params(state, handler)
-    }
-
-    /// Create a tool with no parameters but with request context.
-    ///
-    /// Use this for tools that need access to `RequestContext` for progress
-    /// reporting, cancellation, sampling, and logging, but don't take any
-    /// input parameters.
-    ///
-    /// Returns an error if the tool name is invalid.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use tower_mcp::{ToolBuilder, CallToolResult, RequestContext};
-    ///
-    /// let tool = ToolBuilder::new("health_check")
-    ///     .description("Check server health")
-    ///     .handler_no_params_with_context(|ctx: RequestContext| async move {
-    ///         // Can use ctx for progress, cancellation, sampling, logging
-    ///         if ctx.is_cancelled() {
-    ///             return Ok(CallToolResult::error("Cancelled"));
-    ///         }
-    ///         Ok(CallToolResult::text("OK"))
-    ///     })
-    ///     .expect("valid tool name");
-    /// ```
-    pub fn handler_no_params_with_context<F, Fut>(self, handler: F) -> Result<Tool>
-    where
-        F: Fn(RequestContext) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
-    {
-        validate_tool_name(&self.name)?;
-        Ok(Tool::from_handler(
-            self.name,
-            self.title,
-            self.description,
-            self.output_schema,
-            self.icons,
-            self.annotations,
-            NoParamsWithContextHandler { handler },
-        ))
-    }
-
-    /// Create a tool with shared state and request context but no parameters.
-    ///
-    /// Combines state injection with `RequestContext` access for tools that need
-    /// both but don't take any input parameters.
-    ///
-    /// Returns an error if the tool name is invalid.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use std::sync::Arc;
-    /// use tower_mcp::{ToolBuilder, CallToolResult, RequestContext};
-    ///
-    /// struct Config { version: String }
-    ///
-    /// let config = Arc::new(Config { version: "1.0.0".to_string() });
-    ///
-    /// let tool = ToolBuilder::new("version_with_progress")
-    ///     .description("Get version with progress reporting")
-    ///     .handler_with_state_and_context_no_params(config, |config: Arc<Config>, ctx: RequestContext| async move {
-    ///         ctx.report_progress(1.0, Some(1.0), Some("Done")).await;
-    ///         Ok(CallToolResult::text(&config.version))
-    ///     })
-    ///     .expect("valid tool name");
-    /// ```
-    pub fn handler_with_state_and_context_no_params<S, F, Fut>(
-        self,
-        state: S,
-        handler: F,
-    ) -> Result<Tool>
-    where
-        S: Clone + Send + Sync + 'static,
-        F: Fn(S, RequestContext) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
-    {
-        validate_tool_name(&self.name)?;
-        Ok(Tool::from_handler(
-            self.name,
-            self.title,
-            self.description,
-            self.output_schema,
-            self.icons,
-            self.annotations,
-            NoParamsWithStateAndContextHandler { state, handler },
-        ))
-    }
-
-    /// Create a tool with raw JSON handling (no automatic deserialization)
-    ///
-    /// Returns an error if the tool name is invalid.
-    pub fn raw_handler<F, Fut>(self, handler: F) -> Result<Tool>
-    where
-        F: Fn(Value) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
-    {
-        validate_tool_name(&self.name)?;
-        Ok(Tool::from_handler(
-            self.name,
-            self.title,
-            self.description,
-            self.output_schema,
-            self.icons,
-            self.annotations,
-            RawHandler { handler },
-        ))
-    }
-
-    /// Create a tool with raw JSON handling and request context
-    ///
-    /// The handler receives a `RequestContext` for progress reporting,
-    /// cancellation, sampling, and logging, along with raw JSON arguments.
-    ///
-    /// Returns an error if the tool name is invalid.
-    pub fn raw_handler_with_context<F, Fut>(self, handler: F) -> Result<Tool>
-    where
-        F: Fn(RequestContext, Value) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
-    {
-        validate_tool_name(&self.name)?;
-        Ok(Tool::from_handler(
-            self.name,
-            self.title,
-            self.description,
-            self.output_schema,
-            self.icons,
-            self.annotations,
-            RawContextHandler { handler },
-        ))
-    }
-
-    /// Create a tool with raw JSON handling and shared state.
-    ///
-    /// The handler receives raw JSON arguments along with shared state.
-    /// No automatic deserialization is performed.
-    ///
-    /// Returns an error if the tool name is invalid.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use std::sync::Arc;
-    /// use tower_mcp::{ToolBuilder, CallToolResult};
-    /// use serde_json::Value;
-    ///
-    /// struct Config { prefix: String }
-    ///
-    /// let config = Arc::new(Config { prefix: "result:".to_string() });
-    ///
-    /// let tool = ToolBuilder::new("process_raw")
-    ///     .description("Process raw JSON with config")
-    ///     .raw_handler_with_state(config, |config: Arc<Config>, args: Value| async move {
-    ///         Ok(CallToolResult::text(format!("{} {}", config.prefix, args)))
-    ///     })
-    ///     .expect("valid tool name");
-    /// ```
-    pub fn raw_handler_with_state<S, F, Fut>(self, state: S, handler: F) -> Result<Tool>
-    where
-        S: Clone + Send + Sync + 'static,
-        F: Fn(S, Value) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
-    {
-        validate_tool_name(&self.name)?;
-        Ok(Tool::from_handler(
-            self.name,
-            self.title,
-            self.description,
-            self.output_schema,
-            self.icons,
-            self.annotations,
-            RawWithStateHandler { state, handler },
-        ))
-    }
-
-    /// Create a tool with raw JSON handling, shared state, and request context.
-    ///
-    /// Combines raw JSON handling with state injection and `RequestContext` access.
-    ///
-    /// Returns an error if the tool name is invalid.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use std::sync::Arc;
-    /// use tower_mcp::{ToolBuilder, CallToolResult, RequestContext};
-    /// use serde_json::Value;
-    ///
-    /// struct Config { prefix: String }
-    ///
-    /// let config = Arc::new(Config { prefix: "result:".to_string() });
-    ///
-    /// let tool = ToolBuilder::new("process_raw_logged")
-    ///     .description("Process raw JSON with config and logging")
-    ///     .raw_handler_with_state_and_context(config, |config: Arc<Config>, ctx: RequestContext, args: Value| async move {
-    ///         ctx.report_progress(0.5, Some(1.0), Some("Processing...")).await;
-    ///         Ok(CallToolResult::text(format!("{} {}", config.prefix, args)))
-    ///     })
-    ///     .expect("valid tool name");
-    /// ```
-    pub fn raw_handler_with_state_and_context<S, F, Fut>(self, state: S, handler: F) -> Result<Tool>
-    where
-        S: Clone + Send + Sync + 'static,
-        F: Fn(S, RequestContext, Value) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
-    {
-        validate_tool_name(&self.name)?;
-        Ok(Tool::from_handler(
-            self.name,
-            self.title,
-            self.description,
-            self.output_schema,
-            self.icons,
-            self.annotations,
-            RawWithStateAndContextHandler { state, handler },
-        ))
-    }
-
     /// Create a tool using the extractor pattern.
     ///
     /// This method provides an axum-inspired way to define handlers where state,
@@ -1439,133 +974,6 @@ where
     }
 }
 
-/// Builder state after context-aware handler is specified
-pub struct ToolBuilderWithContextHandler<I, F> {
-    name: String,
-    title: Option<String>,
-    description: Option<String>,
-    output_schema: Option<Value>,
-    icons: Option<Vec<ToolIcon>>,
-    annotations: Option<ToolAnnotations>,
-    handler: F,
-    _phantom: std::marker::PhantomData<I>,
-}
-
-impl<I, F, Fut> ToolBuilderWithContextHandler<I, F>
-where
-    I: JsonSchema + DeserializeOwned + Send + Sync + 'static,
-    F: Fn(RequestContext, I) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
-{
-    /// Build the tool
-    ///
-    /// Returns an error if the tool name is invalid.
-    pub fn build(self) -> Result<Tool> {
-        validate_tool_name(&self.name)?;
-        Ok(Tool::from_handler(
-            self.name,
-            self.title,
-            self.description,
-            self.output_schema,
-            self.icons,
-            self.annotations,
-            ContextAwareHandler {
-                handler: self.handler,
-                _phantom: std::marker::PhantomData,
-            },
-        ))
-    }
-
-    /// Apply a Tower layer (middleware) to this tool.
-    ///
-    /// Works the same as [`ToolBuilderWithHandler::layer`].
-    pub fn layer<L>(self, layer: L) -> ToolBuilderWithContextLayer<I, F, L> {
-        ToolBuilderWithContextLayer {
-            name: self.name,
-            title: self.title,
-            description: self.description,
-            output_schema: self.output_schema,
-            icons: self.icons,
-            annotations: self.annotations,
-            handler: self.handler,
-            layer,
-            _phantom: std::marker::PhantomData,
-        }
-    }
-}
-
-/// Builder state after a layer has been applied to a context-aware handler.
-pub struct ToolBuilderWithContextLayer<I, F, L> {
-    name: String,
-    title: Option<String>,
-    description: Option<String>,
-    output_schema: Option<Value>,
-    icons: Option<Vec<ToolIcon>>,
-    annotations: Option<ToolAnnotations>,
-    handler: F,
-    layer: L,
-    _phantom: std::marker::PhantomData<I>,
-}
-
-// Allow private_bounds because these internal types are implementation details.
-#[allow(private_bounds)]
-impl<I, F, Fut, L> ToolBuilderWithContextLayer<I, F, L>
-where
-    I: JsonSchema + DeserializeOwned + Send + Sync + 'static,
-    F: Fn(RequestContext, I) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
-    L: tower::Layer<ToolHandlerService<ContextAwareHandler<I, F>>> + Clone + Send + Sync + 'static,
-    L::Service: Service<ToolRequest, Response = CallToolResult> + Clone + Send + 'static,
-    <L::Service as Service<ToolRequest>>::Error: fmt::Display + Send,
-    <L::Service as Service<ToolRequest>>::Future: Send,
-{
-    /// Build the tool with the applied layer(s).
-    pub fn build(self) -> Result<Tool> {
-        validate_tool_name(&self.name)?;
-
-        let input_schema = schemars::schema_for!(I);
-        let input_schema = serde_json::to_value(input_schema)
-            .unwrap_or_else(|_| serde_json::json!({ "type": "object" }));
-
-        let handler_service = ToolHandlerService::new(ContextAwareHandler {
-            handler: self.handler,
-            _phantom: std::marker::PhantomData,
-        });
-        let layered = self.layer.layer(handler_service);
-        let catch_error = ToolCatchError::new(layered);
-        let service = BoxCloneService::new(catch_error);
-
-        Ok(Tool {
-            name: self.name,
-            title: self.title,
-            description: self.description,
-            output_schema: self.output_schema,
-            icons: self.icons,
-            annotations: self.annotations,
-            service,
-            input_schema,
-        })
-    }
-
-    /// Apply an additional Tower layer (middleware).
-    pub fn layer<L2>(
-        self,
-        layer: L2,
-    ) -> ToolBuilderWithContextLayer<I, F, tower::layer::util::Stack<L2, L>> {
-        ToolBuilderWithContextLayer {
-            name: self.name,
-            title: self.title,
-            description: self.description,
-            output_schema: self.output_schema,
-            icons: self.icons,
-            annotations: self.annotations,
-            handler: self.handler,
-            layer: tower::layer::util::Stack::new(layer, self.layer),
-            _phantom: std::marker::PhantomData,
-        }
-    }
-}
-
 // =============================================================================
 // Handler implementations
 // =============================================================================
@@ -1596,293 +1004,6 @@ where
             serde_json::json!({
                 "type": "object"
             })
-        })
-    }
-}
-
-/// Handler that works with raw JSON
-struct RawHandler<F> {
-    handler: F,
-}
-
-impl<F, Fut> ToolHandler for RawHandler<F>
-where
-    F: Fn(Value) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
-{
-    fn call(&self, args: Value) -> BoxFuture<'_, Result<CallToolResult>> {
-        Box::pin((self.handler)(args))
-    }
-
-    fn input_schema(&self) -> Value {
-        // Raw handlers accept any JSON
-        serde_json::json!({
-            "type": "object",
-            "additionalProperties": true
-        })
-    }
-}
-
-/// Handler that works with raw JSON and request context
-struct RawContextHandler<F> {
-    handler: F,
-}
-
-impl<F, Fut> ToolHandler for RawContextHandler<F>
-where
-    F: Fn(RequestContext, Value) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
-{
-    fn call(&self, args: Value) -> BoxFuture<'_, Result<CallToolResult>> {
-        let ctx = RequestContext::new(crate::protocol::RequestId::Number(0));
-        self.call_with_context(ctx, args)
-    }
-
-    fn call_with_context(
-        &self,
-        ctx: RequestContext,
-        args: Value,
-    ) -> BoxFuture<'_, Result<CallToolResult>> {
-        Box::pin((self.handler)(ctx, args))
-    }
-
-    fn uses_context(&self) -> bool {
-        true
-    }
-
-    fn input_schema(&self) -> Value {
-        // Raw context handlers accept any JSON object
-        serde_json::json!({
-            "type": "object",
-            "additionalProperties": true
-        })
-    }
-}
-
-/// Handler that receives request context for progress/cancellation
-struct ContextAwareHandler<I, F> {
-    handler: F,
-    _phantom: std::marker::PhantomData<I>,
-}
-
-impl<I, F, Fut> ToolHandler for ContextAwareHandler<I, F>
-where
-    I: JsonSchema + DeserializeOwned + Send + Sync + 'static,
-    F: Fn(RequestContext, I) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
-{
-    fn call(&self, args: Value) -> BoxFuture<'_, Result<CallToolResult>> {
-        // When called without context, create a dummy context
-        let ctx = RequestContext::new(crate::protocol::RequestId::Number(0));
-        self.call_with_context(ctx, args)
-    }
-
-    fn call_with_context(
-        &self,
-        ctx: RequestContext,
-        args: Value,
-    ) -> BoxFuture<'_, Result<CallToolResult>> {
-        Box::pin(async move {
-            let input: I = serde_json::from_value(args)
-                .map_err(|e| Error::tool(format!("Invalid input: {}", e)))?;
-            (self.handler)(ctx, input).await
-        })
-    }
-
-    fn uses_context(&self) -> bool {
-        true
-    }
-
-    fn input_schema(&self) -> Value {
-        let schema = schemars::schema_for!(I);
-        serde_json::to_value(schema).unwrap_or_else(|_| {
-            serde_json::json!({
-                "type": "object"
-            })
-        })
-    }
-}
-
-/// Handler that takes no parameters
-struct NoParamsHandler<F> {
-    handler: F,
-}
-
-impl<F, Fut> ToolHandler for NoParamsHandler<F>
-where
-    F: Fn() -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
-{
-    fn call(&self, _args: Value) -> BoxFuture<'_, Result<CallToolResult>> {
-        Box::pin((self.handler)())
-    }
-
-    fn input_schema(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {}
-        })
-    }
-}
-
-/// Handler that takes no parameters but has shared state
-struct NoParamsWithStateHandler<S, F> {
-    state: S,
-    handler: F,
-}
-
-impl<S, F, Fut> ToolHandler for NoParamsWithStateHandler<S, F>
-where
-    S: Clone + Send + Sync + 'static,
-    F: Fn(S) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
-{
-    fn call(&self, _args: Value) -> BoxFuture<'_, Result<CallToolResult>> {
-        let state = self.state.clone();
-        let fut = (self.handler)(state);
-        Box::pin(fut)
-    }
-
-    fn input_schema(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {}
-        })
-    }
-}
-
-/// Handler that takes no parameters but has request context
-struct NoParamsWithContextHandler<F> {
-    handler: F,
-}
-
-impl<F, Fut> ToolHandler for NoParamsWithContextHandler<F>
-where
-    F: Fn(RequestContext) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
-{
-    fn call(&self, _args: Value) -> BoxFuture<'_, Result<CallToolResult>> {
-        let ctx = RequestContext::new(crate::protocol::RequestId::Number(0));
-        self.call_with_context(ctx, _args)
-    }
-
-    fn call_with_context(
-        &self,
-        ctx: RequestContext,
-        _args: Value,
-    ) -> BoxFuture<'_, Result<CallToolResult>> {
-        Box::pin((self.handler)(ctx))
-    }
-
-    fn uses_context(&self) -> bool {
-        true
-    }
-
-    fn input_schema(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {}
-        })
-    }
-}
-
-/// Handler that takes no parameters but has shared state and request context
-struct NoParamsWithStateAndContextHandler<S, F> {
-    state: S,
-    handler: F,
-}
-
-impl<S, F, Fut> ToolHandler for NoParamsWithStateAndContextHandler<S, F>
-where
-    S: Clone + Send + Sync + 'static,
-    F: Fn(S, RequestContext) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
-{
-    fn call(&self, _args: Value) -> BoxFuture<'_, Result<CallToolResult>> {
-        let ctx = RequestContext::new(crate::protocol::RequestId::Number(0));
-        self.call_with_context(ctx, _args)
-    }
-
-    fn call_with_context(
-        &self,
-        ctx: RequestContext,
-        _args: Value,
-    ) -> BoxFuture<'_, Result<CallToolResult>> {
-        let state = self.state.clone();
-        Box::pin((self.handler)(state, ctx))
-    }
-
-    fn uses_context(&self) -> bool {
-        true
-    }
-
-    fn input_schema(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {}
-        })
-    }
-}
-
-/// Handler that works with raw JSON and shared state
-struct RawWithStateHandler<S, F> {
-    state: S,
-    handler: F,
-}
-
-impl<S, F, Fut> ToolHandler for RawWithStateHandler<S, F>
-where
-    S: Clone + Send + Sync + 'static,
-    F: Fn(S, Value) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
-{
-    fn call(&self, args: Value) -> BoxFuture<'_, Result<CallToolResult>> {
-        let state = self.state.clone();
-        Box::pin((self.handler)(state, args))
-    }
-
-    fn input_schema(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "additionalProperties": true
-        })
-    }
-}
-
-/// Handler that works with raw JSON, shared state, and request context
-struct RawWithStateAndContextHandler<S, F> {
-    state: S,
-    handler: F,
-}
-
-impl<S, F, Fut> ToolHandler for RawWithStateAndContextHandler<S, F>
-where
-    S: Clone + Send + Sync + 'static,
-    F: Fn(S, RequestContext, Value) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
-{
-    fn call(&self, args: Value) -> BoxFuture<'_, Result<CallToolResult>> {
-        let ctx = RequestContext::new(crate::protocol::RequestId::Number(0));
-        self.call_with_context(ctx, args)
-    }
-
-    fn call_with_context(
-        &self,
-        ctx: RequestContext,
-        args: Value,
-    ) -> BoxFuture<'_, Result<CallToolResult>> {
-        let state = self.state.clone();
-        Box::pin((self.handler)(state, ctx, args))
-    }
-
-    fn uses_context(&self) -> bool {
-        true
-    }
-
-    fn input_schema(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "additionalProperties": true
         })
     }
 }
@@ -1994,6 +1115,7 @@ impl<T: McpTool> ToolHandler for McpToolHandler<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extract::{Context, Json, RawArgs, State};
     use crate::protocol::Content;
     use schemars::JsonSchema;
     use serde::Deserialize;
@@ -2025,7 +1147,10 @@ mod tests {
     async fn test_raw_handler() {
         let tool = ToolBuilder::new("echo")
             .description("Echo input")
-            .raw_handler(|args: Value| async move { Ok(CallToolResult::json(args)) })
+            .extractor_handler((), |RawArgs(args): RawArgs| async move {
+                Ok(CallToolResult::json(args))
+            })
+            .build()
             .expect("valid tool name");
 
         let result = tool.call(serde_json::json!({"foo": "bar"})).await;
@@ -2037,7 +1162,10 @@ mod tests {
     fn test_invalid_tool_name_empty() {
         let result = ToolBuilder::new("")
             .description("Empty name")
-            .raw_handler(|args: Value| async move { Ok(CallToolResult::json(args)) });
+            .extractor_handler((), |RawArgs(args): RawArgs| async move {
+                Ok(CallToolResult::json(args))
+            })
+            .build();
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("cannot be empty"));
@@ -2048,7 +1176,10 @@ mod tests {
         let long_name = "a".repeat(129);
         let result = ToolBuilder::new(long_name)
             .description("Too long")
-            .raw_handler(|args: Value| async move { Ok(CallToolResult::json(args)) });
+            .extractor_handler((), |RawArgs(args): RawArgs| async move {
+                Ok(CallToolResult::json(args))
+            })
+            .build();
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("exceeds maximum"));
@@ -2058,7 +1189,10 @@ mod tests {
     fn test_invalid_tool_name_bad_chars() {
         let result = ToolBuilder::new("my tool!")
             .description("Bad chars")
-            .raw_handler(|args: Value| async move { Ok(CallToolResult::json(args)) });
+            .extractor_handler((), |RawArgs(args): RawArgs| async move {
+                Ok(CallToolResult::json(args))
+            })
+            .build();
 
         assert!(result.is_err());
         assert!(
@@ -2083,14 +1217,17 @@ mod tests {
         for name in names {
             let result = ToolBuilder::new(name)
                 .description("Valid")
-                .raw_handler(|args: Value| async move { Ok(CallToolResult::json(args)) });
+                .extractor_handler((), |RawArgs(args): RawArgs| async move {
+                    Ok(CallToolResult::json(args))
+                })
+                .build();
             assert!(result.is_ok(), "Expected '{}' to be valid", name);
         }
     }
 
     #[tokio::test]
     async fn test_context_aware_handler() {
-        use crate::context::{RequestContext, notification_channel};
+        use crate::context::notification_channel;
         use crate::protocol::{ProgressToken, RequestId};
 
         #[derive(Debug, Deserialize, JsonSchema)]
@@ -2100,20 +1237,23 @@ mod tests {
 
         let tool = ToolBuilder::new("process")
             .description("Process with context")
-            .handler_with_context(|ctx: RequestContext, input: ProcessInput| async move {
-                // Simulate progress reporting
-                for i in 0..input.count {
-                    if ctx.is_cancelled() {
-                        return Ok(CallToolResult::error("Cancelled"));
+            .extractor_handler_typed::<_, _, _, ProcessInput>(
+                (),
+                |ctx: Context, Json(input): Json<ProcessInput>| async move {
+                    // Simulate progress reporting
+                    for i in 0..input.count {
+                        if ctx.is_cancelled() {
+                            return Ok(CallToolResult::error("Cancelled"));
+                        }
+                        ctx.report_progress(i as f64, Some(input.count as f64), None)
+                            .await;
                     }
-                    ctx.report_progress(i as f64, Some(input.count as f64), None)
-                        .await;
-                }
-                Ok(CallToolResult::text(format!(
-                    "Processed {} items",
-                    input.count
-                )))
-            })
+                    Ok(CallToolResult::text(format!(
+                        "Processed {} items",
+                        input.count
+                    )))
+                },
+            )
             .build()
             .expect("valid tool name");
 
@@ -2141,9 +1281,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_context_aware_handler_cancellation() {
-        use crate::context::RequestContext;
         use crate::protocol::RequestId;
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicI32, Ordering};
 
         #[derive(Debug, Deserialize, JsonSchema)]
@@ -2156,24 +1294,27 @@ mod tests {
 
         let tool = ToolBuilder::new("long_running")
             .description("Long running task")
-            .handler_with_context(move |ctx: RequestContext, input: LongRunningInput| {
-                let completed = iterations_ref.clone();
-                async move {
-                    for i in 0..input.iterations {
-                        if ctx.is_cancelled() {
-                            return Ok(CallToolResult::error("Cancelled"));
+            .extractor_handler_typed::<_, _, _, LongRunningInput>(
+                (),
+                move |ctx: Context, Json(input): Json<LongRunningInput>| {
+                    let completed = iterations_ref.clone();
+                    async move {
+                        for i in 0..input.iterations {
+                            if ctx.is_cancelled() {
+                                return Ok(CallToolResult::error("Cancelled"));
+                            }
+                            completed.fetch_add(1, Ordering::SeqCst);
+                            // Simulate work
+                            tokio::task::yield_now().await;
+                            // Cancel after iteration 2
+                            if i == 2 {
+                                ctx.cancellation_token().cancel();
+                            }
                         }
-                        completed.fetch_add(1, Ordering::SeqCst);
-                        // Simulate work
-                        tokio::task::yield_now().await;
-                        // Cancel after iteration 2
-                        if i == 2 {
-                            ctx.cancellation_token().cancel();
-                        }
+                        Ok(CallToolResult::text("Done"))
                     }
-                    Ok(CallToolResult::text("Done"))
-                }
-            })
+                },
+            )
             .build()
             .expect("valid tool name");
 
@@ -2234,12 +1375,15 @@ mod tests {
 
         let tool = ToolBuilder::new("stateful")
             .description("Uses shared state")
-            .handler_with_state(shared, |state: Arc<String>, input: GreetInput| async move {
-                Ok(CallToolResult::text(format!(
-                    "{}: Hello, {}!",
-                    state, input.name
-                )))
-            })
+            .extractor_handler_typed::<_, _, _, GreetInput>(
+                shared,
+                |State(state): State<Arc<String>>, Json(input): Json<GreetInput>| async move {
+                    Ok(CallToolResult::text(format!(
+                        "{}: Hello, {}!",
+                        state, input.name
+                    )))
+                },
+            )
             .build()
             .expect("valid tool name");
 
@@ -2249,24 +1393,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_handler_with_state_and_context() {
-        use crate::context::RequestContext;
         use crate::protocol::RequestId;
 
         let shared = Arc::new(42_i32);
 
-        let tool = ToolBuilder::new("stateful_ctx")
-            .description("Uses state and context")
-            .handler_with_state_and_context(
-                shared,
-                |state: Arc<i32>, _ctx: RequestContext, input: GreetInput| async move {
-                    Ok(CallToolResult::text(format!(
-                        "{}: Hello, {}!",
-                        state, input.name
-                    )))
-                },
-            )
-            .build()
-            .expect("valid tool name");
+        let tool =
+            ToolBuilder::new("stateful_ctx")
+                .description("Uses state and context")
+                .extractor_handler_typed::<_, _, _, GreetInput>(
+                    shared,
+                    |State(state): State<Arc<i32>>,
+                     _ctx: Context,
+                     Json(input): Json<GreetInput>| async move {
+                        Ok(CallToolResult::text(format!(
+                            "{}: Hello, {}!",
+                            state, input.name
+                        )))
+                    },
+                )
+                .build()
+                .expect("valid tool name");
 
         let ctx = RequestContext::new(RequestId::Number(1));
         let result = tool
@@ -2279,7 +1425,10 @@ mod tests {
     async fn test_handler_no_params() {
         let tool = ToolBuilder::new("no_params")
             .description("Takes no parameters")
-            .handler_no_params(|| async { Ok(CallToolResult::text("no params result")) })
+            .extractor_handler_typed::<_, _, _, NoParams>((), |Json(_): Json<NoParams>| async {
+                Ok(CallToolResult::text("no params result"))
+            })
+            .build()
             .expect("valid tool name");
 
         assert_eq!(tool.name, "no_params");
@@ -2292,17 +1441,9 @@ mod tests {
         let result = tool.call(serde_json::json!({"unexpected": "value"})).await;
         assert!(!result.is_error);
 
-        // Check input schema is an empty-properties object
+        // Check input schema includes type: object
         let schema = tool.definition().input_schema;
         assert_eq!(schema.get("type").unwrap().as_str().unwrap(), "object");
-        assert!(
-            schema
-                .get("properties")
-                .unwrap()
-                .as_object()
-                .unwrap()
-                .is_empty()
-        );
     }
 
     #[tokio::test]
@@ -2311,9 +1452,13 @@ mod tests {
 
         let tool = ToolBuilder::new("with_state_no_params")
             .description("Takes no parameters but has state")
-            .handler_with_state_no_params(shared, |state: Arc<String>| async move {
-                Ok(CallToolResult::text(format!("state: {}", state)))
-            })
+            .extractor_handler_typed::<_, _, _, NoParams>(
+                shared,
+                |State(state): State<Arc<String>>, Json(_): Json<NoParams>| async move {
+                    Ok(CallToolResult::text(format!("state: {}", state)))
+                },
+            )
+            .build()
             .expect("valid tool name");
 
         assert_eq!(tool.name, "with_state_no_params");
@@ -2323,26 +1468,22 @@ mod tests {
         assert!(!result.is_error);
         assert_eq!(result.first_text().unwrap(), "state: shared_value");
 
-        // Check input schema is an empty-properties object
+        // Check input schema includes type: object
         let schema = tool.definition().input_schema;
         assert_eq!(schema.get("type").unwrap().as_str().unwrap(), "object");
-        assert!(
-            schema
-                .get("properties")
-                .unwrap()
-                .as_object()
-                .unwrap()
-                .is_empty()
-        );
     }
 
     #[tokio::test]
     async fn test_handler_no_params_with_context() {
         let tool = ToolBuilder::new("no_params_with_context")
             .description("Takes no parameters but has context")
-            .handler_no_params_with_context(|_ctx: RequestContext| async move {
-                Ok(CallToolResult::text("context available"))
-            })
+            .extractor_handler_typed::<_, _, _, NoParams>(
+                (),
+                |_ctx: Context, Json(_): Json<NoParams>| async move {
+                    Ok(CallToolResult::text("context available"))
+                },
+            )
+            .build()
             .expect("valid tool name");
 
         assert_eq!(tool.name, "no_params_with_context");
@@ -2358,12 +1499,15 @@ mod tests {
 
         let tool = ToolBuilder::new("state_context_no_params")
             .description("Has state and context, no params")
-            .handler_with_state_and_context_no_params(
+            .extractor_handler_typed::<_, _, _, NoParams>(
                 shared,
-                |state: Arc<String>, _ctx: RequestContext| async move {
+                |State(state): State<Arc<String>>,
+                 _ctx: Context,
+                 Json(_): Json<NoParams>| async move {
                     Ok(CallToolResult::text(format!("state: {}", state)))
                 },
             )
+            .build()
             .expect("valid tool name");
 
         assert_eq!(tool.name, "state_context_no_params");
@@ -2379,9 +1523,13 @@ mod tests {
 
         let tool = ToolBuilder::new("raw_with_state")
             .description("Raw handler with state")
-            .raw_handler_with_state(prefix, |state: Arc<String>, args: Value| async move {
-                Ok(CallToolResult::text(format!("{} {}", state, args)))
-            })
+            .extractor_handler(
+                prefix,
+                |State(state): State<Arc<String>>, RawArgs(args): RawArgs| async move {
+                    Ok(CallToolResult::text(format!("{} {}", state, args)))
+                },
+            )
+            .build()
             .expect("valid tool name");
 
         assert_eq!(tool.name, "raw_with_state");
@@ -2397,12 +1545,15 @@ mod tests {
 
         let tool = ToolBuilder::new("raw_state_context")
             .description("Raw handler with state and context")
-            .raw_handler_with_state_and_context(
+            .extractor_handler(
                 prefix,
-                |state: Arc<String>, _ctx: RequestContext, args: Value| async move {
+                |State(state): State<Arc<String>>,
+                 _ctx: Context,
+                 RawArgs(args): RawArgs| async move {
                     Ok(CallToolResult::text(format!("{} {}", state, args)))
                 },
             )
+            .build()
             .expect("valid tool name");
 
         assert_eq!(tool.name, "raw_state_context");
@@ -2439,44 +1590,6 @@ mod tests {
         assert_eq!(result.first_text().unwrap(), "completed");
 
         // Slow call should timeout and return an error result
-        let result = tool.call(serde_json::json!({"delay_ms": 200})).await;
-        assert!(result.is_error);
-        // Tower's timeout error message is "request timed out"
-        let msg = result.first_text().unwrap().to_lowercase();
-        assert!(
-            msg.contains("timed out") || msg.contains("timeout") || msg.contains("elapsed"),
-            "Expected timeout error, got: {}",
-            msg
-        );
-    }
-
-    #[tokio::test]
-    async fn test_tool_with_context_and_timeout_layer() {
-        use std::time::Duration;
-        use tower::timeout::TimeoutLayer;
-
-        #[derive(Debug, Deserialize, JsonSchema)]
-        struct ProcessInput {
-            delay_ms: u64,
-        }
-
-        // Create a context-aware tool with a timeout
-        let tool = ToolBuilder::new("slow_ctx_tool")
-            .description("A slow context-aware tool")
-            .handler_with_context(|_ctx: RequestContext, input: ProcessInput| async move {
-                tokio::time::sleep(Duration::from_millis(input.delay_ms)).await;
-                Ok(CallToolResult::text("completed with context"))
-            })
-            .layer(TimeoutLayer::new(Duration::from_millis(50)))
-            .build()
-            .expect("valid tool name");
-
-        // Fast call should succeed
-        let result = tool.call(serde_json::json!({"delay_ms": 10})).await;
-        assert!(!result.is_error);
-        assert_eq!(result.first_text().unwrap(), "completed with context");
-
-        // Slow call should timeout
         let result = tool.call(serde_json::json!({"delay_ms": 200})).await;
         assert!(result.is_error);
         // Tower's timeout error message is "request timed out"
@@ -2576,7 +1689,10 @@ mod tests {
         // Use a simple tool that we can clone
         let tool = ToolBuilder::new("test")
             .description("test")
-            .raw_handler(|_args: Value| async { Ok(CallToolResult::text("ok")) })
+            .extractor_handler((), |RawArgs(_args): RawArgs| async {
+                Ok(CallToolResult::text("ok"))
+            })
+            .build()
             .unwrap();
         // The tool contains a BoxToolService which is cloneable
         let _clone = tool.call(serde_json::json!({}));
@@ -2602,7 +1718,7 @@ mod tests {
 
             fn poll_ready(
                 &mut self,
-                _cx: &mut Context<'_>,
+                _cx: &mut std::task::Context<'_>,
             ) -> Poll<std::result::Result<(), Self::Error>> {
                 Poll::Ready(Ok(()))
             }

@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tower_mcp::{CallToolResult, Error, Tool, ToolBuilder};
+use tower_mcp::{
+    CallToolResult, Error, Tool, ToolBuilder,
+    extract::{Json, State},
+};
 
 use crate::state::AppState;
 
@@ -26,9 +29,9 @@ pub fn build(state: Arc<AppState>) -> Tool {
         )
         .read_only()
         .idempotent()
-        .handler_with_state(
+        .extractor_handler_typed::<_, _, _, AuthorsInput>(
             state,
-            |state: Arc<AppState>, input: AuthorsInput| async move {
+            |State(state): State<Arc<AppState>>, Json(input): Json<AuthorsInput>| async move {
                 // If no version specified, get the latest
                 let version = match input.version {
                     Some(v) => v,

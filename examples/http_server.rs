@@ -56,7 +56,7 @@ use serde::Deserialize;
 use tower::timeout::TimeoutLayer;
 use tower_mcp::{
     CallToolResult, HttpTransport, McpRouter, PromptBuilder, ResourceBuilder, ToolBuilder,
-    context::RequestContext,
+    extract::{Context, Json},
 };
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -116,31 +116,34 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     // Useful for demonstrating SSE event streaming and Last-Event-ID resumption
     let slow_task = ToolBuilder::new("slow_task")
         .description("Simulate a slow task that sends progress notifications (for SSE demo)")
-        .handler_with_context(|ctx: RequestContext, input: SlowTaskInput| async move {
-            let steps = input.steps.min(20); // Cap at 20 steps
-            let delay = Duration::from_millis(input.delay_ms.min(2000)); // Cap delay at 2s
+        .extractor_handler_typed::<_, _, _, SlowTaskInput>(
+            (),
+            |ctx: Context, Json(input): Json<SlowTaskInput>| async move {
+                let steps = input.steps.min(20); // Cap at 20 steps
+                let delay = Duration::from_millis(input.delay_ms.min(2000)); // Cap delay at 2s
 
-            for i in 0..steps {
-                // Send progress notification (appears on SSE stream with event ID)
-                ctx.report_progress(
-                    i as f64,
-                    Some(steps as f64),
-                    Some(&format!("Step {}/{}", i + 1, steps)),
-                )
-                .await;
+                for i in 0..steps {
+                    // Send progress notification (appears on SSE stream with event ID)
+                    ctx.report_progress(
+                        i as f64,
+                        Some(steps as f64),
+                        Some(&format!("Step {}/{}", i + 1, steps)),
+                    )
+                    .await;
 
-                tokio::time::sleep(delay).await;
-            }
+                    tokio::time::sleep(delay).await;
+                }
 
-            // Final progress
-            ctx.report_progress(steps as f64, Some(steps as f64), Some("Complete!"))
-                .await;
+                // Final progress
+                ctx.report_progress(steps as f64, Some(steps as f64), Some("Complete!"))
+                    .await;
 
-            Ok(CallToolResult::text(format!(
-                "Completed {} steps (each SSE event has a unique ID for resumption)",
-                steps
-            )))
-        })
+                Ok(CallToolResult::text(format!(
+                    "Completed {} steps (each SSE event has a unique ID for resumption)",
+                    steps
+                )))
+            },
+        )
         .build()?;
 
     // Create resources

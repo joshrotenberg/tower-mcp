@@ -5,7 +5,10 @@ use tokio::sync::RwLock;
 
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tower_mcp::{CallToolResult, Tool, ToolBuilder};
+use tower_mcp::{
+    CallToolResult, NoParams, Tool, ToolBuilder,
+    extract::{Json, State},
+};
 
 use crate::codegen::generate_code;
 use crate::state::{HandlerType, InputField, ProjectState, ToolAnnotations, ToolDef, Transport};
@@ -111,9 +114,10 @@ pub fn build_tools(state: Arc<CodegenState>) -> Vec<Tool> {
 fn build_init_project(state: Arc<CodegenState>) -> Tool {
     ToolBuilder::new("init_project")
         .description("Initialize a new tower-mcp server project")
-        .handler_with_state(
+        .extractor_handler_typed::<_, _, _, InitProjectInput>(
             state,
-            |state: Arc<CodegenState>, input: InitProjectInput| async move {
+            |State(state): State<Arc<CodegenState>>,
+             Json(input): Json<InitProjectInput>| async move {
                 let mut project = state.project.write().await;
 
                 if project.initialized {
@@ -158,9 +162,9 @@ fn build_init_project(state: Arc<CodegenState>) -> Tool {
 fn build_add_tool(state: Arc<CodegenState>) -> Tool {
     ToolBuilder::new("add_tool")
         .description("Add a tool to the project")
-        .handler_with_state(
+        .extractor_handler_typed::<_, _, _, AddToolInput>(
             state,
-            |state: Arc<CodegenState>, input: AddToolInput| async move {
+            |State(state): State<Arc<CodegenState>>, Json(input): Json<AddToolInput>| async move {
                 let mut project = state.project.write().await;
 
                 if !project.initialized {
@@ -234,9 +238,10 @@ pub struct RemoveToolInput {
 fn build_remove_tool(state: Arc<CodegenState>) -> Tool {
     ToolBuilder::new("remove_tool")
         .description("Remove a tool from the project")
-        .handler_with_state(
+        .extractor_handler_typed::<_, _, _, RemoveToolInput>(
             state,
-            |state: Arc<CodegenState>, input: RemoveToolInput| async move {
+            |State(state): State<Arc<CodegenState>>,
+             Json(input): Json<RemoveToolInput>| async move {
                 let mut project = state.project.write().await;
 
                 if !project.initialized {
@@ -270,10 +275,14 @@ fn build_get_project(state: Arc<CodegenState>) -> Tool {
     ToolBuilder::new("get_project")
         .description("Get the current project state as JSON")
         .read_only()
-        .handler_with_state_no_params(state, |state: Arc<CodegenState>| async move {
-            let project = state.project.read().await;
-            CallToolResult::from_serialize(&*project)
-        })
+        .extractor_handler_typed::<_, _, _, NoParams>(
+            state,
+            |State(state): State<Arc<CodegenState>>, Json(_): Json<NoParams>| async move {
+                let project = state.project.read().await;
+                CallToolResult::from_serialize(&*project)
+            },
+        )
+        .build()
         .expect("valid tool")
 }
 
@@ -281,20 +290,24 @@ fn build_generate(state: Arc<CodegenState>) -> Tool {
     ToolBuilder::new("generate")
         .description("Generate the complete Rust code for the project")
         .read_only()
-        .handler_with_state_no_params(state, |state: Arc<CodegenState>| async move {
-            let project = state.project.read().await;
+        .extractor_handler_typed::<_, _, _, NoParams>(
+            state,
+            |State(state): State<Arc<CodegenState>>, Json(_): Json<NoParams>| async move {
+                let project = state.project.read().await;
 
-            match generate_code(&project) {
-                Ok(code) => {
-                    let output = format!(
-                        "# Generated Code\n\n## Cargo.toml\n\n```toml\n{}\n```\n\n## src/main.rs\n\n```rust\n{}\n```\n\n## README.md\n\n{}\n\n---\n\n**What's next?** You can stop here and implement the handlers manually, or keep using codegen-mcp to add more tools. Read `project://README.md` for details.",
-                        code.cargo_toml, code.main_rs, code.readme_md
-                    );
-                    Ok(CallToolResult::text(output))
+                match generate_code(&project) {
+                    Ok(code) => {
+                        let output = format!(
+                            "# Generated Code\n\n## Cargo.toml\n\n```toml\n{}\n```\n\n## src/main.rs\n\n```rust\n{}\n```\n\n## README.md\n\n{}\n\n---\n\n**What's next?** You can stop here and implement the handlers manually, or keep using codegen-mcp to add more tools. Read `project://README.md` for details.",
+                            code.cargo_toml, code.main_rs, code.readme_md
+                        );
+                        Ok(CallToolResult::text(output))
+                    }
+                    Err(e) => Ok(CallToolResult::error(e)),
                 }
-                Err(e) => Ok(CallToolResult::error(e)),
-            }
-        })
+            },
+        )
+        .build()
         .expect("valid tool")
 }
 
@@ -302,92 +315,100 @@ fn build_validate(state: Arc<CodegenState>) -> Tool {
     ToolBuilder::new("validate")
         .description("Validate the generated code compiles (runs cargo check)")
         .read_only()
-        .handler_with_state_no_params(state, |state: Arc<CodegenState>| async move {
-            let project = state.project.read().await;
+        .extractor_handler_typed::<_, _, _, NoParams>(
+            state,
+            |State(state): State<Arc<CodegenState>>, Json(_): Json<NoParams>| async move {
+                let project = state.project.read().await;
 
-            // Generate the code
-            let code = match generate_code(&project) {
-                Ok(code) => code,
-                Err(e) => return Ok(CallToolResult::error(e)),
-            };
+                // Generate the code
+                let code = match generate_code(&project) {
+                    Ok(code) => code,
+                    Err(e) => return Ok(CallToolResult::error(e)),
+                };
 
-            // Create temp directory
-            let temp_dir = match tempfile::tempdir() {
-                Ok(dir) => dir,
-                Err(e) => {
+                // Create temp directory
+                let temp_dir = match tempfile::tempdir() {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        return Ok(CallToolResult::error(format!(
+                            "Failed to create temp dir: {}",
+                            e
+                        )));
+                    }
+                };
+
+                let project_dir = temp_dir.path();
+                let src_dir = project_dir.join("src");
+
+                // Create src directory
+                if let Err(e) = std::fs::create_dir_all(&src_dir) {
                     return Ok(CallToolResult::error(format!(
-                        "Failed to create temp dir: {}",
+                        "Failed to create src dir: {}",
                         e
                     )));
                 }
-            };
 
-            let project_dir = temp_dir.path();
-            let src_dir = project_dir.join("src");
-
-            // Create src directory
-            if let Err(e) = std::fs::create_dir_all(&src_dir) {
-                return Ok(CallToolResult::error(format!(
-                    "Failed to create src dir: {}",
-                    e
-                )));
-            }
-
-            // Write Cargo.toml
-            if let Err(e) = std::fs::write(project_dir.join("Cargo.toml"), &code.cargo_toml) {
-                return Ok(CallToolResult::error(format!(
-                    "Failed to write Cargo.toml: {}",
-                    e
-                )));
-            }
-
-            // Write main.rs
-            if let Err(e) = std::fs::write(src_dir.join("main.rs"), &code.main_rs) {
-                return Ok(CallToolResult::error(format!(
-                    "Failed to write main.rs: {}",
-                    e
-                )));
-            }
-
-            // Run cargo check
-            let output = match std::process::Command::new("cargo")
-                .arg("check")
-                .current_dir(project_dir)
-                .output()
-            {
-                Ok(output) => output,
-                Err(e) => {
+                // Write Cargo.toml
+                if let Err(e) = std::fs::write(project_dir.join("Cargo.toml"), &code.cargo_toml) {
                     return Ok(CallToolResult::error(format!(
-                        "Failed to run cargo check: {}",
+                        "Failed to write Cargo.toml: {}",
                         e
                     )));
                 }
-            };
 
-            if output.status.success() {
-                Ok(CallToolResult::text(
-                    "Validation successful! Generated code compiles.",
-                ))
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                Ok(CallToolResult::error(format!(
-                    "Compilation failed:\n{}",
-                    stderr
-                )))
-            }
-        })
+                // Write main.rs
+                if let Err(e) = std::fs::write(src_dir.join("main.rs"), &code.main_rs) {
+                    return Ok(CallToolResult::error(format!(
+                        "Failed to write main.rs: {}",
+                        e
+                    )));
+                }
+
+                // Run cargo check
+                let output = match std::process::Command::new("cargo")
+                    .arg("check")
+                    .current_dir(project_dir)
+                    .output()
+                {
+                    Ok(output) => output,
+                    Err(e) => {
+                        return Ok(CallToolResult::error(format!(
+                            "Failed to run cargo check: {}",
+                            e
+                        )));
+                    }
+                };
+
+                if output.status.success() {
+                    Ok(CallToolResult::text(
+                        "Validation successful! Generated code compiles.",
+                    ))
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    Ok(CallToolResult::error(format!(
+                        "Compilation failed:\n{}",
+                        stderr
+                    )))
+                }
+            },
+        )
+        .build()
         .expect("valid tool")
 }
 
 fn build_reset(state: Arc<CodegenState>) -> Tool {
     ToolBuilder::new("reset")
         .description("Reset the project state to start over")
-        .handler_with_state_no_params(state, |state: Arc<CodegenState>| async move {
-            let mut project = state.project.write().await;
-            project.reset();
-            Ok(CallToolResult::text(
-                "Project state reset. Ready for new project.",
-            ))
-        })
+        .extractor_handler_typed::<_, _, _, NoParams>(
+            state,
+            |State(state): State<Arc<CodegenState>>, Json(_): Json<NoParams>| async move {
+                let mut project = state.project.write().await;
+                project.reset();
+                Ok(CallToolResult::text(
+                    "Project state reset. Ready for new project.",
+                ))
+            },
+        )
+        .build()
         .expect("valid tool")
 }

@@ -3,8 +3,8 @@ use tower_mcp::protocol::{
     Content, CreateMessageParams, LogLevel, LoggingMessageParams, ResourceContent, SamplingMessage,
 };
 use tower_mcp::{
-    CallToolResult, ElicitFormParams, ElicitFormSchema, ElicitMode, RequestContext, Tool,
-    ToolBuilder,
+    CallToolResult, ElicitFormParams, ElicitFormSchema, ElicitMode, Tool, ToolBuilder,
+    extract::{Context, RawArgs},
 };
 
 /// 1x1 red PNG
@@ -63,36 +63,39 @@ pub fn build_tools() -> Vec<Tool> {
 fn build_simple_text() -> Tool {
     ToolBuilder::new("test_simple_text")
         .description("Returns simple text content")
-        .raw_handler(|_args| async move {
+        .extractor_handler((), |RawArgs(_args): RawArgs| async move {
             Ok(CallToolResult::text(
                 "This is a simple text response for testing.",
             ))
         })
+        .build()
         .expect("failed to build test_simple_text")
 }
 
 fn build_image_content() -> Tool {
     ToolBuilder::new("test_image_content")
         .description("Returns image content (1x1 red PNG)")
-        .raw_handler(
-            |_args| async move { Ok(CallToolResult::image(red_pixel_base64(), "image/png")) },
-        )
+        .extractor_handler((), |RawArgs(_args): RawArgs| async move {
+            Ok(CallToolResult::image(red_pixel_base64(), "image/png"))
+        })
+        .build()
         .expect("failed to build test_image_content")
 }
 
 fn build_audio_content() -> Tool {
     ToolBuilder::new("test_audio_content")
         .description("Returns audio content (minimal WAV)")
-        .raw_handler(
-            |_args| async move { Ok(CallToolResult::audio(minimal_wav_base64(), "audio/wav")) },
-        )
+        .extractor_handler((), |RawArgs(_args): RawArgs| async move {
+            Ok(CallToolResult::audio(minimal_wav_base64(), "audio/wav"))
+        })
+        .build()
         .expect("failed to build test_audio_content")
 }
 
 fn build_embedded_resource() -> Tool {
     ToolBuilder::new("test_embedded_resource")
         .description("Returns an embedded resource")
-        .raw_handler(|_args| async move {
+        .extractor_handler((), |RawArgs(_args): RawArgs| async move {
             Ok(CallToolResult::resource(ResourceContent {
                 uri: "test://embedded-resource".to_string(),
                 mime_type: Some("text/plain".to_string()),
@@ -100,13 +103,14 @@ fn build_embedded_resource() -> Tool {
                 blob: None,
             }))
         })
+        .build()
         .expect("failed to build test_embedded_resource")
 }
 
 fn build_multiple_content_types() -> Tool {
     ToolBuilder::new("test_multiple_content_types")
         .description("Returns multiple content types (text + image + resource)")
-        .raw_handler(|_args| async move {
+        .extractor_handler((), |RawArgs(_args): RawArgs| async move {
             Ok(CallToolResult {
                 content: vec![
                     Content::Text {
@@ -132,13 +136,14 @@ fn build_multiple_content_types() -> Tool {
                 structured_content: None,
             })
         })
+        .build()
         .expect("failed to build test_multiple_content_types")
 }
 
 fn build_tool_with_logging() -> Tool {
     ToolBuilder::new("test_tool_with_logging")
         .description("Sends log notifications then returns text")
-        .raw_handler_with_context(|ctx: RequestContext, _args| async move {
+        .extractor_handler((), |ctx: Context, RawArgs(_args): RawArgs| async move {
             ctx.send_log(
                 LoggingMessageParams::new(LogLevel::Info)
                     .with_logger("conformance")
@@ -158,13 +163,14 @@ fn build_tool_with_logging() -> Tool {
             );
             Ok(CallToolResult::text("Logging complete"))
         })
+        .build()
         .expect("failed to build test_tool_with_logging")
 }
 
 fn build_tool_with_progress() -> Tool {
     ToolBuilder::new("test_tool_with_progress")
         .description("Sends progress notifications (0/50/100) then returns text")
-        .raw_handler_with_context(|ctx: RequestContext, _args| async move {
+        .extractor_handler((), |ctx: Context, RawArgs(_args): RawArgs| async move {
             ctx.report_progress(0.0, Some(100.0), Some("Starting"))
                 .await;
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -178,20 +184,24 @@ fn build_tool_with_progress() -> Tool {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             Ok(CallToolResult::text("Progress complete"))
         })
+        .build()
         .expect("failed to build test_tool_with_progress")
 }
 
 fn build_error_handling() -> Tool {
     ToolBuilder::new("test_error_handling")
         .description("Returns an error result")
-        .raw_handler(|_args| async move { Ok(CallToolResult::error("This is an error response")) })
+        .extractor_handler((), |RawArgs(_args): RawArgs| async move {
+            Ok(CallToolResult::error("This is an error response"))
+        })
+        .build()
         .expect("failed to build test_error_handling")
 }
 
 fn build_sampling() -> Tool {
     ToolBuilder::new("test_sampling")
         .description("Requests LLM sampling via context and returns the response")
-        .raw_handler_with_context(|ctx: RequestContext, _args| async move {
+        .extractor_handler((), |ctx: Context, RawArgs(_args): RawArgs| async move {
             if !ctx.can_sample() {
                 return Ok(CallToolResult::error("Sampling not available"));
             }
@@ -210,13 +220,14 @@ fn build_sampling() -> Tool {
                 Err(e) => Ok(CallToolResult::error(format!("Sampling failed: {}", e))),
             }
         })
+        .build()
         .expect("failed to build test_sampling")
 }
 
 fn build_elicitation() -> Tool {
     ToolBuilder::new("test_elicitation")
         .description("Requests elicitation via context and returns the response")
-        .raw_handler_with_context(|ctx: RequestContext, _args| async move {
+        .extractor_handler((), |ctx: Context, RawArgs(_args): RawArgs| async move {
             if !ctx.can_elicit() {
                 return Ok(CallToolResult::error("Elicitation not available"));
             }
@@ -238,13 +249,14 @@ fn build_elicitation() -> Tool {
                 Err(e) => Ok(CallToolResult::error(format!("Elicitation failed: {}", e))),
             }
         })
+        .build()
         .expect("failed to build test_elicitation")
 }
 
 fn build_elicitation_sep1034_defaults() -> Tool {
     ToolBuilder::new("test_elicitation_sep1034_defaults")
         .description("Requests elicitation with default values for all primitive types")
-        .raw_handler_with_context(|ctx: RequestContext, _args| async move {
+        .extractor_handler((), |ctx: Context, RawArgs(_args): RawArgs| async move {
             if !ctx.can_elicit() {
                 return Ok(CallToolResult::error("Elicitation not available"));
             }
@@ -273,13 +285,14 @@ fn build_elicitation_sep1034_defaults() -> Tool {
                 Err(e) => Ok(CallToolResult::error(format!("Elicitation failed: {}", e))),
             }
         })
+        .build()
         .expect("failed to build test_elicitation_sep1034_defaults")
 }
 
 fn build_elicitation_sep1330_enums() -> Tool {
     ToolBuilder::new("test_elicitation_sep1330_enums")
         .description("Requests elicitation with enum schemas")
-        .raw_handler_with_context(|ctx: RequestContext, _args| async move {
+        .extractor_handler((), |ctx: Context, RawArgs(_args): RawArgs| async move {
             if !ctx.can_elicit() {
                 return Ok(CallToolResult::error("Elicitation not available"));
             }
@@ -358,5 +371,6 @@ fn build_elicitation_sep1330_enums() -> Tool {
                 Err(e) => Ok(CallToolResult::error(format!("Elicitation failed: {}", e))),
             }
         })
+        .build()
         .expect("failed to build test_elicitation_sep1330_enums")
 }

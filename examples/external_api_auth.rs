@@ -8,13 +8,13 @@
 //!
 //! ## Local stdio transport
 //! - User's environment variables are secure (their own shell)
-//! - `handler_with_state` with shared API client is the natural pattern
+//! - `extractor_handler` with `State<T>` for shared API client is the natural pattern
 //! - No need to bridge identities - the user IS the identity
 //!
 //! ## Public HTTP/WebSocket transport
 //! - Need to authenticate the caller (OAuth, API key, etc.)
 //! - Then map that authenticated identity to downstream API credentials
-//! - Use `handler_with_context` to access the authenticated user's claims
+//! - Use `extractor_handler` with `Context` to access the authenticated user's claims
 //!
 //! # Patterns Demonstrated
 //!
@@ -33,7 +33,7 @@ use serde::Deserialize;
 use tokio::sync::RwLock;
 use tower_mcp::{
     CallToolResult, McpRouter, StdioTransport, ToolBuilder,
-    context::RequestContext,
+    extract::{Context, Json, State},
     protocol::{ElicitFieldValue, ElicitFormParams, ElicitFormSchema, ElicitMode},
 };
 
@@ -100,9 +100,9 @@ fn build_server_side_tool(client: Arc<ExternalApiClient>) -> tower_mcp::Tool {
         .description(
             "Search using server-side API credentials (Pattern 1: best for stdio transport)",
         )
-        .handler_with_state(
+        .extractor_handler_typed::<_, _, _, QueryInput>(
             client,
-            |client: Arc<ExternalApiClient>, input: QueryInput| async move {
+            |State(client): State<Arc<ExternalApiClient>>, Json(input): Json<QueryInput>| async move {
                 match client.list_items(&input.query).await {
                     Ok(items) => Ok(CallToolResult::text(format!("Found: {:?}", items))),
                     Err(e) => Ok(CallToolResult::error(format!("API error: {}", e))),
@@ -133,7 +133,7 @@ fn build_server_side_tool(client: Arc<ExternalApiClient>) -> tower_mcp::Tool {
 // In a real implementation with OAuth middleware configured:
 //
 // ```rust,ignore
-// .handler_with_context(|ctx: RequestContext, input: QueryInput| async move {
+// .extractor_handler_typed::<_, _, _, QueryInput>((), |ctx: Context, Json(input): Json<QueryInput>| async move {
 //     let claims = ctx.extensions().get::<TokenClaims>()
 //         .ok_or_else(|| Error::tool("Not authenticated"))?;
 //     let api_token = claims.extra.get("external_api_token")
@@ -149,20 +149,23 @@ fn build_server_side_tool(client: Arc<ExternalApiClient>) -> tower_mcp::Tool {
 fn build_oauth_claims_tool() -> tower_mcp::Tool {
     ToolBuilder::new("search_with_user_token")
         .description("Search using per-user API token from OAuth claims (Pattern 2: best for HTTP)")
-        .handler_with_context(|_ctx: RequestContext, input: QueryInput| async move {
-            // In production with OAuth middleware, you would extract the token from claims.
-            // Here we simulate having extracted a per-user token.
-            let api_token = "user-specific-token-from-jwt-claims";
+        .extractor_handler_typed::<_, _, _, QueryInput>(
+            (),
+            |_ctx: Context, Json(input): Json<QueryInput>| async move {
+                // In production with OAuth middleware, you would extract the token from claims.
+                // Here we simulate having extracted a per-user token.
+                let api_token = "user-specific-token-from-jwt-claims";
 
-            let client = ExternalApiClient::new(api_token);
-            match client.list_items(&input.query).await {
-                Ok(items) => Ok(CallToolResult::text(format!(
-                    "Found (user-scoped): {:?}",
-                    items
-                ))),
-                Err(e) => Ok(CallToolResult::error(format!("API error: {}", e))),
-            }
-        })
+                let client = ExternalApiClient::new(api_token);
+                match client.list_items(&input.query).await {
+                    Ok(items) => Ok(CallToolResult::text(format!(
+                        "Found (user-scoped): {:?}",
+                        items
+                    ))),
+                    Err(e) => Ok(CallToolResult::error(format!("API error: {}", e))),
+                }
+            },
+        )
         .build()
         .expect("valid tool")
 }
@@ -186,46 +189,57 @@ fn build_oauth_claims_tool() -> tower_mcp::Tool {
 fn build_elicitation_tool() -> tower_mcp::Tool {
     ToolBuilder::new("search_with_elicitation")
         .description("Search by asking user for API key at runtime (Pattern 3: interactive)")
-        .handler_with_context(|ctx: RequestContext, input: QueryInput| async move {
-            // Check if elicitation is available (client supports it)
-            if !ctx.can_elicit() {
-                return Ok(CallToolResult::error(
-                    "This tool requires elicitation support. Please provide credentials another way.",
-                ));
-            }
+        .extractor_handler_typed::<_, _, _, QueryInput>(
+            (),
+            |ctx: Context, Json(input): Json<QueryInput>| async move {
+                // Check if elicitation is available (client supports it)
+                if !ctx.can_elicit() {
+                    return Ok(CallToolResult::error(
+                        "This tool requires elicitation support. Please provide credentials another way.",
+                    ));
+                }
 
-            // Request credentials from the user
-            let params = ElicitFormParams {
-                mode: ElicitMode::Form,
-                message: "Please provide your API key to search the external service.".to_string(),
-                requested_schema: ElicitFormSchema::new()
-                    .string_field("api_key", Some("Your API key for the external service"), true),
-                meta: None,
-            };
+                // Request credentials from the user
+                let params = ElicitFormParams {
+                    mode: ElicitMode::Form,
+                    message: "Please provide your API key to search the external service."
+                        .to_string(),
+                    requested_schema: ElicitFormSchema::new().string_field(
+                        "api_key",
+                        Some("Your API key for the external service"),
+                        true,
+                    ),
+                    meta: None,
+                };
 
-            match ctx.elicit_form(params).await {
-                Ok(result) => {
-                    if let Some(content) = result.content {
-                        if let Some(ElicitFieldValue::String(api_key)) = content.get("api_key") {
-                            let client = ExternalApiClient::new(api_key);
-                            match client.list_items(&input.query).await {
-                                Ok(items) => {
-                                    return Ok(CallToolResult::text(format!(
-                                        "Found (user-provided key): {:?}",
-                                        items
-                                    )));
-                                }
-                                Err(e) => {
-                                    return Ok(CallToolResult::error(format!("API error: {}", e)));
+                match ctx.elicit_form(params).await {
+                    Ok(result) => {
+                        if let Some(content) = result.content {
+                            if let Some(ElicitFieldValue::String(api_key)) = content.get("api_key")
+                            {
+                                let client = ExternalApiClient::new(api_key);
+                                match client.list_items(&input.query).await {
+                                    Ok(items) => {
+                                        return Ok(CallToolResult::text(format!(
+                                            "Found (user-provided key): {:?}",
+                                            items
+                                        )));
+                                    }
+                                    Err(e) => {
+                                        return Ok(CallToolResult::error(format!(
+                                            "API error: {}",
+                                            e
+                                        )));
+                                    }
                                 }
                             }
                         }
+                        Ok(CallToolResult::error("No API key provided"))
                     }
-                    Ok(CallToolResult::error("No API key provided"))
+                    Err(e) => Ok(CallToolResult::error(format!("Elicitation failed: {}", e))),
                 }
-                Err(e) => Ok(CallToolResult::error(format!("Elicitation failed: {}", e))),
-            }
-        })
+            },
+        )
         .build()
         .expect("valid tool")
 }
@@ -249,7 +263,7 @@ fn build_elicitation_tool() -> tower_mcp::Tool {
 // In production with OAuth middleware, you would get the user_id from claims:
 //
 // ```rust,ignore
-// .handler_with_state_and_context(store, |store, ctx, input| async move {
+// .extractor_handler_typed::<_, _, _, QueryInput>(store, |State(store): State<Arc<CredentialStore>>, ctx: Context, Json(input): Json<QueryInput>| async move {
 //     let claims = ctx.extensions().get::<TokenClaims>()?;
 //     let user_id = claims.sub.as_ref()?;
 //     let token = store.get(user_id, "github").await?;
@@ -291,9 +305,11 @@ fn build_credential_store_tool(store: Arc<CredentialStore>) -> tower_mcp::Tool {
         .description(
             "Search using credentials from server-side store (Pattern 4: credential store)",
         )
-        .handler_with_state_and_context(
+        .extractor_handler_typed::<_, _, _, QueryInput>(
             store,
-            |store: Arc<CredentialStore>, _ctx: RequestContext, input: QueryInput| async move {
+            |State(store): State<Arc<CredentialStore>>,
+             _ctx: Context,
+             Json(input): Json<QueryInput>| async move {
                 // In production with OAuth middleware, get user_id from claims:
                 // let claims = ctx.extensions().get::<TokenClaims>()?;
                 // let user_id = claims.sub.as_ref()?;

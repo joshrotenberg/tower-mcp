@@ -16,7 +16,7 @@
 //!
 //! // Each tool gets a clone of the Arc
 //! let tool = ToolBuilder::new("lint_content")
-//!     .handler_with_state(state.clone(), |state, input| async move {
+//!     .extractor_handler_typed::<_, _, _, LintContentInput>(state.clone(), |State(state), Json(input)| async move {
 //!         // Use state here
 //!     })
 //!     .build()?;
@@ -55,7 +55,10 @@ use std::sync::Arc;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tower_mcp::protocol::{Content, GetPromptResult, PromptMessage, PromptRole};
-use tower_mcp::{CallToolResult, Prompt, PromptBuilder, Tool, ToolBuilder};
+use tower_mcp::{
+    CallToolResult, NoParams, Prompt, PromptBuilder, Tool, ToolBuilder,
+    extract::{Json, State},
+};
 
 use crate::engine::{LintState, RulesListResult};
 
@@ -168,9 +171,9 @@ pub fn build_tools() -> Vec<Tool> {
 fn build_lint_content_tool(state: Arc<LintState>) -> Tool {
     ToolBuilder::new("lint_content")
         .description("Lint markdown content and return violations")
-        .handler_with_state(
+        .extractor_handler_typed::<_, _, _, LintContentInput>(
             state,
-            |state: Arc<LintState>, input: LintContentInput| async move {
+            |State(state): State<Arc<LintState>>, Json(input): Json<LintContentInput>| async move {
                 match state.lint_to_result(&input.content, &input.filename) {
                     Ok(result) => CallToolResult::from_serialize(&result),
                     Err(e) => Ok(CallToolResult::error(e)),
@@ -188,9 +191,9 @@ fn build_lint_content_tool(state: Arc<LintState>) -> Tool {
 fn build_lint_file_tool(state: Arc<LintState>) -> Tool {
     ToolBuilder::new("lint_file")
         .description("Lint a local markdown file")
-        .handler_with_state(
+        .extractor_handler_typed::<_, _, _, LintFileInput>(
             state,
-            |state: Arc<LintState>, input: LintFileInput| async move {
+            |State(state): State<Arc<LintState>>, Json(input): Json<LintFileInput>| async move {
                 // Read the file asynchronously
                 let content = match tokio::fs::read_to_string(&input.path).await {
                     Ok(c) => c,
@@ -216,9 +219,9 @@ fn build_lint_file_tool(state: Arc<LintState>) -> Tool {
 fn build_lint_url_tool(state: Arc<LintState>) -> Tool {
     ToolBuilder::new("lint_url")
         .description("Fetch markdown from a URL and lint it")
-        .handler_with_state(
+        .extractor_handler_typed::<_, _, _, LintUrlInput>(
             state,
-            |state: Arc<LintState>, input: LintUrlInput| async move {
+            |State(state): State<Arc<LintState>>, Json(input): Json<LintUrlInput>| async move {
                 // Fetch the URL
                 let content = match reqwest::get(&input.url).await {
                     Ok(resp) => match resp.text().await {
@@ -250,18 +253,22 @@ fn build_lint_url_tool(state: Arc<LintState>) -> Tool {
 /// This tool returns information about all available lint rules.
 /// Useful for discovering what checks are available.
 ///
-/// Note: Uses `handler_with_state_no_params` since no input is needed.
+/// Note: Uses `NoParams` as input type since no parameters are needed.
 fn build_list_rules_tool(state: Arc<LintState>) -> Tool {
     ToolBuilder::new("list_rules")
         .description("List all available lint rules with their descriptions")
-        .handler_with_state_no_params(state, |state: Arc<LintState>| async move {
-            let rules = state.rules();
-            let result = RulesListResult {
-                total: rules.len(),
-                rules,
-            };
-            CallToolResult::from_serialize(&result)
-        })
+        .extractor_handler_typed::<_, _, _, NoParams>(
+            state,
+            |State(state): State<Arc<LintState>>, Json(_): Json<NoParams>| async move {
+                let rules = state.rules();
+                let result = RulesListResult {
+                    total: rules.len(),
+                    rules,
+                };
+                CallToolResult::from_serialize(&result)
+            },
+        )
+        .build()
         .expect("valid tool")
 }
 
@@ -272,9 +279,9 @@ fn build_list_rules_tool(state: Arc<LintState>) -> Tool {
 fn build_explain_rule_tool(state: Arc<LintState>) -> Tool {
     ToolBuilder::new("explain_rule")
         .description("Get detailed explanation of a specific lint rule")
-        .handler_with_state(
+        .extractor_handler_typed::<_, _, _, ExplainRuleInput>(
             state,
-            |state: Arc<LintState>, input: ExplainRuleInput| async move {
+            |State(state): State<Arc<LintState>>, Json(input): Json<ExplainRuleInput>| async move {
                 match state.get_rule(&input.rule_id) {
                     Some(rule) => CallToolResult::from_serialize(&rule),
                     None => Ok(CallToolResult::error(format!(
@@ -295,9 +302,9 @@ fn build_explain_rule_tool(state: Arc<LintState>) -> Tool {
 fn build_fix_content_tool(state: Arc<LintState>) -> Tool {
     ToolBuilder::new("fix_content")
         .description("Apply automatic fixes to markdown content where possible")
-        .handler_with_state(
+        .extractor_handler_typed::<_, _, _, FixContentInput>(
             state,
-            |state: Arc<LintState>, input: FixContentInput| async move {
+            |State(state): State<Arc<LintState>>, Json(input): Json<FixContentInput>| async move {
                 match state.fix_content(&input.content, &input.filename) {
                     Ok(result) => CallToolResult::from_serialize(&result),
                     Err(e) => Ok(CallToolResult::error(e)),

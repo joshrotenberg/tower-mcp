@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tower_mcp::{CallToolResult, Error, Tool, ToolBuilder};
+use tower_mcp::{
+    CallToolResult, Error, Tool, ToolBuilder,
+    extract::{Json, State},
+};
 
 use crate::state::AppState;
 
@@ -20,29 +23,32 @@ pub fn build(state: Arc<AppState>) -> Tool {
         .description("Get a crates.io user's profile information by their GitHub username.")
         .read_only()
         .idempotent()
-        .handler_with_state(state, |state: Arc<AppState>, input: UserInput| async move {
-            let user = state
-                .client
-                .user(&input.username)
-                .await
-                .map_err(|e| Error::tool(format!("Crates.io API error: {}", e)))?;
+        .extractor_handler_typed::<_, _, _, UserInput>(
+            state,
+            |State(state): State<Arc<AppState>>, Json(input): Json<UserInput>| async move {
+                let user = state
+                    .client
+                    .user(&input.username)
+                    .await
+                    .map_err(|e| Error::tool(format!("Crates.io API error: {}", e)))?;
 
-            let mut output = format!("# User: {}\n\n", user.login);
+                let mut output = format!("# User: {}\n\n", user.login);
 
-            if let Some(name) = &user.name {
-                output.push_str(&format!("**Name:** {}\n\n", name));
-            }
+                if let Some(name) = &user.name {
+                    output.push_str(&format!("**Name:** {}\n\n", name));
+                }
 
-            output.push_str(&format!("**GitHub:** https://github.com/{}\n", user.login));
+                output.push_str(&format!("**GitHub:** https://github.com/{}\n", user.login));
 
-            output.push_str(&format!("**Profile:** {}\n", user.url));
+                output.push_str(&format!("**Profile:** {}\n", user.url));
 
-            if let Some(avatar) = &user.avatar {
-                output.push_str(&format!("**Avatar:** {}\n", avatar));
-            }
+                if let Some(avatar) = &user.avatar {
+                    output.push_str(&format!("**Avatar:** {}\n", avatar));
+                }
 
-            Ok(CallToolResult::text(output))
-        })
+                Ok(CallToolResult::text(output))
+            },
+        )
         .build()
         .expect("valid tool")
 }

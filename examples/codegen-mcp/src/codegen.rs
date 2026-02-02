@@ -218,10 +218,10 @@ fn generate_main_rs(state: &ProjectState) -> String {
 
 /// Generate import statements.
 fn generate_imports(state: &ProjectState) -> String {
-    let mut imports = vec![
-        "use schemars::JsonSchema;",
-        "use serde::Deserialize;",
-        "use tower_mcp::{CallToolResult, McpRouter, ToolBuilder};",
+    let mut imports: Vec<String> = vec![
+        "use schemars::JsonSchema;".to_string(),
+        "use serde::Deserialize;".to_string(),
+        "use tower_mcp::{CallToolResult, McpRouter, ToolBuilder};".to_string(),
     ];
 
     // Add transport imports
@@ -230,26 +230,66 @@ fn generate_imports(state: &ProjectState) -> String {
     let has_ws = state.transports.contains(&Transport::WebSocket);
 
     if has_stdio {
-        imports.push("use tower_mcp::StdioTransport;");
+        imports.push("use tower_mcp::StdioTransport;".to_string());
     }
     if has_http {
-        imports.push("use tower_mcp::HttpTransport;");
+        imports.push("use tower_mcp::HttpTransport;".to_string());
     }
     if has_ws {
-        imports.push("use tower_mcp::WebSocketTransport;");
+        imports.push("use tower_mcp::WebSocketTransport;".to_string());
     }
 
     // Add state imports if needed
     if state.any_tool_uses_state() || state.has_state() {
-        imports.push("use std::sync::Arc;");
+        imports.push("use std::sync::Arc;".to_string());
     }
 
-    // Add context import if needed
+    // Add extractor imports
+    let mut extractor_imports = vec![];
+    if state.any_tool_uses_state() {
+        extractor_imports.push("State");
+    }
     if state.any_tool_uses_context() {
-        imports.push("use tower_mcp::RequestContext;");
+        extractor_imports.push("Context");
+    }
+    // Add Json for typed handlers and RawArgs for raw handlers
+    let has_typed_inputs = state.tools.iter().any(|t| {
+        !t.input_fields.is_empty()
+            && !matches!(t.handler_type, HandlerType::Raw | HandlerType::NoParams)
+    });
+    let has_raw = state
+        .tools
+        .iter()
+        .any(|t| t.handler_type == HandlerType::Raw);
+    let has_no_params = state
+        .tools
+        .iter()
+        .any(|t| t.input_fields.is_empty() || t.handler_type == HandlerType::NoParams);
+
+    if has_typed_inputs || has_no_params {
+        extractor_imports.push("Json");
+    }
+    if has_raw {
+        extractor_imports.push("RawArgs");
     }
 
-    imports.join("\n")
+    if !extractor_imports.is_empty() {
+        imports.push(format!(
+            "use tower_mcp::extract::{{{}}};",
+            extractor_imports.join(", ")
+        ));
+    }
+
+    // Add NoParams if needed
+    if has_no_params {
+        imports.push("use tower_mcp::NoParams;".to_string());
+    }
+
+    imports
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Generate an input struct for a tool.
@@ -405,6 +445,7 @@ fn generate_tool_builder(tool: &ToolDef, _has_state: bool) -> String {
         Some(to_pascal_case(&tool.name) + "Input")
     };
 
+    // Generate the appropriate handler based on type using extractor pattern
     match tool.handler_type {
         HandlerType::Simple => {
             if let Some(ref input) = input_type {
@@ -420,7 +461,7 @@ fn generate_tool_builder(tool: &ToolDef, _has_state: bool) -> String {
                 ));
             } else {
                 code.push_str(&format!(
-                    r#"        .handler_no_params(|| async move {{
+                    r#"        .extractor_handler_typed::<_, _, _, NoParams>((), |Json(_): Json<NoParams>| async move {{
             // TODO: implement {}
             // Example: Ok(CallToolResult::text("Done!"))
             Ok(CallToolResult::text("OK"))
@@ -434,17 +475,17 @@ fn generate_tool_builder(tool: &ToolDef, _has_state: bool) -> String {
             if let Some(ref input) = input_type {
                 let example = generate_example_impl(tool, true, false);
                 code.push_str(&format!(
-                    r#"        .handler_with_state(state.clone(), |state: Arc<AppState>, input: {}| async move {{
+                    r#"        .extractor_handler_typed::<_, _, _, {}>(state.clone(), |State(state): State<Arc<AppState>>, Json(input): Json<{}>| async move {{
             // TODO: implement {}
 {}
             Ok(CallToolResult::text(format!("{{:?}}", input)))
         }})
 "#,
-                    input, tool.name, example
+                    input, input, tool.name, example
                 ));
             } else {
                 code.push_str(&format!(
-                    r#"        .handler_with_state_no_params(state.clone(), |state: Arc<AppState>| async move {{
+                    r#"        .extractor_handler_typed::<_, _, _, NoParams>(state.clone(), |State(state): State<Arc<AppState>>, Json(_): Json<NoParams>| async move {{
             // TODO: implement {}
             // Example: let data = state.db.query(...).await?;
             Ok(CallToolResult::text("OK"))
@@ -458,19 +499,19 @@ fn generate_tool_builder(tool: &ToolDef, _has_state: bool) -> String {
             if let Some(ref input) = input_type {
                 let example = generate_example_impl(tool, false, true);
                 code.push_str(&format!(
-                    r#"        .handler_with_context(|ctx: RequestContext, input: {}| async move {{
+                    r#"        .extractor_handler_typed::<_, _, _, {}>((), |ctx: Context, Json(input): Json<{}>| async move {{
             // TODO: implement {}
 {}
             Ok(CallToolResult::text(format!("{{:?}}", input)))
         }})
 "#,
-                    input, tool.name, example
+                    input, input, tool.name, example
                 ));
             } else {
                 code.push_str(&format!(
-                    r#"        .handler_no_params_with_context(|ctx: RequestContext| async move {{
+                    r#"        .extractor_handler_typed::<_, _, _, NoParams>((), |ctx: Context, Json(_): Json<NoParams>| async move {{
             // TODO: implement {}
-            // Example: ctx.send_progress(0.5, Some(50), Some("Halfway done")).await;
+            // Example: ctx.report_progress(0.5, Some(1.0), Some("Halfway done")).await;
             Ok(CallToolResult::text("OK"))
         }})
 "#,
@@ -482,22 +523,22 @@ fn generate_tool_builder(tool: &ToolDef, _has_state: bool) -> String {
             if let Some(ref input) = input_type {
                 let example = generate_example_impl(tool, true, true);
                 code.push_str(&format!(
-                    r#"        .handler_with_state_and_context(state.clone(), |state: Arc<AppState>, ctx: RequestContext, input: {}| async move {{
+                    r#"        .extractor_handler_typed::<_, _, _, {}>(state.clone(), |State(state): State<Arc<AppState>>, ctx: Context, Json(input): Json<{}>| async move {{
             // TODO: implement {}
 {}
             Ok(CallToolResult::text(format!("{{:?}}", input)))
         }})
 "#,
-                    input, tool.name, example
+                    input, input, tool.name, example
                 ));
             } else {
                 code.push_str(&format!(
-                    r#"        .handler_with_state_and_context_no_params(state.clone(), |state: Arc<AppState>, ctx: RequestContext| async move {{
+                    r#"        .extractor_handler_typed::<_, _, _, NoParams>(state.clone(), |State(state): State<Arc<AppState>>, ctx: Context, Json(_): Json<NoParams>| async move {{
             // TODO: implement {}
             // Example:
-            //   ctx.send_progress(0.0, Some(0), Some("Starting")).await;
+            //   ctx.report_progress(0.0, Some(1.0), Some("Starting")).await;
             //   let result = state.client.fetch(...).await?;
-            //   ctx.send_progress(1.0, Some(100), Some("Done")).await;
+            //   ctx.report_progress(1.0, Some(1.0), Some("Done")).await;
             Ok(CallToolResult::text("OK"))
         }})
 "#,
@@ -507,7 +548,7 @@ fn generate_tool_builder(tool: &ToolDef, _has_state: bool) -> String {
         }
         HandlerType::Raw => {
             code.push_str(&format!(
-                r#"        .raw_handler(|args: serde_json::Value| async move {{
+                r#"        .extractor_handler((), |RawArgs(args): RawArgs| async move {{
             // TODO: implement {}
             // Example:
             //   let id = args.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -520,7 +561,7 @@ fn generate_tool_builder(tool: &ToolDef, _has_state: bool) -> String {
         }
         HandlerType::NoParams => {
             code.push_str(&format!(
-                r#"        .handler_no_params(|| async move {{
+                r#"        .extractor_handler_typed::<_, _, _, NoParams>((), |Json(_): Json<NoParams>| async move {{
             // TODO: implement {}
             // Example: Ok(CallToolResult::text("Done!"))
             Ok(CallToolResult::text("OK"))
