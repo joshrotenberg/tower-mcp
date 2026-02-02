@@ -467,13 +467,13 @@ struct PendingRequest {
 /// use tower_mcp::{BoxError, McpRouter, ToolBuilder, CallToolResult};
 /// use tower_mcp::transport::stdio::BidirectionalStdioTransport;
 /// use tower_mcp::{CreateMessageParams, SamplingMessage};
-/// use tower_mcp::context::RequestContext;
+/// use tower_mcp::extract::{Context, RawArgs};
 ///
 /// #[tokio::main]
 /// async fn main() -> Result<(), BoxError> {
 ///     let tool = ToolBuilder::new("ai-tool")
 ///         .description("A tool that uses LLM")
-///         .handler_with_context(|ctx: RequestContext, input: serde_json::Value| async move {
+///         .extractor_handler((), |ctx: Context, RawArgs(_): RawArgs| async move {
 ///             // Request LLM completion from the client
 ///             let params = CreateMessageParams::new(
 ///                 vec![SamplingMessage::user("Help me with: ...")],

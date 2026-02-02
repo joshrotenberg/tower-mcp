@@ -40,13 +40,13 @@
 //!
 //! ```rust,no_run
 //! use tower_mcp::{BoxError, McpRouter, ToolBuilder, CallToolResult, CreateMessageParams, SamplingMessage};
-//! use tower_mcp::context::RequestContext;
+//! use tower_mcp::extract::{Context, RawArgs};
 //! use tower_mcp::transport::websocket::WebSocketTransport;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), BoxError> {
 //!     let tool = ToolBuilder::new("ai-tool")
-//!         .handler_with_context(|ctx: RequestContext, _: serde_json::Value| async move {
+//!         .extractor_handler((), |ctx: Context, RawArgs(_): RawArgs| async move {
 //!             // Request LLM completion from client
 //!             let params = CreateMessageParams::new(
 //!                 vec![SamplingMessage::user("Summarize this...")],

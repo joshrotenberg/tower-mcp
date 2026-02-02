@@ -14,6 +14,48 @@
 //! - Same service can be exposed over multiple transports (stdio, HTTP, WebSocket)
 //! - Easy integration with existing tower-based applications (axum, tonic, etc.)
 //!
+//! ## Familiar to axum Users
+//!
+//! If you've used [axum](https://docs.rs/axum), tower-mcp's API will feel familiar.
+//! We've adopted axum's patterns for a consistent Rust web ecosystem experience:
+//!
+//! - **Extractor pattern**: Tool handlers use extractors like [`extract::State<T>`],
+//!   [`extract::Json<T>`], and [`extract::Context`] - just like axum's request extractors
+//! - **Router composition**: [`McpRouter::merge()`] and [`McpRouter::nest()`] work like
+//!   axum's router methods for combining routers
+//! - **Per-route middleware**: Apply Tower layers to individual tools, resources, or
+//!   prompts via `.layer()` on builders
+//! - **Builder pattern**: Fluent builders for tools, resources, and prompts
+//!
+//! ```rust
+//! use std::sync::Arc;
+//! use tower_mcp::{ToolBuilder, CallToolResult};
+//! use tower_mcp::extract::{State, Json, Context};
+//! use schemars::JsonSchema;
+//! use serde::Deserialize;
+//!
+//! #[derive(Clone)]
+//! struct AppState { db_url: String }
+//!
+//! #[derive(Deserialize, JsonSchema)]
+//! struct SearchInput { query: String }
+//!
+//! // Looks just like an axum handler!
+//! let tool = ToolBuilder::new("search")
+//!     .description("Search the database")
+//!     .extractor_handler_typed::<_, _, _, SearchInput>(
+//!         Arc::new(AppState { db_url: "postgres://...".into() }),
+//!         |State(app): State<Arc<AppState>>,
+//!          ctx: Context,
+//!          Json(input): Json<SearchInput>| async move {
+//!             ctx.report_progress(0.5, Some(1.0), Some("Searching...")).await;
+//!             Ok(CallToolResult::text(format!("Found results for: {}", input.query)))
+//!         },
+//!     )
+//!     .build()
+//!     .unwrap();
+//! ```
+//!
 //! ## Quick Start: Server
 //!
 //! Build an MCP server with tools, resources, and prompts:

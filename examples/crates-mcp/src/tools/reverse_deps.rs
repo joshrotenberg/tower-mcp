@@ -5,7 +5,10 @@ use std::sync::Arc;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tower_mcp::protocol::{LogLevel, LoggingMessageParams};
-use tower_mcp::{CallToolResult, Error, RequestContext, Tool, ToolBuilder};
+use tower_mcp::{
+    CallToolResult, Error, Tool, ToolBuilder,
+    extract::{Context, Json, State},
+};
 
 use crate::state::AppState;
 
@@ -25,9 +28,11 @@ pub fn build(state: Arc<AppState>) -> Tool {
         .read_only()
         .idempotent()
         .icon("https://crates.io/assets/cargo.png")
-        .handler_with_state_and_context(
+        .extractor_handler_typed::<_, _, _, ReverseDepsInput>(
             state,
-            |state: Arc<AppState>, ctx: RequestContext, input: ReverseDepsInput| async move {
+            |State(state): State<Arc<AppState>>,
+             ctx: Context,
+             Json(input): Json<ReverseDepsInput>| async move {
                 // Log the request
                 ctx.send_log(LoggingMessageParams {
                     level: LogLevel::Info,

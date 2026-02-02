@@ -1450,6 +1450,7 @@ impl Service<RouterRequest> for McpRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extract::{Context, Json};
     use crate::jsonrpc::JsonRpcService;
     use crate::tool::ToolBuilder;
     use schemars::JsonSchema;
@@ -1675,7 +1676,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_progress_token_extraction() {
-        use crate::context::{RequestContext, ServerNotification, notification_channel};
+        use crate::context::{ServerNotification, notification_channel};
         use crate::protocol::ProgressToken;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1687,16 +1688,19 @@ mod tests {
         // Create a tool that reports progress
         let tool = ToolBuilder::new("progress_tool")
             .description("Tool that reports progress")
-            .handler_with_context(move |ctx: RequestContext, _input: AddInput| {
-                let reported = progress_ref.clone();
-                async move {
-                    // Report progress - this should work if token was extracted
-                    ctx.report_progress(50.0, Some(100.0), Some("Halfway"))
-                        .await;
-                    reported.store(true, Ordering::SeqCst);
-                    Ok(CallToolResult::text("done"))
-                }
-            })
+            .extractor_handler_typed::<_, _, _, AddInput>(
+                (),
+                move |ctx: Context, Json(_input): Json<AddInput>| {
+                    let reported = progress_ref.clone();
+                    async move {
+                        // Report progress - this should work if token was extracted
+                        ctx.report_progress(50.0, Some(100.0), Some("Halfway"))
+                            .await;
+                        reported.store(true, Ordering::SeqCst);
+                        Ok(CallToolResult::text("done"))
+                    }
+                },
+            )
             .build()
             .expect("valid tool name");
 
@@ -1746,7 +1750,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tool_call_without_progress_token() {
-        use crate::context::{RequestContext, notification_channel};
+        use crate::context::notification_channel;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1755,15 +1759,18 @@ mod tests {
 
         let tool = ToolBuilder::new("no_token_tool")
             .description("Tool that tries to report progress without token")
-            .handler_with_context(move |ctx: RequestContext, _input: AddInput| {
-                let attempted = progress_ref.clone();
-                async move {
-                    // Try to report progress - should be a no-op without token
-                    ctx.report_progress(50.0, Some(100.0), None).await;
-                    attempted.store(true, Ordering::SeqCst);
-                    Ok(CallToolResult::text("done"))
-                }
-            })
+            .extractor_handler_typed::<_, _, _, AddInput>(
+                (),
+                move |ctx: Context, Json(_input): Json<AddInput>| {
+                    let attempted = progress_ref.clone();
+                    async move {
+                        // Try to report progress - should be a no-op without token
+                        ctx.report_progress(50.0, Some(100.0), None).await;
+                        attempted.store(true, Ordering::SeqCst);
+                        Ok(CallToolResult::text("done"))
+                    }
+                },
+            )
             .build()
             .expect("valid tool name");
 
