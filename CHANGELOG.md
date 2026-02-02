@@ -4,6 +4,40 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+## [0.3.0] - 2026-02-02
+
+### Bug Fixes
+
+- **markdownlint-mcp:** Wrap list_rules result in object for MCP compatibility ([#287](https://github.com/joshrotenberg/tower-mcp/pull/287))
+- **markdownlint-mcp:** Implement fix_content to properly apply fixes ([#289](https://github.com/joshrotenberg/tower-mcp/pull/289))
+- **examples:** Add .build() calls to resource handlers ([#300](https://github.com/joshrotenberg/tower-mcp/pull/300))
+
+### Documentation
+
+- Add middleware placement guide to lib.rs ([#297](https://github.com/joshrotenberg/tower-mcp/pull/297))
+
+### Features
+
+- API consistency audit for 0.3.0 ([#278](https://github.com/joshrotenberg/tower-mcp/pull/278))
+- **examples:** Add markdownlint-mcp example ([#285](https://github.com/joshrotenberg/tower-mcp/pull/285))
+- **examples:** Add codegen-mcp server ([#290](https://github.com/joshrotenberg/tower-mcp/pull/290))
+- **codegen-mcp:** Add example comments and README generation ([#291](https://github.com/joshrotenberg/tower-mcp/pull/291))
+- Per-tool middleware via .layer() on ToolBuilder ([#293](https://github.com/joshrotenberg/tower-mcp/pull/293))
+- Per-resource middleware via .layer() on ResourceBuilder ([#298](https://github.com/joshrotenberg/tower-mcp/pull/298))
+- Per-prompt middleware via .layer() on PromptBuilder ([#299](https://github.com/joshrotenberg/tower-mcp/pull/299))
+- **router:** Add merge() and nest() for router composition ([#305](https://github.com/joshrotenberg/tower-mcp/pull/305))
+- **extract:** Add axum-inspired extractor pattern for tool handlers ([#306](https://github.com/joshrotenberg/tower-mcp/pull/306))
+- Simplify handler API with unified extractor pattern ([#308](https://github.com/joshrotenberg/tower-mcp/pull/308))
+- Add router-level state and Extension<T> extractor ([#309](https://github.com/joshrotenberg/tower-mcp/pull/309))
+- Typed rejection handling for extractors ([#303](https://github.com/joshrotenberg/tower-mcp/pull/303)) ([#310](https://github.com/joshrotenberg/tower-mcp/pull/310))
+
+### Miscellaneous Tasks
+
+- Add example MCP servers and tour guide ([#286](https://github.com/joshrotenberg/tower-mcp/pull/286))
+- **ci:** Add examples build check ([#311](https://github.com/joshrotenberg/tower-mcp/pull/311))
+
+
+
 ## [0.2.3] - 2026-01-30
 
 ### Bug Fixes
