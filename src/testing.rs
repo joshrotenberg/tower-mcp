@@ -82,7 +82,8 @@
 //!         Ok(GetPromptResult::user_message(
 //!             format!("Please greet {} warmly.", name),
 //!         ))
-//!     });
+//!     })
+//!     .build();
 //!
 //! let router = McpRouter::new()
 //!     .server_info("test-server", "1.0.0")
@@ -494,7 +495,8 @@ mod tests {
                     "Please greet {} warmly.",
                     name
                 )))
-            });
+            })
+            .build();
 
         McpRouter::new()
             .server_info("test-server", "1.0.0")

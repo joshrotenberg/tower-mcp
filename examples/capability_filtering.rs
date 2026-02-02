@@ -237,7 +237,8 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
                 "Review the following {} code for bugs, security issues, and style.",
                 lang
             )))
-        });
+        })
+        .build();
 
     let admin_debug = PromptBuilder::new("admin_debug_assistant")
         .description("System debugging prompt (admin only)")

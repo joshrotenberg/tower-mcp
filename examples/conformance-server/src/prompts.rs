@@ -59,6 +59,7 @@ After testing each feature, summarize what worked and any issues found."#
                 }],
             })
         })
+        .build()
 }
 
 fn build_simple_prompt() -> Prompt {
@@ -76,6 +77,7 @@ fn build_simple_prompt() -> Prompt {
                 }],
             })
         })
+        .build()
 }
 
 fn build_prompt_with_arguments() -> Prompt {
@@ -97,6 +99,7 @@ fn build_prompt_with_arguments() -> Prompt {
                 }],
             })
         })
+        .build()
 }
 
 fn build_prompt_with_embedded_resource() -> Prompt {
@@ -124,6 +127,7 @@ fn build_prompt_with_embedded_resource() -> Prompt {
                 }],
             })
         })
+        .build()
 }
 
 fn build_prompt_with_image() -> Prompt {
@@ -142,4 +146,5 @@ fn build_prompt_with_image() -> Prompt {
                 }],
             })
         })
+        .build()
 }

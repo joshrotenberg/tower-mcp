@@ -48,4 +48,5 @@ pub fn build() -> Prompt {
                 }],
             })
         })
+        .build()
 }

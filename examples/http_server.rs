@@ -169,7 +169,8 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
                     },
                 }],
             })
-        });
+        })
+        .build();
 
     // Create the MCP router
     let router = McpRouter::new()
