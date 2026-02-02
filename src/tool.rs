@@ -297,12 +297,12 @@ pub trait ToolHandler: Send + Sync {
 ///
 /// This is an internal adapter that bridges the handler abstraction to the
 /// service abstraction, enabling middleware composition.
-struct ToolHandlerService<H> {
+pub(crate) struct ToolHandlerService<H> {
     handler: Arc<H>,
 }
 
 impl<H> ToolHandlerService<H> {
-    fn new(handler: H) -> Self {
+    pub(crate) fn new(handler: H) -> Self {
         Self {
             handler: Arc::new(handler),
         }
@@ -355,9 +355,9 @@ pub struct Tool {
     /// Tool annotations (hints about behavior)
     pub annotations: Option<ToolAnnotations>,
     /// The boxed service that executes the tool
-    service: BoxToolService,
+    pub(crate) service: BoxToolService,
     /// JSON Schema for the tool's input
-    input_schema: Value,
+    pub(crate) input_schema: Value,
 }
 
 impl std::fmt::Debug for Tool {
@@ -1144,6 +1144,140 @@ impl ToolBuilder {
             self.annotations,
             RawWithStateAndContextHandler { state, handler },
         ))
+    }
+
+    /// Create a tool using the extractor pattern.
+    ///
+    /// This method provides an axum-inspired way to define handlers where state,
+    /// context, and input are extracted declaratively from function parameters.
+    /// This reduces the combinatorial explosion of handler variants like
+    /// `handler_with_state`, `handler_with_context`, etc.
+    ///
+    /// # Extractors
+    ///
+    /// Built-in extractors available in [`crate::extract`]:
+    /// - [`Json<T>`](crate::extract::Json) - Deserialize JSON arguments to type `T`
+    /// - [`State<T>`](crate::extract::State) - Extract cloned state
+    /// - [`Context`](crate::extract::Context) - Extract request context
+    /// - [`RawArgs`](crate::extract::RawArgs) - Extract raw JSON arguments
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::sync::Arc;
+    /// use tower_mcp::{ToolBuilder, CallToolResult};
+    /// use tower_mcp::extract::{Json, State, Context};
+    /// use schemars::JsonSchema;
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Clone)]
+    /// struct Database { url: String }
+    ///
+    /// #[derive(Debug, Deserialize, JsonSchema)]
+    /// struct QueryInput { query: String }
+    ///
+    /// let db = Arc::new(Database { url: "postgres://...".to_string() });
+    ///
+    /// let tool = ToolBuilder::new("search")
+    ///     .description("Search the database")
+    ///     .extractor_handler(db, |
+    ///         State(db): State<Arc<Database>>,
+    ///         ctx: Context,
+    ///         Json(input): Json<QueryInput>,
+    ///     | async move {
+    ///         if ctx.is_cancelled() {
+    ///             return Ok(CallToolResult::error("Cancelled"));
+    ///         }
+    ///         ctx.report_progress(0.5, Some(1.0), Some("Searching...")).await;
+    ///         Ok(CallToolResult::text(format!("Searched {} with: {}", db.url, input.query)))
+    ///     })
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    ///
+    /// # Type Inference
+    ///
+    /// The compiler infers extractor types from the function signature. Make sure
+    /// to annotate the extractor types explicitly in the closure parameters.
+    pub fn extractor_handler<S, F, T>(
+        self,
+        state: S,
+        handler: F,
+    ) -> crate::extract::ToolBuilderWithExtractor<S, F, T>
+    where
+        S: Clone + Send + Sync + 'static,
+        F: crate::extract::ExtractorHandler<S, T> + Clone,
+        T: Send + Sync + 'static,
+    {
+        crate::extract::ToolBuilderWithExtractor {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            output_schema: self.output_schema,
+            icons: self.icons,
+            annotations: self.annotations,
+            state,
+            handler,
+            input_schema: F::input_schema(),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// Create a tool using the extractor pattern with typed JSON input.
+    ///
+    /// This is similar to [`extractor_handler`](Self::extractor_handler) but provides
+    /// proper JSON schema generation when using `Json<T>` as an extractor.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::sync::Arc;
+    /// use tower_mcp::{ToolBuilder, CallToolResult};
+    /// use tower_mcp::extract::{Json, State};
+    /// use schemars::JsonSchema;
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Clone)]
+    /// struct AppState { prefix: String }
+    ///
+    /// #[derive(Debug, Deserialize, JsonSchema)]
+    /// struct GreetInput { name: String }
+    ///
+    /// let state = Arc::new(AppState { prefix: "Hello".to_string() });
+    ///
+    /// let tool = ToolBuilder::new("greet")
+    ///     .description("Greet someone")
+    ///     .extractor_handler_typed::<_, _, _, GreetInput>(state, |
+    ///         State(app): State<Arc<AppState>>,
+    ///         Json(input): Json<GreetInput>,
+    ///     | async move {
+    ///         Ok(CallToolResult::text(format!("{}, {}!", app.prefix, input.name)))
+    ///     })
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn extractor_handler_typed<S, F, T, I>(
+        self,
+        state: S,
+        handler: F,
+    ) -> crate::extract::ToolBuilderWithTypedExtractor<S, F, T, I>
+    where
+        S: Clone + Send + Sync + 'static,
+        F: crate::extract::TypedExtractorHandler<S, T, I> + Clone,
+        T: Send + Sync + 'static,
+        I: schemars::JsonSchema + Send + Sync + 'static,
+    {
+        crate::extract::ToolBuilderWithTypedExtractor {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            output_schema: self.output_schema,
+            icons: self.icons,
+            annotations: self.annotations,
+            state,
+            handler,
+            _phantom: std::marker::PhantomData,
+        }
     }
 }
 
