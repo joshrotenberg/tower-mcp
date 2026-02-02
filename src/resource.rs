@@ -6,6 +6,35 @@
 //! 2. **Trait-based** - Implement `McpResource` for full control
 //! 3. **Resource templates** - Parameterized resources using URI templates (RFC 6570)
 //!
+//! ## Per-Resource Middleware
+//!
+//! Resources are implemented as Tower services internally, enabling middleware
+//! composition via the `.layer()` method:
+//!
+//! ```rust
+//! use std::time::Duration;
+//! use tower::timeout::TimeoutLayer;
+//! use tower_mcp::resource::ResourceBuilder;
+//! use tower_mcp::protocol::{ReadResourceResult, ResourceContent};
+//!
+//! let resource = ResourceBuilder::new("file:///large-file.txt")
+//!     .name("Large File")
+//!     .description("A large file that may take time to read")
+//!     .handler(|| async {
+//!         // Simulate slow read
+//!         Ok(ReadResourceResult {
+//!             contents: vec![ResourceContent {
+//!                 uri: "file:///large-file.txt".to_string(),
+//!                 mime_type: Some("text/plain".to_string()),
+//!                 text: Some("content".to_string()),
+//!                 blob: None,
+//!             }],
+//!         })
+//!     })
+//!     .layer(TimeoutLayer::new(Duration::from_secs(30)))
+//!     .build();
+//! ```
+//!
 //! # Resource Templates
 //!
 //! Resource templates allow servers to expose parameterized resources using URI templates.
@@ -34,14 +63,125 @@
 //! ```
 
 use std::collections::HashMap;
+use std::convert::Infallible;
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use crate::error::Result;
+use tower::util::BoxCloneService;
+use tower_service::Service;
+
+use crate::context::RequestContext;
+use crate::error::{Error, Result};
 use crate::protocol::{
     ReadResourceResult, ResourceContent, ResourceDefinition, ResourceTemplateDefinition, ToolIcon,
 };
+
+// =============================================================================
+// Service Types for Per-Resource Middleware
+// =============================================================================
+
+/// Request type for resource services.
+///
+/// Contains the request context (for progress reporting, cancellation, etc.)
+/// and the resource URI being read.
+#[derive(Debug, Clone)]
+pub struct ResourceRequest {
+    /// Request context for progress reporting, cancellation, and client requests
+    pub ctx: RequestContext,
+    /// The URI of the resource being read
+    pub uri: String,
+}
+
+impl ResourceRequest {
+    /// Create a new resource request
+    pub fn new(ctx: RequestContext, uri: String) -> Self {
+        Self { ctx, uri }
+    }
+}
+
+/// A boxed, cloneable resource service with `Error = Infallible`.
+///
+/// This is the internal service type that resources use. Middleware errors are
+/// caught and converted to error results, so the service never fails at the Tower level.
+pub type BoxResourceService = BoxCloneService<ResourceRequest, ReadResourceResult, Infallible>;
+
+/// Catches errors from the inner service and converts them to error results.
+///
+/// This wrapper ensures that middleware errors (e.g., timeouts, rate limits)
+/// and handler errors are converted to `Err(Error)` responses wrapped in
+/// `Ok`, rather than propagating as Tower service errors.
+pub struct ResourceCatchError<S> {
+    inner: S,
+}
+
+impl<S> ResourceCatchError<S> {
+    /// Create a new `ResourceCatchError` wrapping the given service.
+    pub fn new(inner: S) -> Self {
+        Self { inner }
+    }
+}
+
+impl<S: Clone> Clone for ResourceCatchError<S> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<S: fmt::Debug> fmt::Debug for ResourceCatchError<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResourceCatchError")
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
+
+impl<S> Service<ResourceRequest> for ResourceCatchError<S>
+where
+    S: Service<ResourceRequest, Response = ReadResourceResult> + Clone + Send + 'static,
+    S::Error: fmt::Display + Send,
+    S::Future: Send,
+{
+    type Response = ReadResourceResult;
+    type Error = Infallible;
+    type Future =
+        Pin<Box<dyn Future<Output = std::result::Result<ReadResourceResult, Infallible>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        // Map any readiness error to Infallible (we catch it on call)
+        match self.inner.poll_ready(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(_)) => Poll::Ready(Ok(())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn call(&mut self, req: ResourceRequest) -> Self::Future {
+        let uri = req.uri.clone();
+        let fut = self.inner.call(req);
+
+        Box::pin(async move {
+            match fut.await {
+                Ok(result) => Ok(result),
+                Err(err) => {
+                    // Return an error result with the error message
+                    Ok(ReadResourceResult {
+                        contents: vec![ResourceContent {
+                            uri,
+                            mime_type: Some("text/plain".to_string()),
+                            text: Some(format!("Error reading resource: {}", err)),
+                            blob: None,
+                        }],
+                    })
+                }
+            }
+        })
+    }
+}
 
 /// A boxed future for resource handlers
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -50,18 +190,94 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub trait ResourceHandler: Send + Sync {
     /// Read the resource contents
     fn read(&self) -> BoxFuture<'_, Result<ReadResourceResult>>;
+
+    /// Read the resource with request context for progress/cancellation support
+    ///
+    /// The default implementation ignores the context and calls `read`.
+    /// Override this to receive progress/cancellation context.
+    fn read_with_context(&self, _ctx: RequestContext) -> BoxFuture<'_, Result<ReadResourceResult>> {
+        self.read()
+    }
+
+    /// Returns true if this handler uses context (for optimization)
+    fn uses_context(&self) -> bool {
+        false
+    }
 }
 
-/// A complete resource definition with handler
+/// Adapts a `ResourceHandler` to a Tower `Service<ResourceRequest>`.
+///
+/// This is an internal adapter that bridges the handler abstraction to the
+/// service abstraction, enabling middleware composition.
+struct ResourceHandlerService<H> {
+    handler: Arc<H>,
+}
+
+impl<H> ResourceHandlerService<H> {
+    fn new(handler: H) -> Self {
+        Self {
+            handler: Arc::new(handler),
+        }
+    }
+}
+
+impl<H> Clone for ResourceHandlerService<H> {
+    fn clone(&self) -> Self {
+        Self {
+            handler: self.handler.clone(),
+        }
+    }
+}
+
+impl<H> fmt::Debug for ResourceHandlerService<H> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResourceHandlerService")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<H> Service<ResourceRequest> for ResourceHandlerService<H>
+where
+    H: ResourceHandler + 'static,
+{
+    type Response = ReadResourceResult;
+    type Error = Error;
+    type Future =
+        Pin<Box<dyn Future<Output = std::result::Result<ReadResourceResult, Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: ResourceRequest) -> Self::Future {
+        let handler = self.handler.clone();
+        Box::pin(async move { handler.read_with_context(req.ctx).await })
+    }
+}
+
+/// A complete resource definition with service-based execution.
+///
+/// Resources are implemented as Tower services internally, enabling middleware
+/// composition via the builder's `.layer()` method. The service is wrapped
+/// in [`ResourceCatchError`] to convert any errors (from handlers or middleware)
+/// into error result responses.
 pub struct Resource {
+    /// Resource URI
     pub uri: String,
+    /// Human-readable name
     pub name: String,
+    /// Human-readable title for display purposes
     pub title: Option<String>,
+    /// Optional description
     pub description: Option<String>,
+    /// Optional MIME type
     pub mime_type: Option<String>,
+    /// Optional icons for display in user interfaces
     pub icons: Option<Vec<ToolIcon>>,
+    /// Optional size in bytes
     pub size: Option<u64>,
-    handler: Arc<dyn ResourceHandler>,
+    /// The boxed service that reads the resource
+    service: BoxResourceService,
 }
 
 impl Clone for Resource {
@@ -74,7 +290,7 @@ impl Clone for Resource {
             mime_type: self.mime_type.clone(),
             icons: self.icons.clone(),
             size: self.size,
-            handler: self.handler.clone(),
+            service: self.service.clone(),
         }
     }
 }
@@ -92,6 +308,11 @@ impl std::fmt::Debug for Resource {
             .finish_non_exhaustive()
     }
 }
+
+// SAFETY: BoxCloneService is Send + Sync (tower provides unsafe impl Sync),
+// and all other fields in Resource are Send + Sync.
+unsafe impl Send for Resource {}
+unsafe impl Sync for Resource {}
 
 impl Resource {
     /// Create a new resource builder
@@ -112,9 +333,65 @@ impl Resource {
         }
     }
 
-    /// Read the resource
-    pub fn read(&self) -> BoxFuture<'_, Result<ReadResourceResult>> {
-        self.handler.read()
+    /// Read the resource without context
+    ///
+    /// Creates a dummy request context. For full context support, use
+    /// [`read_with_context`](Self::read_with_context).
+    pub fn read(&self) -> BoxFuture<'static, ReadResourceResult> {
+        let ctx = RequestContext::new(crate::protocol::RequestId::Number(0));
+        self.read_with_context(ctx)
+    }
+
+    /// Read the resource with request context
+    ///
+    /// The context provides progress reporting, cancellation support, and
+    /// access to client requests (for sampling, etc.).
+    ///
+    /// # Note
+    ///
+    /// This method returns `ReadResourceResult` directly (not `Result<ReadResourceResult>`).
+    /// Any errors from the handler or middleware are converted to error responses
+    /// in the result contents.
+    pub fn read_with_context(&self, ctx: RequestContext) -> BoxFuture<'static, ReadResourceResult> {
+        use tower::ServiceExt;
+        let service = self.service.clone();
+        let uri = self.uri.clone();
+        Box::pin(async move {
+            // ServiceExt::oneshot properly handles poll_ready before call
+            // Service is Infallible, so unwrap is safe
+            service
+                .oneshot(ResourceRequest::new(ctx, uri))
+                .await
+                .unwrap()
+        })
+    }
+
+    /// Create a resource from a handler (internal helper)
+    #[allow(clippy::too_many_arguments)]
+    fn from_handler<H: ResourceHandler + 'static>(
+        uri: String,
+        name: String,
+        title: Option<String>,
+        description: Option<String>,
+        mime_type: Option<String>,
+        icons: Option<Vec<ToolIcon>>,
+        size: Option<u64>,
+        handler: H,
+    ) -> Self {
+        let handler_service = ResourceHandlerService::new(handler);
+        let catch_error = ResourceCatchError::new(handler_service);
+        let service = BoxCloneService::new(catch_error);
+
+        Self {
+            uri,
+            name,
+            title,
+            description,
+            mime_type,
+            icons,
+            size,
+            service,
+        }
     }
 }
 
@@ -143,7 +420,8 @@ impl Resource {
 ///                 blob: None,
 ///             }],
 ///         })
-///     });
+///     })
+///     .build();
 ///
 /// assert_eq!(resource.uri, "file:///config.json");
 /// ```
@@ -225,24 +503,48 @@ impl ResourceBuilder {
         self
     }
 
-    /// Set the handler function for reading the resource
-    pub fn handler<F, Fut>(self, handler: F) -> Resource
+    /// Set the handler function for reading the resource.
+    ///
+    /// Returns a [`ResourceBuilderWithHandler`] that can be used to apply
+    /// middleware layers via `.layer()` or build the resource directly via `.build()`.
+    pub fn handler<F, Fut>(self, handler: F) -> ResourceBuilderWithHandler<F>
     where
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<ReadResourceResult>> + Send + 'static,
     {
-        // Default name to URI if not specified
-        let name = self.name.unwrap_or_else(|| self.uri.clone());
-
-        Resource {
-            uri: self.uri.clone(),
-            name,
+        ResourceBuilderWithHandler {
+            uri: self.uri,
+            name: self.name,
             title: self.title,
             description: self.description,
             mime_type: self.mime_type,
             icons: self.icons,
             size: self.size,
-            handler: Arc::new(FnHandler { handler }),
+            handler,
+        }
+    }
+
+    /// Set a context-aware handler for reading the resource.
+    ///
+    /// The handler receives a `RequestContext` for progress reporting and
+    /// cancellation checking.
+    ///
+    /// Returns a [`ResourceBuilderWithContextHandler`] that can be used to apply
+    /// middleware layers via `.layer()` or build the resource directly via `.build()`.
+    pub fn handler_with_context<F, Fut>(self, handler: F) -> ResourceBuilderWithContextHandler<F>
+    where
+        F: Fn(RequestContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ReadResourceResult>> + Send + 'static,
+    {
+        ResourceBuilderWithContextHandler {
+            uri: self.uri,
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            mime_type: self.mime_type,
+            icons: self.icons,
+            size: self.size,
+            handler,
         }
     }
 
@@ -267,6 +569,7 @@ impl ResourceBuilder {
                 })
             }
         })
+        .build()
     }
 
     /// Create a static JSON resource (convenience method)
@@ -289,6 +592,279 @@ impl ResourceBuilder {
                 })
             }
         })
+        .build()
+    }
+}
+
+/// Builder state after handler is specified.
+///
+/// This builder allows applying middleware layers via `.layer()` or building
+/// the resource directly via `.build()`.
+pub struct ResourceBuilderWithHandler<F> {
+    uri: String,
+    name: Option<String>,
+    title: Option<String>,
+    description: Option<String>,
+    mime_type: Option<String>,
+    icons: Option<Vec<ToolIcon>>,
+    size: Option<u64>,
+    handler: F,
+}
+
+impl<F, Fut> ResourceBuilderWithHandler<F>
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<ReadResourceResult>> + Send + 'static,
+{
+    /// Build the resource without any middleware layers.
+    pub fn build(self) -> Resource {
+        let name = self.name.unwrap_or_else(|| self.uri.clone());
+
+        Resource::from_handler(
+            self.uri,
+            name,
+            self.title,
+            self.description,
+            self.mime_type,
+            self.icons,
+            self.size,
+            FnHandler {
+                handler: self.handler,
+            },
+        )
+    }
+
+    /// Apply a Tower layer (middleware) to this resource.
+    ///
+    /// The layer wraps the resource's handler service, enabling functionality like
+    /// timeouts, rate limiting, and metrics collection at the per-resource level.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::time::Duration;
+    /// use tower::timeout::TimeoutLayer;
+    /// use tower_mcp::resource::ResourceBuilder;
+    /// use tower_mcp::protocol::{ReadResourceResult, ResourceContent};
+    ///
+    /// let resource = ResourceBuilder::new("file:///slow.txt")
+    ///     .name("Slow Resource")
+    ///     .handler(|| async {
+    ///         Ok(ReadResourceResult {
+    ///             contents: vec![ResourceContent {
+    ///                 uri: "file:///slow.txt".to_string(),
+    ///                 mime_type: Some("text/plain".to_string()),
+    ///                 text: Some("content".to_string()),
+    ///                 blob: None,
+    ///             }],
+    ///         })
+    ///     })
+    ///     .layer(TimeoutLayer::new(Duration::from_secs(30)))
+    ///     .build();
+    /// ```
+    pub fn layer<L>(self, layer: L) -> ResourceBuilderWithLayer<F, L> {
+        ResourceBuilderWithLayer {
+            uri: self.uri,
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            mime_type: self.mime_type,
+            icons: self.icons,
+            size: self.size,
+            handler: self.handler,
+            layer,
+        }
+    }
+}
+
+/// Builder state after a layer has been applied to the handler.
+///
+/// This builder allows chaining additional layers and building the final resource.
+pub struct ResourceBuilderWithLayer<F, L> {
+    uri: String,
+    name: Option<String>,
+    title: Option<String>,
+    description: Option<String>,
+    mime_type: Option<String>,
+    icons: Option<Vec<ToolIcon>>,
+    size: Option<u64>,
+    handler: F,
+    layer: L,
+}
+
+// Allow private_bounds because these internal types (ResourceHandlerService, FnHandler, etc.)
+// are implementation details that users don't interact with directly.
+#[allow(private_bounds)]
+impl<F, Fut, L> ResourceBuilderWithLayer<F, L>
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<ReadResourceResult>> + Send + 'static,
+    L: tower::Layer<ResourceHandlerService<FnHandler<F>>> + Clone + Send + Sync + 'static,
+    L::Service: Service<ResourceRequest, Response = ReadResourceResult> + Clone + Send + 'static,
+    <L::Service as Service<ResourceRequest>>::Error: fmt::Display + Send,
+    <L::Service as Service<ResourceRequest>>::Future: Send,
+{
+    /// Build the resource with the applied layer(s).
+    pub fn build(self) -> Resource {
+        let name = self.name.unwrap_or_else(|| self.uri.clone());
+
+        let handler_service = ResourceHandlerService::new(FnHandler {
+            handler: self.handler,
+        });
+        let layered = self.layer.layer(handler_service);
+        let catch_error = ResourceCatchError::new(layered);
+        let service = BoxCloneService::new(catch_error);
+
+        Resource {
+            uri: self.uri,
+            name,
+            title: self.title,
+            description: self.description,
+            mime_type: self.mime_type,
+            icons: self.icons,
+            size: self.size,
+            service,
+        }
+    }
+
+    /// Apply an additional Tower layer (middleware).
+    ///
+    /// Layers are applied in order, with earlier layers wrapping later ones.
+    /// This means the first layer added is the outermost middleware.
+    pub fn layer<L2>(
+        self,
+        layer: L2,
+    ) -> ResourceBuilderWithLayer<F, tower::layer::util::Stack<L2, L>> {
+        ResourceBuilderWithLayer {
+            uri: self.uri,
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            mime_type: self.mime_type,
+            icons: self.icons,
+            size: self.size,
+            handler: self.handler,
+            layer: tower::layer::util::Stack::new(layer, self.layer),
+        }
+    }
+}
+
+/// Builder state after context-aware handler is specified.
+pub struct ResourceBuilderWithContextHandler<F> {
+    uri: String,
+    name: Option<String>,
+    title: Option<String>,
+    description: Option<String>,
+    mime_type: Option<String>,
+    icons: Option<Vec<ToolIcon>>,
+    size: Option<u64>,
+    handler: F,
+}
+
+impl<F, Fut> ResourceBuilderWithContextHandler<F>
+where
+    F: Fn(RequestContext) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<ReadResourceResult>> + Send + 'static,
+{
+    /// Build the resource without any middleware layers.
+    pub fn build(self) -> Resource {
+        let name = self.name.unwrap_or_else(|| self.uri.clone());
+
+        Resource::from_handler(
+            self.uri,
+            name,
+            self.title,
+            self.description,
+            self.mime_type,
+            self.icons,
+            self.size,
+            ContextAwareHandler {
+                handler: self.handler,
+            },
+        )
+    }
+
+    /// Apply a Tower layer (middleware) to this resource.
+    ///
+    /// Works the same as [`ResourceBuilderWithHandler::layer`].
+    pub fn layer<L>(self, layer: L) -> ResourceBuilderWithContextLayer<F, L> {
+        ResourceBuilderWithContextLayer {
+            uri: self.uri,
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            mime_type: self.mime_type,
+            icons: self.icons,
+            size: self.size,
+            handler: self.handler,
+            layer,
+        }
+    }
+}
+
+/// Builder state after a layer has been applied to a context-aware handler.
+pub struct ResourceBuilderWithContextLayer<F, L> {
+    uri: String,
+    name: Option<String>,
+    title: Option<String>,
+    description: Option<String>,
+    mime_type: Option<String>,
+    icons: Option<Vec<ToolIcon>>,
+    size: Option<u64>,
+    handler: F,
+    layer: L,
+}
+
+// Allow private_bounds because these internal types are implementation details.
+#[allow(private_bounds)]
+impl<F, Fut, L> ResourceBuilderWithContextLayer<F, L>
+where
+    F: Fn(RequestContext) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<ReadResourceResult>> + Send + 'static,
+    L: tower::Layer<ResourceHandlerService<ContextAwareHandler<F>>> + Clone + Send + Sync + 'static,
+    L::Service: Service<ResourceRequest, Response = ReadResourceResult> + Clone + Send + 'static,
+    <L::Service as Service<ResourceRequest>>::Error: fmt::Display + Send,
+    <L::Service as Service<ResourceRequest>>::Future: Send,
+{
+    /// Build the resource with the applied layer(s).
+    pub fn build(self) -> Resource {
+        let name = self.name.unwrap_or_else(|| self.uri.clone());
+
+        let handler_service = ResourceHandlerService::new(ContextAwareHandler {
+            handler: self.handler,
+        });
+        let layered = self.layer.layer(handler_service);
+        let catch_error = ResourceCatchError::new(layered);
+        let service = BoxCloneService::new(catch_error);
+
+        Resource {
+            uri: self.uri,
+            name,
+            title: self.title,
+            description: self.description,
+            mime_type: self.mime_type,
+            icons: self.icons,
+            size: self.size,
+            service,
+        }
+    }
+
+    /// Apply an additional Tower layer (middleware).
+    pub fn layer<L2>(
+        self,
+        layer: L2,
+    ) -> ResourceBuilderWithContextLayer<F, tower::layer::util::Stack<L2, L>> {
+        ResourceBuilderWithContextLayer {
+            uri: self.uri,
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            mime_type: self.mime_type,
+            icons: self.icons,
+            size: self.size,
+            handler: self.handler,
+            layer: tower::layer::util::Stack::new(layer, self.layer),
+        }
     }
 }
 
@@ -308,6 +884,30 @@ where
 {
     fn read(&self) -> BoxFuture<'_, Result<ReadResourceResult>> {
         Box::pin((self.handler)())
+    }
+}
+
+/// Handler that receives request context
+struct ContextAwareHandler<F> {
+    handler: F,
+}
+
+impl<F, Fut> ResourceHandler for ContextAwareHandler<F>
+where
+    F: Fn(RequestContext) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<ReadResourceResult>> + Send + 'static,
+{
+    fn read(&self) -> BoxFuture<'_, Result<ReadResourceResult>> {
+        let ctx = RequestContext::new(crate::protocol::RequestId::Number(0));
+        self.read_with_context(ctx)
+    }
+
+    fn read_with_context(&self, ctx: RequestContext) -> BoxFuture<'_, Result<ReadResourceResult>> {
+        Box::pin((self.handler)(ctx))
+    }
+
+    fn uses_context(&self) -> bool {
+        true
     }
 }
 
@@ -366,16 +966,16 @@ pub trait McpResource: Send + Sync + 'static {
         Self: Sized,
     {
         let resource = Arc::new(self);
-        Resource {
-            uri: Self::URI.to_string(),
-            name: Self::NAME.to_string(),
-            title: None,
-            description: Self::DESCRIPTION.map(|s| s.to_string()),
-            mime_type: Self::MIME_TYPE.map(|s| s.to_string()),
-            icons: None,
-            size: None,
-            handler: Arc::new(McpResourceHandler { resource }),
-        }
+        Resource::from_handler(
+            Self::URI.to_string(),
+            Self::NAME.to_string(),
+            None,
+            Self::DESCRIPTION.map(|s| s.to_string()),
+            Self::MIME_TYPE.map(|s| s.to_string()),
+            None,
+            None,
+            McpResourceHandler { resource },
+        )
     }
 }
 
@@ -746,6 +1346,8 @@ fn compile_uri_template(template: &str) -> (regex::Regex, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+    use tower::timeout::TimeoutLayer;
 
     #[tokio::test]
     async fn test_builder_resource() {
@@ -758,7 +1360,7 @@ mod tests {
         assert_eq!(resource.name, "Test File");
         assert_eq!(resource.description.as_deref(), Some("A test file"));
 
-        let result = resource.read().await.unwrap();
+        let result = resource.read().await;
         assert_eq!(result.contents.len(), 1);
         assert_eq!(result.contents[0].text.as_deref(), Some("Hello, World!"));
     }
@@ -771,7 +1373,7 @@ mod tests {
 
         assert_eq!(resource.mime_type.as_deref(), Some("application/json"));
 
-        let result = resource.read().await.unwrap();
+        let result = resource.read().await;
         assert!(result.contents[0].text.as_ref().unwrap().contains("key"));
     }
 
@@ -788,10 +1390,105 @@ mod tests {
                         blob: None,
                     }],
                 })
-            });
+            })
+            .build();
 
-        let result = resource.read().await.unwrap();
+        let result = resource.read().await;
         assert_eq!(result.contents[0].text.as_deref(), Some("42"));
+    }
+
+    #[tokio::test]
+    async fn test_handler_resource_with_layer() {
+        let resource = ResourceBuilder::new("file:///with-timeout.txt")
+            .name("Resource with Timeout")
+            .handler(|| async {
+                Ok(ReadResourceResult {
+                    contents: vec![ResourceContent {
+                        uri: "file:///with-timeout.txt".to_string(),
+                        mime_type: Some("text/plain".to_string()),
+                        text: Some("content".to_string()),
+                        blob: None,
+                    }],
+                })
+            })
+            .layer(TimeoutLayer::new(Duration::from_secs(30)))
+            .build();
+
+        let result = resource.read().await;
+        assert_eq!(result.contents[0].text.as_deref(), Some("content"));
+    }
+
+    #[tokio::test]
+    async fn test_handler_resource_with_timeout_error() {
+        let resource = ResourceBuilder::new("file:///slow.txt")
+            .name("Slow Resource")
+            .handler(|| async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Ok(ReadResourceResult {
+                    contents: vec![ResourceContent {
+                        uri: "file:///slow.txt".to_string(),
+                        mime_type: Some("text/plain".to_string()),
+                        text: Some("content".to_string()),
+                        blob: None,
+                    }],
+                })
+            })
+            .layer(TimeoutLayer::new(Duration::from_millis(10)))
+            .build();
+
+        let result = resource.read().await;
+        // Timeout error should be caught and converted to error content
+        assert!(
+            result.contents[0]
+                .text
+                .as_ref()
+                .unwrap()
+                .contains("Error reading resource")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_context_aware_handler() {
+        let resource = ResourceBuilder::new("file:///ctx.txt")
+            .name("Context Resource")
+            .handler_with_context(|_ctx: RequestContext| async {
+                Ok(ReadResourceResult {
+                    contents: vec![ResourceContent {
+                        uri: "file:///ctx.txt".to_string(),
+                        mime_type: Some("text/plain".to_string()),
+                        text: Some("context aware".to_string()),
+                        blob: None,
+                    }],
+                })
+            })
+            .build();
+
+        let result = resource.read().await;
+        assert_eq!(result.contents[0].text.as_deref(), Some("context aware"));
+    }
+
+    #[tokio::test]
+    async fn test_context_aware_handler_with_layer() {
+        let resource = ResourceBuilder::new("file:///ctx-layer.txt")
+            .name("Context Resource with Layer")
+            .handler_with_context(|_ctx: RequestContext| async {
+                Ok(ReadResourceResult {
+                    contents: vec![ResourceContent {
+                        uri: "file:///ctx-layer.txt".to_string(),
+                        mime_type: Some("text/plain".to_string()),
+                        text: Some("context with layer".to_string()),
+                        blob: None,
+                    }],
+                })
+            })
+            .layer(TimeoutLayer::new(Duration::from_secs(30)))
+            .build();
+
+        let result = resource.read().await;
+        assert_eq!(
+            result.contents[0].text.as_deref(),
+            Some("context with layer")
+        );
     }
 
     #[tokio::test]
@@ -820,7 +1517,7 @@ mod tests {
         assert_eq!(resource.uri, "test://resource");
         assert_eq!(resource.name, "Test");
 
-        let result = resource.read().await.unwrap();
+        let result = resource.read().await;
         assert_eq!(result.contents[0].text.as_deref(), Some("test content"));
     }
 
@@ -837,6 +1534,34 @@ mod tests {
         assert_eq!(def.name, "Test");
         assert_eq!(def.description.as_deref(), Some("Description"));
         assert_eq!(def.mime_type.as_deref(), Some("text/plain"));
+    }
+
+    #[test]
+    fn test_resource_request_new() {
+        let ctx = RequestContext::new(crate::protocol::RequestId::Number(1));
+        let req = ResourceRequest::new(ctx, "file:///test.txt".to_string());
+        assert_eq!(req.uri, "file:///test.txt");
+    }
+
+    #[test]
+    fn test_resource_catch_error_clone() {
+        let handler = FnHandler {
+            handler: || async { Ok::<_, Error>(ReadResourceResult { contents: vec![] }) },
+        };
+        let service = ResourceHandlerService::new(handler);
+        let catch_error = ResourceCatchError::new(service);
+        let _clone = catch_error.clone();
+    }
+
+    #[test]
+    fn test_resource_catch_error_debug() {
+        let handler = FnHandler {
+            handler: || async { Ok::<_, Error>(ReadResourceResult { contents: vec![] }) },
+        };
+        let service = ResourceHandlerService::new(handler);
+        let catch_error = ResourceCatchError::new(service);
+        let debug = format!("{:?}", catch_error);
+        assert!(debug.contains("ResourceCatchError"));
     }
 
     // =========================================================================

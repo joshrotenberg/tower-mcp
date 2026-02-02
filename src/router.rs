@@ -875,7 +875,7 @@ impl McpRouter {
                     }
 
                     tracing::debug!(uri = %params.uri, "Reading static resource");
-                    let result = resource.read().await?;
+                    let result = resource.read().await;
                     return Ok(McpResponse::ReadResource(result));
                 }
 

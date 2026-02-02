@@ -46,6 +46,7 @@ fn build_static_binary() -> Resource {
                 })
             }
         })
+        .build()
 }
 
 fn build_embedded_resource() -> Resource {
