@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+## [0.3.5] - 2026-02-03
+
+### Bug Fixes
+
+- Increase timeout test margins for CI reliability ([#341](https://github.com/joshrotenberg/tower-mcp/pull/341))
+
+### Documentation
+
+- Add advanced features section for sampling, elicitation, progress, composition ([#342](https://github.com/joshrotenberg/tower-mcp/pull/342))
+
+### Features
+
+- Add API convenience methods ([#335](https://github.com/joshrotenberg/tower-mcp/pull/335))
+- **codegen-mcp:** Add component builder workflow for incremental tool construction ([#338](https://github.com/joshrotenberg/tower-mcp/pull/338))
+
+
+
 ## [0.3.4] - 2026-02-03
 
 ### Features
