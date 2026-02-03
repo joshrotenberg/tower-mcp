@@ -14,8 +14,8 @@ name = "integration"
 path = "tests/integration.rs"
 
 [dependencies]
-# Core MCP
-tower-mcp = { version = "0.3.3", features = ["http"] }
+# Core MCP (use path for development, version for release)
+tower-mcp = { path = "../..", features = ["http"] }
 
 # Crates.io API client
 crates_io_api = "0.12"
@@ -39,4 +39,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Tower middleware
 tower = { version = "0.5", features = ["util", "timeout", "limit"] }
-tower-resilience = { version = "0.7", default-features = false, features = ["bulkhead", "ratelimiter"] }
+tower-resilience = { version = "0.7", default-features = false, features = ["bulkhead", "ratelimiter", "cache"] }

@@ -13,9 +13,13 @@ use std::time::Duration;
 use clap::{Parser, ValueEnum};
 use tower::ServiceBuilder;
 use tower::timeout::TimeoutLayer;
-use tower_mcp::protocol::{CompleteParams, CompleteResult, Completion, CompletionReference};
+use tower_mcp::protocol::{
+    CallToolParams, CompleteParams, CompleteResult, Completion, CompletionReference, McpRequest,
+};
+use tower_mcp::router::RouterRequest;
 use tower_mcp::{HttpTransport, McpRouter, McpTracingLayer, StdioTransport};
 use tower_resilience::bulkhead::BulkheadLayer;
+use tower_resilience::cache::CacheLayer;
 use tower_resilience::ratelimiter::RateLimiterLayer;
 
 use crate::state::AppState;
@@ -63,6 +67,18 @@ struct Args {
     /// See: https://github.com/anthropics/claude-code/issues/2682
     #[arg(long, default_value = "false")]
     minimal: bool,
+
+    /// Enable response caching for tool calls (HTTP transport only)
+    #[arg(long, default_value = "true")]
+    cache_enabled: bool,
+
+    /// Cache TTL in seconds (how long cached responses are valid)
+    #[arg(long, default_value = "300")]
+    cache_ttl_secs: u64,
+
+    /// Maximum number of cached responses
+    #[arg(long, default_value = "200")]
+    cache_max_size: usize,
 }
 
 #[tokio::main]
@@ -258,13 +274,20 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         }
         Transport::Http => {
             let addr = format!("{}:{}", args.host, args.port);
-            tracing::info!(%addr, "Serving over HTTP");
+            tracing::info!(
+                %addr,
+                cache_enabled = args.cache_enabled,
+                cache_ttl_secs = args.cache_ttl_secs,
+                cache_max_size = args.cache_max_size,
+                "Serving over HTTP"
+            );
 
             // Build tower middleware stack for request protection:
             //
             // 1. TimeoutLayer - Request timeout protection
             // 2. RateLimiterLayer - Limits requests per second (token bucket)
             // 3. BulkheadLayer - Limits concurrent in-flight requests
+            // 4. CacheLayer - Response caching for tool calls (optional)
             //
             // These layers compose naturally with tower-mcp's Service implementation.
             // The HTTP transport's CatchError wrapper converts middleware errors
@@ -288,21 +311,55 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
                 .max_wait_duration(Duration::from_millis(500))
                 .build();
 
-            let transport = HttpTransport::new(router)
-                .disable_origin_validation() // Allow any origin for public demo
-                .layer(
-                    ServiceBuilder::new()
-                        // Outer layers (applied first on request, last on response)
-                        .layer(TimeoutLayer::new(Duration::from_secs(
-                            args.request_timeout_secs,
-                        )))
-                        .layer(rate_limiter)
-                        .layer(bulkhead)
-                        // McpTracingLayer is innermost - logs MCP requests with structured tracing
-                        // Must be closest to router since it requires Error = Infallible
-                        .layer(McpTracingLayer::new())
-                        .into_inner(),
-                );
+            // Response caching for tool calls.
+            // The key extractor creates cache keys only for tool calls (tools/call).
+            // Other MCP methods (list_tools, initialize, ping) get unique keys
+            // that never match, effectively bypassing the cache.
+            let cache = CacheLayer::builder()
+                .max_size(args.cache_max_size)
+                .ttl(Duration::from_secs(args.cache_ttl_secs))
+                .key_extractor(|req: &RouterRequest| -> String {
+                    // Only cache tool calls - create deterministic key from tool name + args
+                    match &req.inner {
+                        McpRequest::CallTool(CallToolParams {
+                            name, arguments, ..
+                        }) => {
+                            // Serialize arguments to create stable cache key
+                            let args_str = serde_json::to_string(arguments).unwrap_or_default();
+                            format!("tool:{}:{}", name, args_str)
+                        }
+                        // For all other requests, use unique key based on request ID
+                        // This ensures they're never cached (each request ID is unique)
+                        _ => format!("nocache:{:?}", req.id),
+                    }
+                })
+                .on_hit(|| tracing::debug!("Cache hit"))
+                .on_miss(|| tracing::debug!("Cache miss"))
+                .build();
+
+            let builder = ServiceBuilder::new()
+                // Outer layers (applied first on request, last on response)
+                .layer(TimeoutLayer::new(Duration::from_secs(
+                    args.request_timeout_secs,
+                )))
+                .layer(rate_limiter)
+                .layer(bulkhead);
+
+            // Conditionally add cache layer
+            let transport = if args.cache_enabled {
+                HttpTransport::new(router)
+                    .disable_origin_validation()
+                    .layer(
+                        builder
+                            .layer(cache)
+                            .layer(McpTracingLayer::new())
+                            .into_inner(),
+                    )
+            } else {
+                HttpTransport::new(router)
+                    .disable_origin_validation()
+                    .layer(builder.layer(McpTracingLayer::new()).into_inner())
+            };
 
             transport.serve(&addr).await?;
         }
