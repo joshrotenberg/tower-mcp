@@ -402,9 +402,13 @@ async fn handle_socket(
     state: Arc<AppState>,
     mcp_extensions: crate::router::Extensions,
 ) {
+    // Use with_fresh_session() to ensure each session has its own state
     let session = state
         .sessions
-        .create(state.router_template.clone(), state.service_factory.clone())
+        .create(
+            state.router_template.with_fresh_session(),
+            state.service_factory.clone(),
+        )
         .await;
     let session_id = session.id.clone();
 
