@@ -263,6 +263,7 @@ pub mod session;
 #[cfg(feature = "testing")]
 pub mod testing;
 pub mod tool;
+pub mod tracing_layer;
 pub mod transport;
 
 // Re-exports
@@ -299,6 +300,7 @@ pub use resource::{
 pub use router::{McpRouter, RouterRequest, RouterResponse};
 pub use session::{SessionPhase, SessionState};
 pub use tool::{BoxToolService, NoParams, Tool, ToolBuilder, ToolHandler, ToolRequest};
+pub use tracing_layer::{McpTracingLayer, McpTracingService};
 pub use transport::{
     BidirectionalStdioTransport, CatchError, GenericStdioTransport, StdioTransport,
     SyncStdioTransport,
