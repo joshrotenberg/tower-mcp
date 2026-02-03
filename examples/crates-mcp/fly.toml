@@ -13,8 +13,14 @@ primary_region = "sjc"
   force_https = true
   auto_stop_machines = "suspend"
   auto_start_machines = true
+  # MCP HTTP sessions are stored in-memory, so we need exactly 1 instance
+  # For multi-instance deployments, use sticky sessions or external session store
   min_machines_running = 1
   processes = ["app"]
+  [http_service.concurrency]
+    type = "requests"
+    hard_limit = 100
+    soft_limit = 80
 
 [[vm]]
   memory = "256mb"
