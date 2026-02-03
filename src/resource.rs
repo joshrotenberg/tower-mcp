@@ -1423,7 +1423,8 @@ mod tests {
         let resource = ResourceBuilder::new("file:///slow.txt")
             .name("Slow Resource")
             .handler(|| async {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                // Sleep much longer than timeout to ensure timeout fires reliably in CI
+                tokio::time::sleep(Duration::from_secs(1)).await;
                 Ok(ReadResourceResult {
                     contents: vec![ResourceContent {
                         uri: "file:///slow.txt".to_string(),
@@ -1433,7 +1434,7 @@ mod tests {
                     }],
                 })
             })
-            .layer(TimeoutLayer::new(Duration::from_millis(10)))
+            .layer(TimeoutLayer::new(Duration::from_millis(50)))
             .build();
 
         let result = resource.read().await;

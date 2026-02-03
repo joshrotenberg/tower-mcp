@@ -12,8 +12,8 @@ publish = false
 tower-mcp = { path = "../..", features = ["http"] }
 
 # Markdown linting
-mdbook-lint-core = "0.13"
-mdbook-lint-rulesets = "0.13"
+mdbook-lint-core = "0.14"
+mdbook-lint-rulesets = "0.14"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
