@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+## [0.3.4] - 2026-02-03
+
+### Features
+
+- Add Clone to RouterRequest, RouterResponse, and Tool ([#325](https://github.com/joshrotenberg/tower-mcp/pull/325))
+- **crates-mcp:** Add response caching with tower-resilience-cache ([#327](https://github.com/joshrotenberg/tower-mcp/pull/327))
+
+
+
 ## [0.3.3] - 2026-02-03
 
 ### Bug Fixes
