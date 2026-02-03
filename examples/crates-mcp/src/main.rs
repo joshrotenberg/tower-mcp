@@ -16,10 +16,10 @@ use tower::timeout::TimeoutLayer;
 use tower_mcp::protocol::{
     CallToolParams, CompleteParams, CompleteResult, Completion, CompletionReference, McpRequest,
 };
-use tower_mcp::router::RouterRequest;
+use tower_mcp::router::{RouterRequest, RouterResponse};
 use tower_mcp::{HttpTransport, McpRouter, McpTracingLayer, StdioTransport};
 use tower_resilience::bulkhead::BulkheadLayer;
-use tower_resilience::cache::CacheLayer;
+use tower_resilience::cache::SharedCacheLayer;
 use tower_resilience::ratelimiter::RateLimiterLayer;
 
 use crate::state::AppState;
@@ -311,31 +311,34 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
                 .max_wait_duration(Duration::from_millis(500))
                 .build();
 
-            // Response caching for tool calls.
+            // Response caching for tool calls using SharedCacheLayer.
+            // SharedCacheLayer shares the cache store across all layer() calls,
+            // so all HTTP sessions share the same cache (unlike regular CacheLayer).
             // The key extractor creates cache keys only for tool calls (tools/call).
             // Other MCP methods (list_tools, initialize, ping) get unique keys
             // that never match, effectively bypassing the cache.
-            let cache = CacheLayer::builder()
-                .max_size(args.cache_max_size)
-                .ttl(Duration::from_secs(args.cache_ttl_secs))
-                .key_extractor(|req: &RouterRequest| -> String {
-                    // Only cache tool calls - create deterministic key from tool name + args
-                    match &req.inner {
-                        McpRequest::CallTool(CallToolParams {
-                            name, arguments, ..
-                        }) => {
-                            // Serialize arguments to create stable cache key
-                            let args_str = serde_json::to_string(arguments).unwrap_or_default();
-                            format!("tool:{}:{}", name, args_str)
+            let cache: SharedCacheLayer<RouterRequest, String, RouterResponse> =
+                SharedCacheLayer::builder()
+                    .max_size(args.cache_max_size)
+                    .ttl(Duration::from_secs(args.cache_ttl_secs))
+                    .key_extractor(|req: &RouterRequest| -> String {
+                        // Only cache tool calls - create deterministic key from tool name + args
+                        match &req.inner {
+                            McpRequest::CallTool(CallToolParams {
+                                name, arguments, ..
+                            }) => {
+                                // Serialize arguments to create stable cache key
+                                let args_str = serde_json::to_string(arguments).unwrap_or_default();
+                                format!("tool:{}:{}", name, args_str)
+                            }
+                            // For all other requests, use unique key based on request ID
+                            // This ensures they're never cached (each request ID is unique)
+                            _ => format!("nocache:{:?}", req.id),
                         }
-                        // For all other requests, use unique key based on request ID
-                        // This ensures they're never cached (each request ID is unique)
-                        _ => format!("nocache:{:?}", req.id),
-                    }
-                })
-                .on_hit(|| tracing::debug!("Cache hit"))
-                .on_miss(|| tracing::debug!("Cache miss"))
-                .build();
+                    })
+                    .on_hit(|| tracing::debug!("Cache hit"))
+                    .on_miss(|| tracing::debug!("Cache miss"))
+                    .build();
 
             let builder = ServiceBuilder::new()
                 // Outer layers (applied first on request, last on response)

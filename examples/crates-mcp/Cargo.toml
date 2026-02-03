@@ -39,4 +39,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Tower middleware
 tower = { version = "0.5", features = ["util", "timeout", "limit"] }
-tower-resilience = { version = "0.7", default-features = false, features = ["bulkhead", "ratelimiter", "cache"] }
+# 0.7.1 adds SharedCacheLayer for cross-session cache sharing
+tower-resilience = { version = "0.7.1", default-features = false, features = ["bulkhead", "ratelimiter", "cache"] }
