@@ -14,7 +14,7 @@ use clap::{Parser, ValueEnum};
 use tower::ServiceBuilder;
 use tower::timeout::TimeoutLayer;
 use tower_mcp::protocol::{CompleteParams, CompleteResult, Completion, CompletionReference};
-use tower_mcp::{HttpTransport, McpRouter, StdioTransport};
+use tower_mcp::{HttpTransport, McpRouter, McpTracingLayer, StdioTransport};
 use tower_resilience::bulkhead::BulkheadLayer;
 use tower_resilience::ratelimiter::RateLimiterLayer;
 
@@ -292,11 +292,15 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
                 .disable_origin_validation() // Allow any origin for public demo
                 .layer(
                     ServiceBuilder::new()
+                        // Outer layers (applied first on request, last on response)
                         .layer(TimeoutLayer::new(Duration::from_secs(
                             args.request_timeout_secs,
                         )))
                         .layer(rate_limiter)
                         .layer(bulkhead)
+                        // McpTracingLayer is innermost - logs MCP requests with structured tracing
+                        // Must be closest to router since it requires Error = Infallible
+                        .layer(McpTracingLayer::new())
                         .into_inner(),
                 );
 
