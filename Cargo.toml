@@ -69,6 +69,8 @@ oauth = ["dep:jsonwebtoken", "http"]
 jwks = ["oauth", "dep:reqwest"]
 # Test utilities for MCP servers
 testing = []
+# SEP-1442 stateless mode (experimental)
+stateless = []
 
 [dependencies.axum]
 version = "0.8"

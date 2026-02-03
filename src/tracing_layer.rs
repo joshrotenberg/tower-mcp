@@ -222,6 +222,10 @@ fn extract_operation_details(req: &McpRequest) -> (Option<&'static str>, Option<
         }
         McpRequest::Initialize(_) => (Some("init"), None),
         McpRequest::Ping => (Some("ping"), None),
+        #[cfg(feature = "stateless")]
+        McpRequest::Discover => (Some("discover"), None),
+        #[cfg(feature = "stateless")]
+        McpRequest::MessagesListen(_) => (Some("messages_listen"), None),
         McpRequest::Unknown { method, .. } => (Some("unknown"), Some(method.clone())),
     }
 }

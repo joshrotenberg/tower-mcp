@@ -495,6 +495,9 @@ struct AppState {
     allowed_origins: Vec<String>,
     /// Whether sampling is enabled
     sampling_enabled: bool,
+    /// SEP-1442 stateless mode configuration
+    #[cfg(feature = "stateless")]
+    stateless_config: Option<crate::stateless::StatelessConfig>,
 }
 
 /// Configuration for OAuth 2.1 Protected Resource Metadata.
@@ -521,6 +524,8 @@ pub struct HttpTransport {
     service_factory: ServiceFactory,
     #[cfg(feature = "oauth")]
     oauth_config: Option<OAuthConfig>,
+    #[cfg(feature = "stateless")]
+    stateless_config: Option<crate::stateless::StatelessConfig>,
 }
 
 impl HttpTransport {
@@ -535,6 +540,8 @@ impl HttpTransport {
             service_factory: identity_factory(),
             #[cfg(feature = "oauth")]
             oauth_config: None,
+            #[cfg(feature = "stateless")]
+            stateless_config: None,
         }
     }
 
@@ -635,6 +642,30 @@ impl HttpTransport {
         self
     }
 
+    /// Enable SEP-1442 stateless mode.
+    ///
+    /// In stateless mode:
+    /// - `server/discover` RPC is available before initialization
+    /// - Protocol version is validated on each request
+    /// - Sessions become optional (depending on configuration)
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use tower_mcp::stateless::StatelessConfig;
+    /// use tower_mcp::transport::http::HttpTransport;
+    /// use tower_mcp::McpRouter;
+    ///
+    /// let router = McpRouter::new().server_info("my-server", "1.0.0");
+    /// let transport = HttpTransport::new(router)
+    ///     .stateless(StatelessConfig::new());
+    /// ```
+    #[cfg(feature = "stateless")]
+    pub fn stateless(mut self, config: crate::stateless::StatelessConfig) -> Self {
+        self.stateless_config = Some(config);
+        self
+    }
+
     /// Apply a tower middleware layer to MCP request processing.
     ///
     /// The layer is applied to the [`McpRouter`] service within each session,
@@ -704,6 +735,8 @@ impl HttpTransport {
             validate_origin: self.validate_origin,
             allowed_origins: self.allowed_origins.clone(),
             sampling_enabled: self.sampling_enabled,
+            #[cfg(feature = "stateless")]
+            stateless_config: self.stateless_config.clone(),
         })
     }
 
@@ -941,11 +974,130 @@ async fn handle_post(
         }
     };
 
+    // SEP-1442: Validate protocol version if stateless mode requires it
+    #[cfg(feature = "stateless")]
+    if let Some(ref config) = state.stateless_config {
+        if config.require_protocol_version {
+            let protocol_version = get_protocol_version(&headers);
+            if let Some(version) = protocol_version {
+                if !crate::protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&version.as_str()) {
+                    let error_data = crate::stateless::UnsupportedVersionData {
+                        supported_versions: crate::protocol::SUPPORTED_PROTOCOL_VERSIONS
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect(),
+                    };
+                    return json_rpc_error_response(
+                        extract_request_id(&parsed),
+                        JsonRpcError {
+                            code: crate::stateless::error_codes::UNSUPPORTED_VERSION,
+                            message: "Unsupported protocol version".to_string(),
+                            data: Some(serde_json::to_value(error_data).unwrap()),
+                        },
+                    );
+                }
+            } else {
+                // Protocol version header is required but missing
+                return json_rpc_error_response(
+                    extract_request_id(&parsed),
+                    JsonRpcError::invalid_request(format!(
+                        "Missing required header: {}",
+                        MCP_PROTOCOL_VERSION_HEADER
+                    )),
+                );
+            }
+        }
+    }
+
     // Check if this is an initialize request (creates new session)
     let is_init = is_initialize_request(&parsed);
 
+    // SEP-1442: Handle server/discover directly without creating a session
+    #[cfg(feature = "stateless")]
+    {
+        let is_discover = parsed
+            .get("method")
+            .and_then(|m| m.as_str())
+            .map(|m| m == "server/discover")
+            .unwrap_or(false);
+
+        if is_discover {
+            // Handle discover without session - use the template router directly
+            let request_id = extract_request_id(&parsed);
+            let discover_result = crate::stateless::DiscoverResult {
+                supported_versions: crate::protocol::SUPPORTED_PROTOCOL_VERSIONS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                capabilities: state.router_template.capabilities(),
+                server_info: crate::protocol::Implementation {
+                    name: state.router_template.get_server_name().to_string(),
+                    version: state.router_template.get_server_version().to_string(),
+                    title: state
+                        .router_template
+                        .get_server_title()
+                        .map(|s| s.to_string()),
+                    description: state
+                        .router_template
+                        .get_server_description()
+                        .map(|s| s.to_string()),
+                    icons: state.router_template.get_server_icons().cloned(),
+                    website_url: state
+                        .router_template
+                        .get_server_website_url()
+                        .map(|s| s.to_string()),
+                },
+                instructions: state
+                    .router_template
+                    .get_instructions()
+                    .map(|s| s.to_string()),
+            };
+
+            let response = JsonRpcResponse::result(
+                request_id.unwrap_or(RequestId::Number(0)),
+                serde_json::to_value(discover_result).unwrap(),
+            );
+
+            return (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::to_string(&response).unwrap(),
+            )
+                .into_response();
+        }
+
+        // SEP-1442: Handle messages/listen - returns SSE stream via POST
+        let is_messages_listen = parsed
+            .get("method")
+            .and_then(|m| m.as_str())
+            .map(|m| m == "messages/listen")
+            .unwrap_or(false);
+
+        if is_messages_listen {
+            if let Some(ref config) = state.stateless_config {
+                if config.enable_messages_listen {
+                    return handle_messages_listen(State(state.clone()), headers, &parsed).await;
+                }
+            }
+        }
+    }
+
+    // SEP-1442: Check if optional sessions are enabled
+    #[cfg(feature = "stateless")]
+    let optional_sessions = state
+        .stateless_config
+        .as_ref()
+        .map(|c| c.optional_sessions)
+        .unwrap_or(false);
+    #[cfg(not(feature = "stateless"))]
+    let optional_sessions = false;
+
+    // Track if this is an ephemeral (sessionless) request
+    let is_ephemeral;
+
     // Get or create session
     let session = if is_init {
+        is_ephemeral = false;
         // Create new session for initialize
         // Use with_fresh_session() to ensure each session has its own state
         match state
@@ -966,23 +1118,50 @@ async fn handle_post(
             }
         }
     } else {
-        // Require existing session
-        let session_id = match get_session_id(&headers) {
-            Some(id) => id,
-            None => {
-                // Return JSON-RPC error so clients can detect and handle this
-                return json_rpc_error_response(None, JsonRpcError::session_required());
-            }
-        };
+        // Try to get existing session
+        let session_id = get_session_id(&headers);
 
-        match state.sessions.get(&session_id).await {
-            Some(s) => s,
+        match session_id {
+            Some(id) => {
+                is_ephemeral = false;
+                match state.sessions.get(&id).await {
+                    Some(s) => s,
+                    None => {
+                        // Return JSON-RPC error with session info so clients know to re-initialize
+                        return json_rpc_error_response(
+                            None,
+                            JsonRpcError::session_not_found_with_id(&id),
+                        );
+                    }
+                }
+            }
             None => {
-                // Return JSON-RPC error with session info so clients know to re-initialize
-                return json_rpc_error_response(
-                    None,
-                    JsonRpcError::session_not_found_with_id(&session_id),
-                );
+                if optional_sessions {
+                    // SEP-1442: Create ephemeral session for stateless request
+                    is_ephemeral = true;
+                    match state
+                        .sessions
+                        .create(state.router_template.clone(), state.service_factory.clone())
+                        .await
+                    {
+                        Some(s) => {
+                            // Mark session as initialized for stateless requests
+                            s.router.session().mark_initializing();
+                            s.router.session().mark_initialized();
+                            s
+                        }
+                        None => {
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "Maximum session limit reached",
+                            )
+                                .into_response();
+                        }
+                    }
+                } else {
+                    // Return JSON-RPC error so clients can detect and handle this
+                    return json_rpc_error_response(None, JsonRpcError::session_required());
+                }
             }
         }
     };
@@ -1071,14 +1250,19 @@ async fn handle_post(
         }
     };
 
-    // Build response with session ID header for initialize
+    // Build response with session ID header for initialize (not for ephemeral sessions)
     let mut resp = axum::Json(response).into_response();
 
-    if is_init {
+    if is_init && !is_ephemeral {
         resp.headers_mut().insert(
             MCP_SESSION_ID_HEADER,
             HeaderValue::from_str(&session.id).unwrap(),
         );
+    }
+
+    // SEP-1442: Clean up ephemeral session after request
+    if is_ephemeral {
+        state.sessions.remove(&session.id).await;
     }
 
     resp
@@ -1331,6 +1515,150 @@ async fn handle_get_bidirectional(session: Arc<Session>, last_event_id: Option<u
 
     // Convert the receiver into a stream
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+
+    Sse::new(stream)
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(Duration::from_secs(30))
+                .text("ping"),
+        )
+        .into_response()
+}
+
+/// Handle messages/listen RPC - opens SSE stream for server notifications (SEP-1442)
+///
+/// This is called via POST but returns an SSE stream. The flow is:
+/// 1. Client sends POST with `messages/listen` JSON-RPC request
+/// 2. Server returns SSE stream with first event being the response
+/// 3. Subsequent events are server notifications (progress, log, etc.)
+#[cfg(feature = "stateless")]
+async fn handle_messages_listen(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    parsed: &serde_json::Value,
+) -> Response {
+    use axum::response::sse::Event;
+    use std::convert::Infallible;
+    use tokio_stream::StreamExt;
+    use tokio_stream::wrappers::BroadcastStream;
+
+    let request_id = extract_request_id(parsed);
+
+    // Try to get session ID from header or request _meta
+    let session_id = get_session_id(&headers).or_else(|| {
+        parsed
+            .get("params")
+            .and_then(|p| p.get("_meta"))
+            .and_then(|m| m.get("modelcontextprotocol.io/sessionId"))
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string())
+    });
+
+    // Check if optional sessions are enabled
+    let optional_sessions = state
+        .stateless_config
+        .as_ref()
+        .map(|c| c.optional_sessions)
+        .unwrap_or(false);
+
+    // Get or create session
+    let (session, is_ephemeral) = if let Some(id) = session_id {
+        match state.sessions.get(&id).await {
+            Some(s) => (s, false),
+            None => {
+                return json_rpc_error_response(
+                    request_id,
+                    JsonRpcError::session_not_found_with_id(&id),
+                );
+            }
+        }
+    } else if optional_sessions {
+        // Create ephemeral session for stateless mode
+        match state
+            .sessions
+            .create(state.router_template.clone(), state.service_factory.clone())
+            .await
+        {
+            Some(s) => {
+                // Mark session as initialized for stateless requests
+                s.router.session().mark_initializing();
+                s.router.session().mark_initialized();
+                (s, true)
+            }
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Maximum session limit reached",
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        return json_rpc_error_response(request_id, JsonRpcError::session_required());
+    };
+
+    // Subscribe to session notifications
+    let notification_rx = session.notifications_tx.subscribe();
+
+    // Build the first event: messages/listen response
+    let listen_notification = crate::stateless::MessagesListenNotification {};
+    let response = JsonRpcResponse::result(
+        request_id.unwrap_or(RequestId::Number(0)),
+        serde_json::to_value(listen_notification).unwrap(),
+    );
+    let first_event_data = serde_json::to_string(&response).unwrap();
+
+    let session_clone = session.clone();
+    let session_id_for_cleanup = if is_ephemeral {
+        Some(session.id.clone())
+    } else {
+        None
+    };
+    let state_for_cleanup = state.clone();
+
+    // Build the SSE stream
+    let first_event_id = session.next_event_id();
+    let first_event = std::iter::once(Ok::<_, Infallible>(
+        Event::default()
+            .id(first_event_id.to_string())
+            .event(SSE_MESSAGE_EVENT)
+            .data(first_event_data),
+    ));
+
+    // Create live stream for notifications
+    let live_stream = BroadcastStream::new(notification_rx)
+        .then(move |result: std::result::Result<String, _>| {
+            let session = session_clone.clone();
+            async move {
+                match result {
+                    Ok(msg) => {
+                        let event_id = session.next_event_id();
+                        session.buffer_event(event_id, msg.clone()).await;
+                        Some(Ok::<_, Infallible>(
+                            Event::default()
+                                .id(event_id.to_string())
+                                .event(SSE_MESSAGE_EVENT)
+                                .data(msg),
+                        ))
+                    }
+                    Err(_) => None,
+                }
+            }
+        })
+        .filter_map(|x| x);
+
+    // Wrap the stream to handle cleanup on disconnect
+    let stream = tokio_stream::iter(first_event).chain(live_stream);
+
+    // Spawn cleanup task if ephemeral (runs when stream ends)
+    if let Some(session_id) = session_id_for_cleanup {
+        let state = state_for_cleanup;
+        tokio::spawn(async move {
+            // Wait a bit for the stream to finish
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            state.sessions.remove(&session_id).await;
+        });
+    }
 
     Sse::new(stream)
         .keep_alive(
@@ -1903,5 +2231,245 @@ mod tests {
         let events = session.get_events_after(0).await;
         // Events after 0 should be 1-9 (9 events)
         assert_eq!(events.len(), 9);
+    }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn test_stateless_server_discover() {
+        // SEP-1442: server/discover should work without session
+        let transport = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .stateless(crate::stateless::StatelessConfig::backward_compatible());
+        let app = transport.into_router();
+
+        // Call server/discover without session - should work
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "server/discover"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Should get a successful result with server capabilities
+        assert!(
+            json.get("result").is_some(),
+            "Expected result, got: {:?}",
+            json
+        );
+        let result = &json["result"];
+        assert!(result["supportedVersions"].is_array());
+        assert_eq!(result["serverInfo"]["name"], "test-server");
+    }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn test_stateless_protocol_version_validation() {
+        // SEP-1442: Protocol version validation when required
+        let transport = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .stateless(crate::stateless::StatelessConfig::new()); // requires protocol version
+        let app = transport.into_router();
+
+        // Request without protocol version header should fail
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "server/discover"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Should get error about missing header
+        assert!(
+            json.get("error").is_some(),
+            "Expected error, got: {:?}",
+            json
+        );
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Missing required header")
+        );
+    }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn test_stateless_unsupported_version() {
+        // SEP-1442: Unsupported protocol version returns supportedVersions
+        let transport = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .stateless(crate::stateless::StatelessConfig::new());
+        let app = transport.into_router();
+
+        // Request with unsupported version
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header(MCP_PROTOCOL_VERSION_HEADER, "1999-01-01") // invalid version
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "server/discover"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Should get error with supportedVersions
+        assert!(
+            json.get("error").is_some(),
+            "Expected error, got: {:?}",
+            json
+        );
+        assert_eq!(
+            json["error"]["code"],
+            crate::stateless::error_codes::UNSUPPORTED_VERSION
+        );
+        assert!(json["error"]["data"]["supportedVersions"].is_array());
+    }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn test_stateless_optional_sessions() {
+        // SEP-1442: Requests without session should work with optional_sessions
+        use crate::tool::ToolBuilder;
+
+        let tool = ToolBuilder::new("ping")
+            .description("Simple ping tool")
+            .handler(|_: serde_json::Value| async { Ok(crate::CallToolResult::text("pong")) })
+            .build()
+            .unwrap();
+
+        let router = McpRouter::new()
+            .server_info("test-server", "1.0.0")
+            .tool(tool);
+
+        let transport = HttpTransport::new(router)
+            .disable_origin_validation()
+            .stateless(crate::stateless::StatelessConfig::backward_compatible());
+        let app = transport.into_router();
+
+        // Call tools/list without session - should work with optional sessions
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Should NOT have session ID header (ephemeral session)
+        assert!(
+            response.headers().get(MCP_SESSION_ID_HEADER).is_none(),
+            "Ephemeral request should not return session ID"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Should get successful result with tools
+        assert!(
+            json.get("result").is_some(),
+            "Expected result, got: {:?}",
+            json
+        );
+        let tools = &json["result"]["tools"];
+        assert!(tools.is_array());
+        assert_eq!(tools.as_array().unwrap().len(), 1);
+        assert_eq!(tools[0]["name"], "ping");
+    }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn test_stateless_messages_listen() {
+        // SEP-1442: messages/listen returns an SSE stream
+
+        let router = McpRouter::new().server_info("test-server", "1.0.0");
+
+        let mut config = crate::stateless::StatelessConfig::backward_compatible();
+        config.enable_messages_listen = true;
+
+        let transport = HttpTransport::new(router)
+            .disable_origin_validation()
+            .stateless(config);
+        let app = transport.into_router();
+
+        // Call messages/listen without session (should create ephemeral)
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "messages/listen"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        // Should return SSE stream (text/event-stream)
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .map(|v| v.to_str().unwrap_or(""));
+        assert!(
+            content_type
+                .map(|ct| ct.contains("text/event-stream"))
+                .unwrap_or(false),
+            "Expected text/event-stream, got: {:?}",
+            content_type
+        );
     }
 }

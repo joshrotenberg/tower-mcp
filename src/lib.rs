@@ -260,6 +260,8 @@ pub mod protocol;
 pub mod resource;
 pub mod router;
 pub mod session;
+#[cfg(feature = "stateless")]
+pub mod stateless;
 #[cfg(feature = "testing")]
 pub mod testing;
 pub mod tool;

@@ -369,6 +369,12 @@ pub enum McpRequest {
     SetLoggingLevel(SetLogLevelParams),
     /// Request completion suggestions
     Complete(CompleteParams),
+    /// Server discovery (SEP-1442 stateless mode)
+    #[cfg(feature = "stateless")]
+    Discover,
+    /// Messages listen - opens SSE stream for notifications (SEP-1442 stateless mode)
+    #[cfg(feature = "stateless")]
+    MessagesListen(crate::stateless::MessagesListenParams),
     /// Unknown method
     Unknown {
         method: String,
@@ -398,6 +404,10 @@ impl McpRequest {
             McpRequest::Ping => "ping",
             McpRequest::SetLoggingLevel(_) => "logging/setLevel",
             McpRequest::Complete(_) => "completion/complete",
+            #[cfg(feature = "stateless")]
+            McpRequest::Discover => "server/discover",
+            #[cfg(feature = "stateless")]
+            McpRequest::MessagesListen(_) => "messages/listen",
             McpRequest::Unknown { method, .. } => method,
         }
     }
@@ -487,6 +497,13 @@ pub enum McpResponse {
     SetLoggingLevel(EmptyResult),
     Complete(CompleteResult),
     Pong(EmptyResult),
+    /// Server discovery result (SEP-1442 stateless mode)
+    #[cfg(feature = "stateless")]
+    Discover(crate::stateless::DiscoverResult),
+    /// Messages listen result - indicates SSE stream is ready (SEP-1442 stateless mode)
+    /// Note: The actual response is handled specially by HTTP transport as an SSE stream
+    #[cfg(feature = "stateless")]
+    MessagesListen(crate::stateless::MessagesListenNotification),
     Empty(EmptyResult),
 }
 
@@ -2926,6 +2943,13 @@ impl McpRequest {
             "completion/complete" => {
                 let p: CompleteParams = serde_json::from_value(params)?;
                 Ok(McpRequest::Complete(p))
+            }
+            #[cfg(feature = "stateless")]
+            "server/discover" => Ok(McpRequest::Discover),
+            #[cfg(feature = "stateless")]
+            "messages/listen" => {
+                let p: crate::stateless::MessagesListenParams = serde_json::from_value(params)?;
+                Ok(McpRequest::MessagesListen(p))
             }
             method => Ok(McpRequest::Unknown {
                 method: method.to_string(),
