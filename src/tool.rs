@@ -635,6 +635,40 @@ impl ToolBuilder {
         self
     }
 
+    /// Create a tool that takes no parameters.
+    ///
+    /// This is a convenience method for tools that don't require any input.
+    /// It generates the correct `{"type": "object"}` schema that MCP clients expect.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::{ToolBuilder, CallToolResult};
+    ///
+    /// let tool = ToolBuilder::new("get_status")
+    ///     .description("Get current status")
+    ///     .no_params_handler(|| async {
+    ///         Ok(CallToolResult::text("OK"))
+    ///     })
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn no_params_handler<F, Fut>(self, handler: F) -> ToolBuilderWithNoParamsHandler<F>
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
+    {
+        ToolBuilderWithNoParamsHandler {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            output_schema: self.output_schema,
+            icons: self.icons,
+            annotations: self.annotations,
+            handler,
+        }
+    }
+
     /// Specify input type and handler.
     ///
     /// The input type must implement `JsonSchema` and `DeserializeOwned`.
@@ -831,6 +865,27 @@ impl ToolBuilder {
     }
 }
 
+/// Handler for tools with no parameters.
+///
+/// Used internally by [`ToolBuilder::no_params_handler`].
+struct NoParamsTypedHandler<F> {
+    handler: F,
+}
+
+impl<F, Fut> ToolHandler for NoParamsTypedHandler<F>
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
+{
+    fn call(&self, _args: Value) -> BoxFuture<'_, Result<CallToolResult>> {
+        Box::pin(async move { (self.handler)().await })
+    }
+
+    fn input_schema(&self) -> Value {
+        serde_json::json!({ "type": "object" })
+    }
+}
+
 /// Builder state after handler is specified
 pub struct ToolBuilderWithHandler<I, F> {
     name: String,
@@ -841,6 +896,126 @@ pub struct ToolBuilderWithHandler<I, F> {
     annotations: Option<ToolAnnotations>,
     handler: F,
     _phantom: std::marker::PhantomData<I>,
+}
+
+/// Builder state for tools with no parameters.
+///
+/// Created by [`ToolBuilder::no_params_handler`].
+pub struct ToolBuilderWithNoParamsHandler<F> {
+    name: String,
+    title: Option<String>,
+    description: Option<String>,
+    output_schema: Option<Value>,
+    icons: Option<Vec<ToolIcon>>,
+    annotations: Option<ToolAnnotations>,
+    handler: F,
+}
+
+impl<F, Fut> ToolBuilderWithNoParamsHandler<F>
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
+{
+    /// Build the tool.
+    ///
+    /// Returns an error if the tool name is invalid.
+    pub fn build(self) -> Result<Tool> {
+        validate_tool_name(&self.name)?;
+        Ok(Tool::from_handler(
+            self.name,
+            self.title,
+            self.description,
+            self.output_schema,
+            self.icons,
+            self.annotations,
+            NoParamsTypedHandler {
+                handler: self.handler,
+            },
+        ))
+    }
+
+    /// Apply a Tower layer (middleware) to this tool.
+    ///
+    /// See [`ToolBuilderWithHandler::layer`] for details.
+    pub fn layer<L>(self, layer: L) -> ToolBuilderWithNoParamsHandlerLayer<F, L> {
+        ToolBuilderWithNoParamsHandlerLayer {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            output_schema: self.output_schema,
+            icons: self.icons,
+            annotations: self.annotations,
+            handler: self.handler,
+            layer,
+        }
+    }
+}
+
+/// Builder state after a layer has been applied to a no-params handler.
+pub struct ToolBuilderWithNoParamsHandlerLayer<F, L> {
+    name: String,
+    title: Option<String>,
+    description: Option<String>,
+    output_schema: Option<Value>,
+    icons: Option<Vec<ToolIcon>>,
+    annotations: Option<ToolAnnotations>,
+    handler: F,
+    layer: L,
+}
+
+#[allow(private_bounds)]
+impl<F, Fut, L> ToolBuilderWithNoParamsHandlerLayer<F, L>
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
+    L: tower::Layer<ToolHandlerService<NoParamsTypedHandler<F>>> + Clone + Send + Sync + 'static,
+    L::Service: Service<ToolRequest, Response = CallToolResult> + Clone + Send + 'static,
+    <L::Service as Service<ToolRequest>>::Error: fmt::Display + Send,
+    <L::Service as Service<ToolRequest>>::Future: Send,
+{
+    /// Build the tool with the applied layer(s).
+    ///
+    /// Returns an error if the tool name is invalid.
+    pub fn build(self) -> Result<Tool> {
+        validate_tool_name(&self.name)?;
+
+        let input_schema = serde_json::json!({ "type": "object" });
+
+        let handler_service = ToolHandlerService::new(NoParamsTypedHandler {
+            handler: self.handler,
+        });
+        let layered = self.layer.layer(handler_service);
+        let catch_error = ToolCatchError::new(layered);
+        let service = BoxCloneService::new(catch_error);
+
+        Ok(Tool {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            output_schema: self.output_schema,
+            icons: self.icons,
+            annotations: self.annotations,
+            service,
+            input_schema,
+        })
+    }
+
+    /// Apply an additional Tower layer (middleware).
+    pub fn layer<L2>(
+        self,
+        layer: L2,
+    ) -> ToolBuilderWithNoParamsHandlerLayer<F, tower::layer::util::Stack<L2, L>> {
+        ToolBuilderWithNoParamsHandlerLayer {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            output_schema: self.output_schema,
+            icons: self.icons,
+            annotations: self.annotations,
+            handler: self.handler,
+            layer: tower::layer::util::Stack::new(layer, self.layer),
+        }
+    }
 }
 
 impl<I, F, Fut> ToolBuilderWithHandler<I, F>
@@ -1857,5 +2032,125 @@ mod tests {
 
         let double_prefixed = prefixed.with_name_prefix("level0");
         assert_eq!(double_prefixed.name, "level0.level1.action");
+    }
+
+    // =============================================================================
+    // no_params_handler tests
+    // =============================================================================
+
+    #[tokio::test]
+    async fn test_no_params_handler_basic() {
+        let tool = ToolBuilder::new("get_status")
+            .description("Get current status")
+            .no_params_handler(|| async { Ok(CallToolResult::text("OK")) })
+            .build()
+            .expect("valid tool name");
+
+        assert_eq!(tool.name, "get_status");
+        assert_eq!(tool.description.as_deref(), Some("Get current status"));
+
+        // Should work with empty args
+        let result = tool.call(serde_json::json!({})).await;
+        assert!(!result.is_error);
+        assert_eq!(result.first_text().unwrap(), "OK");
+
+        // Should also work with null args
+        let result = tool.call(serde_json::json!(null)).await;
+        assert!(!result.is_error);
+
+        // Check input schema has type: object
+        let schema = tool.definition().input_schema;
+        assert_eq!(schema.get("type").and_then(|v| v.as_str()), Some("object"));
+    }
+
+    #[tokio::test]
+    async fn test_no_params_handler_with_captured_state() {
+        let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter_ref = counter.clone();
+
+        let tool = ToolBuilder::new("increment")
+            .description("Increment counter")
+            .no_params_handler(move || {
+                let c = counter_ref.clone();
+                async move {
+                    let prev = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(CallToolResult::text(format!("Incremented from {}", prev)))
+                }
+            })
+            .build()
+            .expect("valid tool name");
+
+        // Call multiple times
+        let _ = tool.call(serde_json::json!({})).await;
+        let _ = tool.call(serde_json::json!({})).await;
+        let result = tool.call(serde_json::json!({})).await;
+
+        assert!(!result.is_error);
+        assert_eq!(result.first_text().unwrap(), "Incremented from 2");
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_no_params_handler_with_layer() {
+        use std::time::Duration;
+        use tower::timeout::TimeoutLayer;
+
+        let tool = ToolBuilder::new("slow_status")
+            .description("Slow status check")
+            .no_params_handler(|| async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok(CallToolResult::text("done"))
+            })
+            .layer(TimeoutLayer::new(Duration::from_secs(1)))
+            .build()
+            .expect("valid tool name");
+
+        let result = tool.call(serde_json::json!({})).await;
+        assert!(!result.is_error);
+        assert_eq!(result.first_text().unwrap(), "done");
+    }
+
+    #[tokio::test]
+    async fn test_no_params_handler_timeout() {
+        use std::time::Duration;
+        use tower::timeout::TimeoutLayer;
+
+        let tool = ToolBuilder::new("very_slow_status")
+            .description("Very slow status check")
+            .no_params_handler(|| async {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Ok(CallToolResult::text("done"))
+            })
+            .layer(TimeoutLayer::new(Duration::from_millis(50)))
+            .build()
+            .expect("valid tool name");
+
+        let result = tool.call(serde_json::json!({})).await;
+        assert!(result.is_error);
+        let msg = result.first_text().unwrap().to_lowercase();
+        assert!(
+            msg.contains("timed out") || msg.contains("timeout") || msg.contains("elapsed"),
+            "Expected timeout error, got: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_params_handler_with_multiple_layers() {
+        use std::time::Duration;
+        use tower::limit::ConcurrencyLimitLayer;
+        use tower::timeout::TimeoutLayer;
+
+        let tool = ToolBuilder::new("multi_layer_status")
+            .description("Status with multiple layers")
+            .no_params_handler(|| async { Ok(CallToolResult::text("status ok")) })
+            .layer(TimeoutLayer::new(Duration::from_secs(5)))
+            .layer(ConcurrencyLimitLayer::new(10))
+            .build()
+            .expect("valid tool name");
+
+        let result = tool.call(serde_json::json!({})).await;
+        assert!(!result.is_error);
+        assert_eq!(result.first_text().unwrap(), "status ok");
     }
 }
