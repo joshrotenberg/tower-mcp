@@ -947,9 +947,13 @@ async fn handle_post(
     // Get or create session
     let session = if is_init {
         // Create new session for initialize
+        // Use with_fresh_session() to ensure each session has its own state
         match state
             .sessions
-            .create(state.router_template.clone(), state.service_factory.clone())
+            .create(
+                state.router_template.with_fresh_session(),
+                state.service_factory.clone(),
+            )
             .await
         {
             Some(s) => s,

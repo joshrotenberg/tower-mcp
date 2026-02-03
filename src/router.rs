@@ -146,6 +146,20 @@ impl McpRouter {
         }
     }
 
+    /// Create a clone with fresh session state.
+    ///
+    /// Use this when creating a new logical session (e.g., per HTTP connection).
+    /// The router configuration (tools, resources, prompts) is shared, but the
+    /// session state (phase, extensions) is independent.
+    ///
+    /// This is typically called by transports when establishing a new client session.
+    pub fn with_fresh_session(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            session: SessionState::new(),
+        }
+    }
+
     /// Get access to the task store for async operations
     pub fn task_store(&self) -> &TaskStore {
         &self.inner.task_store
