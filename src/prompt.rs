@@ -1096,8 +1096,8 @@ mod tests {
         let prompt = PromptBuilder::new("slow_prompt")
             .description("A slow prompt")
             .handler(|_args: HashMap<String, String>| async move {
-                // Simulate slow operation
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                // Sleep much longer than timeout to ensure timeout fires reliably in CI
+                tokio::time::sleep(Duration::from_secs(1)).await;
                 Ok(GetPromptResult {
                     description: Some("Slow prompt".to_string()),
                     messages: vec![PromptMessage {
@@ -1109,7 +1109,7 @@ mod tests {
                     }],
                 })
             })
-            .layer(TimeoutLayer::new(Duration::from_millis(10)));
+            .layer(TimeoutLayer::new(Duration::from_millis(50)));
 
         let result = prompt.get(HashMap::new()).await.unwrap();
 
