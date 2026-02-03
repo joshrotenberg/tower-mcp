@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+## [0.3.2] - 2026-02-03
+
+### Features
+
+- Add McpTracingLayer for structured request logging ([#315](https://github.com/joshrotenberg/tower-mcp/pull/315)) ([#316](https://github.com/joshrotenberg/tower-mcp/pull/316))
+- **crates-mcp:** Add McpTracingLayer for request logging ([#319](https://github.com/joshrotenberg/tower-mcp/pull/319))
+
+
+
 ## [0.3.1] - 2026-02-03
 
 ### Documentation
