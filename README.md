@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/crates/l/tower-mcp.svg)](https://github.com/joshrotenberg/tower-mcp#license)
 [![MSRV](https://img.shields.io/crates/msrv/tower-mcp.svg)](https://github.com/joshrotenberg/tower-mcp)
 [![MCP](https://img.shields.io/badge/MCP-2025--11--25-blue)](https://modelcontextprotocol.io/specification/2025-11-25)
-[![Conformance](https://img.shields.io/badge/conformance-39%2F39-brightgreen)](https://github.com/joshrotenberg/tower-mcp/actions/workflows/mcp-conformance.yml)
+[![Conformance](https://img.shields.io/badge/conformance-39%2F39-brightgreen)](https://github.com/joshrotenberg/tower-mcp/actions/workflows/conformance.yml)
 
 Tower-native [Model Context Protocol](https://modelcontextprotocol.io) (MCP) implementation for Rust.
 
@@ -18,6 +18,15 @@ This means:
 - Standard tower middleware (tracing, metrics, rate limiting, auth) just works
 - Same service can be exposed over multiple transports (stdio, HTTP, WebSocket)
 - Easy integration with existing tower-based applications (axum, tonic)
+
+### Familiar to axum Users
+
+If you've used [axum](https://docs.rs/axum), tower-mcp's API will feel familiar:
+
+- **Extractor pattern**: Tool handlers use extractors like `State<T>`, `Json<T>`, and `Context`
+- **Router composition**: `McpRouter::merge()` and `McpRouter::nest()` work like axum's router methods
+- **Per-handler middleware**: Apply Tower layers to individual tools, resources, or prompts via `.layer()`
+- **Builder pattern**: Fluent builders for tools, resources, and prompts
 
 ## Live Demo
 
@@ -98,7 +107,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tower-mcp = "0.2"
+tower-mcp = "0.3"
 ```
 
 ### Feature Flags
@@ -137,7 +146,7 @@ let greet = ToolBuilder::new("greet")
     .handler(|input: GreetInput| async move {
         Ok(CallToolResult::text(format!("Hello, {}!", input.name)))
     })
-    .build();
+    .build()?;
 
 // Create router with tools
 let router = McpRouter::new()
@@ -169,7 +178,7 @@ let add = ToolBuilder::new("add")
     .handler(|input: AddInput| async move {
         Ok(CallToolResult::text(format!("{}", input.a + input.b)))
     })
-    .build();
+    .build()?;
 ```
 
 ### Trait-Based (For Complex Tools)
@@ -208,20 +217,34 @@ let calc = Calculator { precision: 10 };
 let router = McpRouter::new().tool(calc.into_tool());
 ```
 
-### Handler with Context (Progress/Sampling)
+### Handler with Extractors (State, Context, JSON)
+
+Use axum-style extractors to access state, context, and typed input:
 
 ```rust
-use tower_mcp::{ToolBuilder, CallToolResult, RequestContext};
+use std::sync::Arc;
+use tower_mcp::{ToolBuilder, CallToolResult};
+use tower_mcp::extract::{State, Context, Json};
+
+#[derive(Clone)]
+struct AppState { db_url: String }
+
+let state = Arc::new(AppState { db_url: "postgres://...".into() });
 
 let search = ToolBuilder::new("search")
     .description("Search with progress updates")
-    .handler_with_context(|input: SearchInput, ctx: RequestContext| async move {
-        ctx.send_progress(0.5, Some(10.0), None).await?;
-        // ... do work ...
-        ctx.send_progress(1.0, Some(10.0), None).await?;
-        Ok(CallToolResult::text("Done"))
+    .extractor_handler(state, |
+        State(app): State<Arc<AppState>>,
+        ctx: Context,
+        Json(input): Json<SearchInput>,
+    | async move {
+        // Report progress
+        ctx.report_progress(0.5, Some(1.0), Some("Searching...")).await;
+        // Use state
+        let results = format!("Searched {} for: {}", app.db_url, input.query);
+        Ok(CallToolResult::text(results))
     })
-    .build();
+    .build()?;
 ```
 
 ### Tool with Icons and Title
@@ -233,17 +256,40 @@ let tool = ToolBuilder::new("analyze")
     .icon("https://example.com/icon.svg")
     .read_only()
     .idempotent()
-    .build();
+    .build()?;
+```
+
+### Per-Tool Middleware
+
+Apply Tower layers to individual tools:
+
+```rust
+use std::time::Duration;
+use tower::timeout::TimeoutLayer;
+
+let slow_tool = ToolBuilder::new("slow_search")
+    .description("Thorough search (may take a while)")
+    .handler(|input: SearchInput| async move {
+        // ... slow operation ...
+        Ok(CallToolResult::text("results"))
+    })
+    .layer(TimeoutLayer::new(Duration::from_secs(60)))  // 60s for this tool
+    .build()?;
 ```
 
 ### Raw JSON Handler (Escape Hatch)
 
+Use `RawArgs` extractor when you need the raw JSON:
+
 ```rust
+use tower_mcp::extract::RawArgs;
+
 let echo = ToolBuilder::new("echo")
     .description("Echo back the input")
-    .raw_handler(|args: serde_json::Value| async move {
+    .extractor_handler((), |RawArgs(args): RawArgs| async move {
         Ok(CallToolResult::json(args))
-    });
+    })
+    .build()?;
 ```
 
 ## Resource Definition
@@ -258,7 +304,8 @@ let config = ResourceBuilder::new("file:///config.json")
     .json(serde_json::json!({
         "version": "1.0.0",
         "debug": true
-    }));
+    }))
+    .build()?;
 
 // Dynamic resource with handler
 let status = ResourceBuilder::new("app:///status")
@@ -266,7 +313,8 @@ let status = ResourceBuilder::new("app:///status")
     .description("Current server status")
     .handler(|| async {
         Ok("Running".to_string())
-    });
+    })
+    .build()?;
 
 let router = McpRouter::new()
     .resource(config)
@@ -298,9 +346,69 @@ let greet = PromptBuilder::new("greet")
                 content: Content::Text { text, annotations: None },
             }],
         })
-    });
+    })
+    .build()?;
 
 let router = McpRouter::new().prompt(greet);
+```
+
+## Router Composition
+
+Combine routers like in axum:
+
+```rust
+// Merge routers (combines all tools/resources/prompts)
+let api_router = McpRouter::new()
+    .tool(search_tool)
+    .tool(fetch_tool);
+
+let admin_router = McpRouter::new()
+    .tool(reset_tool)
+    .tool(stats_tool);
+
+let combined = McpRouter::new()
+    .merge(api_router)
+    .merge(admin_router);
+
+// Nest with prefix (adds prefix to all tool names)
+let v1 = McpRouter::new().tool(legacy_tool);
+let v2 = McpRouter::new().tool(new_tool);
+
+let versioned = McpRouter::new()
+    .nest("v1", v1)   // Tools become "v1_legacy_tool"
+    .nest("v2", v2);  // Tools become "v2_new_tool"
+```
+
+## Router-Level State
+
+Share state across all handlers using `with_state()`:
+
+```rust
+use std::sync::Arc;
+use tower_mcp::extract::Extension;
+
+#[derive(Clone)]
+struct AppState {
+    db: DatabasePool,
+    config: Config,
+}
+
+let state = Arc::new(AppState { /* ... */ });
+
+// Tools access state via Extension<T> extractor
+let tool = ToolBuilder::new("query")
+    .extractor_handler_typed::<_, _, _, QueryInput>(
+        (),
+        |Extension(app): Extension<Arc<AppState>>, Json(input): Json<QueryInput>| async move {
+            let result = app.db.query(&input.sql).await?;
+            Ok(CallToolResult::text(result))
+        },
+    )
+    .build()?;
+
+let router = McpRouter::new()
+    .with_state(state)  // Makes AppState available to all handlers
+    .tool(tool);
 ```
 
 ## Transports
