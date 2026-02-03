@@ -39,4 +39,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Tower middleware
 tower = { version = "0.5", features = ["util", "timeout", "limit"] }
-tower-resilience.workspace = true
+tower-resilience = { version = "0.7", default-features = false, features = ["bulkhead", "ratelimiter"] }
