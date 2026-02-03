@@ -14,8 +14,8 @@ name = "integration"
 path = "tests/integration.rs"
 
 [dependencies]
-# Core MCP (use path for development, version for release)
-tower-mcp = { path = "../..", features = ["http"] }
+# Core MCP (use version for Docker builds, path for local dev)
+tower-mcp = { version = "0.3", features = ["http"] }
 
 # Crates.io API client
 crates_io_api = "0.12"
