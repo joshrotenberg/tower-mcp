@@ -129,6 +129,26 @@ curl -X POST http://localhost:3000/ \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_crates","arguments":{"query":"async http"}}}'
 ```
 
+### MCP Inspector
+
+For interactive testing, use the MCP Inspector:
+
+```bash
+# Start the server with HTTP transport
+cargo run -p crates-mcp -- --transport http --port 3000
+
+# In another terminal, connect with Inspector
+npx @modelcontextprotocol/inspector --transport http --server-url http://127.0.0.1:3000
+```
+
+The Inspector opens at `http://localhost:6274` where you can:
+
+- Browse and call tools interactively
+- View resources and resource templates
+- Execute prompts with arguments
+- Monitor server notifications and progress updates
+- Test completions
+
 ## Deployment
 
 ### Docker

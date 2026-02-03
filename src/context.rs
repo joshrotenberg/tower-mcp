@@ -609,6 +609,48 @@ impl RequestContext {
 
         requester.elicit(ElicitRequestParams::Url(params)).await
     }
+
+    /// Request simple confirmation from the user.
+    ///
+    /// This is a convenience method for simple yes/no confirmation dialogs.
+    /// It creates an elicitation form with a single boolean "confirm" field
+    /// and returns `true` if the user accepts, `false` otherwise.
+    ///
+    /// Returns an error if elicitation is not available (no client requester configured).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use tower_mcp::{RequestContext, CallToolResult};
+    ///
+    /// async fn delete_item(ctx: RequestContext) -> Result<CallToolResult> {
+    ///     let confirmed = ctx.confirm("Are you sure you want to delete this item?").await?;
+    ///     if confirmed {
+    ///         // Perform deletion
+    ///         Ok(CallToolResult::text("Item deleted"))
+    ///     } else {
+    ///         Ok(CallToolResult::text("Deletion cancelled"))
+    ///     }
+    /// }
+    /// ```
+    pub async fn confirm(&self, message: impl Into<String>) -> Result<bool> {
+        use crate::protocol::{ElicitAction, ElicitFormParams, ElicitFormSchema, ElicitMode};
+
+        let params = ElicitFormParams {
+            mode: ElicitMode::Form,
+            message: message.into(),
+            requested_schema: ElicitFormSchema::new().boolean_field_with_default(
+                "confirm",
+                Some("Confirm this action"),
+                true,
+                false,
+            ),
+            meta: None,
+        };
+
+        let result = self.elicit_form(params).await?;
+        Ok(result.action == ElicitAction::Accept)
+    }
 }
 
 /// A token that can be used to check for cancellation
@@ -848,6 +890,20 @@ mod tests {
         };
 
         let result = ctx.elicit_url(params).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Elicitation not available")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_confirm_without_requester_fails() {
+        let ctx = RequestContext::new(RequestId::Number(1));
+
+        let result = ctx.confirm("Are you sure?").await;
         assert!(result.is_err());
         assert!(
             result

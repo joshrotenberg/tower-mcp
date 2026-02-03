@@ -963,6 +963,33 @@ pub enum SamplingContent {
     },
 }
 
+impl SamplingContent {
+    /// Get the text content if this is a text variant.
+    ///
+    /// Returns `None` if this is an image, audio, tool_use, or tool_result variant.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::protocol::SamplingContent;
+    ///
+    /// let text_content = SamplingContent::Text { text: "Hello".into() };
+    /// assert_eq!(text_content.as_text(), Some("Hello"));
+    ///
+    /// let image_content = SamplingContent::Image {
+    ///     data: "base64...".into(),
+    ///     mime_type: "image/png".into(),
+    /// };
+    /// assert_eq!(image_content.as_text(), None);
+    /// ```
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            SamplingContent::Text { text } => Some(text),
+            _ => None,
+        }
+    }
+}
+
 /// Content that can be either a single item or an array (for CreateMessageResult)
 ///
 /// The MCP spec allows CreateMessageResult.content to be either a single
@@ -1107,6 +1134,30 @@ impl CreateMessageResult {
     /// Get content items as a vector of references
     pub fn content_items(&self) -> Vec<&SamplingContent> {
         self.content.items()
+    }
+
+    /// Get the text from the first text content item.
+    ///
+    /// Returns `None` if there are no content items or if the first
+    /// text-containing item is not found.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::protocol::{CreateMessageResult, SamplingContent, SamplingContentOrArray, ContentRole};
+    ///
+    /// let result = CreateMessageResult {
+    ///     content: SamplingContentOrArray::Single(SamplingContent::Text {
+    ///         text: "Hello, world!".into(),
+    ///     }),
+    ///     model: "claude-3".into(),
+    ///     role: ContentRole::Assistant,
+    ///     stop_reason: None,
+    /// };
+    /// assert_eq!(result.first_text(), Some("Hello, world!"));
+    /// ```
+    pub fn first_text(&self) -> Option<&str> {
+        self.content.items().iter().find_map(|c| c.as_text())
     }
 }
 
@@ -3623,5 +3674,89 @@ mod tests {
         };
         let items = result.content_items();
         assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn test_sampling_content_as_text() {
+        let text_content = SamplingContent::Text {
+            text: "Hello".to_string(),
+        };
+        assert_eq!(text_content.as_text(), Some("Hello"));
+
+        let image_content = SamplingContent::Image {
+            data: "base64data".to_string(),
+            mime_type: "image/png".to_string(),
+        };
+        assert_eq!(image_content.as_text(), None);
+
+        let audio_content = SamplingContent::Audio {
+            data: "base64audio".to_string(),
+            mime_type: "audio/wav".to_string(),
+        };
+        assert_eq!(audio_content.as_text(), None);
+    }
+
+    #[test]
+    fn test_create_message_result_first_text_single() {
+        let result = CreateMessageResult {
+            content: SamplingContentOrArray::Single(SamplingContent::Text {
+                text: "Hello, world!".to_string(),
+            }),
+            model: "test".to_string(),
+            role: ContentRole::Assistant,
+            stop_reason: None,
+        };
+        assert_eq!(result.first_text(), Some("Hello, world!"));
+    }
+
+    #[test]
+    fn test_create_message_result_first_text_array() {
+        let result = CreateMessageResult {
+            content: SamplingContentOrArray::Array(vec![
+                SamplingContent::Text {
+                    text: "First".to_string(),
+                },
+                SamplingContent::Text {
+                    text: "Second".to_string(),
+                },
+            ]),
+            model: "test".to_string(),
+            role: ContentRole::Assistant,
+            stop_reason: None,
+        };
+        assert_eq!(result.first_text(), Some("First"));
+    }
+
+    #[test]
+    fn test_create_message_result_first_text_skips_non_text() {
+        let result = CreateMessageResult {
+            content: SamplingContentOrArray::Array(vec![
+                SamplingContent::Image {
+                    data: "base64data".to_string(),
+                    mime_type: "image/png".to_string(),
+                },
+                SamplingContent::Text {
+                    text: "After image".to_string(),
+                },
+            ]),
+            model: "test".to_string(),
+            role: ContentRole::Assistant,
+            stop_reason: None,
+        };
+        assert_eq!(result.first_text(), Some("After image"));
+    }
+
+    #[test]
+    fn test_create_message_result_first_text_none() {
+        let result = CreateMessageResult {
+            content: SamplingContentOrArray::Single(SamplingContent::Image {
+                data: "base64data".to_string(),
+                mime_type: "image/png".to_string(),
+            }),
+            model: "test".to_string(),
+            role: ContentRole::Assistant,
+            stop_reason: None,
+        };
+        assert_eq!(result.first_text(), None);
     }
 }
