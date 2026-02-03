@@ -240,6 +240,110 @@
 //! - Concurrency limiting for expensive operations
 //! - Multiple layers combined on a single tool
 //!
+//! ## Advanced Features
+//!
+//! ### Sampling (LLM Requests)
+//!
+//! Tools can request LLM completions from the client via [`RequestContext::sample()`].
+//! This enables AI-assisted tools like "suggest a query" or "analyze results":
+//!
+//! ```rust,ignore
+//! use tower_mcp::{ToolBuilder, CallToolResult, CreateMessageParams, SamplingMessage};
+//! use tower_mcp::extract::Context;
+//!
+//! let tool = ToolBuilder::new("suggest")
+//!     .description("Get AI suggestions")
+//!     .extractor_handler(|ctx: Context| async move {
+//!         if !ctx.can_sample() {
+//!             return Ok(CallToolResult::error("Sampling not available"));
+//!         }
+//!
+//!         let params = CreateMessageParams::new()
+//!             .message(SamplingMessage::user("Suggest 3 search queries for: rust async"))
+//!             .max_tokens(200);
+//!
+//!         let result = ctx.sample(params).await?;
+//!         let text = result.first_text().unwrap_or("No response");
+//!         Ok(CallToolResult::text(text))
+//!     })
+//!     .build()?;
+//! ```
+//!
+//! ### Elicitation (User Input)
+//!
+//! Tools can request user input via forms using [`RequestContext::elicit_form()`]
+//! or the convenience method [`RequestContext::confirm()`]:
+//!
+//! ```rust,ignore
+//! use tower_mcp::{ToolBuilder, CallToolResult};
+//! use tower_mcp::extract::Context;
+//!
+//! // Simple confirmation dialog
+//! let delete_tool = ToolBuilder::new("delete")
+//!     .description("Delete a file")
+//!     .extractor_handler(|ctx: Context| async move {
+//!         if !ctx.confirm("Are you sure you want to delete this file?").await? {
+//!             return Ok(CallToolResult::text("Cancelled"));
+//!         }
+//!         // ... perform deletion ...
+//!         Ok(CallToolResult::text("Deleted"))
+//!     })
+//!     .build()?;
+//! ```
+//!
+//! For complex forms, use [`ElicitFormSchema`] to define multiple fields.
+//!
+//! ### Progress Notifications
+//!
+//! Long-running tools can report progress via [`RequestContext::report_progress()`]:
+//!
+//! ```rust,ignore
+//! use tower_mcp::{ToolBuilder, CallToolResult};
+//! use tower_mcp::extract::Context;
+//!
+//! let process_tool = ToolBuilder::new("process")
+//!     .description("Process items")
+//!     .extractor_handler(|ctx: Context| async move {
+//!         let items = vec!["a", "b", "c", "d", "e"];
+//!         let total = items.len() as f64;
+//!
+//!         for (i, item) in items.iter().enumerate() {
+//!             ctx.report_progress(i as f64, Some(total), Some(&format!("Processing {}", item))).await;
+//!             // ... process item ...
+//!         }
+//!
+//!         Ok(CallToolResult::text("Done"))
+//!     })
+//!     .build()?;
+//! ```
+//!
+//! ### Router Composition
+//!
+//! Combine multiple routers using [`McpRouter::merge()`] or [`McpRouter::nest()`]:
+//!
+//! ```rust,ignore
+//! use tower_mcp::McpRouter;
+//!
+//! // Create domain-specific routers
+//! let db_router = McpRouter::new()
+//!     .tool(query_tool)
+//!     .tool(insert_tool);
+//!
+//! let api_router = McpRouter::new()
+//!     .tool(fetch_tool);
+//!
+//! // Nest with prefixes: tools become "db.query", "db.insert", "api.fetch"
+//! let combined = McpRouter::new()
+//!     .server_info("combined", "1.0")
+//!     .nest("db", db_router)
+//!     .nest("api", api_router);
+//!
+//! // Or merge without prefixes
+//! let merged = McpRouter::new()
+//!     .merge(db_router)
+//!     .merge(api_router);
+//! ```
+//!
 //! ## MCP Specification
 //!
 //! This crate implements the MCP specification (2025-11-25):
