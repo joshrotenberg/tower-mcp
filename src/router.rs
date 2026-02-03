@@ -1413,7 +1413,7 @@ impl Default for McpRouter {
 pub use crate::context::Extensions;
 
 /// Request type for the tower Service implementation
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RouterRequest {
     pub id: RequestId,
     pub inner: McpRequest,
@@ -1422,7 +1422,7 @@ pub struct RouterRequest {
 }
 
 /// Response type for the tower Service implementation
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RouterResponse {
     pub id: RequestId,
     pub inner: std::result::Result<McpResponse, JsonRpcError>,
