@@ -33,6 +33,7 @@ pub fn build(state: Arc<AppState>) -> Tool {
             |State(state): State<Arc<AppState>>,
              ctx: Context,
              Json(input): Json<ReverseDepsInput>| async move {
+                tracing::info!(tool = "get_reverse_dependencies", crate_name = %input.name, "Tool called");
                 // Log the request
                 ctx.send_log(LoggingMessageParams {
                     level: LogLevel::Info,

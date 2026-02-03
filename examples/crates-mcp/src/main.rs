@@ -13,6 +13,8 @@ use std::time::Duration;
 use clap::{Parser, ValueEnum};
 use tower::ServiceBuilder;
 use tower::timeout::TimeoutLayer;
+use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
+use tracing::Level;
 use tower_mcp::protocol::{CompleteParams, CompleteResult, Completion, CompletionReference};
 use tower_mcp::{HttpTransport, McpRouter, StdioTransport};
 use tower_resilience::bulkhead::BulkheadLayer;
@@ -288,6 +290,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
                 .max_wait_duration(Duration::from_millis(500))
                 .build();
 
+            // Build the MCP transport with middleware
             let transport = HttpTransport::new(router)
                 .disable_origin_validation() // Allow any origin for public demo
                 .layer(
@@ -300,7 +303,17 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
                         .into_inner(),
                 );
 
-            transport.serve(&addr).await?;
+            // Add HTTP-level request tracing via tower-http
+            // This logs: method, URI, status, latency for every request
+            let app = transport.into_router().layer(
+                TraceLayer::new_for_http()
+                    .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                    .on_response(DefaultOnResponse::new().level(Level::INFO)),
+            );
+
+            let listener = tokio::net::TcpListener::bind(&addr).await?;
+            tracing::info!(%addr, "HTTP server listening");
+            axum::serve(listener, app).await?;
         }
     }
 

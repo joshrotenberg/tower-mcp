@@ -21,6 +21,7 @@ pub fn build(state: Arc<AppState>) -> Tool {
         .extractor_handler_typed::<_, _, _, NoParams>(
             state,
             |State(state): State<Arc<AppState>>, Json(_input): Json<NoParams>| async move {
+                tracing::info!(tool = "get_summary", "Tool called");
                 let summary = state
                     .client
                     .summary()

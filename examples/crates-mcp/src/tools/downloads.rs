@@ -31,6 +31,7 @@ pub fn build(state: Arc<AppState>) -> Tool {
         .extractor_handler_typed::<_, _, _, DownloadsInput>(
             state,
             |State(state): State<Arc<AppState>>, Json(input): Json<DownloadsInput>| async move {
+                tracing::info!(tool = "get_downloads", crate_name = %input.name, "Tool called");
                 let response = state
                     .client
                     .crate_downloads(&input.name)

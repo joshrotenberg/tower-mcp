@@ -40,6 +40,7 @@ pub fn build(state: Arc<AppState>) -> Tool {
         .extractor_handler_typed::<_, _, _, VersionsInput>(
             state,
             |State(state): State<Arc<AppState>>, Json(input): Json<VersionsInput>| async move {
+                tracing::info!(tool = "get_crate_versions", crate_name = %input.name, limit = input.limit, "Tool called");
                 let response = state
                     .client
                     .get_crate(&input.name)

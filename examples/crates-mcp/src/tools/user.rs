@@ -26,6 +26,7 @@ pub fn build(state: Arc<AppState>) -> Tool {
         .extractor_handler_typed::<_, _, _, UserInput>(
             state,
             |State(state): State<Arc<AppState>>, Json(input): Json<UserInput>| async move {
+                tracing::info!(tool = "get_user", username = %input.username, "Tool called");
                 let user = state
                     .client
                     .user(&input.username)

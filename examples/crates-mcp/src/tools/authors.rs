@@ -32,6 +32,7 @@ pub fn build(state: Arc<AppState>) -> Tool {
         .extractor_handler_typed::<_, _, _, AuthorsInput>(
             state,
             |State(state): State<Arc<AppState>>, Json(input): Json<AuthorsInput>| async move {
+                tracing::info!(tool = "get_crate_authors", crate_name = %input.name, version = ?input.version, "Tool called");
                 // If no version specified, get the latest
                 let version = match input.version {
                     Some(v) => v,

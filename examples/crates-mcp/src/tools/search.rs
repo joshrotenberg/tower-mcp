@@ -48,6 +48,7 @@ pub fn build(state: Arc<AppState>) -> Tool {
         .extractor_handler_typed::<_, _, _, SearchInput>(
             state,
             |State(state): State<Arc<AppState>>, Json(input): Json<SearchInput>| async move {
+                tracing::info!(tool = "search_crates", query = %input.query, sort = %input.sort, "Tool called");
                 let sort = parse_sort(&input.sort);
                 let query = CratesQuery::builder()
                     .search(&input.query)

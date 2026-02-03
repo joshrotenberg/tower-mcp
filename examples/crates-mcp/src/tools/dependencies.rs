@@ -35,6 +35,7 @@ pub fn build(state: Arc<AppState>) -> Tool {
         .extractor_handler_typed::<_, _, _, DependenciesInput>(
             state,
             |State(state): State<Arc<AppState>>, Json(input): Json<DependenciesInput>| async move {
+                tracing::info!(tool = "get_dependencies", crate_name = %input.name, version = ?input.version, "Tool called");
                 // Get crate info first to find version
                 let crate_response = state
                     .client

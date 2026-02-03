@@ -30,6 +30,7 @@ pub fn build(state: Arc<AppState>) -> Tool {
         .extractor_handler_typed::<_, _, _, InfoInput>(
             state,
             |State(state): State<Arc<AppState>>, Json(input): Json<InfoInput>| async move {
+                tracing::info!(tool = "get_crate_info", crate_name = %input.name, "Tool called");
                 let response = state
                     .client
                     .get_crate(&input.name)
