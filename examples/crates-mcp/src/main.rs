@@ -14,11 +14,11 @@ use clap::{Parser, ValueEnum};
 use tower::ServiceBuilder;
 use tower::timeout::TimeoutLayer;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
-use tracing::Level;
 use tower_mcp::protocol::{CompleteParams, CompleteResult, Completion, CompletionReference};
 use tower_mcp::{HttpTransport, McpRouter, StdioTransport};
 use tower_resilience::bulkhead::BulkheadLayer;
 use tower_resilience::ratelimiter::RateLimiterLayer;
+use tracing::Level;
 
 use crate::state::AppState;
 
