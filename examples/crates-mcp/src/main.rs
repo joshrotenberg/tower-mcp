@@ -328,8 +328,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
                                 name, arguments, ..
                             }) => {
                                 // Serialize arguments to create stable cache key
-                                let args_str =
-                                    serde_json::to_string(arguments).unwrap_or_default();
+                                let args_str = serde_json::to_string(arguments).unwrap_or_default();
                                 format!("tool:{}:{}", name, args_str)
                             }
                             // For all other requests, use unique key based on request ID
