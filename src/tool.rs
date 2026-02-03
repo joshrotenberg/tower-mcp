@@ -378,6 +378,21 @@ impl std::fmt::Debug for Tool {
 unsafe impl Send for Tool {}
 unsafe impl Sync for Tool {}
 
+impl Clone for Tool {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            title: self.title.clone(),
+            description: self.description.clone(),
+            output_schema: self.output_schema.clone(),
+            icons: self.icons.clone(),
+            annotations: self.annotations.clone(),
+            service: self.service.clone(),
+            input_schema: self.input_schema.clone(),
+        }
+    }
+}
+
 impl Tool {
     /// Create a new tool builder
     pub fn builder(name: impl Into<String>) -> ToolBuilder {
