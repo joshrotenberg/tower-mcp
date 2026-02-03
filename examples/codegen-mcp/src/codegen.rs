@@ -1,8 +1,14 @@
 //! Code generation from project state.
 //!
 //! This module generates Rust source code from the accumulated [`ProjectState`].
+//!
+//! ## Component-Level Generation
+//!
+//! In addition to full project generation, this module supports generating
+//! code for individual components (tools, resources, prompts) via
+//! [`generate_tool_code`] etc.
 
-use crate::state::{HandlerType, ProjectState, ToolDef, Transport};
+use crate::state::{HandlerType, LayerType, ProjectState, ToolBuilderState, ToolDef, Transport};
 
 /// Generate complete Rust code from the project state.
 pub fn generate_code(state: &ProjectState) -> Result<GeneratedCode, String> {
@@ -648,5 +654,268 @@ fn to_rust_type(type_str: &str, required: bool) -> String {
         base_type.to_string()
     } else {
         format!("Option<{}>", base_type)
+    }
+}
+
+// =============================================================================
+// Component-Level Code Generation
+// =============================================================================
+
+/// Generated code for a single tool.
+pub struct GeneratedToolCode {
+    /// The input struct definition (if the tool has inputs)
+    pub input_struct: String,
+    /// The ToolBuilder code
+    pub tool_builder: String,
+}
+
+/// Generate Rust code for a single tool from its builder state.
+///
+/// This is used by the component builder tools (tool_new, tool_build, etc.)
+/// to generate code for individual tools without a full project context.
+pub fn generate_tool_code(builder: &ToolBuilderState) -> Result<GeneratedToolCode, String> {
+    if builder.name.is_empty() {
+        return Err("Tool name is required".to_string());
+    }
+
+    // Generate input struct if needed
+    let input_struct = if !builder.input_fields.is_empty()
+        && !matches!(
+            builder.handler_type,
+            HandlerType::Raw | HandlerType::NoParams
+        ) {
+        let tool_def = ToolDef {
+            name: builder.name.clone(),
+            description: builder.description.clone().unwrap_or_default(),
+            input_fields: builder.input_fields.clone(),
+            handler_type: builder.handler_type.clone(),
+            annotations: builder.annotations.clone(),
+        };
+        generate_input_struct(&tool_def)
+    } else {
+        "// No input struct needed (no_params or raw handler)".to_string()
+    };
+
+    // Generate tool builder code
+    let tool_builder = generate_component_tool_builder(builder);
+
+    Ok(GeneratedToolCode {
+        input_struct,
+        tool_builder,
+    })
+}
+
+/// Generate a tool builder for component-level generation.
+///
+/// Similar to `generate_tool_builder` but:
+/// - Doesn't assume project context (no state.clone())
+/// - Includes layer configuration
+/// - Uses `todo!()` placeholders for state
+fn generate_component_tool_builder(builder: &ToolBuilderState) -> String {
+    let mut code = format!(
+        "let {} = ToolBuilder::new(\"{}\")\n",
+        builder.name, builder.name
+    );
+
+    // Description
+    if let Some(ref desc) = builder.description {
+        code.push_str(&format!("    .description(\"{}\")\n", desc));
+    }
+
+    // Annotations
+    if builder.annotations.read_only {
+        code.push_str("    .read_only()\n");
+    }
+    if builder.annotations.idempotent {
+        code.push_str("    .idempotent()\n");
+    }
+
+    // Handler
+    let input_type = if builder.input_fields.is_empty()
+        || matches!(
+            builder.handler_type,
+            HandlerType::Raw | HandlerType::NoParams
+        ) {
+        None
+    } else {
+        Some(to_pascal_case(&builder.name) + "Input")
+    };
+
+    // Generate the appropriate handler based on type
+    match builder.handler_type {
+        HandlerType::Simple => {
+            if let Some(ref input) = input_type {
+                code.push_str(&format!(
+                    r#"    .handler(|input: {}| async move {{
+        todo!("Implement {} handler")
+    }})
+"#,
+                    input, builder.name
+                ));
+            } else {
+                code.push_str(&format!(
+                    r#"    .no_params_handler(|| async {{
+        todo!("Implement {} handler")
+    }})
+"#,
+                    builder.name
+                ));
+            }
+        }
+        HandlerType::WithState => {
+            if let Some(ref input) = input_type {
+                code.push_str(&format!(
+                    r#"    .extractor_handler_typed::<_, _, _, {}>(
+        state.clone(),  // TODO: pass your Arc<State> here
+        |State(state): State<Arc<YourState>>, Json(input): Json<{}>| async move {{
+            todo!("Implement {} handler with state")
+        }},
+    )
+"#,
+                    input, input, builder.name
+                ));
+            } else {
+                code.push_str(&format!(
+                    r#"    .extractor_handler_typed::<_, _, _, NoParams>(
+        state.clone(),  // TODO: pass your Arc<State> here
+        |State(state): State<Arc<YourState>>, Json(_): Json<NoParams>| async move {{
+            todo!("Implement {} handler with state")
+        }},
+    )
+"#,
+                    builder.name
+                ));
+            }
+        }
+        HandlerType::WithContext => {
+            if let Some(ref input) = input_type {
+                code.push_str(&format!(
+                    r#"    .extractor_handler_typed::<_, _, _, {}>(
+        (),
+        |ctx: Context, Json(input): Json<{}>| async move {{
+            // ctx.report_progress(0.5, Some(1.0), Some("Working...")).await;
+            // ctx.is_cancelled() to check for cancellation
+            todo!("Implement {} handler with context")
+        }},
+    )
+"#,
+                    input, input, builder.name
+                ));
+            } else {
+                code.push_str(&format!(
+                    r#"    .extractor_handler_typed::<_, _, _, NoParams>(
+        (),
+        |ctx: Context, Json(_): Json<NoParams>| async move {{
+            // ctx.report_progress(0.5, Some(1.0), Some("Working...")).await;
+            todo!("Implement {} handler with context")
+        }},
+    )
+"#,
+                    builder.name
+                ));
+            }
+        }
+        HandlerType::WithStateAndContext => {
+            if let Some(ref input) = input_type {
+                code.push_str(&format!(
+                    r#"    .extractor_handler_typed::<_, _, _, {}>(
+        state.clone(),  // TODO: pass your Arc<State> here
+        |State(state): State<Arc<YourState>>, ctx: Context, Json(input): Json<{}>| async move {{
+            // ctx.report_progress(0.5, Some(1.0), Some("Working...")).await;
+            todo!("Implement {} handler with state and context")
+        }},
+    )
+"#,
+                    input, input, builder.name
+                ));
+            } else {
+                code.push_str(&format!(
+                    r#"    .extractor_handler_typed::<_, _, _, NoParams>(
+        state.clone(),  // TODO: pass your Arc<State> here
+        |State(state): State<Arc<YourState>>, ctx: Context, Json(_): Json<NoParams>| async move {{
+            todo!("Implement {} handler with state and context")
+        }},
+    )
+"#,
+                    builder.name
+                ));
+            }
+        }
+        HandlerType::Raw => {
+            code.push_str(&format!(
+                r#"    .extractor_handler(
+        (),
+        |RawArgs(args): RawArgs| async move {{
+            // args is a serde_json::Value
+            todo!("Implement {} raw handler")
+        }},
+    )
+"#,
+                builder.name
+            ));
+        }
+        HandlerType::NoParams => {
+            code.push_str(&format!(
+                r#"    .no_params_handler(|| async {{
+        todo!("Implement {} handler")
+    }})
+"#,
+                builder.name
+            ));
+        }
+    }
+
+    // Layers
+    for layer in &builder.layers {
+        code.push_str(&generate_layer_code(layer));
+    }
+
+    code.push_str("    .build()?;\n");
+    code
+}
+
+/// Generate layer application code.
+fn generate_layer_code(layer: &crate::state::LayerConfig) -> String {
+    match layer.layer_type {
+        LayerType::Timeout => {
+            let secs = layer
+                .config
+                .get("secs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(30);
+            format!(
+                "    .layer(tower::timeout::TimeoutLayer::new(std::time::Duration::from_secs({})))\n",
+                secs
+            )
+        }
+        LayerType::RateLimit => {
+            // Note: tower doesn't have a simple rate limit layer built-in
+            // This generates a comment explaining what to do
+            let requests = layer
+                .config
+                .get("requests")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(10);
+            let per_secs = layer
+                .config
+                .get("per_secs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1);
+            format!(
+                "    // TODO: Add rate limiting ({} requests per {} seconds)\n    // Consider using tower-governor or implementing a custom layer\n",
+                requests, per_secs
+            )
+        }
+        LayerType::ConcurrencyLimit => {
+            let max = layer
+                .config
+                .get("max")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(10);
+            format!(
+                "    .layer(tower::limit::ConcurrencyLimitLayer::new({}))\n",
+                max
+            )
+        }
     }
 }
