@@ -916,7 +916,7 @@ impl McpRouter {
     }
 
     /// Get server capabilities based on registered handlers
-    fn capabilities(&self) -> ServerCapabilities {
+    pub fn capabilities(&self) -> ServerCapabilities {
         let has_resources =
             !self.inner.resources.is_empty() || !self.inner.resource_templates.is_empty();
 
@@ -954,6 +954,41 @@ impl McpRouter {
                 None
             },
         }
+    }
+
+    /// Get server name
+    pub fn get_server_name(&self) -> &str {
+        &self.inner.server_name
+    }
+
+    /// Get server version
+    pub fn get_server_version(&self) -> &str {
+        &self.inner.server_version
+    }
+
+    /// Get server title (optional)
+    pub fn get_server_title(&self) -> Option<&str> {
+        self.inner.server_title.as_deref()
+    }
+
+    /// Get server description (optional)
+    pub fn get_server_description(&self) -> Option<&str> {
+        self.inner.server_description.as_deref()
+    }
+
+    /// Get server icons (optional)
+    pub fn get_server_icons(&self) -> Option<&Vec<ToolIcon>> {
+        self.inner.server_icons.as_ref()
+    }
+
+    /// Get server website URL (optional)
+    pub fn get_server_website_url(&self) -> Option<&str> {
+        self.inner.server_website_url.as_deref()
+    }
+
+    /// Get server instructions (optional)
+    pub fn get_instructions(&self) -> Option<&str> {
+        self.inner.instructions.as_deref()
     }
 
     /// Handle an MCP request
@@ -1342,6 +1377,39 @@ impl McpRouter {
                     // No completion handler registered, return empty completions
                     Ok(McpResponse::Complete(CompleteResult::new(vec![])))
                 }
+            }
+
+            #[cfg(feature = "stateless")]
+            McpRequest::Discover => {
+                // SEP-1442: Return server capabilities without requiring initialization
+                tracing::debug!("Server discovery request (SEP-1442)");
+
+                Ok(McpResponse::Discover(crate::stateless::DiscoverResult {
+                    supported_versions: crate::protocol::SUPPORTED_PROTOCOL_VERSIONS
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    capabilities: self.capabilities(),
+                    server_info: Implementation {
+                        name: self.inner.server_name.clone(),
+                        version: self.inner.server_version.clone(),
+                        title: self.inner.server_title.clone(),
+                        description: self.inner.server_description.clone(),
+                        icons: self.inner.server_icons.clone(),
+                        website_url: self.inner.server_website_url.clone(),
+                    },
+                    instructions: self.inner.instructions.clone(),
+                }))
+            }
+
+            #[cfg(feature = "stateless")]
+            McpRequest::MessagesListen(_) => {
+                // SEP-1442: messages/listen is handled specially by HTTP transport
+                // which returns an SSE stream. If called directly via router, return success.
+                tracing::debug!("Messages listen request (SEP-1442)");
+                Ok(McpResponse::MessagesListen(
+                    crate::stateless::MessagesListenNotification {},
+                ))
             }
 
             McpRequest::Unknown { method, .. } => {
@@ -3772,6 +3840,57 @@ mod tests {
                 assert_eq!(result.server_info.version, "1.0");
             }
             _ => panic!("Expected Initialize response"),
+        }
+    }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn test_server_discover_without_init() {
+        // SEP-1442: server/discover should work without initialization
+        let tool = ToolBuilder::new("test_tool")
+            .description("A test tool")
+            .handler(|_: serde_json::Value| async { Ok(CallToolResult::text("ok")) })
+            .build()
+            .unwrap();
+
+        let mut router = McpRouter::new()
+            .server_info("test-server", "1.0.0")
+            .instructions("Test server instructions")
+            .tool(tool);
+
+        // Do NOT initialize - server/discover should work pre-init
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::Discover,
+            extensions: Extensions::new(),
+        };
+
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+
+        match resp.inner {
+            Ok(McpResponse::Discover(result)) => {
+                // Check supported versions
+                assert!(!result.supported_versions.is_empty());
+                assert!(
+                    result
+                        .supported_versions
+                        .contains(&"2025-11-25".to_string())
+                );
+
+                // Check server info
+                assert_eq!(result.server_info.name, "test-server");
+                assert_eq!(result.server_info.version, "1.0.0");
+
+                // Check capabilities - should have tools since we registered one
+                assert!(result.capabilities.tools.is_some());
+
+                // Check instructions
+                assert_eq!(
+                    result.instructions,
+                    Some("Test server instructions".to_string())
+                );
+            }
+            _ => panic!("Expected Discover response, got {:?}", resp.inner),
         }
     }
 }

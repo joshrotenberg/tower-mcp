@@ -178,6 +178,8 @@ pub struct WebSocketTransport {
     service_factory: ServiceFactory,
     #[cfg(feature = "oauth")]
     oauth_config: Option<crate::oauth::ProtectedResourceMetadata>,
+    #[cfg(feature = "stateless")]
+    stateless_config: Option<crate::stateless::StatelessConfig>,
 }
 
 impl WebSocketTransport {
@@ -189,6 +191,8 @@ impl WebSocketTransport {
             service_factory: identity_factory(),
             #[cfg(feature = "oauth")]
             oauth_config: None,
+            #[cfg(feature = "stateless")]
+            stateless_config: None,
         }
     }
 
@@ -224,6 +228,32 @@ impl WebSocketTransport {
     #[cfg(feature = "oauth")]
     pub fn oauth(mut self, metadata: crate::oauth::ProtectedResourceMetadata) -> Self {
         self.oauth_config = Some(metadata);
+        self
+    }
+
+    /// Enable SEP-1442 stateless mode features for WebSocket transport.
+    ///
+    /// **Note:** WebSocket connections are inherently stateful (persistent connection),
+    /// so the full stateless mode (optional sessions) doesn't apply. However, enabling
+    /// this allows:
+    ///
+    /// - `server/discover` RPC before initialization
+    /// - Per-request metadata in `_meta` fields
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use tower_mcp::stateless::StatelessConfig;
+    /// use tower_mcp::transport::websocket::WebSocketTransport;
+    /// use tower_mcp::McpRouter;
+    ///
+    /// let router = McpRouter::new().server_info("my-server", "1.0.0");
+    /// let transport = WebSocketTransport::new(router)
+    ///     .stateless(StatelessConfig::new());
+    /// ```
+    #[cfg(feature = "stateless")]
+    pub fn stateless(mut self, config: crate::stateless::StatelessConfig) -> Self {
+        self.stateless_config = Some(config);
         self
     }
 
