@@ -175,10 +175,12 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         })
         .build();
 
-    // Create the MCP router
+    // Create the MCP router.
+    // auto_instructions() generates instructions from registered tool/resource/prompt
+    // descriptions at initialization time.
     let router = McpRouter::new()
         .server_info("http-example", "1.0.0")
-        .instructions("A simple HTTP MCP server example with add, echo, and slow_task tools.")
+        .auto_instructions()
         .tool(add)
         .tool(echo)
         .tool(slow_task)

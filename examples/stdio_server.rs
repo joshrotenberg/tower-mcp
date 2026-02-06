@@ -73,12 +73,14 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .mime_type("text/x-rust")
         .text(include_str!("stdio_server.rs"));
 
-    // Create router
+    // Create router.
+    // auto_instructions_with() generates tool/resource sections automatically,
+    // with custom prefix text prepended.
     let router = McpRouter::new()
         .server_info("tower-mcp-example", env!("CARGO_PKG_VERSION"))
-        .instructions(
-            "A simple example MCP server with echo, add, and reverse tools. \
-             Read the source://stdio_server.rs resource to see how it's built.",
+        .auto_instructions_with(
+            Some("A simple example MCP server. Read the source://stdio_server.rs resource to see how it's built."),
+            None::<String>,
         )
         .tool(echo)
         .tool(add)
