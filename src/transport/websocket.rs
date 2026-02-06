@@ -777,12 +777,12 @@ async fn process_message(
 ) -> Result<Option<crate::protocol::JsonRpcResponseMessage>> {
     // Check if it's a notification (no id field)
     let parsed: serde_json::Value = serde_json::from_str(text)?;
-    if parsed.get("id").is_none() {
-        if let Ok(notification) = serde_json::from_str::<JsonRpcNotification>(text) {
-            let mcp_notification = McpNotification::from_jsonrpc(&notification)?;
-            router.handle_notification(mcp_notification);
-            return Ok(None);
-        }
+    if parsed.get("id").is_none()
+        && let Ok(notification) = serde_json::from_str::<JsonRpcNotification>(text)
+    {
+        let mcp_notification = McpNotification::from_jsonrpc(&notification)?;
+        router.handle_notification(mcp_notification);
+        return Ok(None);
     }
 
     // Parse and process as a request

@@ -598,10 +598,10 @@ impl JwksValidator {
         // First try with a read lock
         {
             let cache = self.inner.cache.read().await;
-            if !cache.is_expired() {
-                if let Some(key) = lookup_key(&cache.keys, kid) {
-                    return Ok(key);
-                }
+            if !cache.is_expired()
+                && let Some(key) = lookup_key(&cache.keys, kid)
+            {
+                return Ok(key);
             }
         }
 
@@ -700,10 +700,10 @@ fn parse_cache_control_max_age(header: Option<&str>) -> Option<std::time::Durati
     let header = header?;
     for directive in header.split(',') {
         let directive = directive.trim();
-        if let Some(value) = directive.strip_prefix("max-age=") {
-            if let Ok(seconds) = value.trim().parse::<u64>() {
-                return Some(std::time::Duration::from_secs(seconds));
-            }
+        if let Some(value) = directive.strip_prefix("max-age=")
+            && let Ok(seconds) = value.trim().parse::<u64>()
+        {
+            return Some(std::time::Duration::from_secs(seconds));
         }
     }
     None

@@ -214,23 +214,22 @@ fn build_elicitation_tool() -> tower_mcp::Tool {
 
                 match ctx.elicit_form(params).await {
                     Ok(result) => {
-                        if let Some(content) = result.content {
-                            if let Some(ElicitFieldValue::String(api_key)) = content.get("api_key")
-                            {
-                                let client = ExternalApiClient::new(api_key);
-                                match client.list_items(&input.query).await {
-                                    Ok(items) => {
-                                        return Ok(CallToolResult::text(format!(
-                                            "Found (user-provided key): {:?}",
-                                            items
-                                        )));
-                                    }
-                                    Err(e) => {
-                                        return Ok(CallToolResult::error(format!(
-                                            "API error: {}",
-                                            e
-                                        )));
-                                    }
+                        if let Some(content) = result.content
+                            && let Some(ElicitFieldValue::String(api_key)) = content.get("api_key")
+                        {
+                            let client = ExternalApiClient::new(api_key);
+                            match client.list_items(&input.query).await {
+                                Ok(items) => {
+                                    return Ok(CallToolResult::text(format!(
+                                        "Found (user-provided key): {:?}",
+                                        items
+                                    )));
+                                }
+                                Err(e) => {
+                                    return Ok(CallToolResult::error(format!(
+                                        "API error: {}",
+                                        e
+                                    )));
                                 }
                             }
                         }

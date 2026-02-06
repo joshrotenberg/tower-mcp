@@ -1037,10 +1037,10 @@ impl McpRouter {
                     })?;
 
                 // Check tool filter if configured
-                if let Some(filter) = &self.inner.tool_filter {
-                    if !filter.is_visible(&self.session, tool) {
-                        return Err(filter.denial_error(&params.name));
-                    }
+                if let Some(filter) = &self.inner.tool_filter
+                    && !filter.is_visible(&self.session, tool)
+                {
+                    return Err(filter.denial_error(&params.name));
                 }
 
                 // Extract progress token from request metadata
@@ -1095,10 +1095,10 @@ impl McpRouter {
                 // First, try to find a static resource
                 if let Some(resource) = self.inner.resources.get(&params.uri) {
                     // Check resource filter if configured
-                    if let Some(filter) = &self.inner.resource_filter {
-                        if !filter.is_visible(&self.session, resource) {
-                            return Err(filter.denial_error(&params.uri));
-                        }
+                    if let Some(filter) = &self.inner.resource_filter
+                        && !filter.is_visible(&self.session, resource)
+                    {
+                        return Err(filter.denial_error(&params.uri));
                     }
 
                     tracing::debug!(uri = %params.uri, "Reading static resource");
@@ -1184,10 +1184,10 @@ impl McpRouter {
                 })?;
 
                 // Check prompt filter if configured
-                if let Some(filter) = &self.inner.prompt_filter {
-                    if !filter.is_visible(&self.session, prompt) {
-                        return Err(filter.denial_error(&params.name));
-                    }
+                if let Some(filter) = &self.inner.prompt_filter
+                    && !filter.is_visible(&self.session, prompt)
+                {
+                    return Err(filter.denial_error(&params.name));
                 }
 
                 tracing::debug!(name = %params.name, "Getting prompt");
