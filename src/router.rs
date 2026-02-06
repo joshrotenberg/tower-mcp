@@ -74,6 +74,13 @@ impl std::fmt::Debug for McpRouter {
     }
 }
 
+/// Configuration for auto-generated instructions
+#[derive(Clone, Debug)]
+struct AutoInstructionsConfig {
+    prefix: Option<String>,
+    suffix: Option<String>,
+}
+
 /// Inner configuration that is shared across clones
 #[derive(Clone)]
 struct McpRouterInner {
@@ -88,6 +95,7 @@ struct McpRouterInner {
     /// URL of the server's website
     server_website_url: Option<String>,
     instructions: Option<String>,
+    auto_instructions: Option<AutoInstructionsConfig>,
     tools: HashMap<String, Arc<Tool>>,
     resources: HashMap<String, Arc<Resource>>,
     /// Resource templates for dynamic resource matching (keyed by uri_template)
@@ -115,6 +123,89 @@ struct McpRouterInner {
     extensions: Arc<crate::context::Extensions>,
 }
 
+impl McpRouterInner {
+    /// Generate instructions text from registered tools, resources, and prompts.
+    fn generate_instructions(&self, config: &AutoInstructionsConfig) -> String {
+        let mut parts = Vec::new();
+
+        if let Some(prefix) = &config.prefix {
+            parts.push(prefix.clone());
+        }
+
+        // Tools section
+        if !self.tools.is_empty() {
+            let mut lines = vec!["## Tools".to_string(), String::new()];
+            let mut tools: Vec<_> = self.tools.values().collect();
+            tools.sort_by(|a, b| a.name.cmp(&b.name));
+            for tool in tools {
+                let desc = tool.description.as_deref().unwrap_or("No description");
+                let tags = annotation_tags(tool.annotations.as_ref());
+                if tags.is_empty() {
+                    lines.push(format!("- **{}**: {}", tool.name, desc));
+                } else {
+                    lines.push(format!("- **{}**: {} [{}]", tool.name, desc, tags));
+                }
+            }
+            parts.push(lines.join("\n"));
+        }
+
+        // Resources section
+        if !self.resources.is_empty() || !self.resource_templates.is_empty() {
+            let mut lines = vec!["## Resources".to_string(), String::new()];
+            let mut resources: Vec<_> = self.resources.values().collect();
+            resources.sort_by(|a, b| a.uri.cmp(&b.uri));
+            for resource in resources {
+                let desc = resource.description.as_deref().unwrap_or("No description");
+                lines.push(format!("- **{}**: {}", resource.uri, desc));
+            }
+            let mut templates: Vec<_> = self.resource_templates.iter().collect();
+            templates.sort_by(|a, b| a.uri_template.cmp(&b.uri_template));
+            for template in templates {
+                let desc = template.description.as_deref().unwrap_or("No description");
+                lines.push(format!("- **{}**: {}", template.uri_template, desc));
+            }
+            parts.push(lines.join("\n"));
+        }
+
+        // Prompts section
+        if !self.prompts.is_empty() {
+            let mut lines = vec!["## Prompts".to_string(), String::new()];
+            let mut prompts: Vec<_> = self.prompts.values().collect();
+            prompts.sort_by(|a, b| a.name.cmp(&b.name));
+            for prompt in prompts {
+                let desc = prompt.description.as_deref().unwrap_or("No description");
+                lines.push(format!("- **{}**: {}", prompt.name, desc));
+            }
+            parts.push(lines.join("\n"));
+        }
+
+        if let Some(suffix) = &config.suffix {
+            parts.push(suffix.clone());
+        }
+
+        parts.join("\n\n")
+    }
+}
+
+/// Build annotation tags like "read-only, idempotent" from tool annotations.
+///
+/// Only includes tags that differ from the MCP spec defaults
+/// (read-only=false, idempotent=false). The destructive and open-world
+/// hints are omitted because they match the default assumptions.
+fn annotation_tags(annotations: Option<&crate::protocol::ToolAnnotations>) -> String {
+    let Some(ann) = annotations else {
+        return String::new();
+    };
+    let mut tags = Vec::new();
+    if ann.is_read_only() {
+        tags.push("read-only");
+    }
+    if ann.is_idempotent() {
+        tags.push("idempotent");
+    }
+    tags.join(", ")
+}
+
 impl McpRouter {
     /// Create a new MCP router
     pub fn new() -> Self {
@@ -127,6 +218,7 @@ impl McpRouter {
                 server_icons: None,
                 server_website_url: None,
                 instructions: None,
+                auto_instructions: None,
                 tools: HashMap::new(),
                 resources: HashMap::new(),
                 resource_templates: Vec::new(),
@@ -328,6 +420,74 @@ impl McpRouter {
     /// Set instructions for LLMs describing how to use this server
     pub fn instructions(mut self, instructions: impl Into<String>) -> Self {
         Arc::make_mut(&mut self.inner).instructions = Some(instructions.into());
+        self
+    }
+
+    /// Auto-generate instructions from registered tool, resource, and prompt descriptions.
+    ///
+    /// The instructions are generated lazily at initialization time, so this can be
+    /// called at any point in the builder chain regardless of when tools, resources,
+    /// and prompts are registered.
+    ///
+    /// If both `instructions()` and `auto_instructions()` are set, the auto-generated
+    /// instructions take precedence.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::{McpRouter, ToolBuilder, CallToolResult};
+    /// use schemars::JsonSchema;
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Debug, Deserialize, JsonSchema)]
+    /// struct QueryInput { sql: String }
+    ///
+    /// let query_tool = ToolBuilder::new("query")
+    ///     .description("Execute a read-only SQL query")
+    ///     .read_only()
+    ///     .handler(|input: QueryInput| async move {
+    ///         Ok(CallToolResult::text("result"))
+    ///     })
+    ///     .build()
+    ///     .unwrap();
+    ///
+    /// let router = McpRouter::new()
+    ///     .auto_instructions()
+    ///     .tool(query_tool);
+    /// ```
+    pub fn auto_instructions(mut self) -> Self {
+        Arc::make_mut(&mut self.inner).auto_instructions = Some(AutoInstructionsConfig {
+            prefix: None,
+            suffix: None,
+        });
+        self
+    }
+
+    /// Auto-generate instructions with custom prefix and/or suffix text.
+    ///
+    /// The prefix is prepended and suffix appended to the generated instructions.
+    /// See [`auto_instructions`](Self::auto_instructions) for details.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::McpRouter;
+    ///
+    /// let router = McpRouter::new()
+    ///     .auto_instructions_with(
+    ///         Some("This server provides database tools."),
+    ///         Some("Use 'query' for read operations and 'insert' for writes."),
+    ///     );
+    /// ```
+    pub fn auto_instructions_with(
+        mut self,
+        prefix: Option<impl Into<String>>,
+        suffix: Option<impl Into<String>>,
+    ) -> Self {
+        Arc::make_mut(&mut self.inner).auto_instructions = Some(AutoInstructionsConfig {
+            prefix: prefix.map(Into::into),
+            suffix: suffix.map(Into::into),
+        });
         self
     }
 
@@ -1004,7 +1164,11 @@ impl McpRouter {
                         icons: self.inner.server_icons.clone(),
                         website_url: self.inner.server_website_url.clone(),
                     },
-                    instructions: self.inner.instructions.clone(),
+                    instructions: if let Some(config) = &self.inner.auto_instructions {
+                        Some(self.inner.generate_instructions(config))
+                    } else {
+                        self.inner.instructions.clone()
+                    },
                 }))
             }
 
@@ -3766,6 +3930,436 @@ mod tests {
                 assert_eq!(result.server_info.version, "1.0");
             }
             _ => panic!("Expected Initialize response"),
+        }
+    }
+
+    // =========================================================================
+    // Auto-instructions tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_auto_instructions_tools_only() {
+        let tool_a = ToolBuilder::new("alpha")
+            .description("Alpha tool")
+            .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
+            .build()
+            .unwrap();
+        let tool_b = ToolBuilder::new("beta")
+            .description("Beta tool")
+            .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
+            .build()
+            .unwrap();
+
+        let mut router = McpRouter::new()
+            .auto_instructions()
+            .tool(tool_a)
+            .tool(tool_b);
+
+        let resp = send_initialize(&mut router).await;
+        let instructions = resp.instructions.expect("should have instructions");
+
+        assert!(instructions.contains("## Tools"));
+        assert!(instructions.contains("- **alpha**: Alpha tool"));
+        assert!(instructions.contains("- **beta**: Beta tool"));
+        // No resources or prompts sections
+        assert!(!instructions.contains("## Resources"));
+        assert!(!instructions.contains("## Prompts"));
+    }
+
+    #[tokio::test]
+    async fn test_auto_instructions_with_annotations() {
+        let read_only_tool = ToolBuilder::new("query")
+            .description("Run a query")
+            .read_only()
+            .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
+            .build()
+            .unwrap();
+        let destructive_tool = ToolBuilder::new("delete")
+            .description("Delete a record")
+            .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
+            .build()
+            .unwrap();
+        let idempotent_tool = ToolBuilder::new("upsert")
+            .description("Upsert a record")
+            .non_destructive()
+            .idempotent()
+            .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
+            .build()
+            .unwrap();
+
+        let mut router = McpRouter::new()
+            .auto_instructions()
+            .tool(read_only_tool)
+            .tool(destructive_tool)
+            .tool(idempotent_tool);
+
+        let resp = send_initialize(&mut router).await;
+        let instructions = resp.instructions.unwrap();
+
+        assert!(instructions.contains("- **query**: Run a query [read-only]"));
+        // delete has no annotations set via builder, so no tags
+        assert!(instructions.contains("- **delete**: Delete a record\n"));
+        assert!(instructions.contains("- **upsert**: Upsert a record [idempotent]"));
+    }
+
+    #[tokio::test]
+    async fn test_auto_instructions_with_resources() {
+        use crate::resource::ResourceBuilder;
+
+        let resource = ResourceBuilder::new("file:///schema.sql")
+            .name("Schema")
+            .description("Database schema")
+            .text("CREATE TABLE ...");
+
+        let mut router = McpRouter::new().auto_instructions().resource(resource);
+
+        let resp = send_initialize(&mut router).await;
+        let instructions = resp.instructions.unwrap();
+
+        assert!(instructions.contains("## Resources"));
+        assert!(instructions.contains("- **file:///schema.sql**: Database schema"));
+        assert!(!instructions.contains("## Tools"));
+    }
+
+    #[tokio::test]
+    async fn test_auto_instructions_with_resource_templates() {
+        use crate::resource::ResourceTemplateBuilder;
+
+        let template = ResourceTemplateBuilder::new("file:///{path}")
+            .name("File")
+            .description("Read a file by path")
+            .handler(
+                |_uri: String, _vars: std::collections::HashMap<String, String>| async move {
+                    Ok(crate::ReadResourceResult::text("content", "text/plain"))
+                },
+            );
+
+        let mut router = McpRouter::new()
+            .auto_instructions()
+            .resource_template(template);
+
+        let resp = send_initialize(&mut router).await;
+        let instructions = resp.instructions.unwrap();
+
+        assert!(instructions.contains("## Resources"));
+        assert!(instructions.contains("- **file:///{path}**: Read a file by path"));
+    }
+
+    #[tokio::test]
+    async fn test_auto_instructions_with_prompts() {
+        use crate::prompt::PromptBuilder;
+
+        let prompt = PromptBuilder::new("write_query")
+            .description("Help write a SQL query")
+            .user_message("Write a query for: {task}");
+
+        let mut router = McpRouter::new().auto_instructions().prompt(prompt);
+
+        let resp = send_initialize(&mut router).await;
+        let instructions = resp.instructions.unwrap();
+
+        assert!(instructions.contains("## Prompts"));
+        assert!(instructions.contains("- **write_query**: Help write a SQL query"));
+        assert!(!instructions.contains("## Tools"));
+    }
+
+    #[tokio::test]
+    async fn test_auto_instructions_all_sections() {
+        use crate::prompt::PromptBuilder;
+        use crate::resource::ResourceBuilder;
+
+        let tool = ToolBuilder::new("query")
+            .description("Execute SQL")
+            .read_only()
+            .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
+            .build()
+            .unwrap();
+        let resource = ResourceBuilder::new("db://schema")
+            .name("Schema")
+            .description("Full database schema")
+            .text("schema");
+        let prompt = PromptBuilder::new("write_query")
+            .description("Help write a SQL query")
+            .user_message("Write a query");
+
+        let mut router = McpRouter::new()
+            .auto_instructions()
+            .tool(tool)
+            .resource(resource)
+            .prompt(prompt);
+
+        let resp = send_initialize(&mut router).await;
+        let instructions = resp.instructions.unwrap();
+
+        // All three sections present
+        assert!(instructions.contains("## Tools"));
+        assert!(instructions.contains("## Resources"));
+        assert!(instructions.contains("## Prompts"));
+
+        // Sections appear in order: Tools, Resources, Prompts
+        let tools_pos = instructions.find("## Tools").unwrap();
+        let resources_pos = instructions.find("## Resources").unwrap();
+        let prompts_pos = instructions.find("## Prompts").unwrap();
+        assert!(tools_pos < resources_pos);
+        assert!(resources_pos < prompts_pos);
+    }
+
+    #[tokio::test]
+    async fn test_auto_instructions_with_prefix_and_suffix() {
+        let tool = ToolBuilder::new("echo")
+            .description("Echo input")
+            .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
+            .build()
+            .unwrap();
+
+        let mut router = McpRouter::new()
+            .auto_instructions_with(
+                Some("This server provides echo capabilities."),
+                Some("Contact admin@example.com for support."),
+            )
+            .tool(tool);
+
+        let resp = send_initialize(&mut router).await;
+        let instructions = resp.instructions.unwrap();
+
+        assert!(instructions.starts_with("This server provides echo capabilities."));
+        assert!(instructions.ends_with("Contact admin@example.com for support."));
+        assert!(instructions.contains("## Tools"));
+        assert!(instructions.contains("- **echo**: Echo input"));
+    }
+
+    #[tokio::test]
+    async fn test_auto_instructions_prefix_only() {
+        let tool = ToolBuilder::new("echo")
+            .description("Echo input")
+            .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
+            .build()
+            .unwrap();
+
+        let mut router = McpRouter::new()
+            .auto_instructions_with(Some("My server intro."), None::<String>)
+            .tool(tool);
+
+        let resp = send_initialize(&mut router).await;
+        let instructions = resp.instructions.unwrap();
+
+        assert!(instructions.starts_with("My server intro."));
+        assert!(instructions.contains("- **echo**: Echo input"));
+    }
+
+    #[tokio::test]
+    async fn test_auto_instructions_empty_router() {
+        let mut router = McpRouter::new().auto_instructions();
+
+        let resp = send_initialize(&mut router).await;
+        let instructions = resp.instructions.expect("should have instructions");
+
+        // No sections when nothing is registered
+        assert!(!instructions.contains("## Tools"));
+        assert!(!instructions.contains("## Resources"));
+        assert!(!instructions.contains("## Prompts"));
+        assert!(instructions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_auto_instructions_overrides_manual() {
+        let tool = ToolBuilder::new("echo")
+            .description("Echo input")
+            .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
+            .build()
+            .unwrap();
+
+        let mut router = McpRouter::new()
+            .instructions("This will be overridden")
+            .auto_instructions()
+            .tool(tool);
+
+        let resp = send_initialize(&mut router).await;
+        let instructions = resp.instructions.unwrap();
+
+        assert!(!instructions.contains("This will be overridden"));
+        assert!(instructions.contains("- **echo**: Echo input"));
+    }
+
+    #[tokio::test]
+    async fn test_no_auto_instructions_returns_manual() {
+        let tool = ToolBuilder::new("echo")
+            .description("Echo input")
+            .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
+            .build()
+            .unwrap();
+
+        let mut router = McpRouter::new()
+            .instructions("Manual instructions here")
+            .tool(tool);
+
+        let resp = send_initialize(&mut router).await;
+        let instructions = resp.instructions.unwrap();
+
+        assert_eq!(instructions, "Manual instructions here");
+    }
+
+    #[tokio::test]
+    async fn test_auto_instructions_no_description_fallback() {
+        let tool = ToolBuilder::new("mystery")
+            .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
+            .build()
+            .unwrap();
+
+        let mut router = McpRouter::new().auto_instructions().tool(tool);
+
+        let resp = send_initialize(&mut router).await;
+        let instructions = resp.instructions.unwrap();
+
+        assert!(instructions.contains("- **mystery**: No description"));
+    }
+
+    #[tokio::test]
+    async fn test_auto_instructions_sorted_alphabetically() {
+        let tool_z = ToolBuilder::new("zebra")
+            .description("Z tool")
+            .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
+            .build()
+            .unwrap();
+        let tool_a = ToolBuilder::new("alpha")
+            .description("A tool")
+            .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
+            .build()
+            .unwrap();
+        let tool_m = ToolBuilder::new("middle")
+            .description("M tool")
+            .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
+            .build()
+            .unwrap();
+
+        let mut router = McpRouter::new()
+            .auto_instructions()
+            .tool(tool_z)
+            .tool(tool_a)
+            .tool(tool_m);
+
+        let resp = send_initialize(&mut router).await;
+        let instructions = resp.instructions.unwrap();
+
+        let alpha_pos = instructions.find("**alpha**").unwrap();
+        let middle_pos = instructions.find("**middle**").unwrap();
+        let zebra_pos = instructions.find("**zebra**").unwrap();
+        assert!(alpha_pos < middle_pos);
+        assert!(middle_pos < zebra_pos);
+    }
+
+    #[tokio::test]
+    async fn test_auto_instructions_read_only_and_idempotent_tags() {
+        let tool = ToolBuilder::new("safe_update")
+            .description("Safe update operation")
+            .idempotent()
+            .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
+            .build()
+            .unwrap();
+
+        let mut router = McpRouter::new().auto_instructions().tool(tool);
+
+        let resp = send_initialize(&mut router).await;
+        let instructions = resp.instructions.unwrap();
+
+        assert!(
+            instructions.contains("[idempotent]"),
+            "got: {}",
+            instructions
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auto_instructions_lazy_generation() {
+        // auto_instructions() is called BEFORE tools are registered
+        // but instructions should still include tools
+        let mut router = McpRouter::new().auto_instructions();
+
+        let tool = ToolBuilder::new("late_tool")
+            .description("Added after auto_instructions")
+            .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
+            .build()
+            .unwrap();
+
+        router = router.tool(tool);
+
+        let resp = send_initialize(&mut router).await;
+        let instructions = resp.instructions.unwrap();
+
+        assert!(instructions.contains("- **late_tool**: Added after auto_instructions"));
+    }
+
+    #[tokio::test]
+    async fn test_auto_instructions_multiple_annotation_tags() {
+        let tool = ToolBuilder::new("update")
+            .description("Update a record")
+            .annotations(ToolAnnotations {
+                read_only_hint: true,
+                idempotent_hint: true,
+                ..Default::default()
+            })
+            .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
+            .build()
+            .unwrap();
+
+        let mut router = McpRouter::new().auto_instructions().tool(tool);
+
+        let resp = send_initialize(&mut router).await;
+        let instructions = resp.instructions.unwrap();
+
+        assert!(
+            instructions.contains("[read-only, idempotent]"),
+            "got: {}",
+            instructions
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auto_instructions_no_annotations_no_tags() {
+        // Tools without annotations should have no tags at all
+        let tool = ToolBuilder::new("fetch")
+            .description("Fetch data")
+            .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
+            .build()
+            .unwrap();
+
+        let mut router = McpRouter::new().auto_instructions().tool(tool);
+
+        let resp = send_initialize(&mut router).await;
+        let instructions = resp.instructions.unwrap();
+
+        // No bracket tags
+        assert!(
+            !instructions.contains('['),
+            "should have no tags, got: {}",
+            instructions
+        );
+        assert!(instructions.contains("- **fetch**: Fetch data"));
+    }
+
+    /// Helper to send an Initialize request and return the result
+    async fn send_initialize(router: &mut McpRouter) -> InitializeResult {
+        let init_req = RouterRequest {
+            id: RequestId::Number(0),
+            inner: McpRequest::Initialize(InitializeParams {
+                protocol_version: "2025-11-25".to_string(),
+                capabilities: ClientCapabilities {
+                    roots: None,
+                    sampling: None,
+                    elicitation: None,
+                },
+                client_info: Implementation {
+                    name: "test".to_string(),
+                    version: "1.0".to_string(),
+                    ..Default::default()
+                },
+            }),
+            extensions: Extensions::new(),
+        };
+        let resp = router.ready().await.unwrap().call(init_req).await.unwrap();
+        match resp.inner {
+            Ok(McpResponse::Initialize(result)) => result,
+            other => panic!("Expected Initialize response, got {:?}", other),
         }
     }
 }
