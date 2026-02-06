@@ -116,7 +116,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     // Useful for demonstrating SSE event streaming and Last-Event-ID resumption
     let slow_task = ToolBuilder::new("slow_task")
         .description("Simulate a slow task that sends progress notifications (for SSE demo)")
-        .extractor_handler_typed::<_, _, _, SlowTaskInput>(
+        .extractor_handler(
             (),
             |ctx: Context, Json(input): Json<SlowTaskInput>| async move {
                 let steps = input.steps.min(20); // Cap at 20 steps

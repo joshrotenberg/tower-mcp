@@ -158,7 +158,7 @@ pub fn build_tools(state: Arc<CodegenState>) -> Vec<Tool> {
 fn build_init_project(state: Arc<CodegenState>) -> Tool {
     ToolBuilder::new("init_project")
         .description("Initialize a new tower-mcp server project")
-        .extractor_handler_typed::<_, _, _, InitProjectInput>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<CodegenState>>,
              Json(input): Json<InitProjectInput>| async move {
@@ -206,7 +206,7 @@ fn build_init_project(state: Arc<CodegenState>) -> Tool {
 fn build_add_tool(state: Arc<CodegenState>) -> Tool {
     ToolBuilder::new("add_tool")
         .description("Add a tool to the project")
-        .extractor_handler_typed::<_, _, _, AddToolInput>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<CodegenState>>, Json(input): Json<AddToolInput>| async move {
                 let mut project = state.project.write().await;
@@ -282,7 +282,7 @@ pub struct RemoveToolInput {
 fn build_remove_tool(state: Arc<CodegenState>) -> Tool {
     ToolBuilder::new("remove_tool")
         .description("Remove a tool from the project")
-        .extractor_handler_typed::<_, _, _, RemoveToolInput>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<CodegenState>>,
              Json(input): Json<RemoveToolInput>| async move {
@@ -319,7 +319,7 @@ fn build_get_project(state: Arc<CodegenState>) -> Tool {
     ToolBuilder::new("get_project")
         .description("Get the current project state as JSON")
         .read_only()
-        .extractor_handler_typed::<_, _, _, NoParams>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<CodegenState>>, Json(_): Json<NoParams>| async move {
                 let project = state.project.read().await;
@@ -334,7 +334,7 @@ fn build_generate(state: Arc<CodegenState>) -> Tool {
     ToolBuilder::new("generate")
         .description("Generate the complete Rust code for the project")
         .read_only()
-        .extractor_handler_typed::<_, _, _, NoParams>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<CodegenState>>, Json(_): Json<NoParams>| async move {
                 let project = state.project.read().await;
@@ -359,7 +359,7 @@ fn build_validate(state: Arc<CodegenState>) -> Tool {
     ToolBuilder::new("validate")
         .description("Validate the generated code compiles (runs cargo check)")
         .read_only()
-        .extractor_handler_typed::<_, _, _, NoParams>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<CodegenState>>, Json(_): Json<NoParams>| async move {
                 let project = state.project.read().await;
@@ -443,7 +443,7 @@ fn build_validate(state: Arc<CodegenState>) -> Tool {
 fn build_reset(state: Arc<CodegenState>) -> Tool {
     ToolBuilder::new("reset")
         .description("Reset the project state to start over")
-        .extractor_handler_typed::<_, _, _, NoParams>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<CodegenState>>, Json(_): Json<NoParams>| async move {
                 let mut project = state.project.write().await;
@@ -549,7 +549,7 @@ pub struct ToolNewInput {
 fn build_tool_new(state: Arc<CodegenState>) -> Tool {
     ToolBuilder::new("tool_new")
         .description("Start building a new tool. Returns an ID to use with other tool_* commands.")
-        .extractor_handler_typed::<_, _, _, ToolNewInput>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<CodegenState>>, Json(input): Json<ToolNewInput>| async move {
                 let id = state.next_id();
@@ -579,7 +579,7 @@ pub struct ToolSetDescriptionInput {
 fn build_tool_set_description(state: Arc<CodegenState>) -> Tool {
     ToolBuilder::new("tool_set_description")
         .description("Set the description for a tool being built")
-        .extractor_handler_typed::<_, _, _, ToolSetDescriptionInput>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<CodegenState>>,
              Json(input): Json<ToolSetDescriptionInput>| async move {
@@ -623,7 +623,7 @@ pub struct ToolAddInputInput {
 fn build_tool_add_input(state: Arc<CodegenState>) -> Tool {
     ToolBuilder::new("tool_add_input")
         .description("Add an input field to a tool being built. Use list_input_types to see available types.")
-        .extractor_handler_typed::<_, _, _, ToolAddInputInput>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<CodegenState>>,
              Json(input): Json<ToolAddInputInput>| async move {
@@ -671,7 +671,7 @@ pub struct ToolSetHandlerInput {
 fn build_tool_set_handler(state: Arc<CodegenState>) -> Tool {
     ToolBuilder::new("tool_set_handler")
         .description("Set the handler type for a tool. Use list_handler_types to see available types.")
-        .extractor_handler_typed::<_, _, _, ToolSetHandlerInput>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<CodegenState>>,
              Json(input): Json<ToolSetHandlerInput>| async move {
@@ -726,7 +726,7 @@ pub struct ToolSetAnnotationInput {
 fn build_tool_set_annotation(state: Arc<CodegenState>) -> Tool {
     ToolBuilder::new("tool_set_annotation")
         .description("Set an annotation on a tool. Annotations are hints about tool behavior.")
-        .extractor_handler_typed::<_, _, _, ToolSetAnnotationInput>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<CodegenState>>,
              Json(input): Json<ToolSetAnnotationInput>| async move {
@@ -775,7 +775,7 @@ pub struct ToolAddLayerInput {
 fn build_tool_add_layer(state: Arc<CodegenState>) -> Tool {
     ToolBuilder::new("tool_add_layer")
         .description("Add a middleware layer to a tool. Use list_layer_types to see available layers and their config.")
-        .extractor_handler_typed::<_, _, _, ToolAddLayerInput>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<CodegenState>>,
              Json(input): Json<ToolAddLayerInput>| async move {
@@ -829,7 +829,7 @@ fn build_tool_get(state: Arc<CodegenState>) -> Tool {
     ToolBuilder::new("tool_get")
         .description("Get the current state of a tool being built")
         .read_only()
-        .extractor_handler_typed::<_, _, _, ToolIdInput>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<CodegenState>>, Json(input): Json<ToolIdInput>| async move {
                 let tools = state.building_tools.read().await;
@@ -851,7 +851,7 @@ fn build_tool_build(state: Arc<CodegenState>) -> Tool {
     ToolBuilder::new("tool_build")
         .description("Generate Rust code for the tool. Returns the code but keeps the builder for further modifications.")
         .read_only()
-        .extractor_handler_typed::<_, _, _, ToolIdInput>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<CodegenState>>, Json(input): Json<ToolIdInput>| async move {
                 let tools = state.building_tools.read().await;
@@ -882,7 +882,7 @@ fn build_tool_build(state: Arc<CodegenState>) -> Tool {
 fn build_tool_add_to_project(state: Arc<CodegenState>) -> Tool {
     ToolBuilder::new("tool_add_to_project")
         .description("Add the built tool to the project for full project generation")
-        .extractor_handler_typed::<_, _, _, ToolIdInput>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<CodegenState>>, Json(input): Json<ToolIdInput>| async move {
                 let mut tools = state.building_tools.write().await;
@@ -928,7 +928,7 @@ fn build_tool_list(state: Arc<CodegenState>) -> Tool {
     ToolBuilder::new("tool_list")
         .description("List all tools currently being built")
         .read_only()
-        .extractor_handler_typed::<_, _, _, NoParams>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<CodegenState>>, Json(_): Json<NoParams>| async move {
                 let tools = state.building_tools.read().await;
@@ -965,7 +965,7 @@ fn build_tool_list(state: Arc<CodegenState>) -> Tool {
 fn build_tool_discard(state: Arc<CodegenState>) -> Tool {
     ToolBuilder::new("tool_discard")
         .description("Discard a tool being built without adding it to the project")
-        .extractor_handler_typed::<_, _, _, ToolIdInput>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<CodegenState>>, Json(input): Json<ToolIdInput>| async move {
                 let mut tools = state.building_tools.write().await;

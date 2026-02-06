@@ -467,7 +467,7 @@ fn generate_tool_builder(tool: &ToolDef, _has_state: bool) -> String {
                 ));
             } else {
                 code.push_str(&format!(
-                    r#"        .extractor_handler_typed::<_, _, _, NoParams>((), |Json(_): Json<NoParams>| async move {{
+                    r#"        .extractor_handler((), |Json(_): Json<NoParams>| async move {{
             // TODO: implement {}
             // Example: Ok(CallToolResult::text("Done!"))
             Ok(CallToolResult::text("OK"))
@@ -481,17 +481,17 @@ fn generate_tool_builder(tool: &ToolDef, _has_state: bool) -> String {
             if let Some(ref input) = input_type {
                 let example = generate_example_impl(tool, true, false);
                 code.push_str(&format!(
-                    r#"        .extractor_handler_typed::<_, _, _, {}>(state.clone(), |State(state): State<Arc<AppState>>, Json(input): Json<{}>| async move {{
+                    r#"        .extractor_handler(state.clone(), |State(state): State<Arc<AppState>>, Json(input): Json<{}>| async move {{
             // TODO: implement {}
 {}
             Ok(CallToolResult::text(format!("{{:?}}", input)))
         }})
 "#,
-                    input, input, tool.name, example
+                    input, tool.name, example
                 ));
             } else {
                 code.push_str(&format!(
-                    r#"        .extractor_handler_typed::<_, _, _, NoParams>(state.clone(), |State(state): State<Arc<AppState>>, Json(_): Json<NoParams>| async move {{
+                    r#"        .extractor_handler(state.clone(), |State(state): State<Arc<AppState>>, Json(_): Json<NoParams>| async move {{
             // TODO: implement {}
             // Example: let data = state.db.query(...).await?;
             Ok(CallToolResult::text("OK"))
@@ -505,17 +505,17 @@ fn generate_tool_builder(tool: &ToolDef, _has_state: bool) -> String {
             if let Some(ref input) = input_type {
                 let example = generate_example_impl(tool, false, true);
                 code.push_str(&format!(
-                    r#"        .extractor_handler_typed::<_, _, _, {}>((), |ctx: Context, Json(input): Json<{}>| async move {{
+                    r#"        .extractor_handler((), |ctx: Context, Json(input): Json<{}>| async move {{
             // TODO: implement {}
 {}
             Ok(CallToolResult::text(format!("{{:?}}", input)))
         }})
 "#,
-                    input, input, tool.name, example
+                    input, tool.name, example
                 ));
             } else {
                 code.push_str(&format!(
-                    r#"        .extractor_handler_typed::<_, _, _, NoParams>((), |ctx: Context, Json(_): Json<NoParams>| async move {{
+                    r#"        .extractor_handler((), |ctx: Context, Json(_): Json<NoParams>| async move {{
             // TODO: implement {}
             // Example: ctx.report_progress(0.5, Some(1.0), Some("Halfway done")).await;
             Ok(CallToolResult::text("OK"))
@@ -529,17 +529,17 @@ fn generate_tool_builder(tool: &ToolDef, _has_state: bool) -> String {
             if let Some(ref input) = input_type {
                 let example = generate_example_impl(tool, true, true);
                 code.push_str(&format!(
-                    r#"        .extractor_handler_typed::<_, _, _, {}>(state.clone(), |State(state): State<Arc<AppState>>, ctx: Context, Json(input): Json<{}>| async move {{
+                    r#"        .extractor_handler(state.clone(), |State(state): State<Arc<AppState>>, ctx: Context, Json(input): Json<{}>| async move {{
             // TODO: implement {}
 {}
             Ok(CallToolResult::text(format!("{{:?}}", input)))
         }})
 "#,
-                    input, input, tool.name, example
+                    input, tool.name, example
                 ));
             } else {
                 code.push_str(&format!(
-                    r#"        .extractor_handler_typed::<_, _, _, NoParams>(state.clone(), |State(state): State<Arc<AppState>>, ctx: Context, Json(_): Json<NoParams>| async move {{
+                    r#"        .extractor_handler(state.clone(), |State(state): State<Arc<AppState>>, ctx: Context, Json(_): Json<NoParams>| async move {{
             // TODO: implement {}
             // Example:
             //   ctx.report_progress(0.0, Some(1.0), Some("Starting")).await;
@@ -567,7 +567,7 @@ fn generate_tool_builder(tool: &ToolDef, _has_state: bool) -> String {
         }
         HandlerType::NoParams => {
             code.push_str(&format!(
-                r#"        .extractor_handler_typed::<_, _, _, NoParams>((), |Json(_): Json<NoParams>| async move {{
+                r#"        .extractor_handler((), |Json(_): Json<NoParams>| async move {{
             // TODO: implement {}
             // Example: Ok(CallToolResult::text("Done!"))
             Ok(CallToolResult::text("OK"))
@@ -765,18 +765,18 @@ fn generate_component_tool_builder(builder: &ToolBuilderState) -> String {
         HandlerType::WithState => {
             if let Some(ref input) = input_type {
                 code.push_str(&format!(
-                    r#"    .extractor_handler_typed::<_, _, _, {}>(
+                    r#"    .extractor_handler(
         state.clone(),  // TODO: pass your Arc<State> here
         |State(state): State<Arc<YourState>>, Json(input): Json<{}>| async move {{
             todo!("Implement {} handler with state")
         }},
     )
 "#,
-                    input, input, builder.name
+                    input, builder.name
                 ));
             } else {
                 code.push_str(&format!(
-                    r#"    .extractor_handler_typed::<_, _, _, NoParams>(
+                    r#"    .extractor_handler(
         state.clone(),  // TODO: pass your Arc<State> here
         |State(state): State<Arc<YourState>>, Json(_): Json<NoParams>| async move {{
             todo!("Implement {} handler with state")
@@ -790,7 +790,7 @@ fn generate_component_tool_builder(builder: &ToolBuilderState) -> String {
         HandlerType::WithContext => {
             if let Some(ref input) = input_type {
                 code.push_str(&format!(
-                    r#"    .extractor_handler_typed::<_, _, _, {}>(
+                    r#"    .extractor_handler(
         (),
         |ctx: Context, Json(input): Json<{}>| async move {{
             // ctx.report_progress(0.5, Some(1.0), Some("Working...")).await;
@@ -799,11 +799,11 @@ fn generate_component_tool_builder(builder: &ToolBuilderState) -> String {
         }},
     )
 "#,
-                    input, input, builder.name
+                    input, builder.name
                 ));
             } else {
                 code.push_str(&format!(
-                    r#"    .extractor_handler_typed::<_, _, _, NoParams>(
+                    r#"    .extractor_handler(
         (),
         |ctx: Context, Json(_): Json<NoParams>| async move {{
             // ctx.report_progress(0.5, Some(1.0), Some("Working...")).await;
@@ -818,7 +818,7 @@ fn generate_component_tool_builder(builder: &ToolBuilderState) -> String {
         HandlerType::WithStateAndContext => {
             if let Some(ref input) = input_type {
                 code.push_str(&format!(
-                    r#"    .extractor_handler_typed::<_, _, _, {}>(
+                    r#"    .extractor_handler(
         state.clone(),  // TODO: pass your Arc<State> here
         |State(state): State<Arc<YourState>>, ctx: Context, Json(input): Json<{}>| async move {{
             // ctx.report_progress(0.5, Some(1.0), Some("Working...")).await;
@@ -826,11 +826,11 @@ fn generate_component_tool_builder(builder: &ToolBuilderState) -> String {
         }},
     )
 "#,
-                    input, input, builder.name
+                    input, builder.name
                 ));
             } else {
                 code.push_str(&format!(
-                    r#"    .extractor_handler_typed::<_, _, _, NoParams>(
+                    r#"    .extractor_handler(
         state.clone(),  // TODO: pass your Arc<State> here
         |State(state): State<Arc<YourState>>, ctx: Context, Json(_): Json<NoParams>| async move {{
             todo!("Implement {} handler with state and context")

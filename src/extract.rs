@@ -534,7 +534,7 @@ impl<S> FromToolRequest<S> for RawArgs {
 ///
 /// let tool = ToolBuilder::new("query")
 ///     .description("Run a query")
-///     .extractor_handler_typed::<_, _, _, QueryInput>(
+///     .extractor_handler(
 ///         (),
 ///         |Extension(db): Extension<Arc<DatabasePool>>, Json(input): Json<QueryInput>| async move {
 ///             Ok(CallToolResult::text(format!("Query on {}: {}", db.url, input.sql)))

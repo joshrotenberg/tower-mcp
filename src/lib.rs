@@ -43,7 +43,7 @@
 //! // Looks just like an axum handler!
 //! let tool = ToolBuilder::new("search")
 //!     .description("Search the database")
-//!     .extractor_handler_typed::<_, _, _, SearchInput>(
+//!     .extractor_handler(
 //!         Arc::new(AppState { db_url: "postgres://...".into() }),
 //!         |State(app): State<Arc<AppState>>,
 //!          ctx: Context,
