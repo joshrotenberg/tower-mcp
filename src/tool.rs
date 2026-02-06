@@ -47,7 +47,7 @@ use tower::util::BoxCloneService;
 use tower_service::Service;
 
 use crate::context::RequestContext;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, ResultExt};
 use crate::protocol::{CallToolResult, ToolAnnotations, ToolDefinition, ToolIcon};
 
 // =============================================================================
@@ -1182,8 +1182,7 @@ where
 {
     fn call(&self, args: Value) -> BoxFuture<'_, Result<CallToolResult>> {
         Box::pin(async move {
-            let input: I = serde_json::from_value(args)
-                .map_err(|e| Error::tool(format!("Invalid input: {}", e)))?;
+            let input: I = serde_json::from_value(args).tool_context("Invalid input")?;
             (self.handler)(input).await
         })
     }
@@ -1283,11 +1282,9 @@ impl<T: McpTool> ToolHandler for McpToolHandler<T> {
     fn call(&self, args: Value) -> BoxFuture<'_, Result<CallToolResult>> {
         let tool = self.tool.clone();
         Box::pin(async move {
-            let input: T::Input = serde_json::from_value(args)
-                .map_err(|e| Error::tool(format!("Invalid input: {}", e)))?;
+            let input: T::Input = serde_json::from_value(args).tool_context("Invalid input")?;
             let output = tool.call(input).await?;
-            let value = serde_json::to_value(output)
-                .map_err(|e| Error::tool(format!("Failed to serialize output: {}", e)))?;
+            let value = serde_json::to_value(output).tool_context("Failed to serialize output")?;
             Ok(CallToolResult::json(value))
         })
     }
