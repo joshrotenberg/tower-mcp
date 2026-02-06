@@ -403,7 +403,7 @@ pub use resource::{
 };
 pub use router::{McpRouter, RouterRequest, RouterResponse};
 pub use session::{SessionPhase, SessionState};
-pub use tool::{BoxToolService, NoParams, Tool, ToolBuilder, ToolHandler, ToolRequest};
+pub use tool::{BoxToolService, GuardLayer, NoParams, Tool, ToolBuilder, ToolHandler, ToolRequest};
 pub use tracing_layer::{McpTracingLayer, McpTracingService};
 pub use transport::{
     BidirectionalStdioTransport, CatchError, GenericStdioTransport, StdioTransport,
