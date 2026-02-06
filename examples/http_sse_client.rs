@@ -233,11 +233,11 @@ async fn reconnect_and_show_replay(
                 match chunk {
                     Some(Ok(bytes)) => {
                         let text = String::from_utf8_lossy(&bytes);
-                        if let Some((id, is_replay)) = parse_sse_events_with_replay_detection(&text, last_event_id, &mut seen_ids) {
-                            if is_replay {
-                                replay_count += 1;
-                                println!("  >> REPLAYED Event (id: {}) - this was buffered while we were offline!", id);
-                            }
+                        if let Some((id, is_replay)) = parse_sse_events_with_replay_detection(&text, last_event_id, &mut seen_ids)
+                            && is_replay
+                        {
+                            replay_count += 1;
+                            println!("  >> REPLAYED Event (id: {}) - this was buffered while we were offline!", id);
                         }
                     }
                     Some(Err(e)) => {
@@ -276,23 +276,22 @@ fn parse_sse_events_with_replay_detection(
 
     for line in text.lines() {
         if line.is_empty() {
-            if let Some(id) = current_id {
-                if !seen_ids.contains(&id) {
-                    seen_ids.push(id);
-                    // Events replayed have IDs that came after our last_sent_id
-                    // but arrived immediately on reconnect (before any new events)
-                    let is_replay = id > last_sent_id && seen_ids.len() <= 10; // heuristic
-                    result = Some((id, is_replay));
+            if let Some(id) = current_id
+                && !seen_ids.contains(&id)
+            {
+                seen_ids.push(id);
+                // Events replayed have IDs that came after our last_sent_id
+                // but arrived immediately on reconnect (before any new events)
+                let is_replay = id > last_sent_id && seen_ids.len() <= 10; // heuristic
+                result = Some((id, is_replay));
 
-                    if !current_data.is_empty() {
-                        let data = current_data.join("");
-                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
-                            if let Some(method) = json.get("method").and_then(|m| m.as_str()) {
-                                if !is_replay {
-                                    println!("  Event (id: {}): {}", id, method);
-                                }
-                            }
-                        }
+                if !current_data.is_empty() {
+                    let data = current_data.join("");
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data)
+                        && let Some(method) = json.get("method").and_then(|m| m.as_str())
+                        && !is_replay
+                    {
+                        println!("  Event (id: {}): {}", id, method);
                     }
                 }
             }

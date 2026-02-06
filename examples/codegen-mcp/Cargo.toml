@@ -2,7 +2,7 @@
 name = "codegen-mcp"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.90"
 description = "MCP server that helps AI agents build tower-mcp servers"
 license = "MIT OR Apache-2.0"
 publish = false

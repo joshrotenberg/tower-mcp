@@ -44,11 +44,11 @@ async fn process_line(
 ) -> Result<Option<JsonRpcResponseMessage>> {
     // Check if it's a notification (no id field)
     let parsed: serde_json::Value = serde_json::from_str(line)?;
-    if parsed.get("id").is_none() {
-        if let Ok(notification) = serde_json::from_str::<JsonRpcNotification>(line) {
-            handle_notification(router, notification)?;
-            return Ok(None);
-        }
+    if parsed.get("id").is_none()
+        && let Ok(notification) = serde_json::from_str::<JsonRpcNotification>(line)
+    {
+        handle_notification(router, notification)?;
+        return Ok(None);
     }
 
     // Parse and process as a request (single or batch)
