@@ -737,13 +737,55 @@ impl ToolBuilder {
     /// This reduces the combinatorial explosion of handler variants like
     /// `handler_with_state`, `handler_with_context`, etc.
     ///
+    /// # Schema Auto-Detection
+    ///
+    /// When a [`Json<T>`](crate::extract::Json) extractor is used, the proper JSON
+    /// schema is automatically generated from `T`'s `JsonSchema` implementation.
+    /// This means `extractor_handler` produces the same schema as
+    /// `extractor_handler_typed` for the common case, without requiring a turbofish.
+    ///
     /// # Extractors
     ///
     /// Built-in extractors available in [`crate::extract`]:
     /// - [`Json<T>`](crate::extract::Json) - Deserialize JSON arguments to type `T`
     /// - [`State<T>`](crate::extract::State) - Extract cloned state
+    /// - [`Extension<T>`](crate::extract::Extension) - Extract router-level state
     /// - [`Context`](crate::extract::Context) - Extract request context
     /// - [`RawArgs`](crate::extract::RawArgs) - Extract raw JSON arguments
+    ///
+    /// # Per-Tool Middleware
+    ///
+    /// The returned builder supports `.layer()` to apply Tower middleware:
+    ///
+    /// ```rust
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    /// use tower::timeout::TimeoutLayer;
+    /// use tower_mcp::{ToolBuilder, CallToolResult};
+    /// use tower_mcp::extract::{Json, State};
+    /// use schemars::JsonSchema;
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Clone)]
+    /// struct Database { url: String }
+    ///
+    /// #[derive(Debug, Deserialize, JsonSchema)]
+    /// struct QueryInput { query: String }
+    ///
+    /// let db = Arc::new(Database { url: "postgres://...".to_string() });
+    ///
+    /// let tool = ToolBuilder::new("search")
+    ///     .description("Search the database")
+    ///     .extractor_handler(db, |
+    ///         State(db): State<Arc<Database>>,
+    ///         Json(input): Json<QueryInput>,
+    ///     | async move {
+    ///         Ok(CallToolResult::text(format!("Searched {} with: {}", db.url, input.query)))
+    ///     })
+    ///     .layer(TimeoutLayer::new(Duration::from_secs(30)))
+    ///     .build()
+    ///     .unwrap();
+    /// ```
     ///
     /// # Example
     ///
@@ -809,8 +851,12 @@ impl ToolBuilder {
 
     /// Create a tool using the extractor pattern with typed JSON input.
     ///
-    /// This is similar to [`extractor_handler`](Self::extractor_handler) but provides
-    /// proper JSON schema generation when using `Json<T>` as an extractor.
+    /// This is similar to [`extractor_handler`](Self::extractor_handler) but requires
+    /// an explicit type parameter for the JSON input type via turbofish syntax.
+    ///
+    /// Since `extractor_handler` now auto-detects the JSON schema from `Json<T>`
+    /// extractors, this method is typically unnecessary. It remains available for
+    /// cases where you need explicit control over the schema type parameter.
     ///
     /// # Example
     ///
