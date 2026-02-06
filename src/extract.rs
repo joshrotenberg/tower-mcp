@@ -609,7 +609,7 @@ where
     S: Clone + Send + Sync + 'static,
     F: Fn(T1) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Result<CallToolResult>> + Send,
-    T1: FromToolRequest<S> + Send,
+    T1: FromToolRequest<S> + HasSchema + Send,
 {
     type Future = Pin<Box<dyn Future<Output = Result<CallToolResult>> + Send>>;
 
@@ -621,7 +621,9 @@ where
     }
 
     fn input_schema() -> Value {
-        // For single extractors, check if it's Json<T>
+        if let Some(schema) = T1::schema() {
+            return schema;
+        }
         serde_json::json!({
             "type": "object",
             "additionalProperties": true
@@ -635,8 +637,8 @@ where
     S: Clone + Send + Sync + 'static,
     F: Fn(T1, T2) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Result<CallToolResult>> + Send,
-    T1: FromToolRequest<S> + Send,
-    T2: FromToolRequest<S> + Send,
+    T1: FromToolRequest<S> + HasSchema + Send,
+    T2: FromToolRequest<S> + HasSchema + Send,
 {
     type Future = Pin<Box<dyn Future<Output = Result<CallToolResult>> + Send>>;
 
@@ -649,6 +651,12 @@ where
     }
 
     fn input_schema() -> Value {
+        if let Some(schema) = T2::schema() {
+            return schema;
+        }
+        if let Some(schema) = T1::schema() {
+            return schema;
+        }
         serde_json::json!({
             "type": "object",
             "additionalProperties": true
@@ -662,9 +670,9 @@ where
     S: Clone + Send + Sync + 'static,
     F: Fn(T1, T2, T3) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Result<CallToolResult>> + Send,
-    T1: FromToolRequest<S> + Send,
-    T2: FromToolRequest<S> + Send,
-    T3: FromToolRequest<S> + Send,
+    T1: FromToolRequest<S> + HasSchema + Send,
+    T2: FromToolRequest<S> + HasSchema + Send,
+    T3: FromToolRequest<S> + HasSchema + Send,
 {
     type Future = Pin<Box<dyn Future<Output = Result<CallToolResult>> + Send>>;
 
@@ -678,6 +686,15 @@ where
     }
 
     fn input_schema() -> Value {
+        if let Some(schema) = T3::schema() {
+            return schema;
+        }
+        if let Some(schema) = T2::schema() {
+            return schema;
+        }
+        if let Some(schema) = T1::schema() {
+            return schema;
+        }
         serde_json::json!({
             "type": "object",
             "additionalProperties": true
@@ -691,10 +708,10 @@ where
     S: Clone + Send + Sync + 'static,
     F: Fn(T1, T2, T3, T4) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Result<CallToolResult>> + Send,
-    T1: FromToolRequest<S> + Send,
-    T2: FromToolRequest<S> + Send,
-    T3: FromToolRequest<S> + Send,
-    T4: FromToolRequest<S> + Send,
+    T1: FromToolRequest<S> + HasSchema + Send,
+    T2: FromToolRequest<S> + HasSchema + Send,
+    T3: FromToolRequest<S> + HasSchema + Send,
+    T4: FromToolRequest<S> + HasSchema + Send,
 {
     type Future = Pin<Box<dyn Future<Output = Result<CallToolResult>> + Send>>;
 
@@ -709,6 +726,18 @@ where
     }
 
     fn input_schema() -> Value {
+        if let Some(schema) = T4::schema() {
+            return schema;
+        }
+        if let Some(schema) = T3::schema() {
+            return schema;
+        }
+        if let Some(schema) = T2::schema() {
+            return schema;
+        }
+        if let Some(schema) = T1::schema() {
+            return schema;
+        }
         serde_json::json!({
             "type": "object",
             "additionalProperties": true
@@ -722,11 +751,11 @@ where
     S: Clone + Send + Sync + 'static,
     F: Fn(T1, T2, T3, T4, T5) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Result<CallToolResult>> + Send,
-    T1: FromToolRequest<S> + Send,
-    T2: FromToolRequest<S> + Send,
-    T3: FromToolRequest<S> + Send,
-    T4: FromToolRequest<S> + Send,
-    T5: FromToolRequest<S> + Send,
+    T1: FromToolRequest<S> + HasSchema + Send,
+    T2: FromToolRequest<S> + HasSchema + Send,
+    T3: FromToolRequest<S> + HasSchema + Send,
+    T4: FromToolRequest<S> + HasSchema + Send,
+    T5: FromToolRequest<S> + HasSchema + Send,
 {
     type Future = Pin<Box<dyn Future<Output = Result<CallToolResult>> + Send>>;
 
@@ -742,6 +771,21 @@ where
     }
 
     fn input_schema() -> Value {
+        if let Some(schema) = T5::schema() {
+            return schema;
+        }
+        if let Some(schema) = T4::schema() {
+            return schema;
+        }
+        if let Some(schema) = T3::schema() {
+            return schema;
+        }
+        if let Some(schema) = T2::schema() {
+            return schema;
+        }
+        if let Some(schema) = T1::schema() {
+            return schema;
+        }
         serde_json::json!({
             "type": "object",
             "additionalProperties": true
@@ -779,6 +823,12 @@ impl HasSchema for RawArgs {
 }
 
 impl<T> HasSchema for State<T> {
+    fn schema() -> Option<Value> {
+        None
+    }
+}
+
+impl<T> HasSchema for Extension<T> {
     fn schema() -> Option<Value> {
         None
     }
@@ -895,8 +945,12 @@ where
 // ToolBuilder Extensions
 // =============================================================================
 
-use crate::tool::{BoxFuture, Tool, ToolCatchError, ToolHandler, validate_tool_name};
+use crate::tool::{
+    BoxFuture, Tool, ToolCatchError, ToolHandler, ToolHandlerService, ToolRequest,
+    validate_tool_name,
+};
 use tower::util::BoxCloneService;
+use tower_service::Service;
 
 /// Internal handler wrapper for extractor-based handlers
 pub(crate) struct ExtractorToolHandler<S, F, T> {
@@ -969,7 +1023,7 @@ where
             _phantom: PhantomData,
         };
 
-        let handler_service = crate::tool::ToolHandlerService::new(handler);
+        let handler_service = ToolHandlerService::new(handler);
         let catch_error = ToolCatchError::new(handler_service);
         let service = BoxCloneService::new(catch_error);
 
@@ -983,6 +1037,144 @@ where
             service,
             input_schema: self.input_schema,
         })
+    }
+
+    /// Apply a Tower layer (middleware) to this tool.
+    ///
+    /// The layer wraps the tool's handler service, enabling functionality like
+    /// timeouts, rate limiting, and metrics collection at the per-tool level.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    /// use tower::timeout::TimeoutLayer;
+    /// use tower_mcp::{ToolBuilder, CallToolResult};
+    /// use tower_mcp::extract::{Json, State};
+    /// use schemars::JsonSchema;
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Clone)]
+    /// struct AppState { prefix: String }
+    ///
+    /// #[derive(Debug, Deserialize, JsonSchema)]
+    /// struct QueryInput { query: String }
+    ///
+    /// let state = Arc::new(AppState { prefix: "db".to_string() });
+    ///
+    /// let tool = ToolBuilder::new("search")
+    ///     .description("Search with timeout")
+    ///     .extractor_handler(state, |
+    ///         State(app): State<Arc<AppState>>,
+    ///         Json(input): Json<QueryInput>,
+    ///     | async move {
+    ///         Ok(CallToolResult::text(format!("{}: {}", app.prefix, input.query)))
+    ///     })
+    ///     .layer(TimeoutLayer::new(Duration::from_secs(30)))
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn layer<L>(self, layer: L) -> ToolBuilderWithExtractorLayer<S, F, T, L> {
+        ToolBuilderWithExtractorLayer {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            output_schema: self.output_schema,
+            icons: self.icons,
+            annotations: self.annotations,
+            state: self.state,
+            handler: self.handler,
+            input_schema: self.input_schema,
+            layer,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+/// Builder state after a layer has been applied to an extractor handler.
+///
+/// This builder allows chaining additional layers and building the final tool.
+pub struct ToolBuilderWithExtractorLayer<S, F, T, L> {
+    name: String,
+    title: Option<String>,
+    description: Option<String>,
+    output_schema: Option<Value>,
+    icons: Option<Vec<crate::protocol::ToolIcon>>,
+    annotations: Option<crate::protocol::ToolAnnotations>,
+    state: S,
+    handler: F,
+    input_schema: Value,
+    layer: L,
+    _phantom: PhantomData<T>,
+}
+
+#[allow(private_bounds)]
+impl<S, F, T, L> ToolBuilderWithExtractorLayer<S, F, T, L>
+where
+    S: Clone + Send + Sync + 'static,
+    F: ExtractorHandler<S, T> + Clone,
+    T: Send + Sync + 'static,
+    L: tower::Layer<ToolHandlerService<ExtractorToolHandler<S, F, T>>>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    L::Service: Service<ToolRequest, Response = CallToolResult> + Clone + Send + 'static,
+    <L::Service as Service<ToolRequest>>::Error: std::fmt::Display + Send,
+    <L::Service as Service<ToolRequest>>::Future: Send,
+{
+    /// Build the tool with the applied layer(s).
+    ///
+    /// Returns an error if the tool name is invalid.
+    pub fn build(self) -> Result<Tool> {
+        validate_tool_name(&self.name)?;
+
+        let handler = ExtractorToolHandler {
+            state: self.state,
+            handler: self.handler,
+            input_schema: self.input_schema.clone(),
+            _phantom: PhantomData,
+        };
+
+        let handler_service = ToolHandlerService::new(handler);
+        let layered = self.layer.layer(handler_service);
+        let catch_error = ToolCatchError::new(layered);
+        let service = BoxCloneService::new(catch_error);
+
+        Ok(Tool {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            output_schema: self.output_schema,
+            icons: self.icons,
+            annotations: self.annotations,
+            service,
+            input_schema: self.input_schema,
+        })
+    }
+
+    /// Apply an additional Tower layer (middleware).
+    ///
+    /// Layers are applied in order, with earlier layers wrapping later ones.
+    /// This means the first layer added is the outermost middleware.
+    pub fn layer<L2>(
+        self,
+        layer: L2,
+    ) -> ToolBuilderWithExtractorLayer<S, F, T, tower::layer::util::Stack<L2, L>> {
+        ToolBuilderWithExtractorLayer {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            output_schema: self.output_schema,
+            icons: self.icons,
+            annotations: self.annotations,
+            state: self.state,
+            handler: self.handler,
+            input_schema: self.input_schema,
+            layer: tower::layer::util::Stack::new(layer, self.layer),
+            _phantom: PhantomData,
+        }
     }
 }
 
@@ -1396,5 +1588,177 @@ mod tests {
             .call(serde_json::json!({"name": "world", "count": 99}))
             .await;
         assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn test_extractor_handler_auto_schema() {
+        use crate::ToolBuilder;
+
+        let state = Arc::new("auto-schema".to_string());
+
+        // extractor_handler (not _typed) should auto-detect Json<TestInput> schema
+        let tool = ToolBuilder::new("test_auto_schema")
+            .description("Test auto schema detection")
+            .extractor_handler(
+                state,
+                |State(state): State<Arc<String>>, Json(input): Json<TestInput>| async move {
+                    Ok(CallToolResult::text(format!(
+                        "{}: {} - {}",
+                        state, input.name, input.count
+                    )))
+                },
+            )
+            .build()
+            .expect("valid tool name");
+
+        // Verify schema is properly generated from TestInput (not generic object)
+        let def = tool.definition();
+        let schema = def.input_schema;
+        assert!(
+            schema.get("properties").is_some(),
+            "Schema should have properties from TestInput, got: {}",
+            schema
+        );
+        let props = schema.get("properties").unwrap();
+        assert!(
+            props.get("name").is_some(),
+            "Schema should have 'name' property"
+        );
+        assert!(
+            props.get("count").is_some(),
+            "Schema should have 'count' property"
+        );
+
+        // Test calling the tool
+        let result = tool
+            .call(serde_json::json!({"name": "world", "count": 99}))
+            .await;
+        assert!(!result.is_error);
+    }
+
+    #[test]
+    fn test_extractor_handler_no_json_fallback() {
+        use crate::ToolBuilder;
+
+        // extractor_handler without Json<T> should fall back to generic schema
+        let tool = ToolBuilder::new("test_no_json")
+            .description("Test no json fallback")
+            .extractor_handler((), |RawArgs(args): RawArgs| async move {
+                Ok(CallToolResult::json(args))
+            })
+            .build()
+            .expect("valid tool name");
+
+        let def = tool.definition();
+        let schema = def.input_schema;
+        assert_eq!(
+            schema.get("type").and_then(|v| v.as_str()),
+            Some("object"),
+            "Schema should be generic object"
+        );
+        assert_eq!(
+            schema.get("additionalProperties").and_then(|v| v.as_bool()),
+            Some(true),
+            "Schema should allow additional properties"
+        );
+        // Should NOT have specific properties
+        assert!(
+            schema.get("properties").is_none(),
+            "Generic schema should not have specific properties"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extractor_handler_with_layer() {
+        use crate::ToolBuilder;
+        use std::time::Duration;
+        use tower::timeout::TimeoutLayer;
+
+        let state = Arc::new("layered".to_string());
+
+        let tool = ToolBuilder::new("test_extractor_layer")
+            .description("Test extractor handler with layer")
+            .extractor_handler(
+                state,
+                |State(s): State<Arc<String>>, Json(input): Json<TestInput>| async move {
+                    Ok(CallToolResult::text(format!("{}: {}", s, input.name)))
+                },
+            )
+            .layer(TimeoutLayer::new(Duration::from_secs(5)))
+            .build()
+            .expect("valid tool name");
+
+        // Verify the tool works
+        let result = tool
+            .call(serde_json::json!({"name": "test", "count": 1}))
+            .await;
+        assert!(!result.is_error);
+        assert_eq!(result.first_text().unwrap(), "layered: test");
+
+        // Verify schema is still properly generated
+        let def = tool.definition();
+        let schema = def.input_schema;
+        assert!(
+            schema.get("properties").is_some(),
+            "Schema should have properties even with layer"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extractor_handler_with_timeout_layer() {
+        use crate::ToolBuilder;
+        use std::time::Duration;
+        use tower::timeout::TimeoutLayer;
+
+        let tool = ToolBuilder::new("test_extractor_timeout")
+            .description("Test extractor handler timeout")
+            .extractor_handler((), |Json(input): Json<TestInput>| async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Ok(CallToolResult::text(input.name.to_string()))
+            })
+            .layer(TimeoutLayer::new(Duration::from_millis(50)))
+            .build()
+            .expect("valid tool name");
+
+        // Should timeout
+        let result = tool
+            .call(serde_json::json!({"name": "slow", "count": 1}))
+            .await;
+        assert!(result.is_error);
+        let msg = result.first_text().unwrap().to_lowercase();
+        assert!(
+            msg.contains("timed out") || msg.contains("timeout") || msg.contains("elapsed"),
+            "Expected timeout error, got: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extractor_handler_with_multiple_layers() {
+        use crate::ToolBuilder;
+        use std::time::Duration;
+        use tower::limit::ConcurrencyLimitLayer;
+        use tower::timeout::TimeoutLayer;
+
+        let state = Arc::new("multi".to_string());
+
+        let tool = ToolBuilder::new("test_multi_layer")
+            .description("Test multiple layers")
+            .extractor_handler(
+                state,
+                |State(s): State<Arc<String>>, Json(input): Json<TestInput>| async move {
+                    Ok(CallToolResult::text(format!("{}: {}", s, input.name)))
+                },
+            )
+            .layer(TimeoutLayer::new(Duration::from_secs(5)))
+            .layer(ConcurrencyLimitLayer::new(10))
+            .build()
+            .expect("valid tool name");
+
+        let result = tool
+            .call(serde_json::json!({"name": "test", "count": 1}))
+            .await;
+        assert!(!result.is_error);
+        assert_eq!(result.first_text().unwrap(), "multi: test");
     }
 }
