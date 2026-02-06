@@ -89,10 +89,11 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         })
         .build()?;
 
-    // Create the router with our tools
+    // Create the router with our tools.
+    // auto_instructions() generates instructions from tool descriptions at init time.
     let router = McpRouter::new()
         .server_info("basic-example", "0.1.0")
-        .instructions("A simple example server with greeting and math tools")
+        .auto_instructions()
         .tool(greet)
         .tool(add)
         .tool(echo);
