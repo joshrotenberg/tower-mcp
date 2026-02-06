@@ -320,13 +320,15 @@ impl Error {
 
     /// Create a tool error with context prefix.
     ///
-    /// This is useful for adding context when converting errors:
+    /// This is useful for adding context when converting errors.
+    /// For a more ergonomic API, see [`ResultExt::tool_context`] which can be
+    /// called directly on `Result` values:
     ///
     /// ```rust
-    /// # use tower_mcp::Error;
-    /// # fn example() -> Result<(), Error> {
+    /// # use tower_mcp::error::ResultExt;
+    /// # fn example() -> tower_mcp::Result<()> {
     /// let result: Result<(), std::io::Error> = Err(std::io::Error::other("connection refused"));
-    /// result.map_err(|e| Error::tool_context("API request failed", e))?;
+    /// result.tool_context("API request failed")?;
     /// # Ok(())
     /// # }
     /// ```
@@ -356,6 +358,60 @@ impl Error {
     /// ```
     pub fn internal(message: impl Into<String>) -> Self {
         Error::JsonRpc(JsonRpcError::internal_error(message))
+    }
+}
+
+/// Extension trait for converting errors into tower-mcp tool errors.
+///
+/// Provides ergonomic error conversion methods on `Result` types,
+/// similar to `anyhow::Context`. Import this trait to use `.tool_err()`
+/// and `.tool_context()` on any `Result` whose error type implements `Display`.
+///
+/// # Examples
+///
+/// ```rust
+/// use tower_mcp::error::ResultExt;
+///
+/// fn query_database() -> tower_mcp::Result<String> {
+///     let result: Result<String, std::io::Error> =
+///         Err(std::io::Error::other("connection refused"));
+///     let value = result.tool_context("database query failed")?;
+///     Ok(value)
+/// }
+/// ```
+pub trait ResultExt<T> {
+    /// Convert the error into a tool error.
+    ///
+    /// ```rust
+    /// use tower_mcp::error::ResultExt;
+    /// # fn example() -> tower_mcp::Result<()> {
+    /// let value: Result<i32, std::io::Error> = Err(std::io::Error::other("timeout"));
+    /// let value = value.tool_err()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn tool_err(self) -> std::result::Result<T, Error>;
+
+    /// Convert the error into a tool error with additional context.
+    ///
+    /// ```rust
+    /// use tower_mcp::error::ResultExt;
+    /// # fn example() -> tower_mcp::Result<()> {
+    /// let value: Result<i32, std::io::Error> = Err(std::io::Error::other("timeout"));
+    /// let value = value.tool_context("database query failed")?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn tool_context(self, context: impl Into<String>) -> std::result::Result<T, Error>;
+}
+
+impl<T, E: std::fmt::Display> ResultExt<T> for std::result::Result<T, E> {
+    fn tool_err(self) -> std::result::Result<T, Error> {
+        self.map_err(Error::tool_from)
+    }
+
+    fn tool_context(self, context: impl Into<String>) -> std::result::Result<T, Error> {
+        self.map_err(|e| Error::tool_context(context, e))
     }
 }
 
@@ -397,5 +453,32 @@ mod tests {
         let tool_err = ToolError::new("failed").with_source(io_err);
         assert!(tool_err.source.is_some());
         assert_eq!(tool_err.source.unwrap().to_string(), "timeout");
+    }
+
+    #[test]
+    fn test_result_ext_tool_err() {
+        let result: std::result::Result<(), std::io::Error> =
+            Err(std::io::Error::other("disk full"));
+        let err = result.tool_err().unwrap_err();
+        assert!(matches!(err, Error::Tool(_)));
+        assert!(err.to_string().contains("disk full"));
+    }
+
+    #[test]
+    fn test_result_ext_tool_context() {
+        let result: std::result::Result<(), std::io::Error> =
+            Err(std::io::Error::other("connection refused"));
+        let err = result.tool_context("database query failed").unwrap_err();
+        assert!(matches!(err, Error::Tool(_)));
+        assert!(err.to_string().contains("database query failed"));
+        assert!(err.to_string().contains("connection refused"));
+    }
+
+    #[test]
+    fn test_result_ext_ok_passes_through() {
+        let result: std::result::Result<i32, std::io::Error> = Ok(42);
+        assert_eq!(result.tool_err().unwrap(), 42);
+        let result: std::result::Result<i32, std::io::Error> = Ok(42);
+        assert_eq!(result.tool_context("should not appear").unwrap(), 42);
     }
 }

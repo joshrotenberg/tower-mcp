@@ -379,7 +379,7 @@ pub use context::{
     OutgoingRequestSender, RequestContext, RequestContextBuilder, ServerNotification,
     outgoing_request_channel,
 };
-pub use error::{BoxError, Error, Result, ToolError};
+pub use error::{BoxError, Error, Result, ResultExt, ToolError};
 pub use filter::{
     CapabilityFilter, DenialBehavior, Filterable, PromptFilter, ResourceFilter, ToolFilter,
 };
