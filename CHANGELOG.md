@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+## [0.4.0] - 2026-02-06
+
+### Miscellaneous Tasks
+
+- Bump MSRV to 1.90 and fix RUSTSEC-2026-0009 ([#343](https://github.com/joshrotenberg/tower-mcp/pull/343))
+
+
+
 ## [0.3.5] - 2026-02-03
 
 ### Bug Fixes
