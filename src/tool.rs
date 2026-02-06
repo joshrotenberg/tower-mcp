@@ -1470,7 +1470,7 @@ mod tests {
 
         let tool = ToolBuilder::new("process")
             .description("Process with context")
-            .extractor_handler_typed::<_, _, _, ProcessInput>(
+            .extractor_handler(
                 (),
                 |ctx: Context, Json(input): Json<ProcessInput>| async move {
                     // Simulate progress reporting
@@ -1527,7 +1527,7 @@ mod tests {
 
         let tool = ToolBuilder::new("long_running")
             .description("Long running task")
-            .extractor_handler_typed::<_, _, _, LongRunningInput>(
+            .extractor_handler(
                 (),
                 move |ctx: Context, Json(input): Json<LongRunningInput>| {
                     let completed = iterations_ref.clone();
@@ -1608,7 +1608,7 @@ mod tests {
 
         let tool = ToolBuilder::new("stateful")
             .description("Uses shared state")
-            .extractor_handler_typed::<_, _, _, GreetInput>(
+            .extractor_handler(
                 shared,
                 |State(state): State<Arc<String>>, Json(input): Json<GreetInput>| async move {
                     Ok(CallToolResult::text(format!(
@@ -1633,7 +1633,7 @@ mod tests {
         let tool =
             ToolBuilder::new("stateful_ctx")
                 .description("Uses state and context")
-                .extractor_handler_typed::<_, _, _, GreetInput>(
+                .extractor_handler(
                     shared,
                     |State(state): State<Arc<i32>>,
                      _ctx: Context,
@@ -1658,7 +1658,7 @@ mod tests {
     async fn test_handler_no_params() {
         let tool = ToolBuilder::new("no_params")
             .description("Takes no parameters")
-            .extractor_handler_typed::<_, _, _, NoParams>((), |Json(_): Json<NoParams>| async {
+            .extractor_handler((), |Json(_): Json<NoParams>| async {
                 Ok(CallToolResult::text("no params result"))
             })
             .build()
@@ -1685,7 +1685,7 @@ mod tests {
 
         let tool = ToolBuilder::new("with_state_no_params")
             .description("Takes no parameters but has state")
-            .extractor_handler_typed::<_, _, _, NoParams>(
+            .extractor_handler(
                 shared,
                 |State(state): State<Arc<String>>, Json(_): Json<NoParams>| async move {
                     Ok(CallToolResult::text(format!("state: {}", state)))
@@ -1710,12 +1710,9 @@ mod tests {
     async fn test_handler_no_params_with_context() {
         let tool = ToolBuilder::new("no_params_with_context")
             .description("Takes no parameters but has context")
-            .extractor_handler_typed::<_, _, _, NoParams>(
-                (),
-                |_ctx: Context, Json(_): Json<NoParams>| async move {
-                    Ok(CallToolResult::text("context available"))
-                },
-            )
+            .extractor_handler((), |_ctx: Context, Json(_): Json<NoParams>| async move {
+                Ok(CallToolResult::text("context available"))
+            })
             .build()
             .expect("valid tool name");
 
@@ -1732,7 +1729,7 @@ mod tests {
 
         let tool = ToolBuilder::new("state_context_no_params")
             .description("Has state and context, no params")
-            .extractor_handler_typed::<_, _, _, NoParams>(
+            .extractor_handler(
                 shared,
                 |State(state): State<Arc<String>>,
                  _ctx: Context,

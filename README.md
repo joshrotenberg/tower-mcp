@@ -397,7 +397,7 @@ let state = Arc::new(AppState { /* ... */ });
 
 // Tools access state via Extension<T> extractor
 let tool = ToolBuilder::new("query")
-    .extractor_handler_typed::<_, _, _, QueryInput>(
+    .extractor_handler(
         (),
         |Extension(app): Extension<Arc<AppState>>, Json(input): Json<QueryInput>| async move {
             let result = app.db.query(&input.sql).await?;

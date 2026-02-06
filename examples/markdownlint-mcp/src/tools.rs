@@ -16,7 +16,7 @@
 //!
 //! // Each tool gets a clone of the Arc
 //! let tool = ToolBuilder::new("lint_content")
-//!     .extractor_handler_typed::<_, _, _, LintContentInput>(state.clone(), |State(state), Json(input)| async move {
+//!     .extractor_handler(state.clone(), |State(state), Json(input)| async move {
 //!         // Use state here
 //!     })
 //!     .build()?;
@@ -171,7 +171,7 @@ pub fn build_tools() -> Vec<Tool> {
 fn build_lint_content_tool(state: Arc<LintState>) -> Tool {
     ToolBuilder::new("lint_content")
         .description("Lint markdown content and return violations")
-        .extractor_handler_typed::<_, _, _, LintContentInput>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<LintState>>, Json(input): Json<LintContentInput>| async move {
                 match state.lint_to_result(&input.content, &input.filename) {
@@ -191,7 +191,7 @@ fn build_lint_content_tool(state: Arc<LintState>) -> Tool {
 fn build_lint_file_tool(state: Arc<LintState>) -> Tool {
     ToolBuilder::new("lint_file")
         .description("Lint a local markdown file")
-        .extractor_handler_typed::<_, _, _, LintFileInput>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<LintState>>, Json(input): Json<LintFileInput>| async move {
                 // Read the file asynchronously
@@ -219,7 +219,7 @@ fn build_lint_file_tool(state: Arc<LintState>) -> Tool {
 fn build_lint_url_tool(state: Arc<LintState>) -> Tool {
     ToolBuilder::new("lint_url")
         .description("Fetch markdown from a URL and lint it")
-        .extractor_handler_typed::<_, _, _, LintUrlInput>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<LintState>>, Json(input): Json<LintUrlInput>| async move {
                 // Fetch the URL
@@ -257,7 +257,7 @@ fn build_lint_url_tool(state: Arc<LintState>) -> Tool {
 fn build_list_rules_tool(state: Arc<LintState>) -> Tool {
     ToolBuilder::new("list_rules")
         .description("List all available lint rules with their descriptions")
-        .extractor_handler_typed::<_, _, _, NoParams>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<LintState>>, Json(_): Json<NoParams>| async move {
                 let rules = state.rules();
@@ -279,7 +279,7 @@ fn build_list_rules_tool(state: Arc<LintState>) -> Tool {
 fn build_explain_rule_tool(state: Arc<LintState>) -> Tool {
     ToolBuilder::new("explain_rule")
         .description("Get detailed explanation of a specific lint rule")
-        .extractor_handler_typed::<_, _, _, ExplainRuleInput>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<LintState>>, Json(input): Json<ExplainRuleInput>| async move {
                 match state.get_rule(&input.rule_id) {
@@ -302,7 +302,7 @@ fn build_explain_rule_tool(state: Arc<LintState>) -> Tool {
 fn build_fix_content_tool(state: Arc<LintState>) -> Tool {
     ToolBuilder::new("fix_content")
         .description("Apply automatic fixes to markdown content where possible")
-        .extractor_handler_typed::<_, _, _, FixContentInput>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<LintState>>, Json(input): Json<FixContentInput>| async move {
                 match state.fix_content(&input.content, &input.filename) {
