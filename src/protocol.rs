@@ -1329,6 +1329,58 @@ pub struct ToolAnnotations {
     pub open_world_hint: bool,
 }
 
+impl ToolAnnotations {
+    /// Returns true if the tool does not modify state.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only_hint
+    }
+
+    /// Returns true if the tool may have destructive effects.
+    pub fn is_destructive(&self) -> bool {
+        self.destructive_hint
+    }
+
+    /// Returns true if calling repeatedly with same args has the same effect.
+    pub fn is_idempotent(&self) -> bool {
+        self.idempotent_hint
+    }
+
+    /// Returns true if the tool interacts with external entities.
+    pub fn is_open_world(&self) -> bool {
+        self.open_world_hint
+    }
+}
+
+impl ToolDefinition {
+    /// Returns true if the tool does not modify state.
+    ///
+    /// Returns `false` (the MCP spec default) when annotations are absent.
+    pub fn is_read_only(&self) -> bool {
+        self.annotations.as_ref().is_some_and(|a| a.read_only_hint)
+    }
+
+    /// Returns true if the tool may have destructive effects.
+    ///
+    /// Returns `true` (the MCP spec default) when annotations are absent.
+    pub fn is_destructive(&self) -> bool {
+        self.annotations.as_ref().is_none_or(|a| a.destructive_hint)
+    }
+
+    /// Returns true if calling repeatedly with same args has the same effect.
+    ///
+    /// Returns `false` (the MCP spec default) when annotations are absent.
+    pub fn is_idempotent(&self) -> bool {
+        self.annotations.as_ref().is_some_and(|a| a.idempotent_hint)
+    }
+
+    /// Returns true if the tool interacts with external entities.
+    ///
+    /// Returns `true` (the MCP spec default) when annotations are absent.
+    pub fn is_open_world(&self) -> bool {
+        self.annotations.as_ref().is_none_or(|a| a.open_world_hint)
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -3758,5 +3810,89 @@ mod tests {
             stop_reason: None,
         };
         assert_eq!(result.first_text(), None);
+    }
+
+    #[test]
+    fn test_tool_annotations_accessors() {
+        let annotations = ToolAnnotations {
+            read_only_hint: true,
+            destructive_hint: false,
+            idempotent_hint: true,
+            open_world_hint: false,
+            ..Default::default()
+        };
+
+        assert!(annotations.is_read_only());
+        assert!(!annotations.is_destructive());
+        assert!(annotations.is_idempotent());
+        assert!(!annotations.is_open_world());
+    }
+
+    #[test]
+    fn test_tool_annotations_defaults() {
+        // Default::default() uses Rust defaults (false for bool).
+        // The serde defaults (destructive_hint=true, open_world_hint=true)
+        // only apply during deserialization.
+        let annotations = ToolAnnotations::default();
+
+        assert!(!annotations.is_read_only());
+        assert!(!annotations.is_destructive());
+        assert!(!annotations.is_idempotent());
+        assert!(!annotations.is_open_world());
+    }
+
+    #[test]
+    fn test_tool_annotations_serde_defaults() {
+        // When deserialized from an empty object, serde applies
+        // the spec defaults: destructive_hint=true, open_world_hint=true
+        let annotations: ToolAnnotations = serde_json::from_str("{}").unwrap();
+
+        assert!(!annotations.is_read_only());
+        assert!(annotations.is_destructive());
+        assert!(!annotations.is_idempotent());
+        assert!(annotations.is_open_world());
+    }
+
+    #[test]
+    fn test_tool_definition_accessors_with_annotations() {
+        let def = ToolDefinition {
+            name: "test".to_string(),
+            title: None,
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: None,
+            icons: None,
+            annotations: Some(ToolAnnotations {
+                read_only_hint: true,
+                idempotent_hint: true,
+                destructive_hint: false,
+                open_world_hint: false,
+                ..Default::default()
+            }),
+        };
+
+        assert!(def.is_read_only());
+        assert!(!def.is_destructive());
+        assert!(def.is_idempotent());
+        assert!(!def.is_open_world());
+    }
+
+    #[test]
+    fn test_tool_definition_accessors_without_annotations() {
+        let def = ToolDefinition {
+            name: "test".to_string(),
+            title: None,
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: None,
+            icons: None,
+            annotations: None,
+        };
+
+        // MCP spec defaults when no annotations present
+        assert!(!def.is_read_only());
+        assert!(def.is_destructive());
+        assert!(!def.is_idempotent());
+        assert!(def.is_open_world());
     }
 }
