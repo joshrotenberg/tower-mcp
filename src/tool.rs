@@ -144,6 +144,101 @@ where
     }
 }
 
+/// A tower [`Layer`](tower::Layer) that applies a guard function before the inner service.
+///
+/// Guards run before the tool handler and can short-circuit with an error message.
+/// Use via [`ToolBuilderWithHandler::guard`] or [`Tool::with_guard`] rather than
+/// constructing directly.
+///
+/// # Example
+///
+/// ```rust
+/// use tower_mcp::{ToolBuilder, ToolRequest, CallToolResult};
+/// use schemars::JsonSchema;
+/// use serde::Deserialize;
+///
+/// #[derive(Debug, Deserialize, JsonSchema)]
+/// struct DeleteInput { id: String, confirm: bool }
+///
+/// let tool = ToolBuilder::new("delete")
+///     .description("Delete a record")
+///     .handler(|input: DeleteInput| async move {
+///         Ok(CallToolResult::text(format!("deleted {}", input.id)))
+///     })
+///     .guard(|req: &ToolRequest| {
+///         let confirm = req.args.get("confirm").and_then(|v| v.as_bool()).unwrap_or(false);
+///         if !confirm {
+///             return Err("Must set confirm=true to delete".to_string());
+///         }
+///         Ok(())
+///     })
+///     .build()
+///     .unwrap();
+/// ```
+#[derive(Clone)]
+pub struct GuardLayer<G> {
+    guard: G,
+}
+
+impl<G> GuardLayer<G> {
+    /// Create a new guard layer from a closure.
+    ///
+    /// The closure receives a `&ToolRequest` and returns `Ok(())` to proceed
+    /// or `Err(String)` to reject with an error message.
+    pub fn new(guard: G) -> Self {
+        Self { guard }
+    }
+}
+
+impl<G, S> tower::Layer<S> for GuardLayer<G>
+where
+    G: Clone,
+{
+    type Service = GuardService<G, S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        GuardService {
+            guard: self.guard.clone(),
+            inner,
+        }
+    }
+}
+
+/// Service wrapper that runs a guard check before calling the inner service.
+///
+/// Created by [`GuardLayer`]. See its documentation for usage.
+#[derive(Clone)]
+pub struct GuardService<G, S> {
+    guard: G,
+    inner: S,
+}
+
+impl<G, S> Service<ToolRequest> for GuardService<G, S>
+where
+    G: Fn(&ToolRequest) -> std::result::Result<(), String> + Clone + Send + Sync + 'static,
+    S: Service<ToolRequest, Response = CallToolResult> + Clone + Send + 'static,
+    S::Error: Into<Error> + Send,
+    S::Future: Send,
+{
+    type Response = CallToolResult;
+    type Error = Error;
+    type Future = Pin<Box<dyn Future<Output = std::result::Result<CallToolResult, Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        self.inner.poll_ready(cx).map_err(Into::into)
+    }
+
+    fn call(&mut self, req: ToolRequest) -> Self::Future {
+        match (self.guard)(&req) {
+            Ok(()) => {
+                let fut = self.inner.call(req);
+                Box::pin(async move { fut.await.map_err(Into::into) })
+            }
+            Err(msg) => Box::pin(async move { Err(Error::tool(msg)) }),
+        }
+    }
+}
+
 /// A marker type for tools that take no parameters.
 ///
 /// Use this instead of `()` when defining tools with no input parameters.
@@ -443,6 +538,50 @@ impl Tool {
             // Service is Infallible, so unwrap is safe
             service.oneshot(ToolRequest::new(ctx, args)).await.unwrap()
         })
+    }
+
+    /// Apply a guard to this built tool.
+    ///
+    /// The guard runs before the handler and can short-circuit with an error.
+    /// This is useful for applying the same guard to multiple tools (per-group
+    /// pattern):
+    ///
+    /// ```rust
+    /// use tower_mcp::{ToolBuilder, CallToolResult};
+    /// use tower_mcp::tool::ToolRequest;
+    /// use schemars::JsonSchema;
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Debug, Deserialize, JsonSchema)]
+    /// struct Input { value: String }
+    ///
+    /// fn build_tool(name: &str) -> tower_mcp::tool::Tool {
+    ///     ToolBuilder::new(name)
+    ///         .handler(|i: Input| async move { Ok(CallToolResult::text(&i.value)) })
+    ///         .build()
+    ///         .unwrap()
+    /// }
+    ///
+    /// let guard = |_req: &ToolRequest| -> Result<(), String> { Ok(()) };
+    ///
+    /// let tools: Vec<_> = vec![build_tool("a"), build_tool("b")]
+    ///     .into_iter()
+    ///     .map(|t| t.with_guard(guard.clone()))
+    ///     .collect();
+    /// ```
+    pub fn with_guard<G>(self, guard: G) -> Self
+    where
+        G: Fn(&ToolRequest) -> std::result::Result<(), String> + Clone + Send + Sync + 'static,
+    {
+        let guarded = GuardService {
+            guard,
+            inner: self.service,
+        };
+        let caught = ToolCatchError::new(guarded);
+        Tool {
+            service: BoxCloneService::new(caught),
+            ..self
+        }
     }
 
     /// Create a new tool with a prefixed name.
@@ -995,6 +1134,16 @@ where
             layer,
         }
     }
+
+    /// Apply a guard to this tool.
+    ///
+    /// See [`ToolBuilderWithHandler::guard`] for details.
+    pub fn guard<G>(self, guard: G) -> ToolBuilderWithNoParamsHandlerLayer<F, GuardLayer<G>>
+    where
+        G: Fn(&ToolRequest) -> std::result::Result<(), String> + Clone + Send + Sync + 'static,
+    {
+        self.layer(GuardLayer::new(guard))
+    }
 }
 
 /// Builder state after a layer has been applied to a no-params handler.
@@ -1062,6 +1211,19 @@ where
             layer: tower::layer::util::Stack::new(layer, self.layer),
         }
     }
+
+    /// Apply a guard to this tool.
+    ///
+    /// See [`ToolBuilderWithHandler::guard`] for details.
+    pub fn guard<G>(
+        self,
+        guard: G,
+    ) -> ToolBuilderWithNoParamsHandlerLayer<F, tower::layer::util::Stack<GuardLayer<G>, L>>
+    where
+        G: Fn(&ToolRequest) -> std::result::Result<(), String> + Clone + Send + Sync + 'static,
+    {
+        self.layer(GuardLayer::new(guard))
+    }
 }
 
 impl<I, F, Fut> ToolBuilderWithHandler<I, F>
@@ -1127,6 +1289,19 @@ where
             layer,
             _phantom: std::marker::PhantomData,
         }
+    }
+
+    /// Apply a guard to this tool.
+    ///
+    /// The guard runs before the handler and can short-circuit with an error
+    /// message. This is syntactic sugar for `.layer(GuardLayer::new(f))`.
+    ///
+    /// See [`GuardLayer`] for a full example.
+    pub fn guard<G>(self, guard: G) -> ToolBuilderWithLayer<I, F, GuardLayer<G>>
+    where
+        G: Fn(&ToolRequest) -> std::result::Result<(), String> + Clone + Send + Sync + 'static,
+    {
+        self.layer(GuardLayer::new(guard))
     }
 }
 
@@ -1207,6 +1382,19 @@ where
             layer: tower::layer::util::Stack::new(layer, self.layer),
             _phantom: std::marker::PhantomData,
         }
+    }
+
+    /// Apply a guard to this tool.
+    ///
+    /// See [`ToolBuilderWithHandler::guard`] for details.
+    pub fn guard<G>(
+        self,
+        guard: G,
+    ) -> ToolBuilderWithLayer<I, F, tower::layer::util::Stack<GuardLayer<G>, L>>
+    where
+        G: Fn(&ToolRequest) -> std::result::Result<(), String> + Clone + Send + Sync + 'static,
+    {
+        self.layer(GuardLayer::new(guard))
     }
 }
 
@@ -2192,5 +2380,346 @@ mod tests {
         let result = tool.call(serde_json::json!({})).await;
         assert!(!result.is_error);
         assert_eq!(result.first_text().unwrap(), "status ok");
+    }
+
+    // =========================================================================
+    // Guard tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_guard_allows_request() {
+        #[derive(Debug, Deserialize, JsonSchema)]
+        #[allow(dead_code)]
+        struct DeleteInput {
+            id: String,
+            confirm: bool,
+        }
+
+        let tool = ToolBuilder::new("delete")
+            .description("Delete a record")
+            .handler(|input: DeleteInput| async move {
+                Ok(CallToolResult::text(format!("deleted {}", input.id)))
+            })
+            .guard(|req: &ToolRequest| {
+                let confirm = req
+                    .args
+                    .get("confirm")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !confirm {
+                    return Err("Must set confirm=true to delete".to_string());
+                }
+                Ok(())
+            })
+            .build()
+            .expect("valid tool name");
+
+        let result = tool
+            .call(serde_json::json!({"id": "abc", "confirm": true}))
+            .await;
+        assert!(!result.is_error);
+        assert_eq!(result.first_text().unwrap(), "deleted abc");
+    }
+
+    #[tokio::test]
+    async fn test_guard_rejects_request() {
+        #[derive(Debug, Deserialize, JsonSchema)]
+        #[allow(dead_code)]
+        struct DeleteInput2 {
+            id: String,
+            confirm: bool,
+        }
+
+        let tool = ToolBuilder::new("delete2")
+            .description("Delete a record")
+            .handler(|input: DeleteInput2| async move {
+                Ok(CallToolResult::text(format!("deleted {}", input.id)))
+            })
+            .guard(|req: &ToolRequest| {
+                let confirm = req
+                    .args
+                    .get("confirm")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !confirm {
+                    return Err("Must set confirm=true to delete".to_string());
+                }
+                Ok(())
+            })
+            .build()
+            .expect("valid tool name");
+
+        let result = tool
+            .call(serde_json::json!({"id": "abc", "confirm": false}))
+            .await;
+        assert!(result.is_error);
+        assert!(
+            result
+                .first_text()
+                .unwrap()
+                .contains("Must set confirm=true")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_guard_with_layer() {
+        use std::time::Duration;
+        use tower::timeout::TimeoutLayer;
+
+        let tool = ToolBuilder::new("guarded_timeout")
+            .description("Guarded with timeout")
+            .handler(|input: GreetInput| async move {
+                Ok(CallToolResult::text(format!("Hello, {}!", input.name)))
+            })
+            .layer(TimeoutLayer::new(Duration::from_secs(5)))
+            .guard(|_req: &ToolRequest| Ok(()))
+            .build()
+            .expect("valid tool name");
+
+        let result = tool.call(serde_json::json!({"name": "World"})).await;
+        assert!(!result.is_error);
+        assert_eq!(result.first_text().unwrap(), "Hello, World!");
+    }
+
+    #[tokio::test]
+    async fn test_guard_on_no_params_handler() {
+        let allowed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let allowed_clone = allowed.clone();
+
+        let tool = ToolBuilder::new("status")
+            .description("Get status")
+            .no_params_handler(|| async { Ok(CallToolResult::text("ok")) })
+            .guard(move |_req: &ToolRequest| {
+                if allowed_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    Ok(())
+                } else {
+                    Err("Access denied".to_string())
+                }
+            })
+            .build()
+            .expect("valid tool name");
+
+        // Allowed
+        let result = tool.call(serde_json::json!({})).await;
+        assert!(!result.is_error);
+        assert_eq!(result.first_text().unwrap(), "ok");
+
+        // Denied
+        allowed.store(false, std::sync::atomic::Ordering::Relaxed);
+        let result = tool.call(serde_json::json!({})).await;
+        assert!(result.is_error);
+        assert!(result.first_text().unwrap().contains("Access denied"));
+    }
+
+    #[tokio::test]
+    async fn test_guard_on_no_params_handler_with_layer() {
+        use std::time::Duration;
+        use tower::timeout::TimeoutLayer;
+
+        let tool = ToolBuilder::new("status_layered")
+            .description("Get status with layers")
+            .no_params_handler(|| async { Ok(CallToolResult::text("ok")) })
+            .layer(TimeoutLayer::new(Duration::from_secs(5)))
+            .guard(|_req: &ToolRequest| Ok(()))
+            .build()
+            .expect("valid tool name");
+
+        let result = tool.call(serde_json::json!({})).await;
+        assert!(!result.is_error);
+        assert_eq!(result.first_text().unwrap(), "ok");
+    }
+
+    #[tokio::test]
+    async fn test_guard_on_extractor_handler() {
+        use std::sync::Arc;
+
+        #[derive(Clone)]
+        struct AppState {
+            prefix: String,
+        }
+
+        #[derive(Debug, Deserialize, JsonSchema)]
+        struct QueryInput {
+            query: String,
+        }
+
+        let state = Arc::new(AppState {
+            prefix: "db".to_string(),
+        });
+
+        let tool = ToolBuilder::new("search")
+            .description("Search")
+            .extractor_handler(
+                state,
+                |State(app): State<Arc<AppState>>, Json(input): Json<QueryInput>| async move {
+                    Ok(CallToolResult::text(format!(
+                        "{}: {}",
+                        app.prefix, input.query
+                    )))
+                },
+            )
+            .guard(|req: &ToolRequest| {
+                let query = req.args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                if query.is_empty() {
+                    return Err("Query cannot be empty".to_string());
+                }
+                Ok(())
+            })
+            .build()
+            .expect("valid tool name");
+
+        // Valid query
+        let result = tool.call(serde_json::json!({"query": "hello"})).await;
+        assert!(!result.is_error);
+        assert_eq!(result.first_text().unwrap(), "db: hello");
+
+        // Empty query rejected by guard
+        let result = tool.call(serde_json::json!({"query": ""})).await;
+        assert!(result.is_error);
+        assert!(
+            result
+                .first_text()
+                .unwrap()
+                .contains("Query cannot be empty")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_guard_on_extractor_handler_with_layer() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tower::timeout::TimeoutLayer;
+
+        #[derive(Clone)]
+        struct AppState2 {
+            prefix: String,
+        }
+
+        #[derive(Debug, Deserialize, JsonSchema)]
+        struct QueryInput2 {
+            query: String,
+        }
+
+        let state = Arc::new(AppState2 {
+            prefix: "db".to_string(),
+        });
+
+        let tool = ToolBuilder::new("search2")
+            .description("Search with layer and guard")
+            .extractor_handler(
+                state,
+                |State(app): State<Arc<AppState2>>, Json(input): Json<QueryInput2>| async move {
+                    Ok(CallToolResult::text(format!(
+                        "{}: {}",
+                        app.prefix, input.query
+                    )))
+                },
+            )
+            .layer(TimeoutLayer::new(Duration::from_secs(5)))
+            .guard(|_req: &ToolRequest| Ok(()))
+            .build()
+            .expect("valid tool name");
+
+        let result = tool.call(serde_json::json!({"query": "hello"})).await;
+        assert!(!result.is_error);
+        assert_eq!(result.first_text().unwrap(), "db: hello");
+    }
+
+    #[tokio::test]
+    async fn test_tool_with_guard_post_build() {
+        let tool = ToolBuilder::new("admin_action")
+            .description("Admin action")
+            .handler(|_input: GreetInput| async move { Ok(CallToolResult::text("done")) })
+            .build()
+            .expect("valid tool name");
+
+        // Apply guard after building
+        let guarded = tool.with_guard(|req: &ToolRequest| {
+            let name = req.args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if name == "admin" {
+                Ok(())
+            } else {
+                Err("Only admin allowed".to_string())
+            }
+        });
+
+        // Admin passes
+        let result = guarded.call(serde_json::json!({"name": "admin"})).await;
+        assert!(!result.is_error);
+
+        // Non-admin blocked
+        let result = guarded.call(serde_json::json!({"name": "user"})).await;
+        assert!(result.is_error);
+        assert!(result.first_text().unwrap().contains("Only admin allowed"));
+    }
+
+    #[tokio::test]
+    async fn test_with_guard_preserves_tool_metadata() {
+        let tool = ToolBuilder::new("my_tool")
+            .description("A tool")
+            .title("My Tool")
+            .read_only()
+            .handler(|_input: GreetInput| async move { Ok(CallToolResult::text("done")) })
+            .build()
+            .expect("valid tool name");
+
+        let guarded = tool.with_guard(|_req: &ToolRequest| Ok(()));
+
+        assert_eq!(guarded.name, "my_tool");
+        assert_eq!(guarded.description.as_deref(), Some("A tool"));
+        assert_eq!(guarded.title.as_deref(), Some("My Tool"));
+        assert!(guarded.annotations.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_guard_group_pattern() {
+        // Demonstrate applying the same guard to multiple tools (per-group pattern)
+        let require_auth = |req: &ToolRequest| {
+            let token = req
+                .args
+                .get("_token")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if token == "valid" {
+                Ok(())
+            } else {
+                Err("Authentication required".to_string())
+            }
+        };
+
+        let tool1 = ToolBuilder::new("action1")
+            .description("Action 1")
+            .handler(|_input: GreetInput| async move { Ok(CallToolResult::text("action1")) })
+            .build()
+            .expect("valid");
+        let tool2 = ToolBuilder::new("action2")
+            .description("Action 2")
+            .handler(|_input: GreetInput| async move { Ok(CallToolResult::text("action2")) })
+            .build()
+            .expect("valid");
+
+        // Apply same guard to both
+        let guarded1 = tool1.with_guard(require_auth);
+        let guarded2 = tool2.with_guard(require_auth);
+
+        // Without auth
+        let r1 = guarded1
+            .call(serde_json::json!({"name": "test", "_token": "invalid"}))
+            .await;
+        let r2 = guarded2
+            .call(serde_json::json!({"name": "test", "_token": "invalid"}))
+            .await;
+        assert!(r1.is_error);
+        assert!(r2.is_error);
+
+        // With auth
+        let r1 = guarded1
+            .call(serde_json::json!({"name": "test", "_token": "valid"}))
+            .await;
+        let r2 = guarded2
+            .call(serde_json::json!({"name": "test", "_token": "valid"}))
+            .await;
+        assert!(!r1.is_error);
+        assert!(!r2.is_error);
     }
 }

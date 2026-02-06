@@ -946,7 +946,7 @@ where
 // =============================================================================
 
 use crate::tool::{
-    BoxFuture, Tool, ToolCatchError, ToolHandler, ToolHandlerService, ToolRequest,
+    BoxFuture, GuardLayer, Tool, ToolCatchError, ToolHandler, ToolHandlerService, ToolRequest,
     validate_tool_name,
 };
 use tower::util::BoxCloneService;
@@ -1090,6 +1090,16 @@ where
             _phantom: PhantomData,
         }
     }
+
+    /// Apply a guard to this tool.
+    ///
+    /// See [`ToolBuilderWithHandler::guard`](crate::ToolBuilder) for details.
+    pub fn guard<G>(self, guard: G) -> ToolBuilderWithExtractorLayer<S, F, T, GuardLayer<G>>
+    where
+        G: Fn(&ToolRequest) -> std::result::Result<(), String> + Clone + Send + Sync + 'static,
+    {
+        self.layer(GuardLayer::new(guard))
+    }
 }
 
 /// Builder state after a layer has been applied to an extractor handler.
@@ -1175,6 +1185,19 @@ where
             layer: tower::layer::util::Stack::new(layer, self.layer),
             _phantom: PhantomData,
         }
+    }
+
+    /// Apply a guard to this tool.
+    ///
+    /// See [`ToolBuilderWithHandler::guard`](crate::ToolBuilder) for details.
+    pub fn guard<G>(
+        self,
+        guard: G,
+    ) -> ToolBuilderWithExtractorLayer<S, F, T, tower::layer::util::Stack<GuardLayer<G>, L>>
+    where
+        G: Fn(&ToolRequest) -> std::result::Result<(), String> + Clone + Send + Sync + 'static,
+    {
+        self.layer(GuardLayer::new(guard))
     }
 }
 
