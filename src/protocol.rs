@@ -1520,6 +1520,39 @@ impl CallToolResult {
         Ok(Self::json(json_value))
     }
 
+    /// Create a result from a list of serializable items.
+    ///
+    /// Wraps the list in a JSON object with the given key and a `count` field,
+    /// since MCP `structuredContent` requires objects, not bare arrays.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tower_mcp::CallToolResult;
+    /// use serde::Serialize;
+    ///
+    /// #[derive(Serialize)]
+    /// struct Database {
+    ///     name: String,
+    ///     size_mb: u64,
+    /// }
+    ///
+    /// let databases = vec![
+    ///     Database { name: "users".to_string(), size_mb: 100 },
+    ///     Database { name: "logs".to_string(), size_mb: 500 },
+    /// ];
+    /// let result = CallToolResult::from_list("databases", &databases).unwrap();
+    /// // Produces: {"databases": [...], "count": 2}
+    /// assert!(!result.is_error);
+    /// assert!(result.structured_content.is_some());
+    /// ```
+    pub fn from_list<T: serde::Serialize>(
+        key: &str,
+        items: &[T],
+    ) -> std::result::Result<Self, crate::error::Error> {
+        Self::from_serialize(&serde_json::json!({ key: items, "count": items.len() }))
+    }
+
     /// Create a result with an image
     pub fn image(data: impl Into<String>, mime_type: impl Into<String>) -> Self {
         Self {
@@ -3894,5 +3927,44 @@ mod tests {
         assert!(def.is_destructive());
         assert!(!def.is_idempotent());
         assert!(def.is_open_world());
+    }
+
+    #[test]
+    fn test_call_tool_result_from_list() {
+        #[derive(serde::Serialize)]
+        struct Item {
+            name: String,
+        }
+
+        let items = vec![
+            Item {
+                name: "a".to_string(),
+            },
+            Item {
+                name: "b".to_string(),
+            },
+            Item {
+                name: "c".to_string(),
+            },
+        ];
+
+        let result = CallToolResult::from_list("items", &items).unwrap();
+        assert!(!result.is_error);
+
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["count"], 3);
+        assert_eq!(structured["items"].as_array().unwrap().len(), 3);
+        assert_eq!(structured["items"][0]["name"], "a");
+    }
+
+    #[test]
+    fn test_call_tool_result_from_list_empty() {
+        let items: Vec<String> = vec![];
+        let result = CallToolResult::from_list("results", &items).unwrap();
+        assert!(!result.is_error);
+
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["count"], 0);
+        assert_eq!(structured["results"].as_array().unwrap().len(), 0);
     }
 }
