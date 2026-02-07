@@ -72,13 +72,23 @@ impl Filterable for Prompt {
 /// Behavior when a filtered capability is accessed directly.
 #[derive(Clone, Default)]
 pub enum DenialBehavior {
-    /// Return "method not found" error - don't reveal the capability exists.
-    /// This is the default and recommended for security.
+    /// Return "method not found" error -- hides the capability entirely.
+    ///
+    /// This is the default and recommended for security. Use this in
+    /// multi-tenant scenarios where tools should not be discoverable by
+    /// unauthorized users.
     #[default]
     NotFound,
     /// Return an "unauthorized" error, revealing the capability exists.
+    ///
+    /// Use this when the client should know about the capability but is
+    /// not permitted to invoke it (e.g., premium features behind an
+    /// upgrade prompt).
     Unauthorized,
-    /// Use a custom error generator.
+    /// Use a custom error generator for application-specific responses.
+    ///
+    /// Use this when you need custom status codes, domain-specific error
+    /// messages, or structured error payloads.
     Custom(Arc<dyn Fn(&str) -> Error + Send + Sync>),
 }
 
