@@ -1747,6 +1747,38 @@ impl Content {
     /// let content = Content::Text { text: "hello".into(), annotations: None };
     /// assert_eq!(content.as_text(), Some("hello"));
     /// ```
+    /// Create a [`Content::Text`] variant with no annotations.
+    ///
+    /// This is a shorthand for the common case of creating text content
+    /// without annotations.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::Content;
+    ///
+    /// let content = Content::text("hello world");
+    /// assert_eq!(content.as_text(), Some("hello world"));
+    /// ```
+    pub fn text(text: impl Into<String>) -> Self {
+        Content::Text {
+            text: text.into(),
+            annotations: None,
+        }
+    }
+
+    /// Extract the text from a [`Content::Text`] variant.
+    ///
+    /// Returns `None` for non-text content variants.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::Content;
+    ///
+    /// let content = Content::Text { text: "hello".into(), annotations: None };
+    /// assert_eq!(content.as_text(), Some("hello"));
+    /// ```
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Content::Text { text, .. } => Some(text),
@@ -3101,6 +3133,25 @@ impl McpNotification {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_content_text_constructor() {
+        let content = Content::text("hello world");
+        assert_eq!(content.as_text(), Some("hello world"));
+
+        // Verify it creates a Text variant with no annotations
+        match &content {
+            Content::Text { text, annotations } => {
+                assert_eq!(text, "hello world");
+                assert!(annotations.is_none());
+            }
+            _ => panic!("expected Content::Text"),
+        }
+
+        // Works with String too
+        let content = Content::text(String::from("owned"));
+        assert_eq!(content.as_text(), Some("owned"));
+    }
 
     #[test]
     fn test_elicit_form_schema_builder() {

@@ -507,6 +507,41 @@ impl ResourceBuilder {
     ///
     /// Returns a [`ResourceBuilderWithHandler`] that can be used to apply
     /// middleware layers via `.layer()` or build the resource directly via `.build()`.
+    ///
+    /// # Sharing State
+    ///
+    /// Capture an [`Arc`] in the closure to share state across handler
+    /// invocations or with other parts of your application:
+    ///
+    /// ```rust
+    /// use std::sync::Arc;
+    /// use tokio::sync::RwLock;
+    /// use tower_mcp::resource::ResourceBuilder;
+    /// use tower_mcp::protocol::{ReadResourceResult, ResourceContent};
+    ///
+    /// let db = Arc::new(RwLock::new(vec!["initial".to_string()]));
+    ///
+    /// let db_clone = Arc::clone(&db);
+    /// let resource = ResourceBuilder::new("app://entries")
+    ///     .name("Entries")
+    ///     .handler(move || {
+    ///         let db = Arc::clone(&db_clone);
+    ///         async move {
+    ///             let entries = db.read().await;
+    ///             Ok(ReadResourceResult {
+    ///                 contents: vec![ResourceContent {
+    ///                     uri: "app://entries".to_string(),
+    ///                     mime_type: Some("text/plain".to_string()),
+    ///                     text: Some(entries.join("\n")),
+    ///                     blob: None,
+    ///                 }],
+    ///             })
+    ///         }
+    ///     })
+    ///     .build();
+    /// ```
+    ///
+    /// [`Arc`]: std::sync::Arc
     pub fn handler<F, Fut>(self, handler: F) -> ResourceBuilderWithHandler<F>
     where
         F: Fn() -> Fut + Send + Sync + 'static,

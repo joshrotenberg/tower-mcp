@@ -463,10 +463,51 @@ impl PromptBuilder {
         self
     }
 
-    /// Set the handler function for getting the prompt
+    /// Set the handler function for getting the prompt.
     ///
     /// Returns a `PromptBuilderWithHandler` which can be finalized with `.build()`
     /// or have middleware applied with `.layer()`.
+    ///
+    /// # Sharing State
+    ///
+    /// Capture an [`Arc`] in the closure to share state across handler
+    /// invocations or with other parts of your application:
+    ///
+    /// ```rust
+    /// use std::collections::HashMap;
+    /// use std::sync::Arc;
+    /// use tokio::sync::RwLock;
+    /// use tower_mcp::prompt::PromptBuilder;
+    /// use tower_mcp::protocol::{GetPromptResult, PromptMessage, PromptRole, Content};
+    ///
+    /// let templates = Arc::new(RwLock::new(HashMap::from([
+    ///     ("greeting".to_string(), "Hello, {name}!".to_string()),
+    /// ])));
+    ///
+    /// let tpl = Arc::clone(&templates);
+    /// let prompt = PromptBuilder::new("greet")
+    ///     .description("Greet a user by name")
+    ///     .required_arg("name", "The user's name")
+    ///     .handler(move |args: HashMap<String, String>| {
+    ///         let tpl = Arc::clone(&tpl);
+    ///         async move {
+    ///             let templates = tpl.read().await;
+    ///             let greeting = templates.get("greeting").unwrap();
+    ///             let name = args.get("name").unwrap();
+    ///             let text = greeting.replace("{name}", name);
+    ///             Ok(GetPromptResult {
+    ///                 description: Some("A greeting".to_string()),
+    ///                 messages: vec![PromptMessage {
+    ///                     role: PromptRole::User,
+    ///                     content: Content::text(text),
+    ///                 }],
+    ///             })
+    ///         }
+    ///     })
+    ///     .build();
+    /// ```
+    ///
+    /// [`Arc`]: std::sync::Arc
     pub fn handler<F, Fut>(self, handler: F) -> PromptBuilderWithHandler<F>
     where
         F: Fn(HashMap<String, String>) -> Fut + Send + Sync + Clone + 'static,
