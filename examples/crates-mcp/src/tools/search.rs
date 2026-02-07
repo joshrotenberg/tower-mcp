@@ -6,7 +6,7 @@ use crates_io_api::{CratesQuery, Sort};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tower_mcp::{
-    CallToolResult, Error, Tool, ToolBuilder,
+    CallToolResult, ResultExt, Tool, ToolBuilder,
     extract::{Json, State},
 };
 
@@ -45,7 +45,7 @@ pub fn build(state: Arc<AppState>) -> Tool {
         .read_only()
         .idempotent()
         .icon("https://crates.io/assets/cargo.png")
-        .extractor_handler_typed::<_, _, _, SearchInput>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<AppState>>, Json(input): Json<SearchInput>| async move {
                 let sort = parse_sort(&input.sort);
@@ -58,7 +58,7 @@ pub fn build(state: Arc<AppState>) -> Tool {
                     .client
                     .crates(query)
                     .await
-                    .map_err(|e| Error::tool(format!("Crates.io API error: {}", e)))?;
+                    .tool_context("Crates.io API error")?;
 
                 // Save search for resources
                 let summaries: Vec<_> = response

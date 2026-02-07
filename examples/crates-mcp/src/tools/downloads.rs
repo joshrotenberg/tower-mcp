@@ -6,7 +6,7 @@ use std::sync::Arc;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tower_mcp::{
-    CallToolResult, Error, Tool, ToolBuilder,
+    CallToolResult, ResultExt, Tool, ToolBuilder,
     extract::{Json, State},
 };
 
@@ -28,14 +28,14 @@ pub fn build(state: Arc<AppState>) -> Tool {
         .read_only()
         .idempotent()
         .icon("https://crates.io/assets/cargo.png")
-        .extractor_handler_typed::<_, _, _, DownloadsInput>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<AppState>>, Json(input): Json<DownloadsInput>| async move {
                 let response = state
                     .client
                     .crate_downloads(&input.name)
                     .await
-                    .map_err(|e| Error::tool(format!("Crates.io API error: {}", e)))?;
+                    .tool_context("Crates.io API error")?;
 
                 let mut output = format!("# {} - Download Statistics\n\n", input.name);
 

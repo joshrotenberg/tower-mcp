@@ -5,7 +5,7 @@ use std::sync::Arc;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tower_mcp::{
-    CallToolResult, Error, Tool, ToolBuilder,
+    CallToolResult, ResultExt, Tool, ToolBuilder,
     extract::{Json, State},
 };
 
@@ -32,7 +32,7 @@ pub fn build(state: Arc<AppState>) -> Tool {
         .read_only()
         .idempotent()
         .icon("https://crates.io/assets/cargo.png")
-        .extractor_handler_typed::<_, _, _, DependenciesInput>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<AppState>>, Json(input): Json<DependenciesInput>| async move {
                 // Get crate info first to find version
@@ -40,7 +40,7 @@ pub fn build(state: Arc<AppState>) -> Tool {
                     .client
                     .get_crate(&input.name)
                     .await
-                    .map_err(|e| Error::tool(format!("Crates.io API error: {}", e)))?;
+                    .tool_context("Crates.io API error")?;
 
                 let version = input
                     .version
@@ -51,7 +51,7 @@ pub fn build(state: Arc<AppState>) -> Tool {
                     .client
                     .crate_dependencies(&input.name, version)
                     .await
-                    .map_err(|e| Error::tool(format!("Crates.io API error: {}", e)))?;
+                    .tool_context("Crates.io API error")?;
 
                 let (normal, dev, build): (Vec<_>, Vec<_>, Vec<_>) =
                     deps.iter().fold((vec![], vec![], vec![]), |mut acc, d| {

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use tower_mcp::{
-    CallToolResult, Error, NoParams, Tool, ToolBuilder,
+    CallToolResult, NoParams, ResultExt, Tool, ToolBuilder,
     extract::{Json, State},
 };
 
@@ -18,14 +18,14 @@ pub fn build(state: Arc<AppState>) -> Tool {
         .read_only()
         .idempotent()
         .icon("https://crates.io/assets/cargo.png")
-        .extractor_handler_typed::<_, _, _, NoParams>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<AppState>>, Json(_input): Json<NoParams>| async move {
                 let summary = state
                     .client
                     .summary()
                     .await
-                    .map_err(|e| Error::tool(format!("Crates.io API error: {}", e)))?;
+                    .tool_context("Crates.io API error")?;
 
                 let mut output = String::from("# Crates.io Summary\n\n");
 

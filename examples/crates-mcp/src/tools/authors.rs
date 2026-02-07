@@ -5,7 +5,7 @@ use std::sync::Arc;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tower_mcp::{
-    CallToolResult, Error, Tool, ToolBuilder,
+    CallToolResult, ResultExt, Tool, ToolBuilder,
     extract::{Json, State},
 };
 
@@ -29,7 +29,7 @@ pub fn build(state: Arc<AppState>) -> Tool {
         )
         .read_only()
         .idempotent()
-        .extractor_handler_typed::<_, _, _, AuthorsInput>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<AppState>>, Json(input): Json<AuthorsInput>| async move {
                 // If no version specified, get the latest
@@ -40,7 +40,7 @@ pub fn build(state: Arc<AppState>) -> Tool {
                             .client
                             .get_crate(&input.name)
                             .await
-                            .map_err(|e| Error::tool(format!("Crates.io API error: {}", e)))?;
+                            .tool_context("Crates.io API error")?;
                         crate_info.crate_data.max_version.clone()
                     }
                 };
@@ -49,7 +49,7 @@ pub fn build(state: Arc<AppState>) -> Tool {
                     .client
                     .crate_authors(&input.name, &version)
                     .await
-                    .map_err(|e| Error::tool(format!("Crates.io API error: {}", e)))?;
+                    .tool_context("Crates.io API error")?;
 
                 let mut output = format!("# {} v{} - Authors\n\n", input.name, version);
 
