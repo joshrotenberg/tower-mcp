@@ -61,7 +61,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .handler(|input: GreetInput| async move {
             Ok(CallToolResult::text(format!("Hello, {}!", input.name)))
         })
-        .build()?;
+        .build();
 
     // Demonstrates returning structured JSON using from_serialize
     let add = ToolBuilder::new("add")
@@ -76,7 +76,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
             // Use from_serialize for structured JSON output from any Serialize type
             CallToolResult::from_serialize(&output)
         })
-        .build()?;
+        .build();
 
     let echo = ToolBuilder::new("echo")
         .description("Echo a message back, optionally repeated")
@@ -87,7 +87,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
                 .collect();
             Ok(CallToolResult::text(repeated.join(" ")))
         })
-        .build()?;
+        .build();
 
     // Create the router with our tools.
     // auto_instructions() generates instructions from tool descriptions at init time.

@@ -373,8 +373,7 @@ mod tests {
                     input.a + input.b
                 )))
             })
-            .build()
-            .unwrap();
+            .build();
 
         McpRouter::new()
             .server_info("test-server", "1.0.0")

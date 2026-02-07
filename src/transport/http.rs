@@ -93,7 +93,7 @@
 //! async fn main() -> Result<(), BoxError> {
 //!     let tool = ToolBuilder::new("echo")
 //!         .handler(|i: Input| async move { Ok(CallToolResult::text(i.value)) })
-//!         .build()?;
+//!         .build();
 //!
 //!     let router = McpRouter::new()
 //!         .server_info("my-server", "1.0.0")
@@ -563,7 +563,7 @@ impl HttpTransport {
     ///             let result = ctx.sample(params).await?;
     ///             Ok(CallToolResult::text(format!("{:?}", result.content)))
     ///         })
-    ///         .build()?;
+    ///         .build();
     ///
     ///     let router = McpRouter::new()
     ///         .server_info("my-server", "1.0.0")
@@ -1703,8 +1703,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 Ok(crate::CallToolResult::text("done"))
             })
-            .build()
-            .unwrap();
+            .build();
 
         let router = McpRouter::new()
             .server_info("test-server", "1.0.0")

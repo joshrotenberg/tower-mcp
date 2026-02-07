@@ -90,5 +90,4 @@ pub fn build(state: Arc<AppState>) -> Tool {
             },
         )
         .build()
-        .expect("valid tool")
 }

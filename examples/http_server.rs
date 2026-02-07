@@ -105,12 +105,12 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .handler(|input: AddInput| async move {
             Ok(CallToolResult::text(format!("{}", input.a + input.b)))
         })
-        .build()?;
+        .build();
 
     let echo = ToolBuilder::new("echo")
         .description("Echo a message back")
         .handler(|input: EchoInput| async move { Ok(CallToolResult::text(input.message)) })
-        .build()?;
+        .build();
 
     // A tool that simulates work and sends progress notifications
     // Useful for demonstrating SSE event streaming and Last-Event-ID resumption
@@ -144,7 +144,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
                 )))
             },
         )
-        .build()?;
+        .build();
 
     // Create resources
     let config = ResourceBuilder::new("file:///config.json")

@@ -38,7 +38,7 @@
 //!         .handler(|input: serde_json::Value| async move {
 //!             Ok(CallToolResult::text(format!("{}", input)))
 //!         })
-//!         .build()?;
+//!         .build();
 //!
 //!     let router = McpRouter::new()
 //!         .server_info("oauth-server", "1.0.0")

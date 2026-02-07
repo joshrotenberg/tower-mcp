@@ -59,7 +59,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .handler(|input: AddInput| async move {
             Ok(CallToolResult::text(format!("{}", input.a + input.b)))
         })
-        .build()?;
+        .build();
 
     let router = McpRouter::new()
         .server_info("oauth-example", "1.0.0")

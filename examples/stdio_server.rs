@@ -44,7 +44,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .description("Echo a message back")
         .read_only()
         .handler(|input: EchoInput| async move { Ok(CallToolResult::text(input.message)) })
-        .build()?;
+        .build();
 
     let add = ToolBuilder::new("add")
         .description("Add two numbers together")
@@ -54,7 +54,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
             let result = input.a + input.b;
             Ok(CallToolResult::text(format!("{}", result)))
         })
-        .build()?;
+        .build();
 
     let reverse = ToolBuilder::new("reverse")
         .description("Reverse a string")
@@ -64,7 +64,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
             let reversed: String = input.text.chars().rev().collect();
             Ok(CallToolResult::text(reversed))
         })
-        .build()?;
+        .build();
 
     // Create a resource that serves this file's own source code
     let source = ResourceBuilder::new("source://stdio_server.rs")

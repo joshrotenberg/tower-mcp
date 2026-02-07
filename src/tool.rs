@@ -27,8 +27,7 @@
 //!         Ok(CallToolResult::text("result"))
 //!     })
 //!     .layer(TimeoutLayer::new(Duration::from_secs(30)))
-//!     .build()
-//!     .unwrap();
+//!     .build();
 //! ```
 
 use std::borrow::Cow;
@@ -172,8 +171,7 @@ where
 ///         }
 ///         Ok(())
 ///     })
-///     .build()
-///     .unwrap();
+///     .build();
 /// ```
 #[derive(Clone)]
 pub struct GuardLayer<G> {
@@ -256,8 +254,7 @@ where
 ///     .handler(|_input: NoParams| async move {
 ///         Ok(CallToolResult::text("OK"))
 ///     })
-///     .build()
-///     .unwrap();
+///     .build();
 /// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NoParams;
@@ -559,7 +556,6 @@ impl Tool {
     ///     ToolBuilder::new(name)
     ///         .handler(|i: Input| async move { Ok(CallToolResult::text(&i.value)) })
     ///         .build()
-    ///         .unwrap()
     /// }
     ///
     /// let guard = |_req: &ToolRequest| -> Result<(), String> { Ok(()) };
@@ -605,8 +601,7 @@ impl Tool {
     /// let tool = ToolBuilder::new("query")
     ///     .description("Query the database")
     ///     .handler(|i: Input| async move { Ok(CallToolResult::text(&i.value)) })
-    ///     .build()
-    ///     .unwrap();
+    ///     .build();
     ///
     /// let prefixed = tool.with_name_prefix("db");
     /// assert_eq!(prefixed.name, "db.query");
@@ -675,8 +670,7 @@ impl Tool {
 ///     .handler(|input: GreetInput| async move {
 ///         Ok(CallToolResult::text(format!("Hello, {}!", input.name)))
 ///     })
-///     .build()
-///     .expect("valid tool name");
+///     .build();
 ///
 /// assert_eq!(tool.name, "greet");
 /// ```
@@ -690,15 +684,48 @@ pub struct ToolBuilder {
 }
 
 impl ToolBuilder {
+    /// Create a new tool builder with the given name.
+    ///
+    /// Tool names must be 1-128 characters and contain only alphanumeric
+    /// characters, underscores, hyphens, and dots.
+    ///
+    /// Use [`try_new`](Self::try_new) if the name comes from runtime input.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` is empty, exceeds 128 characters, or contains
+    /// characters other than ASCII alphanumerics, `_`, `-`, and `.`.
     pub fn new(name: impl Into<String>) -> Self {
+        let name = name.into();
+        if let Err(e) = validate_tool_name(&name) {
+            panic!("{e}");
+        }
         Self {
-            name: name.into(),
+            name,
             title: None,
             description: None,
             output_schema: None,
             icons: None,
             annotations: None,
         }
+    }
+
+    /// Create a new tool builder, returning an error if the name is invalid.
+    ///
+    /// This is the fallible alternative to [`new`](Self::new) for cases where
+    /// the tool name comes from runtime input (e.g., user configuration or
+    /// database).
+    pub fn try_new(name: impl Into<String>) -> Result<Self> {
+        let name = name.into();
+        validate_tool_name(&name)?;
+        Ok(Self {
+            name,
+            title: None,
+            description: None,
+            output_schema: None,
+            icons: None,
+            annotations: None,
+        })
     }
 
     /// Set a human-readable title for the tool
@@ -789,8 +816,7 @@ impl ToolBuilder {
     ///     .no_params_handler(|| async {
     ///         Ok(CallToolResult::text("OK"))
     ///     })
-    ///     .build()
-    ///     .unwrap();
+    ///     .build();
     /// ```
     pub fn no_params_handler<F, Fut>(self, handler: F) -> ToolBuilderWithNoParamsHandler<F>
     where
@@ -844,8 +870,7 @@ impl ToolBuilder {
     ///             Ok(CallToolResult::text(format!("Query: {}", input.query)))
     ///         }
     ///     })
-    ///     .build()
-    ///     .expect("valid tool name");
+    ///     .build();
     /// ```
     ///
     /// The `move` keyword on the closure captures the `Arc<AppState>`, and
@@ -922,8 +947,7 @@ impl ToolBuilder {
     ///         Ok(CallToolResult::text(format!("Searched {} with: {}", db.url, input.query)))
     ///     })
     ///     .layer(TimeoutLayer::new(Duration::from_secs(30)))
-    ///     .build()
-    ///     .unwrap();
+    ///     .build();
     /// ```
     ///
     /// # Example
@@ -956,8 +980,7 @@ impl ToolBuilder {
     ///         ctx.report_progress(0.5, Some(1.0), Some("Searching...")).await;
     ///         Ok(CallToolResult::text(format!("Searched {} with: {}", db.url, input.query)))
     ///     })
-    ///     .build()
-    ///     .unwrap();
+    ///     .build();
     /// ```
     ///
     /// # Type Inference
@@ -1022,8 +1045,7 @@ impl ToolBuilder {
     ///     | async move {
     ///         Ok(CallToolResult::text(format!("{}, {}!", app.prefix, input.name)))
     ///     })
-    ///     .build()
-    ///     .unwrap();
+    ///     .build();
     /// ```
     pub fn extractor_handler_typed<S, F, T, I>(
         self,
@@ -1102,11 +1124,8 @@ where
     Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
 {
     /// Build the tool.
-    ///
-    /// Returns an error if the tool name is invalid.
-    pub fn build(self) -> Result<Tool> {
-        validate_tool_name(&self.name)?;
-        Ok(Tool::from_handler(
+    pub fn build(self) -> Tool {
+        Tool::from_handler(
             self.name,
             self.title,
             self.description,
@@ -1116,7 +1135,7 @@ where
             NoParamsTypedHandler {
                 handler: self.handler,
             },
-        ))
+        )
     }
 
     /// Apply a Tower layer (middleware) to this tool.
@@ -1169,11 +1188,7 @@ where
     <L::Service as Service<ToolRequest>>::Future: Send,
 {
     /// Build the tool with the applied layer(s).
-    ///
-    /// Returns an error if the tool name is invalid.
-    pub fn build(self) -> Result<Tool> {
-        validate_tool_name(&self.name)?;
-
+    pub fn build(self) -> Tool {
         let input_schema = serde_json::json!({ "type": "object" });
 
         let handler_service = ToolHandlerService::new(NoParamsTypedHandler {
@@ -1183,7 +1198,7 @@ where
         let catch_error = ToolCatchError::new(layered);
         let service = BoxCloneService::new(catch_error);
 
-        Ok(Tool {
+        Tool {
             name: self.name,
             title: self.title,
             description: self.description,
@@ -1192,7 +1207,7 @@ where
             annotations: self.annotations,
             service,
             input_schema,
-        })
+        }
     }
 
     /// Apply an additional Tower layer (middleware).
@@ -1232,12 +1247,9 @@ where
     F: Fn(I) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
 {
-    /// Build the tool
-    ///
-    /// Returns an error if the tool name is invalid.
-    pub fn build(self) -> Result<Tool> {
-        validate_tool_name(&self.name)?;
-        Ok(Tool::from_handler(
+    /// Build the tool.
+    pub fn build(self) -> Tool {
+        Tool::from_handler(
             self.name,
             self.title,
             self.description,
@@ -1248,7 +1260,7 @@ where
                 handler: self.handler,
                 _phantom: std::marker::PhantomData,
             },
-        ))
+        )
     }
 
     /// Apply a Tower layer (middleware) to this tool.
@@ -1274,8 +1286,7 @@ where
     ///         Ok(CallToolResult::text("result"))
     ///     })
     ///     .layer(TimeoutLayer::new(Duration::from_secs(30)))
-    ///     .build()
-    ///     .unwrap();
+    ///     .build();
     /// ```
     pub fn layer<L>(self, layer: L) -> ToolBuilderWithLayer<I, F, L> {
         ToolBuilderWithLayer {
@@ -1334,11 +1345,7 @@ where
     <L::Service as Service<ToolRequest>>::Future: Send,
 {
     /// Build the tool with the applied layer(s).
-    ///
-    /// Returns an error if the tool name is invalid.
-    pub fn build(self) -> Result<Tool> {
-        validate_tool_name(&self.name)?;
-
+    pub fn build(self) -> Tool {
         let input_schema = schemars::schema_for!(I);
         let input_schema = serde_json::to_value(input_schema)
             .unwrap_or_else(|_| serde_json::json!({ "type": "object" }));
@@ -1351,7 +1358,7 @@ where
         let catch_error = ToolCatchError::new(layered);
         let service = BoxCloneService::new(catch_error);
 
-        Ok(Tool {
+        Tool {
             name: self.name,
             title: self.title,
             description: self.description,
@@ -1360,7 +1367,7 @@ where
             annotations: self.annotations,
             service,
             input_schema,
-        })
+        }
     }
 
     /// Apply an additional Tower layer (middleware).
@@ -1468,7 +1475,7 @@ where
 ///     }
 /// }
 ///
-/// let tool = AddTool.into_tool().expect("valid tool name");
+/// let tool = AddTool.into_tool();
 /// assert_eq!(tool.name, "add");
 /// ```
 pub trait McpTool: Send + Sync + 'static {
@@ -1485,17 +1492,23 @@ pub trait McpTool: Send + Sync + 'static {
         None
     }
 
-    /// Convert to a Tool instance
+    /// Convert to a [`Tool`] instance.
     ///
-    /// Returns an error if the tool name is invalid.
-    fn into_tool(self) -> Result<Tool>
+    /// # Panics
+    ///
+    /// Panics if [`NAME`](Self::NAME) is not a valid tool name. Since `NAME`
+    /// is a `&'static str`, invalid names are caught immediately during
+    /// development.
+    fn into_tool(self) -> Tool
     where
         Self: Sized,
     {
-        validate_tool_name(Self::NAME)?;
+        if let Err(e) = validate_tool_name(Self::NAME) {
+            panic!("{e}");
+        }
         let annotations = self.annotations();
         let tool = Arc::new(self);
-        Ok(Tool::from_handler(
+        Tool::from_handler(
             Self::NAME.to_string(),
             None,
             Some(Self::DESCRIPTION.to_string()),
@@ -1503,7 +1516,7 @@ pub trait McpTool: Send + Sync + 'static {
             None,
             annotations,
             McpToolHandler { tool },
-        ))
+        )
     }
 }
 
@@ -1553,8 +1566,7 @@ mod tests {
             .handler(|input: GreetInput| async move {
                 Ok(CallToolResult::text(format!("Hello, {}!", input.name)))
             })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         assert_eq!(tool.name, "greet");
         assert_eq!(tool.description.as_deref(), Some("Greet someone"));
@@ -1571,8 +1583,7 @@ mod tests {
             .extractor_handler((), |RawArgs(args): RawArgs| async move {
                 Ok(CallToolResult::json(args))
             })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         let result = tool.call(serde_json::json!({"foo": "bar"})).await;
 
@@ -1581,47 +1592,39 @@ mod tests {
 
     #[test]
     fn test_invalid_tool_name_empty() {
-        let result = ToolBuilder::new("")
-            .description("Empty name")
-            .extractor_handler((), |RawArgs(args): RawArgs| async move {
-                Ok(CallToolResult::json(args))
-            })
-            .build();
-
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("cannot be empty"));
+        let err = ToolBuilder::try_new("").err().expect("should fail");
+        assert!(err.to_string().contains("cannot be empty"));
     }
 
     #[test]
     fn test_invalid_tool_name_too_long() {
         let long_name = "a".repeat(129);
-        let result = ToolBuilder::new(long_name)
-            .description("Too long")
-            .extractor_handler((), |RawArgs(args): RawArgs| async move {
-                Ok(CallToolResult::json(args))
-            })
-            .build();
-
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("exceeds maximum"));
+        let err = ToolBuilder::try_new(long_name).err().expect("should fail");
+        assert!(err.to_string().contains("exceeds maximum"));
     }
 
     #[test]
     fn test_invalid_tool_name_bad_chars() {
-        let result = ToolBuilder::new("my tool!")
-            .description("Bad chars")
-            .extractor_handler((), |RawArgs(args): RawArgs| async move {
-                Ok(CallToolResult::json(args))
-            })
-            .build();
+        let err = ToolBuilder::try_new("my tool!").err().expect("should fail");
+        assert!(err.to_string().contains("invalid character"));
+    }
 
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("invalid character")
-        );
+    #[test]
+    #[should_panic(expected = "cannot be empty")]
+    fn test_new_panics_on_empty_name() {
+        ToolBuilder::new("");
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds maximum")]
+    fn test_new_panics_on_too_long_name() {
+        ToolBuilder::new("a".repeat(129));
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid character")]
+    fn test_new_panics_on_invalid_chars() {
+        ToolBuilder::new("my tool!");
     }
 
     #[test]
@@ -1636,13 +1639,11 @@ mod tests {
             &"a".repeat(128),
         ];
         for name in names {
-            let result = ToolBuilder::new(name)
-                .description("Valid")
-                .extractor_handler((), |RawArgs(args): RawArgs| async move {
-                    Ok(CallToolResult::json(args))
-                })
-                .build();
-            assert!(result.is_ok(), "Expected '{}' to be valid", name);
+            assert!(
+                ToolBuilder::try_new(name).is_ok(),
+                "Expected '{}' to be valid",
+                name
+            );
         }
     }
 
@@ -1675,8 +1676,7 @@ mod tests {
                     )))
                 },
             )
-            .build()
-            .expect("valid tool name");
+            .build();
 
         assert_eq!(tool.name, "process");
 
@@ -1736,8 +1736,7 @@ mod tests {
                     }
                 },
             )
-            .build()
-            .expect("valid tool name");
+            .build();
 
         let ctx = RequestContext::new(RequestId::Number(1));
 
@@ -1773,8 +1772,7 @@ mod tests {
             .handler(|input: GreetInput| async move {
                 Ok(CallToolResult::text(format!("Hello, {}!", input.name)))
             })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         assert_eq!(tool.name, "greet");
         assert_eq!(tool.title.as_deref(), Some("Greeting Tool"));
@@ -1805,8 +1803,7 @@ mod tests {
                     )))
                 },
             )
-            .build()
-            .expect("valid tool name");
+            .build();
 
         let result = tool.call(serde_json::json!({"name": "World"})).await;
         assert!(!result.is_error);
@@ -1832,8 +1829,7 @@ mod tests {
                         )))
                     },
                 )
-                .build()
-                .expect("valid tool name");
+                .build();
 
         let ctx = RequestContext::new(RequestId::Number(1));
         let result = tool
@@ -1849,8 +1845,7 @@ mod tests {
             .extractor_handler((), |Json(_): Json<NoParams>| async {
                 Ok(CallToolResult::text("no params result"))
             })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         assert_eq!(tool.name, "no_params");
 
@@ -1879,8 +1874,7 @@ mod tests {
                     Ok(CallToolResult::text(format!("state: {}", state)))
                 },
             )
-            .build()
-            .expect("valid tool name");
+            .build();
 
         assert_eq!(tool.name, "with_state_no_params");
 
@@ -1901,8 +1895,7 @@ mod tests {
             .extractor_handler((), |_ctx: Context, Json(_): Json<NoParams>| async move {
                 Ok(CallToolResult::text("context available"))
             })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         assert_eq!(tool.name, "no_params_with_context");
 
@@ -1925,8 +1918,7 @@ mod tests {
                     Ok(CallToolResult::text(format!("state: {}", state)))
                 },
             )
-            .build()
-            .expect("valid tool name");
+            .build();
 
         assert_eq!(tool.name, "state_context_no_params");
 
@@ -1947,8 +1939,7 @@ mod tests {
                     Ok(CallToolResult::text(format!("{} {}", state, args)))
                 },
             )
-            .build()
-            .expect("valid tool name");
+            .build();
 
         assert_eq!(tool.name, "raw_with_state");
 
@@ -1971,8 +1962,7 @@ mod tests {
                     Ok(CallToolResult::text(format!("{} {}", state, args)))
                 },
             )
-            .build()
-            .expect("valid tool name");
+            .build();
 
         assert_eq!(tool.name, "raw_state_context");
 
@@ -1999,8 +1989,7 @@ mod tests {
                 Ok(CallToolResult::text("completed"))
             })
             .layer(TimeoutLayer::new(Duration::from_millis(50)))
-            .build()
-            .expect("valid tool name");
+            .build();
 
         // Fast call should succeed
         let result = tool.call(serde_json::json!({"delay_ms": 10})).await;
@@ -2054,8 +2043,7 @@ mod tests {
                 }
             })
             .layer(ConcurrencyLimitLayer::new(2))
-            .build()
-            .expect("valid tool name");
+            .build();
 
         // Launch 4 concurrent calls
         let handles: Vec<_> = (0..4)
@@ -2093,8 +2081,7 @@ mod tests {
             })
             .layer(TimeoutLayer::new(Duration::from_secs(5)))
             .layer(ConcurrencyLimitLayer::new(10))
-            .build()
-            .expect("valid tool name");
+            .build();
 
         let result = tool.call(serde_json::json!({"value": "test"})).await;
         assert!(!result.is_error);
@@ -2110,8 +2097,7 @@ mod tests {
             .extractor_handler((), |RawArgs(_args): RawArgs| async {
                 Ok(CallToolResult::text("ok"))
             })
-            .build()
-            .unwrap();
+            .build();
         // The tool contains a BoxToolService which is cloneable
         let _clone = tool.call(serde_json::json!({}));
     }
@@ -2195,8 +2181,7 @@ mod tests {
         let tool = ToolBuilder::new("status")
             .description("Get status")
             .handler(|_input: NoParams| async move { Ok(CallToolResult::text("OK")) })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         // Check schema has type: object (not type: null like () would produce)
         let schema = tool.definition().input_schema;
@@ -2222,8 +2207,7 @@ mod tests {
             .description("Query something")
             .title("Query Tool")
             .handler(|input: Input| async move { Ok(CallToolResult::text(&input.value)) })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         // Create prefixed version
         let prefixed = tool.with_name_prefix("db");
@@ -2251,8 +2235,7 @@ mod tests {
         let tool = ToolBuilder::new("action")
             .description("Do something")
             .handler(|_: NoParams| async move { Ok(CallToolResult::text("done")) })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         // Apply multiple prefixes
         let prefixed = tool.with_name_prefix("level1");
@@ -2271,8 +2254,7 @@ mod tests {
         let tool = ToolBuilder::new("get_status")
             .description("Get current status")
             .no_params_handler(|| async { Ok(CallToolResult::text("OK")) })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         assert_eq!(tool.name, "get_status");
         assert_eq!(tool.description.as_deref(), Some("Get current status"));
@@ -2305,8 +2287,7 @@ mod tests {
                     Ok(CallToolResult::text(format!("Incremented from {}", prev)))
                 }
             })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         // Call multiple times
         let _ = tool.call(serde_json::json!({})).await;
@@ -2330,8 +2311,7 @@ mod tests {
                 Ok(CallToolResult::text("done"))
             })
             .layer(TimeoutLayer::new(Duration::from_secs(1)))
-            .build()
-            .expect("valid tool name");
+            .build();
 
         let result = tool.call(serde_json::json!({})).await;
         assert!(!result.is_error);
@@ -2350,8 +2330,7 @@ mod tests {
                 Ok(CallToolResult::text("done"))
             })
             .layer(TimeoutLayer::new(Duration::from_millis(50)))
-            .build()
-            .expect("valid tool name");
+            .build();
 
         let result = tool.call(serde_json::json!({})).await;
         assert!(result.is_error);
@@ -2374,8 +2353,7 @@ mod tests {
             .no_params_handler(|| async { Ok(CallToolResult::text("status ok")) })
             .layer(TimeoutLayer::new(Duration::from_secs(5)))
             .layer(ConcurrencyLimitLayer::new(10))
-            .build()
-            .expect("valid tool name");
+            .build();
 
         let result = tool.call(serde_json::json!({})).await;
         assert!(!result.is_error);
@@ -2411,8 +2389,7 @@ mod tests {
                 }
                 Ok(())
             })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         let result = tool
             .call(serde_json::json!({"id": "abc", "confirm": true}))
@@ -2446,8 +2423,7 @@ mod tests {
                 }
                 Ok(())
             })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         let result = tool
             .call(serde_json::json!({"id": "abc", "confirm": false}))
@@ -2473,8 +2449,7 @@ mod tests {
             })
             .layer(TimeoutLayer::new(Duration::from_secs(5)))
             .guard(|_req: &ToolRequest| Ok(()))
-            .build()
-            .expect("valid tool name");
+            .build();
 
         let result = tool.call(serde_json::json!({"name": "World"})).await;
         assert!(!result.is_error);
@@ -2496,8 +2471,7 @@ mod tests {
                     Err("Access denied".to_string())
                 }
             })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         // Allowed
         let result = tool.call(serde_json::json!({})).await;
@@ -2521,8 +2495,7 @@ mod tests {
             .no_params_handler(|| async { Ok(CallToolResult::text("ok")) })
             .layer(TimeoutLayer::new(Duration::from_secs(5)))
             .guard(|_req: &ToolRequest| Ok(()))
-            .build()
-            .expect("valid tool name");
+            .build();
 
         let result = tool.call(serde_json::json!({})).await;
         assert!(!result.is_error);
@@ -2565,8 +2538,7 @@ mod tests {
                 }
                 Ok(())
             })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         // Valid query
         let result = tool.call(serde_json::json!({"query": "hello"})).await;
@@ -2617,8 +2589,7 @@ mod tests {
             )
             .layer(TimeoutLayer::new(Duration::from_secs(5)))
             .guard(|_req: &ToolRequest| Ok(()))
-            .build()
-            .expect("valid tool name");
+            .build();
 
         let result = tool.call(serde_json::json!({"query": "hello"})).await;
         assert!(!result.is_error);
@@ -2630,8 +2601,7 @@ mod tests {
         let tool = ToolBuilder::new("admin_action")
             .description("Admin action")
             .handler(|_input: GreetInput| async move { Ok(CallToolResult::text("done")) })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         // Apply guard after building
         let guarded = tool.with_guard(|req: &ToolRequest| {
@@ -2660,8 +2630,7 @@ mod tests {
             .title("My Tool")
             .read_only()
             .handler(|_input: GreetInput| async move { Ok(CallToolResult::text("done")) })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         let guarded = tool.with_guard(|_req: &ToolRequest| Ok(()));
 
@@ -2690,13 +2659,11 @@ mod tests {
         let tool1 = ToolBuilder::new("action1")
             .description("Action 1")
             .handler(|_input: GreetInput| async move { Ok(CallToolResult::text("action1")) })
-            .build()
-            .expect("valid");
+            .build();
         let tool2 = ToolBuilder::new("action2")
             .description("Action 2")
             .handler(|_input: GreetInput| async move { Ok(CallToolResult::text("action2")) })
-            .build()
-            .expect("valid");
+            .build();
 
         // Apply same guard to both
         let guarded1 = tool1.with_guard(require_auth);

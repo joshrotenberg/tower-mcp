@@ -52,8 +52,7 @@
 //!             Ok(CallToolResult::text(format!("Found results for: {}", input.query)))
 //!         },
 //!     )
-//!     .build()
-//!     .unwrap();
+//!     .build();
 //! ```
 //!
 //! ## Quick Start: Server
@@ -78,7 +77,7 @@
 //!         .handler(|input: GreetInput| async move {
 //!             Ok(CallToolResult::text(format!("Hello, {}!", input.name)))
 //!         })
-//!         .build()?;
+//!         .build();
 //!
 //!     // Create router and run over stdio
 //!     let router = McpRouter::new()
@@ -197,8 +196,7 @@
 //!         Ok(CallToolResult::text("results"))
 //!     })
 //!     .layer(TimeoutLayer::new(Duration::from_secs(60)))  // 60s for this tool
-//!     .build()
-//!     .unwrap();
+//!     .build();
 //!
 //! let router = McpRouter::new()
 //!     .server_info("example", "1.0.0")
@@ -266,7 +264,7 @@
 //!         let text = result.first_text().unwrap_or("No response");
 //!         Ok(CallToolResult::text(text))
 //!     })
-//!     .build()?;
+//!     .build();
 //! ```
 //!
 //! ### Elicitation (User Input)
@@ -288,7 +286,7 @@
 //!         // ... perform deletion ...
 //!         Ok(CallToolResult::text("Deleted"))
 //!     })
-//!     .build()?;
+//!     .build();
 //! ```
 //!
 //! For complex forms, use [`ElicitFormSchema`] to define multiple fields.
@@ -314,7 +312,7 @@
 //!
 //!         Ok(CallToolResult::text("Done"))
 //!     })
-//!     .build()?;
+//!     .build();
 //! ```
 //!
 //! ### Router Composition

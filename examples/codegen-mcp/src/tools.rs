@@ -200,7 +200,6 @@ fn build_init_project(state: Arc<CodegenState>) -> Tool {
             },
         )
         .build()
-        .expect("valid tool")
 }
 
 fn build_add_tool(state: Arc<CodegenState>) -> Tool {
@@ -270,7 +269,6 @@ fn build_add_tool(state: Arc<CodegenState>) -> Tool {
             },
         )
         .build()
-        .expect("valid tool")
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -312,7 +310,6 @@ fn build_remove_tool(state: Arc<CodegenState>) -> Tool {
             },
         )
         .build()
-        .expect("valid tool")
 }
 
 fn build_get_project(state: Arc<CodegenState>) -> Tool {
@@ -327,7 +324,6 @@ fn build_get_project(state: Arc<CodegenState>) -> Tool {
             },
         )
         .build()
-        .expect("valid tool")
 }
 
 fn build_generate(state: Arc<CodegenState>) -> Tool {
@@ -352,7 +348,6 @@ fn build_generate(state: Arc<CodegenState>) -> Tool {
             },
         )
         .build()
-        .expect("valid tool")
 }
 
 fn build_validate(state: Arc<CodegenState>) -> Tool {
@@ -437,7 +432,6 @@ fn build_validate(state: Arc<CodegenState>) -> Tool {
             },
         )
         .build()
-        .expect("valid tool")
 }
 
 fn build_reset(state: Arc<CodegenState>) -> Tool {
@@ -454,7 +448,6 @@ fn build_reset(state: Arc<CodegenState>) -> Tool {
             },
         )
         .build()
-        .expect("valid tool")
 }
 
 // =============================================================================
@@ -488,7 +481,6 @@ fn build_list_handler_types() -> Tool {
             )))
         })
         .build()
-        .expect("valid tool")
 }
 
 fn build_list_layer_types() -> Tool {
@@ -514,7 +506,6 @@ fn build_list_layer_types() -> Tool {
             )))
         })
         .build()
-        .expect("valid tool")
 }
 
 fn build_list_input_types() -> Tool {
@@ -533,7 +524,6 @@ fn build_list_input_types() -> Tool {
             )))
         })
         .build()
-        .expect("valid tool")
 }
 
 // =============================================================================
@@ -565,7 +555,6 @@ fn build_tool_new(state: Arc<CodegenState>) -> Tool {
             },
         )
         .build()
-        .expect("valid tool")
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -601,7 +590,6 @@ fn build_tool_set_description(state: Arc<CodegenState>) -> Tool {
             },
         )
         .build()
-        .expect("valid tool")
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -657,7 +645,6 @@ fn build_tool_add_input(state: Arc<CodegenState>) -> Tool {
             },
         )
         .build()
-        .expect("valid tool")
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -710,7 +697,6 @@ fn build_tool_set_handler(state: Arc<CodegenState>) -> Tool {
             },
         )
         .build()
-        .expect("valid tool")
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -758,7 +744,6 @@ fn build_tool_set_annotation(state: Arc<CodegenState>) -> Tool {
             },
         )
         .build()
-        .expect("valid tool")
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -816,7 +801,6 @@ fn build_tool_add_layer(state: Arc<CodegenState>) -> Tool {
             },
         )
         .build()
-        .expect("valid tool")
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -844,7 +828,6 @@ fn build_tool_get(state: Arc<CodegenState>) -> Tool {
             },
         )
         .build()
-        .expect("valid tool")
 }
 
 fn build_tool_build(state: Arc<CodegenState>) -> Tool {
@@ -876,7 +859,6 @@ fn build_tool_build(state: Arc<CodegenState>) -> Tool {
             },
         )
         .build()
-        .expect("valid tool")
 }
 
 fn build_tool_add_to_project(state: Arc<CodegenState>) -> Tool {
@@ -921,7 +903,6 @@ fn build_tool_add_to_project(state: Arc<CodegenState>) -> Tool {
             },
         )
         .build()
-        .expect("valid tool")
 }
 
 fn build_tool_list(state: Arc<CodegenState>) -> Tool {
@@ -959,7 +940,6 @@ fn build_tool_list(state: Arc<CodegenState>) -> Tool {
             },
         )
         .build()
-        .expect("valid tool")
 }
 
 fn build_tool_discard(state: Arc<CodegenState>) -> Tool {
@@ -983,5 +963,4 @@ fn build_tool_discard(state: Arc<CodegenState>) -> Tool {
             },
         )
         .build()
-        .expect("valid tool")
 }

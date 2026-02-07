@@ -59,8 +59,7 @@
 //!         // Use state
 //!         Ok(CallToolResult::text(format!("Searched {} with query: {}", db.db_url, input.query)))
 //!     })
-//!     .build()
-//!     .unwrap();
+//!     .build();
 //! ```
 //!
 //! # Extractor Order
@@ -540,8 +539,7 @@ impl<S> FromToolRequest<S> for RawArgs {
 ///             Ok(CallToolResult::text(format!("Query on {}: {}", db.url, input.sql)))
 ///         },
 ///     )
-///     .build()
-///     .unwrap();
+///     .build();
 ///
 /// let router = McpRouter::new()
 ///     .with_state(pool)
@@ -947,7 +945,6 @@ where
 
 use crate::tool::{
     BoxFuture, GuardLayer, Tool, ToolCatchError, ToolHandler, ToolHandlerService, ToolRequest,
-    validate_tool_name,
 };
 use tower::util::BoxCloneService;
 use tower_service::Service;
@@ -1011,11 +1008,7 @@ where
     T: Send + Sync + 'static,
 {
     /// Build the tool.
-    ///
-    /// Returns an error if the tool name is invalid.
-    pub fn build(self) -> Result<Tool> {
-        validate_tool_name(&self.name)?;
-
+    pub fn build(self) -> Tool {
         let handler = ExtractorToolHandler {
             state: self.state,
             handler: self.handler,
@@ -1027,7 +1020,7 @@ where
         let catch_error = ToolCatchError::new(handler_service);
         let service = BoxCloneService::new(catch_error);
 
-        Ok(Tool {
+        Tool {
             name: self.name,
             title: self.title,
             description: self.description,
@@ -1036,7 +1029,7 @@ where
             annotations: self.annotations,
             service,
             input_schema: self.input_schema,
-        })
+        }
     }
 
     /// Apply a Tower layer (middleware) to this tool.
@@ -1072,8 +1065,7 @@ where
     ///         Ok(CallToolResult::text(format!("{}: {}", app.prefix, input.query)))
     ///     })
     ///     .layer(TimeoutLayer::new(Duration::from_secs(30)))
-    ///     .build()
-    ///     .unwrap();
+    ///     .build();
     /// ```
     pub fn layer<L>(self, layer: L) -> ToolBuilderWithExtractorLayer<S, F, T, L> {
         ToolBuilderWithExtractorLayer {
@@ -1135,11 +1127,7 @@ where
     <L::Service as Service<ToolRequest>>::Future: Send,
 {
     /// Build the tool with the applied layer(s).
-    ///
-    /// Returns an error if the tool name is invalid.
-    pub fn build(self) -> Result<Tool> {
-        validate_tool_name(&self.name)?;
-
+    pub fn build(self) -> Tool {
         let handler = ExtractorToolHandler {
             state: self.state,
             handler: self.handler,
@@ -1152,7 +1140,7 @@ where
         let catch_error = ToolCatchError::new(layered);
         let service = BoxCloneService::new(catch_error);
 
-        Ok(Tool {
+        Tool {
             name: self.name,
             title: self.title,
             description: self.description,
@@ -1161,7 +1149,7 @@ where
             annotations: self.annotations,
             service,
             input_schema: self.input_schema,
-        })
+        }
     }
 
     /// Apply an additional Tower layer (middleware).
@@ -1222,11 +1210,7 @@ where
     I: JsonSchema + Send + Sync + 'static,
 {
     /// Build the tool.
-    ///
-    /// Returns an error if the tool name is invalid.
-    pub fn build(self) -> Result<Tool> {
-        validate_tool_name(&self.name)?;
-
+    pub fn build(self) -> Tool {
         let input_schema = {
             let schema = schemars::schema_for!(I);
             serde_json::to_value(schema).unwrap_or_else(|_| {
@@ -1247,7 +1231,7 @@ where
         let catch_error = ToolCatchError::new(handler_service);
         let service = BoxCloneService::new(catch_error);
 
-        Ok(Tool {
+        Tool {
             name: self.name,
             title: self.title,
             description: self.description,
@@ -1256,7 +1240,7 @@ where
             annotations: self.annotations,
             service,
             input_schema,
-        })
+        }
     }
 }
 
@@ -1566,8 +1550,7 @@ mod tests {
                         )))
                     },
                 )
-                .build()
-                .expect("valid tool name");
+                .build();
 
         assert_eq!(tool.name, "test_extractor");
         assert_eq!(tool.description.as_deref(), Some("Test extractor handler"));
@@ -1596,8 +1579,7 @@ mod tests {
                     )))
                 },
             )
-            .build()
-            .expect("valid tool name");
+            .build();
 
         assert_eq!(tool.name, "test_typed");
 
@@ -1631,8 +1613,7 @@ mod tests {
                     )))
                 },
             )
-            .build()
-            .expect("valid tool name");
+            .build();
 
         // Verify schema is properly generated from TestInput (not generic object)
         let def = tool.definition();
@@ -1669,8 +1650,7 @@ mod tests {
             .extractor_handler((), |RawArgs(args): RawArgs| async move {
                 Ok(CallToolResult::json(args))
             })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         let def = tool.definition();
         let schema = def.input_schema;
@@ -1708,8 +1688,7 @@ mod tests {
                 },
             )
             .layer(TimeoutLayer::new(Duration::from_secs(5)))
-            .build()
-            .expect("valid tool name");
+            .build();
 
         // Verify the tool works
         let result = tool
@@ -1740,8 +1719,7 @@ mod tests {
                 Ok(CallToolResult::text(input.name.to_string()))
             })
             .layer(TimeoutLayer::new(Duration::from_millis(50)))
-            .build()
-            .expect("valid tool name");
+            .build();
 
         // Should timeout
         let result = tool
@@ -1775,8 +1753,7 @@ mod tests {
             )
             .layer(TimeoutLayer::new(Duration::from_secs(5)))
             .layer(ConcurrencyLimitLayer::new(10))
-            .build()
-            .expect("valid tool name");
+            .build();
 
         let result = tool
             .call(serde_json::json!({"name": "test", "count": 1}))

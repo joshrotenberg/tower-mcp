@@ -32,8 +32,7 @@ fn create_test_router() -> McpRouter {
         .description("Echo a message")
         .read_only()
         .handler(|input: EchoInput| async move { Ok(CallToolResult::text(input.message)) })
-        .build()
-        .expect("valid tool");
+        .build();
 
     let add = ToolBuilder::new("add")
         .description("Add two numbers")
@@ -42,16 +41,14 @@ fn create_test_router() -> McpRouter {
         .handler(|input: AddInput| async move {
             Ok(CallToolResult::text(format!("{}", input.a + input.b)))
         })
-        .build()
-        .expect("valid tool");
+        .build();
 
     let failing = ToolBuilder::new("failing")
         .description("A tool that always fails")
         .handler(
             |_input: EchoInput| async move { Err(tower_mcp::Error::tool("Intentional failure")) },
         )
-        .build()
-        .expect("valid tool");
+        .build();
 
     McpRouter::new()
         .server_info("test-server", "1.0.0")
@@ -66,8 +63,7 @@ fn create_router_with_resources_and_prompts() -> McpRouter {
     let echo = ToolBuilder::new("echo")
         .description("Echo a message")
         .handler(|input: EchoInput| async move { Ok(CallToolResult::text(input.message)) })
-        .build()
-        .expect("valid tool");
+        .build();
 
     // Resources
     let config_resource = ResourceBuilder::new("file:///config.json")

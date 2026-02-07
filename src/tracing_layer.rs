@@ -67,7 +67,7 @@ use crate::router::{RouterRequest, RouterResponse};
 /// let tool = ToolBuilder::new("search")
 ///     .handler(|input: SearchInput| async move { ... })
 ///     .layer(McpTracingLayer::new())
-///     .build()?;
+///     .build();
 /// ```
 #[derive(Debug, Clone, Copy)]
 pub struct McpTracingLayer {

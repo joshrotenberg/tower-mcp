@@ -63,7 +63,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .handler(|input: AddInput| async move {
             Ok(CallToolResult::text(format!("{}", input.a + input.b)))
         })
-        .build()?;
+        .build();
 
     let slow = ToolBuilder::new("slow")
         .description("Sleep for a specified number of seconds, then respond")
@@ -74,7 +74,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
                 input.seconds
             )))
         })
-        .build()?;
+        .build();
 
     let router = McpRouter::new()
         .server_info("middleware-example", "1.0.0")
