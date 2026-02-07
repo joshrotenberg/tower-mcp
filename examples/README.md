@@ -125,7 +125,7 @@ let echo = ToolBuilder::new("echo")
     .handler(|input: EchoInput| async move {
         Ok(CallToolResult::text(input.message))
     })
-    .build()?;
+    .build();
 ```
 
 And the input type with automatic JSON Schema generation:

@@ -21,7 +21,7 @@
 //! async fn main() -> Result<(), BoxError> {
 //!     let tool = ToolBuilder::new("echo")
 //!         .handler(|i: Input| async move { Ok(CallToolResult::text(i.value)) })
-//!         .build()?;
+//!         .build();
 //!
 //!     let router = McpRouter::new()
 //!         .server_info("my-server", "1.0.0")
@@ -55,7 +55,7 @@
 //!             let result = ctx.sample(params).await?;
 //!             Ok(CallToolResult::text(format!("{:?}", result.content)))
 //!         })
-//!         .build()?;
+//!         .build();
 //!
 //!     let router = McpRouter::new()
 //!         .server_info("my-server", "1.0.0")

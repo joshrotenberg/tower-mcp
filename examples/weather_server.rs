@@ -196,7 +196,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
 
             Ok(CallToolResult::text(forecast))
         })
-        .build()?;
+        .build();
 
     let get_alerts = ToolBuilder::new("get_alerts")
         .description("Get weather alerts for a US state (use two-letter state code)")
@@ -227,7 +227,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
                 ))),
             }
         })
-        .build()?;
+        .build();
 
     // Create router
     let router = McpRouter::new()

@@ -17,14 +17,12 @@
 //! let public_tool = ToolBuilder::new("public")
 //!     .description("Available to everyone")
 //!     .handler(|i: Input| async move { Ok(CallToolResult::text(&i.value)) })
-//!     .build()
-//!     .unwrap();
+//!     .build();
 //!
 //! let admin_tool = ToolBuilder::new("admin")
 //!     .description("Admin only")
 //!     .handler(|i: Input| async move { Ok(CallToolResult::text(&i.value)) })
-//!     .build()
-//!     .unwrap();
+//!     .build();
 //!
 //! let router = McpRouter::new()
 //!     .tool(public_tool)
@@ -241,7 +239,6 @@ mod tests {
             .description("Test tool")
             .handler(|_: serde_json::Value| async { Ok(CallToolResult::text("ok")) })
             .build()
-            .unwrap()
     }
 
     #[test]

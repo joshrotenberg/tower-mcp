@@ -59,7 +59,7 @@ async fn main() -> Result<(), BoxError> {
             )))
         })
         .layer(TimeoutLayer::new(Duration::from_secs(2)))
-        .build()?;
+        .build();
 
     // Tool 2: Slow search with long (30-second) timeout
     let slow_search = ToolBuilder::new("slow_search")
@@ -73,7 +73,7 @@ async fn main() -> Result<(), BoxError> {
             )))
         })
         .layer(TimeoutLayer::new(Duration::from_secs(30)))
-        .build()?;
+        .build();
 
     // Tool 3: Expensive operation with concurrency limit
     // Only 5 concurrent calls allowed; additional calls will wait
@@ -107,7 +107,7 @@ async fn main() -> Result<(), BoxError> {
             }
         })
         .layer(ConcurrencyLimitLayer::new(5))
-        .build()?;
+        .build();
 
     // Tool 4: Combined layers - both timeout AND concurrency limit
     let rate_limited_api = ToolBuilder::new("rate_limited_api")
@@ -122,7 +122,7 @@ async fn main() -> Result<(), BoxError> {
         // Multiple layers can be chained; outer layers wrap inner layers
         .layer(TimeoutLayer::new(Duration::from_secs(10)))
         .layer(ConcurrencyLimitLayer::new(3))
-        .build()?;
+        .build();
 
     // Tool 5: No middleware - direct handler for comparison
     let simple_tool = ToolBuilder::new("simple_tool")
@@ -133,7 +133,7 @@ async fn main() -> Result<(), BoxError> {
                 input.query
             )))
         })
-        .build()?;
+        .build();
 
     let router = McpRouter::new()
         .server_info("tool-middleware-example", "1.0.0")

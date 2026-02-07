@@ -110,7 +110,6 @@ fn build_server_side_tool(client: Arc<ExternalApiClient>) -> tower_mcp::Tool {
             },
         )
         .build()
-        .expect("valid tool")
 }
 
 // =============================================================================
@@ -167,7 +166,6 @@ fn build_oauth_claims_tool() -> tower_mcp::Tool {
             },
         )
         .build()
-        .expect("valid tool")
 }
 
 // =============================================================================
@@ -240,7 +238,6 @@ fn build_elicitation_tool() -> tower_mcp::Tool {
             },
         )
         .build()
-        .expect("valid tool")
 }
 
 // =============================================================================
@@ -336,7 +333,6 @@ fn build_credential_store_tool(store: Arc<CredentialStore>) -> tower_mcp::Tool {
             },
         )
         .build()
-        .expect("valid tool")
 }
 
 // =============================================================================

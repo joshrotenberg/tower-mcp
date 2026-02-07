@@ -48,8 +48,7 @@ pub type CompletionHandler = Arc<
 /// let tool = ToolBuilder::new("echo")
 ///     .description("Echo input")
 ///     .handler(|i: Input| async move { Ok(CallToolResult::text(i.value)) })
-///     .build()
-///     .unwrap();
+///     .build();
 ///
 /// let router = McpRouter::new()
 ///     .server_info("my-server", "1.0.0")
@@ -320,8 +319,7 @@ impl McpRouter {
     ///             Ok(CallToolResult::text(format!("Query on {}: {}", state.db_url, input.sql)))
     ///         },
     ///     )
-    ///     .build()
-    ///     .unwrap();
+    ///     .build();
     ///
     /// let router = McpRouter::new()
     ///     .with_state(state)  // State is now available to all handlers
@@ -448,8 +446,7 @@ impl McpRouter {
     ///     .handler(|input: QueryInput| async move {
     ///         Ok(CallToolResult::text("result"))
     ///     })
-    ///     .build()
-    ///     .unwrap();
+    ///     .build();
     ///
     /// let router = McpRouter::new()
     ///     .auto_instructions()
@@ -592,11 +589,11 @@ impl McpRouter {
     ///     ToolBuilder::new("a")
     ///         .description("Tool A")
     ///         .handler(|i: Input| async move { Ok(CallToolResult::text(&i.value)) })
-    ///         .build().unwrap(),
+    ///         .build(),
     ///     ToolBuilder::new("b")
     ///         .description("Tool B")
     ///         .handler(|i: Input| async move { Ok(CallToolResult::text(&i.value)) })
-    ///         .build().unwrap(),
+    ///         .build(),
     /// ];
     ///
     /// let router = McpRouter::new().tools(tools);
@@ -682,7 +679,6 @@ impl McpRouter {
     ///             .description("Query the database")
     ///             .handler(|i: Input| async move { Ok(CallToolResult::text(&i.value)) })
     ///             .build()
-    ///             .unwrap()
     ///     );
     ///
     /// // Create a router with API tools
@@ -692,7 +688,6 @@ impl McpRouter {
     ///             .description("Fetch from API")
     ///             .handler(|i: Input| async move { Ok(CallToolResult::text(&i.value)) })
     ///             .build()
-    ///             .unwrap()
     ///     );
     ///
     /// // Merge them together
@@ -755,14 +750,12 @@ impl McpRouter {
     ///             .description("Query the database")
     ///             .handler(|i: Input| async move { Ok(CallToolResult::text(&i.value)) })
     ///             .build()
-    ///             .unwrap()
     ///     )
     ///     .tool(
     ///         ToolBuilder::new("insert")
     ///             .description("Insert into database")
     ///             .handler(|i: Input| async move { Ok(CallToolResult::text(&i.value)) })
     ///             .build()
-    ///             .unwrap()
     ///     );
     ///
     /// // Nest under "db" prefix - tools become "db.query" and "db.insert"
@@ -856,14 +849,12 @@ impl McpRouter {
     /// let public_tool = ToolBuilder::new("public")
     ///     .description("Available to everyone")
     ///     .handler(|i: Input| async move { Ok(CallToolResult::text(&i.value)) })
-    ///     .build()
-    ///     .unwrap();
+    ///     .build();
     ///
     /// let admin_tool = ToolBuilder::new("admin")
     ///     .description("Admin only")
     ///     .handler(|i: Input| async move { Ok(CallToolResult::text(&i.value)) })
-    ///     .build()
-    ///     .unwrap();
+    ///     .build();
     ///
     /// let router = McpRouter::new()
     ///     .tool(public_tool)
@@ -1692,8 +1683,7 @@ mod tests {
             .handler(|input: AddInput| async move {
                 Ok(CallToolResult::text(format!("{}", input.a + input.b)))
             })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         let mut router = McpRouter::new().tool(add_tool);
 
@@ -1724,8 +1714,7 @@ mod tests {
             .handler(|input: AddInput| async move {
                 Ok(CallToolResult::text(format!("{}", input.a + input.b)))
             })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         let mut router = McpRouter::new().tool(add_tool);
 
@@ -1775,8 +1764,7 @@ mod tests {
             .handler(|input: AddInput| async move {
                 Ok(CallToolResult::text(format!("{}", input.a + input.b)))
             })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         let router = McpRouter::new().tool(add_tool);
         let mut service = JsonRpcService::new(router.clone());
@@ -1805,8 +1793,7 @@ mod tests {
             .handler(|input: AddInput| async move {
                 Ok(CallToolResult::text(format!("{}", input.a + input.b)))
             })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         let router = McpRouter::new().tool(add_tool);
         let mut service = JsonRpcService::new(router.clone());
@@ -1895,8 +1882,7 @@ mod tests {
                     Ok(CallToolResult::text("done"))
                 }
             })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         // Set up notification channel
         let (tx, mut rx) = notification_channel(10);
@@ -1962,8 +1948,7 @@ mod tests {
                     Ok(CallToolResult::text("done"))
                 }
             })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         let (tx, mut rx) = notification_channel(10);
         let router = McpRouter::new().with_notification_sender(tx).tool(tool);
@@ -1994,8 +1979,7 @@ mod tests {
             .handler(|input: AddInput| async move {
                 Ok(CallToolResult::text(format!("{}", input.a + input.b)))
             })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         let router = McpRouter::new().tool(add_tool);
         let mut service = JsonRpcService::new(router.clone());
@@ -2441,8 +2425,7 @@ mod tests {
             .handler(|input: AddInput| async move {
                 Ok(CallToolResult::text(format!("{}", input.a + input.b)))
             })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         let mut router = McpRouter::new().tool(add_tool);
         init_router(&mut router).await;
@@ -2496,8 +2479,7 @@ mod tests {
             .handler(|input: AddInput| async move {
                 Ok(CallToolResult::text(format!("{}", input.a + input.b)))
             })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         let mut router = McpRouter::new().tool(add_tool);
         init_router(&mut router).await;
@@ -2560,8 +2542,7 @@ mod tests {
                 tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
                 Ok(CallToolResult::text("done"))
             })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         let mut router = McpRouter::new().tool(slow_tool);
         init_router(&mut router).await;
@@ -2611,8 +2592,7 @@ mod tests {
             .handler(|input: AddInput| async move {
                 Ok(CallToolResult::text(format!("{}", input.a + input.b)))
             })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         let mut router = McpRouter::new().tool(add_tool);
         init_router(&mut router).await;
@@ -3082,14 +3062,12 @@ mod tests {
         let public_tool = ToolBuilder::new("public")
             .description("Public tool")
             .handler(|_: AddInput| async move { Ok(CallToolResult::text("public")) })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         let admin_tool = ToolBuilder::new("admin")
             .description("Admin tool")
             .handler(|_: AddInput| async move { Ok(CallToolResult::text("admin")) })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         let mut router = McpRouter::new()
             .tool(public_tool)
@@ -3125,8 +3103,7 @@ mod tests {
         let admin_tool = ToolBuilder::new("admin")
             .description("Admin tool")
             .handler(|_: AddInput| async move { Ok(CallToolResult::text("admin")) })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         let mut router = McpRouter::new()
             .tool(admin_tool)
@@ -3166,8 +3143,7 @@ mod tests {
             .handler(|input: AddInput| async move {
                 Ok(CallToolResult::text(format!("{}", input.a + input.b)))
             })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         let mut router = McpRouter::new()
             .tool(public_tool)
@@ -3204,8 +3180,7 @@ mod tests {
         let admin_tool = ToolBuilder::new("admin")
             .description("Admin tool")
             .handler(|_: AddInput| async move { Ok(CallToolResult::text("admin")) })
-            .build()
-            .expect("valid tool name");
+            .build();
 
         let mut router = McpRouter::new().tool(admin_tool).tool_filter(
             CapabilityFilter::new(|_, _: &Tool| false)
@@ -3553,8 +3528,7 @@ mod tests {
         let tool_a = ToolBuilder::new("tool_a")
             .description("Tool A")
             .handler(|_: StringInput| async move { Ok(CallToolResult::text("A")) })
-            .build()
-            .unwrap();
+            .build();
 
         let router_a = McpRouter::new().tool(tool_a);
 
@@ -3562,13 +3536,11 @@ mod tests {
         let tool_b = ToolBuilder::new("tool_b")
             .description("Tool B")
             .handler(|_: StringInput| async move { Ok(CallToolResult::text("B")) })
-            .build()
-            .unwrap();
+            .build();
         let tool_c = ToolBuilder::new("tool_c")
             .description("Tool C")
             .handler(|_: StringInput| async move { Ok(CallToolResult::text("C")) })
-            .build()
-            .unwrap();
+            .build();
 
         let router_b = McpRouter::new().tool(tool_b).tool(tool_c);
 
@@ -3607,8 +3579,7 @@ mod tests {
         let tool_v1 = ToolBuilder::new("shared")
             .description("Version 1")
             .handler(|_: StringInput| async move { Ok(CallToolResult::text("v1")) })
-            .build()
-            .unwrap();
+            .build();
 
         let router_a = McpRouter::new().tool(tool_v1);
 
@@ -3616,8 +3587,7 @@ mod tests {
         let tool_v2 = ToolBuilder::new("shared")
             .description("Version 2")
             .handler(|_: StringInput| async move { Ok(CallToolResult::text("v2")) })
-            .build()
-            .unwrap();
+            .build();
 
         let router_b = McpRouter::new().tool(tool_v2);
 
@@ -3723,13 +3693,11 @@ mod tests {
         let tool_query = ToolBuilder::new("query")
             .description("Query the database")
             .handler(|_: StringInput| async move { Ok(CallToolResult::text("query result")) })
-            .build()
-            .unwrap();
+            .build();
         let tool_insert = ToolBuilder::new("insert")
             .description("Insert into database")
             .handler(|_: StringInput| async move { Ok(CallToolResult::text("insert result")) })
-            .build()
-            .unwrap();
+            .build();
 
         let db_router = McpRouter::new().tool(tool_query).tool(tool_insert);
 
@@ -3764,8 +3732,7 @@ mod tests {
         let tool = ToolBuilder::new("echo")
             .description("Echo input")
             .handler(|input: StringInput| async move { Ok(CallToolResult::text(&input.value)) })
-            .build()
-            .unwrap();
+            .build();
 
         let nested_router = McpRouter::new().tool(tool);
 
@@ -3803,14 +3770,12 @@ mod tests {
         let db_tool = ToolBuilder::new("query")
             .description("Database query")
             .handler(|_: StringInput| async move { Ok(CallToolResult::text("db")) })
-            .build()
-            .unwrap();
+            .build();
 
         let api_tool = ToolBuilder::new("fetch")
             .description("API fetch")
             .handler(|_: StringInput| async move { Ok(CallToolResult::text("api")) })
-            .build()
-            .unwrap();
+            .build();
 
         let db_router = McpRouter::new().tool(db_tool);
         let api_router = McpRouter::new().tool(api_tool);
@@ -3846,14 +3811,12 @@ mod tests {
         let tool_a = ToolBuilder::new("local")
             .description("Local tool")
             .handler(|_: StringInput| async move { Ok(CallToolResult::text("local")) })
-            .build()
-            .unwrap();
+            .build();
 
         let nested_tool = ToolBuilder::new("remote")
             .description("Remote tool")
             .handler(|_: StringInput| async move { Ok(CallToolResult::text("remote")) })
-            .build()
-            .unwrap();
+            .build();
 
         let nested_router = McpRouter::new().tool(nested_tool);
 
@@ -3942,13 +3905,11 @@ mod tests {
         let tool_a = ToolBuilder::new("alpha")
             .description("Alpha tool")
             .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
-            .build()
-            .unwrap();
+            .build();
         let tool_b = ToolBuilder::new("beta")
             .description("Beta tool")
             .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
-            .build()
-            .unwrap();
+            .build();
 
         let mut router = McpRouter::new()
             .auto_instructions()
@@ -3972,20 +3933,17 @@ mod tests {
             .description("Run a query")
             .read_only()
             .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
-            .build()
-            .unwrap();
+            .build();
         let destructive_tool = ToolBuilder::new("delete")
             .description("Delete a record")
             .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
-            .build()
-            .unwrap();
+            .build();
         let idempotent_tool = ToolBuilder::new("upsert")
             .description("Upsert a record")
             .non_destructive()
             .idempotent()
             .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
-            .build()
-            .unwrap();
+            .build();
 
         let mut router = McpRouter::new()
             .auto_instructions()
@@ -4072,8 +4030,7 @@ mod tests {
             .description("Execute SQL")
             .read_only()
             .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
-            .build()
-            .unwrap();
+            .build();
         let resource = ResourceBuilder::new("db://schema")
             .name("Schema")
             .description("Full database schema")
@@ -4109,8 +4066,7 @@ mod tests {
         let tool = ToolBuilder::new("echo")
             .description("Echo input")
             .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
-            .build()
-            .unwrap();
+            .build();
 
         let mut router = McpRouter::new()
             .auto_instructions_with(
@@ -4133,8 +4089,7 @@ mod tests {
         let tool = ToolBuilder::new("echo")
             .description("Echo input")
             .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
-            .build()
-            .unwrap();
+            .build();
 
         let mut router = McpRouter::new()
             .auto_instructions_with(Some("My server intro."), None::<String>)
@@ -4166,8 +4121,7 @@ mod tests {
         let tool = ToolBuilder::new("echo")
             .description("Echo input")
             .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
-            .build()
-            .unwrap();
+            .build();
 
         let mut router = McpRouter::new()
             .instructions("This will be overridden")
@@ -4186,8 +4140,7 @@ mod tests {
         let tool = ToolBuilder::new("echo")
             .description("Echo input")
             .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
-            .build()
-            .unwrap();
+            .build();
 
         let mut router = McpRouter::new()
             .instructions("Manual instructions here")
@@ -4203,8 +4156,7 @@ mod tests {
     async fn test_auto_instructions_no_description_fallback() {
         let tool = ToolBuilder::new("mystery")
             .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
-            .build()
-            .unwrap();
+            .build();
 
         let mut router = McpRouter::new().auto_instructions().tool(tool);
 
@@ -4219,18 +4171,15 @@ mod tests {
         let tool_z = ToolBuilder::new("zebra")
             .description("Z tool")
             .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
-            .build()
-            .unwrap();
+            .build();
         let tool_a = ToolBuilder::new("alpha")
             .description("A tool")
             .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
-            .build()
-            .unwrap();
+            .build();
         let tool_m = ToolBuilder::new("middle")
             .description("M tool")
             .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
-            .build()
-            .unwrap();
+            .build();
 
         let mut router = McpRouter::new()
             .auto_instructions()
@@ -4254,8 +4203,7 @@ mod tests {
             .description("Safe update operation")
             .idempotent()
             .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
-            .build()
-            .unwrap();
+            .build();
 
         let mut router = McpRouter::new().auto_instructions().tool(tool);
 
@@ -4278,8 +4226,7 @@ mod tests {
         let tool = ToolBuilder::new("late_tool")
             .description("Added after auto_instructions")
             .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
-            .build()
-            .unwrap();
+            .build();
 
         router = router.tool(tool);
 
@@ -4299,8 +4246,7 @@ mod tests {
                 ..Default::default()
             })
             .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
-            .build()
-            .unwrap();
+            .build();
 
         let mut router = McpRouter::new().auto_instructions().tool(tool);
 
@@ -4320,8 +4266,7 @@ mod tests {
         let tool = ToolBuilder::new("fetch")
             .description("Fetch data")
             .handler(|_: AddInput| async move { Ok(CallToolResult::text("ok")) })
-            .build()
-            .unwrap();
+            .build();
 
         let mut router = McpRouter::new().auto_instructions().tool(tool);
 

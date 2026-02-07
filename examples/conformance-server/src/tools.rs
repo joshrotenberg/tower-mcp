@@ -69,7 +69,6 @@ fn build_simple_text() -> Tool {
             ))
         })
         .build()
-        .expect("failed to build test_simple_text")
 }
 
 fn build_image_content() -> Tool {
@@ -79,7 +78,6 @@ fn build_image_content() -> Tool {
             Ok(CallToolResult::image(red_pixel_base64(), "image/png"))
         })
         .build()
-        .expect("failed to build test_image_content")
 }
 
 fn build_audio_content() -> Tool {
@@ -89,7 +87,6 @@ fn build_audio_content() -> Tool {
             Ok(CallToolResult::audio(minimal_wav_base64(), "audio/wav"))
         })
         .build()
-        .expect("failed to build test_audio_content")
 }
 
 fn build_embedded_resource() -> Tool {
@@ -104,7 +101,6 @@ fn build_embedded_resource() -> Tool {
             }))
         })
         .build()
-        .expect("failed to build test_embedded_resource")
 }
 
 fn build_multiple_content_types() -> Tool {
@@ -137,7 +133,6 @@ fn build_multiple_content_types() -> Tool {
             })
         })
         .build()
-        .expect("failed to build test_multiple_content_types")
 }
 
 fn build_tool_with_logging() -> Tool {
@@ -164,7 +159,6 @@ fn build_tool_with_logging() -> Tool {
             Ok(CallToolResult::text("Logging complete"))
         })
         .build()
-        .expect("failed to build test_tool_with_logging")
 }
 
 fn build_tool_with_progress() -> Tool {
@@ -185,7 +179,6 @@ fn build_tool_with_progress() -> Tool {
             Ok(CallToolResult::text("Progress complete"))
         })
         .build()
-        .expect("failed to build test_tool_with_progress")
 }
 
 fn build_error_handling() -> Tool {
@@ -195,7 +188,6 @@ fn build_error_handling() -> Tool {
             Ok(CallToolResult::error("This is an error response"))
         })
         .build()
-        .expect("failed to build test_error_handling")
 }
 
 fn build_sampling() -> Tool {
@@ -221,7 +213,6 @@ fn build_sampling() -> Tool {
             }
         })
         .build()
-        .expect("failed to build test_sampling")
 }
 
 fn build_elicitation() -> Tool {
@@ -250,7 +241,6 @@ fn build_elicitation() -> Tool {
             }
         })
         .build()
-        .expect("failed to build test_elicitation")
 }
 
 fn build_elicitation_sep1034_defaults() -> Tool {
@@ -286,7 +276,6 @@ fn build_elicitation_sep1034_defaults() -> Tool {
             }
         })
         .build()
-        .expect("failed to build test_elicitation_sep1034_defaults")
 }
 
 fn build_elicitation_sep1330_enums() -> Tool {
@@ -372,5 +361,4 @@ fn build_elicitation_sep1330_enums() -> Tool {
             }
         })
         .build()
-        .expect("failed to build test_elicitation_sep1330_enums")
 }

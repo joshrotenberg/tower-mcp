@@ -164,7 +164,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .handler(|input: AddInput| async move {
             Ok(CallToolResult::text(format!("{}", input.a + input.b)))
         })
-        .build()?;
+        .build();
 
     // Create the MCP router
     let mcp_router = McpRouter::new()

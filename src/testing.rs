@@ -23,8 +23,7 @@
 //!     .handler(|input: EchoInput| async move {
 //!         Ok(CallToolResult::text(input.message))
 //!     })
-//!     .build()
-//!     .expect("valid tool");
+//!     .build();
 //!
 //! let router = McpRouter::new()
 //!     .server_info("test-server", "1.0.0")
@@ -66,8 +65,7 @@
 //!     .handler(|input: AddInput| async move {
 //!         Ok(CallToolResult::text(format!("{}", input.a + input.b)))
 //!     })
-//!     .build()
-//!     .expect("valid tool");
+//!     .build();
 //!
 //! let readme = ResourceBuilder::new("file:///README.md")
 //!     .name("README")
@@ -535,16 +533,14 @@ mod tests {
         let echo = ToolBuilder::new("echo")
             .description("Echo a message")
             .handler(|input: EchoInput| async move { Ok(CallToolResult::text(input.message)) })
-            .build()
-            .unwrap();
+            .build();
 
         let add = ToolBuilder::new("add")
             .description("Add two numbers")
             .handler(|input: AddInput| async move {
                 Ok(CallToolResult::text(format!("{}", input.a + input.b)))
             })
-            .build()
-            .unwrap();
+            .build();
 
         let add_json = ToolBuilder::new("add_json")
             .description("Add two numbers and return JSON")
@@ -554,8 +550,7 @@ mod tests {
                 })
                 .unwrap())
             })
-            .build()
-            .unwrap();
+            .build();
 
         let readme = ResourceBuilder::new("file:///README.md")
             .name("README")

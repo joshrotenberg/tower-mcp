@@ -482,7 +482,7 @@ struct PendingRequest {
 ///             let result = ctx.sample(params).await?;
 ///             Ok(CallToolResult::text(format!("{:?}", result.content)))
 ///         })
-///         .build()?;
+///         .build();
 ///
 ///     let router = McpRouter::new()
 ///         .server_info("my-server", "1.0.0")

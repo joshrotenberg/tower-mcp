@@ -157,7 +157,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .handler(|input: EchoInput| async move {
             Ok(CallToolResult::text(format!("Echo: {}", input.message)))
         })
-        .build()?;
+        .build();
 
     let get_time = ToolBuilder::new("get_time")
         .description("Get the current server time")
@@ -168,7 +168,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
                 .as_secs();
             Ok(CallToolResult::text(format!("Current timestamp: {}", now)))
         })
-        .build()?;
+        .build();
 
     // === ADMIN TOOLS (visible to Admin and Developer roles) ===
 
@@ -179,7 +179,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
                 "System Stats: CPU: 45%, Memory: 2.1GB, Active Users: 1,234",
             ))
         })
-        .build()?;
+        .build();
 
     let admin_delete = ToolBuilder::new("admin_delete_user")
         .description("Delete a user account (admin only)")
@@ -189,7 +189,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
                 input.user_id
             )))
         })
-        .build()?;
+        .build();
 
     // === INTERNAL TOOLS (visible only to Developer role) ===
 
@@ -198,7 +198,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .handler(|_: tower_mcp::NoParams| async move {
             Ok(CallToolResult::text("Debug: memory_pools=12, gc_runs=847"))
         })
-        .build()?;
+        .build();
 
     // === RESOURCES ===
 

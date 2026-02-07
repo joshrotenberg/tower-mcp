@@ -19,7 +19,7 @@
 //!     .extractor_handler(state.clone(), |State(state), Json(input)| async move {
 //!         // Use state here
 //!     })
-//!     .build()?;
+//!     .build();
 //! ```
 //!
 //! ## Input Types with JsonSchema
@@ -181,7 +181,6 @@ fn build_lint_content_tool(state: Arc<LintState>) -> Tool {
             },
         )
         .build()
-        .expect("valid tool")
 }
 
 /// Build the `lint_file` tool.
@@ -209,7 +208,6 @@ fn build_lint_file_tool(state: Arc<LintState>) -> Tool {
             },
         )
         .build()
-        .expect("valid tool")
 }
 
 /// Build the `lint_url` tool.
@@ -245,7 +243,6 @@ fn build_lint_url_tool(state: Arc<LintState>) -> Tool {
             },
         )
         .build()
-        .expect("valid tool")
 }
 
 /// Build the `list_rules` tool.
@@ -269,7 +266,6 @@ fn build_list_rules_tool(state: Arc<LintState>) -> Tool {
             },
         )
         .build()
-        .expect("valid tool")
 }
 
 /// Build the `explain_rule` tool.
@@ -292,7 +288,6 @@ fn build_explain_rule_tool(state: Arc<LintState>) -> Tool {
             },
         )
         .build()
-        .expect("valid tool")
 }
 
 /// Build the `fix_content` tool.
@@ -312,7 +307,6 @@ fn build_fix_content_tool(state: Arc<LintState>) -> Tool {
             },
         )
         .build()
-        .expect("valid tool")
 }
 
 // =============================================================================

@@ -578,7 +578,7 @@ fn generate_tool_builder(tool: &ToolDef, _has_state: bool) -> String {
         }
     }
 
-    code.push_str("        .build()?;\n");
+    code.push_str("        .build();\n");
     code
 }
 
@@ -870,7 +870,7 @@ fn generate_component_tool_builder(builder: &ToolBuilderState) -> String {
         code.push_str(&generate_layer_code(layer));
     }
 
-    code.push_str("    .build()?;\n");
+    code.push_str("    .build();\n");
     code
 }
 
