@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+## [0.5.0] - 2026-02-07
+
+### Features
+
+- Add ResultExt trait for ergonomic tool error handling ([#354](https://github.com/joshrotenberg/tower-mcp/pull/354))
+- Auto-detect JSON schema in extractor_handler and add layer support ([#357](https://github.com/joshrotenberg/tower-mcp/pull/357))
+- Add convenience accessors for tool annotation hints ([#347](https://github.com/joshrotenberg/tower-mcp/pull/347)) ([#360](https://github.com/joshrotenberg/tower-mcp/pull/360))
+- Add CallToolResult::from_list helper for collection responses ([#348](https://github.com/joshrotenberg/tower-mcp/pull/348)) ([#361](https://github.com/joshrotenberg/tower-mcp/pull/361))
+- Auto-generate server instructions from registered capabilities ([#362](https://github.com/joshrotenberg/tower-mcp/pull/362))
+- Add per-tool guards for request-level access control ([#350](https://github.com/joshrotenberg/tower-mcp/pull/350)) ([#363](https://github.com/joshrotenberg/tower-mcp/pull/363))
+- Add JSON helpers and tool-level testing ([#351](https://github.com/joshrotenberg/tower-mcp/pull/351)) ([#364](https://github.com/joshrotenberg/tower-mcp/pull/364))
+- Add Content::text() shorthand and improve documentation ([#365](https://github.com/joshrotenberg/tower-mcp/pull/365))
+- Make ToolBuilder::build() infallible ([#366](https://github.com/joshrotenberg/tower-mcp/pull/366))
+
+### Refactor
+
+- Migrate examples and docs to extractor_handler ([#358](https://github.com/joshrotenberg/tower-mcp/pull/358))
+- **crates-mcp:** Adopt extractor_handler and ResultExt ([#367](https://github.com/joshrotenberg/tower-mcp/pull/367))
+
+
+
 ## [0.4.0] - 2026-02-06
 
 ### Miscellaneous Tasks
