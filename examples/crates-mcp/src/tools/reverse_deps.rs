@@ -6,7 +6,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tower_mcp::protocol::{LogLevel, LoggingMessageParams};
 use tower_mcp::{
-    CallToolResult, Error, Tool, ToolBuilder,
+    CallToolResult, ResultExt, Tool, ToolBuilder,
     extract::{Context, Json, State},
 };
 
@@ -28,7 +28,7 @@ pub fn build(state: Arc<AppState>) -> Tool {
         .read_only()
         .idempotent()
         .icon("https://crates.io/assets/cargo.png")
-        .extractor_handler_typed::<_, _, _, ReverseDepsInput>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<AppState>>,
              ctx: Context,
@@ -51,7 +51,7 @@ pub fn build(state: Arc<AppState>) -> Tool {
                     .client
                     .crate_reverse_dependencies(&input.name)
                     .await
-                    .map_err(|e| Error::tool(format!("Crates.io API error: {}", e)))?;
+                    .tool_context("Crates.io API error")?;
 
                 // Update progress
                 ctx.report_progress(0.8, Some(1.0), Some("Processing results..."))

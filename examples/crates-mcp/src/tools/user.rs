@@ -5,7 +5,7 @@ use std::sync::Arc;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tower_mcp::{
-    CallToolResult, Error, Tool, ToolBuilder,
+    CallToolResult, ResultExt, Tool, ToolBuilder,
     extract::{Json, State},
 };
 
@@ -23,14 +23,14 @@ pub fn build(state: Arc<AppState>) -> Tool {
         .description("Get a crates.io user's profile information by their GitHub username.")
         .read_only()
         .idempotent()
-        .extractor_handler_typed::<_, _, _, UserInput>(
+        .extractor_handler(
             state,
             |State(state): State<Arc<AppState>>, Json(input): Json<UserInput>| async move {
                 let user = state
                     .client
                     .user(&input.username)
                     .await
-                    .map_err(|e| Error::tool(format!("Crates.io API error: {}", e)))?;
+                    .tool_context("Crates.io API error")?;
 
                 let mut output = format!("# User: {}\n\n", user.login);
 
