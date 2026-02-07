@@ -47,7 +47,7 @@ Connect with any MCP client that supports HTTP transport, or add to Claude Code'
 }
 ```
 
-The demo includes 7 tools (search, info, versions, dependencies, reverse deps, downloads, owners), 2 prompts (analyze, compare), and 1 resource (recent searches). See [`examples/crates-mcp`](examples/crates-mcp) for the full source.
+The demo includes 10 tools (search, info, versions, dependencies, reverse deps, downloads, owners, authors, user, summary), 2 prompts (analyze, compare), and 2 resources (recent searches, crate info template). See [`examples/crates-mcp`](examples/crates-mcp) for the full source.
 
 ## Try the Examples
 
@@ -100,6 +100,13 @@ Or jump straight in:
 - **Sampling types**: `CreateMessageParams`/`CreateMessageResult` for LLM requests
 - **Sampling runtime**: Full support on stdio, WebSocket, and HTTP transports
 - **Async tasks**: Task ID generation, status tracking, TTL-based cleanup for long-running operations
+- **Per-tool guards**: Request-level access control for individual tools
+- **Capability filters**: Session-based tool/resource/prompt visibility
+- **`ResultExt`**: Ergonomic error handling in tool handlers
+- **Auto-generated instructions**: Server instructions derived from registered capabilities
+- **Convenience helpers**: `Content::text()`, `CallToolResult::from_list()`, JSON helpers
+- **Tool-level testing**: Unit test tools directly via `Tool::call()`
+- **Infallible builds**: `ToolBuilder::build()` is infallible; `try_new()` available for runtime names
 
 ## Installation
 
@@ -107,7 +114,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tower-mcp = "0.3"
+tower-mcp = "0.5"
 ```
 
 ### Feature Flags
@@ -115,16 +122,18 @@ tower-mcp = "0.3"
 | Feature | Description |
 |---------|-------------|
 | `full` | Enable all optional features |
-| `http` | HTTP transport with SSE support (adds axum, hyper dependencies) |
+| `http` | HTTP transport with SSE support (adds axum, hyper) |
 | `websocket` | WebSocket transport for full-duplex communication |
 | `childproc` | Child process transport for spawning subprocess MCP servers |
-| `client` | MCP client support for connecting to external servers |
+| `oauth` | OAuth 2.1 resource server support (JWT validation) |
+| `jwks` | JWKS endpoint fetching for remote key sets (requires `oauth`) |
+| `testing` | Test utilities (`TestClient`) for in-process testing |
 
 Example with features:
 
 ```toml
 [dependencies]
-tower-mcp = { version = "0.2", features = ["full"] }
+tower-mcp = { version = "0.5", features = ["full"] }
 ```
 
 ## Quick Start
@@ -146,7 +155,7 @@ let greet = ToolBuilder::new("greet")
     .handler(|input: GreetInput| async move {
         Ok(CallToolResult::text(format!("Hello, {}!", input.name)))
     })
-    .build()?;
+    .build();
 
 // Create router with tools
 let router = McpRouter::new()
@@ -178,7 +187,7 @@ let add = ToolBuilder::new("add")
     .handler(|input: AddInput| async move {
         Ok(CallToolResult::text(format!("{}", input.a + input.b)))
     })
-    .build()?;
+    .build();
 ```
 
 ### Trait-Based (For Complex Tools)
@@ -244,7 +253,7 @@ let search = ToolBuilder::new("search")
         let results = format!("Searched {} for: {}", app.db_url, input.query);
         Ok(CallToolResult::text(results))
     })
-    .build()?;
+    .build();
 ```
 
 ### Tool with Icons and Title
@@ -256,7 +265,7 @@ let tool = ToolBuilder::new("analyze")
     .icon("https://example.com/icon.svg")
     .read_only()
     .idempotent()
-    .build()?;
+    .build();
 ```
 
 ### Per-Tool Middleware
@@ -274,7 +283,7 @@ let slow_tool = ToolBuilder::new("slow_search")
         Ok(CallToolResult::text("results"))
     })
     .layer(TimeoutLayer::new(Duration::from_secs(60)))  // 60s for this tool
-    .build()?;
+    .build();
 ```
 
 ### Raw JSON Handler (Escape Hatch)
@@ -289,7 +298,7 @@ let echo = ToolBuilder::new("echo")
     .extractor_handler((), |RawArgs(args): RawArgs| async move {
         Ok(CallToolResult::json(args))
     })
-    .build()?;
+    .build();
 ```
 
 ## Resource Definition
@@ -305,7 +314,7 @@ let config = ResourceBuilder::new("file:///config.json")
         "version": "1.0.0",
         "debug": true
     }))
-    .build()?;
+    .build();
 
 // Dynamic resource with handler
 let status = ResourceBuilder::new("app:///status")
@@ -314,7 +323,7 @@ let status = ResourceBuilder::new("app:///status")
     .handler(|| async {
         Ok("Running".to_string())
     })
-    .build()?;
+    .build();
 
 let router = McpRouter::new()
     .resource(config)
@@ -324,7 +333,7 @@ let router = McpRouter::new()
 ## Prompt Definition
 
 ```rust
-use tower_mcp::{PromptBuilder, GetPromptResult, PromptMessage, PromptRole, protocol::Content};
+use tower_mcp::{PromptBuilder, GetPromptResult, PromptMessage, PromptRole, Content};
 
 let greet = PromptBuilder::new("greet")
     .description("Generate a greeting")
@@ -343,11 +352,11 @@ let greet = PromptBuilder::new("greet")
             description: Some("A friendly greeting".to_string()),
             messages: vec![PromptMessage {
                 role: PromptRole::User,
-                content: Content::Text { text, annotations: None },
+                content: Content::text(text),
             }],
         })
     })
-    .build()?;
+    .build();
 
 let router = McpRouter::new().prompt(greet);
 ```
@@ -404,7 +413,7 @@ let tool = ToolBuilder::new("query")
             Ok(CallToolResult::text(result))
         },
     )
-    .build()?;
+    .build();
 
 let router = McpRouter::new()
     .with_state(state)  // Makes AppState available to all handlers
