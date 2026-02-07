@@ -3,6 +3,7 @@
 //! These types follow the MCP specification (2025-11-25):
 //! <https://modelcontextprotocol.io/specification/2025-11-25>
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -1658,6 +1659,55 @@ impl CallToolResult {
     pub fn first_text(&self) -> Option<&str> {
         self.content.iter().find_map(|c| c.as_text())
     }
+
+    /// Parse the result as a JSON [`Value`].
+    ///
+    /// Returns `structured_content` if set (from [`json()`](Self::json) /
+    /// [`from_serialize()`](Self::from_serialize)), otherwise parses
+    /// [`first_text()`](Self::first_text). Returns `None` if no content is available.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::CallToolResult;
+    /// use serde_json::json;
+    ///
+    /// let result = CallToolResult::json(json!({"key": "value"}));
+    /// let value = result.as_json().unwrap().unwrap();
+    /// assert_eq!(value["key"], "value");
+    /// ```
+    pub fn as_json(&self) -> Option<Result<Value, serde_json::Error>> {
+        if let Some(ref sc) = self.structured_content {
+            return Some(Ok(sc.clone()));
+        }
+        self.first_text().map(serde_json::from_str)
+    }
+
+    /// Deserialize the result into a typed value.
+    ///
+    /// Uses `structured_content` if set, otherwise parses
+    /// [`first_text()`](Self::first_text). Returns `None` if no content is available.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::CallToolResult;
+    /// use serde::Deserialize;
+    /// use serde_json::json;
+    ///
+    /// #[derive(Debug, Deserialize, PartialEq)]
+    /// struct Output { key: String }
+    ///
+    /// let result = CallToolResult::json(json!({"key": "value"}));
+    /// let output: Output = result.deserialize().unwrap().unwrap();
+    /// assert_eq!(output.key, "value");
+    /// ```
+    pub fn deserialize<T: DeserializeOwned>(&self) -> Option<Result<T, serde_json::Error>> {
+        if let Some(ref sc) = self.structured_content {
+            return Some(serde_json::from_value(sc.clone()));
+        }
+        self.first_text().map(serde_json::from_str)
+    }
 }
 
 /// Content types for tool results, resources, and prompts.
@@ -1990,6 +2040,46 @@ impl ReadResourceResult {
     pub fn first_uri(&self) -> Option<&str> {
         self.contents.first().map(|c| c.uri.as_str())
     }
+
+    /// Parse the first text content as a JSON [`Value`].
+    ///
+    /// Returns `None` if there are no contents or the first item has no text.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::ReadResourceResult;
+    /// use serde_json::json;
+    ///
+    /// let result = ReadResourceResult::json("data://config", &json!({"key": "value"}));
+    /// let value = result.as_json().unwrap().unwrap();
+    /// assert_eq!(value["key"], "value");
+    /// ```
+    pub fn as_json(&self) -> Option<Result<Value, serde_json::Error>> {
+        self.first_text().map(serde_json::from_str)
+    }
+
+    /// Deserialize the first text content into a typed value.
+    ///
+    /// Returns `None` if there are no contents or the first item has no text.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::ReadResourceResult;
+    /// use serde::Deserialize;
+    /// use serde_json::json;
+    ///
+    /// #[derive(Debug, Deserialize, PartialEq)]
+    /// struct Config { key: String }
+    ///
+    /// let result = ReadResourceResult::json("data://config", &json!({"key": "value"}));
+    /// let config: Config = result.deserialize().unwrap().unwrap();
+    /// assert_eq!(config.key, "value");
+    /// ```
+    pub fn deserialize<T: DeserializeOwned>(&self) -> Option<Result<T, serde_json::Error>> {
+        self.first_text().map(serde_json::from_str)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2219,6 +2309,46 @@ impl GetPromptResult {
     /// ```
     pub fn first_message_text(&self) -> Option<&str> {
         self.messages.first().and_then(|m| m.content.as_text())
+    }
+
+    /// Parse the first message text as a JSON [`Value`].
+    ///
+    /// Returns `None` if there are no messages or the first message
+    /// does not contain text content.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::GetPromptResult;
+    ///
+    /// let result = GetPromptResult::user_message(r#"{"key": "value"}"#);
+    /// let value = result.as_json().unwrap().unwrap();
+    /// assert_eq!(value["key"], "value");
+    /// ```
+    pub fn as_json(&self) -> Option<Result<Value, serde_json::Error>> {
+        self.first_message_text().map(serde_json::from_str)
+    }
+
+    /// Deserialize the first message text into a typed value.
+    ///
+    /// Returns `None` if there are no messages or the first message
+    /// does not contain text content.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::GetPromptResult;
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Debug, Deserialize, PartialEq)]
+    /// struct Params { key: String }
+    ///
+    /// let result = GetPromptResult::user_message(r#"{"key": "value"}"#);
+    /// let params: Params = result.deserialize().unwrap().unwrap();
+    /// assert_eq!(params.key, "value");
+    /// ```
+    pub fn deserialize<T: DeserializeOwned>(&self) -> Option<Result<T, serde_json::Error>> {
+        self.first_message_text().map(serde_json::from_str)
     }
 }
 
@@ -3966,5 +4096,111 @@ mod tests {
         let structured = result.structured_content.unwrap();
         assert_eq!(structured["count"], 0);
         assert_eq!(structured["results"].as_array().unwrap().len(), 0);
+    }
+
+    // =========================================================================
+    // JSON Helper Tests
+    // =========================================================================
+
+    #[test]
+    fn test_call_tool_result_as_json() {
+        let result = CallToolResult::json(serde_json::json!({"key": "value"}));
+        let value = result.as_json().unwrap().unwrap();
+        assert_eq!(value["key"], "value");
+    }
+
+    #[test]
+    fn test_call_tool_result_as_json_from_text() {
+        let result = CallToolResult::text(r#"{"key": "value"}"#);
+        let value = result.as_json().unwrap().unwrap();
+        assert_eq!(value["key"], "value");
+    }
+
+    #[test]
+    fn test_call_tool_result_as_json_none() {
+        let result = CallToolResult::text("not json");
+        let parsed = result.as_json().unwrap();
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn test_call_tool_result_deserialize() {
+        #[derive(Debug, serde::Deserialize, PartialEq)]
+        struct Output {
+            key: String,
+        }
+
+        let result = CallToolResult::json(serde_json::json!({"key": "value"}));
+        let output: Output = result.deserialize().unwrap().unwrap();
+        assert_eq!(output.key, "value");
+    }
+
+    #[test]
+    fn test_call_tool_result_as_json_empty() {
+        let result = CallToolResult {
+            content: vec![],
+            is_error: false,
+            structured_content: None,
+        };
+        assert!(result.as_json().is_none());
+    }
+
+    #[test]
+    fn test_call_tool_result_deserialize_from_text() {
+        #[derive(Debug, serde::Deserialize, PartialEq)]
+        struct Output {
+            key: String,
+        }
+
+        let result = CallToolResult::text(r#"{"key": "from_text"}"#);
+        let output: Output = result.deserialize().unwrap().unwrap();
+        assert_eq!(output.key, "from_text");
+    }
+
+    #[test]
+    fn test_read_resource_result_as_json() {
+        let result = ReadResourceResult::json("data://config", &serde_json::json!({"port": 8080}));
+        let value = result.as_json().unwrap().unwrap();
+        assert_eq!(value["port"], 8080);
+    }
+
+    #[test]
+    fn test_read_resource_result_deserialize() {
+        #[derive(Debug, serde::Deserialize, PartialEq)]
+        struct Config {
+            port: u16,
+        }
+
+        let result = ReadResourceResult::json("data://config", &serde_json::json!({"port": 8080}));
+        let config: Config = result.deserialize().unwrap().unwrap();
+        assert_eq!(config.port, 8080);
+    }
+
+    #[test]
+    fn test_get_prompt_result_as_json() {
+        let result = GetPromptResult::user_message(r#"{"action": "analyze"}"#);
+        let value = result.as_json().unwrap().unwrap();
+        assert_eq!(value["action"], "analyze");
+    }
+
+    #[test]
+    fn test_get_prompt_result_deserialize() {
+        #[derive(Debug, serde::Deserialize, PartialEq)]
+        struct Params {
+            action: String,
+        }
+
+        let result = GetPromptResult::user_message(r#"{"action": "analyze"}"#);
+        let params: Params = result.deserialize().unwrap().unwrap();
+        assert_eq!(params.action, "analyze");
+    }
+
+    #[test]
+    fn test_get_prompt_result_as_json_empty() {
+        let result = GetPromptResult {
+            description: None,
+            messages: vec![],
+        };
+        assert!(result.as_json().is_none());
     }
 }

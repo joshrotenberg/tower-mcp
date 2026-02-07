@@ -144,6 +144,7 @@
 
 use std::collections::HashMap;
 
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::context::{NotificationReceiver, ServerNotification, notification_channel};
@@ -264,6 +265,65 @@ impl TestClient {
             })),
         )
         .await
+    }
+
+    /// Call a tool and parse the result as a JSON [`Value`].
+    ///
+    /// Panics if the tool call fails, returns an error, or has no parseable content.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use tower_mcp::TestClient;
+    /// # use serde_json::json;
+    /// # async fn example(client: &mut TestClient) {
+    /// let value = client.call_tool_json("search", json!({"q": "rust"})).await;
+    /// assert!(value["results"].is_array());
+    /// # }
+    /// ```
+    pub async fn call_tool_json(&mut self, name: &str, args: Value) -> Value {
+        let result = self.call_tool(name, args).await;
+        assert!(
+            !result.is_error,
+            "tool '{}' returned an error: {}",
+            name,
+            result.all_text()
+        );
+        result
+            .as_json()
+            .expect("no parseable content in tool result")
+            .expect("failed to parse tool result as JSON")
+    }
+
+    /// Call a tool and deserialize the result into a typed value.
+    ///
+    /// Panics if the tool call fails, returns an error, or deserialization fails.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use tower_mcp::TestClient;
+    /// # use serde::Deserialize;
+    /// # use serde_json::json;
+    /// # #[derive(Deserialize)]
+    /// # struct SearchResult { count: usize }
+    /// # async fn example(client: &mut TestClient) {
+    /// let result: SearchResult = client.call_tool_typed("search", json!({"q": "rust"})).await;
+    /// assert!(result.count > 0);
+    /// # }
+    /// ```
+    pub async fn call_tool_typed<T: DeserializeOwned>(&mut self, name: &str, args: Value) -> T {
+        let result = self.call_tool(name, args).await;
+        assert!(
+            !result.is_error,
+            "tool '{}' returned an error: {}",
+            name,
+            result.all_text()
+        );
+        result
+            .deserialize()
+            .expect("no parseable content in tool result")
+            .expect("failed to deserialize tool result")
     }
 
     /// Call a tool and assert that it returns an error.
@@ -466,6 +526,11 @@ mod tests {
         b: i64,
     }
 
+    #[derive(Debug, Clone, Deserialize, serde::Serialize, JsonSchema, PartialEq)]
+    struct AddResult {
+        sum: i64,
+    }
+
     fn create_test_router() -> McpRouter {
         let echo = ToolBuilder::new("echo")
             .description("Echo a message")
@@ -477,6 +542,17 @@ mod tests {
             .description("Add two numbers")
             .handler(|input: AddInput| async move {
                 Ok(CallToolResult::text(format!("{}", input.a + input.b)))
+            })
+            .build()
+            .unwrap();
+
+        let add_json = ToolBuilder::new("add_json")
+            .description("Add two numbers and return JSON")
+            .handler(|input: AddInput| async move {
+                Ok(CallToolResult::from_serialize(&AddResult {
+                    sum: input.a + input.b,
+                })
+                .unwrap())
             })
             .build()
             .unwrap();
@@ -502,6 +578,7 @@ mod tests {
             .server_info("test-server", "1.0.0")
             .tool(echo)
             .tool(add)
+            .tool(add_json)
             .resource(readme)
             .prompt(greet)
     }
@@ -531,13 +608,14 @@ mod tests {
 
         let tools = client.list_tools().await;
 
-        assert_eq!(tools.len(), 2);
+        assert_eq!(tools.len(), 3);
         let names: Vec<&str> = tools
             .iter()
             .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
             .collect();
         assert!(names.contains(&"echo"));
         assert!(names.contains(&"add"));
+        assert!(names.contains(&"add_json"));
     }
 
     #[tokio::test]
@@ -681,5 +759,29 @@ mod tests {
         // Raw response should have content array
         assert!(raw.get("content").is_some());
         assert!(raw.get("content").unwrap().is_array());
+    }
+
+    #[tokio::test]
+    async fn test_client_call_tool_json() {
+        let router = create_test_router();
+        let mut client = TestClient::from_router(router);
+        client.initialize().await;
+
+        let value = client
+            .call_tool_json("add_json", json!({"a": 10, "b": 20}))
+            .await;
+        assert_eq!(value["sum"], 30);
+    }
+
+    #[tokio::test]
+    async fn test_client_call_tool_typed() {
+        let router = create_test_router();
+        let mut client = TestClient::from_router(router);
+        client.initialize().await;
+
+        let result: AddResult = client
+            .call_tool_typed("add_json", json!({"a": 10, "b": 20}))
+            .await;
+        assert_eq!(result, AddResult { sum: 30 });
     }
 }
