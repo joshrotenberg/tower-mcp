@@ -1904,6 +1904,9 @@ pub struct ResourceDefinition {
     /// Size of the resource in bytes (if known)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
+    /// Annotations for this resource (audience, priority hints)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<ContentAnnotations>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2177,6 +2180,9 @@ pub struct ResourceTemplateDefinition {
     /// Optional icons for display in user interfaces
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icons: Option<Vec<ToolIcon>>,
+    /// Annotations for this resource template (audience, priority hints)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<ContentAnnotations>,
 }
 
 // =============================================================================
