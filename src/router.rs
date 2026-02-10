@@ -11,6 +11,8 @@ use std::task::{Context, Poll};
 
 use tower_service::Service;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+
 use crate::async_task::TaskStore;
 use crate::context::{
     CancellationToken, ClientRequesterHandle, NotificationSender, RequestContext,
@@ -30,6 +32,57 @@ pub type CompletionHandler = Arc<
         + Send
         + Sync,
 >;
+
+/// Decode a pagination cursor into an offset.
+///
+/// Returns `Err` if the cursor is malformed.
+fn decode_cursor(cursor: &str) -> Result<usize> {
+    let bytes = BASE64
+        .decode(cursor)
+        .map_err(|_| Error::JsonRpc(JsonRpcError::invalid_params("Invalid pagination cursor")))?;
+    let s = String::from_utf8(bytes)
+        .map_err(|_| Error::JsonRpc(JsonRpcError::invalid_params("Invalid pagination cursor")))?;
+    s.parse::<usize>()
+        .map_err(|_| Error::JsonRpc(JsonRpcError::invalid_params("Invalid pagination cursor")))
+}
+
+/// Encode an offset into an opaque pagination cursor.
+fn encode_cursor(offset: usize) -> String {
+    BASE64.encode(offset.to_string())
+}
+
+/// Apply pagination to a collected list of items.
+///
+/// Returns the page of items and an optional `next_cursor`.
+fn paginate<T>(
+    items: Vec<T>,
+    cursor: Option<&str>,
+    page_size: Option<usize>,
+) -> Result<(Vec<T>, Option<String>)> {
+    let Some(page_size) = page_size else {
+        return Ok((items, None));
+    };
+
+    let offset = match cursor {
+        Some(c) => decode_cursor(c)?,
+        None => 0,
+    };
+
+    if offset >= items.len() {
+        return Ok((Vec::new(), None));
+    }
+
+    let end = (offset + page_size).min(items.len());
+    let next_cursor = if end < items.len() {
+        Some(encode_cursor(end))
+    } else {
+        None
+    };
+
+    let mut items = items;
+    let page = items.drain(offset..end).collect();
+    Ok((page, next_cursor))
+}
 
 /// MCP Router that dispatches requests to registered handlers
 ///
@@ -122,6 +175,8 @@ struct McpRouterInner {
     extensions: Arc<crate::context::Extensions>,
     /// Minimum log level for filtering outgoing log notifications (set by client via logging/setLevel)
     min_log_level: Arc<RwLock<LogLevel>>,
+    /// Page size for list method pagination (None = return all results)
+    page_size: Option<usize>,
 }
 
 impl McpRouterInner {
@@ -235,6 +290,7 @@ impl McpRouter {
                 resource_filter: None,
                 prompt_filter: None,
                 min_log_level: Arc::new(RwLock::new(LogLevel::Debug)),
+                page_size: None,
             }),
             session: SessionState::new(),
         }
@@ -418,6 +474,17 @@ impl McpRouter {
         let inner = Arc::make_mut(&mut self.inner);
         inner.server_name = name.into();
         inner.server_version = version.into();
+        self
+    }
+
+    /// Set the page size for list method pagination.
+    ///
+    /// When set, list methods (`tools/list`, `resources/list`, etc.) will return
+    /// at most `page_size` items per response, with a `next_cursor` for fetching
+    /// subsequent pages. When `None` (the default), all items are returned in a
+    /// single response.
+    pub fn page_size(mut self, size: usize) -> Self {
+        Arc::make_mut(&mut self.inner).page_size = Some(size);
         self
     }
 
@@ -1194,8 +1261,8 @@ impl McpRouter {
                 }))
             }
 
-            McpRequest::ListTools(_params) => {
-                let tools: Vec<ToolDefinition> = self
+            McpRequest::ListTools(params) => {
+                let mut tools: Vec<ToolDefinition> = self
                     .inner
                     .tools
                     .values()
@@ -1209,10 +1276,14 @@ impl McpRouter {
                     })
                     .map(|t| t.definition())
                     .collect();
+                tools.sort_by(|a, b| a.name.cmp(&b.name));
+
+                let (tools, next_cursor) =
+                    paginate(tools, params.cursor.as_deref(), self.inner.page_size)?;
 
                 Ok(McpResponse::ListTools(ListToolsResult {
                     tools,
-                    next_cursor: None,
+                    next_cursor,
                 }))
             }
 
@@ -1239,8 +1310,8 @@ impl McpRouter {
                 Ok(McpResponse::CallTool(result))
             }
 
-            McpRequest::ListResources(_params) => {
-                let resources: Vec<ResourceDefinition> = self
+            McpRequest::ListResources(params) => {
+                let mut resources: Vec<ResourceDefinition> = self
                     .inner
                     .resources
                     .values()
@@ -1254,25 +1325,36 @@ impl McpRouter {
                     })
                     .map(|r| r.definition())
                     .collect();
+                resources.sort_by(|a, b| a.uri.cmp(&b.uri));
+
+                let (resources, next_cursor) =
+                    paginate(resources, params.cursor.as_deref(), self.inner.page_size)?;
 
                 Ok(McpResponse::ListResources(ListResourcesResult {
                     resources,
-                    next_cursor: None,
+                    next_cursor,
                 }))
             }
 
-            McpRequest::ListResourceTemplates(_params) => {
-                let resource_templates: Vec<ResourceTemplateDefinition> = self
+            McpRequest::ListResourceTemplates(params) => {
+                let mut resource_templates: Vec<ResourceTemplateDefinition> = self
                     .inner
                     .resource_templates
                     .iter()
                     .map(|t| t.definition())
                     .collect();
+                resource_templates.sort_by(|a, b| a.uri_template.cmp(&b.uri_template));
+
+                let (resource_templates, next_cursor) = paginate(
+                    resource_templates,
+                    params.cursor.as_deref(),
+                    self.inner.page_size,
+                )?;
 
                 Ok(McpResponse::ListResourceTemplates(
                     ListResourceTemplatesResult {
                         resource_templates,
-                        next_cursor: None,
+                        next_cursor,
                     },
                 ))
             }
@@ -1339,8 +1421,8 @@ impl McpRouter {
                 Ok(McpResponse::UnsubscribeResource(EmptyResult {}))
             }
 
-            McpRequest::ListPrompts(_params) => {
-                let prompts: Vec<PromptDefinition> = self
+            McpRequest::ListPrompts(params) => {
+                let mut prompts: Vec<PromptDefinition> = self
                     .inner
                     .prompts
                     .values()
@@ -1354,10 +1436,14 @@ impl McpRouter {
                     })
                     .map(|p| p.definition())
                     .collect();
+                prompts.sort_by(|a, b| a.name.cmp(&b.name));
+
+                let (prompts, next_cursor) =
+                    paginate(prompts, params.cursor.as_deref(), self.inner.page_size)?;
 
                 Ok(McpResponse::ListPrompts(ListPromptsResult {
                     prompts,
-                    next_cursor: None,
+                    next_cursor,
                 }))
             }
 
@@ -1444,9 +1530,12 @@ impl McpRouter {
             McpRequest::ListTasks(params) => {
                 let tasks = self.inner.task_store.list_tasks(params.status);
 
+                let (tasks, next_cursor) =
+                    paginate(tasks, params.cursor.as_deref(), self.inner.page_size)?;
+
                 Ok(McpResponse::ListTasks(ListTasksResult {
                     tasks,
-                    next_cursor: None,
+                    next_cursor,
                 }))
             }
 
@@ -4464,5 +4553,156 @@ mod tests {
             rx.try_recv().is_err(),
             "Info should be filtered at Warning level"
         );
+    }
+
+    #[test]
+    fn test_paginate_no_page_size() {
+        let items = vec![1, 2, 3, 4, 5];
+        let (page, cursor) = paginate(items.clone(), None, None).unwrap();
+        assert_eq!(page, items);
+        assert!(cursor.is_none());
+    }
+
+    #[test]
+    fn test_paginate_first_page() {
+        let items = vec![1, 2, 3, 4, 5];
+        let (page, cursor) = paginate(items, None, Some(2)).unwrap();
+        assert_eq!(page, vec![1, 2]);
+        assert!(cursor.is_some());
+    }
+
+    #[test]
+    fn test_paginate_middle_page() {
+        let items = vec![1, 2, 3, 4, 5];
+        let (page1, cursor1) = paginate(items.clone(), None, Some(2)).unwrap();
+        assert_eq!(page1, vec![1, 2]);
+
+        let (page2, cursor2) = paginate(items, cursor1.as_deref(), Some(2)).unwrap();
+        assert_eq!(page2, vec![3, 4]);
+        assert!(cursor2.is_some());
+    }
+
+    #[test]
+    fn test_paginate_last_page() {
+        let items = vec![1, 2, 3, 4, 5];
+        // Skip to offset 4 (last item)
+        let cursor = encode_cursor(4);
+        let (page, next) = paginate(items, Some(&cursor), Some(2)).unwrap();
+        assert_eq!(page, vec![5]);
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn test_paginate_exact_boundary() {
+        let items = vec![1, 2, 3, 4];
+        let (page, cursor) = paginate(items, None, Some(4)).unwrap();
+        assert_eq!(page, vec![1, 2, 3, 4]);
+        assert!(cursor.is_none());
+    }
+
+    #[test]
+    fn test_paginate_invalid_cursor() {
+        let items = vec![1, 2, 3];
+        let result = paginate(items, Some("not-valid-base64!@#$"), Some(2));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cursor_round_trip() {
+        let offset = 42;
+        let encoded = encode_cursor(offset);
+        let decoded = decode_cursor(&encoded).unwrap();
+        assert_eq!(decoded, offset);
+    }
+
+    #[tokio::test]
+    async fn test_list_tools_pagination() {
+        let tool_a = ToolBuilder::new("alpha")
+            .description("a")
+            .handler(|_input: AddInput| async { Ok(CallToolResult::text("ok")) })
+            .build();
+        let tool_b = ToolBuilder::new("beta")
+            .description("b")
+            .handler(|_input: AddInput| async { Ok(CallToolResult::text("ok")) })
+            .build();
+        let tool_c = ToolBuilder::new("gamma")
+            .description("c")
+            .handler(|_input: AddInput| async { Ok(CallToolResult::text("ok")) })
+            .build();
+
+        let mut router = McpRouter::new()
+            .server_info("test", "1.0")
+            .page_size(2)
+            .tool(tool_a)
+            .tool(tool_b)
+            .tool(tool_c);
+
+        init_router(&mut router).await;
+
+        // First page
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::ListTools(ListToolsParams { cursor: None }),
+            extensions: Extensions::new(),
+        };
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+        let (tools, next_cursor) = match resp.inner {
+            Ok(McpResponse::ListTools(result)) => (result.tools, result.next_cursor),
+            other => panic!("Expected ListTools, got {:?}", other),
+        };
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].name, "alpha");
+        assert_eq!(tools[1].name, "beta");
+        assert!(next_cursor.is_some());
+
+        // Second page
+        let req = RouterRequest {
+            id: RequestId::Number(2),
+            inner: McpRequest::ListTools(ListToolsParams {
+                cursor: next_cursor,
+            }),
+            extensions: Extensions::new(),
+        };
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+        let (tools, next_cursor) = match resp.inner {
+            Ok(McpResponse::ListTools(result)) => (result.tools, result.next_cursor),
+            other => panic!("Expected ListTools, got {:?}", other),
+        };
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "gamma");
+        assert!(next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_tools_no_pagination_by_default() {
+        let tool_a = ToolBuilder::new("alpha")
+            .description("a")
+            .handler(|_input: AddInput| async { Ok(CallToolResult::text("ok")) })
+            .build();
+        let tool_b = ToolBuilder::new("beta")
+            .description("b")
+            .handler(|_input: AddInput| async { Ok(CallToolResult::text("ok")) })
+            .build();
+
+        let mut router = McpRouter::new()
+            .server_info("test", "1.0")
+            .tool(tool_a)
+            .tool(tool_b);
+
+        init_router(&mut router).await;
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::ListTools(ListToolsParams { cursor: None }),
+            extensions: Extensions::new(),
+        };
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+        match resp.inner {
+            Ok(McpResponse::ListTools(result)) => {
+                assert_eq!(result.tools.len(), 2);
+                assert!(result.next_cursor.is_none());
+            }
+            other => panic!("Expected ListTools, got {:?}", other),
+        }
     }
 }
