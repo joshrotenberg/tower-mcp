@@ -606,47 +606,38 @@ A full implementation showing dynamic tools with a Redis MCP server.
 
 ### Running the Example
 
+**Option 1: Fully managed with docker-wrapper (recommended)**
+
+The example uses [docker-wrapper](https://crates.io/crates/docker-wrapper) to manage Redis
+automatically from Rust:
+
 ```bash
-# Start Redis in Docker
+# Just run it - Redis container starts automatically
+cargo run --example redis-workflow-server --features dynamic-tools,docker-templates
+```
+
+**Option 2: External Redis**
+
+```bash
+# Start Redis manually
 docker run -d --name redis-mcp-demo -p 6379:6379 redis:7-alpine
 
-# Run the MCP server
-cargo run --example redis-workflow-server --features dynamic-tools
-
-# Or with Docker Compose for both
-docker compose -f examples/redis-workflow-server/docker-compose.yml up
+# Run the server with external Redis
+REDIS_URL=redis://127.0.0.1:6379 cargo run --example redis-workflow-server --features dynamic-tools
 ```
 
-**docker-compose.yml:**
-```yaml
-services:
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
+### Dependencies
 
-  mcp-server:
-    build:
-      context: ../..
-      dockerfile: examples/redis-workflow-server/Dockerfile
-    depends_on:
-      - redis
-    environment:
-      - REDIS_URL=redis://redis:6379
-    stdin_open: true
-    tty: true
-```
+```toml
+# In Cargo.toml
 
-**Dockerfile:**
-```dockerfile
-FROM rust:1.85-alpine AS builder
-WORKDIR /app
-COPY . .
-RUN cargo build --release --example redis-workflow-server --features dynamic-tools
+[features]
+dynamic-tools = []
+docker-templates = ["docker-wrapper/templates"]
 
-FROM alpine:3.19
-COPY --from=builder /app/target/release/examples/redis-workflow-server /usr/local/bin/
-ENTRYPOINT ["redis-workflow-server"]
+[dependencies]
+docker-wrapper = { version = "0.8", features = ["templates"], optional = true }
+redis = { version = "0.27", features = ["tokio-comp"] }
 ```
 
 ### Setup and Configuration
@@ -659,9 +650,26 @@ use tower_mcp::{
 };
 use redis::Client as RedisClient;
 
+#[cfg(feature = "docker-templates")]
+use docker_wrapper::{RedisTemplate, Template};
+
 #[tokio::main]
 async fn main() -> Result<(), tower_mcp::BoxError> {
-    // Connect to Redis (Docker or local)
+    // === 0. Start Redis container (if using docker-wrapper) ===
+    #[cfg(feature = "docker-templates")]
+    let redis_template = {
+        // docker-wrapper provides pre-configured container templates
+        let template = RedisTemplate::new("redis-mcp-demo")
+            .port(6379)
+            .custom_image("redis", "7-alpine");
+
+        eprintln!("Starting Redis container...");
+        template.start().await?;
+        eprintln!("Redis container started");
+        template
+    };
+
+    // Connect to Redis
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
     let redis = RedisClient::open(redis_url)?;
     let redis = Arc::new(redis);
@@ -720,8 +728,18 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         router = router.tool(tool);
     }
 
-    // Run
-    StdioTransport::new(router).run().await?;
+    // Run (blocks until Ctrl+C or connection closes)
+    let result = StdioTransport::new(router).run().await;
+
+    // === Cleanup: Stop Redis container ===
+    #[cfg(feature = "docker-templates")]
+    {
+        eprintln!("Stopping Redis container...");
+        redis_template.stop().await.ok();
+        eprintln!("Redis container stopped");
+    }
+
+    result?;
     Ok(())
 }
 ```
