@@ -27,6 +27,7 @@
 //! | -32005 | SessionNotFound | Session not found or expired             |
 //! | -32006 | SessionRequired | MCP-Session-Id header is required        |
 //! | -32007 | Forbidden       | Access forbidden (insufficient scope)    |
+//! | -32042 | UrlElicitationRequired | URL elicitation required          |
 
 use serde::{Deserialize, Serialize};
 
@@ -73,6 +74,8 @@ pub enum McpErrorCode {
     SessionRequired = -32006,
     /// Access forbidden (insufficient scope or authorization)
     Forbidden = -32007,
+    /// URL elicitation is required before processing the request
+    UrlElicitationRequired = -32042,
 }
 
 impl McpErrorCode {
@@ -209,6 +212,11 @@ impl JsonRpcError {
     /// Access forbidden (insufficient scope or authorization)
     pub fn forbidden(message: impl Into<String>) -> Self {
         Self::mcp_error(McpErrorCode::Forbidden, message)
+    }
+
+    /// URL elicitation is required before processing the request
+    pub fn url_elicitation_required(message: impl Into<String>) -> Self {
+        Self::mcp_error(McpErrorCode::UrlElicitationRequired, message)
     }
 }
 
