@@ -600,6 +600,410 @@ dynamic-tools = []
 pub mod dynamic;
 ```
 
+## Complete Example: Redis Workflow Server
+
+A full implementation showing dynamic tools with a Redis MCP server.
+
+### Setup and Configuration
+
+```rust
+use std::sync::Arc;
+use tower_mcp::{
+    McpRouter, ToolBuilder, CallToolResult, StdioTransport,
+    dynamic::{DynamicToolRegistry, DynamicToolsConfig, CompositeToolFilter, CompositePermissionMode},
+};
+
+#[tokio::main]
+async fn main() -> Result<(), tower_mcp::BoxError> {
+    // === 1. Configure dynamic tools ===
+    let config = DynamicToolsConfig {
+        // Allow up to 10 workflows per session
+        max_tools_per_session: 10,
+
+        // Workflows can have up to 20 steps
+        max_steps: 20,
+
+        // Only non-destructive tools can be composed
+        // This means redis_del and redis_flushdb are blocked
+        composite_tool_filter: CompositeToolFilter::NonDestructive,
+
+        // Caller's permissions checked at each step
+        composite_permission_mode: CompositePermissionMode::Caller,
+
+        // Allow workflows to call other workflows (1 level deep)
+        allow_composite_nesting: true,
+        max_depth: 2,
+
+        // Session-scoped only (no global workflows)
+        allow_global_scope: false,
+
+        ..Default::default()
+    };
+
+    // === 2. Create the dynamic registry ===
+    let registry = DynamicToolRegistry::new(config);
+
+    // === 3. Build Redis tools with proper annotations ===
+    let redis_tools = build_redis_tools();
+
+    // === 4. Build workflow management tools ===
+    let workflow_tools = build_workflow_tools(registry.clone());
+
+    // === 5. Assemble router ===
+    let mut router = McpRouter::new()
+        .server_info("redis-mcp", "1.0.0")
+        .instructions(
+            "Redis management server with dynamic workflow creation.\n\n\
+             Use the workflow tools to create reusable command sequences:\n\
+             - create_workflow: Define a new workflow from existing tools\n\
+             - list_workflows: See available workflows\n\
+             - delete_workflow: Remove a workflow\n\n\
+             Workflows can only use non-destructive tools (no DEL, FLUSHDB)."
+        )
+        .with_dynamic_registry(registry);
+
+    // Add all tools
+    for tool in redis_tools {
+        router = router.tool(tool);
+    }
+    for tool in workflow_tools {
+        router = router.tool(tool);
+    }
+
+    // Run
+    StdioTransport::new(router).run().await?;
+    Ok(())
+}
+```
+
+### Redis Tools with Annotations
+
+```rust
+fn build_redis_tools() -> Vec<tower_mcp::Tool> {
+    vec![
+        // === Read-only tools (safe for any workflow) ===
+
+        ToolBuilder::new("redis_get")
+            .description("Get the value of a key")
+            .read_only()  // ← Marked safe
+            .extractor_handler(|State(redis): State<RedisClient>, input: GetInput| async move {
+                let value = redis.get(&input.key).await?;
+                Ok(CallToolResult::text(value.unwrap_or_default()))
+            })
+            .build(),
+
+        ToolBuilder::new("redis_keys")
+            .description("Find keys matching a pattern")
+            .read_only()  // ← Marked safe
+            .extractor_handler(|State(redis): State<RedisClient>, input: KeysInput| async move {
+                let keys = redis.keys(&input.pattern).await?;
+                Ok(CallToolResult::json(&keys)?)
+            })
+            .build(),
+
+        ToolBuilder::new("redis_info")
+            .description("Get Redis server information")
+            .read_only()  // ← Marked safe
+            .extractor_handler(|State(redis): State<RedisClient>| async move {
+                let info = redis.info().await?;
+                Ok(CallToolResult::text(info))
+            })
+            .build(),
+
+        ToolBuilder::new("redis_ttl")
+            .description("Get time-to-live for a key in seconds")
+            .read_only()  // ← Marked safe
+            .extractor_handler(|State(redis): State<RedisClient>, input: KeyInput| async move {
+                let ttl = redis.ttl(&input.key).await?;
+                Ok(CallToolResult::text(ttl.to_string()))
+            })
+            .build(),
+
+        // === Write tools (allowed in workflows, not destructive) ===
+
+        ToolBuilder::new("redis_set")
+            .description("Set a key to a value")
+            // No annotation = not read_only, not destructive
+            // NonDestructive filter will allow this
+            .extractor_handler(|State(redis): State<RedisClient>, input: SetInput| async move {
+                redis.set(&input.key, &input.value).await?;
+                Ok(CallToolResult::text("OK"))
+            })
+            .build(),
+
+        ToolBuilder::new("redis_expire")
+            .description("Set a timeout on a key")
+            .extractor_handler(|State(redis): State<RedisClient>, input: ExpireInput| async move {
+                redis.expire(&input.key, input.seconds).await?;
+                Ok(CallToolResult::text("OK"))
+            })
+            .build(),
+
+        ToolBuilder::new("redis_incr")
+            .description("Increment a key's integer value")
+            .extractor_handler(|State(redis): State<RedisClient>, input: KeyInput| async move {
+                let new_val = redis.incr(&input.key).await?;
+                Ok(CallToolResult::text(new_val.to_string()))
+            })
+            .build(),
+
+        // === Destructive tools (BLOCKED from workflows) ===
+
+        ToolBuilder::new("redis_del")
+            .description("Delete one or more keys")
+            .destructive()  // ← Blocked by NonDestructive filter
+            .extractor_handler(|State(redis): State<RedisClient>, input: DelInput| async move {
+                let count = redis.del(&input.keys).await?;
+                Ok(CallToolResult::text(format!("Deleted {} keys", count)))
+            })
+            .build(),
+
+        ToolBuilder::new("redis_flushdb")
+            .description("Delete all keys in the current database")
+            .destructive()  // ← Blocked by NonDestructive filter
+            .extractor_handler(|State(redis): State<RedisClient>| async move {
+                redis.flushdb().await?;
+                Ok(CallToolResult::text("OK"))
+            })
+            .build(),
+    ]
+}
+```
+
+### Workflow Management Tools
+
+```rust
+fn build_workflow_tools(registry: DynamicToolRegistry) -> Vec<tower_mcp::Tool> {
+    vec![
+        ToolBuilder::new("create_workflow")
+            .description(
+                "Create a reusable workflow from a sequence of tool calls. \
+                 Workflows can only use non-destructive tools."
+            )
+            .extractor_handler({
+                let registry = registry.clone();
+                move |input: CreateWorkflowInput| {
+                    let registry = registry.clone();
+                    async move {
+                        // Build input schema from parameters
+                        let schema = build_schema(&input.parameters);
+
+                        // Create the composite tool
+                        let tool = DynamicTool::builder(&input.name)
+                            .description(&input.description)
+                            .input_schema(schema)
+                            .composite(input.steps)
+                            .build()?;
+
+                        // Register it
+                        registry.register(tool, ToolScope::Session).await?;
+
+                        Ok(CallToolResult::text(format!(
+                            "Created workflow '{}' with {} steps. \
+                             It's now available as a tool.",
+                            input.name, input.steps.len()
+                        )))
+                    }
+                }
+            })
+            .build(),
+
+        ToolBuilder::new("list_workflows")
+            .description("List all workflows created in this session")
+            .read_only()
+            .extractor_handler({
+                let registry = registry.clone();
+                move || {
+                    let registry = registry.clone();
+                    async move {
+                        let workflows = registry.list_composites().await;
+                        Ok(CallToolResult::json(&workflows)?)
+                    }
+                }
+            })
+            .build(),
+
+        ToolBuilder::new("delete_workflow")
+            .description("Delete a workflow")
+            .extractor_handler({
+                let registry = registry.clone();
+                move |input: DeleteWorkflowInput| {
+                    let registry = registry.clone();
+                    async move {
+                        registry.unregister(&input.name).await?;
+                        Ok(CallToolResult::text(format!("Deleted workflow '{}'", input.name)))
+                    }
+                }
+            })
+            .build(),
+
+        ToolBuilder::new("describe_workflow")
+            .description("Show the steps in a workflow")
+            .read_only()
+            .extractor_handler({
+                let registry = registry.clone();
+                move |input: DescribeWorkflowInput| {
+                    let registry = registry.clone();
+                    async move {
+                        let workflow = registry.get(&input.name).await
+                            .ok_or_else(|| ToolError::not_found(&input.name))?;
+                        Ok(CallToolResult::json(&workflow.definition())?)
+                    }
+                }
+            })
+            .build(),
+    ]
+}
+```
+
+### Input Types
+
+```rust
+#[derive(Debug, Deserialize, JsonSchema)]
+struct CreateWorkflowInput {
+    /// Name for the new workflow
+    name: String,
+    /// What this workflow does
+    description: String,
+    /// Parameters the workflow accepts
+    #[serde(default)]
+    parameters: Vec<WorkflowParam>,
+    /// Steps to execute in order
+    steps: Vec<CompositeStep>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct WorkflowParam {
+    name: String,
+    #[serde(rename = "type")]
+    param_type: String,
+    #[serde(default)]
+    required: bool,
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct CompositeStep {
+    /// Tool to call
+    tool: String,
+    /// Arguments (use $input.field for parameters, $stepN.field for previous results)
+    args: serde_json::Value,
+    /// Name to reference this step's output
+    #[serde(default)]
+    output_as: Option<String>,
+    /// What to do on error: "stop" (default), "continue", or {"default": value}
+    #[serde(default)]
+    on_error: OnError,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct DeleteWorkflowInput {
+    name: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct DescribeWorkflowInput {
+    name: String,
+}
+```
+
+### Example Session
+
+```
+User: "I keep checking the same set of keys for a cache warmup verification.
+       Can you create a workflow for that?"
+
+Agent: I'll create a workflow that checks multiple cache keys and reports their status.
+
+[Calls create_workflow with:]
+{
+  "name": "verify_cache_warmup",
+  "description": "Check if cache keys exist and have expected TTLs",
+  "parameters": [
+    {"name": "prefix", "type": "string", "required": true, "description": "Key prefix to check"}
+  ],
+  "steps": [
+    {
+      "tool": "redis_keys",
+      "args": {"pattern": "$input.prefix:*"},
+      "output_as": "keys"
+    },
+    {
+      "tool": "redis_get",
+      "args": {"key": "$input.prefix:users"},
+      "output_as": "users_cache"
+    },
+    {
+      "tool": "redis_ttl",
+      "args": {"key": "$input.prefix:users"},
+      "output_as": "users_ttl"
+    },
+    {
+      "tool": "redis_get",
+      "args": {"key": "$input.prefix:products"},
+      "output_as": "products_cache"
+    },
+    {
+      "tool": "redis_ttl",
+      "args": {"key": "$input.prefix:products"},
+      "output_as": "products_ttl"
+    }
+  ]
+}
+
+Response: Created workflow 'verify_cache_warmup' with 5 steps. It's now available as a tool.
+
+User: "Great, now check the production cache"
+
+Agent: [Calls verify_cache_warmup with {"prefix": "prod"}]
+
+Response:
+{
+  "keys": ["prod:users", "prod:products", "prod:sessions"],
+  "users_cache": "{...cached data...}",
+  "users_ttl": 3200,
+  "products_cache": "{...cached data...}",
+  "products_ttl": 3198
+}
+
+Agent: The production cache is warmed up. Found 3 keys with the prod: prefix.
+       Both users and products caches are populated with ~53 minutes TTL remaining.
+```
+
+### What the Config Prevented
+
+If the user tried to create a workflow with `redis_del`:
+
+```
+User: "Create a workflow that clears and rebuilds the cache"
+
+Agent: [Attempts create_workflow with redis_del step]
+
+Error: Tool 'redis_del' is marked as destructive.
+       Destructive tools cannot be used in composites with this filter.
+
+Agent: I can't include redis_del in a workflow because it's marked as destructive.
+       You'll need to call redis_del directly, then I can create a workflow for
+       the rebuild steps.
+```
+
+### Permission Mode in Action
+
+If using `CompositePermissionMode::Caller` (default) and a user without `redis_set` permission:
+
+```
+User (read-only role): "Run the cache_rebuild workflow"
+
+[Workflow tries to execute redis_set step]
+
+Error: Caller lacks permission for tool 'redis_set' in composite step.
+       The composite can only use tools the caller can access directly.
+
+Agent: You don't have permission to run this workflow because it includes
+       redis_set, which requires write access. Contact your administrator
+       for write permissions, or use the read-only verify_cache_warmup workflow.
+```
+
 ## Configuration
 
 Philosophy: **Safe by default, unlock with intention.** All limits are configurable
