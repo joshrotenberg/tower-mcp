@@ -606,6 +606,116 @@ Philosophy: **Safe by default, unlock with intention.** All limits are configura
 but defaults are conservative. Operators must explicitly opt into more permissive
 settings.
 
+### CompositeToolFilter
+
+Filter which tools can be used in composite workflows. Leverages existing tool annotations.
+
+```rust
+/// Filter for which tools composites are allowed to call.
+///
+/// This enables annotation-driven permissions: mark your tools as `read_only()`,
+/// `destructive()`, etc., and the filter automatically enforces what can be composed.
+#[derive(Clone)]
+pub enum CompositeToolFilter {
+    /// Only tools with read_only_hint = true (safest, default)
+    ReadOnlyOnly,
+
+    /// Only tools without destructive_hint = true
+    NonDestructive,
+
+    /// Explicit allowlist of tool names
+    AllowList(HashSet<String>),
+
+    /// All static tools (no filtering)
+    AllStatic,
+
+    /// Combine filters - all must pass
+    All(Vec<CompositeToolFilter>),
+
+    /// Combine filters - any must pass
+    Any(Vec<CompositeToolFilter>),
+
+    /// Custom predicate
+    Custom(Arc<dyn Fn(&ToolInfo) -> bool + Send + Sync>),
+}
+
+impl Default for CompositeToolFilter {
+    fn default() -> Self {
+        Self::ReadOnlyOnly
+    }
+}
+
+impl CompositeToolFilter {
+    /// Check if a tool passes this filter.
+    pub fn allows(&self, tool: &ToolInfo) -> bool {
+        match self {
+            Self::ReadOnlyOnly => tool.annotations
+                .as_ref()
+                .and_then(|a| a.read_only_hint)
+                .unwrap_or(false),
+            Self::NonDestructive => !tool.annotations
+                .as_ref()
+                .and_then(|a| a.destructive_hint)
+                .unwrap_or(false),
+            Self::AllowList(set) => set.contains(&tool.name),
+            Self::AllStatic => true,
+            Self::All(filters) => filters.iter().all(|f| f.allows(tool)),
+            Self::Any(filters) => filters.iter().any(|f| f.allows(tool)),
+            Self::Custom(f) => f(tool),
+        }
+    }
+
+    /// Human-readable reason why a tool was rejected.
+    pub fn rejection_reason(&self, tool: &ToolInfo) -> String {
+        match self {
+            Self::ReadOnlyOnly => format!(
+                "Tool '{}' is not marked as read_only. \
+                 Add .read_only() to the tool or change composite_tool_filter.",
+                tool.name
+            ),
+            Self::NonDestructive => format!(
+                "Tool '{}' is marked as destructive. \
+                 Destructive tools cannot be used in composites with this filter.",
+                tool.name
+            ),
+            Self::AllowList(set) => format!(
+                "Tool '{}' is not in the allowlist. Allowed: {:?}",
+                tool.name, set
+            ),
+            _ => format!("Tool '{}' rejected by filter", tool.name),
+        }
+    }
+}
+```
+
+### CompositePermissionMode
+
+Controls how permissions are checked when a composite tool executes.
+
+```rust
+/// How to check permissions for composite step execution.
+///
+/// This prevents privilege escalation: even if a composite was created by
+/// an admin, a regular user running it shouldn't gain admin powers.
+#[derive(Clone, Debug, Default)]
+pub enum CompositePermissionMode {
+    /// Each step is checked against the CALLER's permissions (default, safest).
+    /// The composite can only do what the caller could do directly.
+    #[default]
+    Caller,
+
+    /// Steps are checked against the CREATOR's permissions.
+    /// Like setuid - composite runs with creator's permissions.
+    /// Use only for trusted, audited workflows.
+    Creator,
+
+    /// No step-level permission checks.
+    /// Only the composite tool itself is checked.
+    /// Most permissive, use with caution.
+    None,
+}
+```
+
 ### DynamicToolsConfig
 
 ```rust
@@ -645,15 +755,17 @@ pub struct DynamicToolsConfig {
     /// Default: 60 seconds
     pub max_execution_time: Duration,
 
-    /// Tools that composites are allowed to call.
-    /// None = only static tools (safest)
-    /// Some(set) = only these tools
-    /// Default: None (static tools only)
-    pub allowed_tools: Option<HashSet<String>>,
+    /// Filter for which tools composites can reference.
+    /// Default: ReadOnlyOnly (only tools with read_only_hint = true)
+    pub composite_tool_filter: CompositeToolFilter,
 
     /// Whether composites can call other composites.
     /// Default: false
     pub allow_composite_nesting: bool,
+
+    /// How to check permissions when executing composite steps.
+    /// Default: Caller (each step checked against caller's permissions)
+    pub composite_permission_mode: CompositePermissionMode,
 
     // === Scope & Lifecycle ===
 
@@ -702,8 +814,9 @@ impl Default for DynamicToolsConfig {
             max_steps: 10,
             max_depth: 2,
             max_execution_time: Duration::from_secs(60),
-            allowed_tools: None, // static only
+            composite_tool_filter: CompositeToolFilter::ReadOnlyOnly,
             allow_composite_nesting: false,
+            composite_permission_mode: CompositePermissionMode::Caller,
 
             // Scope: session only by default
             allow_global_scope: false,
@@ -741,20 +854,72 @@ Increase for complex multi-stage workflows. Consider:
 
 **Risk**: Long-running operations, unclear failure states.
 
-#### When to set `allowed_tools`
+#### When to change `composite_tool_filter`
 
-Set explicitly when you want composites to access a curated subset:
+The default `ReadOnlyOnly` means composites can only chain tools marked with `.read_only()`.
+This encourages proper annotation of your tools.
 
 ```rust
-config.allowed_tools = Some(hashset![
-    "git_status", "git_push", "git_pull",  // git operations
-    "run_tests", "build",                   // CI operations
-    // NOT: "delete_file", "shell_exec"     // dangerous operations
+// Default: only read-only tools (safest)
+config.composite_tool_filter = CompositeToolFilter::ReadOnlyOnly;
+
+// Allow non-destructive writes (e.g., create but not delete)
+config.composite_tool_filter = CompositeToolFilter::NonDestructive;
+
+// Explicit allowlist
+config.composite_tool_filter = CompositeToolFilter::AllowList(hashset![
+    "git_status", "git_log", "git_diff",  // reads
+    "git_add", "git_commit",               // safe writes
+    // NOT: "git_push", "git_reset"        // dangerous
 ]);
+
+// Combine: must be in list AND non-destructive
+config.composite_tool_filter = CompositeToolFilter::All(vec![
+    CompositeToolFilter::AllowList(hashset!["redis_get", "redis_set", "redis_del"]),
+    CompositeToolFilter::NonDestructive,
+]);
+
+// Custom logic for redis: reads always OK, writes only for non-production keys
+config.composite_tool_filter = CompositeToolFilter::Custom(Arc::new(|tool| {
+    if tool.name.starts_with("redis_get") { return true; }
+    if tool.name.starts_with("redis_set") {
+        // Would need to check args at runtime, this is creation-time only
+        return true;
+    }
+    false
+}));
 ```
 
-**Risk if None**: Composites can only call static tools (safe).
-**Risk if Some**: Composites can call listed tools, verify each is safe for chaining.
+**Risk with ReadOnlyOnly**: Tools without `.read_only()` annotation can't be composed.
+**Risk with AllStatic**: Any tool can be chained, including destructive ones.
+
+#### When to change `composite_permission_mode`
+
+Controls privilege escalation. Default is `Caller` (safest).
+
+```rust
+// Default: composite can only do what caller could do directly
+config.composite_permission_mode = CompositePermissionMode::Caller;
+
+// Creator mode: composite runs with creator's permissions (like setuid)
+// Use only for trusted, audited workflows
+config.composite_permission_mode = CompositePermissionMode::Creator;
+
+// No checks: only the composite itself is permission-checked
+// Most dangerous, use with caution
+config.composite_permission_mode = CompositePermissionMode::None;
+```
+
+**Scenario**: Admin creates composite "cleanup" that calls "delete_database".
+
+| Mode | Regular user calls "cleanup" | Result |
+|------|------------------------------|--------|
+| Caller | Fails - user can't call delete_database | ✓ Safe |
+| Creator | Succeeds - runs as admin | ⚠️ Privilege escalation |
+| None | Succeeds - no step checks | ⚠️ Privilege escalation |
+
+**Recommendation**: Use `Caller` unless you have a specific need for elevated workflows
+AND you have audit logging to track who created what.
 
 #### When to enable `allow_composite_nesting`
 
@@ -801,9 +966,10 @@ let config = DynamicToolsConfig {
     max_steps: 100,
     max_depth: 5,
     max_execution_time: Duration::from_secs(300),
-    allowed_tools: None,  // all static tools
+    composite_tool_filter: CompositeToolFilter::AllStatic,  // any tool
     allow_composite_nesting: true,
     allow_global_scope: true,
+    composite_permission_mode: CompositePermissionMode::None,
     global_tool_ttl: Duration::from_secs(86400),  // 24h
     ..Default::default()
 };
@@ -817,9 +983,12 @@ let config = DynamicToolsConfig {
     max_steps: 5,
     max_depth: 1,  // no nesting
     max_execution_time: Duration::from_secs(30),
-    allowed_tools: Some(hashset!["safe_tool_1", "safe_tool_2"]),
+    composite_tool_filter: CompositeToolFilter::AllowList(
+        hashset!["safe_tool_1", "safe_tool_2"]
+    ),
     allow_composite_nesting: false,
     allow_global_scope: false,
+    composite_permission_mode: CompositePermissionMode::Caller,
     strict_schema_checking: true,
     ..Default::default()
 };
@@ -832,9 +1001,30 @@ let config = DynamicToolsConfig {
     max_tools_per_session: 10,
     max_tools_global: 0,  // no global tools
     allow_global_scope: false,
+    composite_tool_filter: CompositeToolFilter::ReadOnlyOnly,  // only reads
+    composite_permission_mode: CompositePermissionMode::Caller,
     session_tool_ttl: Some(Duration::from_secs(3600)),  // 1h inactivity
     ..Default::default()
 };
+```
+
+#### Redis MCP Server (Annotation-Driven)
+
+```rust
+// Tools are annotated:
+// - redis_get, redis_keys, redis_info → .read_only()
+// - redis_set, redis_hset → (no annotation, not destructive)
+// - redis_del, redis_flushdb → .destructive()
+
+let config = DynamicToolsConfig {
+    // Allow reads and non-destructive writes in composites
+    composite_tool_filter: CompositeToolFilter::NonDestructive,
+    // Caller permissions at runtime
+    composite_permission_mode: CompositePermissionMode::Caller,
+    ..Default::default()
+};
+
+// Result: composites can chain get/set/keys but NOT del/flushdb
 ```
 
 ### Runtime Limit Enforcement
@@ -892,14 +1082,16 @@ impl DynamicToolRegistry {
             });
         }
 
-        // Check allowed tools
+        // Check tool filter (annotation-based or allowlist)
         for step in &composite.steps {
-            if let Some(allowed) = &config.allowed_tools {
-                if !allowed.contains(&step.tool) && !self.is_static_tool(&step.tool) {
-                    return Err(RegistryError::ToolNotAllowed {
-                        tool: step.tool.clone(),
-                    });
-                }
+            let tool_info = self.get_tool_info(&step.tool)
+                .ok_or_else(|| RegistryError::ToolNotFound(step.tool.clone()))?;
+
+            if !config.composite_tool_filter.allows(&tool_info) {
+                return Err(RegistryError::ToolNotAllowedInComposite {
+                    tool: step.tool.clone(),
+                    reason: config.composite_tool_filter.rejection_reason(&tool_info),
+                });
             }
 
             // Check nesting
@@ -909,6 +1101,40 @@ impl DynamicToolRegistry {
         }
 
         Ok(())
+    }
+}
+
+// Runtime permission checking during execution
+impl CompositeHandler {
+    async fn call(&self, input: Value, ctx: DynamicContext) -> Result<CallToolResult, ToolError> {
+        for step in &self.steps {
+            // Check permissions based on mode
+            match ctx.config.composite_permission_mode {
+                CompositePermissionMode::Caller => {
+                    if !ctx.caller_can_call(&step.tool).await? {
+                        return Err(ToolError::permission_denied(format!(
+                            "Caller lacks permission for tool '{}' in composite step. \
+                             The composite can only use tools the caller can access directly.",
+                            step.tool
+                        )));
+                    }
+                }
+                CompositePermissionMode::Creator => {
+                    if !ctx.creator_can_call(&step.tool).await? {
+                        return Err(ToolError::permission_denied(format!(
+                            "Composite creator lacks permission for tool '{}'",
+                            step.tool
+                        )));
+                    }
+                }
+                CompositePermissionMode::None => {
+                    // No step-level checks
+                }
+            }
+
+            // Execute step...
+        }
+        // ...
     }
 }
 ```
@@ -950,11 +1176,18 @@ pub enum RegistryError {
     )]
     TooManySteps { count: usize, max: usize },
 
+    #[error("{reason}")]
+    ToolNotAllowedInComposite { tool: String, reason: String },
+
+    #[error("Tool not found: {0}")]
+    ToolNotFound(String),
+
     #[error(
-        "Tool '{tool}' is not in the allowed list for composites. \
-         Allowed tools: {allowed:?}"
+        "Permission denied: {0}. \
+         With CompositePermissionMode::Caller, composites can only use tools \
+         the caller can access directly."
     )]
-    ToolNotAllowed { tool: String, allowed: Vec<String> },
+    PermissionDenied(String),
 
     #[error(
         "Composite nesting is disabled. Workflows cannot call other workflows. \
