@@ -8,6 +8,12 @@
 //! The [`BidirectionalStdioTransport`] enables server-to-client requests like
 //! sampling (LLM requests). It multiplexes the stdio streams to handle both
 //! incoming requests and outgoing requests/responses.
+//!
+//! # Server Notifications
+//!
+//! [`StdioTransport`] and [`BidirectionalStdioTransport`] automatically set up
+//! notification channels and forward server notifications (progress, logging,
+//! resource/tool/prompt list changes) to stdout as JSON-RPC notifications.
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
@@ -17,8 +23,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, oneshot};
 
 use crate::context::{
-    ChannelClientRequester, ClientRequesterHandle, OutgoingRequest, OutgoingRequestReceiver,
-    outgoing_request_channel,
+    ChannelClientRequester, ClientRequesterHandle, NotificationReceiver, OutgoingRequest,
+    OutgoingRequestReceiver, ServerNotification, notification_channel, outgoing_request_channel,
 };
 use tower_service::Service;
 
@@ -26,12 +32,12 @@ use crate::error::{Error, Result};
 use crate::jsonrpc::JsonRpcService;
 use crate::protocol::{
     JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, JsonRpcResponseMessage,
-    McpNotification, RequestId,
+    McpNotification, RequestId, notifications,
 };
 use crate::router::{McpRouter, RouterRequest, RouterResponse};
 
 // ============================================================================
-// Shared line processing logic
+// Shared helpers
 // ============================================================================
 
 /// Process a single line of JSON-RPC input
@@ -64,6 +70,56 @@ fn handle_notification(router: &McpRouter, notification: JsonRpcNotification) ->
     Ok(())
 }
 
+/// Serialize a server notification to a JSON-RPC notification string.
+pub(crate) fn serialize_notification(notification: &ServerNotification) -> Option<String> {
+    match notification {
+        ServerNotification::Progress(params) => {
+            let notif = JsonRpcNotification::new(notifications::PROGRESS)
+                .with_params(serde_json::to_value(params).unwrap_or_default());
+            serde_json::to_string(&notif).ok()
+        }
+        ServerNotification::LogMessage(params) => {
+            let notif = JsonRpcNotification::new(notifications::MESSAGE)
+                .with_params(serde_json::to_value(params).unwrap_or_default());
+            serde_json::to_string(&notif).ok()
+        }
+        ServerNotification::ResourceUpdated { uri } => {
+            let notif = JsonRpcNotification::new(notifications::RESOURCE_UPDATED)
+                .with_params(serde_json::json!({ "uri": uri }));
+            serde_json::to_string(&notif).ok()
+        }
+        ServerNotification::ResourcesListChanged => {
+            let notif = JsonRpcNotification::new(notifications::RESOURCES_LIST_CHANGED);
+            serde_json::to_string(&notif).ok()
+        }
+        ServerNotification::ToolsListChanged => {
+            let notif = JsonRpcNotification::new(notifications::TOOLS_LIST_CHANGED);
+            serde_json::to_string(&notif).ok()
+        }
+        ServerNotification::PromptsListChanged => {
+            let notif = JsonRpcNotification::new(notifications::PROMPTS_LIST_CHANGED);
+            serde_json::to_string(&notif).ok()
+        }
+    }
+}
+
+/// Write a line to an async stdout writer and flush.
+async fn write_line_to_stdout(stdout: &mut tokio::io::Stdout, line: &str) -> Result<()> {
+    stdout
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|e| Error::Transport(format!("Failed to write to stdout: {}", e)))?;
+    stdout
+        .write_all(b"\n")
+        .await
+        .map_err(|e| Error::Transport(format!("Failed to write newline: {}", e)))?;
+    stdout
+        .flush()
+        .await
+        .map_err(|e| Error::Transport(format!("Failed to flush stdout: {}", e)))?;
+    Ok(())
+}
+
 // ============================================================================
 // Async stdio transport
 // ============================================================================
@@ -72,6 +128,9 @@ fn handle_notification(router: &McpRouter, notification: JsonRpcNotification) ->
 ///
 /// Reads JSON-RPC messages from stdin and writes responses to stdout.
 /// Supports both single requests and batch requests.
+///
+/// Server notifications (progress, logging, resource/tool/prompt list changes)
+/// are automatically forwarded to stdout as JSON-RPC notifications.
 ///
 /// # Example
 ///
@@ -91,13 +150,20 @@ fn handle_notification(router: &McpRouter, notification: JsonRpcNotification) ->
 pub struct StdioTransport {
     service: JsonRpcService<McpRouter>,
     router: McpRouter,
+    notification_rx: NotificationReceiver,
 }
 
 impl StdioTransport {
     /// Create a new stdio transport wrapping an MCP router
     pub fn new(router: McpRouter) -> Self {
+        let (notif_tx, notification_rx) = notification_channel(256);
+        let router = router.with_notification_sender(notif_tx);
         let service = JsonRpcService::new(router.clone());
-        Self { service, router }
+        Self {
+            service,
+            router,
+            notification_rx,
+        }
     }
 
     /// Run the transport, processing messages until EOF or error
@@ -105,76 +171,63 @@ impl StdioTransport {
         let stdin = tokio::io::stdin();
         let mut stdout = tokio::io::stdout();
         let mut reader = BufReader::new(stdin);
-        let mut line = String::new();
 
         tracing::info!("Stdio transport started, waiting for input");
 
         loop {
-            line.clear();
-            let bytes_read = reader
-                .read_line(&mut line)
-                .await
-                .map_err(|e| Error::Transport(format!("Failed to read from stdin: {}", e)))?;
+            let mut line = String::new();
 
-            if bytes_read == 0 {
-                // EOF
-                tracing::info!("Stdin closed, shutting down");
-                break;
-            }
-
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            tracing::debug!(input = %trimmed, "Received message");
-
-            match process_line(&mut self.service, &self.router, trimmed).await {
-                Ok(Some(response)) => {
-                    let response_json = serde_json::to_string(&response).map_err(|e| {
-                        Error::Transport(format!("Failed to serialize response: {}", e))
+            tokio::select! {
+                // Handle incoming messages from stdin
+                result = reader.read_line(&mut line) => {
+                    let bytes_read = result.map_err(|e| {
+                        Error::Transport(format!("Failed to read from stdin: {}", e))
                     })?;
-                    tracing::debug!(output = %response_json, "Sending response");
-                    stdout
-                        .write_all(response_json.as_bytes())
-                        .await
-                        .map_err(|e| {
-                            Error::Transport(format!("Failed to write to stdout: {}", e))
-                        })?;
-                    stdout
-                        .write_all(b"\n")
-                        .await
-                        .map_err(|e| Error::Transport(format!("Failed to write newline: {}", e)))?;
-                    stdout
-                        .flush()
-                        .await
-                        .map_err(|e| Error::Transport(format!("Failed to flush stdout: {}", e)))?;
+
+                    if bytes_read == 0 {
+                        // EOF
+                        tracing::info!("Stdin closed, shutting down");
+                        break;
+                    }
+
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+
+                    tracing::debug!(input = %trimmed, "Received message");
+
+                    match process_line(&mut self.service, &self.router, trimmed).await {
+                        Ok(Some(response)) => {
+                            let response_json = serde_json::to_string(&response).map_err(|e| {
+                                Error::Transport(format!("Failed to serialize response: {}", e))
+                            })?;
+                            tracing::debug!(output = %response_json, "Sending response");
+                            write_line_to_stdout(&mut stdout, &response_json).await?;
+                        }
+                        Ok(None) => {
+                            // Notification, no response needed
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "Error processing message");
+                            let error_response = JsonRpcResponse::error(
+                                None,
+                                crate::error::JsonRpcError::parse_error(e.to_string()),
+                            );
+                            let response_json = serde_json::to_string(&error_response).map_err(|e| {
+                                Error::Transport(format!("Failed to serialize error: {}", e))
+                            })?;
+                            write_line_to_stdout(&mut stdout, &response_json).await?;
+                        }
+                    }
                 }
-                Ok(None) => {
-                    // Notification, no response needed
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "Error processing message");
-                    // Send error response
-                    let error_response = JsonRpcResponse::error(
-                        None,
-                        crate::error::JsonRpcError::parse_error(e.to_string()),
-                    );
-                    let response_json = serde_json::to_string(&error_response).map_err(|e| {
-                        Error::Transport(format!("Failed to serialize error: {}", e))
-                    })?;
-                    stdout
-                        .write_all(response_json.as_bytes())
-                        .await
-                        .map_err(|e| Error::Transport(format!("Failed to write error: {}", e)))?;
-                    stdout
-                        .write_all(b"\n")
-                        .await
-                        .map_err(|e| Error::Transport(format!("Failed to write newline: {}", e)))?;
-                    stdout
-                        .flush()
-                        .await
-                        .map_err(|e| Error::Transport(format!("Failed to flush stdout: {}", e)))?;
+
+                // Forward server notifications to stdout
+                Some(notification) = self.notification_rx.recv() => {
+                    if let Some(json) = serialize_notification(&notification) {
+                        tracing::debug!(output = %json, "Sending notification");
+                        write_line_to_stdout(&mut stdout, &json).await?;
+                    }
                 }
             }
         }
@@ -193,11 +246,10 @@ impl StdioTransport {
 /// directly. Use this when you want to apply tower middleware layers like
 /// rate limiting or bulkhead patterns.
 ///
-/// # Notification Handling
+/// # Server Notifications
 ///
-/// Unlike [`StdioTransport`], this transport does not handle notifications
-/// (like cancellation) because it doesn't have access to the underlying router.
-/// Notifications are logged at the debug level and ignored.
+/// Use [`GenericStdioTransport::with_notifications`] to enable server notification
+/// forwarding. Without it, notifications from the router will not reach the client.
 ///
 /// # Example
 ///
@@ -206,14 +258,16 @@ impl StdioTransport {
 /// use tower::ServiceBuilder;
 /// use tower::timeout::TimeoutLayer;
 /// use tower_mcp::{BoxError, CatchError, McpRouter, GenericStdioTransport};
+/// use tower_mcp::context::notification_channel;
 ///
 /// #[tokio::main]
 /// async fn main() -> Result<(), BoxError> {
+///     // Set up notification channel before wrapping in middleware
+///     let (notif_tx, notif_rx) = notification_channel(256);
 ///     let router = McpRouter::new()
-///         .server_info("my-server", "1.0.0");
+///         .server_info("my-server", "1.0.0")
+///         .with_notification_sender(notif_tx);
 ///
-///     // Apply tower middleware via ServiceBuilder, then wrap in CatchError
-///     // to convert middleware errors into JSON-RPC error responses.
 ///     let service = CatchError::new(
 ///         ServiceBuilder::new()
 ///             .layer(TimeoutLayer::new(Duration::from_secs(5)))
@@ -221,7 +275,7 @@ impl StdioTransport {
 ///             .service(router),
 ///     );
 ///
-///     let mut transport = GenericStdioTransport::new(service);
+///     let mut transport = GenericStdioTransport::with_notifications(service, notif_rx);
 ///     transport.run().await?;
 ///     Ok(())
 /// }
@@ -235,6 +289,7 @@ where
     S::Future: Send,
 {
     service: JsonRpcService<S>,
+    notification_rx: Option<NotificationReceiver>,
 }
 
 impl<S> GenericStdioTransport<S>
@@ -249,9 +304,28 @@ where
     ///
     /// The service must implement `Service<RouterRequest, Response = RouterResponse>`.
     /// This is typically an `McpRouter` wrapped in tower middleware layers.
+    ///
+    /// **Note:** This constructor does not set up notification forwarding. Server
+    /// notifications (progress, logging, list changes) will not reach the client.
+    /// Use [`GenericStdioTransport::with_notifications`] instead to enable them.
     pub fn new(service: S) -> Self {
         Self {
             service: JsonRpcService::new(service),
+            notification_rx: None,
+        }
+    }
+
+    /// Create a new generic stdio transport with notification forwarding.
+    ///
+    /// Pass a `NotificationReceiver` from [`notification_channel()`] to enable
+    /// server notifications. Make sure to also call
+    /// `router.with_notification_sender(tx)` before wrapping the router in middleware.
+    ///
+    /// [`notification_channel()`]: crate::context::notification_channel
+    pub fn with_notifications(service: S, notification_rx: NotificationReceiver) -> Self {
+        Self {
+            service: JsonRpcService::new(service),
+            notification_rx: Some(notification_rx),
         }
     }
 
@@ -260,84 +334,101 @@ where
         let stdin = tokio::io::stdin();
         let mut stdout = tokio::io::stdout();
         let mut reader = BufReader::new(stdin);
-        let mut line = String::new();
 
         tracing::info!("Generic stdio transport started, waiting for input");
 
         loop {
-            line.clear();
-            let bytes_read = reader
-                .read_line(&mut line)
-                .await
-                .map_err(|e| Error::Transport(format!("Failed to read from stdin: {}", e)))?;
+            let mut line = String::new();
 
-            if bytes_read == 0 {
-                tracing::info!("Stdin closed, shutting down");
-                break;
-            }
-
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            tracing::debug!(input = %trimmed, "Received message");
-
-            // Check if it's a notification (no id field)
-            let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
-                Ok(v) => v,
-                Err(e) => {
-                    self.write_error(&mut stdout, None, &e.to_string()).await?;
-                    continue;
-                }
-            };
-
-            if parsed.get("id").is_none() {
-                // Notification - log and ignore since we don't have router access
-                tracing::debug!(
-                    method = parsed.get("method").and_then(|m| m.as_str()),
-                    "Received notification (ignored in generic transport)"
-                );
-                continue;
-            }
-
-            // Parse and process as a request (single or batch)
-            let message: JsonRpcMessage = match serde_json::from_str(trimmed) {
-                Ok(m) => m,
-                Err(e) => {
-                    self.write_error(&mut stdout, None, &e.to_string()).await?;
-                    continue;
-                }
-            };
-
-            match self.service.call_message(message).await {
-                Ok(response) => {
-                    let response_json = serde_json::to_string(&response).map_err(|e| {
-                        Error::Transport(format!("Failed to serialize response: {}", e))
-                    })?;
-                    tracing::debug!(output = %response_json, "Sending response");
-                    stdout
-                        .write_all(response_json.as_bytes())
-                        .await
-                        .map_err(|e| {
-                            Error::Transport(format!("Failed to write to stdout: {}", e))
+            // Use select! if we have a notification receiver, otherwise just read
+            if let Some(ref mut notif_rx) = self.notification_rx {
+                tokio::select! {
+                    result = reader.read_line(&mut line) => {
+                        let bytes_read = result.map_err(|e| {
+                            Error::Transport(format!("Failed to read from stdin: {}", e))
                         })?;
-                    stdout
-                        .write_all(b"\n")
-                        .await
-                        .map_err(|e| Error::Transport(format!("Failed to write newline: {}", e)))?;
-                    stdout
-                        .flush()
-                        .await
-                        .map_err(|e| Error::Transport(format!("Failed to flush stdout: {}", e)))?;
+
+                        if bytes_read == 0 {
+                            tracing::info!("Stdin closed, shutting down");
+                            break;
+                        }
+
+                        self.process_input(&line, &mut stdout).await?;
+                    }
+
+                    Some(notification) = notif_rx.recv() => {
+                        if let Some(json) = serialize_notification(&notification) {
+                            tracing::debug!(output = %json, "Sending notification");
+                            write_line_to_stdout(&mut stdout, &json).await?;
+                        }
+                    }
                 }
-                Err(e) => {
-                    tracing::error!(error = %e, "Error processing message");
-                    self.write_error(&mut stdout, None, &e.to_string()).await?;
+            } else {
+                let bytes_read = reader
+                    .read_line(&mut line)
+                    .await
+                    .map_err(|e| Error::Transport(format!("Failed to read from stdin: {}", e)))?;
+
+                if bytes_read == 0 {
+                    tracing::info!("Stdin closed, shutting down");
+                    break;
                 }
+
+                self.process_input(&line, &mut stdout).await?;
             }
         }
 
+        Ok(())
+    }
+
+    async fn process_input(&mut self, line: &str, stdout: &mut tokio::io::Stdout) -> Result<()> {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+
+        tracing::debug!(input = %trimmed, "Received message");
+
+        // Check if it's a notification (no id field)
+        let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(e) => {
+                self.write_error(stdout, None, &e.to_string()).await?;
+                return Ok(());
+            }
+        };
+
+        if parsed.get("id").is_none() {
+            // Notification - log and ignore since we don't have router access
+            tracing::debug!(
+                method = parsed.get("method").and_then(|m| m.as_str()),
+                "Received notification (ignored in generic transport)"
+            );
+            return Ok(());
+        }
+
+        // Parse and process as a request (single or batch)
+        let message: JsonRpcMessage = match serde_json::from_str(trimmed) {
+            Ok(m) => m,
+            Err(e) => {
+                self.write_error(stdout, None, &e.to_string()).await?;
+                return Ok(());
+            }
+        };
+
+        match self.service.call_message(message).await {
+            Ok(response) => {
+                let response_json = serde_json::to_string(&response).map_err(|e| {
+                    Error::Transport(format!("Failed to serialize response: {}", e))
+                })?;
+                tracing::debug!(output = %response_json, "Sending response");
+                write_line_to_stdout(stdout, &response_json).await?;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Error processing message");
+                self.write_error(stdout, None, &e.to_string()).await?;
+            }
+        }
         Ok(())
     }
 
@@ -351,19 +442,7 @@ where
             JsonRpcResponse::error(id, crate::error::JsonRpcError::parse_error(message));
         let response_json = serde_json::to_string(&error_response)
             .map_err(|e| Error::Transport(format!("Failed to serialize error: {}", e)))?;
-        stdout
-            .write_all(response_json.as_bytes())
-            .await
-            .map_err(|e| Error::Transport(format!("Failed to write error: {}", e)))?;
-        stdout
-            .write_all(b"\n")
-            .await
-            .map_err(|e| Error::Transport(format!("Failed to write newline: {}", e)))?;
-        stdout
-            .flush()
-            .await
-            .map_err(|e| Error::Transport(format!("Failed to flush stdout: {}", e)))?;
-        Ok(())
+        write_line_to_stdout(stdout, &response_json).await
     }
 }
 
@@ -374,6 +453,10 @@ where
 /// Synchronous stdio transport for simpler use cases
 ///
 /// This version uses blocking I/O and is suitable for simple CLI tools.
+///
+/// **Note:** This transport does not support server notification forwarding
+/// (progress, logging, list changes) because it uses blocking I/O. Use
+/// [`StdioTransport`] for full notification support.
 pub struct SyncStdioTransport {
     service: JsonRpcService<McpRouter>,
     router: McpRouter,
@@ -461,6 +544,9 @@ struct PendingRequest {
 /// requests to clients (for sampling/LLM requests). It multiplexes stdin/stdout
 /// to handle the bidirectional communication.
 ///
+/// Server notifications (progress, logging, resource/tool/prompt list changes)
+/// are automatically forwarded to stdout as JSON-RPC notifications.
+///
 /// # Example
 ///
 /// ```rust,no_run
@@ -502,6 +588,8 @@ pub struct BidirectionalStdioTransport {
     client_requester: ClientRequesterHandle,
     /// Pending requests waiting for responses
     pending_requests: Arc<Mutex<HashMap<RequestId, PendingRequest>>>,
+    /// Channel for receiving server notifications to forward to the client
+    notification_rx: NotificationReceiver,
 }
 
 impl BidirectionalStdioTransport {
@@ -511,6 +599,9 @@ impl BidirectionalStdioTransport {
         let client_requester: ClientRequesterHandle =
             Arc::new(ChannelClientRequester::new(request_tx));
 
+        let (notif_tx, notification_rx) = notification_channel(256);
+        let router = router.with_notification_sender(notif_tx);
+
         let service = JsonRpcService::new(router.clone());
 
         Self {
@@ -519,6 +610,7 @@ impl BidirectionalStdioTransport {
             request_rx,
             client_requester,
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            notification_rx,
         }
     }
 
@@ -563,6 +655,14 @@ impl BidirectionalStdioTransport {
                 // Handle outgoing requests to send to the client
                 Some(outgoing) = self.request_rx.recv() => {
                     self.send_outgoing_request(outgoing, stdout.clone()).await?;
+                }
+
+                // Forward server notifications to the client
+                Some(notification) = self.notification_rx.recv() => {
+                    if let Some(json) = serialize_notification(&notification) {
+                        tracing::debug!(output = %json, "Sending notification");
+                        self.write_line(&json, stdout.clone()).await?;
+                    }
                 }
             }
         }

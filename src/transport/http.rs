@@ -125,14 +125,14 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::context::{
-    ChannelClientRequester, ClientRequesterHandle, OutgoingRequestReceiver, ServerNotification,
-    notification_channel, outgoing_request_channel,
+    ChannelClientRequester, ClientRequesterHandle, OutgoingRequestReceiver, notification_channel,
+    outgoing_request_channel,
 };
 use crate::error::{Error, JsonRpcError, Result};
 use crate::jsonrpc::JsonRpcService;
 use crate::protocol::{
     JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpNotification, RequestId,
-    SUPPORTED_PROTOCOL_VERSIONS, notifications,
+    SUPPORTED_PROTOCOL_VERSIONS,
 };
 use crate::router::{McpRouter, RouterRequest, RouterResponse};
 use crate::transport::service::{CatchError, McpBoxService, ServiceFactory, identity_factory};
@@ -207,36 +207,7 @@ impl Session {
         let broadcast_tx = notifications_tx.clone();
         tokio::spawn(async move {
             while let Some(notification) = notif_receiver.recv().await {
-                let json = match &notification {
-                    ServerNotification::Progress(params) => {
-                        let notif = JsonRpcNotification::new(notifications::PROGRESS)
-                            .with_params(serde_json::to_value(params).unwrap_or_default());
-                        serde_json::to_string(&notif).ok()
-                    }
-                    ServerNotification::LogMessage(params) => {
-                        let notif = JsonRpcNotification::new(notifications::MESSAGE)
-                            .with_params(serde_json::to_value(params).unwrap_or_default());
-                        serde_json::to_string(&notif).ok()
-                    }
-                    ServerNotification::ResourceUpdated { uri } => {
-                        let notif = JsonRpcNotification::new(notifications::RESOURCE_UPDATED)
-                            .with_params(serde_json::json!({ "uri": uri }));
-                        serde_json::to_string(&notif).ok()
-                    }
-                    ServerNotification::ResourcesListChanged => {
-                        let notif = JsonRpcNotification::new(notifications::RESOURCES_LIST_CHANGED);
-                        serde_json::to_string(&notif).ok()
-                    }
-                    ServerNotification::ToolsListChanged => {
-                        let notif = JsonRpcNotification::new(notifications::TOOLS_LIST_CHANGED);
-                        serde_json::to_string(&notif).ok()
-                    }
-                    ServerNotification::PromptsListChanged => {
-                        let notif = JsonRpcNotification::new(notifications::PROMPTS_LIST_CHANGED);
-                        serde_json::to_string(&notif).ok()
-                    }
-                };
-                if let Some(json) = json {
+                if let Some(json) = crate::transport::stdio::serialize_notification(&notification) {
                     // Best effort: if no subscribers, the message is dropped
                     let _ = broadcast_tx.send(json);
                 }
