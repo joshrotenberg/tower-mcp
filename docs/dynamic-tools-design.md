@@ -84,6 +84,81 @@ impl DynamicToolRegistry {
     pub fn subscribe(&self) -> broadcast::Receiver<ToolsChangedNotification> {
         self.inner.notify_tx.subscribe()
     }
+
+    // === Filtering by metadata (inspired by SEP-1300) ===
+
+    /// List tools in a specific category.
+    pub async fn list_by_category(&self, category: &str) -> Vec<ToolInfo> {
+        let tools = self.inner.dynamic_tools.read().await;
+        tools.values()
+            .filter(|t| t.category.as_deref() == Some(category))
+            .map(|t| t.info())
+            .collect()
+    }
+
+    /// List tools with any of the specified tags.
+    pub async fn list_by_tags(&self, tags: &[&str]) -> Vec<ToolInfo> {
+        let tools = self.inner.dynamic_tools.read().await;
+        tools.values()
+            .filter(|t| t.tags.iter().any(|tag| tags.contains(&tag.as_str())))
+            .map(|t| t.info())
+            .collect()
+    }
+
+    /// List all categories in use.
+    pub async fn categories(&self) -> Vec<String> {
+        let tools = self.inner.dynamic_tools.read().await;
+        let mut categories: Vec<_> = tools.values()
+            .filter_map(|t| t.category.clone())
+            .collect();
+        categories.sort();
+        categories.dedup();
+        categories
+    }
+
+    // === Import/Export ===
+
+    /// Export all tools as portable definitions.
+    pub async fn export(&self) -> Vec<ToolDefinition> {
+        let tools = self.inner.dynamic_tools.read().await;
+        tools.values()
+            .filter_map(|t| t.as_exportable())
+            .collect()
+    }
+
+    /// Import tool definitions (composite tools only).
+    /// Returns names of successfully imported tools.
+    pub async fn import(
+        &self,
+        definitions: Vec<ToolDefinition>,
+        created_by: &str,
+    ) -> Result<Vec<String>, RegistryError> {
+        let mut imported = Vec::new();
+        for def in definitions {
+            let tool = DynamicTool::from_definition(def, created_by)?;
+            self.register(tool.clone()).await?;
+            imported.push(tool.name);
+        }
+        Ok(imported)
+    }
+}
+
+/// Portable tool definition for import/export.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub category: Option<String>,
+    pub tags: Vec<String>,
+    /// Steps for composite tools (only composite tools can be exported)
+    pub steps: Vec<CompositeStepDef>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct CompositeStepDef {
+    pub tool: String,
+    pub input_template: serde_json::Value,
+    pub output_binding: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -112,6 +187,16 @@ pub struct DynamicTool {
     pub input_schema: serde_json::Value,  // JSON Schema
     pub annotations: ToolAnnotations,
     handler: Arc<dyn DynamicHandler>,
+
+    // Metadata (inspired by SEP-1300: Tool Filtering with Groups and Tags)
+    /// Optional category for organization (e.g., "data-processing", "notifications")
+    pub category: Option<String>,
+    /// Tags for filtering and discovery (e.g., ["redis", "cache", "read"])
+    pub tags: Vec<String>,
+    /// Who created this tool (session ID or user identifier)
+    pub created_by: String,
+    /// When the tool was created
+    pub created_at: std::time::SystemTime,
 }
 
 /// Handler for dynamic tools.
@@ -136,8 +221,8 @@ pub struct DynamicContext {
 }
 
 impl DynamicTool {
-    pub fn builder(name: impl Into<String>) -> DynamicToolBuilder {
-        DynamicToolBuilder::new(name)
+    pub fn builder(name: impl Into<String>, created_by: impl Into<String>) -> DynamicToolBuilder {
+        DynamicToolBuilder::new(name, created_by)
     }
 
     pub fn info(&self) -> ToolInfo {
@@ -147,6 +232,42 @@ impl DynamicTool {
             input_schema: self.input_schema.clone(),
             annotations: Some(self.annotations.clone()),
         }
+    }
+
+    /// Export as a portable definition (only works for composite tools).
+    pub fn as_exportable(&self) -> Option<ToolDefinition> {
+        // Only composite handlers can be exported
+        let composite = self.handler.as_any().downcast_ref::<CompositeHandler>()?;
+
+        Some(ToolDefinition {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            category: self.category.clone(),
+            tags: self.tags.clone(),
+            steps: composite.steps.iter().map(|s| CompositeStepDef {
+                tool: s.tool.clone(),
+                input_template: s.input_template.clone(),
+                output_binding: s.output_binding.clone(),
+            }).collect(),
+        })
+    }
+
+    /// Create from a portable definition.
+    pub fn from_definition(def: ToolDefinition, created_by: &str) -> Result<Self, RegistryError> {
+        let steps: Vec<CompositeStep> = def.steps.into_iter()
+            .map(|s| CompositeStep {
+                tool: s.tool,
+                input_template: s.input_template,
+                output_binding: s.output_binding,
+            })
+            .collect();
+
+        DynamicTool::builder(&def.name, created_by)
+            .description(def.description)
+            .category(def.category.unwrap_or_default())
+            .tags(def.tags)
+            .composite(steps)
+            .build()
     }
 }
 ```
@@ -162,16 +283,23 @@ pub struct DynamicToolBuilder {
     input_schema: Option<serde_json::Value>,
     annotations: ToolAnnotations,
     handler: Option<Arc<dyn DynamicHandler>>,
+    // Metadata
+    category: Option<String>,
+    tags: Vec<String>,
+    created_by: String,
 }
 
 impl DynamicToolBuilder {
-    pub fn new(name: impl Into<String>) -> Self {
+    pub fn new(name: impl Into<String>, created_by: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             description: None,
             input_schema: None,
             annotations: ToolAnnotations::default(),
             handler: None,
+            category: None,
+            tags: Vec::new(),
+            created_by: created_by.into(),
         }
     }
 
@@ -202,6 +330,24 @@ impl DynamicToolBuilder {
         self
     }
 
+    /// Categorize this tool for organization.
+    pub fn category(mut self, category: impl Into<String>) -> Self {
+        self.category = Some(category.into());
+        self
+    }
+
+    /// Add tags for filtering and discovery.
+    pub fn tags(mut self, tags: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.tags = tags.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Add a single tag.
+    pub fn tag(mut self, tag: impl Into<String>) -> Self {
+        self.tags.push(tag.into());
+        self
+    }
+
     /// Set handler from a closure.
     pub fn handler<F, Fut>(mut self, f: F) -> Self
     where
@@ -226,6 +372,10 @@ impl DynamicToolBuilder {
             annotations: self.annotations,
             handler: self.handler.ok_or_else(||
                 RegistryError::InvalidDefinition("handler required".into()))?,
+            category: self.category,
+            tags: self.tags,
+            created_by: self.created_by,
+            created_at: std::time::SystemTime::now(),
         })
     }
 }
@@ -920,6 +1070,75 @@ fn build_workflow_tools(registry: DynamicToolRegistry) -> Vec<tower_mcp::Tool> {
                 }
             })
             .build(),
+
+        // === Category/Tag filtering (inspired by SEP-1300) ===
+
+        ToolBuilder::new("list_workflow_categories")
+            .description("List all workflow categories in use")
+            .read_only()
+            .extractor_handler({
+                let registry = registry.clone();
+                move || {
+                    let registry = registry.clone();
+                    async move {
+                        let categories = registry.categories().await;
+                        Ok(CallToolResult::json(&categories)?)
+                    }
+                }
+            })
+            .build(),
+
+        ToolBuilder::new("filter_workflows_by_tag")
+            .description("List workflows that have any of the specified tags")
+            .read_only()
+            .extractor_handler({
+                let registry = registry.clone();
+                move |input: FilterByTagInput| {
+                    let registry = registry.clone();
+                    async move {
+                        let tags: Vec<&str> = input.tags.iter().map(|s| s.as_str()).collect();
+                        let workflows = registry.list_by_tags(&tags).await;
+                        Ok(CallToolResult::json(&workflows)?)
+                    }
+                }
+            })
+            .build(),
+
+        // === Import/Export ===
+
+        ToolBuilder::new("export_workflows")
+            .description("Export all workflows as portable definitions (for backup or sharing)")
+            .read_only()
+            .extractor_handler({
+                let registry = registry.clone();
+                move || {
+                    let registry = registry.clone();
+                    async move {
+                        let definitions = registry.export().await;
+                        Ok(CallToolResult::json(&definitions)?)
+                    }
+                }
+            })
+            .build(),
+
+        ToolBuilder::new("import_workflows")
+            .description("Import workflow definitions (from export_workflows output)")
+            .extractor_handler({
+                let registry = registry.clone();
+                move |input: ImportWorkflowsInput, ctx: Context| {
+                    let registry = registry.clone();
+                    async move {
+                        let created_by = ctx.session_id().unwrap_or("unknown");
+                        let imported = registry.import(input.definitions, created_by).await?;
+                        Ok(CallToolResult::text(format!(
+                            "Imported {} workflows: {}",
+                            imported.len(),
+                            imported.join(", ")
+                        )))
+                    }
+                }
+            })
+            .build(),
     ]
 }
 ```
@@ -933,6 +1152,12 @@ struct CreateWorkflowInput {
     name: String,
     /// What this workflow does
     description: String,
+    /// Optional category for organization (e.g., "cache-management", "monitoring")
+    #[serde(default)]
+    category: Option<String>,
+    /// Tags for filtering and discovery
+    #[serde(default)]
+    tags: Vec<String>,
     /// Parameters the workflow accepts
     #[serde(default)]
     parameters: Vec<WorkflowParam>,
@@ -972,6 +1197,18 @@ struct DeleteWorkflowInput {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct DescribeWorkflowInput {
     name: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct FilterByTagInput {
+    /// Tags to filter by (workflows matching any tag are returned)
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ImportWorkflowsInput {
+    /// Workflow definitions (from export_workflows output)
+    definitions: Vec<ToolDefinition>,
 }
 ```
 
@@ -1673,3 +1910,133 @@ pub enum RegistryError {
     )]
     SchemaMismatch { tool: String },
 }
+```
+
+---
+
+## Prior Art & References
+
+This design draws on existing implementations and discussions in the MCP ecosystem.
+
+### Official SDK Support
+
+Dynamic tool registration is a first-class feature in the official MCP SDKs:
+
+| SDK | Registration Method | Notification |
+|-----|---------------------|--------------|
+| Python | `mcp.add_tool()`, `mcp.remove_tool()` | `notifications/tools/list_changed` |
+| TypeScript | `server.addTool()` | Automatic `listChanged` emission |
+| Spring AI | `McpSyncServer.addTool()`, `removeTool()` | Built-in notification support |
+
+The existence of `tools/list_changed` in the MCP spec explicitly anticipates runtime tool list mutations.
+
+**References:**
+- [Python SDK - Tool Management](https://github.com/modelcontextprotocol/python-sdk)
+- [TypeScript SDK - Dynamic Tools](https://github.com/modelcontextprotocol/typescript-sdk)
+- [Spring AI - Dynamic Tool Updates](https://spring.io/blog/2025/05/04/spring-ai-dynamic-tool-updates-with-mcp/)
+
+### Existing Implementations
+
+Several projects have implemented dynamic tool creation:
+
+#### AI Meta MCP Server
+AI-powered dynamic tool creation with sandboxed execution (JavaScript, Python, Shell).
+Features human approval workflows and persistence between sessions.
+- https://mcpmarket.com/server/ai-meta
+
+#### DIY Tools MCP
+User-facing tool creation via JSON definitions. Supports multiple languages
+(Python, JavaScript, Bash, Ruby, TypeScript) with automatic validation.
+- https://github.com/hesreallyhim/diy-tools-mcp
+
+#### dynamic-mcp-server
+Framework supporting both static and dynamic tool registration with SSE transport
+for testing dynamic creation/management.
+- https://github.com/scitara-cto/dynamic-mcp-server
+
+#### lazy-mcp
+MCP proxy implementing the meta-tool pattern with on-demand loading.
+Reduces context window consumption through hierarchical exploration.
+- https://github.com/voicetreelab/lazy-mcp
+
+### Spec Discussions
+
+Active discussions in the MCP repository informed this design:
+
+#### Discussion #643: Dynamic Tool Exposure Based on Server State
+Proposes using `ToolListChangedNotification` for multi-stage workflows where
+different phases require different tool sets (research → summarization → integration).
+- https://github.com/modelcontextprotocol/modelcontextprotocol/discussions/643
+
+#### Discussion #532: Hierarchical Tool Management
+Addresses context window saturation with large tool lists. Proposes category-based
+discovery and lazy loading via `tools/categories` and `tools/discover` methods.
+- https://github.com/orgs/modelcontextprotocol/discussions/532
+
+#### SEP-1300: Tool Filtering with Groups and Tags
+Proposes client-side and server-side filtering approaches with groups (first-class
+objects for tool collections) and tags (lightweight labels for categorization).
+- https://github.com/modelcontextprotocol/modelcontextprotocol/issues/1300
+
+#### Issue #682: Dynamic Tool Registration Timing
+Documents that dynamically registered tools aren't available mid-chain in some clients.
+Our design ensures workflows are immediately available after creation.
+- https://github.com/modelcontextprotocol/typescript-sdk/issues/682
+
+### Design Patterns
+
+#### The Meta-Tool Pattern
+Uses discovery + execution tools instead of loading all tool schemas upfront.
+Reduces token overhead by 85-95% for large tool sets. Our `list_workflows` +
+`describe_workflow` + workflow execution follows this pattern.
+- https://blog.synapticlabs.ai/bounded-context-packs-meta-tool-pattern
+
+#### Tool Composition Patterns
+Documents that repeated tool sequences indicate composition is needed.
+Recommends Unix pipe principle: consistent response shapes, batch support.
+- https://blog.arcade.dev/mcp-tool-patterns
+
+#### Code Execution for Tool Composition
+Anthropic's engineering blog discusses agents writing code to compose tools
+rather than calling tools directly—a pattern for efficient multi-tool workflows.
+- https://www.anthropic.com/engineering/code-execution-with-mcp
+
+### Comparison with Prior Art
+
+| Feature | AI Meta | DIY Tools | lazy-mcp | **This RFC** |
+|---------|---------|-----------|----------|--------------|
+| Arbitrary code execution | ✓ (sandboxed) | ✓ | ✗ | ✗ |
+| Composite tool sequences | ✗ | ✗ | ✗ | ✓ |
+| Variable substitution | ✗ | ✗ | ✗ | ✓ |
+| Annotation-based filtering | ✗ | ✗ | ✗ | ✓ |
+| Permission modes | ✓ (approval) | ✗ | ✗ | ✓ (Caller/Creator/None) |
+| Session scoping | ✓ | ✗ | ✗ | ✓ |
+| Nesting control | ✗ | ✗ | ✓ | ✓ |
+| Schema validation | ✗ | ✓ | ✗ | ✓ (optional strict mode) |
+
+### Ideas Incorporated from Prior Art
+
+1. **Meta-tool pattern** (lazy-mcp): Our `list_workflows`, `describe_workflow` provide
+   progressive disclosure without loading all workflow definitions upfront.
+
+2. **Immediate availability** (Issue #682): Workflows are usable immediately after
+   creation—no waiting for next request cycle.
+
+3. **Approval workflows** (AI Meta): Our `CompositePermissionMode::Caller` ensures
+   runtime permission checking at each step.
+
+4. **Hierarchical organization** (Discussion #532): Workflow categories can help
+   manage large numbers of workflows (future enhancement).
+
+5. **Annotation-based filtering** (SEP-1300): `CompositeToolFilter::ReadOnlyOnly` and
+   `NonDestructive` leverage existing tool annotations.
+
+### Future Considerations
+
+Based on prior art, potential future enhancements:
+
+- **Workflow categories/tags**: Organization for large workflow collections (per SEP-1300)
+- **Import/export**: Share workflow definitions between sessions or users
+- **Template workflows**: Server-defined starter workflows that users can customize
+- **Semantic filtering**: Embedding-based tool selection (per Portkey's mcp-tool-filter)
+- **Workflow versioning**: Explicit version tracking beyond schema mismatch detection
