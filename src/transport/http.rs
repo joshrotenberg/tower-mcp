@@ -228,13 +228,11 @@ impl Session {
                         serde_json::to_string(&notif).ok()
                     }
                     ServerNotification::ToolsListChanged => {
-                        let notif =
-                            JsonRpcNotification::new(notifications::TOOLS_LIST_CHANGED);
+                        let notif = JsonRpcNotification::new(notifications::TOOLS_LIST_CHANGED);
                         serde_json::to_string(&notif).ok()
                     }
                     ServerNotification::PromptsListChanged => {
-                        let notif =
-                            JsonRpcNotification::new(notifications::PROMPTS_LIST_CHANGED);
+                        let notif = JsonRpcNotification::new(notifications::PROMPTS_LIST_CHANGED);
                         serde_json::to_string(&notif).ok()
                     }
                 };

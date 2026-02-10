@@ -1083,8 +1083,7 @@ impl McpRouter {
         let Some(tx) = &self.inner.notification_tx else {
             return false;
         };
-        tx.try_send(ServerNotification::PromptsListChanged)
-            .is_ok()
+        tx.try_send(ServerNotification::PromptsListChanged).is_ok()
     }
 
     /// Get server capabilities based on registered handlers
@@ -4340,10 +4339,7 @@ mod tests {
         assert!(router.notify_tools_list_changed());
 
         let notification = rx.recv().await.unwrap();
-        assert!(matches!(
-            notification,
-            ServerNotification::ToolsListChanged
-        ));
+        assert!(matches!(notification, ServerNotification::ToolsListChanged));
     }
 
     #[tokio::test]
