@@ -307,6 +307,7 @@ impl<T: ClientTransport> McpClient<T> {
         let params = CompleteParams {
             reference,
             argument: CompletionArgument::new(argument_name, argument_value),
+            context: None,
         };
         self.request("completion/complete", &params).await
     }
