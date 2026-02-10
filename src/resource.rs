@@ -1807,6 +1807,7 @@ mod tests {
         let annotations = ContentAnnotations {
             audience: Some(vec![ContentRole::User]),
             priority: Some(0.8),
+            last_modified: None,
         };
 
         let resource = ResourceBuilder::new("file:///important.txt")
@@ -1828,6 +1829,7 @@ mod tests {
         let annotations = ContentAnnotations {
             audience: Some(vec![ContentRole::Assistant]),
             priority: Some(0.5),
+            last_modified: None,
         };
 
         let template = ResourceTemplateBuilder::new("db://users/{id}")
