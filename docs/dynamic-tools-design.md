@@ -604,6 +604,51 @@ pub mod dynamic;
 
 A full implementation showing dynamic tools with a Redis MCP server.
 
+### Running the Example
+
+```bash
+# Start Redis in Docker
+docker run -d --name redis-mcp-demo -p 6379:6379 redis:7-alpine
+
+# Run the MCP server
+cargo run --example redis-workflow-server --features dynamic-tools
+
+# Or with Docker Compose for both
+docker compose -f examples/redis-workflow-server/docker-compose.yml up
+```
+
+**docker-compose.yml:**
+```yaml
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  mcp-server:
+    build:
+      context: ../..
+      dockerfile: examples/redis-workflow-server/Dockerfile
+    depends_on:
+      - redis
+    environment:
+      - REDIS_URL=redis://redis:6379
+    stdin_open: true
+    tty: true
+```
+
+**Dockerfile:**
+```dockerfile
+FROM rust:1.85-alpine AS builder
+WORKDIR /app
+COPY . .
+RUN cargo build --release --example redis-workflow-server --features dynamic-tools
+
+FROM alpine:3.19
+COPY --from=builder /app/target/release/examples/redis-workflow-server /usr/local/bin/
+ENTRYPOINT ["redis-workflow-server"]
+```
+
 ### Setup and Configuration
 
 ```rust
@@ -612,9 +657,14 @@ use tower_mcp::{
     McpRouter, ToolBuilder, CallToolResult, StdioTransport,
     dynamic::{DynamicToolRegistry, DynamicToolsConfig, CompositeToolFilter, CompositePermissionMode},
 };
+use redis::Client as RedisClient;
 
 #[tokio::main]
 async fn main() -> Result<(), tower_mcp::BoxError> {
+    // Connect to Redis (Docker or local)
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+    let redis = RedisClient::open(redis_url)?;
+    let redis = Arc::new(redis);
     // === 1. Configure dynamic tools ===
     let config = DynamicToolsConfig {
         // Allow up to 10 workflows per session
@@ -644,7 +694,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     let registry = DynamicToolRegistry::new(config);
 
     // === 3. Build Redis tools with proper annotations ===
-    let redis_tools = build_redis_tools();
+    let redis_tools = build_redis_tools(redis.clone());
 
     // === 4. Build workflow management tools ===
     let workflow_tools = build_workflow_tools(registry.clone());
@@ -679,7 +729,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
 ### Redis Tools with Annotations
 
 ```rust
-fn build_redis_tools() -> Vec<tower_mcp::Tool> {
+fn build_redis_tools(redis: Arc<RedisClient>) -> Vec<tower_mcp::Tool> {
     vec![
         // === Read-only tools (safe for any workflow) ===
 
