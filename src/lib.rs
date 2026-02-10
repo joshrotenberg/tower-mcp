@@ -142,6 +142,7 @@
 //! - `childproc` - Child process transport for subprocess management
 //! - `oauth` - OAuth 2.1 resource server support (token validation, metadata endpoint)
 //! - `testing` - Test utilities ([`TestClient`]) for ergonomic MCP server testing
+//! - `dynamic-tools` - Runtime tool (de)registration via [`DynamicToolRegistry`]
 //!
 //! ## Middleware Placement Guide
 //!
@@ -359,6 +360,8 @@ pub mod jsonrpc;
 pub mod oauth;
 pub mod prompt;
 pub mod protocol;
+#[cfg(feature = "dynamic-tools")]
+pub mod registry;
 pub mod resource;
 pub mod router;
 pub mod session;
@@ -395,6 +398,8 @@ pub use protocol::{
     ResourceContent, ResourceReference, Root, RootsCapability, SamplingCapability, SamplingContent,
     SamplingContentOrArray, SamplingMessage, SamplingTool, ToolChoice,
 };
+#[cfg(feature = "dynamic-tools")]
+pub use registry::DynamicToolRegistry;
 pub use resource::{
     BoxResourceService, Resource, ResourceBuilder, ResourceHandler, ResourceRequest,
     ResourceTemplate, ResourceTemplateBuilder, ResourceTemplateHandler,

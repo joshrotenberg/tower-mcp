@@ -22,6 +22,8 @@ use crate::error::{Error, JsonRpcError, Result};
 use crate::filter::{PromptFilter, ResourceFilter, ToolFilter};
 use crate::prompt::Prompt;
 use crate::protocol::*;
+#[cfg(feature = "dynamic-tools")]
+use crate::registry::{DynamicToolRegistry, DynamicToolsInner};
 use crate::resource::{Resource, ResourceTemplate};
 use crate::session::SessionState;
 use crate::tool::Tool;
@@ -177,6 +179,9 @@ struct McpRouterInner {
     min_log_level: Arc<RwLock<LogLevel>>,
     /// Page size for list method pagination (None = return all results)
     page_size: Option<usize>,
+    /// Dynamic tools registry for runtime tool (de)registration
+    #[cfg(feature = "dynamic-tools")]
+    dynamic_tools: Option<Arc<DynamicToolsInner>>,
 }
 
 impl McpRouterInner {
@@ -291,6 +296,8 @@ impl McpRouter {
                 prompt_filter: None,
                 min_log_level: Arc::new(RwLock::new(LogLevel::Debug)),
                 page_size: None,
+                #[cfg(feature = "dynamic-tools")]
+                dynamic_tools: None,
             }),
             session: SessionState::new(),
         }
@@ -315,11 +322,54 @@ impl McpRouter {
         &self.inner.task_store
     }
 
+    /// Enable dynamic tool registration and return a registry handle.
+    ///
+    /// The returned [`DynamicToolRegistry`] can be used to add and remove tools
+    /// at runtime. Dynamic tools are merged with static tools when handling
+    /// `tools/list` and `tools/call` requests. Static tools take precedence
+    /// over dynamic tools when names collide.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::{McpRouter, ToolBuilder, CallToolResult};
+    /// use schemars::JsonSchema;
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Debug, Deserialize, JsonSchema)]
+    /// struct Input { value: String }
+    ///
+    /// let (router, registry) = McpRouter::new()
+    ///     .server_info("my-server", "1.0.0")
+    ///     .with_dynamic_tools();
+    ///
+    /// // Register a tool at runtime
+    /// let tool = ToolBuilder::new("echo")
+    ///     .description("Echo input")
+    ///     .handler(|i: Input| async move { Ok(CallToolResult::text(&i.value)) })
+    ///     .build();
+    ///
+    /// registry.register(tool);
+    /// ```
+    #[cfg(feature = "dynamic-tools")]
+    pub fn with_dynamic_tools(mut self) -> (Self, DynamicToolRegistry) {
+        let inner_dyn = Arc::new(DynamicToolsInner::new());
+        Arc::make_mut(&mut self.inner).dynamic_tools = Some(inner_dyn.clone());
+        (self, DynamicToolRegistry::new(inner_dyn))
+    }
+
     /// Set the notification sender for progress reporting
     ///
     /// This is typically called by the transport layer to receive notifications.
     pub fn with_notification_sender(mut self, tx: NotificationSender) -> Self {
-        Arc::make_mut(&mut self.inner).notification_tx = Some(tx);
+        let inner = Arc::make_mut(&mut self.inner);
+        // Also register the sender with the dynamic tools registry so it can
+        // broadcast ToolsListChanged notifications to this session.
+        #[cfg(feature = "dynamic-tools")]
+        if let Some(ref dynamic_tools) = inner.dynamic_tools {
+            dynamic_tools.add_notification_sender(tx.clone());
+        }
+        inner.notification_tx = Some(tx);
         self
     }
 
@@ -1165,8 +1215,13 @@ impl McpRouter {
             !self.inner.resources.is_empty() || !self.inner.resource_templates.is_empty();
         let has_notifications = self.inner.notification_tx.is_some();
 
+        #[cfg(feature = "dynamic-tools")]
+        let has_dynamic_tools = self.inner.dynamic_tools.is_some();
+        #[cfg(not(feature = "dynamic-tools"))]
+        let has_dynamic_tools = false;
+
         ServerCapabilities {
-            tools: if self.inner.tools.is_empty() {
+            tools: if self.inner.tools.is_empty() && !has_dynamic_tools {
                 None
             } else {
                 Some(ToolsCapability {
@@ -1262,20 +1317,34 @@ impl McpRouter {
             }
 
             McpRequest::ListTools(params) => {
+                let filter = self.inner.tool_filter.as_ref();
+                let is_visible = |t: &Tool| {
+                    filter
+                        .map(|f| f.is_visible(&self.session, t))
+                        .unwrap_or(true)
+                };
+
+                // Collect static tools
                 let mut tools: Vec<ToolDefinition> = self
                     .inner
                     .tools
                     .values()
-                    .filter(|t| {
-                        // Apply tool filter if configured
-                        self.inner
-                            .tool_filter
-                            .as_ref()
-                            .map(|f| f.is_visible(&self.session, t))
-                            .unwrap_or(true)
-                    })
+                    .filter(|t| is_visible(t))
                     .map(|t| t.definition())
                     .collect();
+
+                // Merge dynamic tools (static tools win on name collision)
+                #[cfg(feature = "dynamic-tools")]
+                if let Some(ref dynamic) = self.inner.dynamic_tools {
+                    let static_names: HashSet<String> =
+                        tools.iter().map(|t| t.name.clone()).collect();
+                    for t in dynamic.list() {
+                        if !static_names.contains(&t.name) && is_visible(&t) {
+                            tools.push(t.definition());
+                        }
+                    }
+                }
+
                 tools.sort_by(|a, b| a.name.cmp(&b.name));
 
                 let (tools, next_cursor) =
@@ -1288,14 +1357,22 @@ impl McpRouter {
             }
 
             McpRequest::CallTool(params) => {
-                let tool =
-                    self.inner.tools.get(&params.name).ok_or_else(|| {
-                        Error::JsonRpc(JsonRpcError::method_not_found(&params.name))
-                    })?;
+                // Look up static tools first, then dynamic
+                let tool = self.inner.tools.get(&params.name).cloned();
+                #[cfg(feature = "dynamic-tools")]
+                let tool = tool.or_else(|| {
+                    self.inner
+                        .dynamic_tools
+                        .as_ref()
+                        .and_then(|d| d.get(&params.name))
+                });
+
+                let tool = tool
+                    .ok_or_else(|| Error::JsonRpc(JsonRpcError::method_not_found(&params.name)))?;
 
                 // Check tool filter if configured
                 if let Some(filter) = &self.inner.tool_filter
-                    && !filter.is_visible(&self.session, tool)
+                    && !filter.is_visible(&self.session, &tool)
                 {
                     return Err(filter.denial_error(&params.name));
                 }
@@ -4705,4 +4782,464 @@ mod tests {
             other => panic!("Expected ListTools, got {:?}", other),
         }
     }
+
+    // =========================================================================
+    // Dynamic Tool Registry Tests
+    // =========================================================================
+
+    #[cfg(feature = "dynamic-tools")]
+    mod dynamic_tools_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_dynamic_tools_register_and_list() {
+            let (router, registry) = McpRouter::new()
+                .server_info("test", "1.0")
+                .with_dynamic_tools();
+
+            let tool = ToolBuilder::new("dynamic_echo")
+                .description("Dynamic echo")
+                .handler(|input: AddInput| async move {
+                    Ok(CallToolResult::text(format!("{}", input.a)))
+                })
+                .build();
+
+            registry.register(tool);
+
+            let mut router = router;
+            init_router(&mut router).await;
+
+            let req = RouterRequest {
+                id: RequestId::Number(1),
+                inner: McpRequest::ListTools(ListToolsParams::default()),
+                extensions: Extensions::new(),
+            };
+
+            let resp = router.ready().await.unwrap().call(req).await.unwrap();
+            match resp.inner {
+                Ok(McpResponse::ListTools(result)) => {
+                    assert_eq!(result.tools.len(), 1);
+                    assert_eq!(result.tools[0].name, "dynamic_echo");
+                }
+                _ => panic!("Expected ListTools response"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_dynamic_tools_unregister() {
+            let (router, registry) = McpRouter::new()
+                .server_info("test", "1.0")
+                .with_dynamic_tools();
+
+            let tool = ToolBuilder::new("temp")
+                .description("Temporary")
+                .handler(|_: AddInput| async { Ok(CallToolResult::text("ok")) })
+                .build();
+
+            registry.register(tool);
+            assert!(registry.contains("temp"));
+
+            let removed = registry.unregister("temp");
+            assert!(removed);
+            assert!(!registry.contains("temp"));
+
+            // Unregistering again returns false
+            assert!(!registry.unregister("temp"));
+
+            let mut router = router;
+            init_router(&mut router).await;
+
+            let req = RouterRequest {
+                id: RequestId::Number(1),
+                inner: McpRequest::ListTools(ListToolsParams::default()),
+                extensions: Extensions::new(),
+            };
+
+            let resp = router.ready().await.unwrap().call(req).await.unwrap();
+            match resp.inner {
+                Ok(McpResponse::ListTools(result)) => {
+                    assert_eq!(result.tools.len(), 0);
+                }
+                _ => panic!("Expected ListTools response"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_dynamic_tools_merged_with_static() {
+            let static_tool = ToolBuilder::new("static_tool")
+                .description("Static")
+                .handler(|_: AddInput| async { Ok(CallToolResult::text("static")) })
+                .build();
+
+            let (router, registry) = McpRouter::new()
+                .server_info("test", "1.0")
+                .tool(static_tool)
+                .with_dynamic_tools();
+
+            let dynamic_tool = ToolBuilder::new("dynamic_tool")
+                .description("Dynamic")
+                .handler(|_: AddInput| async { Ok(CallToolResult::text("dynamic")) })
+                .build();
+
+            registry.register(dynamic_tool);
+
+            let mut router = router;
+            init_router(&mut router).await;
+
+            let req = RouterRequest {
+                id: RequestId::Number(1),
+                inner: McpRequest::ListTools(ListToolsParams::default()),
+                extensions: Extensions::new(),
+            };
+
+            let resp = router.ready().await.unwrap().call(req).await.unwrap();
+            match resp.inner {
+                Ok(McpResponse::ListTools(result)) => {
+                    assert_eq!(result.tools.len(), 2);
+                    let names: Vec<&str> = result.tools.iter().map(|t| t.name.as_str()).collect();
+                    assert!(names.contains(&"static_tool"));
+                    assert!(names.contains(&"dynamic_tool"));
+                }
+                _ => panic!("Expected ListTools response"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_static_tools_shadow_dynamic() {
+            let static_tool = ToolBuilder::new("shared")
+                .description("Static version")
+                .handler(|_: AddInput| async { Ok(CallToolResult::text("static")) })
+                .build();
+
+            let (router, registry) = McpRouter::new()
+                .server_info("test", "1.0")
+                .tool(static_tool)
+                .with_dynamic_tools();
+
+            let dynamic_tool = ToolBuilder::new("shared")
+                .description("Dynamic version")
+                .handler(|_: AddInput| async { Ok(CallToolResult::text("dynamic")) })
+                .build();
+
+            registry.register(dynamic_tool);
+
+            let mut router = router;
+            init_router(&mut router).await;
+
+            // List should only show the static version
+            let req = RouterRequest {
+                id: RequestId::Number(1),
+                inner: McpRequest::ListTools(ListToolsParams::default()),
+                extensions: Extensions::new(),
+            };
+
+            let resp = router.ready().await.unwrap().call(req).await.unwrap();
+            match resp.inner {
+                Ok(McpResponse::ListTools(result)) => {
+                    assert_eq!(result.tools.len(), 1);
+                    assert_eq!(result.tools[0].name, "shared");
+                    assert_eq!(
+                        result.tools[0].description.as_deref(),
+                        Some("Static version")
+                    );
+                }
+                _ => panic!("Expected ListTools response"),
+            }
+
+            // Call should dispatch to the static tool
+            let req = RouterRequest {
+                id: RequestId::Number(2),
+                inner: McpRequest::CallTool(CallToolParams {
+                    name: "shared".to_string(),
+                    arguments: serde_json::json!({"a": 1, "b": 2}),
+                    meta: None,
+                }),
+                extensions: Extensions::new(),
+            };
+
+            let resp = router.ready().await.unwrap().call(req).await.unwrap();
+            match resp.inner {
+                Ok(McpResponse::CallTool(result)) => {
+                    assert!(!result.is_error);
+                    match &result.content[0] {
+                        Content::Text { text, .. } => assert_eq!(text, "static"),
+                        _ => panic!("Expected text content"),
+                    }
+                }
+                _ => panic!("Expected CallTool response"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_dynamic_tools_call() {
+            let (router, registry) = McpRouter::new()
+                .server_info("test", "1.0")
+                .with_dynamic_tools();
+
+            let tool = ToolBuilder::new("add")
+                .description("Add two numbers")
+                .handler(|input: AddInput| async move {
+                    Ok(CallToolResult::text(format!("{}", input.a + input.b)))
+                })
+                .build();
+
+            registry.register(tool);
+
+            let mut router = router;
+            init_router(&mut router).await;
+
+            let req = RouterRequest {
+                id: RequestId::Number(1),
+                inner: McpRequest::CallTool(CallToolParams {
+                    name: "add".to_string(),
+                    arguments: serde_json::json!({"a": 3, "b": 4}),
+                    meta: None,
+                }),
+                extensions: Extensions::new(),
+            };
+
+            let resp = router.ready().await.unwrap().call(req).await.unwrap();
+            match resp.inner {
+                Ok(McpResponse::CallTool(result)) => {
+                    assert!(!result.is_error);
+                    match &result.content[0] {
+                        Content::Text { text, .. } => assert_eq!(text, "7"),
+                        _ => panic!("Expected text content"),
+                    }
+                }
+                _ => panic!("Expected CallTool response"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_dynamic_tools_notification_on_register() {
+            let (tx, mut rx) = crate::context::notification_channel(16);
+            let (router, registry) = McpRouter::new()
+                .server_info("test", "1.0")
+                .with_dynamic_tools();
+            let _router = router.with_notification_sender(tx);
+
+            let tool = ToolBuilder::new("notified")
+                .description("Test")
+                .handler(|_: AddInput| async { Ok(CallToolResult::text("ok")) })
+                .build();
+
+            registry.register(tool);
+
+            let notification = rx.recv().await.unwrap();
+            assert!(matches!(notification, ServerNotification::ToolsListChanged));
+        }
+
+        #[tokio::test]
+        async fn test_dynamic_tools_notification_on_unregister() {
+            let (tx, mut rx) = crate::context::notification_channel(16);
+            let (router, registry) = McpRouter::new()
+                .server_info("test", "1.0")
+                .with_dynamic_tools();
+            let _router = router.with_notification_sender(tx);
+
+            let tool = ToolBuilder::new("notified")
+                .description("Test")
+                .handler(|_: AddInput| async { Ok(CallToolResult::text("ok")) })
+                .build();
+
+            registry.register(tool);
+            // Consume the register notification
+            let _ = rx.recv().await.unwrap();
+
+            registry.unregister("notified");
+            let notification = rx.recv().await.unwrap();
+            assert!(matches!(notification, ServerNotification::ToolsListChanged));
+        }
+
+        #[tokio::test]
+        async fn test_dynamic_tools_no_notification_on_empty_unregister() {
+            let (tx, mut rx) = crate::context::notification_channel(16);
+            let (router, registry) = McpRouter::new()
+                .server_info("test", "1.0")
+                .with_dynamic_tools();
+            let _router = router.with_notification_sender(tx);
+
+            // Unregister a tool that doesn't exist — should NOT send notification
+            assert!(!registry.unregister("nonexistent"));
+
+            // Channel should be empty
+            assert!(rx.try_recv().is_err());
+        }
+
+        #[tokio::test]
+        async fn test_dynamic_tools_filter_applies() {
+            use crate::filter::CapabilityFilter;
+
+            let (router, registry) = McpRouter::new()
+                .server_info("test", "1.0")
+                .tool_filter(CapabilityFilter::new(|_, tool: &Tool| {
+                    tool.name != "hidden"
+                }))
+                .with_dynamic_tools();
+
+            let visible = ToolBuilder::new("visible")
+                .description("Visible")
+                .handler(|_: AddInput| async { Ok(CallToolResult::text("ok")) })
+                .build();
+
+            let hidden = ToolBuilder::new("hidden")
+                .description("Hidden")
+                .handler(|_: AddInput| async { Ok(CallToolResult::text("ok")) })
+                .build();
+
+            registry.register(visible);
+            registry.register(hidden);
+
+            let mut router = router;
+            init_router(&mut router).await;
+
+            // List should only show visible tool
+            let req = RouterRequest {
+                id: RequestId::Number(1),
+                inner: McpRequest::ListTools(ListToolsParams::default()),
+                extensions: Extensions::new(),
+            };
+
+            let resp = router.ready().await.unwrap().call(req).await.unwrap();
+            match resp.inner {
+                Ok(McpResponse::ListTools(result)) => {
+                    assert_eq!(result.tools.len(), 1);
+                    assert_eq!(result.tools[0].name, "visible");
+                }
+                _ => panic!("Expected ListTools response"),
+            }
+
+            // Call to hidden tool should be denied
+            let req = RouterRequest {
+                id: RequestId::Number(2),
+                inner: McpRequest::CallTool(CallToolParams {
+                    name: "hidden".to_string(),
+                    arguments: serde_json::json!({"a": 1, "b": 2}),
+                    meta: None,
+                }),
+                extensions: Extensions::new(),
+            };
+
+            let resp = router.ready().await.unwrap().call(req).await.unwrap();
+            match resp.inner {
+                Err(e) => {
+                    assert_eq!(e.code, -32601); // Method not found
+                }
+                _ => panic!("Expected JsonRpc error"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_dynamic_tools_capabilities_advertised() {
+            // No static tools, but dynamic tools enabled — should advertise tools capability
+            let (mut router, _registry) = McpRouter::new()
+                .server_info("test", "1.0")
+                .with_dynamic_tools();
+
+            let init_req = RouterRequest {
+                id: RequestId::Number(1),
+                inner: McpRequest::Initialize(InitializeParams {
+                    protocol_version: "2025-11-25".to_string(),
+                    capabilities: ClientCapabilities::default(),
+                    client_info: Implementation {
+                        name: "test".to_string(),
+                        version: "1.0".to_string(),
+                        ..Default::default()
+                    },
+                }),
+                extensions: Extensions::new(),
+            };
+
+            let resp = router.ready().await.unwrap().call(init_req).await.unwrap();
+            match resp.inner {
+                Ok(McpResponse::Initialize(result)) => {
+                    assert!(result.capabilities.tools.is_some());
+                }
+                _ => panic!("Expected Initialize response"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_dynamic_tools_multi_session_notification() {
+            let (tx1, mut rx1) = crate::context::notification_channel(16);
+            let (tx2, mut rx2) = crate::context::notification_channel(16);
+
+            let (router, registry) = McpRouter::new()
+                .server_info("test", "1.0")
+                .with_dynamic_tools();
+
+            // Simulate two sessions by calling with_notification_sender on two clones
+            let _session1 = router.clone().with_notification_sender(tx1);
+            let _session2 = router.clone().with_notification_sender(tx2);
+
+            let tool = ToolBuilder::new("broadcast")
+                .description("Test")
+                .handler(|_: AddInput| async { Ok(CallToolResult::text("ok")) })
+                .build();
+
+            registry.register(tool);
+
+            // Both sessions should receive the notification
+            let n1 = rx1.recv().await.unwrap();
+            let n2 = rx2.recv().await.unwrap();
+            assert!(matches!(n1, ServerNotification::ToolsListChanged));
+            assert!(matches!(n2, ServerNotification::ToolsListChanged));
+        }
+
+        #[tokio::test]
+        async fn test_dynamic_tools_call_not_found() {
+            let (router, _registry) = McpRouter::new()
+                .server_info("test", "1.0")
+                .with_dynamic_tools();
+
+            let mut router = router;
+            init_router(&mut router).await;
+
+            let req = RouterRequest {
+                id: RequestId::Number(1),
+                inner: McpRequest::CallTool(CallToolParams {
+                    name: "nonexistent".to_string(),
+                    arguments: serde_json::json!({}),
+                    meta: None,
+                }),
+                extensions: Extensions::new(),
+            };
+
+            let resp = router.ready().await.unwrap().call(req).await.unwrap();
+            match resp.inner {
+                Err(e) => {
+                    assert_eq!(e.code, -32601);
+                }
+                _ => panic!("Expected method not found error"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_dynamic_tools_registry_list() {
+            let (_, registry) = McpRouter::new()
+                .server_info("test", "1.0")
+                .with_dynamic_tools();
+
+            assert!(registry.list().is_empty());
+
+            let tool = ToolBuilder::new("tool_a")
+                .description("A")
+                .handler(|_: AddInput| async { Ok(CallToolResult::text("ok")) })
+                .build();
+            registry.register(tool);
+
+            let tool = ToolBuilder::new("tool_b")
+                .description("B")
+                .handler(|_: AddInput| async { Ok(CallToolResult::text("ok")) })
+                .build();
+            registry.register(tool);
+
+            let tools = registry.list();
+            assert_eq!(tools.len(), 2);
+            let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+            assert!(names.contains(&"tool_a"));
+            assert!(names.contains(&"tool_b"));
+        }
+    } // mod dynamic_tools_tests
 }
