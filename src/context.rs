@@ -95,6 +95,10 @@ pub enum ServerNotification {
     },
     /// The list of available resources has changed
     ResourcesListChanged,
+    /// The list of available tools has changed
+    ToolsListChanged,
+    /// The list of available prompts has changed
+    PromptsListChanged,
 }
 
 /// Sender for server notifications

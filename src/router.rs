@@ -1066,6 +1066,27 @@ impl McpRouter {
             .is_ok()
     }
 
+    /// Notify clients that the list of available tools has changed
+    ///
+    /// Returns `true` if the notification was sent.
+    pub fn notify_tools_list_changed(&self) -> bool {
+        let Some(tx) = &self.inner.notification_tx else {
+            return false;
+        };
+        tx.try_send(ServerNotification::ToolsListChanged).is_ok()
+    }
+
+    /// Notify clients that the list of available prompts has changed
+    ///
+    /// Returns `true` if the notification was sent.
+    pub fn notify_prompts_list_changed(&self) -> bool {
+        let Some(tx) = &self.inner.notification_tx else {
+            return false;
+        };
+        tx.try_send(ServerNotification::PromptsListChanged)
+            .is_ok()
+    }
+
     /// Get server capabilities based on registered handlers
     fn capabilities(&self) -> ServerCapabilities {
         let has_resources =
@@ -4306,5 +4327,48 @@ mod tests {
             Ok(McpResponse::Initialize(result)) => result,
             other => panic!("Expected Initialize response, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_notify_tools_list_changed() {
+        let (tx, mut rx) = crate::context::notification_channel(16);
+
+        let router = McpRouter::new()
+            .server_info("test", "1.0")
+            .with_notification_sender(tx);
+
+        assert!(router.notify_tools_list_changed());
+
+        let notification = rx.recv().await.unwrap();
+        assert!(matches!(
+            notification,
+            ServerNotification::ToolsListChanged
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_notify_prompts_list_changed() {
+        let (tx, mut rx) = crate::context::notification_channel(16);
+
+        let router = McpRouter::new()
+            .server_info("test", "1.0")
+            .with_notification_sender(tx);
+
+        assert!(router.notify_prompts_list_changed());
+
+        let notification = rx.recv().await.unwrap();
+        assert!(matches!(
+            notification,
+            ServerNotification::PromptsListChanged
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_notify_without_sender_returns_false() {
+        let router = McpRouter::new().server_info("test", "1.0");
+
+        assert!(!router.notify_tools_list_changed());
+        assert!(!router.notify_prompts_list_changed());
+        assert!(!router.notify_resources_list_changed());
     }
 }
