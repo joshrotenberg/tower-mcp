@@ -69,8 +69,8 @@
 //! }
 //! ```
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -78,7 +78,7 @@ use tokio::sync::mpsc;
 use crate::error::{Error, Result};
 use crate::protocol::{
     CreateMessageParams, CreateMessageResult, ElicitFormParams, ElicitRequestParams, ElicitResult,
-    ElicitUrlParams, LoggingMessageParams, ProgressParams, ProgressToken, RequestId,
+    ElicitUrlParams, LogLevel, LoggingMessageParams, ProgressParams, ProgressToken, RequestId,
 };
 
 /// A notification to be sent to the client
@@ -258,6 +258,8 @@ pub struct RequestContext {
     client_requester: Option<ClientRequesterHandle>,
     /// Extensions for passing data from router/middleware to handlers
     extensions: Arc<Extensions>,
+    /// Minimum log level set by the client (shared with router for dynamic updates)
+    min_log_level: Option<Arc<RwLock<LogLevel>>>,
 }
 
 /// Type-erased extensions map for passing data to handlers.
@@ -334,6 +336,7 @@ impl RequestContext {
             notification_tx: None,
             client_requester: None,
             extensions: Arc::new(Extensions::new()),
+            min_log_level: None,
         }
     }
 
@@ -346,6 +349,15 @@ impl RequestContext {
     /// Set the notification sender
     pub fn with_notification_sender(mut self, tx: NotificationSender) -> Self {
         self.notification_tx = Some(tx);
+        self
+    }
+
+    /// Set the minimum log level for filtering outgoing log notifications
+    ///
+    /// This is shared with the router so that `logging/setLevel` updates
+    /// are immediately visible to all request contexts.
+    pub fn with_min_log_level(mut self, level: Arc<RwLock<LogLevel>>) -> Self {
+        self.min_log_level = Some(level);
         self
     }
 
@@ -486,6 +498,17 @@ impl RequestContext {
         let Some(tx) = &self.notification_tx else {
             return;
         };
+
+        // Filter by minimum log level set via logging/setLevel
+        // LogLevel derives Ord with Emergency < Alert < ... < Debug,
+        // so a message passes if its severity is at least the minimum
+        // (i.e., its ordinal is <= the minimum level's ordinal).
+        if let Some(min_level) = &self.min_log_level
+            && let Ok(min) = min_level.read()
+            && params.level > *min
+        {
+            return;
+        }
 
         let _ = tx.try_send(ServerNotification::LogMessage(params));
     }
@@ -682,6 +705,7 @@ pub struct RequestContextBuilder {
     progress_token: Option<ProgressToken>,
     notification_tx: Option<NotificationSender>,
     client_requester: Option<ClientRequesterHandle>,
+    min_log_level: Option<Arc<RwLock<LogLevel>>>,
 }
 
 impl RequestContextBuilder {
@@ -714,6 +738,12 @@ impl RequestContextBuilder {
         self
     }
 
+    /// Set the minimum log level for filtering
+    pub fn min_log_level(mut self, level: Arc<RwLock<LogLevel>>) -> Self {
+        self.min_log_level = Some(level);
+        self
+    }
+
     /// Build the request context
     ///
     /// Panics if request_id is not set.
@@ -727,6 +757,9 @@ impl RequestContextBuilder {
         }
         if let Some(requester) = self.client_requester {
             ctx = ctx.with_client_requester(requester);
+        }
+        if let Some(level) = self.min_log_level {
+            ctx = ctx.with_min_log_level(level);
         }
         ctx
     }
@@ -914,6 +947,77 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("Elicitation not available")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_log_filtered_by_level() {
+        let (tx, mut rx) = notification_channel(10);
+        let min_level = Arc::new(RwLock::new(LogLevel::Warning));
+
+        let ctx = RequestContext::new(RequestId::Number(1))
+            .with_notification_sender(tx)
+            .with_min_log_level(min_level.clone());
+
+        // Error is more severe than Warning — should pass through
+        ctx.send_log(LoggingMessageParams::new(LogLevel::Error));
+        let msg = rx.try_recv();
+        assert!(msg.is_ok(), "Error should pass through Warning filter");
+
+        // Warning is equal to min level — should pass through
+        ctx.send_log(LoggingMessageParams::new(LogLevel::Warning));
+        let msg = rx.try_recv();
+        assert!(msg.is_ok(), "Warning should pass through Warning filter");
+
+        // Info is less severe than Warning — should be filtered
+        ctx.send_log(LoggingMessageParams::new(LogLevel::Info));
+        let msg = rx.try_recv();
+        assert!(msg.is_err(), "Info should be filtered by Warning filter");
+
+        // Debug is less severe than Warning — should be filtered
+        ctx.send_log(LoggingMessageParams::new(LogLevel::Debug));
+        let msg = rx.try_recv();
+        assert!(msg.is_err(), "Debug should be filtered by Warning filter");
+    }
+
+    #[tokio::test]
+    async fn test_send_log_level_updates_dynamically() {
+        let (tx, mut rx) = notification_channel(10);
+        let min_level = Arc::new(RwLock::new(LogLevel::Error));
+
+        let ctx = RequestContext::new(RequestId::Number(1))
+            .with_notification_sender(tx)
+            .with_min_log_level(min_level.clone());
+
+        // Info should be filtered at Error level
+        ctx.send_log(LoggingMessageParams::new(LogLevel::Info));
+        assert!(
+            rx.try_recv().is_err(),
+            "Info should be filtered at Error level"
+        );
+
+        // Dynamically update to Debug (most permissive)
+        *min_level.write().unwrap() = LogLevel::Debug;
+
+        // Now Info should pass through
+        ctx.send_log(LoggingMessageParams::new(LogLevel::Info));
+        assert!(
+            rx.try_recv().is_ok(),
+            "Info should pass through after level changed to Debug"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_log_no_min_level_sends_all() {
+        let (tx, mut rx) = notification_channel(10);
+
+        // No min_log_level set — all messages should pass through
+        let ctx = RequestContext::new(RequestId::Number(1)).with_notification_sender(tx);
+
+        ctx.send_log(LoggingMessageParams::new(LogLevel::Debug));
+        assert!(
+            rx.try_recv().is_ok(),
+            "Debug should pass when no min level is set"
         );
     }
 }

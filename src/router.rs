@@ -120,6 +120,8 @@ struct McpRouterInner {
     prompt_filter: Option<PromptFilter>,
     /// Router-level extensions (for state and middleware data)
     extensions: Arc<crate::context::Extensions>,
+    /// Minimum log level for filtering outgoing log notifications (set by client via logging/setLevel)
+    min_log_level: Arc<RwLock<LogLevel>>,
 }
 
 impl McpRouterInner {
@@ -232,6 +234,7 @@ impl McpRouter {
                 tool_filter: None,
                 resource_filter: None,
                 prompt_filter: None,
+                min_log_level: Arc::new(RwLock::new(LogLevel::Debug)),
             }),
             session: SessionState::new(),
         }
@@ -378,6 +381,9 @@ impl McpRouter {
 
         // Include router extensions (for with_state() and middleware data)
         let ctx = ctx.with_extensions(self.inner.extensions.clone());
+
+        // Set up log level filtering
+        let ctx = ctx.with_min_log_level(self.inner.min_log_level.clone());
 
         // Register for cancellation tracking
         let token = ctx.cancellation_token();
@@ -1500,10 +1506,10 @@ impl McpRouter {
             }
 
             McpRequest::SetLoggingLevel(params) => {
-                // Store the log level for filtering outgoing log notifications
-                // For now, we just accept the request - actual filtering would be
-                // implemented in the notification sending logic
                 tracing::debug!(level = ?params.level, "Client set logging level");
+                if let Ok(mut level) = self.inner.min_log_level.write() {
+                    *level = params.level;
+                }
                 Ok(McpResponse::SetLoggingLevel(EmptyResult {}))
             }
 
@@ -4412,6 +4418,51 @@ mod tests {
         assert!(
             !tools_cap.list_changed,
             "tools.listChanged should be false without notification sender"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_logging_level_filters_messages() {
+        let (tx, mut rx) = crate::context::notification_channel(16);
+
+        let mut router = McpRouter::new()
+            .server_info("test", "1.0")
+            .with_notification_sender(tx);
+
+        init_router(&mut router).await;
+
+        // Set logging level to Warning
+        let set_level_req = RouterRequest {
+            id: RequestId::Number(99),
+            inner: McpRequest::SetLoggingLevel(SetLogLevelParams {
+                level: LogLevel::Warning,
+            }),
+            extensions: crate::context::Extensions::new(),
+        };
+        let resp = router
+            .ready()
+            .await
+            .unwrap()
+            .call(set_level_req)
+            .await
+            .unwrap();
+        assert!(matches!(resp.inner, Ok(McpResponse::SetLoggingLevel(_))));
+
+        // Create a context from the router (simulating a handler)
+        let ctx = router.create_context(RequestId::Number(100), None);
+
+        // Error (more severe than Warning) should pass through
+        ctx.send_log(LoggingMessageParams::new(LogLevel::Error));
+        assert!(
+            rx.try_recv().is_ok(),
+            "Error should pass through Warning filter"
+        );
+
+        // Info (less severe than Warning) should be filtered
+        ctx.send_log(LoggingMessageParams::new(LogLevel::Info));
+        assert!(
+            rx.try_recv().is_err(),
+            "Info should be filtered at Warning level"
         );
     }
 }
