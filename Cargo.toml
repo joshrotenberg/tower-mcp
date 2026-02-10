@@ -58,7 +58,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "j
 [features]
 default = []
 # Enable all optional features
-full = ["http", "websocket", "childproc", "oauth", "jwks", "testing"]
+full = ["http", "websocket", "childproc", "oauth", "jwks", "testing", "dynamic-tools"]
 # Transport features
 http = ["dep:axum", "dep:hyper", "dep:http", "dep:http-body-util", "dep:tokio-stream", "dep:uuid"]
 websocket = ["dep:axum", "dep:uuid"]
@@ -69,6 +69,8 @@ oauth = ["dep:jsonwebtoken", "http"]
 jwks = ["oauth", "dep:reqwest"]
 # Test utilities for MCP servers
 testing = []
+# Runtime tool (de)registration via DynamicToolRegistry
+dynamic-tools = []
 
 [dependencies.axum]
 version = "0.8"
