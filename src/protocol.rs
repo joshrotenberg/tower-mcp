@@ -1782,6 +1782,9 @@ pub struct ContentAnnotations {
     /// Priority hint from 0 (optional) to 1 (required)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<f64>,
+    /// ISO 8601 timestamp of when this content was last modified
+    #[serde(rename = "lastModified", skip_serializing_if = "Option::is_none")]
+    pub last_modified: Option<String>,
 }
 
 impl Content {
