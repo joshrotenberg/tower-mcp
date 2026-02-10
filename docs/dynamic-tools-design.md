@@ -600,21 +600,371 @@ dynamic-tools = []
 pub mod dynamic;
 ```
 
-## Open Questions
+## Configuration
 
-1. **Security**: Should there be limits on what dynamic tools can do?
-   - Rate limiting on tool creation?
-   - Sandboxing for composite execution?
-   - Approval workflow before tool becomes available?
+Philosophy: **Safe by default, unlock with intention.** All limits are configurable
+but defaults are conservative. Operators must explicitly opt into more permissive
+settings.
 
-2. **Scope**: Per-session dynamic tools vs global?
-   - Session-scoped: tool only visible to the session that created it
-   - Global: visible to all sessions (requires auth consideration)
+### DynamicToolsConfig
 
-3. **Cleanup**: Auto-expire unused dynamic tools?
-   - TTL on dynamic tools
-   - Usage tracking
+```rust
+/// Configuration for dynamic tool registration and execution.
+///
+/// All defaults are conservative. Increase limits only after understanding
+/// the implications for your deployment.
+#[derive(Clone, Debug)]
+pub struct DynamicToolsConfig {
+    // === Creation Limits ===
 
-4. **Versioning**: What if a workflow references a tool that changes?
-   - Pin to tool version?
-   - Fail if underlying tool changes?
+    /// Maximum dynamic tools per session. Prevents resource exhaustion.
+    /// Default: 5
+    pub max_tools_per_session: usize,
+
+    /// Maximum dynamic tools globally. Prevents unbounded growth.
+    /// Default: 20
+    pub max_tools_global: usize,
+
+    /// Rate limit: tool creations per minute per session.
+    /// Default: 3
+    pub creation_rate_limit: usize,
+
+    // === Execution Limits ===
+
+    /// Maximum steps in a composite tool execution.
+    /// Prevents runaway workflows.
+    /// Default: 10
+    pub max_steps: usize,
+
+    /// Maximum nesting depth for composites calling composites.
+    /// Prevents infinite recursion.
+    /// Default: 2
+    pub max_depth: usize,
+
+    /// Maximum total execution time for a composite.
+    /// Default: 60 seconds
+    pub max_execution_time: Duration,
+
+    /// Tools that composites are allowed to call.
+    /// None = only static tools (safest)
+    /// Some(set) = only these tools
+    /// Default: None (static tools only)
+    pub allowed_tools: Option<HashSet<String>>,
+
+    /// Whether composites can call other composites.
+    /// Default: false
+    pub allow_composite_nesting: bool,
+
+    // === Scope & Lifecycle ===
+
+    /// Whether to allow global (cross-session) tools.
+    /// Default: false (session-scoped only)
+    pub allow_global_scope: bool,
+
+    /// TTL for session-scoped tools after last use.
+    /// None = expire with session only.
+    /// Default: None
+    pub session_tool_ttl: Option<Duration>,
+
+    /// TTL for global tools after last use.
+    /// Only applies if allow_global_scope is true.
+    /// Default: 1 hour
+    pub global_tool_ttl: Duration,
+
+    /// How often to run cleanup of expired tools.
+    /// Default: 5 minutes
+    pub cleanup_interval: Duration,
+
+    // === Versioning ===
+
+    /// Whether to snapshot underlying tool schemas at creation.
+    /// If true, composite fails if underlying tool changes.
+    /// Default: false (best-effort execution)
+    pub strict_schema_checking: bool,
+
+    // === Persistence ===
+
+    /// Path to persist global tools across restarts.
+    /// None = no persistence (tools lost on restart).
+    /// Default: None
+    pub persistence_path: Option<PathBuf>,
+}
+
+impl Default for DynamicToolsConfig {
+    fn default() -> Self {
+        Self {
+            // Creation: very conservative
+            max_tools_per_session: 5,
+            max_tools_global: 20,
+            creation_rate_limit: 3,
+
+            // Execution: tight bounds
+            max_steps: 10,
+            max_depth: 2,
+            max_execution_time: Duration::from_secs(60),
+            allowed_tools: None, // static only
+            allow_composite_nesting: false,
+
+            // Scope: session only by default
+            allow_global_scope: false,
+            session_tool_ttl: None,
+            global_tool_ttl: Duration::from_secs(3600),
+            cleanup_interval: Duration::from_secs(300),
+
+            // Versioning: permissive
+            strict_schema_checking: false,
+
+            // Persistence: off
+            persistence_path: None,
+        }
+    }
+}
+```
+
+### Configuration Guide
+
+#### When to increase `max_tools_per_session`
+
+Increase if agents legitimately need many task-specific workflows. Consider:
+- What's the typical session duration?
+- Are tools being created and abandoned, or reused?
+- Is there a cleanup strategy?
+
+**Risk**: Memory exhaustion, tool list pollution.
+
+#### When to increase `max_steps`
+
+Increase for complex multi-stage workflows. Consider:
+- Can the workflow be broken into smaller composites?
+- Is progress reporting working so users see what's happening?
+- What's the failure mode if a step fails late in the sequence?
+
+**Risk**: Long-running operations, unclear failure states.
+
+#### When to set `allowed_tools`
+
+Set explicitly when you want composites to access a curated subset:
+
+```rust
+config.allowed_tools = Some(hashset![
+    "git_status", "git_push", "git_pull",  // git operations
+    "run_tests", "build",                   // CI operations
+    // NOT: "delete_file", "shell_exec"     // dangerous operations
+]);
+```
+
+**Risk if None**: Composites can only call static tools (safe).
+**Risk if Some**: Composites can call listed tools, verify each is safe for chaining.
+
+#### When to enable `allow_composite_nesting`
+
+Enable for meta-workflows (workflows that orchestrate workflows). Consider:
+- Is `max_depth` set appropriately?
+- Can you trace execution through nested composites?
+- What happens if an inner composite changes?
+
+**Risk**: Harder to debug, potential for deep recursion.
+
+#### When to enable `allow_global_scope`
+
+Enable for shared team workflows. Consider:
+- Who can create global tools?
+- Who can delete them?
+- Is there audit logging?
+- How do you handle conflicting tool names?
+
+**Risk**: Cross-session interference, permission confusion.
+
+#### When to enable `strict_schema_checking`
+
+Enable for production workflows where reliability matters:
+
+```rust
+config.strict_schema_checking = true;
+```
+
+With this enabled:
+- Tool schemas are captured at workflow creation time
+- If underlying tool schema changes, workflow fails loudly
+- Forces explicit workflow recreation after tool updates
+
+**Risk if false**: Workflow may break silently if underlying tools change.
+**Risk if true**: More maintenance burden when tools evolve.
+
+### Example Configurations
+
+#### Local Development (Permissive)
+
+```rust
+let config = DynamicToolsConfig {
+    max_tools_per_session: 50,
+    max_steps: 100,
+    max_depth: 5,
+    max_execution_time: Duration::from_secs(300),
+    allowed_tools: None,  // all static tools
+    allow_composite_nesting: true,
+    allow_global_scope: true,
+    global_tool_ttl: Duration::from_secs(86400),  // 24h
+    ..Default::default()
+};
+```
+
+#### Production API Server (Conservative)
+
+```rust
+let config = DynamicToolsConfig {
+    max_tools_per_session: 3,
+    max_steps: 5,
+    max_depth: 1,  // no nesting
+    max_execution_time: Duration::from_secs(30),
+    allowed_tools: Some(hashset!["safe_tool_1", "safe_tool_2"]),
+    allow_composite_nesting: false,
+    allow_global_scope: false,
+    strict_schema_checking: true,
+    ..Default::default()
+};
+```
+
+#### Multi-Tenant Platform (Isolated)
+
+```rust
+let config = DynamicToolsConfig {
+    max_tools_per_session: 10,
+    max_tools_global: 0,  // no global tools
+    allow_global_scope: false,
+    session_tool_ttl: Some(Duration::from_secs(3600)),  // 1h inactivity
+    ..Default::default()
+};
+```
+
+### Runtime Limit Enforcement
+
+```rust
+impl DynamicToolRegistry {
+    async fn register(&self, tool: DynamicTool, scope: ToolScope) -> Result<(), RegistryError> {
+        let config = &self.config;
+
+        // Check session limit
+        let session_count = self.count_session_tools(&scope).await;
+        if session_count >= config.max_tools_per_session {
+            return Err(RegistryError::SessionLimitReached {
+                current: session_count,
+                max: config.max_tools_per_session,
+            });
+        }
+
+        // Check global limit
+        let global_count = self.count_all_tools().await;
+        if global_count >= config.max_tools_global {
+            return Err(RegistryError::GlobalLimitReached {
+                current: global_count,
+                max: config.max_tools_global,
+            });
+        }
+
+        // Check rate limit
+        if !self.rate_limiter.check(&scope.session_id()) {
+            return Err(RegistryError::RateLimited {
+                retry_after: self.rate_limiter.retry_after(&scope.session_id()),
+            });
+        }
+
+        // Check global scope permission
+        if matches!(scope, ToolScope::Global { .. }) && !config.allow_global_scope {
+            return Err(RegistryError::GlobalScopeDisabled);
+        }
+
+        // Validate composite if applicable
+        if let Some(composite) = tool.as_composite() {
+            self.validate_composite(composite, config)?;
+        }
+
+        // All checks passed
+        self.inner.insert(tool, scope).await
+    }
+
+    fn validate_composite(&self, composite: &CompositeHandler, config: &DynamicToolsConfig) -> Result<(), RegistryError> {
+        // Check step count
+        if composite.steps.len() > config.max_steps {
+            return Err(RegistryError::TooManySteps {
+                count: composite.steps.len(),
+                max: config.max_steps,
+            });
+        }
+
+        // Check allowed tools
+        for step in &composite.steps {
+            if let Some(allowed) = &config.allowed_tools {
+                if !allowed.contains(&step.tool) && !self.is_static_tool(&step.tool) {
+                    return Err(RegistryError::ToolNotAllowed {
+                        tool: step.tool.clone(),
+                    });
+                }
+            }
+
+            // Check nesting
+            if self.is_composite(&step.tool) && !config.allow_composite_nesting {
+                return Err(RegistryError::CompositeNestingDisabled);
+            }
+        }
+
+        Ok(())
+    }
+}
+```
+
+### Error Messages
+
+Clear, actionable error messages:
+
+```rust
+#[derive(Debug, thiserror::Error)]
+pub enum RegistryError {
+    #[error(
+        "Session tool limit reached ({current}/{max}). \
+         Delete unused tools with delete_workflow or increase max_tools_per_session."
+    )]
+    SessionLimitReached { current: usize, max: usize },
+
+    #[error(
+        "Global tool limit reached ({current}/{max}). \
+         This affects all sessions. Contact your administrator."
+    )]
+    GlobalLimitReached { current: usize, max: usize },
+
+    #[error(
+        "Rate limited. Try again in {retry_after:?}. \
+         Creation rate is limited to prevent abuse."
+    )]
+    RateLimited { retry_after: Duration },
+
+    #[error(
+        "Global scope is disabled. Tools are session-scoped only. \
+         To enable global tools, set allow_global_scope = true in config."
+    )]
+    GlobalScopeDisabled,
+
+    #[error(
+        "Workflow has {count} steps but maximum is {max}. \
+         Break into smaller workflows or increase max_steps."
+    )]
+    TooManySteps { count: usize, max: usize },
+
+    #[error(
+        "Tool '{tool}' is not in the allowed list for composites. \
+         Allowed tools: {allowed:?}"
+    )]
+    ToolNotAllowed { tool: String, allowed: Vec<String> },
+
+    #[error(
+        "Composite nesting is disabled. Workflows cannot call other workflows. \
+         To enable, set allow_composite_nesting = true in config."
+    )]
+    CompositeNestingDisabled,
+
+    #[error(
+        "Tool schema mismatch for '{tool}'. Schema changed since workflow creation. \
+         Recreate the workflow to pick up the new schema."
+    )]
+    SchemaMismatch { tool: String },
+}
