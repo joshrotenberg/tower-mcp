@@ -160,3 +160,8 @@ required-features = ["http"]
 name = "capability_filtering"
 path = "examples/capability_filtering.rs"
 required-features = ["http"]
+
+[[example]]
+name = "dynamic_tools"
+path = "examples/dynamic_tools.rs"
+required-features = ["dynamic-tools"]
