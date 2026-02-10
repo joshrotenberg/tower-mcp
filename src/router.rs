@@ -1090,17 +1090,20 @@ impl McpRouter {
     fn capabilities(&self) -> ServerCapabilities {
         let has_resources =
             !self.inner.resources.is_empty() || !self.inner.resource_templates.is_empty();
+        let has_notifications = self.inner.notification_tx.is_some();
 
         ServerCapabilities {
             tools: if self.inner.tools.is_empty() {
                 None
             } else {
-                Some(ToolsCapability::default())
+                Some(ToolsCapability {
+                    list_changed: has_notifications,
+                })
             },
             resources: if has_resources {
                 Some(ResourcesCapability {
                     subscribe: true,
-                    ..Default::default()
+                    list_changed: has_notifications,
                 })
             } else {
                 None
@@ -1108,7 +1111,9 @@ impl McpRouter {
             prompts: if self.inner.prompts.is_empty() {
                 None
             } else {
-                Some(PromptsCapability::default())
+                Some(PromptsCapability {
+                    list_changed: has_notifications,
+                })
             },
             // Always advertise logging capability when notification channel is configured
             logging: if self.inner.notification_tx.is_some() {
@@ -4366,5 +4371,47 @@ mod tests {
         assert!(!router.notify_tools_list_changed());
         assert!(!router.notify_prompts_list_changed());
         assert!(!router.notify_resources_list_changed());
+    }
+
+    #[tokio::test]
+    async fn test_list_changed_capabilities_with_notification_sender() {
+        let (tx, _rx) = crate::context::notification_channel(16);
+        let tool = ToolBuilder::new("test")
+            .description("test")
+            .handler(|_input: AddInput| async { Ok(CallToolResult::text("ok")) })
+            .build();
+
+        let mut router = McpRouter::new()
+            .server_info("test", "1.0")
+            .tool(tool)
+            .with_notification_sender(tx);
+
+        init_router(&mut router).await;
+
+        let caps = router.capabilities();
+        let tools_cap = caps.tools.expect("tools capability should be present");
+        assert!(
+            tools_cap.list_changed,
+            "tools.listChanged should be true when notification sender is configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_changed_capabilities_without_notification_sender() {
+        let tool = ToolBuilder::new("test")
+            .description("test")
+            .handler(|_input: AddInput| async { Ok(CallToolResult::text("ok")) })
+            .build();
+
+        let mut router = McpRouter::new().server_info("test", "1.0").tool(tool);
+
+        init_router(&mut router).await;
+
+        let caps = router.capabilities();
+        let tools_cap = caps.tools.expect("tools capability should be present");
+        assert!(
+            !tools_cap.list_changed,
+            "tools.listChanged should be false without notification sender"
+        );
     }
 }
