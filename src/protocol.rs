@@ -207,7 +207,7 @@ pub mod notifications {
     /// Log message notification
     pub const MESSAGE: &str = "notifications/message";
     /// Task status changed
-    pub const TASK_STATUS_CHANGED: &str = "notifications/tasks/status_changed";
+    pub const TASK_STATUS_CHANGED: &str = "notifications/tasks/status";
     /// Elicitation completed (for URL-based elicitation)
     pub const ELICITATION_COMPLETE: &str = "notifications/elicitation/complete";
 }
@@ -2633,7 +2633,7 @@ pub struct CancelTaskResult {
 /// Notification params when task status changes
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TaskStatusChangedParams {
+pub struct TaskStatusParams {
     /// Task ID
     pub task_id: String,
     /// New status
@@ -2642,6 +2642,9 @@ pub struct TaskStatusChangedParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
+
+/// Backwards-compatible alias
+pub type TaskStatusChangedParams = TaskStatusParams;
 
 // =============================================================================
 // Elicitation (server-to-client user input requests)
