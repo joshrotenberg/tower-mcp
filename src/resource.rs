@@ -76,7 +76,8 @@ use tower_service::Service;
 use crate::context::RequestContext;
 use crate::error::{Error, Result};
 use crate::protocol::{
-    ReadResourceResult, ResourceContent, ResourceDefinition, ResourceTemplateDefinition, ToolIcon,
+    ContentAnnotations, ReadResourceResult, ResourceContent, ResourceDefinition,
+    ResourceTemplateDefinition, ToolIcon,
 };
 
 // =============================================================================
@@ -276,6 +277,8 @@ pub struct Resource {
     pub icons: Option<Vec<ToolIcon>>,
     /// Optional size in bytes
     pub size: Option<u64>,
+    /// Optional annotations (audience, priority hints)
+    pub annotations: Option<ContentAnnotations>,
     /// The boxed service that reads the resource
     service: BoxResourceService,
 }
@@ -290,6 +293,7 @@ impl Clone for Resource {
             mime_type: self.mime_type.clone(),
             icons: self.icons.clone(),
             size: self.size,
+            annotations: self.annotations.clone(),
             service: self.service.clone(),
         }
     }
@@ -305,6 +309,7 @@ impl std::fmt::Debug for Resource {
             .field("mime_type", &self.mime_type)
             .field("icons", &self.icons)
             .field("size", &self.size)
+            .field("annotations", &self.annotations)
             .finish_non_exhaustive()
     }
 }
@@ -330,6 +335,7 @@ impl Resource {
             mime_type: self.mime_type.clone(),
             icons: self.icons.clone(),
             size: self.size,
+            annotations: self.annotations.clone(),
         }
     }
 
@@ -376,6 +382,7 @@ impl Resource {
         mime_type: Option<String>,
         icons: Option<Vec<ToolIcon>>,
         size: Option<u64>,
+        annotations: Option<ContentAnnotations>,
         handler: H,
     ) -> Self {
         let handler_service = ResourceHandlerService::new(handler);
@@ -390,6 +397,7 @@ impl Resource {
             mime_type,
             icons,
             size,
+            annotations,
             service,
         }
     }
@@ -433,6 +441,7 @@ pub struct ResourceBuilder {
     mime_type: Option<String>,
     icons: Option<Vec<ToolIcon>>,
     size: Option<u64>,
+    annotations: Option<ContentAnnotations>,
 }
 
 impl ResourceBuilder {
@@ -445,6 +454,7 @@ impl ResourceBuilder {
             mime_type: None,
             icons: None,
             size: None,
+            annotations: None,
         }
     }
 
@@ -503,6 +513,12 @@ impl ResourceBuilder {
         self
     }
 
+    /// Set annotations (audience, priority hints) for this resource
+    pub fn annotations(mut self, annotations: ContentAnnotations) -> Self {
+        self.annotations = Some(annotations);
+        self
+    }
+
     /// Set the handler function for reading the resource.
     ///
     /// Returns a [`ResourceBuilderWithHandler`] that can be used to apply
@@ -555,6 +571,7 @@ impl ResourceBuilder {
             mime_type: self.mime_type,
             icons: self.icons,
             size: self.size,
+            annotations: self.annotations,
             handler,
         }
     }
@@ -579,6 +596,7 @@ impl ResourceBuilder {
             mime_type: self.mime_type,
             icons: self.icons,
             size: self.size,
+            annotations: self.annotations,
             handler,
         }
     }
@@ -643,6 +661,7 @@ pub struct ResourceBuilderWithHandler<F> {
     mime_type: Option<String>,
     icons: Option<Vec<ToolIcon>>,
     size: Option<u64>,
+    annotations: Option<ContentAnnotations>,
     handler: F,
 }
 
@@ -663,6 +682,7 @@ where
             self.mime_type,
             self.icons,
             self.size,
+            self.annotations,
             FnHandler {
                 handler: self.handler,
             },
@@ -706,6 +726,7 @@ where
             mime_type: self.mime_type,
             icons: self.icons,
             size: self.size,
+            annotations: self.annotations,
             handler: self.handler,
             layer,
         }
@@ -723,6 +744,7 @@ pub struct ResourceBuilderWithLayer<F, L> {
     mime_type: Option<String>,
     icons: Option<Vec<ToolIcon>>,
     size: Option<u64>,
+    annotations: Option<ContentAnnotations>,
     handler: F,
     layer: L,
 }
@@ -758,6 +780,7 @@ where
             mime_type: self.mime_type,
             icons: self.icons,
             size: self.size,
+            annotations: self.annotations,
             service,
         }
     }
@@ -778,6 +801,7 @@ where
             mime_type: self.mime_type,
             icons: self.icons,
             size: self.size,
+            annotations: self.annotations,
             handler: self.handler,
             layer: tower::layer::util::Stack::new(layer, self.layer),
         }
@@ -793,6 +817,7 @@ pub struct ResourceBuilderWithContextHandler<F> {
     mime_type: Option<String>,
     icons: Option<Vec<ToolIcon>>,
     size: Option<u64>,
+    annotations: Option<ContentAnnotations>,
     handler: F,
 }
 
@@ -813,6 +838,7 @@ where
             self.mime_type,
             self.icons,
             self.size,
+            self.annotations,
             ContextAwareHandler {
                 handler: self.handler,
             },
@@ -831,6 +857,7 @@ where
             mime_type: self.mime_type,
             icons: self.icons,
             size: self.size,
+            annotations: self.annotations,
             handler: self.handler,
             layer,
         }
@@ -846,6 +873,7 @@ pub struct ResourceBuilderWithContextLayer<F, L> {
     mime_type: Option<String>,
     icons: Option<Vec<ToolIcon>>,
     size: Option<u64>,
+    annotations: Option<ContentAnnotations>,
     handler: F,
     layer: L,
 }
@@ -880,6 +908,7 @@ where
             mime_type: self.mime_type,
             icons: self.icons,
             size: self.size,
+            annotations: self.annotations,
             service,
         }
     }
@@ -897,6 +926,7 @@ where
             mime_type: self.mime_type,
             icons: self.icons,
             size: self.size,
+            annotations: self.annotations,
             handler: self.handler,
             layer: tower::layer::util::Stack::new(layer, self.layer),
         }
@@ -1009,6 +1039,7 @@ pub trait McpResource: Send + Sync + 'static {
             Self::MIME_TYPE.map(|s| s.to_string()),
             None,
             None,
+            None,
             McpResourceHandler { resource },
         )
     }
@@ -1083,6 +1114,8 @@ pub struct ResourceTemplate {
     pub mime_type: Option<String>,
     /// Optional icons for display in user interfaces
     pub icons: Option<Vec<ToolIcon>>,
+    /// Optional annotations (audience, priority hints)
+    pub annotations: Option<ContentAnnotations>,
     /// Compiled regex for matching URIs
     pattern: regex::Regex,
     /// Variable names in order of appearance
@@ -1100,6 +1133,7 @@ impl Clone for ResourceTemplate {
             description: self.description.clone(),
             mime_type: self.mime_type.clone(),
             icons: self.icons.clone(),
+            annotations: self.annotations.clone(),
             pattern: self.pattern.clone(),
             variables: self.variables.clone(),
             handler: self.handler.clone(),
@@ -1136,6 +1170,7 @@ impl ResourceTemplate {
             description: self.description.clone(),
             mime_type: self.mime_type.clone(),
             icons: self.icons.clone(),
+            annotations: self.annotations.clone(),
         }
     }
 
@@ -1202,6 +1237,7 @@ pub struct ResourceTemplateBuilder {
     description: Option<String>,
     mime_type: Option<String>,
     icons: Option<Vec<ToolIcon>>,
+    annotations: Option<ContentAnnotations>,
 }
 
 impl ResourceTemplateBuilder {
@@ -1225,6 +1261,7 @@ impl ResourceTemplateBuilder {
             description: None,
             mime_type: None,
             icons: None,
+            annotations: None,
         }
     }
 
@@ -1277,6 +1314,12 @@ impl ResourceTemplateBuilder {
         self
     }
 
+    /// Set annotations (audience, priority hints) for this resource template
+    pub fn annotations(mut self, annotations: ContentAnnotations) -> Self {
+        self.annotations = Some(annotations);
+        self
+    }
+
     /// Set the handler function for reading template resources
     ///
     /// The handler receives:
@@ -1297,6 +1340,7 @@ impl ResourceTemplateBuilder {
             description: self.description,
             mime_type: self.mime_type,
             icons: self.icons,
+            annotations: self.annotations,
             pattern,
             variables,
             handler: Arc::new(FnTemplateHandler { handler }),
@@ -1754,5 +1798,66 @@ mod tests {
         // Reserved expansion should match slashes
         let vars = template.match_uri("file:///src/lib/utils.rs").unwrap();
         assert_eq!(vars.get("path"), Some(&"src/lib/utils.rs".to_string()));
+    }
+
+    #[test]
+    fn test_resource_annotations() {
+        use crate::protocol::{ContentAnnotations, ContentRole};
+
+        let annotations = ContentAnnotations {
+            audience: Some(vec![ContentRole::User]),
+            priority: Some(0.8),
+        };
+
+        let resource = ResourceBuilder::new("file:///important.txt")
+            .name("Important File")
+            .annotations(annotations.clone())
+            .text("content");
+
+        let def = resource.definition();
+        assert!(def.annotations.is_some());
+        let ann = def.annotations.unwrap();
+        assert_eq!(ann.priority, Some(0.8));
+        assert_eq!(ann.audience.unwrap(), vec![ContentRole::User]);
+    }
+
+    #[test]
+    fn test_resource_template_annotations() {
+        use crate::protocol::{ContentAnnotations, ContentRole};
+
+        let annotations = ContentAnnotations {
+            audience: Some(vec![ContentRole::Assistant]),
+            priority: Some(0.5),
+        };
+
+        let template = ResourceTemplateBuilder::new("db://users/{id}")
+            .name("Users")
+            .annotations(annotations)
+            .handler(|uri: String, _vars: HashMap<String, String>| async move {
+                Ok(ReadResourceResult {
+                    contents: vec![ResourceContent {
+                        uri,
+                        mime_type: None,
+                        text: Some("data".to_string()),
+                        blob: None,
+                    }],
+                })
+            });
+
+        let def = template.definition();
+        assert!(def.annotations.is_some());
+        let ann = def.annotations.unwrap();
+        assert_eq!(ann.priority, Some(0.5));
+        assert_eq!(ann.audience.unwrap(), vec![ContentRole::Assistant]);
+    }
+
+    #[test]
+    fn test_resource_no_annotations_by_default() {
+        let resource = ResourceBuilder::new("file:///test.txt")
+            .name("Test")
+            .text("content");
+
+        let def = resource.definition();
+        assert!(def.annotations.is_none());
     }
 }
