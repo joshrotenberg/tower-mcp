@@ -227,6 +227,14 @@ impl Session {
                         let notif = JsonRpcNotification::new(notifications::RESOURCES_LIST_CHANGED);
                         serde_json::to_string(&notif).ok()
                     }
+                    ServerNotification::ToolsListChanged => {
+                        let notif = JsonRpcNotification::new(notifications::TOOLS_LIST_CHANGED);
+                        serde_json::to_string(&notif).ok()
+                    }
+                    ServerNotification::PromptsListChanged => {
+                        let notif = JsonRpcNotification::new(notifications::PROMPTS_LIST_CHANGED);
+                        serde_json::to_string(&notif).ok()
+                    }
                 };
                 if let Some(json) = json {
                     // Best effort: if no subscribers, the message is dropped
