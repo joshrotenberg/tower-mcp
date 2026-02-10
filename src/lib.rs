@@ -388,7 +388,7 @@ pub use jsonrpc::{JsonRpcLayer, JsonRpcService};
 pub use prompt::{BoxPromptService, Prompt, PromptBuilder, PromptHandler, PromptRequest};
 pub use protocol::{
     CallToolResult, CompleteParams, CompleteResult, Completion, CompletionArgument,
-    CompletionReference, CompletionsCapability, Content, ContentRole, CreateMessageParams,
+    CompletionContext, CompletionReference, CompletionsCapability, Content, ContentRole, CreateMessageParams,
     CreateMessageResult, ElicitAction, ElicitFieldValue, ElicitFormParams, ElicitFormSchema,
     ElicitMode, ElicitRequestParams, ElicitResult, ElicitUrlParams, ElicitationCapability,
     ElicitationCompleteParams, GetPromptResult, GetPromptResultBuilder, IncludeContext,

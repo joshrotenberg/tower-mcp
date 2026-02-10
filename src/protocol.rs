@@ -698,6 +698,18 @@ pub struct CompleteParams {
     pub reference: CompletionReference,
     /// The argument being completed
     pub argument: CompletionArgument,
+    /// Additional context for completion, such as previously resolved argument values
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<CompletionContext>,
+}
+
+/// Context provided alongside a completion request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompletionContext {
+    /// Previously resolved argument name-value pairs
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<std::collections::HashMap<String, String>>,
 }
 
 /// Completion suggestions
@@ -3574,6 +3586,7 @@ mod tests {
         let params = CompleteParams {
             reference: CompletionReference::prompt("sql-prompt"),
             argument: CompletionArgument::new("query", "SEL"),
+            context: None,
         };
 
         let json = serde_json::to_value(&params).unwrap();
@@ -3581,6 +3594,7 @@ mod tests {
         assert_eq!(json["ref"]["name"], "sql-prompt");
         assert_eq!(json["argument"]["name"], "query");
         assert_eq!(json["argument"]["value"], "SEL");
+        assert!(json.get("context").is_none()); // omitted when None
     }
 
     #[test]

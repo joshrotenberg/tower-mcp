@@ -3167,6 +3167,7 @@ mod tests {
             inner: McpRequest::Complete(CompleteParams {
                 reference: CompletionReference::prompt("test-prompt"),
                 argument: CompletionArgument::new("query", "al"),
+                context: None,
             }),
             extensions: Extensions::new(),
         };
@@ -3231,6 +3232,7 @@ mod tests {
             inner: McpRequest::Complete(CompleteParams {
                 reference: CompletionReference::prompt("test-prompt"),
                 argument: CompletionArgument::new("query", "al"),
+                context: None,
             }),
             extensions: Extensions::new(),
         };
