@@ -529,6 +529,9 @@ pub struct ClientCapabilities {
     /// Experimental, non-standard capabilities
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub experimental: Option<HashMap<String, serde_json::Value>>,
+    /// Declared extension support (SEP-1724/SEP-2133)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<HashMap<String, serde_json::Value>>,
 }
 
 /// Client capability for elicitation (requesting user input)
@@ -1433,6 +1436,9 @@ pub struct ServerCapabilities {
     /// Experimental, non-standard capabilities
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub experimental: Option<HashMap<String, serde_json::Value>>,
+    /// Declared extension support (SEP-1724/SEP-2133)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<HashMap<String, serde_json::Value>>,
 }
 
 /// Logging capability declaration
@@ -3497,6 +3503,9 @@ pub struct MultiSelectEnumSchema {
     pub items: MultiSelectEnumItems,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unique_items: Option<bool>,
+    /// Default value for this field
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<Vec<String>>,
 }
 
 /// Items definition for multi-select enum
@@ -3841,6 +3850,7 @@ mod tests {
             }),
             tasks: None,
             experimental: None,
+            extensions: None,
         };
 
         let json = serde_json::to_value(&caps).unwrap();
@@ -3949,6 +3959,7 @@ mod tests {
             elicitation: None,
             tasks: None,
             experimental: None,
+            extensions: None,
         };
 
         let json = serde_json::to_value(&caps).unwrap();

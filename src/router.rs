@@ -1279,6 +1279,7 @@ impl McpRouter {
                 None
             },
             experimental: None,
+            extensions: None,
         }
     }
 
@@ -1942,6 +1943,7 @@ mod tests {
                     elicitation: None,
                     tasks: None,
                     experimental: None,
+                    extensions: None,
                 },
                 client_info: Implementation {
                     name: "test".to_string(),
@@ -2544,6 +2546,7 @@ mod tests {
                     elicitation: None,
                     tasks: None,
                     experimental: None,
+                    extensions: None,
                 },
                 client_info: Implementation {
                     name: "test".to_string(),
@@ -2660,6 +2663,7 @@ mod tests {
                     elicitation: None,
                     tasks: None,
                     experimental: None,
+                    extensions: None,
                 },
                 client_info: Implementation {
                     name: "test".to_string(),
@@ -2696,6 +2700,7 @@ mod tests {
                     elicitation: None,
                     tasks: None,
                     experimental: None,
+                    extensions: None,
                 },
                 client_info: Implementation {
                     name: "test".to_string(),
@@ -3209,6 +3214,7 @@ mod tests {
                     elicitation: None,
                     tasks: None,
                     experimental: None,
+                    extensions: None,
                 },
                 client_info: Implementation {
                     name: "test".to_string(),
@@ -4621,6 +4627,7 @@ mod tests {
                     elicitation: None,
                     tasks: None,
                     experimental: None,
+                    extensions: None,
                 },
                 client_info: Implementation {
                     name: "test".to_string(),
