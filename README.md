@@ -117,6 +117,7 @@ Or jump straight in:
 - **`list_changed` notifications**: `notify_tools_list_changed()`, `notify_resources_list_changed()`, `notify_prompts_list_changed()`
 - **Dynamic tools**: Runtime tool registration/deregistration via `DynamicToolRegistry` (feature: `dynamic-tools`)
 - **Experimental capabilities**: `experimental` field on both client and server capabilities
+- **Extension support**: `extensions` field on server and client capabilities for declared extension negotiation
 
 ## Installation
 
@@ -124,7 +125,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tower-mcp = "0.5"
+tower-mcp = "0.6"
 ```
 
 ### Feature Flags
@@ -144,7 +145,7 @@ Example with features:
 
 ```toml
 [dependencies]
-tower-mcp = { version = "0.5", features = ["full"] }
+tower-mcp = { version = "0.6", features = ["full"] }
 ```
 
 ## Quick Start
