@@ -2798,8 +2798,9 @@ pub struct ElicitFormParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ElicitUrlParams {
-    /// The elicitation mode
-    pub mode: ElicitMode,
+    /// The elicitation mode (defaults to url if not specified)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ElicitMode>,
     /// Unique ID for this elicitation (opaque to client)
     pub elicitation_id: String,
     /// Message explaining why the user needs to navigate to the URL
@@ -3574,7 +3575,7 @@ mod tests {
     #[test]
     fn test_elicit_url_params() {
         let params = ElicitUrlParams {
-            mode: ElicitMode::Url,
+            mode: Some(ElicitMode::Url),
             elicitation_id: "abc123".to_string(),
             message: "Please authorize".to_string(),
             url: "https://example.com/auth".to_string(),

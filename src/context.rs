@@ -614,7 +614,7 @@ impl RequestContext {
     ///
     /// async fn my_tool(ctx: RequestContext, input: MyInput) -> Result<CallToolResult> {
     ///     let params = ElicitUrlParams {
-    ///         mode: ElicitMode::Url,
+    ///         mode: Some(ElicitMode::Url),
     ///         elicitation_id: "unique-id-123".to_string(),
     ///         message: "Please authorize via the link".to_string(),
     ///         url: "https://example.com/auth?id=unique-id-123".to_string(),
@@ -918,7 +918,7 @@ mod tests {
 
         let ctx = RequestContext::new(RequestId::Number(1));
         let params = ElicitUrlParams {
-            mode: ElicitMode::Url,
+            mode: Some(ElicitMode::Url),
             elicitation_id: "test-123".to_string(),
             message: "Please authorize".to_string(),
             url: "https://example.com/auth".to_string(),
