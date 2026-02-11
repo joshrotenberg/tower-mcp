@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use tower_mcp::{
     CallToolResult, Extensions, GetPromptResult, JsonRpcRequest, JsonRpcResponse, JsonRpcService,
     McpRouter, PromptBuilder, PromptMessage, PromptRole, ReadResourceResult, ResourceBuilder,
-    ResourceContent, ToolBuilder,
+    ResourceContent, TaskSupportMode, ToolBuilder,
 };
 
 // =============================================================================
@@ -1521,5 +1521,470 @@ mod scope_enforcement_tests {
             }
             JsonRpcResponse::Result(_) => panic!("Expected forbidden error for default scope"),
         }
+    }
+}
+
+// =============================================================================
+// Task-augmented request tests
+// =============================================================================
+
+fn create_router_with_tasks() -> McpRouter {
+    let echo = ToolBuilder::new("echo")
+        .description("Echo a message")
+        .task_support(TaskSupportMode::Optional)
+        .handler(|input: EchoInput| async move { Ok(CallToolResult::text(input.message)) })
+        .build();
+
+    let slow = ToolBuilder::new("slow")
+        .description("A slow tool")
+        .task_support(TaskSupportMode::Optional)
+        .handler(|_input: serde_json::Value| async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            Ok(CallToolResult::text("done"))
+        })
+        .build();
+
+    let sync_only = ToolBuilder::new("sync_only")
+        .description("Sync-only tool")
+        .handler(|_input: serde_json::Value| async move { Ok(CallToolResult::text("sync")) })
+        .build();
+
+    let async_required = ToolBuilder::new("async_required")
+        .description("Requires async task execution")
+        .task_support(TaskSupportMode::Required)
+        .handler(|_input: serde_json::Value| async move { Ok(CallToolResult::text("async")) })
+        .build();
+
+    McpRouter::new()
+        .server_info("task-test-server", "1.0.0")
+        .tool(echo)
+        .tool(slow)
+        .tool(sync_only)
+        .tool(async_required)
+}
+
+/// Initialize a service and send the Initialized notification.
+async fn init_service(router: &McpRouter, service: &mut JsonRpcService<McpRouter>) {
+    let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+        "protocolVersion": "2025-11-25",
+        "capabilities": {},
+        "clientInfo": { "name": "task-test-client", "version": "1.0" }
+    }));
+    service.call_single(init_req).await.unwrap();
+    router.handle_notification(tower_mcp::protocol::McpNotification::Initialized);
+}
+
+#[tokio::test]
+async fn test_task_create_via_tools_call() {
+    let router = create_router_with_tasks();
+    let mut service = JsonRpcService::new(router.clone());
+    init_service(&router, &mut service).await;
+
+    let call_req = JsonRpcRequest::new(2, "tools/call").with_params(serde_json::json!({
+        "name": "echo",
+        "arguments": { "message": "hello" },
+        "task": {}
+    }));
+    let resp = service.call_single(call_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Result(r) => {
+            let task = r
+                .result
+                .get("task")
+                .expect("response should have 'task' field");
+            let task_id = task.get("taskId").expect("task should have 'taskId'");
+            assert!(task_id.as_str().unwrap().starts_with("task-"));
+            assert_eq!(task.get("status").unwrap().as_str().unwrap(), "working");
+            assert!(
+                task.get("createdAt").is_some(),
+                "task should have 'createdAt'"
+            );
+            assert!(
+                task.get("lastUpdatedAt").is_some(),
+                "task should have 'lastUpdatedAt'"
+            );
+            assert!(
+                task.get("pollInterval").is_some(),
+                "task should have 'pollInterval'"
+            );
+        }
+        JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+    }
+}
+
+#[tokio::test]
+async fn test_task_list_after_creation() {
+    let router = create_router_with_tasks();
+    let mut service = JsonRpcService::new(router.clone());
+    init_service(&router, &mut service).await;
+
+    // Create a task using slow tool so it stays in working state
+    let call_req = JsonRpcRequest::new(2, "tools/call").with_params(serde_json::json!({
+        "name": "slow",
+        "arguments": {},
+        "task": {}
+    }));
+    let resp = service.call_single(call_req).await.unwrap();
+
+    let task_id = match &resp {
+        JsonRpcResponse::Result(r) => r.result["task"]["taskId"].as_str().unwrap().to_string(),
+        JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+    };
+
+    // List tasks
+    let list_req = JsonRpcRequest::new(3, "tasks/list");
+    let resp = service.call_single(list_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Result(r) => {
+            let tasks = r.result.get("tasks").unwrap().as_array().unwrap();
+            assert!(!tasks.is_empty(), "tasks list should not be empty");
+            let found = tasks
+                .iter()
+                .any(|t| t.get("taskId").unwrap().as_str().unwrap() == task_id);
+            assert!(found, "created task should be in the list");
+        }
+        JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+    }
+}
+
+#[tokio::test]
+async fn test_task_get_info() {
+    let router = create_router_with_tasks();
+    let mut service = JsonRpcService::new(router.clone());
+    init_service(&router, &mut service).await;
+
+    // Create a task with TTL
+    let call_req = JsonRpcRequest::new(2, "tools/call").with_params(serde_json::json!({
+        "name": "slow",
+        "arguments": {},
+        "task": { "ttl": 600000 }
+    }));
+    let resp = service.call_single(call_req).await.unwrap();
+
+    let task_id = match &resp {
+        JsonRpcResponse::Result(r) => r.result["task"]["taskId"].as_str().unwrap().to_string(),
+        JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+    };
+
+    // Get task info
+    let get_req = JsonRpcRequest::new(3, "tasks/get").with_params(serde_json::json!({
+        "taskId": task_id
+    }));
+    let resp = service.call_single(get_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Result(r) => {
+            assert_eq!(r.result["taskId"].as_str().unwrap(), task_id);
+            assert_eq!(r.result["ttl"].as_u64().unwrap(), 600_000);
+            // ISO 8601 timestamps contain 'T'
+            let created_at = r.result["createdAt"].as_str().unwrap();
+            assert!(
+                created_at.contains('T'),
+                "createdAt should be ISO 8601: {}",
+                created_at
+            );
+            let last_updated = r.result["lastUpdatedAt"].as_str().unwrap();
+            assert!(
+                last_updated.contains('T'),
+                "lastUpdatedAt should be ISO 8601: {}",
+                last_updated
+            );
+        }
+        JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+    }
+}
+
+#[tokio::test]
+async fn test_task_lifecycle_get_result() {
+    let router = create_router_with_tasks();
+    let mut service = JsonRpcService::new(router.clone());
+    init_service(&router, &mut service).await;
+
+    // Create a task with the echo tool (completes fast)
+    let call_req = JsonRpcRequest::new(2, "tools/call").with_params(serde_json::json!({
+        "name": "echo",
+        "arguments": { "message": "task result" },
+        "task": {}
+    }));
+    let resp = service.call_single(call_req).await.unwrap();
+
+    let task_id = match &resp {
+        JsonRpcResponse::Result(r) => r.result["task"]["taskId"].as_str().unwrap().to_string(),
+        JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+    };
+
+    // Wait briefly for the spawned task to complete
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Get task result
+    let result_req = JsonRpcRequest::new(3, "tasks/result").with_params(serde_json::json!({
+        "taskId": task_id
+    }));
+    let resp = service.call_single(result_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Result(r) => {
+            let content = r.result.get("content").unwrap().as_array().unwrap();
+            let text = content[0].get("text").unwrap().as_str().unwrap();
+            assert_eq!(text, "task result");
+
+            // Check _meta contains related-task
+            let meta = r.result.get("_meta").expect("result should have '_meta'");
+            let related_task = meta
+                .get("io.modelcontextprotocol/related-task")
+                .expect("_meta should have related-task");
+            assert_eq!(related_task["taskId"].as_str().unwrap(), task_id);
+        }
+        JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+    }
+}
+
+#[tokio::test]
+async fn test_task_cancel() {
+    let router = create_router_with_tasks();
+    let mut service = JsonRpcService::new(router.clone());
+    init_service(&router, &mut service).await;
+
+    // Create a task using the slow tool
+    let call_req = JsonRpcRequest::new(2, "tools/call").with_params(serde_json::json!({
+        "name": "slow",
+        "arguments": {},
+        "task": {}
+    }));
+    let resp = service.call_single(call_req).await.unwrap();
+
+    let task_id = match &resp {
+        JsonRpcResponse::Result(r) => r.result["task"]["taskId"].as_str().unwrap().to_string(),
+        JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+    };
+
+    // Cancel the task
+    let cancel_req = JsonRpcRequest::new(3, "tasks/cancel").with_params(serde_json::json!({
+        "taskId": task_id,
+        "reason": "Testing cancellation"
+    }));
+    let resp = service.call_single(cancel_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Result(r) => {
+            assert_eq!(r.result["status"].as_str().unwrap(), "cancelled");
+        }
+        JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+    }
+}
+
+#[tokio::test]
+async fn test_task_cancel_already_terminal() {
+    let router = create_router_with_tasks();
+    let mut service = JsonRpcService::new(router.clone());
+    init_service(&router, &mut service).await;
+
+    // Create a task with the echo tool (completes fast)
+    let call_req = JsonRpcRequest::new(2, "tools/call").with_params(serde_json::json!({
+        "name": "echo",
+        "arguments": { "message": "done" },
+        "task": {}
+    }));
+    let resp = service.call_single(call_req).await.unwrap();
+
+    let task_id = match &resp {
+        JsonRpcResponse::Result(r) => r.result["task"]["taskId"].as_str().unwrap().to_string(),
+        JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+    };
+
+    // Wait for completion
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Try to cancel the already-completed task
+    let cancel_req = JsonRpcRequest::new(3, "tasks/cancel").with_params(serde_json::json!({
+        "taskId": task_id
+    }));
+    let resp = service.call_single(cancel_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Error(e) => {
+            assert!(
+                e.error.message.contains("terminal"),
+                "Expected 'terminal' in error message, got: {}",
+                e.error.message
+            );
+        }
+        JsonRpcResponse::Result(_) => panic!("Expected error for cancel of terminal task"),
+    }
+}
+
+#[tokio::test]
+async fn test_task_forbidden_tool_rejects_task_params() {
+    let router = create_router_with_tasks();
+    let mut service = JsonRpcService::new(router.clone());
+    init_service(&router, &mut service).await;
+
+    // Try to create a task on the sync_only tool (TaskSupportMode::Forbidden)
+    let call_req = JsonRpcRequest::new(2, "tools/call").with_params(serde_json::json!({
+        "name": "sync_only",
+        "arguments": {},
+        "task": {}
+    }));
+    let resp = service.call_single(call_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Error(e) => {
+            assert!(
+                e.error.message.contains("does not support async tasks"),
+                "Expected 'does not support async tasks' in error, got: {}",
+                e.error.message
+            );
+        }
+        JsonRpcResponse::Result(_) => panic!("Expected error for forbidden tool with task params"),
+    }
+}
+
+#[tokio::test]
+async fn test_task_required_tool_rejects_sync_call() {
+    let router = create_router_with_tasks();
+    let mut service = JsonRpcService::new(router.clone());
+    init_service(&router, &mut service).await;
+
+    // Call async_required tool WITHOUT task params
+    let call_req = JsonRpcRequest::new(2, "tools/call").with_params(serde_json::json!({
+        "name": "async_required",
+        "arguments": {}
+    }));
+    let resp = service.call_single(call_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Error(e) => {
+            assert!(
+                e.error.message.contains("requires async task execution"),
+                "Expected 'requires async task execution' in error, got: {}",
+                e.error.message
+            );
+        }
+        JsonRpcResponse::Result(_) => {
+            panic!("Expected error for required tool without task params")
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_task_capabilities_advertised() {
+    let router = create_router_with_tasks();
+    let mut service = JsonRpcService::new(router);
+
+    let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+        "protocolVersion": "2025-11-25",
+        "capabilities": {},
+        "clientInfo": { "name": "test", "version": "1.0" }
+    }));
+    let resp = service.call_single(init_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Result(r) => {
+            let caps = r.result.get("capabilities").unwrap();
+            let tasks = caps
+                .get("tasks")
+                .expect("capabilities should include 'tasks'");
+            assert!(tasks.get("list").is_some(), "tasks should have 'list'");
+            assert!(tasks.get("cancel").is_some(), "tasks should have 'cancel'");
+            let requests = tasks.get("requests").expect("tasks should have 'requests'");
+            assert!(
+                requests.get("tools").is_some(),
+                "requests should have 'tools'"
+            );
+        }
+        JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+    }
+}
+
+#[tokio::test]
+async fn test_task_capabilities_not_advertised_without_task_tools() {
+    // Router with only Forbidden tools (default task support)
+    let router = create_test_router();
+    let mut service = JsonRpcService::new(router);
+
+    let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+        "protocolVersion": "2025-11-25",
+        "capabilities": {},
+        "clientInfo": { "name": "test", "version": "1.0" }
+    }));
+    let resp = service.call_single(init_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Result(r) => {
+            let caps = r.result.get("capabilities").unwrap();
+            assert!(
+                caps.get("tasks").is_none(),
+                "capabilities should NOT include 'tasks' when no tool supports tasks"
+            );
+        }
+        JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+    }
+}
+
+#[tokio::test]
+async fn test_task_tool_definition_includes_execution() {
+    let router = create_router_with_tasks();
+    let mut service = JsonRpcService::new(router.clone());
+    init_service(&router, &mut service).await;
+
+    let list_req = JsonRpcRequest::new(2, "tools/list");
+    let resp = service.call_single(list_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Result(r) => {
+            let tools = r.result.get("tools").unwrap().as_array().unwrap();
+
+            for tool in tools {
+                let name = tool["name"].as_str().unwrap();
+                let execution = tool.get("execution");
+                match name {
+                    "echo" => {
+                        let exec = execution.expect("echo should have 'execution'");
+                        assert_eq!(exec["taskSupport"].as_str().unwrap(), "optional");
+                    }
+                    "slow" => {
+                        let exec = execution.expect("slow should have 'execution'");
+                        assert_eq!(exec["taskSupport"].as_str().unwrap(), "optional");
+                    }
+                    "sync_only" => {
+                        assert!(
+                            execution.is_none(),
+                            "sync_only (Forbidden) should NOT have 'execution'"
+                        );
+                    }
+                    "async_required" => {
+                        let exec = execution.expect("async_required should have 'execution'");
+                        assert_eq!(exec["taskSupport"].as_str().unwrap(), "required");
+                    }
+                    other => panic!("Unexpected tool: {}", other),
+                }
+            }
+        }
+        JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+    }
+}
+
+#[tokio::test]
+async fn test_task_get_nonexistent() {
+    let router = create_router_with_tasks();
+    let mut service = JsonRpcService::new(router.clone());
+    init_service(&router, &mut service).await;
+
+    let get_req = JsonRpcRequest::new(2, "tasks/get").with_params(serde_json::json!({
+        "taskId": "task-nonexistent-999"
+    }));
+    let resp = service.call_single(get_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Error(e) => {
+            assert!(
+                e.error.message.contains("not found"),
+                "Expected 'not found' in error, got: {}",
+                e.error.message
+            );
+        }
+        JsonRpcResponse::Result(_) => panic!("Expected error for nonexistent task"),
     }
 }
