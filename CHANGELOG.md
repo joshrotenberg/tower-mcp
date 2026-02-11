@@ -4,6 +4,55 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+## [0.6.0] - 2026-02-11
+
+### Bug Fixes
+
+- Add ToolsListChanged and PromptsListChanged to ServerNotification ([#379](https://github.com/joshrotenberg/tower-mcp/pull/379))
+- Forward server notifications in stdio transports ([#380](https://github.com/joshrotenberg/tower-mcp/pull/380))
+- Set listChanged capabilities to true when notification sender is configured ([#381](https://github.com/joshrotenberg/tower-mcp/pull/381))
+- Enforce logging/setLevel filtering on outgoing log notifications ([#382](https://github.com/joshrotenberg/tower-mcp/pull/382))
+- Add annotations field to ResourceDefinition and ResourceTemplateDefinition ([#384](https://github.com/joshrotenberg/tower-mcp/pull/384))
+- Add lastModified field to ContentAnnotations ([#387](https://github.com/joshrotenberg/tower-mcp/pull/387)) ([#396](https://github.com/joshrotenberg/tower-mcp/pull/396))
+- Correct task notification name to match spec ([#395](https://github.com/joshrotenberg/tower-mcp/pull/395)) ([#399](https://github.com/joshrotenberg/tower-mcp/pull/399))
+- Add URLElicitationRequired error code -32042 ([#393](https://github.com/joshrotenberg/tower-mcp/pull/393)) ([#398](https://github.com/joshrotenberg/tower-mcp/pull/398))
+- Add context.arguments to CompleteParams ([#397](https://github.com/joshrotenberg/tower-mcp/pull/397))
+- Batch of isolated MCP spec compliance fixes ([#421](https://github.com/joshrotenberg/tower-mcp/pull/421))
+- Correct ToolChoice serialization and add tool mode variant (#404, #412) ([#422](https://github.com/joshrotenberg/tower-mcp/pull/422))
+- Correct tasks capability nesting, add TaskStatusParams fields, emit null for ttl (#406, #408, #417) ([#424](https://github.com/joshrotenberg/tower-mcp/pull/424))
+- Make ResourceLink.name required and add missing title, icons, size fields ([#409](https://github.com/joshrotenberg/tower-mcp/pull/409)) ([#425](https://github.com/joshrotenberg/tower-mcp/pull/425))
+
+### Documentation
+
+- Update README.md for v0.5.0 ([#368](https://github.com/joshrotenberg/tower-mcp/pull/368))
+- Update README to reflect all implemented features ([#420](https://github.com/joshrotenberg/tower-mcp/pull/420)) ([#427](https://github.com/joshrotenberg/tower-mcp/pull/427))
+- Update README version to 0.6 and add extensions to feature list ([#452](https://github.com/joshrotenberg/tower-mcp/pull/452))
+
+### Features
+
+- Implement cursor-based pagination for list methods ([#383](https://github.com/joshrotenberg/tower-mcp/pull/383))
+- Add DynamicToolRegistry for runtime tool registration ([#370](https://github.com/joshrotenberg/tower-mcp/pull/370)) ([#385](https://github.com/joshrotenberg/tower-mcp/pull/385))
+- Add dynamic_tools example demonstrating meta-tools ([#371](https://github.com/joshrotenberg/tower-mcp/pull/371)) ([#386](https://github.com/joshrotenberg/tower-mcp/pull/386))
+- Add tasks capability to ClientCapabilities ([#401](https://github.com/joshrotenberg/tower-mcp/pull/401))
+- Add tools and context sub-fields to SamplingCapability ([#391](https://github.com/joshrotenberg/tower-mcp/pull/391)) ([#402](https://github.com/joshrotenberg/tower-mcp/pull/402))
+- Add experimental field to ServerCapabilities and ClientCapabilities ([#403](https://github.com/joshrotenberg/tower-mcp/pull/403))
+- Support single-or-array SamplingMessage content and add missing sampling fields (#407, #413) ([#423](https://github.com/joshrotenberg/tower-mcp/pull/423))
+- Add _meta field across all protocol types ([#419](https://github.com/joshrotenberg/tower-mcp/pull/419)) ([#426](https://github.com/joshrotenberg/tower-mcp/pull/426))
+- Add extensions field to capabilities and default to MultiSelectEnumSchema ([#448](https://github.com/joshrotenberg/tower-mcp/pull/448))
+- Add _meta field to all request params types (SEP-1319) ([#449](https://github.com/joshrotenberg/tower-mcp/pull/449))
+- Add stdio transport tests and CORS documentation ([#450](https://github.com/joshrotenberg/tower-mcp/pull/450))
+
+### Miscellaneous Tasks
+
+- 0.6.0 release prep — API stability, test coverage, and cleanup ([#447](https://github.com/joshrotenberg/tower-mcp/pull/447))
+
+### Testing
+
+- Add integration tests for task-augmented requests ([#400](https://github.com/joshrotenberg/tower-mcp/pull/400))
+- Add schema validation suite against official MCP JSON schema ([#435](https://github.com/joshrotenberg/tower-mcp/pull/435)) ([#451](https://github.com/joshrotenberg/tower-mcp/pull/451))
+
+
+
 ## [0.5.0] - 2026-02-07
 
 ### Features
