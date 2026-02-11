@@ -234,8 +234,14 @@ impl<T: ClientTransport> McpClient<T> {
     /// List available tools
     pub async fn list_tools(&mut self) -> Result<ListToolsResult> {
         self.ensure_initialized()?;
-        self.request("tools/list", &ListToolsParams { cursor: None })
-            .await
+        self.request(
+            "tools/list",
+            &ListToolsParams {
+                cursor: None,
+                meta: None,
+            },
+        )
+        .await
     }
 
     /// Call a tool
@@ -257,8 +263,14 @@ impl<T: ClientTransport> McpClient<T> {
     /// List available resources
     pub async fn list_resources(&mut self) -> Result<ListResourcesResult> {
         self.ensure_initialized()?;
-        self.request("resources/list", &ListResourcesParams { cursor: None })
-            .await
+        self.request(
+            "resources/list",
+            &ListResourcesParams {
+                cursor: None,
+                meta: None,
+            },
+        )
+        .await
     }
 
     /// Read a resource
@@ -266,6 +278,7 @@ impl<T: ClientTransport> McpClient<T> {
         self.ensure_initialized()?;
         let params = ReadResourceParams {
             uri: uri.to_string(),
+            meta: None,
         };
         self.request("resources/read", &params).await
     }
@@ -273,8 +286,14 @@ impl<T: ClientTransport> McpClient<T> {
     /// List available prompts
     pub async fn list_prompts(&mut self) -> Result<ListPromptsResult> {
         self.ensure_initialized()?;
-        self.request("prompts/list", &ListPromptsParams { cursor: None })
-            .await
+        self.request(
+            "prompts/list",
+            &ListPromptsParams {
+                cursor: None,
+                meta: None,
+            },
+        )
+        .await
     }
 
     /// Get a prompt
@@ -287,6 +306,7 @@ impl<T: ClientTransport> McpClient<T> {
         let params = GetPromptParams {
             name: name.to_string(),
             arguments: arguments.unwrap_or_default(),
+            meta: None,
         };
         self.request("prompts/get", &params).await
     }

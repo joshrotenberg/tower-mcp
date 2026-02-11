@@ -299,6 +299,9 @@ impl LoggingMessageParams {
 pub struct SetLogLevelParams {
     /// Minimum log level to receive
     pub level: LogLevel,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<RequestMeta>,
 }
 
 /// Request ID - can be string or number per JSON-RPC spec
@@ -1521,6 +1524,9 @@ pub struct PromptsCapability {
 pub struct ListToolsParams {
     #[serde(default)]
     pub cursor: Option<String>,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<RequestMeta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2218,6 +2224,9 @@ pub struct ResourceContent {
 pub struct ListResourcesParams {
     #[serde(default)]
     pub cursor: Option<String>,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<RequestMeta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2260,6 +2269,9 @@ pub struct ResourceDefinition {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadResourceParams {
     pub uri: String,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<RequestMeta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2481,11 +2493,17 @@ impl ReadResourceResult {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SubscribeResourceParams {
     pub uri: String,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<RequestMeta>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UnsubscribeResourceParams {
     pub uri: String,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<RequestMeta>,
 }
 
 /// Parameters for listing resource templates
@@ -2494,6 +2512,9 @@ pub struct ListResourceTemplatesParams {
     /// Pagination cursor from previous response
     #[serde(default)]
     pub cursor: Option<String>,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<RequestMeta>,
 }
 
 /// Result of listing resource templates
@@ -2563,6 +2584,9 @@ pub struct ResourceTemplateDefinition {
 pub struct ListPromptsParams {
     #[serde(default)]
     pub cursor: Option<String>,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<RequestMeta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2608,6 +2632,9 @@ pub struct GetPromptParams {
     pub name: String,
     #[serde(default)]
     pub arguments: std::collections::HashMap<String, String>,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<RequestMeta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2974,6 +3001,9 @@ pub struct ListTasksParams {
     /// Pagination cursor
     #[serde(default)]
     pub cursor: Option<String>,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<RequestMeta>,
 }
 
 /// Result of listing tasks
@@ -2993,6 +3023,9 @@ pub struct ListTasksResult {
 pub struct GetTaskInfoParams {
     /// Task ID to query
     pub task_id: String,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<RequestMeta>,
 }
 
 /// Parameters for getting task result
@@ -3001,6 +3034,9 @@ pub struct GetTaskInfoParams {
 pub struct GetTaskResultParams {
     /// Task ID to get result for
     pub task_id: String,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<RequestMeta>,
 }
 
 /// Parameters for cancelling a task
@@ -3012,6 +3048,9 @@ pub struct CancelTaskParams {
     /// Optional reason for cancellation
     #[serde(default)]
     pub reason: Option<String>,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<RequestMeta>,
 }
 
 /// Notification params when task status changes
