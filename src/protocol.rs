@@ -3,6 +3,8 @@
 //! These types follow the MCP specification (2025-11-25):
 //! <https://modelcontextprotocol.io/specification/2025-11-25>
 
+use std::collections::HashMap;
+
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -510,6 +512,9 @@ pub struct ClientCapabilities {
     pub elicitation: Option<ElicitationCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tasks: Option<ClientTasksCapability>,
+    /// Experimental, non-standard capabilities
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experimental: Option<HashMap<String, serde_json::Value>>,
 }
 
 /// Client capability for elicitation (requesting user input)
@@ -1282,6 +1287,9 @@ pub struct ServerCapabilities {
     /// Completion capability - server provides autocomplete suggestions
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completions: Option<CompletionsCapability>,
+    /// Experimental, non-standard capabilities
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experimental: Option<HashMap<String, serde_json::Value>>,
 }
 
 /// Logging capability declaration
@@ -3499,6 +3507,7 @@ mod tests {
                 url: Some(ElicitationUrlCapability {}),
             }),
             tasks: None,
+            experimental: None,
         };
 
         let json = serde_json::to_value(&caps).unwrap();
@@ -3604,6 +3613,7 @@ mod tests {
             sampling: None,
             elicitation: None,
             tasks: None,
+            experimental: None,
         };
 
         let json = serde_json::to_value(&caps).unwrap();
