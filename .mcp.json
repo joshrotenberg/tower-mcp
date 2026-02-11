@@ -38,6 +38,13 @@
       "env": {
         "RUST_LOG": "codegen_mcp=info"
       }
+    },
+    "notes-mcp": {
+      "command": "cargo",
+      "args": ["run", "-p", "notes-mcp", "--", "--seed"],
+      "env": {
+        "RUST_LOG": "notes_mcp=info"
+      }
     }
   }
 }
