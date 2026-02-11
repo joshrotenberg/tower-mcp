@@ -78,6 +78,44 @@
 //! | -32005  | SessionNotFound| Session expired or server restarted      |
 //! | -32006  | SessionRequired| MCP-Session-Id header missing            |
 //!
+//! ## CORS Support
+//!
+//! Browser-based MCP clients require CORS headers. Since [`HttpTransport::into_router()`]
+//! returns a standard [`axum::Router`], you can add CORS support using
+//! `tower_http::cors::CorsLayer`:
+//!
+//! ```rust,ignore
+//! use tower_mcp::McpRouter;
+//! use tower_mcp::transport::http::HttpTransport;
+//! use tower_http::cors::{CorsLayer, Any};
+//! use http::Method;
+//!
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let router = McpRouter::new().server_info("my-server", "1.0.0");
+//! let transport = HttpTransport::new(router);
+//!
+//! // Wrap the axum router with CORS middleware
+//! let app = transport.into_router().layer(
+//!     CorsLayer::new()
+//!         .allow_origin(Any)
+//!         .allow_methods([Method::GET, Method::POST, Method::DELETE])
+//!         .allow_headers(Any)
+//!         .expose_headers(Any),
+//! );
+//!
+//! let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
+//! axum::serve(listener, app).await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! For production, replace `Any` origins with your specific allowed origins.
+//!
+//! **Note:** [`HttpTransport::layer()`] applies middleware at the *MCP request* level
+//! (inside the JSON-RPC service). CORS must be applied at the *HTTP* level using
+//! `into_router().layer(...)` as shown above.
+//!
 //! # Example
 //!
 //! ```rust,no_run
