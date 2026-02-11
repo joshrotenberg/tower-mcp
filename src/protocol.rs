@@ -508,6 +508,8 @@ pub struct ClientCapabilities {
     pub sampling: Option<SamplingCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elicitation: Option<ElicitationCapability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tasks: Option<ClientTasksCapability>,
 }
 
 /// Client capability for elicitation (requesting user input)
@@ -528,6 +530,49 @@ pub struct ElicitationFormCapability {}
 /// Marker for URL-based elicitation support
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ElicitationUrlCapability {}
+
+/// Client capability for async task management
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientTasksCapability {
+    /// Support for listing tasks
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list: Option<ClientTasksListCapability>,
+    /// Support for cancelling tasks
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel: Option<ClientTasksCancelCapability>,
+    /// Which request types support task-augmented requests
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests: Option<ClientTasksRequestsCapability>,
+}
+
+/// Marker capability for client tasks/list support
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClientTasksListCapability {}
+
+/// Marker capability for client tasks/cancel support
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClientTasksCancelCapability {}
+
+/// Capability declaring which request types support task-augmented requests on the client
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientTasksRequestsCapability {
+    /// Support for task-augmented sampling/createMessage
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling_create_message: Option<ClientTasksSamplingCapability>,
+    /// Support for task-augmented elicitation/create
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elicitation_create: Option<ClientTasksElicitationCapability>,
+}
+
+/// Marker capability for task-augmented sampling/createMessage support
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClientTasksSamplingCapability {}
+
+/// Marker capability for task-augmented elicitation/create support
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClientTasksElicitationCapability {}
 
 /// Client capability for roots (filesystem access)
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -3438,6 +3483,7 @@ mod tests {
                 form: Some(ElicitationFormCapability {}),
                 url: Some(ElicitationUrlCapability {}),
             }),
+            tasks: None,
         };
 
         let json = serde_json::to_value(&caps).unwrap();
@@ -3542,6 +3588,7 @@ mod tests {
             roots: Some(RootsCapability { list_changed: true }),
             sampling: None,
             elicitation: None,
+            tasks: None,
         };
 
         let json = serde_json::to_value(&caps).unwrap();
