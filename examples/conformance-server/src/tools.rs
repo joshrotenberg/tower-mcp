@@ -210,7 +210,7 @@ fn build_sampling() -> Tool {
                 Ok(result) => {
                     // Get the first content item
                     let text = match result.content_items().first() {
-                        Some(tower_mcp::SamplingContent::Text { text }) => text.clone(),
+                        Some(tower_mcp::SamplingContent::Text { text, .. }) => text.clone(),
                         Some(content) => format!("{:?}", content),
                         None => "No content".to_string(),
                     };

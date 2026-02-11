@@ -920,8 +920,8 @@ pub enum IncludeContext {
 pub struct SamplingMessage {
     /// The role of the message sender
     pub role: ContentRole,
-    /// The content of the message
-    pub content: SamplingContent,
+    /// The content of the message (single item or array)
+    pub content: SamplingContentOrArray,
 }
 
 impl SamplingMessage {
@@ -929,7 +929,10 @@ impl SamplingMessage {
     pub fn user(text: impl Into<String>) -> Self {
         Self {
             role: ContentRole::User,
-            content: SamplingContent::Text { text: text.into() },
+            content: SamplingContentOrArray::Single(SamplingContent::Text {
+                text: text.into(),
+                annotations: None,
+            }),
         }
     }
 
@@ -937,24 +940,43 @@ impl SamplingMessage {
     pub fn assistant(text: impl Into<String>) -> Self {
         Self {
             role: ContentRole::Assistant,
-            content: SamplingContent::Text { text: text.into() },
+            content: SamplingContentOrArray::Single(SamplingContent::Text {
+                text: text.into(),
+                annotations: None,
+            }),
         }
     }
 }
 
 /// Tool definition for use in sampling requests (SEP-1577)
 ///
-/// Describes a tool that can be used during a sampling request.
+/// The MCP spec uses the full `Tool` type for sampling tools.
+/// This struct mirrors `ToolDefinition` with all optional fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SamplingTool {
     /// The name of the tool
     pub name: String,
+    /// Human-readable title for display purposes
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// Description of what the tool does
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// JSON Schema describing the tool's input parameters
     pub input_schema: Value,
+    /// Optional JSON Schema defining expected output structure
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+    /// Optional icons for display in user interfaces
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icons: Option<Vec<ToolIcon>>,
+    /// Optional annotations describing tool behavior
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<ToolAnnotations>,
+    /// Optional execution configuration for task support
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ToolExecution>,
 }
 
 /// Tool choice mode for sampling requests (SEP-1577)
@@ -1011,6 +1033,9 @@ pub enum SamplingContent {
     Text {
         /// The text content
         text: String,
+        /// Optional annotations for this content
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        annotations: Option<ContentAnnotations>,
     },
     /// Image content
     Image {
@@ -1019,6 +1044,9 @@ pub enum SamplingContent {
         /// MIME type of the image
         #[serde(rename = "mimeType")]
         mime_type: String,
+        /// Optional annotations for this content
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        annotations: Option<ContentAnnotations>,
     },
     /// Audio content (if supported)
     Audio {
@@ -1027,6 +1055,9 @@ pub enum SamplingContent {
         /// MIME type of the audio
         #[serde(rename = "mimeType")]
         mime_type: String,
+        /// Optional annotations for this content
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        annotations: Option<ContentAnnotations>,
     },
     /// Tool use request from the model (SEP-1577)
     #[serde(rename = "tool_use")]
@@ -1046,6 +1077,13 @@ pub enum SamplingContent {
         tool_use_id: String,
         /// The tool result content
         content: Vec<SamplingContent>,
+        /// Structured content from the tool result
+        #[serde(
+            default,
+            rename = "structuredContent",
+            skip_serializing_if = "Option::is_none"
+        )]
+        structured_content: Option<Value>,
         /// Whether the tool execution resulted in an error
         #[serde(default, rename = "isError", skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
@@ -1062,26 +1100,27 @@ impl SamplingContent {
     /// ```rust
     /// use tower_mcp::protocol::SamplingContent;
     ///
-    /// let text_content = SamplingContent::Text { text: "Hello".into() };
+    /// let text_content = SamplingContent::Text { text: "Hello".into(), annotations: None };
     /// assert_eq!(text_content.as_text(), Some("Hello"));
     ///
     /// let image_content = SamplingContent::Image {
     ///     data: "base64...".into(),
     ///     mime_type: "image/png".into(),
+    ///     annotations: None,
     /// };
     /// assert_eq!(image_content.as_text(), None);
     /// ```
     pub fn as_text(&self) -> Option<&str> {
         match self {
-            SamplingContent::Text { text } => Some(text),
+            SamplingContent::Text { text, .. } => Some(text),
             _ => None,
         }
     }
 }
 
-/// Content that can be either a single item or an array (for CreateMessageResult)
+/// Content that can be either a single item or an array
 ///
-/// The MCP spec allows CreateMessageResult.content to be either a single
+/// The MCP spec allows content fields to be either a single
 /// SamplingContent or an array of SamplingContent items.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -1142,6 +1181,9 @@ pub struct CreateMessageParams {
     /// Tool choice mode (SEP-1577)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
+    /// Task parameters for async execution
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskRequestParams>,
 }
 
 impl CreateMessageParams {
@@ -1158,6 +1200,7 @@ impl CreateMessageParams {
             metadata: None,
             tools: None,
             tool_choice: None,
+            task: None,
         }
     }
 
@@ -1238,6 +1281,7 @@ impl CreateMessageResult {
     /// let result = CreateMessageResult {
     ///     content: SamplingContentOrArray::Single(SamplingContent::Text {
     ///         text: "Hello, world!".into(),
+    ///         annotations: None,
     ///     }),
     ///     model: "claude-3".into(),
     ///     role: ContentRole::Assistant,
@@ -3842,7 +3886,7 @@ mod tests {
         let msg = SamplingMessage::user("Hello, how are you?");
         assert_eq!(msg.role, ContentRole::User);
         assert!(
-            matches!(msg.content, SamplingContent::Text { text } if text == "Hello, how are you?")
+            matches!(msg.content, SamplingContentOrArray::Single(SamplingContent::Text { ref text, .. }) if text == "Hello, how are you?")
         );
     }
 
@@ -3856,6 +3900,7 @@ mod tests {
     fn test_sampling_content_text_serialization() {
         let content = SamplingContent::Text {
             text: "Hello".to_string(),
+            annotations: None,
         };
         let json = serde_json::to_value(&content).unwrap();
         assert_eq!(json["type"], "text");
@@ -3867,6 +3912,7 @@ mod tests {
         let content = SamplingContent::Image {
             data: "base64data".to_string(),
             mime_type: "image/png".to_string(),
+            annotations: None,
         };
         let json = serde_json::to_value(&content).unwrap();
         assert_eq!(json["type"], "image");
@@ -4007,6 +4053,7 @@ mod tests {
     fn test_sampling_tool_serialization() {
         let tool = SamplingTool {
             name: "get_weather".to_string(),
+            title: None,
             description: Some("Get current weather".to_string()),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -4014,6 +4061,10 @@ mod tests {
                     "location": { "type": "string" }
                 }
             }),
+            output_schema: None,
+            icons: None,
+            annotations: None,
+            execution: None,
         };
         let json = serde_json::to_value(&tool).unwrap();
         assert_eq!(json["name"], "get_weather");
@@ -4067,7 +4118,9 @@ mod tests {
             tool_use_id: "tool_123".to_string(),
             content: vec![SamplingContent::Text {
                 text: "72F, sunny".to_string(),
+                annotations: None,
             }],
+            structured_content: None,
             is_error: None,
         };
         let json = serde_json::to_value(&content).unwrap();
@@ -4086,7 +4139,7 @@ mod tests {
         let items = content.items();
         assert_eq!(items.len(), 1);
         match items[0] {
-            SamplingContent::Text { text } => assert_eq!(text, "Hello"),
+            SamplingContent::Text { text, .. } => assert_eq!(text, "Hello"),
             _ => panic!("Expected text content"),
         }
     }
@@ -4106,8 +4159,13 @@ mod tests {
     fn test_create_message_params_with_tools() {
         let tool = SamplingTool {
             name: "calculator".to_string(),
+            title: None,
             description: Some("Do math".to_string()),
             input_schema: serde_json::json!({"type": "object"}),
+            output_schema: None,
+            icons: None,
+            annotations: None,
+            execution: None,
         };
         let params = CreateMessageParams::new(vec![], 100)
             .tools(vec![tool])
@@ -4125,9 +4183,11 @@ mod tests {
             content: SamplingContentOrArray::Array(vec![
                 SamplingContent::Text {
                     text: "First".to_string(),
+                    annotations: None,
                 },
                 SamplingContent::Text {
                     text: "Second".to_string(),
+                    annotations: None,
                 },
             ]),
             model: "test".to_string(),
@@ -4142,18 +4202,21 @@ mod tests {
     fn test_sampling_content_as_text() {
         let text_content = SamplingContent::Text {
             text: "Hello".to_string(),
+            annotations: None,
         };
         assert_eq!(text_content.as_text(), Some("Hello"));
 
         let image_content = SamplingContent::Image {
             data: "base64data".to_string(),
             mime_type: "image/png".to_string(),
+            annotations: None,
         };
         assert_eq!(image_content.as_text(), None);
 
         let audio_content = SamplingContent::Audio {
             data: "base64audio".to_string(),
             mime_type: "audio/wav".to_string(),
+            annotations: None,
         };
         assert_eq!(audio_content.as_text(), None);
     }
@@ -4163,6 +4226,7 @@ mod tests {
         let result = CreateMessageResult {
             content: SamplingContentOrArray::Single(SamplingContent::Text {
                 text: "Hello, world!".to_string(),
+                annotations: None,
             }),
             model: "test".to_string(),
             role: ContentRole::Assistant,
@@ -4177,9 +4241,11 @@ mod tests {
             content: SamplingContentOrArray::Array(vec![
                 SamplingContent::Text {
                     text: "First".to_string(),
+                    annotations: None,
                 },
                 SamplingContent::Text {
                     text: "Second".to_string(),
+                    annotations: None,
                 },
             ]),
             model: "test".to_string(),
@@ -4196,9 +4262,11 @@ mod tests {
                 SamplingContent::Image {
                     data: "base64data".to_string(),
                     mime_type: "image/png".to_string(),
+                    annotations: None,
                 },
                 SamplingContent::Text {
                     text: "After image".to_string(),
+                    annotations: None,
                 },
             ]),
             model: "test".to_string(),
@@ -4214,6 +4282,7 @@ mod tests {
             content: SamplingContentOrArray::Single(SamplingContent::Image {
                 data: "base64data".to_string(),
                 mime_type: "image/png".to_string(),
+                annotations: None,
             }),
             model: "test".to_string(),
             role: ContentRole::Assistant,
