@@ -141,8 +141,8 @@
 //! - `websocket` - WebSocket transport for bidirectional communication
 //! - `childproc` - Child process transport for subprocess management
 //! - `oauth` - OAuth 2.1 resource server support (token validation, metadata endpoint)
-//! - `testing` - Test utilities ([`TestClient`]) for ergonomic MCP server testing
-//! - `dynamic-tools` - Runtime tool (de)registration via [`DynamicToolRegistry`]
+//! - `testing` - Test utilities (`TestClient`) for ergonomic MCP server testing
+//! - `dynamic-tools` - Runtime tool (de)registration via `DynamicToolRegistry`
 //!
 //! ## Middleware Placement Guide
 //!
@@ -388,19 +388,36 @@ pub use jsonrpc::{JsonRpcLayer, JsonRpcService};
 pub use prompt::{BoxPromptService, Prompt, PromptBuilder, PromptHandler, PromptRequest};
 #[allow(deprecated)]
 pub use protocol::{
-    CallToolResult, ClientTasksCapability, CompleteParams, CompleteResult, Completion,
+    BooleanSchema, CallToolParams, CallToolResult, CancelTaskParams, CancelledParams,
+    ClientCapabilities, ClientTasksCancelCapability, ClientTasksCapability,
+    ClientTasksElicitationCapability, ClientTasksElicitationCreateCapability,
+    ClientTasksListCapability, ClientTasksRequestsCapability, ClientTasksSamplingCapability,
+    ClientTasksSamplingCreateMessageCapability, CompleteParams, CompleteResult, Completion,
     CompletionArgument, CompletionContext, CompletionReference, CompletionsCapability, Content,
-    ContentRole, CreateMessageParams, CreateMessageResult, CreateTaskResult, ElicitAction,
-    ElicitFieldValue, ElicitFormParams, ElicitFormSchema, ElicitMode, ElicitRequestParams,
-    ElicitResult, ElicitUrlParams, ElicitationCapability, ElicitationCompleteParams,
-    GetPromptResult, GetPromptResultBuilder, IconTheme, IncludeContext, JsonRpcMessage,
-    JsonRpcRequest, JsonRpcResponse, JsonRpcResponseMessage, ListRootsParams, ListRootsResult,
-    McpRequest, McpResponse, ModelHint, ModelPreferences, PrimitiveSchemaDefinition, PromptMessage,
-    PromptReference, PromptRole, ReadResourceResult, ResourceContent, ResourceReference, Root,
-    RootsCapability, SamplingCapability, SamplingContent, SamplingContentOrArray,
-    SamplingContextCapability, SamplingMessage, SamplingTool, SamplingToolsCapability, TaskInfo,
-    TaskObject, TaskRequestParams, TaskStatusParams, TaskSupportMode, TasksToolsRequestsCapability,
-    ToolChoice, ToolExecution,
+    ContentAnnotations, ContentRole, CreateMessageParams, CreateMessageResult, CreateTaskResult,
+    ElicitAction, ElicitFieldValue, ElicitFormParams, ElicitFormSchema, ElicitMode,
+    ElicitRequestParams, ElicitResult, ElicitUrlParams, ElicitationCapability,
+    ElicitationCompleteParams, ElicitationFormCapability, ElicitationUrlCapability, EmptyResult,
+    GetPromptParams, GetPromptResult, GetPromptResultBuilder, GetTaskInfoParams,
+    GetTaskResultParams, IconTheme, Implementation, IncludeContext, InitializeParams,
+    InitializeResult, IntegerSchema, JsonRpcErrorResponse, JsonRpcMessage, JsonRpcNotification,
+    JsonRpcRequest, JsonRpcResponse, JsonRpcResponseMessage, JsonRpcResultResponse,
+    ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
+    ListResourcesParams, ListResourcesResult, ListRootsParams, ListRootsResult, ListTasksParams,
+    ListTasksResult, ListToolsParams, ListToolsResult, LogLevel, LoggingCapability,
+    LoggingMessageParams, McpNotification, McpRequest, McpResponse, ModelHint, ModelPreferences,
+    MultiSelectEnumItems, MultiSelectEnumSchema, NumberSchema, PrimitiveSchemaDefinition,
+    ProgressParams, ProgressToken, PromptArgument, PromptDefinition, PromptMessage,
+    PromptReference, PromptRole, PromptsCapability, ReadResourceParams, ReadResourceResult,
+    RequestId, RequestMeta, ResourceContent, ResourceDefinition, ResourceReference,
+    ResourceTemplateDefinition, ResourcesCapability, Root, RootsCapability, SamplingCapability,
+    SamplingContent, SamplingContentOrArray, SamplingContextCapability, SamplingMessage,
+    SamplingTool, SamplingToolsCapability, ServerCapabilities, SetLogLevelParams,
+    SingleSelectEnumSchema, StringSchema, SubscribeResourceParams, TaskInfo, TaskObject,
+    TaskRequestParams, TaskStatus, TaskStatusChangedParams, TaskStatusParams, TaskSupportMode,
+    TasksCancelCapability, TasksCapability, TasksListCapability, TasksRequestsCapability,
+    TasksToolsCallCapability, TasksToolsRequestsCapability, ToolAnnotations, ToolChoice,
+    ToolDefinition, ToolExecution, ToolIcon, ToolsCapability, UnsubscribeResourceParams,
 };
 #[cfg(feature = "dynamic-tools")]
 pub use registry::DynamicToolRegistry;

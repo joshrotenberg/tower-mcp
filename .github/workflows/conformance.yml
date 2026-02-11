@@ -44,7 +44,7 @@ jobs:
           exit 1
 
       - name: Run conformance suite
-        run: npx @modelcontextprotocol/conformance@0.1.11 server --url http://127.0.0.1:3001/mcp --expected-failures ./conformance-baseline.yml
+        run: npx @modelcontextprotocol/conformance@0.1.13 server --url http://127.0.0.1:3001/mcp --expected-failures ./conformance-baseline.yml
 
       - name: Show server logs on failure
         if: failure()

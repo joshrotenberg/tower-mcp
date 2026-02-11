@@ -516,7 +516,7 @@ pub struct InitializeParams {
     pub meta: Option<Value>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClientCapabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roots: Option<RootsCapability>,
@@ -532,7 +532,7 @@ pub struct ClientCapabilities {
 }
 
 /// Client capability for elicitation (requesting user input)
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ElicitationCapability {
     /// Support for form-based elicitation
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -543,11 +543,11 @@ pub struct ElicitationCapability {
 }
 
 /// Marker for form-based elicitation support
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ElicitationFormCapability {}
 
 /// Marker for URL-based elicitation support
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ElicitationUrlCapability {}
 
 /// Client capability for async task management
@@ -612,7 +612,7 @@ pub struct ClientTasksElicitationCapability {
 pub struct ClientTasksElicitationCreateCapability {}
 
 /// Client capability for roots (filesystem access)
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RootsCapability {
     /// Whether the client supports roots list changed notifications
@@ -626,7 +626,7 @@ pub struct RootsCapability {
 /// - Scoped file access
 /// - Workspace awareness
 /// - Security boundaries
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Root {
     /// The URI identifying the root. Must start with `file://` for now.
     pub uri: String,
@@ -659,7 +659,7 @@ impl Root {
 }
 
 /// Parameters for roots/list request (server to client)
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListRootsParams {
     /// Optional metadata
     #[serde(default, rename = "_meta", skip_serializing_if = "Option::is_none")]
@@ -667,7 +667,7 @@ pub struct ListRootsParams {
 }
 
 /// Result of roots/list request
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListRootsResult {
     /// The list of roots available to the server
     pub roots: Vec<Root>,
@@ -676,7 +676,7 @@ pub struct ListRootsResult {
     pub meta: Option<Value>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SamplingCapability {
     /// Support for tool use within sampling
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -687,15 +687,15 @@ pub struct SamplingCapability {
 }
 
 /// Marker capability for tool use within sampling
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SamplingToolsCapability {}
 
 /// Marker capability for context inclusion within sampling
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SamplingContextCapability {}
 
 /// Server capability for providing completions
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CompletionsCapability {}
 
 // =============================================================================
@@ -1374,7 +1374,7 @@ impl CreateMessageResult {
 }
 
 /// Information about a client or server implementation
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Implementation {
     /// Name of the implementation
