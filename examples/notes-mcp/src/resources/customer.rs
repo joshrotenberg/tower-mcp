@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tower_mcp::protocol::{ReadResourceResult, ResourceContent};
 use tower_mcp::resource::{ResourceTemplate, ResourceTemplateBuilder};
 
-use crate::state::{AppState, Customer, Note, parse_ft_search};
+use crate::state::{AppState, Customer, Note, escape_tag, parse_ft_search};
 
 pub fn build(state: Arc<AppState>) -> ResourceTemplate {
     ResourceTemplateBuilder::new("notes://customers/{id}")
@@ -42,7 +42,7 @@ pub fn build(state: Arc<AppState>) -> ResourceTemplate {
                 // Get their notes
                 let values: Vec<redis::Value> = redis::cmd("FT.SEARCH")
                     .arg("idx:notes")
-                    .arg(format!("@customerId:{{{id}}}"))
+                    .arg(format!("@customerId:{{{}}}", escape_tag(&id)))
                     .arg("RETURN")
                     .arg("1")
                     .arg("$")

@@ -45,6 +45,72 @@ impl AppState {
     }
 }
 
+/// Escape special characters for RediSearch TAG filter values.
+///
+/// RediSearch interprets characters like `-`, `.`, `@`, etc. as operators.
+/// Tags such as `case-study` or `disaster-recovery` must be escaped to match.
+pub fn escape_tag(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() * 2);
+    for ch in value.chars() {
+        if matches!(
+            ch,
+            ',' | '.'
+                | '<'
+                | '>'
+                | '{'
+                | '}'
+                | '['
+                | ']'
+                | '"'
+                | '\''
+                | ':'
+                | ';'
+                | '!'
+                | '@'
+                | '#'
+                | '$'
+                | '%'
+                | '^'
+                | '&'
+                | '*'
+                | '('
+                | ')'
+                | '-'
+                | '+'
+                | '='
+                | '~'
+                | '/'
+                | '|'
+                | ' '
+                | '\\'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+/// Transform a multi-word text query into an OR query for RediSearch.
+///
+/// RediSearch ANDs all terms by default, so `"case study marketing"` returns
+/// nothing unless a document contains all three words. Joining with `|` makes
+/// it an OR so any matching term produces results.
+pub fn or_join_query(query: &str) -> String {
+    let trimmed = query.trim();
+    // Don't transform single words, wildcard, or queries already using RediSearch operators
+    if !trimmed.contains(' ')
+        || trimmed == "*"
+        || trimmed.contains('|')
+        || trimmed.contains('@')
+        || trimmed.contains('(')
+    {
+        return trimmed.to_string();
+    }
+    let terms: Vec<&str> = trimmed.split_whitespace().collect();
+    format!("({})", terms.join("|"))
+}
+
 /// Parse an `FT.SEARCH` response that used `RETURN 1 $`.
 ///
 /// Returns `(total_count, vec_of_(key, json_string))`.

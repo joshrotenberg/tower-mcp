@@ -9,7 +9,7 @@ use tower_mcp::{
     extract::{Json, State},
 };
 
-use crate::state::{AppState, Customer, Note, parse_ft_search};
+use crate::state::{AppState, Customer, Note, escape_tag, parse_ft_search};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetCustomerInput {
@@ -51,7 +51,7 @@ pub fn build(state: Arc<AppState>) -> Tool {
                 // Search for their notes
                 let values: Vec<redis::Value> = redis::cmd("FT.SEARCH")
                     .arg("idx:notes")
-                    .arg(format!("@customerId:{{{}}}", input.id))
+                    .arg(format!("@customerId:{{{}}}", escape_tag(&input.id)))
                     .arg("RETURN")
                     .arg("1")
                     .arg("$")

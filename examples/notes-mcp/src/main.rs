@@ -75,14 +75,20 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     // Build tools
     let search_customers = tools::search_customers::build(state.clone());
     let search_notes = tools::search_notes::build(state.clone());
+    let list_customers = tools::list_customers::build(state.clone());
     let add_note = tools::add_note::build(state.clone());
     let get_customer = tools::get_customer::build(state.clone());
+    let update_customer = tools::update_customer::build(state.clone());
+    let update_note = tools::update_note::build(state.clone());
+    let delete_note = tools::delete_note::build(state.clone());
 
     // Build resources
     let customer_template = resources::customer::build(state.clone());
+    let recent_notes = resources::recent_notes::build(state.clone());
 
     // Build prompts
     let prep_meeting = prompts::prep_meeting::build();
+    let account_review = prompts::account_review::build();
 
     // Assemble router
     let router = McpRouter::new()
@@ -92,18 +98,30 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
              Available tools:\n\
              - search_customers: Find customers by name, company, or role\n\
              - search_notes: Search note content with optional filters\n\
+             - list_customers: List all customers with note counts\n\
              - get_customer: Get a customer's full profile and notes\n\
-             - add_note: Create a new note for a customer\n\n\
+             - add_note: Create a new note for a customer\n\
+             - update_customer: Update customer profile fields\n\
+             - update_note: Update note content or metadata\n\
+             - delete_note: Delete a note by ID\n\n\
              Resources:\n\
-             - notes://customers/{id}: Customer profile with notes\n\n\
-             Use the prep_meeting prompt for guided meeting preparation.",
+             - notes://customers/{id}: Customer profile with notes\n\
+             - notes://recent: 10 most recent notes across all customers\n\n\
+             Use the prep_meeting prompt for guided meeting preparation.\n\
+             Use the account_review prompt for tier-level portfolio analysis.",
         )
         .tool(search_customers)
         .tool(search_notes)
+        .tool(list_customers)
         .tool(add_note)
         .tool(get_customer)
+        .tool(update_customer)
+        .tool(update_note)
+        .tool(delete_note)
         .resource_template(customer_template)
-        .prompt(prep_meeting);
+        .resource(recent_notes)
+        .prompt(prep_meeting)
+        .prompt(account_review);
 
     match args.transport {
         Transport::Stdio => {
