@@ -100,6 +100,11 @@ pub(crate) fn serialize_notification(notification: &ServerNotification) -> Optio
             let notif = JsonRpcNotification::new(notifications::PROMPTS_LIST_CHANGED);
             serde_json::to_string(&notif).ok()
         }
+        ServerNotification::TaskStatusChanged(params) => {
+            let notif = JsonRpcNotification::new(notifications::TASK_STATUS_CHANGED)
+                .with_params(serde_json::to_value(params).unwrap_or_default());
+            serde_json::to_string(&notif).ok()
+        }
     }
 }
 

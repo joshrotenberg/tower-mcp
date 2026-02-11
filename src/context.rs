@@ -99,6 +99,8 @@ pub enum ServerNotification {
     ToolsListChanged,
     /// The list of available prompts has changed
     PromptsListChanged,
+    /// Task status has changed
+    TaskStatusChanged(crate::protocol::TaskStatusParams),
 }
 
 /// Sender for server notifications

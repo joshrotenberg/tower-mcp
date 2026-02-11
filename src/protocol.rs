@@ -564,21 +564,39 @@ pub struct ClientTasksCancelCapability {}
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientTasksRequestsCapability {
-    /// Support for task-augmented sampling/createMessage
+    /// Task support for sampling-related requests
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sampling_create_message: Option<ClientTasksSamplingCapability>,
-    /// Support for task-augmented elicitation/create
+    pub sampling: Option<ClientTasksSamplingCapability>,
+    /// Task support for elicitation-related requests
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub elicitation_create: Option<ClientTasksElicitationCapability>,
+    pub elicitation: Option<ClientTasksElicitationCapability>,
+}
+
+/// Nested capability for task-augmented sampling requests
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientTasksSamplingCapability {
+    /// Whether the client supports task-augmented sampling/createMessage requests
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_message: Option<ClientTasksSamplingCreateMessageCapability>,
 }
 
 /// Marker capability for task-augmented sampling/createMessage support
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ClientTasksSamplingCapability {}
+pub struct ClientTasksSamplingCreateMessageCapability {}
+
+/// Nested capability for task-augmented elicitation requests
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientTasksElicitationCapability {
+    /// Whether the client supports task-augmented elicitation/create requests
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create: Option<ClientTasksElicitationCreateCapability>,
+}
 
 /// Marker capability for task-augmented elicitation/create support
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ClientTasksElicitationCapability {}
+pub struct ClientTasksElicitationCreateCapability {}
 
 /// Client capability for roots (filesystem access)
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -1381,9 +1399,18 @@ pub struct TasksCancelCapability {}
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TasksRequestsCapability {
-    /// Support for task-augmented tools/call
+    /// Task support for tool-related requests
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tools: Option<TasksToolsCallCapability>,
+    pub tools: Option<TasksToolsRequestsCapability>,
+}
+
+/// Nested capability for task-augmented tool requests
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TasksToolsRequestsCapability {
+    /// Whether the server supports task-augmented tools/call requests
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call: Option<TasksToolsCallCapability>,
 }
 
 /// Marker capability for task-augmented tools/call support
@@ -2741,8 +2768,7 @@ pub struct TaskObject {
     pub created_at: String,
     /// ISO 8601 timestamp when the task was last updated
     pub last_updated_at: String,
-    /// Time-to-live in milliseconds
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Time-to-live in milliseconds, null for unlimited
     pub ttl: Option<u64>,
     /// Suggested polling interval in milliseconds
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2812,6 +2838,9 @@ pub struct CancelTaskParams {
 }
 
 /// Notification params when task status changes
+///
+/// Per the spec, `TaskStatusNotificationParams = NotificationParams & Task`,
+/// so this includes all fields from the Task object.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskStatusParams {
@@ -2822,6 +2851,15 @@ pub struct TaskStatusParams {
     /// Human-readable status message
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status_message: Option<String>,
+    /// ISO 8601 timestamp when the task was created
+    pub created_at: String,
+    /// ISO 8601 timestamp when the task was last updated
+    pub last_updated_at: String,
+    /// Time-to-live in milliseconds, null for unlimited
+    pub ttl: Option<u64>,
+    /// Suggested polling interval in milliseconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll_interval: Option<u64>,
 }
 
 /// Backwards-compatible alias
