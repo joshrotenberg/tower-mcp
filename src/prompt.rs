@@ -30,8 +30,11 @@
 //!                 content: Content::Text {
 //!                     text: "Hello!".to_string(),
 //!                     annotations: None,
+//!                     meta: None,
 //!                 },
+//!                 meta: None,
 //!             }],
+//!             meta: None,
 //!         })
 //!     })
 //!     .layer(TimeoutLayer::new(Duration::from_secs(5)));
@@ -165,8 +168,11 @@ where
                             content: Content::Text {
                                 text: format!("Error generating prompt: {}", err),
                                 annotations: None,
+                                meta: None,
                             },
+                            meta: None,
                         }],
+                        meta: None,
                     })
                 }
             }
@@ -321,6 +327,7 @@ impl Prompt {
             description: self.description.clone(),
             icons: self.icons.clone(),
             arguments: self.arguments.clone(),
+            meta: None,
         }
     }
 
@@ -373,8 +380,11 @@ impl Prompt {
 ///                 content: Content::Text {
 ///                     text: format!("Please greet {}", name),
 ///                     annotations: None,
+///                     meta: None,
 ///                 },
+///                 meta: None,
 ///             }],
+///             meta: None,
 ///         })
 ///     })
 ///     .build();
@@ -502,7 +512,9 @@ impl PromptBuilder {
     ///                 messages: vec![PromptMessage {
     ///                     role: PromptRole::User,
     ///                     content: Content::text(text),
+    ///                     meta: None,
     ///                 }],
+    ///                 meta: None,
     ///             })
     ///         }
     ///     })
@@ -554,6 +566,7 @@ impl PromptBuilder {
                 Ok(GetPromptResult {
                     description,
                     messages,
+                    meta: None,
                 })
             }
         })
@@ -568,7 +581,9 @@ impl PromptBuilder {
             content: Content::Text {
                 text,
                 annotations: None,
+                meta: None,
             },
+            meta: None,
         }])
     }
 
@@ -641,8 +656,11 @@ where
     ///                 content: Content::Text {
     ///                     text: "Hello!".to_string(),
     ///                     annotations: None,
+    ///                     meta: None,
     ///                 },
+    ///                 meta: None,
     ///             }],
+    ///             meta: None,
     ///         })
     ///     })
     ///     .layer(TimeoutLayer::new(Duration::from_secs(5)));
@@ -894,8 +912,11 @@ impl PromptHandler for ServiceContextHandler {
 ///                 content: Content::Text {
 ///                     text: format!("Please review this {} code:\n\n```{}\n{}\n```", lang, lang, code),
 ///                     annotations: None,
+///                     meta: None,
 ///                 },
+///                 meta: None,
 ///             }],
+///             meta: None,
 ///         })
 ///     }
 /// }
@@ -965,8 +986,11 @@ mod tests {
                         content: Content::Text {
                             text: format!("Hello, {}!", name),
                             annotations: None,
+                            meta: None,
                         },
+                        meta: None,
                     }],
+                    meta: None,
                 })
             })
             .build();
@@ -1026,8 +1050,11 @@ mod tests {
                         content: Content::Text {
                             text: format!("Input: {}", input),
                             annotations: None,
+                            meta: None,
                         },
+                        meta: None,
                     }],
+                    meta: None,
                 })
             }
         }
@@ -1077,8 +1104,11 @@ mod tests {
                         content: Content::Text {
                             text: format!("Hello, {}!", name),
                             annotations: None,
+                            meta: None,
                         },
+                        meta: None,
                     }],
+                    meta: None,
                 })
             })
             .build();
@@ -1113,8 +1143,11 @@ mod tests {
                         content: Content::Text {
                             text: format!("Hello, {}!", name),
                             annotations: None,
+                            meta: None,
                         },
+                        meta: None,
                     }],
+                    meta: None,
                 })
             })
             .layer(TimeoutLayer::new(Duration::from_secs(5)));
@@ -1148,8 +1181,11 @@ mod tests {
                         content: Content::Text {
                             text: "This should not appear".to_string(),
                             annotations: None,
+                            meta: None,
                         },
+                        meta: None,
                     }],
+                    meta: None,
                 })
             })
             .layer(TimeoutLayer::new(Duration::from_millis(50)));
@@ -1183,8 +1219,11 @@ mod tests {
                             content: Content::Text {
                                 text: format!("Hello, {}!", name),
                                 annotations: None,
+                                meta: None,
                             },
+                            meta: None,
                         }],
+                        meta: None,
                     })
                 },
             )
@@ -1226,6 +1265,7 @@ mod tests {
                 Ok::<GetPromptResult, Error>(GetPromptResult {
                     description: None,
                     messages: vec![],
+                    meta: None,
                 })
             },
         };

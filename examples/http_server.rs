@@ -169,8 +169,11 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
                     content: tower_mcp::protocol::Content::Text {
                         text: format!("Please greet {} warmly.", name),
                         annotations: None,
+                        meta: None,
                     },
+                    meta: None,
                 }],
+                meta: None,
             })
         })
         .build();

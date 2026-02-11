@@ -84,7 +84,9 @@ fn build_rules_overview_resource() -> Resource {
                     mime_type: Some("application/json".to_string()),
                     text: Some(serde_json::to_string_pretty(&overview).unwrap_or_default()),
                     blob: None,
+                    meta: None,
                 }],
+                meta: None,
             })
         })
         .build()
@@ -117,7 +119,9 @@ fn build_rule_detail_template() -> ResourceTemplate {
                             mime_type: Some("application/json".to_string()),
                             text: Some(serde_json::to_string_pretty(&detail).unwrap_or_default()),
                             blob: None,
+                            meta: None,
                         }],
+                        meta: None,
                     })
                 }
                 None => Err(tower_mcp::Error::internal(format!(

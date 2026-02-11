@@ -41,6 +41,7 @@ pub fn build(state: Arc<AppState>) -> Tool {
                         "action": "fetch_reverse_deps",
                         "crate": input.name
                     }),
+                    meta: None,
                 });
 
                 // Send initial progress
@@ -66,6 +67,7 @@ pub fn build(state: Arc<AppState>) -> Tool {
                         "crate": input.name,
                         "count": response.meta.total
                     }),
+                    meta: None,
                 });
 
                 let mut output = format!(

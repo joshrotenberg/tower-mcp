@@ -105,7 +105,7 @@ impl<T: ClientTransport> McpClient<T> {
     /// # async fn example() -> Result<(), tower_mcp::BoxError> {
     /// let transport = StdioClientTransport::spawn("server", &[]).await?;
     /// let client = McpClient::new(transport)
-    ///     .with_roots(vec![Root { uri: "file:///project".into(), name: Some("Project".into()) }]);
+    ///     .with_roots(vec![Root { uri: "file:///project".into(), name: Some("Project".into()), meta: None }]);
     /// # Ok(())
     /// # }
     /// ```
@@ -197,6 +197,7 @@ impl<T: ClientTransport> McpClient<T> {
     pub fn list_roots(&self) -> ListRootsResult {
         ListRootsResult {
             roots: self.roots.clone(),
+            meta: None,
         }
     }
 
@@ -214,6 +215,7 @@ impl<T: ClientTransport> McpClient<T> {
                 version: client_version.to_string(),
                 ..Default::default()
             },
+            meta: None,
         };
 
         let result: InitializeResult = self.request("initialize", &params).await?;
@@ -309,6 +311,7 @@ impl<T: ClientTransport> McpClient<T> {
             reference,
             argument: CompletionArgument::new(argument_name, argument_value),
             context: None,
+            meta: None,
         };
         self.request("completion/complete", &params).await
     }

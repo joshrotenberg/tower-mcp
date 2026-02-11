@@ -44,7 +44,9 @@ fn build_cargo_toml_resource(state: Arc<CodegenState>) -> Resource {
                         mime_type: Some("text/x-toml".to_string()),
                         text: Some(text),
                         blob: None,
+                        meta: None,
                     }],
+                    meta: None,
                 })
             }
         })
@@ -76,7 +78,9 @@ fn build_main_rs_resource(state: Arc<CodegenState>) -> Resource {
                         mime_type: Some("text/x-rust".to_string()),
                         text: Some(text),
                         blob: None,
+                        meta: None,
                     }],
+                    meta: None,
                 })
             }
         })
@@ -108,7 +112,9 @@ fn build_readme_resource(state: Arc<CodegenState>) -> Resource {
                         mime_type: Some("text/markdown".to_string()),
                         text: Some(text),
                         blob: None,
+                        meta: None,
                     }],
+                    meta: None,
                 })
             }
         })
@@ -134,7 +140,9 @@ fn build_state_resource(state: Arc<CodegenState>) -> Resource {
                         mime_type: Some("application/json".to_string()),
                         text: Some(json),
                         blob: None,
+                        meta: None,
                     }],
+                    meta: None,
                 })
             }
         })

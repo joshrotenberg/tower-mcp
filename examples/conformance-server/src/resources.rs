@@ -42,7 +42,9 @@ fn build_static_binary() -> Resource {
                         mime_type: Some("image/png".to_string()),
                         text: None,
                         blob: Some(png_base64),
+                        meta: None,
                     }],
+                    meta: None,
                 })
             }
         })
@@ -78,7 +80,9 @@ fn build_template() -> ResourceTemplate {
                     mime_type: Some("text/plain".to_string()),
                     text: Some(format!("Template data for id: {}", id)),
                     blob: None,
+                    meta: None,
                 }],
+                meta: None,
             })
         })
 }

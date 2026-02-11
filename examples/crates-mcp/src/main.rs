@@ -252,6 +252,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
                             total: None,
                             has_more: Some(false),
                         },
+                        meta: None,
                     })
                 }
             });

@@ -56,7 +56,9 @@ pub fn build(state: Arc<AppState>) -> ResourceTemplate {
                         mime_type: Some("text/markdown".to_string()),
                         text: Some(content),
                         blob: None,
+                        meta: None,
                     }],
+                    meta: None,
                 })
             }
         })

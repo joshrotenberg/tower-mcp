@@ -452,6 +452,7 @@ impl RequestContext {
             progress,
             total,
             message: message.map(|s| s.to_string()),
+            meta: None,
         };
 
         // Best effort - don't block if channel is full
@@ -474,6 +475,7 @@ impl RequestContext {
             progress,
             total,
             message: message.map(|s| s.to_string()),
+            meta: None,
         };
 
         let _ = tx.try_send(ServerNotification::Progress(params));
