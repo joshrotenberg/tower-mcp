@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+## [0.6.1] - 2026-02-11
+
+### Features
+
+- Add notes-mcp example — Redis-backed customer notes server ([#453](https://github.com/joshrotenberg/tower-mcp/pull/453))
+- **notes-mcp:** Add CRUD tools, fix search bugs, add resource and prompt ([#455](https://github.com/joshrotenberg/tower-mcp/pull/455))
+
+
+
 ## [0.6.0] - 2026-02-11
 
 ### Bug Fixes
