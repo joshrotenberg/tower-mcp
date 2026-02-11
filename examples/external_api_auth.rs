@@ -199,7 +199,7 @@ fn build_elicitation_tool() -> tower_mcp::Tool {
 
                 // Request credentials from the user
                 let params = ElicitFormParams {
-                    mode: ElicitMode::Form,
+                    mode: Some(ElicitMode::Form),
                     message: "Please provide your API key to search the external service."
                         .to_string(),
                     requested_schema: ElicitFormSchema::new().string_field(

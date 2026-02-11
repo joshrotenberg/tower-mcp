@@ -488,6 +488,7 @@ impl ResourceBuilder {
             src: src.into(),
             mime_type: None,
             sizes: None,
+            theme: None,
         });
         self
     }
@@ -503,6 +504,7 @@ impl ResourceBuilder {
             src: src.into(),
             mime_type,
             sizes,
+            theme: None,
         });
         self
     }
@@ -1171,6 +1173,7 @@ impl ResourceTemplate {
             mime_type: self.mime_type.clone(),
             icons: self.icons.clone(),
             annotations: self.annotations.clone(),
+            arguments: Vec::new(),
         }
     }
 
@@ -1295,6 +1298,7 @@ impl ResourceTemplateBuilder {
             src: src.into(),
             mime_type: None,
             sizes: None,
+            theme: None,
         });
         self
     }
@@ -1310,6 +1314,7 @@ impl ResourceTemplateBuilder {
             src: src.into(),
             mime_type,
             sizes,
+            theme: None,
         });
         self
     }

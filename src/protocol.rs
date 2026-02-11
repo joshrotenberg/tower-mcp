@@ -262,18 +262,18 @@ pub struct LoggingMessageParams {
     /// Optional logger name (e.g., "database", "auth", "tools")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logger: Option<String>,
-    /// Optional structured data
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<Value>,
+    /// Structured data to be logged
+    #[serde(default)]
+    pub data: Value,
 }
 
 impl LoggingMessageParams {
-    /// Create a new logging message with the given level
-    pub fn new(level: LogLevel) -> Self {
+    /// Create a new logging message with the given level and data
+    pub fn new(level: LogLevel, data: impl Into<Value>) -> Self {
         Self {
             level,
             logger: None,
-            data: None,
+            data: data.into(),
         }
     }
 
@@ -284,8 +284,8 @@ impl LoggingMessageParams {
     }
 
     /// Set the structured data
-    pub fn with_data(mut self, data: Value) -> Self {
-        self.data = Some(data);
+    pub fn with_data(mut self, data: impl Into<Value>) -> Self {
+        self.data = data.into();
         self
     }
 }
@@ -425,8 +425,9 @@ pub enum McpNotification {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CancelledParams {
-    /// The ID of the request to cancel
-    pub request_id: RequestId,
+    /// The ID of the request to cancel (required for non-task cancellations)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<RequestId>,
     /// Optional reason for cancellation
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -839,13 +840,16 @@ impl CompleteResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelHint {
     /// Suggested model name (partial match allowed)
-    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 impl ModelHint {
     /// Create a new model hint
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into() }
+        Self {
+            name: Some(name.into()),
+        }
     }
 }
 
@@ -1029,11 +1033,12 @@ pub enum SamplingContent {
     #[serde(rename = "tool_result")]
     ToolResult {
         /// ID of the tool use this result corresponds to
+        #[serde(rename = "toolUseId")]
         tool_use_id: String,
         /// The tool result content
         content: Vec<SamplingContent>,
         /// Whether the tool execution resulted in an error
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default, rename = "isError", skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
     },
 }
@@ -1399,6 +1404,16 @@ pub struct ToolDefinition {
     pub execution: Option<ToolExecution>,
 }
 
+/// Icon theme context
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IconTheme {
+    /// Icon designed for light backgrounds
+    Light,
+    /// Icon designed for dark backgrounds
+    Dark,
+}
+
 /// Icon for tool display in user interfaces
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1411,6 +1426,9 @@ pub struct ToolIcon {
     /// Available sizes (e.g., ["48x48", "96x96"])
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sizes: Option<Vec<String>>,
+    /// Icon theme context ("light" or "dark")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub theme: Option<IconTheme>,
 }
 
 /// Annotations describing tool behavior for trust and safety.
@@ -2307,6 +2325,9 @@ pub struct ResourceTemplateDefinition {
     /// Annotations for this resource template (audience, priority hints)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<ContentAnnotations>,
+    /// Arguments accepted by this template for URI expansion
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arguments: Vec<PromptArgument>,
 }
 
 // =============================================================================
@@ -2600,8 +2621,9 @@ pub enum TaskSupportMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolExecution {
-    /// Whether the tool supports task-augmented requests
-    pub task_support: TaskSupportMode,
+    /// Whether the tool supports task-augmented requests (defaults to "forbidden")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_support: Option<TaskSupportMode>,
 }
 
 /// Parameters for task-augmented requests (the `task` field in CallToolParams)
@@ -2760,8 +2782,9 @@ pub type TaskStatusChangedParams = TaskStatusParams;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ElicitFormParams {
-    /// The elicitation mode
-    pub mode: ElicitMode,
+    /// The elicitation mode (defaults to form if not specified)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ElicitMode>,
     /// Message to present to the user explaining what information is needed
     pub message: String,
     /// Schema for the form fields (restricted subset of JSON Schema)
@@ -2837,8 +2860,10 @@ impl ElicitFormSchema {
             name.to_string(),
             PrimitiveSchemaDefinition::String(StringSchema {
                 schema_type: "string".to_string(),
+                title: None,
                 description: description.map(|s| s.to_string()),
                 format: None,
+                pattern: None,
                 min_length: None,
                 max_length: None,
                 default: None,
@@ -2862,8 +2887,10 @@ impl ElicitFormSchema {
             name.to_string(),
             PrimitiveSchemaDefinition::String(StringSchema {
                 schema_type: "string".to_string(),
+                title: None,
                 description: description.map(|s| s.to_string()),
                 format: None,
+                pattern: None,
                 min_length: None,
                 max_length: None,
                 default: Some(default.to_string()),
@@ -2881,6 +2908,7 @@ impl ElicitFormSchema {
             name.to_string(),
             PrimitiveSchemaDefinition::Integer(IntegerSchema {
                 schema_type: "integer".to_string(),
+                title: None,
                 description: description.map(|s| s.to_string()),
                 minimum: None,
                 maximum: None,
@@ -2905,6 +2933,7 @@ impl ElicitFormSchema {
             name.to_string(),
             PrimitiveSchemaDefinition::Integer(IntegerSchema {
                 schema_type: "integer".to_string(),
+                title: None,
                 description: description.map(|s| s.to_string()),
                 minimum: None,
                 maximum: None,
@@ -2923,6 +2952,7 @@ impl ElicitFormSchema {
             name.to_string(),
             PrimitiveSchemaDefinition::Number(NumberSchema {
                 schema_type: "number".to_string(),
+                title: None,
                 description: description.map(|s| s.to_string()),
                 minimum: None,
                 maximum: None,
@@ -2947,6 +2977,7 @@ impl ElicitFormSchema {
             name.to_string(),
             PrimitiveSchemaDefinition::Number(NumberSchema {
                 schema_type: "number".to_string(),
+                title: None,
                 description: description.map(|s| s.to_string()),
                 minimum: None,
                 maximum: None,
@@ -2965,6 +2996,7 @@ impl ElicitFormSchema {
             name.to_string(),
             PrimitiveSchemaDefinition::Boolean(BooleanSchema {
                 schema_type: "boolean".to_string(),
+                title: None,
                 description: description.map(|s| s.to_string()),
                 default: None,
             }),
@@ -2987,6 +3019,7 @@ impl ElicitFormSchema {
             name.to_string(),
             PrimitiveSchemaDefinition::Boolean(BooleanSchema {
                 schema_type: "boolean".to_string(),
+                title: None,
                 description: description.map(|s| s.to_string()),
                 default: Some(default),
             }),
@@ -3009,6 +3042,7 @@ impl ElicitFormSchema {
             name.to_string(),
             PrimitiveSchemaDefinition::SingleSelectEnum(SingleSelectEnumSchema {
                 schema_type: "string".to_string(),
+                title: None,
                 description: description.map(|s| s.to_string()),
                 enum_values: options,
                 default: None,
@@ -3033,6 +3067,7 @@ impl ElicitFormSchema {
             name.to_string(),
             PrimitiveSchemaDefinition::SingleSelectEnum(SingleSelectEnumSchema {
                 schema_type: "string".to_string(),
+                title: None,
                 description: description.map(|s| s.to_string()),
                 enum_values: options.iter().map(|s| s.to_string()).collect(),
                 default: Some(default.to_string()),
@@ -3089,10 +3124,16 @@ pub enum PrimitiveSchemaDefinition {
 pub struct StringSchema {
     #[serde(rename = "type")]
     pub schema_type: String,
+    /// Human-readable title for this field
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
+    /// Regex pattern for validation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_length: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3108,6 +3149,9 @@ pub struct StringSchema {
 pub struct IntegerSchema {
     #[serde(rename = "type")]
     pub schema_type: String,
+    /// Human-readable title for this field
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3125,6 +3169,9 @@ pub struct IntegerSchema {
 pub struct NumberSchema {
     #[serde(rename = "type")]
     pub schema_type: String,
+    /// Human-readable title for this field
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3142,6 +3189,9 @@ pub struct NumberSchema {
 pub struct BooleanSchema {
     #[serde(rename = "type")]
     pub schema_type: String,
+    /// Human-readable title for this field
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Default value for this field
@@ -3155,6 +3205,9 @@ pub struct BooleanSchema {
 pub struct SingleSelectEnumSchema {
     #[serde(rename = "type")]
     pub schema_type: String,
+    /// Human-readable title for this field
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(rename = "enum")]
@@ -3170,6 +3223,9 @@ pub struct SingleSelectEnumSchema {
 pub struct MultiSelectEnumSchema {
     #[serde(rename = "type")]
     pub schema_type: String,
+    /// Human-readable title for this field
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub items: MultiSelectEnumItems,
@@ -3729,7 +3785,7 @@ mod tests {
     #[test]
     fn test_model_hint() {
         let hint = ModelHint::new("claude-3-opus");
-        assert_eq!(hint.name, "claude-3-opus");
+        assert_eq!(hint.name, Some("claude-3-opus".to_string()));
     }
 
     #[test]
@@ -3996,7 +4052,7 @@ mod tests {
         };
         let json = serde_json::to_value(&content).unwrap();
         assert_eq!(json["type"], "tool_result");
-        assert_eq!(json["tool_use_id"], "tool_123");
+        assert_eq!(json["toolUseId"], "tool_123");
         assert_eq!(json["content"][0]["type"], "text");
     }
 
