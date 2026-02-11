@@ -1919,6 +1919,7 @@ mod tests {
                     roots: None,
                     sampling: None,
                     elicitation: None,
+                    tasks: None,
                 },
                 client_info: Implementation {
                     name: "test".to_string(),
@@ -2508,6 +2509,7 @@ mod tests {
                     roots: None,
                     sampling: None,
                     elicitation: None,
+                    tasks: None,
                 },
                 client_info: Implementation {
                     name: "test".to_string(),
@@ -2619,6 +2621,7 @@ mod tests {
                     roots: None,
                     sampling: None,
                     elicitation: None,
+                    tasks: None,
                 },
                 client_info: Implementation {
                     name: "test".to_string(),
@@ -2652,6 +2655,7 @@ mod tests {
                     roots: None,
                     sampling: None,
                     elicitation: None,
+                    tasks: None,
                 },
                 client_info: Implementation {
                     name: "test".to_string(),
@@ -3162,6 +3166,7 @@ mod tests {
                     roots: None,
                     sampling: None,
                     elicitation: None,
+                    tasks: None,
                 },
                 client_info: Implementation {
                     name: "test".to_string(),
@@ -4566,6 +4571,7 @@ mod tests {
                     roots: None,
                     sampling: None,
                     elicitation: None,
+                    tasks: None,
                 },
                 client_info: Implementation {
                     name: "test".to_string(),

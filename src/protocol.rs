@@ -3483,6 +3483,7 @@ mod tests {
                 form: Some(ElicitationFormCapability {}),
                 url: Some(ElicitationUrlCapability {}),
             }),
+            tasks: None,
         };
 
         let json = serde_json::to_value(&caps).unwrap();
@@ -3587,6 +3588,7 @@ mod tests {
             roots: Some(RootsCapability { list_changed: true }),
             sampling: None,
             elicitation: None,
+            tasks: None,
         };
 
         let json = serde_json::to_value(&caps).unwrap();
