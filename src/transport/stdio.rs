@@ -834,3 +834,234 @@ impl BidirectionalStdioTransport {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::ServerNotification;
+    use crate::protocol::{
+        LogLevel, LoggingMessageParams, ProgressParams, ProgressToken, TaskStatus, TaskStatusParams,
+    };
+
+    // =========================================================================
+    // serialize_notification tests
+    // =========================================================================
+
+    #[test]
+    fn test_serialize_progress_notification() {
+        let notification = ServerNotification::Progress(ProgressParams {
+            progress_token: ProgressToken::String("tok-1".to_string()),
+            progress: 50.0,
+            total: Some(100.0),
+            message: Some("Halfway there".to_string()),
+            meta: None,
+        });
+        let json = serialize_notification(&notification).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["jsonrpc"], "2.0");
+        assert_eq!(parsed["method"], "notifications/progress");
+        assert_eq!(parsed["params"]["progressToken"], "tok-1");
+        assert_eq!(parsed["params"]["progress"], 50.0);
+        assert_eq!(parsed["params"]["total"], 100.0);
+        assert!(parsed.get("id").is_none());
+    }
+
+    #[test]
+    fn test_serialize_log_message_notification() {
+        let notification = ServerNotification::LogMessage(LoggingMessageParams {
+            level: LogLevel::Warning,
+            logger: Some("test-logger".to_string()),
+            data: serde_json::json!("something happened"),
+            meta: None,
+        });
+        let json = serialize_notification(&notification).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["method"], "notifications/message");
+        assert_eq!(parsed["params"]["level"], "warning");
+        assert_eq!(parsed["params"]["logger"], "test-logger");
+    }
+
+    #[test]
+    fn test_serialize_resource_updated_notification() {
+        let notification = ServerNotification::ResourceUpdated {
+            uri: "file:///data.json".to_string(),
+        };
+        let json = serialize_notification(&notification).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["method"], "notifications/resources/updated");
+        assert_eq!(parsed["params"]["uri"], "file:///data.json");
+    }
+
+    #[test]
+    fn test_serialize_resources_list_changed_notification() {
+        let notification = ServerNotification::ResourcesListChanged;
+        let json = serialize_notification(&notification).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["method"], "notifications/resources/list_changed");
+        assert!(parsed.get("params").is_none());
+    }
+
+    #[test]
+    fn test_serialize_tools_list_changed_notification() {
+        let notification = ServerNotification::ToolsListChanged;
+        let json = serialize_notification(&notification).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["method"], "notifications/tools/list_changed");
+    }
+
+    #[test]
+    fn test_serialize_prompts_list_changed_notification() {
+        let notification = ServerNotification::PromptsListChanged;
+        let json = serialize_notification(&notification).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["method"], "notifications/prompts/list_changed");
+    }
+
+    #[test]
+    fn test_serialize_task_status_changed_notification() {
+        let notification = ServerNotification::TaskStatusChanged(TaskStatusParams {
+            task_id: "task-42".to_string(),
+            status: TaskStatus::Working,
+            status_message: Some("Processing...".to_string()),
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            last_updated_at: "2025-01-01T00:01:00Z".to_string(),
+            ttl: None,
+            poll_interval: None,
+            meta: None,
+        });
+        let json = serialize_notification(&notification).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["method"], "notifications/tasks/status");
+        assert_eq!(parsed["params"]["taskId"], "task-42");
+        assert_eq!(parsed["params"]["status"], "working");
+    }
+
+    // =========================================================================
+    // process_line tests
+    // =========================================================================
+
+    fn make_router() -> McpRouter {
+        McpRouter::new().server_info("test-server", "1.0.0")
+    }
+
+    async fn init_service(router: &McpRouter) -> JsonRpcService<McpRouter> {
+        let mut service = JsonRpcService::new(router.clone());
+
+        // Initialize the session
+        let init_msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "test-client", "version": "1.0.0" }
+            }
+        });
+        let msg: JsonRpcMessage = serde_json::from_value(init_msg).unwrap();
+        let _ = service.call_message(msg).await.unwrap();
+
+        // Send initialized notification
+        let notif_line = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        let notif = serde_json::from_str::<JsonRpcNotification>(notif_line).unwrap();
+        handle_notification(router, notif).unwrap();
+
+        service
+    }
+
+    #[tokio::test]
+    async fn test_process_line_valid_request() {
+        let router = make_router();
+        let mut service = init_service(&router).await;
+
+        let line = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        let result = process_line(&mut service, &router, line).await;
+
+        let response = result.unwrap().unwrap();
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["jsonrpc"], "2.0");
+        assert_eq!(json["id"], 1);
+        assert!(json.get("result").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_process_line_notification_returns_none() {
+        let router = make_router();
+        let mut service = init_service(&router).await;
+
+        let line = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        let result = process_line(&mut service, &router, line).await;
+
+        assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_process_line_malformed_json() {
+        let router = make_router();
+        let mut service = init_service(&router).await;
+
+        let line = r#"not valid json at all"#;
+        let result = process_line(&mut service, &router, line).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_process_line_tools_list() {
+        let router = make_router();
+        let mut service = init_service(&router).await;
+
+        let line = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#;
+        let result = process_line(&mut service, &router, line).await;
+
+        let response = result.unwrap().unwrap();
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["id"], 2);
+        assert!(json["result"]["tools"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_process_line_unknown_method() {
+        let router = make_router();
+        let mut service = init_service(&router).await;
+
+        let line = r#"{"jsonrpc":"2.0","id":3,"method":"nonexistent/method"}"#;
+        let result = process_line(&mut service, &router, line).await;
+
+        let response = result.unwrap().unwrap();
+        let json = serde_json::to_value(&response).unwrap();
+        assert!(json.get("error").is_some());
+        assert_eq!(json["error"]["code"], -32601); // Method not found
+    }
+
+    // =========================================================================
+    // handle_notification tests
+    // =========================================================================
+
+    #[test]
+    fn test_handle_notification_initialized() {
+        let router = make_router();
+        let notif_json = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        let notif: JsonRpcNotification = serde_json::from_str(notif_json).unwrap();
+
+        let result = handle_notification(&router, notif);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_handle_notification_cancelled() {
+        let router = make_router();
+        let notif_json = r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1,"reason":"timeout"}}"#;
+        let notif: JsonRpcNotification = serde_json::from_str(notif_json).unwrap();
+
+        let result = handle_notification(&router, notif);
+        assert!(result.is_ok());
+    }
+}
