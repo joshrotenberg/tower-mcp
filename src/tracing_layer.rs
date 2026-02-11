@@ -201,7 +201,6 @@ fn extract_operation_details(req: &McpRequest) -> (Option<&'static str>, Option<
         McpRequest::ListPrompts(_) => (Some("list"), Some("prompts".to_string())),
         McpRequest::SubscribeResource(params) => (Some("subscribe"), Some(params.uri.clone())),
         McpRequest::UnsubscribeResource(params) => (Some("unsubscribe"), Some(params.uri.clone())),
-        McpRequest::EnqueueTask(params) => (Some("task"), Some(params.tool_name.clone())),
         McpRequest::ListTasks(_) => (Some("list"), Some("tasks".to_string())),
         McpRequest::GetTaskInfo(params) => (Some("task"), Some(params.task_id.clone())),
         McpRequest::GetTaskResult(params) => (Some("task_result"), Some(params.task_id.clone())),
@@ -318,6 +317,7 @@ mod tests {
             name: "my_tool".to_string(),
             arguments: Value::Null,
             meta: None,
+            task: None,
         });
         let (name, target) = extract_operation_details(&req);
         assert_eq!(name, Some("tool"));

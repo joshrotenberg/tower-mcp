@@ -1249,8 +1249,25 @@ impl McpRouter {
             } else {
                 None
             },
-            // Tasks capability is always available
-            tasks: Some(TasksCapability::default()),
+            // Tasks capability is advertised if any tool supports tasks
+            tasks: {
+                let has_task_support = self
+                    .inner
+                    .tools
+                    .values()
+                    .any(|t| !matches!(t.task_support, TaskSupportMode::Forbidden));
+                if has_task_support {
+                    Some(TasksCapability {
+                        list: Some(TasksListCapability {}),
+                        cancel: Some(TasksCancelCapability {}),
+                        requests: Some(TasksRequestsCapability {
+                            tools: Some(TasksToolsCallCapability {}),
+                        }),
+                    })
+                } else {
+                    None
+                }
+            },
             // Completions capability when a handler is registered
             completions: if self.inner.completion_handler.is_some() {
                 Some(CompletionsCapability::default())
@@ -1377,14 +1394,82 @@ impl McpRouter {
                     return Err(filter.denial_error(&params.name));
                 }
 
-                // Extract progress token from request metadata
-                let progress_token = params.meta.and_then(|m| m.progress_token);
-                let ctx = self.create_context(request_id, progress_token);
+                if let Some(task_params) = params.task {
+                    // Task-augmented request: validate task_support != Forbidden
+                    if matches!(tool.task_support, TaskSupportMode::Forbidden) {
+                        return Err(Error::JsonRpc(JsonRpcError::invalid_params(format!(
+                            "Tool '{}' does not support async tasks",
+                            params.name
+                        ))));
+                    }
 
-                tracing::debug!(tool = %params.name, "Calling tool");
-                let result = tool.call_with_context(ctx, params.arguments).await;
+                    // Create the task
+                    let (task_id, cancellation_token) = self.inner.task_store.create_task(
+                        &params.name,
+                        params.arguments.clone(),
+                        task_params.ttl,
+                    );
 
-                Ok(McpResponse::CallTool(result))
+                    tracing::info!(task_id = %task_id, tool = %params.name, "Created async task");
+
+                    // Create a context for the async task execution
+                    let progress_token = params.meta.and_then(|m| m.progress_token);
+                    let ctx = self.create_context(request_id, progress_token);
+
+                    // Spawn the task execution in the background
+                    let task_store = self.inner.task_store.clone();
+                    let tool = tool.clone();
+                    let arguments = params.arguments;
+                    let task_id_clone = task_id.clone();
+
+                    tokio::spawn(async move {
+                        // Check for cancellation before starting
+                        if cancellation_token.is_cancelled() {
+                            tracing::debug!(task_id = %task_id_clone, "Task cancelled before execution");
+                            return;
+                        }
+
+                        // Execute the tool
+                        let result = tool.call_with_context(ctx, arguments).await;
+
+                        if cancellation_token.is_cancelled() {
+                            tracing::debug!(task_id = %task_id_clone, "Task cancelled during execution");
+                        } else if result.is_error {
+                            // Tool returned an error result
+                            let error_msg = result.first_text().unwrap_or("Tool execution failed");
+                            task_store.fail_task(&task_id_clone, error_msg);
+                            tracing::warn!(task_id = %task_id_clone, error = %error_msg, "Task failed");
+                        } else {
+                            task_store.complete_task(&task_id_clone, result);
+                            tracing::debug!(task_id = %task_id_clone, "Task completed successfully");
+                        }
+                    });
+
+                    let task = self.inner.task_store.get_task(&task_id).ok_or_else(|| {
+                        Error::JsonRpc(JsonRpcError::internal_error(
+                            "Failed to retrieve created task",
+                        ))
+                    })?;
+
+                    Ok(McpResponse::CreateTask(CreateTaskResult { task }))
+                } else {
+                    // Synchronous request: validate task_support != Required
+                    if matches!(tool.task_support, TaskSupportMode::Required) {
+                        return Err(Error::JsonRpc(JsonRpcError::invalid_params(format!(
+                            "Tool '{}' requires async task execution (include 'task' in params)",
+                            params.name
+                        ))));
+                    }
+
+                    // Extract progress token from request metadata
+                    let progress_token = params.meta.and_then(|m| m.progress_token);
+                    let ctx = self.create_context(request_id, progress_token);
+
+                    tracing::debug!(tool = %params.name, "Calling tool");
+                    let result = tool.call_with_context(ctx, params.arguments).await;
+
+                    Ok(McpResponse::CallTool(result))
+                }
             }
 
             McpRequest::ListResources(params) => {
@@ -1547,63 +1632,6 @@ impl McpRouter {
 
             McpRequest::Ping => Ok(McpResponse::Pong(EmptyResult {})),
 
-            McpRequest::EnqueueTask(params) => {
-                // Verify the tool exists
-                let tool = self.inner.tools.get(&params.tool_name).ok_or_else(|| {
-                    Error::JsonRpc(JsonRpcError::method_not_found(&format!(
-                        "Tool not found: {}",
-                        params.tool_name
-                    )))
-                })?;
-
-                // Create the task
-                let (task_id, cancellation_token) = self.inner.task_store.create_task(
-                    &params.tool_name,
-                    params.arguments.clone(),
-                    params.ttl,
-                );
-
-                tracing::info!(task_id = %task_id, tool = %params.tool_name, "Enqueued async task");
-
-                // Create a context for the async task execution
-                let ctx = self.create_context(request_id, None);
-
-                // Spawn the task execution in the background
-                let task_store = self.inner.task_store.clone();
-                let tool = tool.clone();
-                let arguments = params.arguments;
-                let task_id_clone = task_id.clone();
-
-                tokio::spawn(async move {
-                    // Check for cancellation before starting
-                    if cancellation_token.is_cancelled() {
-                        tracing::debug!(task_id = %task_id_clone, "Task cancelled before execution");
-                        return;
-                    }
-
-                    // Execute the tool
-                    let result = tool.call_with_context(ctx, arguments).await;
-
-                    if cancellation_token.is_cancelled() {
-                        tracing::debug!(task_id = %task_id_clone, "Task cancelled during execution");
-                    } else if result.is_error {
-                        // Tool returned an error result
-                        let error_msg = result.first_text().unwrap_or("Tool execution failed");
-                        task_store.fail_task(&task_id_clone, error_msg);
-                        tracing::warn!(task_id = %task_id_clone, error = %error_msg, "Task failed");
-                    } else {
-                        task_store.complete_task(&task_id_clone, result);
-                        tracing::debug!(task_id = %task_id_clone, "Task completed successfully");
-                    }
-                });
-
-                Ok(McpResponse::EnqueueTask(EnqueueTaskResult {
-                    task_id,
-                    status: TaskStatus::Working,
-                    poll_interval: Some(2),
-                }))
-            }
-
             McpRequest::ListTasks(params) => {
                 let tasks = self.inner.task_store.list_tasks(params.status);
 
@@ -1632,10 +1660,12 @@ impl McpRouter {
             }
 
             McpRequest::GetTaskResult(params) => {
-                let (status, result, error) = self
+                // Wait for task to reach terminal state (blocks if still running)
+                let (task_obj, result, error) = self
                     .inner
                     .task_store
-                    .get_task_full(&params.task_id)
+                    .wait_for_completion(&params.task_id)
+                    .await
                     .ok_or_else(|| {
                         Error::JsonRpc(JsonRpcError::invalid_params(format!(
                             "Task not found: {}",
@@ -1643,16 +1673,51 @@ impl McpRouter {
                         )))
                     })?;
 
-                Ok(McpResponse::GetTaskResult(GetTaskResultResult {
-                    task_id: params.task_id,
-                    status,
-                    result,
-                    error,
-                }))
+                // Build _meta with related-task reference
+                let meta = serde_json::json!({
+                    "io.modelcontextprotocol/related-task": task_obj
+                });
+
+                match task_obj.status {
+                    TaskStatus::Cancelled => Err(Error::JsonRpc(JsonRpcError::invalid_params(
+                        format!("Task {} was cancelled", params.task_id),
+                    ))),
+                    TaskStatus::Failed => {
+                        let mut call_result = CallToolResult::error(
+                            error.unwrap_or_else(|| "Task failed".to_string()),
+                        );
+                        call_result.meta = Some(meta);
+                        Ok(McpResponse::GetTaskResult(call_result))
+                    }
+                    _ => {
+                        let mut call_result = result.unwrap_or_else(|| CallToolResult::text(""));
+                        call_result.meta = Some(meta);
+                        Ok(McpResponse::GetTaskResult(call_result))
+                    }
+                }
             }
 
             McpRequest::CancelTask(params) => {
-                let status = self
+                // First check if the task exists and is not already terminal
+                let current = self
+                    .inner
+                    .task_store
+                    .get_task(&params.task_id)
+                    .ok_or_else(|| {
+                        Error::JsonRpc(JsonRpcError::invalid_params(format!(
+                            "Task not found: {}",
+                            params.task_id
+                        )))
+                    })?;
+
+                if current.status.is_terminal() {
+                    return Err(Error::JsonRpc(JsonRpcError::invalid_params(format!(
+                        "Task {} is already in terminal state: {}",
+                        params.task_id, current.status
+                    ))));
+                }
+
+                let task_obj = self
                     .inner
                     .task_store
                     .cancel_task(&params.task_id, params.reason.as_deref())
@@ -1663,12 +1728,7 @@ impl McpRouter {
                         )))
                     })?;
 
-                let cancelled = status == TaskStatus::Cancelled;
-
-                Ok(McpResponse::CancelTask(CancelTaskResult {
-                    cancelled,
-                    status,
-                }))
+                Ok(McpResponse::CancelTask(task_obj))
             }
 
             McpRequest::SetLoggingLevel(params) => {
@@ -1924,6 +1984,7 @@ mod tests {
                 name: "add".to_string(),
                 arguments: serde_json::json!({"a": 2, "b": 3}),
                 meta: None,
+                task: None,
             }),
             extensions: Extensions::new(),
         };
@@ -2616,9 +2677,10 @@ mod tests {
     // =========================================================================
 
     #[tokio::test]
-    async fn test_enqueue_task() {
+    async fn test_create_task_via_call_tool() {
         let add_tool = ToolBuilder::new("add")
             .description("Add two numbers")
+            .task_support(TaskSupportMode::Optional)
             .handler(|input: AddInput| async move {
                 Ok(CallToolResult::text(format!("{}", input.a + input.b)))
             })
@@ -2629,10 +2691,11 @@ mod tests {
 
         let req = RouterRequest {
             id: RequestId::Number(1),
-            inner: McpRequest::EnqueueTask(EnqueueTaskParams {
-                tool_name: "add".to_string(),
+            inner: McpRequest::CallTool(CallToolParams {
+                name: "add".to_string(),
                 arguments: serde_json::json!({"a": 5, "b": 10}),
-                ttl: None,
+                meta: None,
+                task: Some(TaskRequestParams { ttl: None }),
             }),
             extensions: Extensions::new(),
         };
@@ -2640,11 +2703,11 @@ mod tests {
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
 
         match resp.inner {
-            Ok(McpResponse::EnqueueTask(result)) => {
-                assert!(result.task_id.starts_with("task-"));
-                assert_eq!(result.status, TaskStatus::Working);
+            Ok(McpResponse::CreateTask(result)) => {
+                assert!(result.task.task_id.starts_with("task-"));
+                assert_eq!(result.task.status, TaskStatus::Working);
             }
-            _ => panic!("Expected EnqueueTask response"),
+            _ => panic!("Expected CreateTask response"),
         }
     }
 
@@ -2673,6 +2736,7 @@ mod tests {
     async fn test_task_lifecycle_complete() {
         let add_tool = ToolBuilder::new("add")
             .description("Add two numbers")
+            .task_support(TaskSupportMode::Optional)
             .handler(|input: AddInput| async move {
                 Ok(CallToolResult::text(format!("{}", input.a + input.b)))
             })
@@ -2681,21 +2745,22 @@ mod tests {
         let mut router = McpRouter::new().tool(add_tool);
         init_router(&mut router).await;
 
-        // Enqueue task
+        // Create task via tools/call with task params
         let req = RouterRequest {
             id: RequestId::Number(1),
-            inner: McpRequest::EnqueueTask(EnqueueTaskParams {
-                tool_name: "add".to_string(),
+            inner: McpRequest::CallTool(CallToolParams {
+                name: "add".to_string(),
                 arguments: serde_json::json!({"a": 7, "b": 8}),
-                ttl: None,
+                meta: None,
+                task: Some(TaskRequestParams { ttl: None }),
             }),
             extensions: Extensions::new(),
         };
 
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
         let task_id = match resp.inner {
-            Ok(McpResponse::EnqueueTask(result)) => result.task_id,
-            _ => panic!("Expected EnqueueTask response"),
+            Ok(McpResponse::CreateTask(result)) => result.task.task_id,
+            _ => panic!("Expected CreateTask response"),
         };
 
         // Wait for task to complete
@@ -2714,14 +2779,10 @@ mod tests {
 
         match resp.inner {
             Ok(McpResponse::GetTaskResult(result)) => {
-                assert_eq!(result.task_id, task_id);
-                assert_eq!(result.status, TaskStatus::Completed);
-                assert!(result.result.is_some());
-                assert!(result.error.is_none());
-
+                // Result should have _meta with related-task
+                assert!(result.meta.is_some());
                 // Check the result content
-                let tool_result = result.result.unwrap();
-                match &tool_result.content[0] {
+                match &result.content[0] {
                     Content::Text { text, .. } => assert_eq!(text, "15"),
                     _ => panic!("Expected text content"),
                 }
@@ -2735,6 +2796,7 @@ mod tests {
         // Use a slow tool to test cancellation
         let slow_tool = ToolBuilder::new("slow")
             .description("Slow tool")
+            .task_support(TaskSupportMode::Optional)
             .handler(|_input: serde_json::Value| async move {
                 tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
                 Ok(CallToolResult::text("done"))
@@ -2744,21 +2806,22 @@ mod tests {
         let mut router = McpRouter::new().tool(slow_tool);
         init_router(&mut router).await;
 
-        // Enqueue task
+        // Create task
         let req = RouterRequest {
             id: RequestId::Number(1),
-            inner: McpRequest::EnqueueTask(EnqueueTaskParams {
-                tool_name: "slow".to_string(),
+            inner: McpRequest::CallTool(CallToolParams {
+                name: "slow".to_string(),
                 arguments: serde_json::json!({}),
-                ttl: None,
+                meta: None,
+                task: Some(TaskRequestParams { ttl: None }),
             }),
             extensions: Extensions::new(),
         };
 
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
         let task_id = match resp.inner {
-            Ok(McpResponse::EnqueueTask(result)) => result.task_id,
-            _ => panic!("Expected EnqueueTask response"),
+            Ok(McpResponse::CreateTask(result)) => result.task.task_id,
+            _ => panic!("Expected CreateTask response"),
         };
 
         // Cancel the task
@@ -2774,9 +2837,8 @@ mod tests {
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
 
         match resp.inner {
-            Ok(McpResponse::CancelTask(result)) => {
-                assert!(result.cancelled);
-                assert_eq!(result.status, TaskStatus::Cancelled);
+            Ok(McpResponse::CancelTask(task_obj)) => {
+                assert_eq!(task_obj.status, TaskStatus::Cancelled);
             }
             _ => panic!("Expected CancelTask response"),
         }
@@ -2786,6 +2848,7 @@ mod tests {
     async fn test_get_task_info() {
         let add_tool = ToolBuilder::new("add")
             .description("Add two numbers")
+            .task_support(TaskSupportMode::Optional)
             .handler(|input: AddInput| async move {
                 Ok(CallToolResult::text(format!("{}", input.a + input.b)))
             })
@@ -2794,21 +2857,22 @@ mod tests {
         let mut router = McpRouter::new().tool(add_tool);
         init_router(&mut router).await;
 
-        // Enqueue task
+        // Create task with TTL
         let req = RouterRequest {
             id: RequestId::Number(1),
-            inner: McpRequest::EnqueueTask(EnqueueTaskParams {
-                tool_name: "add".to_string(),
+            inner: McpRequest::CallTool(CallToolParams {
+                name: "add".to_string(),
                 arguments: serde_json::json!({"a": 1, "b": 2}),
-                ttl: Some(600),
+                meta: None,
+                task: Some(TaskRequestParams { ttl: Some(600_000) }),
             }),
             extensions: Extensions::new(),
         };
 
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
         let task_id = match resp.inner {
-            Ok(McpResponse::EnqueueTask(result)) => result.task_id,
-            _ => panic!("Expected EnqueueTask response"),
+            Ok(McpResponse::CreateTask(result)) => result.task.task_id,
+            _ => panic!("Expected CreateTask response"),
         };
 
         // Get task info
@@ -2826,23 +2890,30 @@ mod tests {
             Ok(McpResponse::GetTaskInfo(info)) => {
                 assert_eq!(info.task_id, task_id);
                 assert!(info.created_at.contains('T')); // ISO 8601
-                assert_eq!(info.ttl, Some(600));
+                assert_eq!(info.ttl, Some(600_000));
             }
             _ => panic!("Expected GetTaskInfo response"),
         }
     }
 
     #[tokio::test]
-    async fn test_enqueue_nonexistent_tool() {
-        let mut router = McpRouter::new();
+    async fn test_task_forbidden_tool_rejects_task_params() {
+        let tool = ToolBuilder::new("sync_only")
+            .description("Sync only tool")
+            .handler(|_input: serde_json::Value| async move { Ok(CallToolResult::text("ok")) })
+            .build();
+
+        let mut router = McpRouter::new().tool(tool);
         init_router(&mut router).await;
 
+        // Try to create task on a tool with Forbidden task support
         let req = RouterRequest {
             id: RequestId::Number(1),
-            inner: McpRequest::EnqueueTask(EnqueueTaskParams {
-                tool_name: "nonexistent".to_string(),
+            inner: McpRequest::CallTool(CallToolParams {
+                name: "sync_only".to_string(),
                 arguments: serde_json::json!({}),
-                ttl: None,
+                meta: None,
+                task: Some(TaskRequestParams { ttl: None }),
             }),
             extensions: Extensions::new(),
         };
@@ -2851,7 +2922,7 @@ mod tests {
 
         match resp.inner {
             Err(e) => {
-                assert!(e.message.contains("not found"));
+                assert!(e.message.contains("does not support async tasks"));
             }
             _ => panic!("Expected error response"),
         }
@@ -3317,6 +3388,7 @@ mod tests {
                 name: "admin".to_string(),
                 arguments: serde_json::json!({"a": 1, "b": 2}),
                 meta: None,
+                task: None,
             }),
             extensions: Extensions::new(),
         };
@@ -3357,6 +3429,7 @@ mod tests {
                 name: "public".to_string(),
                 arguments: serde_json::json!({"a": 1, "b": 2}),
                 meta: None,
+                task: None,
             }),
             extensions: Extensions::new(),
         };
@@ -3395,6 +3468,7 @@ mod tests {
                 name: "admin".to_string(),
                 arguments: serde_json::json!({"a": 1, "b": 2}),
                 meta: None,
+                task: None,
             }),
             extensions: Extensions::new(),
         };
@@ -3946,6 +4020,7 @@ mod tests {
                 name: "api.echo".to_string(),
                 arguments: serde_json::json!({"value": "hello world"}),
                 meta: None,
+                task: None,
             }),
             extensions: Extensions::new(),
         };
@@ -4955,6 +5030,7 @@ mod tests {
                     name: "shared".to_string(),
                     arguments: serde_json::json!({"a": 1, "b": 2}),
                     meta: None,
+                    task: None,
                 }),
                 extensions: Extensions::new(),
             };
@@ -4996,6 +5072,7 @@ mod tests {
                     name: "add".to_string(),
                     arguments: serde_json::json!({"a": 3, "b": 4}),
                     meta: None,
+                    task: None,
                 }),
                 extensions: Extensions::new(),
             };
@@ -5119,6 +5196,7 @@ mod tests {
                     name: "hidden".to_string(),
                     arguments: serde_json::json!({"a": 1, "b": 2}),
                     meta: None,
+                    task: None,
                 }),
                 extensions: Extensions::new(),
             };
@@ -5204,6 +5282,7 @@ mod tests {
                     name: "nonexistent".to_string(),
                     arguments: serde_json::json!({}),
                     meta: None,
+                    task: None,
                 }),
                 extensions: Extensions::new(),
             };

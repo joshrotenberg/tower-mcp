@@ -354,8 +354,6 @@ pub enum McpRequest {
     ListPrompts(ListPromptsParams),
     /// Get a prompt
     GetPrompt(GetPromptParams),
-    /// Enqueue an async task
-    EnqueueTask(EnqueueTaskParams),
     /// List tasks
     ListTasks(ListTasksParams),
     /// Get task info
@@ -391,7 +389,6 @@ impl McpRequest {
             McpRequest::UnsubscribeResource(_) => "resources/unsubscribe",
             McpRequest::ListPrompts(_) => "prompts/list",
             McpRequest::GetPrompt(_) => "prompts/get",
-            McpRequest::EnqueueTask(_) => "tasks/enqueue",
             McpRequest::ListTasks(_) => "tasks/list",
             McpRequest::GetTaskInfo(_) => "tasks/get",
             McpRequest::GetTaskResult(_) => "tasks/result",
@@ -480,11 +477,11 @@ pub enum McpResponse {
     UnsubscribeResource(EmptyResult),
     ListPrompts(ListPromptsResult),
     GetPrompt(GetPromptResult),
-    EnqueueTask(EnqueueTaskResult),
+    CreateTask(CreateTaskResult),
     ListTasks(ListTasksResult),
-    GetTaskInfo(TaskInfo),
-    GetTaskResult(GetTaskResultResult),
-    CancelTask(CancelTaskResult),
+    GetTaskInfo(TaskObject),
+    GetTaskResult(CallToolResult),
+    CancelTask(TaskObject),
     SetLoggingLevel(EmptyResult),
     Complete(CompleteResult),
     Pong(EmptyResult),
@@ -1235,10 +1232,37 @@ pub struct LoggingCapability {}
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TasksCapability {
-    /// Default poll interval suggestion in seconds
+    /// Support for listing tasks
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_poll_interval: Option<u64>,
+    pub list: Option<TasksListCapability>,
+    /// Support for cancelling tasks
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel: Option<TasksCancelCapability>,
+    /// Which request types support task-augmented requests
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests: Option<TasksRequestsCapability>,
 }
+
+/// Marker capability for tasks/list support
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TasksListCapability {}
+
+/// Marker capability for tasks/cancel support
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TasksCancelCapability {}
+
+/// Capability declaring which request types support task-augmented requests
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TasksRequestsCapability {
+    /// Support for task-augmented tools/call
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<TasksToolsCallCapability>,
+}
+
+/// Marker capability for task-augmented tools/call support
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TasksToolsCallCapability {}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1302,6 +1326,9 @@ pub struct ToolDefinition {
     /// Note: Clients MUST consider these untrusted unless from a trusted server.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<ToolAnnotations>,
+    /// Optional execution configuration for task support
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ToolExecution>,
 }
 
 /// Icon for tool display in user interfaces
@@ -1410,6 +1437,9 @@ pub struct CallToolParams {
     /// Request metadata including progress token
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<RequestMeta>,
+    /// Task parameters for async execution
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskRequestParams>,
 }
 
 /// Result of a tool invocation.
@@ -1443,6 +1473,9 @@ pub struct CallToolResult {
     /// Optional structured content for programmatic access.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_content: Option<Value>,
+    /// Optional metadata (e.g., for io.modelcontextprotocol/related-task)
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 impl CallToolResult {
@@ -1457,6 +1490,7 @@ impl CallToolResult {
             }],
             is_error: false,
             structured_content: None,
+            meta: None,
         }
     }
 
@@ -1472,6 +1506,7 @@ impl CallToolResult {
             }],
             is_error: true,
             structured_content: None,
+            meta: None,
         }
     }
 
@@ -1491,6 +1526,7 @@ impl CallToolResult {
             }],
             is_error: false,
             structured_content: Some(value),
+            meta: None,
         }
     }
 
@@ -1576,6 +1612,7 @@ impl CallToolResult {
             }],
             is_error: false,
             structured_content: None,
+            meta: None,
         }
     }
 
@@ -1589,6 +1626,7 @@ impl CallToolResult {
             }],
             is_error: false,
             structured_content: None,
+            meta: None,
         }
     }
 
@@ -1604,6 +1642,7 @@ impl CallToolResult {
             }],
             is_error: false,
             structured_content: None,
+            meta: None,
         }
     }
 
@@ -1624,6 +1663,7 @@ impl CallToolResult {
             }],
             is_error: false,
             structured_content: None,
+            meta: None,
         }
     }
 
@@ -1636,6 +1676,7 @@ impl CallToolResult {
             }],
             is_error: false,
             structured_content: None,
+            meta: None,
         }
     }
 
@@ -2474,6 +2515,36 @@ pub enum PromptRole {
 // Tasks (async operations)
 // =============================================================================
 
+/// Task support mode for tool execution
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TaskSupportMode {
+    /// Task execution is required (tool MUST be called with task params)
+    Required,
+    /// Task execution is optional (tool MAY be called with or without task params)
+    Optional,
+    /// Task execution is forbidden (tool MUST NOT be called with task params)
+    #[default]
+    Forbidden,
+}
+
+/// Execution metadata for a tool definition
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolExecution {
+    /// Whether the tool supports task-augmented requests
+    pub task_support: TaskSupportMode,
+}
+
+/// Parameters for task-augmented requests (the `task` field in CallToolParams)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskRequestParams {
+    /// Time-to-live for the task in milliseconds
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<u64>,
+}
+
 /// Status of an async task
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2512,55 +2583,39 @@ impl TaskStatus {
     }
 }
 
-/// Information about a task
+/// Task object matching the MCP 2025-11-25 spec
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TaskInfo {
+pub struct TaskObject {
     /// Unique task identifier
     pub task_id: String,
     /// Current task status
     pub status: TaskStatus,
-    /// ISO 8601 timestamp when the task was created
-    pub created_at: String,
-    /// Time-to-live in seconds (how long to keep the result after completion)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ttl: Option<u64>,
-    /// Suggested polling interval in seconds
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub poll_interval: Option<u64>,
-    /// Progress percentage (0-100) if available
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub progress: Option<f64>,
     /// Human-readable status message
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-}
-
-/// Parameters for enqueuing a task
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EnqueueTaskParams {
-    /// Tool name to execute
-    pub tool_name: String,
-    /// Arguments to pass to the tool
-    #[serde(default)]
-    pub arguments: Value,
-    /// Optional time-to-live for the task result in seconds
-    #[serde(default)]
+    pub status_message: Option<String>,
+    /// ISO 8601 timestamp when the task was created
+    pub created_at: String,
+    /// ISO 8601 timestamp when the task was last updated
+    pub last_updated_at: String,
+    /// Time-to-live in milliseconds
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ttl: Option<u64>,
-}
-
-/// Result of enqueuing a task
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EnqueueTaskResult {
-    /// The task ID for tracking
-    pub task_id: String,
-    /// Initial status (should be Working)
-    pub status: TaskStatus,
-    /// Suggested polling interval in seconds
+    /// Suggested polling interval in milliseconds
     #[serde(skip_serializing_if = "Option::is_none")]
     pub poll_interval: Option<u64>,
+}
+
+/// Backwards-compatible alias for TaskObject
+#[deprecated(note = "Use TaskObject instead")]
+pub type TaskInfo = TaskObject;
+
+/// Result of creating a task (returned when tools/call includes task params)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateTaskResult {
+    /// The created task object
+    pub task: TaskObject,
 }
 
 /// Parameters for listing tasks
@@ -2580,7 +2635,7 @@ pub struct ListTasksParams {
 #[serde(rename_all = "camelCase")]
 pub struct ListTasksResult {
     /// List of tasks
-    pub tasks: Vec<TaskInfo>,
+    pub tasks: Vec<TaskObject>,
     /// Next cursor for pagination
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
@@ -2594,31 +2649,12 @@ pub struct GetTaskInfoParams {
     pub task_id: String,
 }
 
-/// Result of getting task info
-pub type GetTaskInfoResult = TaskInfo;
-
 /// Parameters for getting task result
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetTaskResultParams {
     /// Task ID to get result for
     pub task_id: String,
-}
-
-/// Result of getting task result
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GetTaskResultResult {
-    /// Task ID
-    pub task_id: String,
-    /// Task status
-    pub status: TaskStatus,
-    /// The tool call result (if completed)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<CallToolResult>,
-    /// Error message (if failed)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }
 
 /// Parameters for cancelling a task
@@ -2632,16 +2668,6 @@ pub struct CancelTaskParams {
     pub reason: Option<String>,
 }
 
-/// Result of cancelling a task
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CancelTaskResult {
-    /// Whether the cancellation was successful
-    pub cancelled: bool,
-    /// Updated task status
-    pub status: TaskStatus,
-}
-
 /// Notification params when task status changes
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2650,9 +2676,9 @@ pub struct TaskStatusParams {
     pub task_id: String,
     /// New status
     pub status: TaskStatus,
-    /// Human-readable message
+    /// Human-readable status message
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
+    pub status_message: Option<String>,
 }
 
 /// Backwards-compatible alias
@@ -3219,10 +3245,6 @@ impl McpRequest {
             "prompts/get" => {
                 let p: GetPromptParams = serde_json::from_value(params)?;
                 Ok(McpRequest::GetPrompt(p))
-            }
-            "tasks/enqueue" => {
-                let p: EnqueueTaskParams = serde_json::from_value(params)?;
-                Ok(McpRequest::EnqueueTask(p))
             }
             "tasks/list" => {
                 let p: ListTasksParams = serde_json::from_value(params).unwrap_or_default();
@@ -4109,6 +4131,7 @@ mod tests {
                 open_world_hint: false,
                 ..Default::default()
             }),
+            execution: None,
         };
 
         assert!(def.is_read_only());
@@ -4127,6 +4150,7 @@ mod tests {
             output_schema: None,
             icons: None,
             annotations: None,
+            execution: None,
         };
 
         // MCP spec defaults when no annotations present
@@ -4218,6 +4242,7 @@ mod tests {
             content: vec![],
             is_error: false,
             structured_content: None,
+            meta: None,
         };
         assert!(result.as_json().is_none());
     }

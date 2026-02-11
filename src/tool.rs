@@ -47,7 +47,9 @@ use tower_service::Service;
 
 use crate::context::RequestContext;
 use crate::error::{Error, Result, ResultExt};
-use crate::protocol::{CallToolResult, ToolAnnotations, ToolDefinition, ToolIcon};
+use crate::protocol::{
+    CallToolResult, TaskSupportMode, ToolAnnotations, ToolDefinition, ToolExecution, ToolIcon,
+};
 
 // =============================================================================
 // Service Types for Per-Tool Middleware
@@ -446,6 +448,8 @@ pub struct Tool {
     pub icons: Option<Vec<ToolIcon>>,
     /// Tool annotations (hints about behavior)
     pub annotations: Option<ToolAnnotations>,
+    /// Task support mode for this tool
+    pub task_support: TaskSupportMode,
     /// The boxed service that executes the tool
     pub(crate) service: BoxToolService,
     /// JSON Schema for the tool's input
@@ -461,6 +465,7 @@ impl std::fmt::Debug for Tool {
             .field("output_schema", &self.output_schema)
             .field("icons", &self.icons)
             .field("annotations", &self.annotations)
+            .field("task_support", &self.task_support)
             .finish_non_exhaustive()
     }
 }
@@ -479,6 +484,7 @@ impl Clone for Tool {
             output_schema: self.output_schema.clone(),
             icons: self.icons.clone(),
             annotations: self.annotations.clone(),
+            task_support: self.task_support,
             service: self.service.clone(),
             input_schema: self.input_schema.clone(),
         }
@@ -493,6 +499,10 @@ impl Tool {
 
     /// Get the tool definition for tools/list
     pub fn definition(&self) -> ToolDefinition {
+        let execution = match self.task_support {
+            TaskSupportMode::Forbidden => None,
+            mode => Some(ToolExecution { task_support: mode }),
+        };
         ToolDefinition {
             name: self.name.clone(),
             title: self.title.clone(),
@@ -501,6 +511,7 @@ impl Tool {
             output_schema: self.output_schema.clone(),
             icons: self.icons.clone(),
             annotations: self.annotations.clone(),
+            execution,
         }
     }
 
@@ -614,12 +625,14 @@ impl Tool {
             output_schema: self.output_schema.clone(),
             icons: self.icons.clone(),
             annotations: self.annotations.clone(),
+            task_support: self.task_support,
             service: self.service.clone(),
             input_schema: self.input_schema.clone(),
         }
     }
 
     /// Create a tool from a handler (internal helper)
+    #[allow(clippy::too_many_arguments)]
     fn from_handler<H: ToolHandler + 'static>(
         name: String,
         title: Option<String>,
@@ -627,6 +640,7 @@ impl Tool {
         output_schema: Option<Value>,
         icons: Option<Vec<ToolIcon>>,
         annotations: Option<ToolAnnotations>,
+        task_support: TaskSupportMode,
         handler: H,
     ) -> Self {
         let input_schema = handler.input_schema();
@@ -641,6 +655,7 @@ impl Tool {
             output_schema,
             icons,
             annotations,
+            task_support,
             service,
             input_schema,
         }
@@ -681,6 +696,7 @@ pub struct ToolBuilder {
     output_schema: Option<Value>,
     icons: Option<Vec<ToolIcon>>,
     annotations: Option<ToolAnnotations>,
+    task_support: TaskSupportMode,
 }
 
 impl ToolBuilder {
@@ -707,6 +723,7 @@ impl ToolBuilder {
             output_schema: None,
             icons: None,
             annotations: None,
+            task_support: TaskSupportMode::default(),
         }
     }
 
@@ -725,6 +742,7 @@ impl ToolBuilder {
             output_schema: None,
             icons: None,
             annotations: None,
+            task_support: TaskSupportMode::default(),
         })
     }
 
@@ -801,6 +819,12 @@ impl ToolBuilder {
         self
     }
 
+    /// Set the task support mode for this tool
+    pub fn task_support(mut self, mode: TaskSupportMode) -> Self {
+        self.task_support = mode;
+        self
+    }
+
     /// Create a tool that takes no parameters.
     ///
     /// This is a convenience method for tools that don't require any input.
@@ -830,6 +854,7 @@ impl ToolBuilder {
             output_schema: self.output_schema,
             icons: self.icons,
             annotations: self.annotations,
+            task_support: self.task_support,
             handler,
         }
     }
@@ -889,6 +914,7 @@ impl ToolBuilder {
             output_schema: self.output_schema,
             icons: self.icons,
             annotations: self.annotations,
+            task_support: self.task_support,
             handler,
             _phantom: std::marker::PhantomData,
         }
@@ -1004,6 +1030,7 @@ impl ToolBuilder {
             output_schema: self.output_schema,
             icons: self.icons,
             annotations: self.annotations,
+            task_support: self.task_support,
             state,
             handler,
             input_schema: F::input_schema(),
@@ -1065,6 +1092,7 @@ impl ToolBuilder {
             output_schema: self.output_schema,
             icons: self.icons,
             annotations: self.annotations,
+            task_support: self.task_support,
             state,
             handler,
             _phantom: std::marker::PhantomData,
@@ -1101,6 +1129,7 @@ pub struct ToolBuilderWithHandler<I, F> {
     output_schema: Option<Value>,
     icons: Option<Vec<ToolIcon>>,
     annotations: Option<ToolAnnotations>,
+    task_support: TaskSupportMode,
     handler: F,
     _phantom: std::marker::PhantomData<I>,
 }
@@ -1115,6 +1144,7 @@ pub struct ToolBuilderWithNoParamsHandler<F> {
     output_schema: Option<Value>,
     icons: Option<Vec<ToolIcon>>,
     annotations: Option<ToolAnnotations>,
+    task_support: TaskSupportMode,
     handler: F,
 }
 
@@ -1132,6 +1162,7 @@ where
             self.output_schema,
             self.icons,
             self.annotations,
+            self.task_support,
             NoParamsTypedHandler {
                 handler: self.handler,
             },
@@ -1149,6 +1180,7 @@ where
             output_schema: self.output_schema,
             icons: self.icons,
             annotations: self.annotations,
+            task_support: self.task_support,
             handler: self.handler,
             layer,
         }
@@ -1173,6 +1205,7 @@ pub struct ToolBuilderWithNoParamsHandlerLayer<F, L> {
     output_schema: Option<Value>,
     icons: Option<Vec<ToolIcon>>,
     annotations: Option<ToolAnnotations>,
+    task_support: TaskSupportMode,
     handler: F,
     layer: L,
 }
@@ -1205,6 +1238,7 @@ where
             output_schema: self.output_schema,
             icons: self.icons,
             annotations: self.annotations,
+            task_support: self.task_support,
             service,
             input_schema,
         }
@@ -1222,6 +1256,7 @@ where
             output_schema: self.output_schema,
             icons: self.icons,
             annotations: self.annotations,
+            task_support: self.task_support,
             handler: self.handler,
             layer: tower::layer::util::Stack::new(layer, self.layer),
         }
@@ -1256,6 +1291,7 @@ where
             self.output_schema,
             self.icons,
             self.annotations,
+            self.task_support,
             TypedHandler {
                 handler: self.handler,
                 _phantom: std::marker::PhantomData,
@@ -1296,6 +1332,7 @@ where
             output_schema: self.output_schema,
             icons: self.icons,
             annotations: self.annotations,
+            task_support: self.task_support,
             handler: self.handler,
             layer,
             _phantom: std::marker::PhantomData,
@@ -1326,6 +1363,7 @@ pub struct ToolBuilderWithLayer<I, F, L> {
     output_schema: Option<Value>,
     icons: Option<Vec<ToolIcon>>,
     annotations: Option<ToolAnnotations>,
+    task_support: TaskSupportMode,
     handler: F,
     layer: L,
     _phantom: std::marker::PhantomData<I>,
@@ -1365,6 +1403,7 @@ where
             output_schema: self.output_schema,
             icons: self.icons,
             annotations: self.annotations,
+            task_support: self.task_support,
             service,
             input_schema,
         }
@@ -1385,6 +1424,7 @@ where
             output_schema: self.output_schema,
             icons: self.icons,
             annotations: self.annotations,
+            task_support: self.task_support,
             handler: self.handler,
             layer: tower::layer::util::Stack::new(layer, self.layer),
             _phantom: std::marker::PhantomData,
@@ -1515,6 +1555,7 @@ pub trait McpTool: Send + Sync + 'static {
             None,
             None,
             annotations,
+            TaskSupportMode::default(),
             McpToolHandler { tool },
         )
     }
