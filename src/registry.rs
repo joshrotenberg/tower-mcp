@@ -135,3 +135,150 @@ impl DynamicToolRegistry {
         self.inner.contains(name)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CallToolResult;
+    use crate::tool::ToolBuilder;
+    use tokio::sync::mpsc;
+
+    fn make_tool(name: &str) -> Tool {
+        ToolBuilder::new(name)
+            .description(format!("Test tool: {name}"))
+            .no_params_handler(|| async { Ok(CallToolResult::text("ok")) })
+            .build()
+    }
+
+    fn make_registry() -> (DynamicToolRegistry, Arc<DynamicToolsInner>) {
+        let inner = Arc::new(DynamicToolsInner::new());
+        let registry = DynamicToolRegistry::new(inner.clone());
+        (registry, inner)
+    }
+
+    #[test]
+    fn test_register_and_list() {
+        let (registry, _) = make_registry();
+
+        assert!(registry.list().is_empty());
+
+        registry.register(make_tool("tool_a"));
+        assert_eq!(registry.list().len(), 1);
+        assert!(registry.contains("tool_a"));
+
+        registry.register(make_tool("tool_b"));
+        assert_eq!(registry.list().len(), 2);
+        assert!(registry.contains("tool_b"));
+    }
+
+    #[test]
+    fn test_unregister() {
+        let (registry, _) = make_registry();
+
+        registry.register(make_tool("tool_a"));
+        registry.register(make_tool("tool_b"));
+        assert_eq!(registry.list().len(), 2);
+
+        assert!(registry.unregister("tool_a"));
+        assert_eq!(registry.list().len(), 1);
+        assert!(!registry.contains("tool_a"));
+        assert!(registry.contains("tool_b"));
+    }
+
+    #[test]
+    fn test_unregister_nonexistent() {
+        let (registry, _) = make_registry();
+        assert!(!registry.unregister("no_such_tool"));
+    }
+
+    #[test]
+    fn test_register_replaces_existing() {
+        let (registry, _) = make_registry();
+
+        registry.register(make_tool("tool_a"));
+        registry.register(make_tool("tool_a"));
+        assert_eq!(registry.list().len(), 1);
+    }
+
+    #[test]
+    fn test_contains() {
+        let (registry, _) = make_registry();
+
+        assert!(!registry.contains("tool_a"));
+        registry.register(make_tool("tool_a"));
+        assert!(registry.contains("tool_a"));
+        registry.unregister("tool_a");
+        assert!(!registry.contains("tool_a"));
+    }
+
+    #[test]
+    fn test_inner_get() {
+        let (registry, inner) = make_registry();
+
+        assert!(inner.get("tool_a").is_none());
+        registry.register(make_tool("tool_a"));
+        let tool = inner.get("tool_a").unwrap();
+        assert_eq!(tool.name, "tool_a");
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_on_register() {
+        let (registry, inner) = make_registry();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        inner.add_notification_sender(tx);
+
+        registry.register(make_tool("tool_a"));
+
+        let notification = rx.try_recv().unwrap();
+        assert!(matches!(notification, ServerNotification::ToolsListChanged));
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_on_unregister() {
+        let (registry, inner) = make_registry();
+
+        registry.register(make_tool("tool_a"));
+
+        let (tx, mut rx) = mpsc::channel(16);
+        inner.add_notification_sender(tx);
+
+        registry.unregister("tool_a");
+
+        let notification = rx.try_recv().unwrap();
+        assert!(matches!(notification, ServerNotification::ToolsListChanged));
+    }
+
+    #[tokio::test]
+    async fn test_no_broadcast_on_unregister_nonexistent() {
+        let (registry, inner) = make_registry();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        inner.add_notification_sender(tx);
+
+        registry.unregister("no_such_tool");
+
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_closed_senders_are_cleaned_up() {
+        let (registry, inner) = make_registry();
+
+        let (tx, rx) = mpsc::channel(16);
+        inner.add_notification_sender(tx);
+        // Drop the receiver to close the channel
+        drop(rx);
+
+        // This should not panic, and should clean up the closed sender
+        registry.register(make_tool("tool_a"));
+
+        // Add a new sender and verify it still works
+        let (tx2, mut rx2) = mpsc::channel(16);
+        inner.add_notification_sender(tx2);
+
+        registry.register(make_tool("tool_b"));
+        let notification = rx2.try_recv().unwrap();
+        assert!(matches!(notification, ServerNotification::ToolsListChanged));
+    }
+}
