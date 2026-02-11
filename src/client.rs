@@ -247,6 +247,7 @@ impl<T: ClientTransport> McpClient<T> {
             name: name.to_string(),
             arguments,
             meta: None,
+            task: None,
         };
         self.request("tools/call", &params).await
     }

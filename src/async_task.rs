@@ -1,8 +1,8 @@
 //! Async task management for long-running MCP operations
 //!
 //! This module provides task lifecycle management for operations that may take
-//! longer than a typical request/response cycle. Tasks can be enqueued, tracked,
-//! polled for status, and cancelled.
+//! longer than a typical request/response cycle. Tasks can be created via
+//! task-augmented `tools/call` requests, tracked, polled for status, and cancelled.
 //!
 //! # Example
 //!
@@ -13,7 +13,7 @@
 //! // Create a task store
 //! let store = TaskStore::new();
 //!
-//! // Enqueue a task
+//! // Create a task
 //! let task = store.create_task("my-tool", serde_json::json!({"key": "value"}), None);
 //!
 //! // Get task status
@@ -28,13 +28,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::protocol::{CallToolResult, TaskInfo, TaskStatus};
+use crate::protocol::{CallToolResult, TaskObject, TaskStatus};
 
-/// Default time-to-live for completed tasks (5 minutes)
-const DEFAULT_TTL_SECS: u64 = 300;
+/// Default time-to-live for completed tasks (5 minutes, in milliseconds)
+const DEFAULT_TTL_MS: u64 = 300_000;
 
-/// Default poll interval suggestion (2 seconds)
-const DEFAULT_POLL_INTERVAL_SECS: u64 = 2;
+/// Default poll interval suggestion (2 seconds, in milliseconds)
+const DEFAULT_POLL_INTERVAL_MS: u64 = 2_000;
 
 /// Internal task representation with full state
 #[derive(Debug)]
@@ -51,14 +51,14 @@ pub struct Task {
     pub created_at: Instant,
     /// ISO 8601 timestamp string
     pub created_at_str: String,
-    /// Time-to-live in seconds (for cleanup after completion)
+    /// ISO 8601 timestamp of last state change
+    pub last_updated_at_str: String,
+    /// Time-to-live in milliseconds (for cleanup after completion)
     pub ttl: u64,
-    /// Suggested polling interval in seconds
+    /// Suggested polling interval in milliseconds
     pub poll_interval: u64,
-    /// Current progress (0.0 - 100.0)
-    pub progress: Option<f64>,
     /// Human-readable status message
-    pub message: Option<String>,
+    pub status_message: Option<String>,
     /// The result of the tool call (when completed)
     pub result: Option<CallToolResult>,
     /// Error message (when failed)
@@ -67,47 +67,51 @@ pub struct Task {
     pub cancellation_token: CancellationToken,
     /// When the task reached terminal status (for TTL tracking)
     pub completed_at: Option<Instant>,
+    /// Notified when task reaches a terminal state
+    pub completion_notify: Arc<tokio::sync::Notify>,
 }
 
 impl Task {
     /// Create a new task
     fn new(id: String, tool_name: String, arguments: serde_json::Value, ttl: Option<u64>) -> Self {
         let cancelled = Arc::new(AtomicBool::new(false));
+        let now_str = chrono_now_iso8601();
         Self {
             id,
             tool_name,
             arguments,
             status: TaskStatus::Working,
             created_at: Instant::now(),
-            created_at_str: chrono_now_iso8601(),
-            ttl: ttl.unwrap_or(DEFAULT_TTL_SECS),
-            poll_interval: DEFAULT_POLL_INTERVAL_SECS,
-            progress: None,
-            message: Some("Task started".to_string()),
+            created_at_str: now_str.clone(),
+            last_updated_at_str: now_str,
+            ttl: ttl.unwrap_or(DEFAULT_TTL_MS),
+            poll_interval: DEFAULT_POLL_INTERVAL_MS,
+            status_message: Some("Task started".to_string()),
             result: None,
             error: None,
             cancellation_token: CancellationToken { cancelled },
             completed_at: None,
+            completion_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
-    /// Convert to TaskInfo for API responses
-    pub fn to_info(&self) -> TaskInfo {
-        TaskInfo {
+    /// Convert to TaskObject for API responses
+    pub fn to_task_object(&self) -> TaskObject {
+        TaskObject {
             task_id: self.id.clone(),
             status: self.status,
+            status_message: self.status_message.clone(),
             created_at: self.created_at_str.clone(),
+            last_updated_at: self.last_updated_at_str.clone(),
             ttl: Some(self.ttl),
             poll_interval: Some(self.poll_interval),
-            progress: self.progress,
-            message: self.message.clone(),
         }
     }
 
     /// Check if this task should be cleaned up (TTL expired)
     pub fn is_expired(&self) -> bool {
         if let Some(completed_at) = self.completed_at {
-            completed_at.elapsed() > Duration::from_secs(self.ttl)
+            completed_at.elapsed() > Duration::from_millis(self.ttl)
         } else {
             false
         }
@@ -185,58 +189,69 @@ impl TaskStore {
         (id, token)
     }
 
-    /// Get task info by ID
-    pub fn get_task(&self, task_id: &str) -> Option<TaskInfo> {
+    /// Get task object by ID
+    pub fn get_task(&self, task_id: &str) -> Option<TaskObject> {
         if let Ok(tasks) = self.tasks.read() {
-            tasks.get(task_id).map(|t| t.to_info())
+            tasks.get(task_id).map(|t| t.to_task_object())
         } else {
             None
         }
     }
 
-    /// Get full task data by ID (for internal use)
-    pub fn get_task_full(
+    /// Get full task result by ID (task object, result, error)
+    pub fn get_task_result(
         &self,
         task_id: &str,
-    ) -> Option<(TaskStatus, Option<CallToolResult>, Option<String>)> {
+    ) -> Option<(TaskObject, Option<CallToolResult>, Option<String>)> {
         if let Ok(tasks) = self.tasks.read() {
             tasks
                 .get(task_id)
-                .map(|t| (t.status, t.result.clone(), t.error.clone()))
+                .map(|t| (t.to_task_object(), t.result.clone(), t.error.clone()))
         } else {
             None
         }
     }
 
+    /// Wait for a task to reach a terminal state, then return its result.
+    ///
+    /// If the task is already terminal, returns immediately. Otherwise blocks
+    /// until the task completes, fails, or is cancelled.
+    pub async fn wait_for_completion(
+        &self,
+        task_id: &str,
+    ) -> Option<(TaskObject, Option<CallToolResult>, Option<String>)> {
+        // First check if already terminal and get the notify handle
+        let notify = {
+            let tasks = self.tasks.read().ok()?;
+            let task = tasks.get(task_id)?;
+            if task.status.is_terminal() {
+                return Some((
+                    task.to_task_object(),
+                    task.result.clone(),
+                    task.error.clone(),
+                ));
+            }
+            task.completion_notify.clone()
+        };
+
+        // Wait for completion notification
+        notify.notified().await;
+
+        // Read the result
+        self.get_task_result(task_id)
+    }
+
     /// List all tasks, optionally filtered by status
-    pub fn list_tasks(&self, status_filter: Option<TaskStatus>) -> Vec<TaskInfo> {
+    pub fn list_tasks(&self, status_filter: Option<TaskStatus>) -> Vec<TaskObject> {
         if let Ok(tasks) = self.tasks.read() {
             tasks
                 .values()
                 .filter(|t| status_filter.is_none() || status_filter == Some(t.status))
-                .map(|t| t.to_info())
+                .map(|t| t.to_task_object())
                 .collect()
         } else {
             vec![]
         }
-    }
-
-    /// Update task progress
-    pub fn update_progress(&self, task_id: &str, progress: f64, message: Option<String>) -> bool {
-        let Ok(mut tasks) = self.tasks.write() else {
-            return false;
-        };
-        let Some(task) = tasks.get_mut(task_id) else {
-            return false;
-        };
-        if task.status.is_terminal() {
-            return false;
-        }
-        task.progress = Some(progress);
-        if let Some(msg) = message {
-            task.message = Some(msg);
-        }
-        true
     }
 
     /// Mark a task as requiring input
@@ -251,7 +266,8 @@ impl TaskStore {
             return false;
         }
         task.status = TaskStatus::InputRequired;
-        task.message = Some(message.to_string());
+        task.status_message = Some(message.to_string());
+        task.last_updated_at_str = chrono_now_iso8601();
         true
     }
 
@@ -267,10 +283,11 @@ impl TaskStore {
             return false;
         }
         task.status = TaskStatus::Completed;
-        task.progress = Some(100.0);
-        task.message = Some("Task completed".to_string());
+        task.status_message = Some("Task completed".to_string());
         task.result = Some(result);
         task.completed_at = Some(Instant::now());
+        task.last_updated_at_str = chrono_now_iso8601();
+        task.completion_notify.notify_waiters();
         true
     }
 
@@ -286,14 +303,16 @@ impl TaskStore {
             return false;
         }
         task.status = TaskStatus::Failed;
-        task.message = Some(format!("Task failed: {}", error));
+        task.status_message = Some(format!("Task failed: {}", error));
         task.error = Some(error.to_string());
         task.completed_at = Some(Instant::now());
+        task.last_updated_at_str = chrono_now_iso8601();
+        task.completion_notify.notify_waiters();
         true
     }
 
     /// Cancel a task
-    pub fn cancel_task(&self, task_id: &str, reason: Option<&str>) -> Option<TaskStatus> {
+    pub fn cancel_task(&self, task_id: &str, reason: Option<&str>) -> Option<TaskObject> {
         let mut tasks = self.tasks.write().ok()?;
         let task = tasks.get_mut(task_id)?;
 
@@ -303,14 +322,16 @@ impl TaskStore {
         // If not already terminal, mark as cancelled
         if !task.status.is_terminal() {
             task.status = TaskStatus::Cancelled;
-            task.message = Some(
+            task.status_message = Some(
                 reason
                     .map(|r| format!("Cancelled: {}", r))
                     .unwrap_or_else(|| "Task cancelled".to_string()),
             );
             task.completed_at = Some(Instant::now());
+            task.last_updated_at_str = chrono_now_iso8601();
+            task.completion_notify.notify_waiters();
         }
-        Some(task.status)
+        Some(task.to_task_object())
     }
 
     /// Remove expired tasks (call periodically for cleanup)
@@ -425,19 +446,11 @@ mod tests {
         let store = TaskStore::new();
         let (id, _) = store.create_task("test-tool", serde_json::json!({}), None);
 
-        // Update progress
-        assert!(store.update_progress(&id, 50.0, Some("Halfway".to_string())));
-
-        let info = store.get_task(&id).unwrap();
-        assert_eq!(info.progress, Some(50.0));
-        assert_eq!(info.message.as_deref(), Some("Halfway"));
-
         // Complete task
         assert!(store.complete_task(&id, CallToolResult::text("Done")));
 
         let info = store.get_task(&id).unwrap();
         assert_eq!(info.status, TaskStatus::Completed);
-        assert_eq!(info.progress, Some(100.0));
     }
 
     #[test]
@@ -447,8 +460,9 @@ mod tests {
 
         assert!(!token.is_cancelled());
 
-        let status = store.cancel_task(&id, Some("User requested"));
-        assert_eq!(status, Some(TaskStatus::Cancelled));
+        let task_obj = store.cancel_task(&id, Some("User requested"));
+        assert!(task_obj.is_some());
+        assert_eq!(task_obj.unwrap().status, TaskStatus::Cancelled);
         assert!(token.is_cancelled());
 
         let info = store.get_task(&id).unwrap();
@@ -464,7 +478,7 @@ mod tests {
 
         let info = store.get_task(&id).unwrap();
         assert_eq!(info.status, TaskStatus::Failed);
-        assert!(info.message.as_ref().unwrap().contains("failed"));
+        assert!(info.status_message.as_ref().unwrap().contains("failed"));
     }
 
     #[test]
@@ -498,8 +512,7 @@ mod tests {
         // Complete the task
         store.complete_task(&id, CallToolResult::text("Done"));
 
-        // Try to update - should fail
-        assert!(!store.update_progress(&id, 50.0, None));
+        // Try to fail - should fail
         assert!(!store.fail_task(&id, "Error"));
 
         // Status should still be completed
@@ -520,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_task_full() {
+    fn test_get_task_result() {
         let store = TaskStore::new();
         let (id, _) = store.create_task("test-tool", serde_json::json!({}), None);
 
@@ -528,8 +541,8 @@ mod tests {
         let result = CallToolResult::text("The result");
         store.complete_task(&id, result);
 
-        let (status, result, error) = store.get_task_full(&id).unwrap();
-        assert_eq!(status, TaskStatus::Completed);
+        let (task_obj, result, error) = store.get_task_result(&id).unwrap();
+        assert_eq!(task_obj.status, TaskStatus::Completed);
         assert!(result.is_some());
         assert!(error.is_none());
     }

@@ -386,17 +386,19 @@ pub use filter::{
 };
 pub use jsonrpc::{JsonRpcLayer, JsonRpcService};
 pub use prompt::{BoxPromptService, Prompt, PromptBuilder, PromptHandler, PromptRequest};
+#[allow(deprecated)]
 pub use protocol::{
     CallToolResult, CompleteParams, CompleteResult, Completion, CompletionArgument,
     CompletionContext, CompletionReference, CompletionsCapability, Content, ContentRole,
-    CreateMessageParams, CreateMessageResult, ElicitAction, ElicitFieldValue, ElicitFormParams,
-    ElicitFormSchema, ElicitMode, ElicitRequestParams, ElicitResult, ElicitUrlParams,
-    ElicitationCapability, ElicitationCompleteParams, GetPromptResult, GetPromptResultBuilder,
-    IncludeContext, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, JsonRpcResponseMessage,
-    ListRootsParams, ListRootsResult, McpRequest, McpResponse, ModelHint, ModelPreferences,
-    PrimitiveSchemaDefinition, PromptMessage, PromptReference, PromptRole, ReadResourceResult,
-    ResourceContent, ResourceReference, Root, RootsCapability, SamplingCapability, SamplingContent,
-    SamplingContentOrArray, SamplingMessage, SamplingTool, ToolChoice,
+    CreateMessageParams, CreateMessageResult, CreateTaskResult, ElicitAction, ElicitFieldValue,
+    ElicitFormParams, ElicitFormSchema, ElicitMode, ElicitRequestParams, ElicitResult,
+    ElicitUrlParams, ElicitationCapability, ElicitationCompleteParams, GetPromptResult,
+    GetPromptResultBuilder, IncludeContext, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
+    JsonRpcResponseMessage, ListRootsParams, ListRootsResult, McpRequest, McpResponse, ModelHint,
+    ModelPreferences, PrimitiveSchemaDefinition, PromptMessage, PromptReference, PromptRole,
+    ReadResourceResult, ResourceContent, ResourceReference, Root, RootsCapability,
+    SamplingCapability, SamplingContent, SamplingContentOrArray, SamplingMessage, SamplingTool,
+    TaskInfo, TaskObject, TaskRequestParams, TaskSupportMode, ToolChoice, ToolExecution,
 };
 #[cfg(feature = "dynamic-tools")]
 pub use registry::DynamicToolRegistry;
