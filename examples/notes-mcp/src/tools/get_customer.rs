@@ -9,12 +9,17 @@ use tower_mcp::{
     extract::{Json, State},
 };
 
-use crate::state::{AppState, Customer, Note, escape_tag, parse_ft_search};
+use crate::state::{
+    AppState, Customer, CustomerWithNotes, Note, escape_tag, is_json_output, parse_ft_search,
+};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetCustomerInput {
     /// Customer ID (e.g. "c1")
     id: String,
+    /// Output format: "markdown" (default) or "json"
+    #[serde(default)]
+    output_format: Option<String>,
 }
 
 pub fn build(state: Arc<AppState>) -> Tool {
@@ -68,6 +73,21 @@ pub fn build(state: Arc<AppState>) -> Tool {
                 let (_total, rows) = parse_ft_search(values)
                     .map_err(|e| tower_mcp::Error::tool(format!("Parse error: {e}")))?;
 
+                let notes: Vec<Note> = rows
+                    .iter()
+                    .map(|(_key, json_str)| {
+                        serde_json::from_str(json_str)
+                            .map_err(|e| tower_mcp::Error::tool(format!("JSON parse error: {e}")))
+                    })
+                    .collect::<Result<_, _>>()?;
+
+                if is_json_output(&input.output_format) {
+                    let result = CustomerWithNotes { customer, notes };
+                    let json = serde_json::to_string_pretty(&result)
+                        .map_err(|e| tower_mcp::Error::tool(format!("JSON error: {e}")))?;
+                    return Ok(CallToolResult::text(json));
+                }
+
                 // Format as markdown
                 let mut output = format!(
                     "# {} ({})\n\n\
@@ -82,12 +102,10 @@ pub fn build(state: Arc<AppState>) -> Tool {
                     customer.role,
                     customer.email,
                     customer.tier,
-                    rows.len(),
+                    notes.len(),
                 );
 
-                for (_key, json_str) in &rows {
-                    let n: Note = serde_json::from_str(json_str)
-                        .map_err(|e| tower_mcp::Error::tool(format!("JSON parse error: {e}")))?;
+                for n in &notes {
                     output.push_str(&format!(
                         "### {} — {} ({})\n**Tags:** {}\n\n{}\n\n",
                         n.note_type,

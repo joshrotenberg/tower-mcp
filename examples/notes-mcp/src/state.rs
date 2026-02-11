@@ -26,6 +26,29 @@ pub struct Note {
     pub created_at: String,
 }
 
+/// A customer with their note count, used by list_customers JSON output
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomerSummary {
+    #[serde(flatten)]
+    pub customer: Customer,
+    pub note_count: usize,
+}
+
+/// A customer profile bundled with their notes, used by get_customer JSON output
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomerWithNotes {
+    #[serde(flatten)]
+    pub customer: Customer,
+    pub notes: Vec<Note>,
+}
+
+/// Returns true if the caller requested JSON output format.
+pub fn is_json_output(format: &Option<String>) -> bool {
+    matches!(format.as_deref(), Some("json"))
+}
+
 /// Shared state for the MCP server
 pub struct AppState {
     conn: MultiplexedConnection,
