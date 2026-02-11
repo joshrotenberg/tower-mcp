@@ -418,6 +418,7 @@ impl PromptBuilder {
             src: src.into(),
             mime_type: None,
             sizes: None,
+            theme: None,
         });
         self
     }
@@ -433,6 +434,7 @@ impl PromptBuilder {
             src: src.into(),
             mime_type,
             sizes,
+            theme: None,
         });
         self
     }

@@ -51,7 +51,7 @@
 //! async fn interactive_tool(ctx: RequestContext, input: MyInput) -> Result<CallToolResult> {
 //!     // Request user input via form
 //!     let params = ElicitFormParams {
-//!         mode: ElicitMode::Form,
+//!         mode: Some(ElicitMode::Form),
 //!         message: "Please provide additional details".to_string(),
 //!         requested_schema: ElicitFormSchema::new()
 //!             .string_field("name", Some("Your name"), true)
@@ -488,9 +488,8 @@ impl RequestContext {
     ///
     /// async fn my_tool(ctx: RequestContext) {
     ///     ctx.send_log(
-    ///         LoggingMessageParams::new(LogLevel::Info)
+    ///         LoggingMessageParams::new(LogLevel::Info, serde_json::json!("Processing..."))
     ///             .with_logger("my-tool")
-    ///             .with_data(serde_json::json!("Processing..."))
     ///     );
     /// }
     /// ```
@@ -575,7 +574,7 @@ impl RequestContext {
     ///
     /// async fn my_tool(ctx: RequestContext, input: MyInput) -> Result<CallToolResult> {
     ///     let params = ElicitFormParams {
-    ///         mode: ElicitMode::Form,
+    ///         mode: Some(ElicitMode::Form),
     ///         message: "Please enter your details".to_string(),
     ///         requested_schema: ElicitFormSchema::new()
     ///             .string_field("name", Some("Your name"), true),
@@ -615,7 +614,7 @@ impl RequestContext {
     ///
     /// async fn my_tool(ctx: RequestContext, input: MyInput) -> Result<CallToolResult> {
     ///     let params = ElicitUrlParams {
-    ///         mode: ElicitMode::Url,
+    ///         mode: Some(ElicitMode::Url),
     ///         elicitation_id: "unique-id-123".to_string(),
     ///         message: "Please authorize via the link".to_string(),
     ///         url: "https://example.com/auth?id=unique-id-123".to_string(),
@@ -664,7 +663,7 @@ impl RequestContext {
         use crate::protocol::{ElicitAction, ElicitFormParams, ElicitFormSchema, ElicitMode};
 
         let params = ElicitFormParams {
-            mode: ElicitMode::Form,
+            mode: Some(ElicitMode::Form),
             message: message.into(),
             requested_schema: ElicitFormSchema::new().boolean_field_with_default(
                 "confirm",
@@ -897,7 +896,7 @@ mod tests {
 
         let ctx = RequestContext::new(RequestId::Number(1));
         let params = ElicitFormParams {
-            mode: ElicitMode::Form,
+            mode: Some(ElicitMode::Form),
             message: "Enter details".to_string(),
             requested_schema: ElicitFormSchema::new().string_field("name", None, true),
             meta: None,
@@ -919,7 +918,7 @@ mod tests {
 
         let ctx = RequestContext::new(RequestId::Number(1));
         let params = ElicitUrlParams {
-            mode: ElicitMode::Url,
+            mode: Some(ElicitMode::Url),
             elicitation_id: "test-123".to_string(),
             message: "Please authorize".to_string(),
             url: "https://example.com/auth".to_string(),
@@ -960,22 +959,34 @@ mod tests {
             .with_min_log_level(min_level.clone());
 
         // Error is more severe than Warning — should pass through
-        ctx.send_log(LoggingMessageParams::new(LogLevel::Error));
+        ctx.send_log(LoggingMessageParams::new(
+            LogLevel::Error,
+            serde_json::Value::Null,
+        ));
         let msg = rx.try_recv();
         assert!(msg.is_ok(), "Error should pass through Warning filter");
 
         // Warning is equal to min level — should pass through
-        ctx.send_log(LoggingMessageParams::new(LogLevel::Warning));
+        ctx.send_log(LoggingMessageParams::new(
+            LogLevel::Warning,
+            serde_json::Value::Null,
+        ));
         let msg = rx.try_recv();
         assert!(msg.is_ok(), "Warning should pass through Warning filter");
 
         // Info is less severe than Warning — should be filtered
-        ctx.send_log(LoggingMessageParams::new(LogLevel::Info));
+        ctx.send_log(LoggingMessageParams::new(
+            LogLevel::Info,
+            serde_json::Value::Null,
+        ));
         let msg = rx.try_recv();
         assert!(msg.is_err(), "Info should be filtered by Warning filter");
 
         // Debug is less severe than Warning — should be filtered
-        ctx.send_log(LoggingMessageParams::new(LogLevel::Debug));
+        ctx.send_log(LoggingMessageParams::new(
+            LogLevel::Debug,
+            serde_json::Value::Null,
+        ));
         let msg = rx.try_recv();
         assert!(msg.is_err(), "Debug should be filtered by Warning filter");
     }
@@ -990,7 +1001,10 @@ mod tests {
             .with_min_log_level(min_level.clone());
 
         // Info should be filtered at Error level
-        ctx.send_log(LoggingMessageParams::new(LogLevel::Info));
+        ctx.send_log(LoggingMessageParams::new(
+            LogLevel::Info,
+            serde_json::Value::Null,
+        ));
         assert!(
             rx.try_recv().is_err(),
             "Info should be filtered at Error level"
@@ -1000,7 +1014,10 @@ mod tests {
         *min_level.write().unwrap() = LogLevel::Debug;
 
         // Now Info should pass through
-        ctx.send_log(LoggingMessageParams::new(LogLevel::Info));
+        ctx.send_log(LoggingMessageParams::new(
+            LogLevel::Info,
+            serde_json::Value::Null,
+        ));
         assert!(
             rx.try_recv().is_ok(),
             "Info should pass through after level changed to Debug"
@@ -1014,7 +1031,10 @@ mod tests {
         // No min_log_level set — all messages should pass through
         let ctx = RequestContext::new(RequestId::Number(1)).with_notification_sender(tx);
 
-        ctx.send_log(LoggingMessageParams::new(LogLevel::Debug));
+        ctx.send_log(LoggingMessageParams::new(
+            LogLevel::Debug,
+            serde_json::Value::Null,
+        ));
         assert!(
             rx.try_recv().is_ok(),
             "Debug should pass when no min level is set"

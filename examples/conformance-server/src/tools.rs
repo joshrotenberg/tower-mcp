@@ -141,21 +141,27 @@ fn build_tool_with_logging() -> Tool {
         .description("Sends log notifications then returns text")
         .extractor_handler((), |ctx: Context, RawArgs(_args): RawArgs| async move {
             ctx.send_log(
-                LoggingMessageParams::new(LogLevel::Info)
-                    .with_logger("conformance")
-                    .with_data(serde_json::json!("Tool execution started")),
+                LoggingMessageParams::new(
+                    LogLevel::Info,
+                    serde_json::json!("Tool execution started"),
+                )
+                .with_logger("conformance"),
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             ctx.send_log(
-                LoggingMessageParams::new(LogLevel::Info)
-                    .with_logger("conformance")
-                    .with_data(serde_json::json!("Tool processing data")),
+                LoggingMessageParams::new(
+                    LogLevel::Info,
+                    serde_json::json!("Tool processing data"),
+                )
+                .with_logger("conformance"),
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             ctx.send_log(
-                LoggingMessageParams::new(LogLevel::Info)
-                    .with_logger("conformance")
-                    .with_data(serde_json::json!("Tool execution completed")),
+                LoggingMessageParams::new(
+                    LogLevel::Info,
+                    serde_json::json!("Tool execution completed"),
+                )
+                .with_logger("conformance"),
             );
             Ok(CallToolResult::text("Logging complete"))
         })
@@ -224,7 +230,7 @@ fn build_elicitation() -> Tool {
                 return Ok(CallToolResult::error("Elicitation not available"));
             }
             let params = ElicitFormParams {
-                mode: ElicitMode::Form,
+                mode: Some(ElicitMode::Form),
                 message: "Please provide test input".to_string(),
                 requested_schema: ElicitFormSchema::new().string_field(
                     "test_field",
@@ -252,7 +258,7 @@ fn build_elicitation_sep1034_defaults() -> Tool {
                 return Ok(CallToolResult::error("Elicitation not available"));
             }
             let params = ElicitFormParams {
-                mode: ElicitMode::Form,
+                mode: Some(ElicitMode::Form),
                 message: "Please provide details with defaults".to_string(),
                 requested_schema: ElicitFormSchema::new()
                     .string_field_with_default("name", Some("Name"), true, "John Doe")
@@ -348,7 +354,7 @@ fn build_elicitation_sep1330_enums() -> Tool {
                     false,
                 );
             let params = ElicitFormParams {
-                mode: ElicitMode::Form,
+                mode: Some(ElicitMode::Form),
                 message: "Please select from enum options".to_string(),
                 requested_schema: schema,
                 meta: None,

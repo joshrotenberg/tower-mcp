@@ -501,7 +501,9 @@ impl Tool {
     pub fn definition(&self) -> ToolDefinition {
         let execution = match self.task_support {
             TaskSupportMode::Forbidden => None,
-            mode => Some(ToolExecution { task_support: mode }),
+            mode => Some(ToolExecution {
+                task_support: Some(mode),
+            }),
         };
         ToolDefinition {
             name: self.name.clone(),
@@ -764,6 +766,7 @@ impl ToolBuilder {
             src: src.into(),
             mime_type: None,
             sizes: None,
+            theme: None,
         });
         self
     }
@@ -779,6 +782,7 @@ impl ToolBuilder {
             src: src.into(),
             mime_type,
             sizes,
+            theme: None,
         });
         self
     }

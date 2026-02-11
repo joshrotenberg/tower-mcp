@@ -1077,14 +1077,14 @@ impl McpRouter {
     /// use tower_mcp::protocol::{LogLevel, LoggingMessageParams};
     ///
     /// // Simple info message
-    /// router.log(LoggingMessageParams::new(LogLevel::Info).with_data(
+    /// router.log(LoggingMessageParams::new(LogLevel::Info,
     ///     serde_json::json!({"message": "Operation completed"})
     /// ));
     ///
     /// // Error with logger name
-    /// router.log(LoggingMessageParams::new(LogLevel::Error)
-    ///     .with_logger("database")
-    ///     .with_data(serde_json::json!({"error": "Connection failed"})));
+    /// router.log(LoggingMessageParams::new(LogLevel::Error,
+    ///     serde_json::json!({"error": "Connection failed"}))
+    ///     .with_logger("database"));
     /// ```
     pub fn log(&self, params: LoggingMessageParams) -> bool {
         let Some(tx) = &self.inner.notification_tx else {
@@ -1095,36 +1095,36 @@ impl McpRouter {
 
     /// Send an info-level log message
     ///
-    /// Convenience method for sending an info log with optional data.
+    /// Convenience method for sending an info log with a message string.
     pub fn log_info(&self, message: &str) -> bool {
-        self.log(
-            LoggingMessageParams::new(LogLevel::Info)
-                .with_data(serde_json::json!({ "message": message })),
-        )
+        self.log(LoggingMessageParams::new(
+            LogLevel::Info,
+            serde_json::json!({ "message": message }),
+        ))
     }
 
     /// Send a warning-level log message
     pub fn log_warning(&self, message: &str) -> bool {
-        self.log(
-            LoggingMessageParams::new(LogLevel::Warning)
-                .with_data(serde_json::json!({ "message": message })),
-        )
+        self.log(LoggingMessageParams::new(
+            LogLevel::Warning,
+            serde_json::json!({ "message": message }),
+        ))
     }
 
     /// Send an error-level log message
     pub fn log_error(&self, message: &str) -> bool {
-        self.log(
-            LoggingMessageParams::new(LogLevel::Error)
-                .with_data(serde_json::json!({ "message": message })),
-        )
+        self.log(LoggingMessageParams::new(
+            LogLevel::Error,
+            serde_json::json!({ "message": message }),
+        ))
     }
 
     /// Send a debug-level log message
     pub fn log_debug(&self, message: &str) -> bool {
-        self.log(
-            LoggingMessageParams::new(LogLevel::Debug)
-                .with_data(serde_json::json!({ "message": message })),
-        )
+        self.log(LoggingMessageParams::new(
+            LogLevel::Debug,
+            serde_json::json!({ "message": message }),
+        ))
     }
 
     /// Check if a resource URI is currently subscribed
@@ -1777,17 +1777,24 @@ impl McpRouter {
                 }
             }
             McpNotification::Cancelled(params) => {
-                if self.cancel_request(&params.request_id) {
-                    tracing::info!(
-                        request_id = ?params.request_id,
-                        reason = ?params.reason,
-                        "Request cancelled"
-                    );
+                if let Some(ref request_id) = params.request_id {
+                    if self.cancel_request(request_id) {
+                        tracing::info!(
+                            request_id = ?request_id,
+                            reason = ?params.reason,
+                            "Request cancelled"
+                        );
+                    } else {
+                        tracing::debug!(
+                            request_id = ?request_id,
+                            reason = ?params.reason,
+                            "Cancellation requested for unknown request"
+                        );
+                    }
                 } else {
                     tracing::debug!(
-                        request_id = ?params.request_id,
                         reason = ?params.reason,
-                        "Cancellation requested for unknown request"
+                        "Cancellation notification received without request_id"
                     );
                 }
             }
@@ -2553,7 +2560,7 @@ mod tests {
         match notification {
             ServerNotification::LogMessage(params) => {
                 assert_eq!(params.level, LogLevel::Info);
-                let data = params.data.unwrap();
+                let data = params.data;
                 assert_eq!(
                     data.get("message").unwrap().as_str().unwrap(),
                     "Test message"
@@ -2571,12 +2578,14 @@ mod tests {
         let router = McpRouter::new().with_notification_sender(tx);
 
         // Send a custom log message
-        let params = LoggingMessageParams::new(LogLevel::Error)
-            .with_logger("database")
-            .with_data(serde_json::json!({
+        let params = LoggingMessageParams::new(
+            LogLevel::Error,
+            serde_json::json!({
                 "error": "Connection failed",
                 "host": "localhost"
-            }));
+            }),
+        )
+        .with_logger("database");
 
         let sent = router.log(params);
         assert!(sent);
@@ -2586,7 +2595,7 @@ mod tests {
             ServerNotification::LogMessage(params) => {
                 assert_eq!(params.level, LogLevel::Error);
                 assert_eq!(params.logger.as_deref(), Some("database"));
-                let data = params.data.unwrap();
+                let data = params.data;
                 assert_eq!(
                     data.get("error").unwrap().as_str().unwrap(),
                     "Connection failed"
@@ -4708,14 +4717,20 @@ mod tests {
         let ctx = router.create_context(RequestId::Number(100), None);
 
         // Error (more severe than Warning) should pass through
-        ctx.send_log(LoggingMessageParams::new(LogLevel::Error));
+        ctx.send_log(LoggingMessageParams::new(
+            LogLevel::Error,
+            serde_json::Value::Null,
+        ));
         assert!(
             rx.try_recv().is_ok(),
             "Error should pass through Warning filter"
         );
 
         // Info (less severe than Warning) should be filtered
-        ctx.send_log(LoggingMessageParams::new(LogLevel::Info));
+        ctx.send_log(LoggingMessageParams::new(
+            LogLevel::Info,
+            serde_json::Value::Null,
+        ));
         assert!(
             rx.try_recv().is_err(),
             "Info should be filtered at Warning level"
