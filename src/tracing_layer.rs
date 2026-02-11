@@ -326,6 +326,7 @@ mod tests {
         // Test resource read
         let req = McpRequest::ReadResource(ReadResourceParams {
             uri: "file:///test.txt".to_string(),
+            meta: None,
         });
         let (name, target) = extract_operation_details(&req);
         assert_eq!(name, Some("resource"));
@@ -335,6 +336,7 @@ mod tests {
         let req = McpRequest::GetPrompt(GetPromptParams {
             name: "my_prompt".to_string(),
             arguments: HashMap::new(),
+            meta: None,
         });
         let (name, target) = extract_operation_details(&req);
         assert_eq!(name, Some("prompt"));

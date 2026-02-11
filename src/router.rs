@@ -2397,6 +2397,7 @@ mod tests {
             id: RequestId::Number(1),
             inner: McpRequest::ReadResource(ReadResourceParams {
                 uri: "db://users/123".to_string(),
+                meta: None,
             }),
             extensions: Extensions::new(),
         };
@@ -2451,6 +2452,7 @@ mod tests {
             id: RequestId::Number(1),
             inner: McpRequest::ReadResource(ReadResourceParams {
                 uri: "file:///README.md".to_string(),
+                meta: None,
             }),
             extensions: Extensions::new(),
         };
@@ -2499,6 +2501,7 @@ mod tests {
             id: RequestId::Number(1),
             inner: McpRequest::ReadResource(ReadResourceParams {
                 uri: "db://posts/123".to_string(),
+                meta: None,
             }),
             extensions: Extensions::new(),
         };
@@ -2821,6 +2824,7 @@ mod tests {
             id: RequestId::Number(2),
             inner: McpRequest::GetTaskResult(GetTaskResultParams {
                 task_id: task_id.clone(),
+                meta: None,
             }),
             extensions: Extensions::new(),
         };
@@ -2880,6 +2884,7 @@ mod tests {
             inner: McpRequest::CancelTask(CancelTaskParams {
                 task_id: task_id.clone(),
                 reason: Some("Test cancellation".to_string()),
+                meta: None,
             }),
             extensions: Extensions::new(),
         };
@@ -2930,6 +2935,7 @@ mod tests {
             id: RequestId::Number(2),
             inner: McpRequest::GetTaskInfo(GetTaskInfoParams {
                 task_id: task_id.clone(),
+                meta: None,
             }),
             extensions: Extensions::new(),
         };
@@ -2987,6 +2993,7 @@ mod tests {
             id: RequestId::Number(1),
             inner: McpRequest::GetTaskInfo(GetTaskInfoParams {
                 task_id: "task-999".to_string(),
+                meta: None,
             }),
             extensions: Extensions::new(),
         };
@@ -3021,6 +3028,7 @@ mod tests {
             id: RequestId::Number(1),
             inner: McpRequest::SubscribeResource(SubscribeResourceParams {
                 uri: "file:///test.txt".to_string(),
+                meta: None,
             }),
             extensions: Extensions::new(),
         };
@@ -3052,6 +3060,7 @@ mod tests {
             id: RequestId::Number(1),
             inner: McpRequest::SubscribeResource(SubscribeResourceParams {
                 uri: "file:///test.txt".to_string(),
+                meta: None,
             }),
             extensions: Extensions::new(),
         };
@@ -3063,6 +3072,7 @@ mod tests {
             id: RequestId::Number(2),
             inner: McpRequest::UnsubscribeResource(UnsubscribeResourceParams {
                 uri: "file:///test.txt".to_string(),
+                meta: None,
             }),
             extensions: Extensions::new(),
         };
@@ -3087,6 +3097,7 @@ mod tests {
             id: RequestId::Number(1),
             inner: McpRequest::SubscribeResource(SubscribeResourceParams {
                 uri: "file:///nonexistent.txt".to_string(),
+                meta: None,
             }),
             extensions: Extensions::new(),
         };
@@ -3604,6 +3615,7 @@ mod tests {
             id: RequestId::Number(1),
             inner: McpRequest::ReadResource(ReadResourceParams {
                 uri: "file:///secret.txt".to_string(),
+                meta: None,
             }),
             extensions: Extensions::new(),
         };
@@ -3639,6 +3651,7 @@ mod tests {
             id: RequestId::Number(1),
             inner: McpRequest::ReadResource(ReadResourceParams {
                 uri: "file:///public.txt".to_string(),
+                meta: None,
             }),
             extensions: Extensions::new(),
         };
@@ -3675,6 +3688,7 @@ mod tests {
             id: RequestId::Number(1),
             inner: McpRequest::ReadResource(ReadResourceParams {
                 uri: "file:///secret.txt".to_string(),
+                meta: None,
             }),
             extensions: Extensions::new(),
         };
@@ -3754,6 +3768,7 @@ mod tests {
             inner: McpRequest::GetPrompt(GetPromptParams {
                 name: "system_debug".to_string(),
                 arguments: HashMap::new(),
+                meta: None,
             }),
             extensions: Extensions::new(),
         };
@@ -3791,6 +3806,7 @@ mod tests {
             inner: McpRequest::GetPrompt(GetPromptParams {
                 name: "greeting".to_string(),
                 arguments: HashMap::new(),
+                meta: None,
             }),
             extensions: Extensions::new(),
         };
@@ -3828,6 +3844,7 @@ mod tests {
             inner: McpRequest::GetPrompt(GetPromptParams {
                 name: "system_debug".to_string(),
                 arguments: HashMap::new(),
+                meta: None,
             }),
             extensions: Extensions::new(),
         };
@@ -4742,6 +4759,7 @@ mod tests {
             id: RequestId::Number(99),
             inner: McpRequest::SetLoggingLevel(SetLogLevelParams {
                 level: LogLevel::Warning,
+                meta: None,
             }),
             extensions: crate::context::Extensions::new(),
         };
@@ -4865,7 +4883,10 @@ mod tests {
         // First page
         let req = RouterRequest {
             id: RequestId::Number(1),
-            inner: McpRequest::ListTools(ListToolsParams { cursor: None }),
+            inner: McpRequest::ListTools(ListToolsParams {
+                cursor: None,
+                meta: None,
+            }),
             extensions: Extensions::new(),
         };
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
@@ -4883,6 +4904,7 @@ mod tests {
             id: RequestId::Number(2),
             inner: McpRequest::ListTools(ListToolsParams {
                 cursor: next_cursor,
+                meta: None,
             }),
             extensions: Extensions::new(),
         };
@@ -4916,7 +4938,10 @@ mod tests {
 
         let req = RouterRequest {
             id: RequestId::Number(1),
-            inner: McpRequest::ListTools(ListToolsParams { cursor: None }),
+            inner: McpRequest::ListTools(ListToolsParams {
+                cursor: None,
+                meta: None,
+            }),
             extensions: Extensions::new(),
         };
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
