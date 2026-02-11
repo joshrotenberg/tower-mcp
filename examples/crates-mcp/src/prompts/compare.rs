@@ -39,8 +39,11 @@ pub fn build() -> Prompt {
                     content: tower_mcp::protocol::Content::Text {
                         text: prompt,
                         annotations: None,
+                        meta: None,
                     },
+                    meta: None,
                 }],
+                meta: None,
             })
         })
         .build()

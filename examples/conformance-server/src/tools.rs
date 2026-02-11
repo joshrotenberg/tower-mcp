@@ -98,6 +98,7 @@ fn build_embedded_resource() -> Tool {
                 mime_type: Some("text/plain".to_string()),
                 text: Some("Embedded resource content".to_string()),
                 blob: None,
+                meta: None,
             }))
         })
         .build()
@@ -112,11 +113,13 @@ fn build_multiple_content_types() -> Tool {
                     Content::Text {
                         text: "This is text content".to_string(),
                         annotations: None,
+                        meta: None,
                     },
                     Content::Image {
                         data: red_pixel_base64(),
                         mime_type: "image/png".to_string(),
                         annotations: None,
+                        meta: None,
                     },
                     Content::Resource {
                         resource: ResourceContent {
@@ -124,8 +127,10 @@ fn build_multiple_content_types() -> Tool {
                             mime_type: Some("text/plain".to_string()),
                             text: Some("Embedded resource content".to_string()),
                             blob: None,
+                            meta: None,
                         },
                         annotations: None,
+                        meta: None,
                     },
                 ],
                 is_error: false,

@@ -514,6 +514,7 @@ impl Tool {
             icons: self.icons.clone(),
             annotations: self.annotations.clone(),
             execution,
+            meta: None,
         }
     }
 

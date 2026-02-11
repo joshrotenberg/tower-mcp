@@ -354,8 +354,11 @@ pub fn build_fix_suggestions_prompt() -> Prompt {
                     content: Content::Text {
                         text: prompt_text,
                         annotations: None,
+                        meta: None,
                     },
+                    meta: None,
                 }],
+                meta: None,
             })
         })
         .build()

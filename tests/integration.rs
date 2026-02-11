@@ -90,7 +90,9 @@ fn create_router_with_resources_and_prompts() -> McpRouter {
                     mime_type: Some("text/plain".to_string()),
                     text: Some("42".to_string()),
                     blob: None,
+                    meta: None,
                 }],
+                meta: None,
             })
         })
         .build();
@@ -108,8 +110,11 @@ fn create_router_with_resources_and_prompts() -> McpRouter {
                     content: tower_mcp::protocol::Content::Text {
                         text: format!("Please greet {} warmly.", name),
                         annotations: None,
+                        meta: None,
                     },
+                    meta: None,
                 }],
+                meta: None,
             })
         })
         .build();
@@ -134,8 +139,11 @@ fn create_router_with_resources_and_prompts() -> McpRouter {
                             lang, lang, code
                         ),
                         annotations: None,
+                        meta: None,
                     },
+                    meta: None,
                 }],
+                meta: None,
             })
         })
         .build();
@@ -1274,6 +1282,7 @@ mod test_client_tests {
         let text_content = Content::Text {
             text: "hello".to_string(),
             annotations: None,
+            meta: None,
         };
         assert_eq!(text_content.as_text(), Some("hello"));
 
@@ -1281,6 +1290,7 @@ mod test_client_tests {
             data: "abc".to_string(),
             mime_type: "image/png".to_string(),
             annotations: None,
+            meta: None,
         };
         assert_eq!(image_content.as_text(), None);
     }

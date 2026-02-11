@@ -24,7 +24,9 @@ pub fn build(state: Arc<AppState>) -> Resource {
                         mime_type: Some("application/json".to_string()),
                         text: Some(json),
                         blob: None,
+                        meta: None,
                     }],
+                    meta: None,
                 })
             }
         })

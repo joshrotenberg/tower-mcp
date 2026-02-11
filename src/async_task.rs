@@ -105,6 +105,7 @@ impl Task {
             last_updated_at: self.last_updated_at_str.clone(),
             ttl: Some(self.ttl),
             poll_interval: Some(self.poll_interval),
+            meta: None,
         }
     }
 

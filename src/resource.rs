@@ -28,7 +28,9 @@
 //!                 mime_type: Some("text/plain".to_string()),
 //!                 text: Some("content".to_string()),
 //!                 blob: None,
+//!                 meta: None,
 //!             }],
+//!             meta: None,
 //!         })
 //!     })
 //!     .layer(TimeoutLayer::new(Duration::from_secs(30)))
@@ -57,7 +59,9 @@
 //!                 mime_type: Some("text/plain".to_string()),
 //!                 text: Some(format!("Contents of {}", path)),
 //!                 blob: None,
+//!                 meta: None,
 //!             }],
+//!             meta: None,
 //!         })
 //!     });
 //! ```
@@ -176,7 +180,9 @@ where
                             mime_type: Some("text/plain".to_string()),
                             text: Some(format!("Error reading resource: {}", err)),
                             blob: None,
+                            meta: None,
                         }],
+                        meta: None,
                     })
                 }
             }
@@ -336,6 +342,7 @@ impl Resource {
             icons: self.icons.clone(),
             size: self.size,
             annotations: self.annotations.clone(),
+            meta: None,
         }
     }
 
@@ -426,7 +433,9 @@ impl Resource {
 ///                 mime_type: Some("application/json".to_string()),
 ///                 text: Some(r#"{"setting": "value"}"#.to_string()),
 ///                 blob: None,
+///                 meta: None,
 ///             }],
+///             meta: None,
 ///         })
 ///     })
 ///     .build();
@@ -552,7 +561,9 @@ impl ResourceBuilder {
     ///                     mime_type: Some("text/plain".to_string()),
     ///                     text: Some(entries.join("\n")),
     ///                     blob: None,
+    ///                     meta: None,
     ///                 }],
+    ///                 meta: None,
     ///             })
     ///         }
     ///     })
@@ -620,7 +631,9 @@ impl ResourceBuilder {
                         mime_type,
                         text: Some(content),
                         blob: None,
+                        meta: None,
                     }],
+                    meta: None,
                 })
             }
         })
@@ -643,7 +656,9 @@ impl ResourceBuilder {
                         mime_type: Some("application/json".to_string()),
                         text: Some(text),
                         blob: None,
+                        meta: None,
                     }],
+                    meta: None,
                 })
             }
         })
@@ -713,7 +728,9 @@ where
     ///                 mime_type: Some("text/plain".to_string()),
     ///                 text: Some("content".to_string()),
     ///                 blob: None,
+    ///                 meta: None,
     ///             }],
+    ///             meta: None,
     ///         })
     ///     })
     ///     .layer(TimeoutLayer::new(Duration::from_secs(30)))
@@ -1011,7 +1028,9 @@ where
 ///                 mime_type: Self::MIME_TYPE.map(|s| s.to_string()),
 ///                 text: Some(self.config.clone()),
 ///                 blob: None,
+///                 meta: None,
 ///             }],
+///             meta: None,
 ///         })
 ///     }
 /// }
@@ -1099,7 +1118,9 @@ pub trait ResourceTemplateHandler: Send + Sync {
 ///                 mime_type: Some("text/plain".to_string()),
 ///                 text: Some(format!("Contents of {}", path)),
 ///                 blob: None,
+///                 meta: None,
 ///             }],
+///             meta: None,
 ///         })
 ///     });
 /// ```
@@ -1174,6 +1195,7 @@ impl ResourceTemplate {
             icons: self.icons.clone(),
             annotations: self.annotations.clone(),
             arguments: Vec::new(),
+            meta: None,
         }
     }
 
@@ -1229,7 +1251,9 @@ impl ResourceTemplate {
 ///                 mime_type: Some("application/json".to_string()),
 ///                 text: Some(format!(r#"{{"id": "{}"}}"#, id)),
 ///                 blob: None,
+///                 meta: None,
 ///             }],
+///             meta: None,
 ///         })
 ///     });
 /// ```
@@ -1472,7 +1496,9 @@ mod tests {
                         mime_type: Some("text/plain".to_string()),
                         text: Some("42".to_string()),
                         blob: None,
+                        meta: None,
                     }],
+                    meta: None,
                 })
             })
             .build();
@@ -1492,7 +1518,9 @@ mod tests {
                         mime_type: Some("text/plain".to_string()),
                         text: Some("content".to_string()),
                         blob: None,
+                        meta: None,
                     }],
+                    meta: None,
                 })
             })
             .layer(TimeoutLayer::new(Duration::from_secs(30)))
@@ -1515,7 +1543,9 @@ mod tests {
                         mime_type: Some("text/plain".to_string()),
                         text: Some("content".to_string()),
                         blob: None,
+                        meta: None,
                     }],
+                    meta: None,
                 })
             })
             .layer(TimeoutLayer::new(Duration::from_millis(50)))
@@ -1543,7 +1573,9 @@ mod tests {
                         mime_type: Some("text/plain".to_string()),
                         text: Some("context aware".to_string()),
                         blob: None,
+                        meta: None,
                     }],
+                    meta: None,
                 })
             })
             .build();
@@ -1563,7 +1595,9 @@ mod tests {
                         mime_type: Some("text/plain".to_string()),
                         text: Some("context with layer".to_string()),
                         blob: None,
+                        meta: None,
                     }],
+                    meta: None,
                 })
             })
             .layer(TimeoutLayer::new(Duration::from_secs(30)))
@@ -1593,7 +1627,9 @@ mod tests {
                         mime_type: Self::MIME_TYPE.map(|s| s.to_string()),
                         text: Some("test content".to_string()),
                         blob: None,
+                        meta: None,
                     }],
+                    meta: None,
                 })
             }
         }
@@ -1631,7 +1667,12 @@ mod tests {
     #[test]
     fn test_resource_catch_error_clone() {
         let handler = FnHandler {
-            handler: || async { Ok::<_, Error>(ReadResourceResult { contents: vec![] }) },
+            handler: || async {
+                Ok::<_, Error>(ReadResourceResult {
+                    contents: vec![],
+                    meta: None,
+                })
+            },
         };
         let service = ResourceHandlerService::new(handler);
         let catch_error = ResourceCatchError::new(service);
@@ -1641,7 +1682,12 @@ mod tests {
     #[test]
     fn test_resource_catch_error_debug() {
         let handler = FnHandler {
-            handler: || async { Ok::<_, Error>(ReadResourceResult { contents: vec![] }) },
+            handler: || async {
+                Ok::<_, Error>(ReadResourceResult {
+                    contents: vec![],
+                    meta: None,
+                })
+            },
         };
         let service = ResourceHandlerService::new(handler);
         let catch_error = ResourceCatchError::new(service);
@@ -1696,7 +1742,9 @@ mod tests {
                         mime_type: None,
                         text: Some(format!("User {}", vars.get("id").unwrap())),
                         blob: None,
+                        meta: None,
                     }],
+                    meta: None,
                 })
             });
 
@@ -1720,7 +1768,9 @@ mod tests {
                         mime_type: None,
                         text: None,
                         blob: None,
+                        meta: None,
                     }],
+                    meta: None,
                 })
             });
 
@@ -1743,7 +1793,9 @@ mod tests {
                         mime_type: Some("text/plain".to_string()),
                         text: Some(format!("Contents of {}", path)),
                         blob: None,
+                        meta: None,
                     }],
+                    meta: None,
                 })
             });
 
@@ -1771,7 +1823,9 @@ mod tests {
                         mime_type: None,
                         text: None,
                         blob: None,
+                        meta: None,
                     }],
+                    meta: None,
                 })
             });
 
@@ -1796,7 +1850,9 @@ mod tests {
                         mime_type: None,
                         text: None,
                         blob: None,
+                        meta: None,
                     }],
+                    meta: None,
                 })
             });
 
@@ -1847,7 +1903,9 @@ mod tests {
                         mime_type: None,
                         text: Some("data".to_string()),
                         blob: None,
+                        meta: None,
                     }],
+                    meta: None,
                 })
             });
 

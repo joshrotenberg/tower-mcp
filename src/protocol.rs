@@ -265,6 +265,9 @@ pub struct LoggingMessageParams {
     /// Structured data to be logged
     #[serde(default)]
     pub data: Value,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 impl LoggingMessageParams {
@@ -274,6 +277,7 @@ impl LoggingMessageParams {
             level,
             logger: None,
             data: data.into(),
+            meta: None,
         }
     }
 
@@ -431,6 +435,9 @@ pub struct CancelledParams {
     /// Optional reason for cancellation
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 /// Parameters for progress notification
@@ -447,6 +454,9 @@ pub struct ProgressParams {
     /// Human-readable progress message
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 /// Progress token - can be string or number
@@ -501,6 +511,9 @@ pub struct InitializeParams {
     pub protocol_version: String,
     pub capabilities: ClientCapabilities,
     pub client_info: Implementation,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -620,6 +633,9 @@ pub struct Root {
     /// Optional human-readable name for the root
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 impl Root {
@@ -628,6 +644,7 @@ impl Root {
         Self {
             uri: uri.into(),
             name: None,
+            meta: None,
         }
     }
 
@@ -636,6 +653,7 @@ impl Root {
         Self {
             uri: uri.into(),
             name: Some(name.into()),
+            meta: None,
         }
     }
 }
@@ -653,6 +671,9 @@ pub struct ListRootsParams {
 pub struct ListRootsResult {
     /// The list of roots available to the server
     pub roots: Vec<Root>,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -782,6 +803,9 @@ pub struct CompleteParams {
     /// Additional context for completion, such as previously resolved argument values
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<CompletionContext>,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 /// Context provided alongside a completion request
@@ -832,6 +856,9 @@ impl Completion {
 pub struct CompleteResult {
     /// The completion suggestions
     pub completion: Completion,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 impl CompleteResult {
@@ -839,6 +866,7 @@ impl CompleteResult {
     pub fn new(values: Vec<String>) -> Self {
         Self {
             completion: Completion::new(values),
+            meta: None,
         }
     }
 
@@ -846,6 +874,7 @@ impl CompleteResult {
     pub fn with_pagination(values: Vec<String>, total: u32, has_more: bool) -> Self {
         Self {
             completion: Completion::with_pagination(values, total, has_more),
+            meta: None,
         }
     }
 }
@@ -940,6 +969,9 @@ pub struct SamplingMessage {
     pub role: ContentRole,
     /// The content of the message (single item or array)
     pub content: SamplingContentOrArray,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 impl SamplingMessage {
@@ -950,7 +982,9 @@ impl SamplingMessage {
             content: SamplingContentOrArray::Single(SamplingContent::Text {
                 text: text.into(),
                 annotations: None,
+                meta: None,
             }),
+            meta: None,
         }
     }
 
@@ -961,7 +995,9 @@ impl SamplingMessage {
             content: SamplingContentOrArray::Single(SamplingContent::Text {
                 text: text.into(),
                 annotations: None,
+                meta: None,
             }),
+            meta: None,
         }
     }
 }
@@ -1054,6 +1090,9 @@ pub enum SamplingContent {
         /// Optional annotations for this content
         #[serde(default, skip_serializing_if = "Option::is_none")]
         annotations: Option<ContentAnnotations>,
+        /// Optional protocol-level metadata
+        #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+        meta: Option<Value>,
     },
     /// Image content
     Image {
@@ -1065,6 +1104,9 @@ pub enum SamplingContent {
         /// Optional annotations for this content
         #[serde(default, skip_serializing_if = "Option::is_none")]
         annotations: Option<ContentAnnotations>,
+        /// Optional protocol-level metadata
+        #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+        meta: Option<Value>,
     },
     /// Audio content (if supported)
     Audio {
@@ -1076,6 +1118,9 @@ pub enum SamplingContent {
         /// Optional annotations for this content
         #[serde(default, skip_serializing_if = "Option::is_none")]
         annotations: Option<ContentAnnotations>,
+        /// Optional protocol-level metadata
+        #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+        meta: Option<Value>,
     },
     /// Tool use request from the model (SEP-1577)
     #[serde(rename = "tool_use")]
@@ -1086,6 +1131,9 @@ pub enum SamplingContent {
         name: String,
         /// Input arguments for the tool
         input: Value,
+        /// Optional protocol-level metadata
+        #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+        meta: Option<Value>,
     },
     /// Result of a tool invocation (SEP-1577)
     #[serde(rename = "tool_result")]
@@ -1105,6 +1153,9 @@ pub enum SamplingContent {
         /// Whether the tool execution resulted in an error
         #[serde(default, rename = "isError", skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
+        /// Optional protocol-level metadata
+        #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+        meta: Option<Value>,
     },
 }
 
@@ -1118,13 +1169,14 @@ impl SamplingContent {
     /// ```rust
     /// use tower_mcp::protocol::SamplingContent;
     ///
-    /// let text_content = SamplingContent::Text { text: "Hello".into(), annotations: None };
+    /// let text_content = SamplingContent::Text { text: "Hello".into(), annotations: None, meta: None };
     /// assert_eq!(text_content.as_text(), Some("Hello"));
     ///
     /// let image_content = SamplingContent::Image {
     ///     data: "base64...".into(),
     ///     mime_type: "image/png".into(),
     ///     annotations: None,
+    ///     meta: None,
     /// };
     /// assert_eq!(image_content.as_text(), None);
     /// ```
@@ -1202,6 +1254,9 @@ pub struct CreateMessageParams {
     /// Task parameters for async execution
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskRequestParams>,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 impl CreateMessageParams {
@@ -1219,6 +1274,7 @@ impl CreateMessageParams {
             tools: None,
             tool_choice: None,
             task: None,
+            meta: None,
         }
     }
 
@@ -1278,6 +1334,9 @@ pub struct CreateMessageResult {
     /// Why the generation stopped
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 impl CreateMessageResult {
@@ -1300,10 +1359,12 @@ impl CreateMessageResult {
     ///     content: SamplingContentOrArray::Single(SamplingContent::Text {
     ///         text: "Hello, world!".into(),
     ///         annotations: None,
+    ///         meta: None,
     ///     }),
     ///     model: "claude-3".into(),
     ///     role: ContentRole::Assistant,
     ///     stop_reason: None,
+    ///     meta: None,
     /// };
     /// assert_eq!(result.first_text(), Some("Hello, world!"));
     /// ```
@@ -1332,6 +1393,9 @@ pub struct Implementation {
     /// URL of the implementation's website
     #[serde(skip_serializing_if = "Option::is_none")]
     pub website_url: Option<String>,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1344,6 +1408,9 @@ pub struct InitializeResult {
     /// These hints help LLMs understand the server's features.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1456,6 +1523,9 @@ pub struct ListToolsResult {
     pub tools: Vec<ToolDefinition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 /// Tool definition as returned by tools/list
@@ -1482,6 +1552,9 @@ pub struct ToolDefinition {
     /// Optional execution configuration for task support
     #[serde(skip_serializing_if = "Option::is_none")]
     pub execution: Option<ToolExecution>,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 /// Icon theme context
@@ -1653,6 +1726,7 @@ impl CallToolResult {
             content: vec![Content::Text {
                 text: text.into(),
                 annotations: None,
+                meta: None,
             }],
             is_error: false,
             structured_content: None,
@@ -1669,6 +1743,7 @@ impl CallToolResult {
             content: vec![Content::Text {
                 text: message.into(),
                 annotations: None,
+                meta: None,
             }],
             is_error: true,
             structured_content: None,
@@ -1689,6 +1764,7 @@ impl CallToolResult {
             content: vec![Content::Text {
                 text,
                 annotations: None,
+                meta: None,
             }],
             is_error: false,
             structured_content: Some(value),
@@ -1775,6 +1851,7 @@ impl CallToolResult {
                 data: data.into(),
                 mime_type: mime_type.into(),
                 annotations: None,
+                meta: None,
             }],
             is_error: false,
             structured_content: None,
@@ -1789,6 +1866,7 @@ impl CallToolResult {
                 data: data.into(),
                 mime_type: mime_type.into(),
                 annotations: None,
+                meta: None,
             }],
             is_error: false,
             structured_content: None,
@@ -1808,6 +1886,7 @@ impl CallToolResult {
                 size: None,
                 icons: None,
                 annotations: None,
+                meta: None,
             }],
             is_error: false,
             structured_content: None,
@@ -1832,6 +1911,7 @@ impl CallToolResult {
                 size: None,
                 icons: None,
                 annotations: None,
+                meta: None,
             }],
             is_error: false,
             structured_content: None,
@@ -1845,6 +1925,7 @@ impl CallToolResult {
             content: vec![Content::Resource {
                 resource,
                 annotations: None,
+                meta: None,
             }],
             is_error: false,
             structured_content: None,
@@ -1949,6 +2030,9 @@ pub enum Content {
         /// Optional annotations for this content.
         #[serde(skip_serializing_if = "Option::is_none")]
         annotations: Option<ContentAnnotations>,
+        /// Optional protocol-level metadata
+        #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+        meta: Option<Value>,
     },
     /// Base64-encoded image content.
     Image {
@@ -1960,6 +2044,9 @@ pub enum Content {
         /// Optional annotations for this content.
         #[serde(skip_serializing_if = "Option::is_none")]
         annotations: Option<ContentAnnotations>,
+        /// Optional protocol-level metadata
+        #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+        meta: Option<Value>,
     },
     /// Base64-encoded audio content.
     Audio {
@@ -1971,6 +2058,9 @@ pub enum Content {
         /// Optional annotations for this content.
         #[serde(skip_serializing_if = "Option::is_none")]
         annotations: Option<ContentAnnotations>,
+        /// Optional protocol-level metadata
+        #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+        meta: Option<Value>,
     },
     /// Embedded resource content.
     Resource {
@@ -1979,6 +2069,9 @@ pub enum Content {
         /// Optional annotations for this content.
         #[serde(skip_serializing_if = "Option::is_none")]
         annotations: Option<ContentAnnotations>,
+        /// Optional protocol-level metadata
+        #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+        meta: Option<Value>,
     },
     /// Link to a resource (without embedding the content)
     ResourceLink {
@@ -2003,6 +2096,9 @@ pub enum Content {
         icons: Option<Vec<ToolIcon>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         annotations: Option<ContentAnnotations>,
+        /// Optional protocol-level metadata
+        #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+        meta: Option<Value>,
     },
 }
 
@@ -2030,7 +2126,7 @@ impl Content {
     /// ```rust
     /// use tower_mcp::Content;
     ///
-    /// let content = Content::Text { text: "hello".into(), annotations: None };
+    /// let content = Content::Text { text: "hello".into(), annotations: None, meta: None };
     /// assert_eq!(content.as_text(), Some("hello"));
     /// ```
     /// Create a [`Content::Text`] variant with no annotations.
@@ -2050,6 +2146,7 @@ impl Content {
         Content::Text {
             text: text.into(),
             annotations: None,
+            meta: None,
         }
     }
 
@@ -2062,7 +2159,7 @@ impl Content {
     /// ```rust
     /// use tower_mcp::Content;
     ///
-    /// let content = Content::Text { text: "hello".into(), annotations: None };
+    /// let content = Content::Text { text: "hello".into(), annotations: None, meta: None };
     /// assert_eq!(content.as_text(), Some("hello"));
     /// ```
     pub fn as_text(&self) -> Option<&str> {
@@ -2102,6 +2199,9 @@ pub struct ResourceContent {
     /// Base64-encoded binary content (for binary resources).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blob: Option<String>,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 // =============================================================================
@@ -2120,6 +2220,9 @@ pub struct ListResourcesResult {
     pub resources: Vec<ResourceDefinition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2143,6 +2246,9 @@ pub struct ResourceDefinition {
     /// Annotations for this resource (audience, priority hints)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<ContentAnnotations>,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2153,6 +2259,9 @@ pub struct ReadResourceParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadResourceResult {
     pub contents: Vec<ResourceContent>,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 impl ReadResourceResult {
@@ -2172,7 +2281,9 @@ impl ReadResourceResult {
                 mime_type: Some("text/plain".to_string()),
                 text: Some(content.into()),
                 blob: None,
+                meta: None,
             }],
+            meta: None,
         }
     }
 
@@ -2200,7 +2311,9 @@ impl ReadResourceResult {
                 mime_type: Some(mime_type.into()),
                 text: Some(content.into()),
                 blob: None,
+                meta: None,
             }],
+            meta: None,
         }
     }
 
@@ -2226,7 +2339,9 @@ impl ReadResourceResult {
                 mime_type: Some("application/json".to_string()),
                 text: Some(json_string),
                 blob: None,
+                meta: None,
             }],
+            meta: None,
         }
     }
 
@@ -2249,7 +2364,9 @@ impl ReadResourceResult {
                 mime_type: Some("application/octet-stream".to_string()),
                 text: None,
                 blob: Some(encoded),
+                meta: None,
             }],
+            meta: None,
         }
     }
 
@@ -2276,7 +2393,9 @@ impl ReadResourceResult {
                 mime_type: Some(mime_type.into()),
                 text: None,
                 blob: Some(encoded),
+                meta: None,
             }],
+            meta: None,
         }
     }
 
@@ -2380,6 +2499,9 @@ pub struct ListResourceTemplatesResult {
     /// Cursor for next page (if more templates available)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 /// Definition of a resource template as returned by resources/templates/list
@@ -2422,6 +2544,9 @@ pub struct ResourceTemplateDefinition {
     /// Arguments accepted by this template for URI expansion
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub arguments: Vec<PromptArgument>,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 // =============================================================================
@@ -2440,6 +2565,9 @@ pub struct ListPromptsResult {
     pub prompts: Vec<PromptDefinition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2455,6 +2583,9 @@ pub struct PromptDefinition {
     pub icons: Option<Vec<ToolIcon>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub arguments: Vec<PromptArgument>,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2478,6 +2609,9 @@ pub struct GetPromptResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub messages: Vec<PromptMessage>,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 impl GetPromptResult {
@@ -2498,8 +2632,11 @@ impl GetPromptResult {
                 content: Content::Text {
                     text: text.into(),
                     annotations: None,
+                    meta: None,
                 },
+                meta: None,
             }],
+            meta: None,
         }
     }
 
@@ -2526,8 +2663,11 @@ impl GetPromptResult {
                 content: Content::Text {
                     text: text.into(),
                     annotations: None,
+                    meta: None,
                 },
+                meta: None,
             }],
+            meta: None,
         }
     }
 
@@ -2548,8 +2688,11 @@ impl GetPromptResult {
                 content: Content::Text {
                     text: text.into(),
                     annotations: None,
+                    meta: None,
                 },
+                meta: None,
             }],
+            meta: None,
         }
     }
 
@@ -2655,7 +2798,9 @@ impl GetPromptResultBuilder {
             content: Content::Text {
                 text: text.into(),
                 annotations: None,
+                meta: None,
             },
+            meta: None,
         });
         self
     }
@@ -2667,7 +2812,9 @@ impl GetPromptResultBuilder {
             content: Content::Text {
                 text: text.into(),
                 annotations: None,
+                meta: None,
             },
+            meta: None,
         });
         self
     }
@@ -2677,6 +2824,7 @@ impl GetPromptResultBuilder {
         GetPromptResult {
             description: self.description,
             messages: self.messages,
+            meta: None,
         }
     }
 }
@@ -2685,6 +2833,9 @@ impl GetPromptResultBuilder {
 pub struct PromptMessage {
     pub role: PromptRole,
     pub content: Content,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2787,6 +2938,9 @@ pub struct TaskObject {
     /// Suggested polling interval in milliseconds
     #[serde(skip_serializing_if = "Option::is_none")]
     pub poll_interval: Option<u64>,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 /// Backwards-compatible alias for TaskObject
@@ -2799,6 +2953,9 @@ pub type TaskInfo = TaskObject;
 pub struct CreateTaskResult {
     /// The created task object
     pub task: TaskObject,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 /// Parameters for listing tasks
@@ -2874,6 +3031,9 @@ pub struct TaskStatusParams {
     /// Suggested polling interval in milliseconds
     #[serde(skip_serializing_if = "Option::is_none")]
     pub poll_interval: Option<u64>,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 /// Backwards-compatible alias
@@ -3368,6 +3528,9 @@ pub struct ElicitResult {
     /// Submitted form data (only present when action is Accept and mode was Form)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<std::collections::HashMap<String, ElicitFieldValue>>,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 impl ElicitResult {
@@ -3376,6 +3539,7 @@ impl ElicitResult {
         Self {
             action: ElicitAction::Accept,
             content: Some(content),
+            meta: None,
         }
     }
 
@@ -3384,6 +3548,7 @@ impl ElicitResult {
         Self {
             action: ElicitAction::Decline,
             content: None,
+            meta: None,
         }
     }
 
@@ -3392,6 +3557,7 @@ impl ElicitResult {
         Self {
             action: ElicitAction::Cancel,
             content: None,
+            meta: None,
         }
     }
 }
@@ -3413,6 +3579,9 @@ pub enum ElicitFieldValue {
 pub struct ElicitationCompleteParams {
     /// The ID of the elicitation that completed
     pub elicitation_id: String,
+    /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 // =============================================================================
@@ -3547,7 +3716,9 @@ mod tests {
 
         // Verify it creates a Text variant with no annotations
         match &content {
-            Content::Text { text, annotations } => {
+            Content::Text {
+                text, annotations, ..
+            } => {
                 assert_eq!(text, "hello world");
                 assert!(annotations.is_none());
             }
@@ -3698,6 +3869,7 @@ mod tests {
     fn test_elicitation_complete_params() {
         let params = ElicitationCompleteParams {
             elicitation_id: "xyz789".to_string(),
+            meta: None,
         };
 
         let json = serde_json::to_value(&params).unwrap();
@@ -3752,6 +3924,7 @@ mod tests {
                 Root::new("file:///project1"),
                 Root::with_name("file:///project2", "Project 2"),
             ],
+            meta: None,
         };
 
         let json = serde_json::to_value(&result).unwrap();
@@ -3849,6 +4022,7 @@ mod tests {
             reference: CompletionReference::prompt("sql-prompt"),
             argument: CompletionArgument::new("query", "SEL"),
             context: None,
+            meta: None,
         };
 
         let json = serde_json::to_value(&params).unwrap();
@@ -3953,6 +4127,7 @@ mod tests {
         let content = SamplingContent::Text {
             text: "Hello".to_string(),
             annotations: None,
+            meta: None,
         };
         let json = serde_json::to_value(&content).unwrap();
         assert_eq!(json["type"], "text");
@@ -3965,6 +4140,7 @@ mod tests {
             data: "base64data".to_string(),
             mime_type: "image/png".to_string(),
             annotations: None,
+            meta: None,
         };
         let json = serde_json::to_value(&content).unwrap();
         assert_eq!(json["type"], "image");
@@ -4054,6 +4230,7 @@ mod tests {
             size: None,
             icons: None,
             annotations: None,
+            meta: None,
         };
         let json = serde_json::to_value(&content).unwrap();
         assert_eq!(json["type"], "resource_link");
@@ -4159,6 +4336,7 @@ mod tests {
             id: "tool_123".to_string(),
             name: "get_weather".to_string(),
             input: serde_json::json!({"location": "San Francisco"}),
+            meta: None,
         };
         let json = serde_json::to_value(&content).unwrap();
         assert_eq!(json["type"], "tool_use");
@@ -4174,9 +4352,11 @@ mod tests {
             content: vec![SamplingContent::Text {
                 text: "72F, sunny".to_string(),
                 annotations: None,
+                meta: None,
             }],
             structured_content: None,
             is_error: None,
+            meta: None,
         };
         let json = serde_json::to_value(&content).unwrap();
         assert_eq!(json["type"], "tool_result");
@@ -4239,15 +4419,18 @@ mod tests {
                 SamplingContent::Text {
                     text: "First".to_string(),
                     annotations: None,
+                    meta: None,
                 },
                 SamplingContent::Text {
                     text: "Second".to_string(),
                     annotations: None,
+                    meta: None,
                 },
             ]),
             model: "test".to_string(),
             role: ContentRole::Assistant,
             stop_reason: None,
+            meta: None,
         };
         let items = result.content_items();
         assert_eq!(items.len(), 2);
@@ -4258,6 +4441,7 @@ mod tests {
         let text_content = SamplingContent::Text {
             text: "Hello".to_string(),
             annotations: None,
+            meta: None,
         };
         assert_eq!(text_content.as_text(), Some("Hello"));
 
@@ -4265,6 +4449,7 @@ mod tests {
             data: "base64data".to_string(),
             mime_type: "image/png".to_string(),
             annotations: None,
+            meta: None,
         };
         assert_eq!(image_content.as_text(), None);
 
@@ -4272,6 +4457,7 @@ mod tests {
             data: "base64audio".to_string(),
             mime_type: "audio/wav".to_string(),
             annotations: None,
+            meta: None,
         };
         assert_eq!(audio_content.as_text(), None);
     }
@@ -4282,10 +4468,12 @@ mod tests {
             content: SamplingContentOrArray::Single(SamplingContent::Text {
                 text: "Hello, world!".to_string(),
                 annotations: None,
+                meta: None,
             }),
             model: "test".to_string(),
             role: ContentRole::Assistant,
             stop_reason: None,
+            meta: None,
         };
         assert_eq!(result.first_text(), Some("Hello, world!"));
     }
@@ -4297,15 +4485,18 @@ mod tests {
                 SamplingContent::Text {
                     text: "First".to_string(),
                     annotations: None,
+                    meta: None,
                 },
                 SamplingContent::Text {
                     text: "Second".to_string(),
                     annotations: None,
+                    meta: None,
                 },
             ]),
             model: "test".to_string(),
             role: ContentRole::Assistant,
             stop_reason: None,
+            meta: None,
         };
         assert_eq!(result.first_text(), Some("First"));
     }
@@ -4318,15 +4509,18 @@ mod tests {
                     data: "base64data".to_string(),
                     mime_type: "image/png".to_string(),
                     annotations: None,
+                    meta: None,
                 },
                 SamplingContent::Text {
                     text: "After image".to_string(),
                     annotations: None,
+                    meta: None,
                 },
             ]),
             model: "test".to_string(),
             role: ContentRole::Assistant,
             stop_reason: None,
+            meta: None,
         };
         assert_eq!(result.first_text(), Some("After image"));
     }
@@ -4338,10 +4532,12 @@ mod tests {
                 data: "base64data".to_string(),
                 mime_type: "image/png".to_string(),
                 annotations: None,
+                meta: None,
             }),
             model: "test".to_string(),
             role: ContentRole::Assistant,
             stop_reason: None,
+            meta: None,
         };
         assert_eq!(result.first_text(), None);
     }
@@ -4404,6 +4600,7 @@ mod tests {
                 ..Default::default()
             }),
             execution: None,
+            meta: None,
         };
 
         assert!(def.is_read_only());
@@ -4423,6 +4620,7 @@ mod tests {
             icons: None,
             annotations: None,
             execution: None,
+            meta: None,
         };
 
         // MCP spec defaults when no annotations present
@@ -4574,6 +4772,7 @@ mod tests {
         let result = GetPromptResult {
             description: None,
             messages: vec![],
+            meta: None,
         };
         assert!(result.as_json().is_none());
     }

@@ -674,7 +674,9 @@ impl McpRouter {
     ///                 mime_type: Some("text/plain".to_string()),
     ///                 text: Some(format!("Contents of {}", path)),
     ///                 blob: None,
+    ///                 meta: None,
     ///             }],
+    ///             meta: None,
     ///         })
     ///     });
     ///
@@ -1327,12 +1329,14 @@ impl McpRouter {
                         description: self.inner.server_description.clone(),
                         icons: self.inner.server_icons.clone(),
                         website_url: self.inner.server_website_url.clone(),
+                        meta: None,
                     },
                     instructions: if let Some(config) = &self.inner.auto_instructions {
                         Some(self.inner.generate_instructions(config))
                     } else {
                         self.inner.instructions.clone()
                     },
+                    meta: None,
                 }))
             }
 
@@ -1373,6 +1377,7 @@ impl McpRouter {
                 Ok(McpResponse::ListTools(ListToolsResult {
                     tools,
                     next_cursor,
+                    meta: None,
                 }))
             }
 
@@ -1454,7 +1459,10 @@ impl McpRouter {
                         ))
                     })?;
 
-                    Ok(McpResponse::CreateTask(CreateTaskResult { task }))
+                    Ok(McpResponse::CreateTask(CreateTaskResult {
+                        task,
+                        meta: None,
+                    }))
                 } else {
                     // Synchronous request: validate task_support != Required
                     if matches!(tool.task_support, TaskSupportMode::Required) {
@@ -1498,6 +1506,7 @@ impl McpRouter {
                 Ok(McpResponse::ListResources(ListResourcesResult {
                     resources,
                     next_cursor,
+                    meta: None,
                 }))
             }
 
@@ -1520,6 +1529,7 @@ impl McpRouter {
                     ListResourceTemplatesResult {
                         resource_templates,
                         next_cursor,
+                        meta: None,
                     },
                 ))
             }
@@ -1609,6 +1619,7 @@ impl McpRouter {
                 Ok(McpResponse::ListPrompts(ListPromptsResult {
                     prompts,
                     next_cursor,
+                    meta: None,
                 }))
             }
 
@@ -1937,6 +1948,7 @@ mod tests {
                     version: "1.0".to_string(),
                     ..Default::default()
                 },
+                meta: None,
             }),
             extensions: Extensions::new(),
         };
@@ -2323,7 +2335,9 @@ mod tests {
                         mime_type: None,
                         text: None,
                         blob: None,
+                        meta: None,
                     }],
+                    meta: None,
                 })
             });
 
@@ -2365,7 +2379,9 @@ mod tests {
                         mime_type: Some("application/json".to_string()),
                         text: Some(format!(r#"{{"id": "{}"}}"#, id)),
                         blob: None,
+                        meta: None,
                     }],
+                    meta: None,
                 })
             });
 
@@ -2410,7 +2426,9 @@ mod tests {
                         mime_type: None,
                         text: Some("from template".to_string()),
                         blob: None,
+                        meta: None,
                     }],
+                    meta: None,
                 })
             });
 
@@ -2463,7 +2481,9 @@ mod tests {
                         mime_type: None,
                         text: None,
                         blob: None,
+                        meta: None,
                     }],
+                    meta: None,
                 })
             });
 
@@ -2505,7 +2525,9 @@ mod tests {
                         mime_type: None,
                         text: None,
                         blob: None,
+                        meta: None,
                     }],
+                    meta: None,
                 })
             });
 
@@ -2528,6 +2550,7 @@ mod tests {
                     version: "1.0".to_string(),
                     ..Default::default()
                 },
+                meta: None,
             }),
             extensions: Extensions::new(),
         };
@@ -2643,6 +2666,7 @@ mod tests {
                     version: "1.0".to_string(),
                     ..Default::default()
                 },
+                meta: None,
             }),
             extensions: Extensions::new(),
         };
@@ -2678,6 +2702,7 @@ mod tests {
                     version: "1.0".to_string(),
                     ..Default::default()
                 },
+                meta: None,
             }),
             extensions: Extensions::new(),
         };
@@ -3190,6 +3215,7 @@ mod tests {
                     version: "1.0".to_string(),
                     ..Default::default()
                 },
+                meta: None,
             }),
             extensions: Extensions::new(),
         };
@@ -3231,6 +3257,7 @@ mod tests {
                     version: "1.0".to_string(),
                     ..Default::default()
                 },
+                meta: None,
             }),
             extensions: Extensions::new(),
         };
@@ -3261,6 +3288,7 @@ mod tests {
                 reference: CompletionReference::prompt("test-prompt"),
                 argument: CompletionArgument::new("query", "al"),
                 context: None,
+                meta: None,
             }),
             extensions: Extensions::new(),
         };
@@ -3296,6 +3324,7 @@ mod tests {
                     version: "1.0".to_string(),
                     ..Default::default()
                 },
+                meta: None,
             }),
             extensions: Extensions::new(),
         };
@@ -3326,6 +3355,7 @@ mod tests {
                 reference: CompletionReference::prompt("test-prompt"),
                 argument: CompletionArgument::new("query", "al"),
                 context: None,
+                meta: None,
             }),
             extensions: Extensions::new(),
         };
@@ -4165,6 +4195,7 @@ mod tests {
                     version: "1.0".to_string(),
                     ..Default::default()
                 },
+                meta: None,
             }),
             extensions: Extensions::new(),
         };
@@ -4596,6 +4627,7 @@ mod tests {
                     version: "1.0".to_string(),
                     ..Default::default()
                 },
+                meta: None,
             }),
             extensions: Extensions::new(),
         };
@@ -5257,6 +5289,7 @@ mod tests {
                         version: "1.0".to_string(),
                         ..Default::default()
                     },
+                    meta: None,
                 }),
                 extensions: Extensions::new(),
             };
