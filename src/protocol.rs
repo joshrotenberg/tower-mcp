@@ -1797,13 +1797,16 @@ impl CallToolResult {
     }
 
     /// Create a result with a resource link
-    pub fn resource_link(uri: impl Into<String>) -> Self {
+    pub fn resource_link(uri: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             content: vec![Content::ResourceLink {
                 uri: uri.into(),
-                name: None,
+                name: name.into(),
+                title: None,
                 description: None,
                 mime_type: None,
+                size: None,
+                icons: None,
                 annotations: None,
             }],
             is_error: false,
@@ -1815,16 +1818,19 @@ impl CallToolResult {
     /// Create a result with a resource link including metadata
     pub fn resource_link_with_meta(
         uri: impl Into<String>,
-        name: Option<String>,
+        name: impl Into<String>,
         description: Option<String>,
         mime_type: Option<String>,
     ) -> Self {
         Self {
             content: vec![Content::ResourceLink {
                 uri: uri.into(),
-                name,
+                name: name.into(),
+                title: None,
                 description,
                 mime_type,
+                size: None,
+                icons: None,
                 annotations: None,
             }],
             is_error: false,
@@ -1978,15 +1984,23 @@ pub enum Content {
     ResourceLink {
         /// URI of the resource
         uri: String,
-        /// Human-readable name
-        #[serde(skip_serializing_if = "Option::is_none")]
-        name: Option<String>,
+        /// Programmatic name of the resource (required per BaseMetadata)
+        name: String,
+        /// Human-readable title for display purposes
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
         /// Description of the resource
         #[serde(skip_serializing_if = "Option::is_none")]
         description: Option<String>,
         /// MIME type of the resource
         #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
         mime_type: Option<String>,
+        /// Raw content size in bytes
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size: Option<u64>,
+        /// Optional icons for display in user interfaces
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icons: Option<Vec<ToolIcon>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         annotations: Option<ContentAnnotations>,
     },
@@ -4033,9 +4047,12 @@ mod tests {
     fn test_content_resource_link_serialization() {
         let content = Content::ResourceLink {
             uri: "file:///test.txt".to_string(),
-            name: Some("test.txt".to_string()),
+            name: "test.txt".to_string(),
+            title: None,
             description: Some("A test file".to_string()),
             mime_type: Some("text/plain".to_string()),
+            size: None,
+            icons: None,
             annotations: None,
         };
         let json = serde_json::to_value(&content).unwrap();
@@ -4048,7 +4065,7 @@ mod tests {
 
     #[test]
     fn test_call_tool_result_resource_link() {
-        let result = CallToolResult::resource_link("file:///output.json");
+        let result = CallToolResult::resource_link("file:///output.json", "output.json");
         assert_eq!(result.content.len(), 1);
         assert!(!result.is_error);
         match &result.content[0] {
