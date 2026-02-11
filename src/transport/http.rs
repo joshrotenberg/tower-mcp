@@ -82,7 +82,7 @@
 //!
 //! Browser-based MCP clients require CORS headers. Since [`HttpTransport::into_router()`]
 //! returns a standard [`axum::Router`], you can add CORS support using
-//! [`tower_http::cors::CorsLayer`]:
+//! `tower_http::cors::CorsLayer`:
 //!
 //! ```rust,ignore
 //! use tower_mcp::McpRouter;
