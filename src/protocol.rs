@@ -1522,7 +1522,7 @@ pub struct PromptsCapability {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListToolsParams {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
     /// Optional protocol-level metadata
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
@@ -2222,7 +2222,7 @@ pub struct ResourceContent {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListResourcesParams {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
     /// Optional protocol-level metadata
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
@@ -2582,7 +2582,7 @@ pub struct ResourceTemplateDefinition {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListPromptsParams {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
     /// Optional protocol-level metadata
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
