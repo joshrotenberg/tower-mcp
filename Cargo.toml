@@ -54,6 +54,7 @@ tokio-test = "0.4"
 tower = { version = "0.5", features = ["util", "timeout", "limit"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
+jsonschema = "0.41"
 
 [features]
 default = []
