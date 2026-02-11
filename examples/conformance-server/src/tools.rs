@@ -130,6 +130,7 @@ fn build_multiple_content_types() -> Tool {
                 ],
                 is_error: false,
                 structured_content: None,
+                meta: None,
             })
         })
         .build()
