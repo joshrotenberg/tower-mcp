@@ -2044,3 +2044,30 @@ async fn test_sampling_capability_round_trip() {
         JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
     }
 }
+
+#[tokio::test]
+async fn test_experimental_capabilities_round_trip() {
+    let router = create_test_router();
+    let mut service = JsonRpcService::new(router);
+
+    let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+        "protocolVersion": "2025-03-26",
+        "capabilities": {
+            "experimental": {
+                "customFeature": {
+                    "enabled": true
+                }
+            }
+        },
+        "clientInfo": {
+            "name": "test-client",
+            "version": "1.0"
+        }
+    }));
+
+    let resp = service.call_single(init_req).await.unwrap();
+    match resp {
+        JsonRpcResponse::Result(_) => {}
+        JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+    }
+}
