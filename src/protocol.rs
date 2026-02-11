@@ -961,14 +961,12 @@ pub struct SamplingTool {
 ///
 /// Controls how the LLM should use the available tools.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ToolChoice {
-    /// The tool choice mode:
-    /// - "auto": Model decides whether to use tools
-    /// - "required": Model must use a tool
-    /// - "none": Model should not use tools
-    #[serde(rename = "type")]
+    /// The tool choice mode: "auto", "none", or "tool"
     pub mode: String,
+    /// Name of the specific tool to use (required when mode is "tool")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 impl ToolChoice {
@@ -976,6 +974,7 @@ impl ToolChoice {
     pub fn auto() -> Self {
         Self {
             mode: "auto".to_string(),
+            name: None,
         }
     }
 
@@ -983,6 +982,7 @@ impl ToolChoice {
     pub fn required() -> Self {
         Self {
             mode: "required".to_string(),
+            name: None,
         }
     }
 
@@ -990,6 +990,15 @@ impl ToolChoice {
     pub fn none() -> Self {
         Self {
             mode: "none".to_string(),
+            name: None,
+        }
+    }
+
+    /// Force the model to use a specific tool by name
+    pub fn tool(name: impl Into<String>) -> Self {
+        Self {
+            mode: "tool".to_string(),
+            name: Some(name.into()),
         }
     }
 }
@@ -4016,6 +4025,7 @@ mod tests {
     fn test_tool_choice_modes() {
         let auto = ToolChoice::auto();
         assert_eq!(auto.mode, "auto");
+        assert!(auto.name.is_none());
 
         let required = ToolChoice::required();
         assert_eq!(required.mode, "required");
@@ -4023,9 +4033,18 @@ mod tests {
         let none = ToolChoice::none();
         assert_eq!(none.mode, "none");
 
-        // Test serialization
+        let tool = ToolChoice::tool("get_weather");
+        assert_eq!(tool.mode, "tool");
+        assert_eq!(tool.name.as_deref(), Some("get_weather"));
+
+        // Test serialization — mode field should serialize as "mode", not "type"
         let json = serde_json::to_value(&auto).unwrap();
-        assert_eq!(json["type"], "auto");
+        assert_eq!(json["mode"], "auto");
+        assert!(json.get("name").is_none());
+
+        let json = serde_json::to_value(&tool).unwrap();
+        assert_eq!(json["mode"], "tool");
+        assert_eq!(json["name"], "get_weather");
     }
 
     #[test]
@@ -4097,7 +4116,7 @@ mod tests {
         let json = serde_json::to_value(&params).unwrap();
         assert!(json["tools"].is_array());
         assert_eq!(json["tools"][0]["name"], "calculator");
-        assert_eq!(json["toolChoice"]["type"], "auto");
+        assert_eq!(json["toolChoice"]["mode"], "auto");
     }
 
     #[test]
