@@ -2001,8 +2001,8 @@ async fn test_client_tasks_capability_round_trip() {
                 "list": {},
                 "cancel": {},
                 "requests": {
-                    "samplingCreateMessage": {},
-                    "elicitationCreate": {}
+                    "sampling": { "createMessage": {} },
+                    "elicitation": { "create": {} }
                 }
             }
         },

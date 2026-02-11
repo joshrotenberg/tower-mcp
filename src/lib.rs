@@ -399,7 +399,8 @@ pub use protocol::{
     PromptReference, PromptRole, ReadResourceResult, ResourceContent, ResourceReference, Root,
     RootsCapability, SamplingCapability, SamplingContent, SamplingContentOrArray,
     SamplingContextCapability, SamplingMessage, SamplingTool, SamplingToolsCapability, TaskInfo,
-    TaskObject, TaskRequestParams, TaskSupportMode, ToolChoice, ToolExecution,
+    TaskObject, TaskRequestParams, TaskStatusParams, TaskSupportMode, TasksToolsRequestsCapability,
+    ToolChoice, ToolExecution,
 };
 #[cfg(feature = "dynamic-tools")]
 pub use registry::DynamicToolRegistry;

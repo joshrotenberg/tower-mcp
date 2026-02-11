@@ -1261,7 +1261,9 @@ impl McpRouter {
                         list: Some(TasksListCapability {}),
                         cancel: Some(TasksCancelCapability {}),
                         requests: Some(TasksRequestsCapability {
-                            tools: Some(TasksToolsCallCapability {}),
+                            tools: Some(TasksToolsRequestsCapability {
+                                call: Some(TasksToolsCallCapability {}),
+                            }),
                         }),
                     })
                 } else {
