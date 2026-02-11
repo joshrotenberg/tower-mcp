@@ -9,7 +9,7 @@ use tower_mcp::{
     extract::{Json, State},
 };
 
-use crate::state::{AppState, Customer, parse_ft_search};
+use crate::state::{AppState, Customer, escape_tag, or_join_query, parse_ft_search};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchCustomersInput {
@@ -38,9 +38,12 @@ pub fn build(state: Arc<AppState>) -> Tool {
                 let text_part = if input.query == "*" {
                     None
                 } else {
-                    Some(format!("({})", input.query))
+                    Some(or_join_query(&input.query))
                 };
-                let tier_part = input.tier.as_ref().map(|t| format!("@tier:{{{t}}}"));
+                let tier_part = input
+                    .tier
+                    .as_ref()
+                    .map(|t| format!("@tier:{{{}}}", escape_tag(t)));
 
                 let query = match (text_part, tier_part) {
                     (Some(t), Some(f)) => format!("{t} {f}"),

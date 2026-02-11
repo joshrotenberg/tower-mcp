@@ -9,7 +9,7 @@ use tower_mcp::{
     extract::{Json, State},
 };
 
-use crate::state::{AppState, Note, parse_ft_search};
+use crate::state::{AppState, Note, escape_tag, or_join_query, parse_ft_search};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchNotesInput {
@@ -43,16 +43,16 @@ pub fn build(state: Arc<AppState>) -> Tool {
                 let mut parts: Vec<String> = Vec::new();
 
                 if input.query != "*" {
-                    parts.push(format!("({})", input.query));
+                    parts.push(or_join_query(&input.query));
                 }
                 if let Some(ref cid) = input.customer_id {
-                    parts.push(format!("@customerId:{{{cid}}}"));
+                    parts.push(format!("@customerId:{{{}}}", escape_tag(cid)));
                 }
                 if let Some(ref nt) = input.note_type {
-                    parts.push(format!("@noteType:{{{nt}}}"));
+                    parts.push(format!("@noteType:{{{}}}", escape_tag(nt)));
                 }
                 if let Some(ref tag) = input.tag {
-                    parts.push(format!("@tags:{{{tag}}}"));
+                    parts.push(format!("@tags:{{{}}}", escape_tag(tag)));
                 }
 
                 let query = if parts.is_empty() {

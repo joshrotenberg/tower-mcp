@@ -15,17 +15,23 @@ Most MCP examples use ephemeral or read-only data sources. A persistent, searcha
 
 ## Features
 
-- **4 Tools**:
+- **8 Tools**:
   - `search_customers` — Full-text search across name, company, and role with optional tier filter
   - `search_notes` — Full-text content search with filters for customer, note type, and tags
+  - `list_customers` — List all customers with their note counts
   - `get_customer` — Complete customer profile with all their notes, sorted by date
   - `add_note` — Create timestamped, tagged notes attached to a customer
+  - `update_customer` — Update customer profile fields (name, company, email, role, tier)
+  - `update_note` — Update note content, type, or tags
+  - `delete_note` — Permanently delete a note by ID
 
-- **1 Resource Template**:
+- **1 Resource Template + 1 Static Resource**:
   - `notes://customers/{id}` — Customer profile and notes as a readable resource
+  - `notes://recent` — The 10 most recent notes across all customers
 
-- **1 Prompt**:
+- **2 Prompts**:
   - `prep_meeting` — Guided meeting preparation workflow that chains tool calls to build a briefing
+  - `account_review` — Tier-level portfolio review with themes and action items
 
 - **Seed Data** — 5 customers and 18 notes with realistic narrative arcs:
   - Enterprise renewal negotiation (Meridian Systems)
@@ -110,8 +116,17 @@ Once connected, try:
 4. **Add a note after a call:**
    > "Add a meeting note for Marcus at LaunchPad AI: discussed migration timeline, targeting Q1 launch"
 
-5. **Prepare for a meeting:**
+5. **List all customers:**
+   > "List all customers and their note counts"
+
+6. **Update a customer:**
+   > "Update Sarah Chen's role to VP of Engineering"
+
+7. **Prepare for a meeting:**
    > Use the `prep_meeting` prompt with customer name "David Park" and focus "compliance"
+
+8. **Review a tier:**
+   > Use the `account_review` prompt with tier "enterprise" and focus "renewals"
 
 ## How It Works
 
@@ -126,8 +141,11 @@ Once connected, try:
 | Operation | Redis Commands |
 |-----------|---------------|
 | Search customers/notes | `FT.SEARCH` with full-text queries and TAG filters |
+| List all customers | `FT.SEARCH idx:customers *` + per-customer note count query |
 | Get a customer | `JSON.GET customer:{id} $` |
 | Add a note | `JSON.GET` (verify customer) + `JSON.SET note:{uuid} $` |
+| Update customer/note | `JSON.GET` (verify exists) + `JSON.SET` per changed field |
+| Delete a note | `JSON.GET` (verify exists) + `DEL note:{id}` |
 | Create indexes | `FT.CREATE` with JSON schema mappings |
 | Seed data | `FT.DROPINDEX` + `FT.CREATE` + `JSON.SET` per document |
 
@@ -139,11 +157,14 @@ The tools build RediSearch queries dynamically:
 # Full-text search
 sarah
 
+# Multi-word search (OR-joined automatically)
+(case|study|marketing)
+
 # Text + tier filter
 (sarah) @tier:{enterprise}
 
-# Notes by customer with tag filter
-@customerId:{c1} @tags:{renewal}
+# Notes by customer with tag filter (hyphens escaped)
+@customerId:{c1} @tags:{case\-study}
 
 # All meeting notes
 @noteType:{meeting}
@@ -154,20 +175,26 @@ sarah
 ```
 src/
 ├── main.rs              # CLI, router setup, transport
-├── state.rs             # AppState, data models, FT.SEARCH parser
+├── state.rs             # AppState, data models, FT.SEARCH parser, query helpers
 ├── seed.rs              # Index creation + sample data
 ├── tools/
 │   ├── mod.rs
 │   ├── search_customers.rs
 │   ├── search_notes.rs
+│   ├── list_customers.rs
 │   ├── add_note.rs
-│   └── get_customer.rs
+│   ├── get_customer.rs
+│   ├── update_customer.rs
+│   ├── update_note.rs
+│   └── delete_note.rs
 ├── resources/
 │   ├── mod.rs
-│   └── customer.rs      # notes://customers/{id} template
+│   ├── customer.rs      # notes://customers/{id} template
+│   └── recent_notes.rs  # notes://recent static resource
 └── prompts/
     ├── mod.rs
-    └── prep_meeting.rs
+    ├── prep_meeting.rs
+    └── account_review.rs
 ```
 
 ## License
