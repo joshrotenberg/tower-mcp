@@ -37,10 +37,10 @@ pub fn build(state: Arc<AppState>) -> Tool {
                 ctx.send_log(LoggingMessageParams {
                     level: LogLevel::Info,
                     logger: Some("crates-mcp".to_string()),
-                    data: Some(serde_json::json!({
+                    data: serde_json::json!({
                         "action": "fetch_reverse_deps",
                         "crate": input.name
-                    })),
+                    }),
                 });
 
                 // Send initial progress
@@ -61,11 +61,11 @@ pub fn build(state: Arc<AppState>) -> Tool {
                 ctx.send_log(LoggingMessageParams {
                     level: LogLevel::Info,
                     logger: Some("crates-mcp".to_string()),
-                    data: Some(serde_json::json!({
+                    data: serde_json::json!({
                         "action": "fetch_reverse_deps_complete",
                         "crate": input.name,
                         "count": response.meta.total
-                    })),
+                    }),
                 });
 
                 let mut output = format!(
