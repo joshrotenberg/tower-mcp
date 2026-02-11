@@ -397,9 +397,9 @@ pub use protocol::{
     JsonRpcResponse, JsonRpcResponseMessage, ListRootsParams, ListRootsResult, McpRequest,
     McpResponse, ModelHint, ModelPreferences, PrimitiveSchemaDefinition, PromptMessage,
     PromptReference, PromptRole, ReadResourceResult, ResourceContent, ResourceReference, Root,
-    RootsCapability, SamplingCapability, SamplingContent, SamplingContentOrArray, SamplingMessage,
-    SamplingTool, TaskInfo, TaskObject, TaskRequestParams, TaskSupportMode, ToolChoice,
-    ToolExecution,
+    RootsCapability, SamplingCapability, SamplingContent, SamplingContentOrArray,
+    SamplingContextCapability, SamplingMessage, SamplingTool, SamplingToolsCapability, TaskInfo,
+    TaskObject, TaskRequestParams, TaskSupportMode, ToolChoice, ToolExecution,
 };
 #[cfg(feature = "dynamic-tools")]
 pub use registry::DynamicToolRegistry;

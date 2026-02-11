@@ -632,7 +632,22 @@ pub struct ListRootsResult {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct SamplingCapability {}
+pub struct SamplingCapability {
+    /// Support for tool use within sampling
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<SamplingToolsCapability>,
+    /// Support for context inclusion within sampling
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<SamplingContextCapability>,
+}
+
+/// Marker capability for tool use within sampling
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct SamplingToolsCapability {}
+
+/// Marker capability for context inclusion within sampling
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct SamplingContextCapability {}
 
 /// Server capability for providing completions
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
