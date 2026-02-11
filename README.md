@@ -58,6 +58,7 @@ tower-mcp directory. The `.mcp.json` configures several example servers:
 |--------|-------------|
 | `crates-mcp-local` | Query crates.io for Rust crate info |
 | `markdownlint-mcp` | Lint markdown with 66 rules |
+| `codegen-mcp` | Helps AI agents build tower-mcp servers |
 | `weather` | Weather forecasts via NWS API |
 | `conformance` | Full MCP spec conformance server (39/39 tests) |
 
@@ -86,20 +87,22 @@ Or jump straight in:
 - `McpRouter` implementing Tower's `Service` trait
 - `JsonRpcService` layer for protocol framing
 - Session state management with reconnection support
-- Protocol version negotiation
+- Protocol version negotiation (supports `2025-11-25` with `2025-03-26` backward compat)
 - Tool annotations (behavior hints for trust/safety)
-- **Transports**: stdio, HTTP (with SSE and stream resumption), WebSocket, child process
+- **Transports**: stdio (`StdioTransport`, `SyncStdioTransport`, `BidirectionalStdioTransport`, `GenericStdioTransport`), HTTP (with SSE and stream resumption), WebSocket, child process
 - **Resources**: list, read, subscribe/unsubscribe with change notifications
+- **Resource templates**: `resources/templates/list` with URI template matching (RFC 6570)
 - **Prompts**: list and get with argument support
+- **Logging**: `notifications/message` and `logging/setLevel` with structured log data
 - **Authentication**: API key and Bearer token middleware helpers
-- **Elicitation**: Server-to-client user input requests (form and URL modes)
+- **Elicitation**: Server-to-client user input requests (form mode via `elicit()` and URL mode via `elicit_url()`)
 - **Client support**: MCP client for connecting to external servers
 - **Progress notifications**: Via `RequestContext` in tool handlers
 - **Request cancellation**: Via `CancellationToken` in tool handlers
 - **Completion**: Autocomplete for prompt arguments and resource URIs
 - **Sampling types**: `CreateMessageParams`/`CreateMessageResult` for LLM requests
 - **Sampling runtime**: Full support on stdio, WebSocket, and HTTP transports
-- **Async tasks**: Task ID generation, status tracking, TTL-based cleanup for long-running operations
+- **Async tasks**: Task ID generation, status tracking, TTL-based cleanup, per-tool `task_support` mode
 - **Per-tool guards**: Request-level access control for individual tools
 - **Capability filters**: Session-based tool/resource/prompt visibility
 - **`ResultExt`**: Ergonomic error handling in tool handlers
@@ -107,6 +110,13 @@ Or jump straight in:
 - **Convenience helpers**: `Content::text()`, `CallToolResult::from_list()`, JSON helpers
 - **Tool-level testing**: Unit test tools directly via `Tool::call()`
 - **Infallible builds**: `ToolBuilder::build()` is infallible; `try_new()` available for runtime names
+- **Cursor-based pagination**: `McpRouter::page_size()` for paginated list responses
+- **Tool output schema**: `ToolBuilder::output_schema()` for structured output validation
+- **Server metadata**: `server_title()`, `server_description()`, `server_icons()`, `server_website_url()`
+- **`McpTracingLayer`**: Built-in Tower middleware for structured request logging
+- **`list_changed` notifications**: `notify_tools_list_changed()`, `notify_resources_list_changed()`, `notify_prompts_list_changed()`
+- **Dynamic tools**: Runtime tool registration/deregistration via `DynamicToolRegistry` (feature: `dynamic-tools`)
+- **Experimental capabilities**: `experimental` field on both client and server capabilities
 
 ## Installation
 
@@ -128,6 +138,7 @@ tower-mcp = "0.5"
 | `oauth` | OAuth 2.1 resource server support (JWT validation) |
 | `jwks` | JWKS endpoint fetching for remote key sets (requires `oauth`) |
 | `testing` | Test utilities (`TestClient`) for in-process testing |
+| `dynamic-tools` | Runtime tool registration/deregistration via `DynamicToolRegistry` |
 
 Example with features:
 
@@ -333,7 +344,7 @@ let router = McpRouter::new()
 ## Prompt Definition
 
 ```rust
-use tower_mcp::{PromptBuilder, GetPromptResult, PromptMessage, PromptRole, Content};
+use tower_mcp::{PromptBuilder, GetPromptResult};
 
 let greet = PromptBuilder::new("greet")
     .description("Generate a greeting")
@@ -348,13 +359,11 @@ let greet = PromptBuilder::new("greet")
             _ => format!("Hey {}!", name),
         };
 
-        Ok(GetPromptResult {
-            description: Some("A friendly greeting".to_string()),
-            messages: vec![PromptMessage {
-                role: PromptRole::User,
-                content: Content::text(text),
-            }],
-        })
+        // Builder handles message construction
+        Ok(GetPromptResult::builder()
+            .description("A friendly greeting")
+            .user(text)
+            .build())
     })
     .build();
 
@@ -501,29 +510,32 @@ let app = transport.into_router()
 
 ## Protocol Compliance
 
-tower-mcp targets the [MCP specification 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25). Current compliance:
+tower-mcp targets the [MCP specification 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) with backward compatibility for `2025-03-26`. Current compliance:
 
 - [x] [JSON-RPC 2.0 message format](https://modelcontextprotocol.io/specification/2025-11-25/basic#messages)
-- [x] [Protocol version negotiation](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle#version-negotiation)
+- [x] [Protocol version negotiation](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle#version-negotiation) (supports `2025-11-25` and `2025-03-26`)
 - [x] [Capability negotiation](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle#capability-negotiation)
 - [x] [Initialize/initialized lifecycle](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle)
 - [x] [tools/list and tools/call](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)
 - [x] [Tool annotations](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)
 - [x] [Batch requests](https://modelcontextprotocol.io/specification/2025-11-25/basic#batching)
 - [x] [resources/list, resources/read, resources/subscribe](https://modelcontextprotocol.io/specification/2025-11-25/server/resources)
+- [x] [resources/templates/list](https://modelcontextprotocol.io/specification/2025-11-25/server/resources#resource-templates)
 - [x] [prompts/list, prompts/get](https://modelcontextprotocol.io/specification/2025-11-25/server/prompts)
+- [x] [Logging (notifications/message, logging/setLevel)](https://modelcontextprotocol.io/specification/2025-11-25/server/utilities/logging)
 - [x] [Icons on tools/resources/prompts (SEP-973)](https://modelcontextprotocol.io/specification/2025-11-25)
 - [x] [Implementation metadata](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle)
 - [x] [Sampling with tools/toolChoice (SEP-1577)](https://modelcontextprotocol.io/specification/2025-11-25/client/sampling)
-- [x] [Elicitation (user input requests)](https://modelcontextprotocol.io/specification/2025-11-25/client/elicitation)
+- [x] [Elicitation (form and URL modes)](https://modelcontextprotocol.io/specification/2025-11-25/client/elicitation)
 - [x] [Session management](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#session-management)
 - [x] [Progress notifications](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/progress)
 - [x] [Request cancellation](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/cancellation)
 - [x] [Completion (autocomplete)](https://modelcontextprotocol.io/specification/2025-11-25/server/utilities/completion)
 - [x] [Roots (filesystem discovery)](https://modelcontextprotocol.io/specification/2025-11-25/client/roots)
 - [x] [Sampling](https://modelcontextprotocol.io/specification/2025-11-25/client/sampling) (all transports)
-- [x] [Async tasks](https://modelcontextprotocol.io/specification/2025-11-25/server/utilities/async) (task ID, status tracking, TTL cleanup)
+- [x] [Async tasks](https://modelcontextprotocol.io/specification/2025-11-25/server/utilities/async) (task ID, status tracking, TTL cleanup, per-tool task support mode)
 - [x] [SSE event IDs and stream resumption](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#resumability-and-redelivery) (SEP-1699)
+- [x] [`_meta` field on all protocol types](https://modelcontextprotocol.io/specification/2025-11-25)
 
 We track all MCP Specification Enhancement Proposals (SEPs) as [GitHub issues](https://github.com/joshrotenberg/tower-mcp/issues?q=label%3Asep). A weekly workflow syncs status from the upstream spec repository.
 
