@@ -9,7 +9,9 @@ use tower_mcp::{
     extract::{Json, State},
 };
 
-use crate::state::{AppState, Customer, escape_tag, or_join_query, parse_ft_search};
+use crate::state::{
+    AppState, Customer, escape_tag, is_json_output, or_join_query, parse_ft_search,
+};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchCustomersInput {
@@ -18,6 +20,9 @@ pub struct SearchCustomersInput {
     /// Filter by tier: "enterprise", "startup", or "smb"
     #[serde(default)]
     tier: Option<String>,
+    /// Output format: "markdown" (default) or "json"
+    #[serde(default)]
+    output_format: Option<String>,
 }
 
 pub fn build(state: Arc<AppState>) -> Tool {
@@ -68,7 +73,21 @@ pub fn build(state: Arc<AppState>) -> Tool {
                 let (total, rows) = parse_ft_search(values)
                     .map_err(|e| tower_mcp::Error::tool(format!("Parse error: {e}")))?;
 
-                if rows.is_empty() {
+                let customers: Vec<Customer> = rows
+                    .iter()
+                    .map(|(_key, json_str)| {
+                        serde_json::from_str(json_str)
+                            .map_err(|e| tower_mcp::Error::tool(format!("JSON parse error: {e}")))
+                    })
+                    .collect::<Result<_, _>>()?;
+
+                if is_json_output(&input.output_format) {
+                    let json = serde_json::to_string_pretty(&customers)
+                        .map_err(|e| tower_mcp::Error::tool(format!("JSON error: {e}")))?;
+                    return Ok(CallToolResult::text(json));
+                }
+
+                if customers.is_empty() {
                     return Ok(CallToolResult::text(format!(
                         "No customers found matching '{}'.",
                         input.query
@@ -77,9 +96,7 @@ pub fn build(state: Arc<AppState>) -> Tool {
 
                 let mut output = format!("Found {total} customer(s):\n\n");
 
-                for (_key, json_str) in &rows {
-                    let c: Customer = serde_json::from_str(json_str)
-                        .map_err(|e| tower_mcp::Error::tool(format!("JSON parse error: {e}")))?;
+                for c in &customers {
                     output.push_str(&format!(
                         "- **{}** ({}) — {} at {}, tier: {}\n",
                         c.name, c.id, c.role, c.company, c.tier
