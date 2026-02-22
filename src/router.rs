@@ -1781,12 +1781,19 @@ impl McpRouter {
     pub fn handle_notification(&self, notification: McpNotification) {
         match notification {
             McpNotification::Initialized => {
+                let phase_before = self.session.phase();
                 if self.session.mark_initialized() {
-                    tracing::info!("Session initialized, entering operation phase");
+                    if phase_before == crate::session::SessionPhase::Uninitialized {
+                        tracing::info!(
+                            "Session initialized from uninitialized state (race resolved)"
+                        );
+                    } else {
+                        tracing::info!("Session initialized, entering operation phase");
+                    }
                 } else {
                     tracing::warn!(
-                        "Received initialized notification in unexpected state: {:?}",
-                        self.session.phase()
+                        phase = ?self.session.phase(),
+                        "Received initialized notification in unexpected state"
                     );
                 }
             }

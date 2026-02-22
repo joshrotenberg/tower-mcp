@@ -151,13 +151,37 @@ impl SessionState {
             .is_ok()
     }
 
-    /// Transition from Initializing to Initialized.
+    /// Transition to Initialized phase.
     /// Called when receiving an `initialized` notification.
+    ///
+    /// Accepts transitions from both `Initializing` and `Uninitialized` states.
+    /// The `Uninitialized → Initialized` path handles a race condition in HTTP
+    /// transports where the client sends the `initialized` notification before
+    /// the server has finished processing the `initialize` request (the session
+    /// is stored in `Uninitialized` state before the request is dispatched).
+    ///
     /// Returns true if the transition was successful.
     pub fn mark_initialized(&self) -> bool {
-        self.phase
+        // Try the expected path first: Initializing → Initialized
+        if self
+            .phase
             .compare_exchange(
                 SessionPhase::Initializing as u8,
+                SessionPhase::Initialized as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return true;
+        }
+
+        // Handle the race: Uninitialized → Initialized
+        // This occurs when the initialized notification arrives before
+        // the initialize request has been fully processed.
+        self.phase
+            .compare_exchange(
+                SessionPhase::Uninitialized as u8,
                 SessionPhase::Initialized as u8,
                 Ordering::AcqRel,
                 Ordering::Acquire,
@@ -281,6 +305,37 @@ mod tests {
 
         // Should be visible in the first
         assert_eq!(session1.get::<String>(), Some("world".to_string()));
+    }
+
+    #[test]
+    fn test_mark_initialized_from_uninitialized() {
+        let session = SessionState::new();
+
+        // Start in Uninitialized, skip straight to Initialized
+        // This handles the race where `initialized` notification arrives
+        // before the `initialize` request is fully processed.
+        assert_eq!(session.phase(), SessionPhase::Uninitialized);
+        assert!(session.mark_initialized());
+        assert_eq!(session.phase(), SessionPhase::Initialized);
+        assert!(session.is_initialized());
+
+        // All requests allowed
+        assert!(session.is_request_allowed("tools/list"));
+        assert!(session.is_request_allowed("ping"));
+    }
+
+    #[test]
+    fn test_mark_initialized_idempotent_when_already_initialized() {
+        let session = SessionState::new();
+
+        // Normal lifecycle
+        session.mark_initializing();
+        session.mark_initialized();
+        assert_eq!(session.phase(), SessionPhase::Initialized);
+
+        // Calling mark_initialized again should fail (already in target state)
+        assert!(!session.mark_initialized());
+        assert_eq!(session.phase(), SessionPhase::Initialized);
     }
 
     #[test]
