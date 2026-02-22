@@ -169,8 +169,8 @@ use crate::context::{
 use crate::error::{Error, JsonRpcError, Result};
 use crate::jsonrpc::JsonRpcService;
 use crate::protocol::{
-    JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpNotification, RequestId,
-    SUPPORTED_PROTOCOL_VERSIONS,
+    JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, LATEST_PROTOCOL_VERSION, McpNotification,
+    RequestId, SUPPORTED_PROTOCOL_VERSIONS,
 };
 use crate::router::{McpRouter, RouterRequest, RouterResponse};
 use crate::transport::service::{CatchError, McpBoxService, ServiceFactory, identity_factory};
@@ -223,6 +223,8 @@ struct Session {
     pending_requests: Mutex<HashMap<RequestId, PendingRequest>>,
     /// Receiver for outgoing requests (used by SSE stream)
     request_rx: Mutex<Option<OutgoingRequestReceiver>>,
+    /// Negotiated protocol version (set after initialize)
+    protocol_version: RwLock<String>,
     /// Counter for SSE event IDs (for stream resumption per SEP-1699)
     event_counter: AtomicU64,
     /// Buffer of recent events for stream resumption (SEP-1699)
@@ -271,6 +273,7 @@ impl Session {
             last_accessed: RwLock::new(Instant::now()),
             pending_requests: Mutex::new(HashMap::new()),
             request_rx: Mutex::new(request_rx),
+            protocol_version: RwLock::new(LATEST_PROTOCOL_VERSION.to_string()),
             event_counter: AtomicU64::new(0),
             event_buffer: RwLock::new(VecDeque::new()),
             max_buffered_events: DEFAULT_MAX_BUFFERED_EVENTS,
@@ -1087,7 +1090,18 @@ async fn handle_post(
         }
     };
 
-    // Build response with session ID header for initialize
+    // For initialize responses, extract and store the negotiated protocol version
+    if is_init
+        && let JsonRpcResponse::Result(ref result) = response
+        && let Some(version) = result
+            .result
+            .get("protocolVersion")
+            .and_then(|v| v.as_str())
+    {
+        *session.protocol_version.write().await = version.to_string();
+    }
+
+    // Build response with headers
     let mut resp = axum::Json(response).into_response();
 
     if is_init {
@@ -1096,6 +1110,13 @@ async fn handle_post(
             HeaderValue::from_str(&session.id).unwrap(),
         );
     }
+
+    // Always include the negotiated protocol version header
+    let version = session.protocol_version.read().await;
+    resp.headers_mut().insert(
+        MCP_PROTOCOL_VERSION_HEADER,
+        HeaderValue::from_str(&version).unwrap(),
+    );
 
     resp
 }
@@ -1442,6 +1463,109 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert!(response.headers().contains_key(MCP_SESSION_ID_HEADER));
+        // Verify protocol version header is present on initialize response
+        assert_eq!(
+            response
+                .headers()
+                .get(MCP_PROTOCOL_VERSION_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("2025-11-25")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_protocol_version_header_on_subsequent_requests() {
+        let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
+        let app = transport.into_router();
+
+        // Initialize
+        let init_request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "clientInfo": {
+                            "name": "test-client",
+                            "version": "1.0.0"
+                        }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let init_response = app.clone().oneshot(init_request).await.unwrap();
+        let session_id = init_response
+            .headers()
+            .get(MCP_SESSION_ID_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Verify init response has negotiated version (2025-03-26, not latest)
+        assert_eq!(
+            init_response
+                .headers()
+                .get(MCP_PROTOCOL_VERSION_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("2025-03-26")
+        );
+
+        // Send initialized notification
+        let initialized_request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header(MCP_SESSION_ID_HEADER, &session_id)
+            .header(MCP_PROTOCOL_VERSION_HEADER, "2025-03-26")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        app.clone().oneshot(initialized_request).await.unwrap();
+
+        // Send tools/list and check for protocol version header
+        let list_request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header(MCP_SESSION_ID_HEADER, &session_id)
+            .header(MCP_PROTOCOL_VERSION_HEADER, "2025-03-26")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/list"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(list_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(MCP_PROTOCOL_VERSION_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("2025-03-26")
+        );
     }
 
     #[tokio::test]
