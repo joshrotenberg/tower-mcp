@@ -4,13 +4,6 @@ This repo has MCP servers configured in `.mcp.json` that you can use directly.
 
 ## Available MCP Servers
 
-### crates-mcp-local
-Query the Rust crate registry (crates.io).
-
-Tools: `search_crates`, `get_crate_info`, `get_crate_versions`,
-`get_dependencies`, `get_reverse_dependencies`, `get_downloads`,
-`get_owners`, `get_summary`, `get_crate_authors`, `get_user`
-
 ### markdownlint-mcp
 Lint markdown files with 66 rules.
 
@@ -63,7 +56,6 @@ cargo test --doc --all-features
 
 - `src/` - Main library code
 - `examples/` - Example MCP servers
-  - `crates-mcp/` - Full-featured crates.io server
   - `markdownlint-mcp/` - Markdown linting server
   - `codegen-mcp/` - MCP server builder (generates tower-mcp code)
   - `conformance-server/` - MCP spec conformance tests

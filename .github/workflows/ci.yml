@@ -94,7 +94,6 @@ jobs:
       - name: Build all examples
         run: |
           cargo build --examples --all-features
-          cargo build --manifest-path examples/crates-mcp/Cargo.toml
           cargo build --manifest-path examples/conformance-server/Cargo.toml
           cargo build --manifest-path examples/codegen-mcp/Cargo.toml
           cargo build --manifest-path examples/markdownlint-mcp/Cargo.toml

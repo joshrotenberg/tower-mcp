@@ -7,17 +7,6 @@
         "RUST_LOG": "tower_mcp=debug"
       }
     },
-    "crates-mcp-local": {
-      "command": "cargo",
-      "args": ["run", "--manifest-path", "examples/crates-mcp/Cargo.toml", "--", "--transport", "stdio"],
-      "env": {
-        "RUST_LOG": "crates_mcp=info"
-      }
-    },
-    "crates-mcp-remote": {
-      "type": "http",
-      "url": "https://crates-mcp-demo.fly.dev/"
-    },
     "markdownlint-mcp": {
       "command": "cargo",
       "args": ["run", "--manifest-path", "examples/markdownlint-mcp/Cargo.toml", "--", "--transport", "stdio"],

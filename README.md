@@ -30,24 +30,9 @@ If you've used [axum](https://docs.rs/axum), tower-mcp's API will feel familiar:
 
 ## Live Demo
 
-A demo MCP server for querying [crates.io](https://crates.io) is deployed at:
+A full-featured MCP server for querying [crates.io](https://crates.io) is available as a standalone project: [cratesio-mcp](https://github.com/joshrotenberg/cratesio-mcp). It includes 21 tools, 2 prompts, 3 resources, docs.rs integration, and vulnerability auditing via OSV.dev.
 
-**https://crates-mcp-demo.fly.dev**
-
-Connect with any MCP client that supports HTTP transport, or add to Claude Code's `.mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "crates": {
-      "type": "http",
-      "url": "https://crates-mcp-demo.fly.dev"
-    }
-  }
-}
-```
-
-The demo includes 10 tools (search, info, versions, dependencies, reverse deps, downloads, owners, authors, user, summary), 2 prompts (analyze, compare), and 2 resources (recent searches, crate info template). See [`examples/crates-mcp`](examples/crates-mcp) for the full source.
+A demo instance is deployed at **https://crates-mcp-demo.fly.dev** -- connect with any MCP client that supports HTTP transport.
 
 ## Try the Examples
 
@@ -56,7 +41,6 @@ tower-mcp directory. The `.mcp.json` configures several example servers:
 
 | Server | Description |
 |--------|-------------|
-| `crates-mcp-local` | Query crates.io for Rust crate info |
 | `markdownlint-mcp` | Lint markdown with 66 rules |
 | `codegen-mcp` | Helps AI agents build tower-mcp servers |
 | `weather` | Weather forecasts via NWS API |
@@ -71,7 +55,6 @@ cd tower-mcp
 For a guided tour, ask your agent to read [`examples/README.md`](examples/README.md).
 Or jump straight in:
 
-- "Search for async runtime crates" (crates-mcp)
 - "Lint examples/README.md for issues" (markdownlint-mcp)
 - "What's the weather in Seattle?" (weather)
 
