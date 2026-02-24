@@ -32,7 +32,7 @@ If you've used [axum](https://docs.rs/axum), tower-mcp's API will feel familiar:
 
 A full-featured MCP server for querying [crates.io](https://crates.io) is available as a standalone project: [cratesio-mcp](https://github.com/joshrotenberg/cratesio-mcp). It includes tools, prompts, and resources for crate search, docs.rs integration, and vulnerability auditing via OSV.dev.
 
-A demo instance is deployed at **https://crates-mcp-demo.fly.dev** -- connect with any MCP client that supports HTTP transport.
+A demo instance is deployed at **https://cratesio-mcp.fly.dev** -- connect with any MCP client that supports HTTP transport.
 
 ## Try the Examples
 
