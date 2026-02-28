@@ -810,11 +810,34 @@ impl ToolBuilder {
         self
     }
 
+    /// Mark the tool as destructive (may perform irreversible operations)
+    pub fn destructive(mut self) -> Self {
+        self.annotations
+            .get_or_insert_with(ToolAnnotations::default)
+            .destructive_hint = true;
+        self
+    }
+
     /// Mark the tool as idempotent (same args = same effect)
     pub fn idempotent(mut self) -> Self {
         self.annotations
             .get_or_insert_with(ToolAnnotations::default)
             .idempotent_hint = true;
+        self
+    }
+
+    /// Mark the tool as read-only, idempotent, and non-destructive.
+    ///
+    /// This is a convenience method for safe, side-effect-free tools.
+    /// For finer control, use `.read_only()`, `.idempotent()`, and
+    /// `.non_destructive()` individually.
+    pub fn read_only_safe(mut self) -> Self {
+        let ann = self
+            .annotations
+            .get_or_insert_with(ToolAnnotations::default);
+        ann.read_only_hint = true;
+        ann.idempotent_hint = true;
+        ann.destructive_hint = false;
         self
     }
 

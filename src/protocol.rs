@@ -1598,7 +1598,7 @@ pub struct ToolIcon {
 
 /// Annotations describing tool behavior for trust and safety.
 /// Clients MUST consider these untrusted unless the server is trusted.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolAnnotations {
     /// Human-readable title for the tool
@@ -1618,6 +1618,18 @@ pub struct ToolAnnotations {
     /// If true, tool interacts with external entities. Default: true
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub open_world_hint: bool,
+}
+
+impl Default for ToolAnnotations {
+    fn default() -> Self {
+        Self {
+            title: None,
+            read_only_hint: false,
+            destructive_hint: true,
+            idempotent_hint: false,
+            open_world_hint: true,
+        }
+    }
 }
 
 impl ToolAnnotations {
@@ -4610,15 +4622,13 @@ mod tests {
 
     #[test]
     fn test_tool_annotations_defaults() {
-        // Default::default() uses Rust defaults (false for bool).
-        // The serde defaults (destructive_hint=true, open_world_hint=true)
-        // only apply during deserialization.
+        // Default matches MCP spec defaults: destructive=true, open_world=true
         let annotations = ToolAnnotations::default();
 
         assert!(!annotations.is_read_only());
-        assert!(!annotations.is_destructive());
+        assert!(annotations.is_destructive());
         assert!(!annotations.is_idempotent());
-        assert!(!annotations.is_open_world());
+        assert!(annotations.is_open_world());
     }
 
     #[test]
