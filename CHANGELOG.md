@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+## [0.7.0] - 2026-02-28
+
+### Bug Fixes
+
+- **session:** Accept initialized notification in uninitialized state ([#462](https://github.com/joshrotenberg/tower-mcp/pull/462))
+- Update demo URL to cratesio-mcp.fly.dev ([#466](https://github.com/joshrotenberg/tower-mcp/pull/466))
+- Align ToolAnnotations::Default with MCP spec defaults ([#469](https://github.com/joshrotenberg/tower-mcp/pull/469))
+
+### Features
+
+- Add notes-mcp example — Redis-backed customer notes server ([#453](https://github.com/joshrotenberg/tower-mcp/pull/453))
+- **notes-mcp:** Add CRUD tools, fix search bugs, add resource and prompt ([#455](https://github.com/joshrotenberg/tower-mcp/pull/455))
+- **notes-mcp:** Add JSON output format to read-only tools ([#456](https://github.com/joshrotenberg/tower-mcp/pull/456))
+- **http:** Include MCP-Protocol-Version header on HTTP responses ([#457](https://github.com/joshrotenberg/tower-mcp/pull/457))
+- Add CapabilityFilter::write_guard() for annotation-based write protection ([#475](https://github.com/joshrotenberg/tower-mcp/pull/475))
+
+### Refactor
+
+- Remove crates-mcp example, now standalone cratesio-mcp ([#465](https://github.com/joshrotenberg/tower-mcp/pull/465))
+
+
+
 ## [0.6.0] - 2026-02-11
 
 ### Bug Fixes
