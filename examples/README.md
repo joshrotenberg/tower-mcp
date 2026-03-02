@@ -18,7 +18,10 @@ The markdownlint-mcp server will find them. Then try:
 
 > "Fix the markdown issues in examples/README.md"
 
-## The Example Servers
+## Interactive MCP Servers
+
+These servers are configured in `.mcp.json` and available to MCP agents
+automatically.
 
 ### 1. markdownlint-mcp
 
@@ -81,6 +84,26 @@ incrementally through tool calls, then generate complete Rust code.
 
 **Source:** `examples/codegen-mcp/`
 
+## Standalone Examples
+
+These demonstrate specific features. Run them individually with `cargo run`.
+
+| Example | Feature | Run |
+|---------|---------|-----|
+| `basic` | Core `JsonRpcService` without transport | `cargo run --example basic` |
+| `http_server` | HTTP/SSE transport, progress, resources, prompts | `cargo run --example http_server --features http` |
+| `websocket_server` | WebSocket transport with middleware | `cargo run --example websocket_server --features websocket` |
+| `transport_middleware` | Tower middleware on HTTP and stdio transports | `cargo run --example transport_middleware --features http -- --transport http` |
+| `http_auth` | API key and OAuth/JWT authentication | `cargo run --example http_auth --features oauth -- --auth apikey` |
+| `tool_middleware` | Per-tool timeout and concurrency limits | `cargo run --example tool_middleware` |
+| `capability_filtering` | Session-based tool/resource/prompt visibility | `cargo run --example capability_filtering --features http` |
+| `dynamic_tools` | Runtime tool registration/deregistration | `cargo run --example dynamic_tools --features dynamic-tools` |
+| `external_api_auth` | Four patterns for downstream API authentication | `cargo run --example external_api_auth` |
+| `testing` | In-process testing with `TestClient` | `cargo run --example testing --features testing` |
+| `client_cli` | MCP client connecting to a subprocess server | `cargo run --example client_cli` |
+| `http_sse_client` | HTTP SSE client with stream resumption | `cargo run --example http_sse_client --features http` |
+| `conformance-server` | Full MCP conformance server (39/39 tests) | `cargo run -p conformance-server` |
+
 ## How It's Built
 
 Ask your agent to read the `source://stdio_server.rs` resource from
@@ -109,6 +132,7 @@ struct EchoInput {
 
 That's the core pattern. For more complex examples:
 
+- **In-process testing**: `examples/testing.rs` - test servers with `TestClient`
 - **Shared state**: `examples/markdownlint-mcp/src/tools.rs` - tools
   sharing a lint engine via `Arc<LintState>`
 - **External APIs**: `examples/weather_server.rs` - calling the NWS API
@@ -162,7 +186,7 @@ suggest what tools your server should have.
 
 ### Example Session
 
-```
+```text
 You: "I want to build an MCP server that searches my notes"
 
 Agent: [uses codegen-mcp to design tools: index_directory, search, get_document]
