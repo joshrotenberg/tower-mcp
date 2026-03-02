@@ -1,0 +1,20 @@
+[package]
+name = "tower-mcp-types"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+authors = ["Josh Rotenberg <joshrotenberg@gmail.com>"]
+license = "MIT OR Apache-2.0"
+description = "MCP protocol and error types for tower-mcp (no runtime dependencies)"
+documentation = "https://docs.rs/tower-mcp-types"
+homepage = "https://github.com/joshrotenberg/tower-mcp"
+repository = "https://github.com/joshrotenberg/tower-mcp"
+readme = "../README.md"
+keywords = ["mcp", "json-rpc", "ai", "llm", "protocol"]
+categories = ["network-programming"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2"
+base64 = "0.22.1"
