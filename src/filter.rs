@@ -219,6 +219,40 @@ impl<T: Filterable> CapabilityFilter<T> {
     }
 }
 
+impl CapabilityFilter<Tool> {
+    /// Create a filter that blocks non-read-only tools when the predicate returns `false`.
+    ///
+    /// Read-only tools (those with `read_only_hint = true`) are always allowed.
+    /// Non-read-only tools are only allowed when `is_write_allowed` returns `true`
+    /// for the current session.
+    ///
+    /// This provides annotation-based write protection without requiring
+    /// manual guards in every write tool handler.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::{CapabilityFilter, Tool};
+    ///
+    /// // Block all write tools unconditionally
+    /// let filter = CapabilityFilter::<Tool>::write_guard(|_session| false);
+    ///
+    /// // Allow writes based on session state
+    /// // let filter = CapabilityFilter::<Tool>::write_guard(|session| {
+    /// //     session.get::<WriteEnabled>().is_some()
+    /// // });
+    /// ```
+    pub fn write_guard<F>(is_write_allowed: F) -> Self
+    where
+        F: Fn(&SessionState) -> bool + Send + Sync + 'static,
+    {
+        Self::new(move |session, tool: &Tool| {
+            let read_only = tool.annotations.as_ref().is_some_and(|a| a.read_only_hint);
+            read_only || is_write_allowed(session)
+        })
+    }
+}
+
 /// Type alias for tool filters.
 pub type ToolFilter = CapabilityFilter<Tool>;
 
@@ -301,6 +335,56 @@ mod tests {
         let error = filter.denial_error("test");
         match error {
             Error::JsonRpc(e) => assert_eq!(e.code, -32007), // McpErrorCode::Forbidden
+            _ => panic!("Expected JsonRpc error"),
+        }
+    }
+
+    fn make_read_only_tool(name: &str) -> Tool {
+        ToolBuilder::new(name)
+            .description("Read-only tool")
+            .read_only()
+            .handler(|_: serde_json::Value| async { Ok(CallToolResult::text("ok")) })
+            .build()
+    }
+
+    #[test]
+    fn test_write_guard_allows_read_only_when_writes_blocked() {
+        let filter = CapabilityFilter::<Tool>::write_guard(|_| false);
+        let session = SessionState::new();
+        let tool = make_read_only_tool("reader");
+
+        assert!(filter.is_visible(&session, &tool));
+    }
+
+    #[test]
+    fn test_write_guard_blocks_write_tool_when_writes_blocked() {
+        let filter = CapabilityFilter::<Tool>::write_guard(|_| false);
+        let session = SessionState::new();
+        let tool = make_test_tool("writer");
+
+        assert!(!filter.is_visible(&session, &tool));
+    }
+
+    #[test]
+    fn test_write_guard_allows_write_tool_when_writes_allowed() {
+        let filter = CapabilityFilter::<Tool>::write_guard(|_| true);
+        let session = SessionState::new();
+        let tool = make_test_tool("writer");
+
+        assert!(filter.is_visible(&session, &tool));
+    }
+
+    #[test]
+    fn test_write_guard_with_denial_behavior() {
+        let filter = CapabilityFilter::<Tool>::write_guard(|_| false)
+            .denial_behavior(DenialBehavior::Unauthorized);
+        let session = SessionState::new();
+        let tool = make_test_tool("writer");
+
+        assert!(!filter.is_visible(&session, &tool));
+        let error = filter.denial_error("writer");
+        match error {
+            Error::JsonRpc(e) => assert_eq!(e.code, -32007),
             _ => panic!("Expected JsonRpc error"),
         }
     }
