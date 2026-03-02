@@ -177,6 +177,10 @@ impl<S> JsonRpcService<S> {
                 let responses = self.call_batch(requests).await?;
                 Ok(JsonRpcResponseMessage::Batch(responses))
             }
+            _ => Ok(JsonRpcResponseMessage::Single(JsonRpcResponse::error(
+                None,
+                JsonRpcError::invalid_request("Unsupported message type"),
+            ))),
         }
     }
 }
@@ -303,6 +307,10 @@ where
 
                     Ok(JsonRpcResponseMessage::Batch(results))
                 }
+                _ => Ok(JsonRpcResponseMessage::Single(JsonRpcResponse::error(
+                    None,
+                    JsonRpcError::invalid_request("Unsupported message type"),
+                ))),
             }
         })
     }
@@ -407,6 +415,7 @@ mod tests {
                 assert_eq!(tools.len(), 1);
             }
             JsonRpcResponse::Error(e) => panic!("Expected result, got error: {:?}", e),
+            _ => panic!("unexpected response variant"),
         }
     }
 
@@ -483,6 +492,7 @@ mod tests {
                 assert_eq!(tools.len(), 1);
             }
             JsonRpcResponse::Error(e) => panic!("Expected result, got error: {:?}", e),
+            _ => panic!("unexpected response variant"),
         }
     }
 

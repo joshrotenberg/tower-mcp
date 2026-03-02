@@ -90,6 +90,7 @@ pub struct JsonRpcErrorResponse {
 /// JSON-RPC 2.0 response (either success or error).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum JsonRpcResponse {
     /// Successful response with result.
     Result(JsonRpcResultResponse),
@@ -120,6 +121,7 @@ impl JsonRpcResponse {
 /// JSON-RPC 2.0 message - can be a single request or a batch
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum JsonRpcMessage {
     /// A single request
     Single(JsonRpcRequest),
@@ -150,6 +152,7 @@ impl JsonRpcMessage {
 /// JSON-RPC 2.0 response message - can be a single response or a batch
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum JsonRpcResponseMessage {
     /// A single response
     Single(JsonRpcResponse),
@@ -219,6 +222,7 @@ pub mod notifications {
 /// Levels are ordered from most severe (emergency) to least severe (debug).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum LogLevel {
     /// System is unusable
     Emergency,
@@ -307,6 +311,7 @@ pub struct SetLogLevelParams {
 /// Request ID - can be string or number per JSON-RPC spec
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum RequestId {
     String(String),
     Number(i64),
@@ -342,6 +347,7 @@ impl From<i32> for RequestId {
 
 /// High-level MCP request (parsed from JSON-RPC)
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum McpRequest {
     /// Initialize session
     Initialize(InitializeParams),
@@ -412,6 +418,7 @@ impl McpRequest {
 
 /// High-level MCP notification (parsed from JSON-RPC)
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum McpNotification {
     /// Client has completed initialization
     Initialized,
@@ -465,6 +472,7 @@ pub struct ProgressParams {
 /// Progress token - can be string or number
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum ProgressToken {
     String(String),
     Number(i64),
@@ -482,6 +490,7 @@ pub struct RequestMeta {
 /// High-level MCP response
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum McpResponse {
     Initialize(InitializeResult),
     ListTools(ListToolsResult),
@@ -751,6 +760,7 @@ impl ResourceReference {
 /// Reference for completion - either a prompt or resource reference
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
+#[non_exhaustive]
 pub enum CompletionReference {
     /// Reference to a prompt
     #[serde(rename = "ref/prompt")]
@@ -958,6 +968,7 @@ impl ModelPreferences {
 /// Context inclusion mode for sampling
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum IncludeContext {
     /// Include context from all connected MCP servers
     AllServers,
@@ -1088,6 +1099,7 @@ impl ToolChoice {
 /// Content types for sampling messages
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum SamplingContent {
     /// Text content
     Text {
@@ -1200,6 +1212,7 @@ impl SamplingContent {
 /// SamplingContent or an array of SamplingContent items.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum SamplingContentOrArray {
     /// Single content item
     Single(SamplingContent),
@@ -1572,6 +1585,7 @@ pub struct ToolDefinition {
 /// Icon theme context
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum IconTheme {
     /// Icon designed for light backgrounds
     Light,
@@ -2046,6 +2060,7 @@ impl CallToolResult {
 /// supports optional annotations for audience targeting and priority hints.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Content {
     /// Plain text content.
     Text {
@@ -2199,6 +2214,7 @@ impl Content {
 /// Used in content annotations to specify the target audience.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum ContentRole {
     /// Content intended for the human user.
     User,
@@ -2885,6 +2901,7 @@ pub struct PromptMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum PromptRole {
     User,
     Assistant,
@@ -2897,6 +2914,7 @@ pub enum PromptRole {
 /// Task support mode for tool execution
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum TaskSupportMode {
     /// Task execution is required (tool MUST be called with task params)
     Required,
@@ -2928,6 +2946,7 @@ pub struct TaskRequestParams {
 /// Status of an async task
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum TaskStatus {
     /// Task is actively being processed
     Working,
@@ -3137,6 +3156,7 @@ pub struct ElicitUrlParams {
 /// Elicitation request parameters (union of form and URL modes)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum ElicitRequestParams {
     Form(ElicitFormParams),
     Url(ElicitUrlParams),
@@ -3145,6 +3165,7 @@ pub enum ElicitRequestParams {
 /// Elicitation mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum ElicitMode {
     /// Form-based elicitation with structured input
     Form,
@@ -3424,6 +3445,7 @@ impl Default for ElicitFormSchema {
 /// Primitive schema definition for form fields
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum PrimitiveSchemaDefinition {
     /// String field
     String(StringSchema),
@@ -3571,6 +3593,7 @@ pub struct MultiSelectEnumItems {
 /// User action in response to elicitation
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum ElicitAction {
     /// User submitted the form/confirmed the action
     Accept,
@@ -3625,6 +3648,7 @@ impl ElicitResult {
 /// Value from an elicitation form field
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum ElicitFieldValue {
     String(String),
     Number(f64),

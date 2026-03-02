@@ -942,6 +942,7 @@ impl McpRouter {
     ///                 // Return resource URI completions
     ///                 Ok(CompleteResult::new(vec![]))
     ///             }
+    ///             _ => Ok(CompleteResult::new(vec![])),
     ///         }
     ///     });
     /// ```
@@ -1774,6 +1775,9 @@ impl McpRouter {
             McpRequest::Unknown { method, .. } => {
                 Err(Error::JsonRpc(JsonRpcError::method_not_found(&method)))
             }
+            _ => Err(Error::JsonRpc(JsonRpcError::method_not_found(
+                "unknown method",
+            ))),
         }
     }
 
@@ -1835,6 +1839,9 @@ impl McpRouter {
             }
             McpNotification::Unknown { method, .. } => {
                 tracing::debug!(method = %method, "Unknown notification received");
+            }
+            _ => {
+                tracing::debug!("Unrecognized notification variant received");
             }
         }
     }
@@ -2074,6 +2081,7 @@ mod tests {
                 assert_eq!(tools.len(), 1);
             }
             JsonRpcResponse::Error(_) => panic!("Expected success response"),
+            _ => panic!("unexpected response variant"),
         }
     }
 
@@ -2114,6 +2122,7 @@ mod tests {
                 assert_eq!(tools.len(), 1);
             }
             JsonRpcResponse::Error(_) => panic!("Expected success for tools/list"),
+            _ => panic!("unexpected response variant"),
         }
 
         // Check second response (tools/call)
@@ -2125,6 +2134,7 @@ mod tests {
                 assert_eq!(text, "30");
             }
             JsonRpcResponse::Error(_) => panic!("Expected success for tools/call"),
+            _ => panic!("unexpected response variant"),
         }
 
         // Check third response (ping)
@@ -2133,6 +2143,7 @@ mod tests {
                 assert_eq!(r.id, RequestId::Number(3));
             }
             JsonRpcResponse::Error(_) => panic!("Expected success for ping"),
+            _ => panic!("unexpected response variant"),
         }
     }
 
@@ -2198,6 +2209,7 @@ mod tests {
         match resp {
             JsonRpcResponse::Result(_) => {}
             JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+            _ => panic!("unexpected response variant"),
         }
 
         // Verify progress was reported by handler
@@ -2304,6 +2316,7 @@ mod tests {
                 assert_eq!(r.id, RequestId::Number(1));
             }
             JsonRpcResponse::Error(_) => panic!("Expected success for first request"),
+            _ => panic!("unexpected response variant"),
         }
 
         // Second should be an error (tool not found)
@@ -2314,6 +2327,7 @@ mod tests {
                 assert!(e.error.message.contains("not found") || e.error.code == -32601);
             }
             JsonRpcResponse::Result(_) => panic!("Expected error for second request"),
+            _ => panic!("unexpected response variant"),
         }
 
         // Third should be success
@@ -2322,6 +2336,7 @@ mod tests {
                 assert_eq!(r.id, RequestId::Number(3));
             }
             JsonRpcResponse::Error(_) => panic!("Expected success for third request"),
+            _ => panic!("unexpected response variant"),
         }
     }
 

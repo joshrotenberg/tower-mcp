@@ -357,6 +357,7 @@ impl TestClient {
                     );
                 }
             }
+            _ => panic!("unexpected response variant"),
         }
     }
 
@@ -464,6 +465,7 @@ impl TestClient {
                     method, r.result
                 );
             }
+            _ => panic!("unexpected response variant"),
         }
     }
 
@@ -501,6 +503,7 @@ impl TestClient {
                     method, e.error.message, e.error.code,
                 );
             }
+            _ => panic!("unexpected response variant"),
         }
     }
 }

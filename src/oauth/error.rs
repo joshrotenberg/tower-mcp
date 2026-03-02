@@ -11,6 +11,7 @@ use std::fmt;
 /// Each variant maps to a specific HTTP status code and `WWW-Authenticate`
 /// header value per RFC 6750 Section 3.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum OAuthError {
     /// No bearer token was provided in the request.
     /// Returns HTTP 401 with `WWW-Authenticate: Bearer`.

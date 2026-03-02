@@ -41,6 +41,7 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// Standard JSON-RPC error codes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
+#[non_exhaustive]
 pub enum ErrorCode {
     /// Invalid JSON was received
     ParseError = -32700,
@@ -57,6 +58,7 @@ pub enum ErrorCode {
 /// MCP-specific error codes (in the -32000 to -32099 range)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
+#[non_exhaustive]
 pub enum McpErrorCode {
     /// Transport connection was closed
     ConnectionClosed = -32000,
@@ -277,6 +279,7 @@ impl ToolError {
 
 /// tower-mcp error type
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("JSON-RPC error: {0:?}")]
     JsonRpc(JsonRpcError),

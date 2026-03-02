@@ -158,6 +158,9 @@ fn print_result(result: &tower_mcp::CallToolResult) {
             tower_mcp::Content::ResourceLink { .. } => {
                 println!("    Result: (resource link)");
             }
+            _ => {
+                println!("    Result: (unknown content type)");
+            }
         }
     }
     println!();
