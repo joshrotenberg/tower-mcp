@@ -131,6 +131,23 @@ Example with features:
 tower-mcp = { version = "0.6", features = ["full"] }
 ```
 
+### Types Only
+
+If you only need MCP protocol types and error types -- without tower, tokio, or axum --
+use the [`tower-mcp-types`](https://crates.io/crates/tower-mcp-types) crate directly.
+This is useful for editor integrations, code generators, protocol validators, or
+any context where you want to serialize/deserialize MCP messages without a runtime.
+
+```toml
+[dependencies]
+tower-mcp-types = "0.1"
+```
+
+`tower-mcp-types` provides all types from `tower_mcp::protocol` and `tower_mcp::error`
+with minimal dependencies (`serde`, `serde_json`, `thiserror`, `base64`). The full
+`tower-mcp` crate re-exports everything from `tower-mcp-types`, so there is no
+duplication if you use both.
+
 ## Quick Start
 
 ```rust
