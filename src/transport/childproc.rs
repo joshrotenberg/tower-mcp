@@ -180,6 +180,7 @@ impl ChildProcessConnection {
         match response {
             JsonRpcResponse::Result(r) => Ok(r.result),
             JsonRpcResponse::Error(e) => Err(Error::JsonRpc(e.error)),
+            _ => Err(Error::Transport("unexpected response variant".to_string())),
         }
     }
 

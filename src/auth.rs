@@ -42,6 +42,7 @@ use tower::Layer;
 
 /// Result of an authentication attempt
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum AuthResult {
     /// Authentication succeeded with optional user/client info
     Authenticated(Option<AuthInfo>),

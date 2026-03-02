@@ -213,6 +213,7 @@ fn extract_operation_details(req: &McpRequest) -> (Option<&'static str>, Option<
                 crate::protocol::CompletionReference::Prompt { name } => {
                     format!("prompt:{}", name)
                 }
+                _ => "unknown".to_string(),
             };
             (Some("complete"), Some(ref_type))
         }
@@ -222,6 +223,7 @@ fn extract_operation_details(req: &McpRequest) -> (Option<&'static str>, Option<
         McpRequest::Initialize(_) => (Some("init"), None),
         McpRequest::Ping => (Some("ping"), None),
         McpRequest::Unknown { method, .. } => (Some("unknown"), Some(method.clone())),
+        _ => (Some("unknown"), None),
     }
 }
 

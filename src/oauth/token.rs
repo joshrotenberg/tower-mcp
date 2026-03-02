@@ -17,6 +17,7 @@ use super::error::OAuthError;
 /// Audience claim value, which can be a single string or array of strings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum TokenAudience {
     /// A single audience string.
     Single(String),
@@ -329,6 +330,7 @@ impl<V: crate::auth::Validate> TokenValidator for ValidateAdapter<V> {
 /// Errors from JWKS endpoint fetching and key parsing.
 #[cfg(feature = "jwks")]
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum JwksError {
     /// HTTP request to the JWKS endpoint failed.
     Fetch(reqwest::Error),

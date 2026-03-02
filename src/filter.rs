@@ -69,6 +69,7 @@ impl Filterable for Prompt {
 
 /// Behavior when a filtered capability is accessed directly.
 #[derive(Clone, Default)]
+#[non_exhaustive]
 pub enum DenialBehavior {
     /// Return "method not found" error -- hides the capability entirely.
     ///

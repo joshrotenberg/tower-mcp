@@ -15,6 +15,7 @@ use crate::router::Extensions;
 /// Session lifecycle phase
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum SessionPhase {
     /// Initial state - only `initialize` and `ping` requests are valid
     Uninitialized = 0,

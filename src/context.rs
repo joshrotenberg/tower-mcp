@@ -83,6 +83,7 @@ use crate::protocol::{
 
 /// A notification to be sent to the client
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ServerNotification {
     /// Progress update for a request
     Progress(ProgressParams),

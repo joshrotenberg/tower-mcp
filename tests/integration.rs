@@ -191,6 +191,7 @@ async fn test_session_lifecycle_happy_path() {
             assert!(r.result.get("capabilities").is_some());
         }
         JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     }
 
     // 2. Send initialized notification (handled by router directly)
@@ -205,6 +206,7 @@ async fn test_session_lifecycle_happy_path() {
             assert_eq!(tools.len(), 3);
         }
         JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     }
 
     // 4. Call a tool
@@ -222,6 +224,7 @@ async fn test_session_lifecycle_happy_path() {
             assert_eq!(text, "Hello, MCP!");
         }
         JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -239,6 +242,7 @@ async fn test_session_rejects_requests_before_init() {
             assert!(e.error.message.contains("not initialized"));
         }
         JsonRpcResponse::Result(_) => panic!("Expected error for pre-init request"),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -254,6 +258,7 @@ async fn test_ping_always_allowed() {
     match resp {
         JsonRpcResponse::Result(_) => {} // Success
         JsonRpcResponse::Error(e) => panic!("Ping should always work: {:?}", e),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -289,6 +294,7 @@ async fn test_tool_call_add() {
             assert_eq!(text, "42");
         }
         JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -318,6 +324,7 @@ async fn test_tool_not_found() {
             assert_eq!(e.error.code, -32601); // Method not found
         }
         JsonRpcResponse::Result(_) => panic!("Expected error for nonexistent tool"),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -358,6 +365,7 @@ async fn test_tool_invalid_arguments() {
             "Expected CallToolResult with is_error, got JSON-RPC error: {:?}",
             e
         ),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -398,6 +406,7 @@ async fn test_tool_execution_error() {
             "Expected CallToolResult with is_error, got JSON-RPC error: {:?}",
             e
         ),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -438,6 +447,7 @@ async fn test_batch_requests() {
         match resp {
             JsonRpcResponse::Result(_) => {}
             JsonRpcResponse::Error(e) => panic!("Unexpected error in batch: {:?}", e),
+            _ => panic!("unexpected response variant"),
         }
     }
 }
@@ -465,6 +475,7 @@ async fn test_protocol_version_negotiation_supported() {
             assert_eq!(version, "2025-03-26");
         }
         JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -489,6 +500,7 @@ async fn test_protocol_version_negotiation_unsupported() {
             assert_eq!(version, "2025-11-25");
         }
         JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -516,6 +528,7 @@ async fn test_invalid_jsonrpc_version() {
             assert_eq!(e.error.code, -32600); // Invalid request
         }
         JsonRpcResponse::Result(_) => panic!("Expected error for invalid JSON-RPC version"),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -547,6 +560,7 @@ async fn test_error_unknown_method() {
             assert!(e.error.message.contains("unknown/method"));
         }
         JsonRpcResponse::Result(_) => panic!("Expected error for unknown method"),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -587,6 +601,7 @@ async fn test_error_malformed_tool_arguments() {
             "Expected CallToolResult with is_error, got JSON-RPC error: {:?}",
             e
         ),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -650,6 +665,7 @@ async fn test_error_missing_required_params() {
             "Expected CallToolResult with is_error, got JSON-RPC error: {:?}",
             e
         ),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -678,6 +694,7 @@ async fn test_error_resources_not_found() {
             assert_eq!(e.error.code, -32002); // MCP ResourceNotFound
         }
         JsonRpcResponse::Result(_) => panic!("Expected error for resource not found"),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -706,6 +723,7 @@ async fn test_error_prompts_not_found() {
             assert_eq!(e.error.code, -32601); // Method not found (prompt not found)
         }
         JsonRpcResponse::Result(_) => panic!("Expected error for prompt not found"),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -736,6 +754,7 @@ async fn test_resources_list() {
             );
         }
         JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     }
 
     router.handle_notification(tower_mcp::protocol::McpNotification::Initialized);
@@ -756,6 +775,7 @@ async fn test_resources_list() {
             }
         }
         JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -800,6 +820,7 @@ async fn test_resources_read_json() {
             assert!(parsed.get("debug").unwrap().as_bool().unwrap());
         }
         JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -831,6 +852,7 @@ async fn test_resources_read_text() {
             assert!(text.contains("# Test Project"));
         }
         JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -862,6 +884,7 @@ async fn test_resources_read_dynamic() {
             assert_eq!(text, "42");
         }
         JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -891,6 +914,7 @@ async fn test_resources_read_not_found() {
             assert!(e.error.message.contains("not found"));
         }
         JsonRpcResponse::Result(_) => panic!("Expected error for non-existent resource"),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -921,6 +945,7 @@ async fn test_prompts_list() {
             );
         }
         JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     }
 
     router.handle_notification(tower_mcp::protocol::McpNotification::Initialized);
@@ -940,6 +965,7 @@ async fn test_prompts_list() {
             }
         }
         JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -979,6 +1005,7 @@ async fn test_prompts_get_with_args() {
             assert!(text.contains("Alice"));
         }
         JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -1015,6 +1042,7 @@ async fn test_prompts_get_code_review() {
             assert!(text.contains("println"));
         }
         JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -1046,6 +1074,7 @@ async fn test_prompts_get_static() {
             assert_eq!(text, "How can I help you today?");
         }
         JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -1075,6 +1104,7 @@ async fn test_prompts_get_not_found() {
             assert!(e.error.message.contains("not found"));
         }
         JsonRpcResponse::Result(_) => panic!("Expected error for non-existent prompt"),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -1111,6 +1141,7 @@ async fn test_capabilities_tools_only() {
             );
         }
         JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -1143,6 +1174,7 @@ async fn test_capabilities_all() {
             );
         }
         JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -1410,6 +1442,7 @@ mod scope_enforcement_tests {
                 );
             }
             JsonRpcResponse::Result(_) => panic!("Expected forbidden error"),
+            _ => panic!("unexpected response variant"),
         }
     }
 
@@ -1435,6 +1468,7 @@ mod scope_enforcement_tests {
                 assert_eq!(text, "hello");
             }
             JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+            _ => panic!("unexpected response variant"),
         }
     }
 
@@ -1460,6 +1494,7 @@ mod scope_enforcement_tests {
                 assert_eq!(text, "no auth");
             }
             JsonRpcResponse::Error(e) => panic!("Expected pass-through, got error: {:?}", e),
+            _ => panic!("unexpected response variant"),
         }
     }
 
@@ -1482,6 +1517,7 @@ mod scope_enforcement_tests {
                 assert_eq!(e.error.code, -32007);
             }
             JsonRpcResponse::Result(_) => panic!("Expected forbidden error for resource"),
+            _ => panic!("unexpected response variant"),
         }
     }
 
@@ -1505,6 +1541,7 @@ mod scope_enforcement_tests {
                 assert_eq!(e.error.code, -32007);
             }
             JsonRpcResponse::Result(_) => panic!("Expected forbidden error for prompt"),
+            _ => panic!("unexpected response variant"),
         }
     }
 
@@ -1530,6 +1567,7 @@ mod scope_enforcement_tests {
                 assert_eq!(e.error.code, -32007);
             }
             JsonRpcResponse::Result(_) => panic!("Expected forbidden error for default scope"),
+            _ => panic!("unexpected response variant"),
         }
     }
 }
@@ -1620,6 +1658,7 @@ async fn test_task_create_via_tools_call() {
             );
         }
         JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -1640,6 +1679,7 @@ async fn test_task_list_after_creation() {
     let task_id = match &resp {
         JsonRpcResponse::Result(r) => r.result["task"]["taskId"].as_str().unwrap().to_string(),
         JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     };
 
     // List tasks
@@ -1656,6 +1696,7 @@ async fn test_task_list_after_creation() {
             assert!(found, "created task should be in the list");
         }
         JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -1676,6 +1717,7 @@ async fn test_task_get_info() {
     let task_id = match &resp {
         JsonRpcResponse::Result(r) => r.result["task"]["taskId"].as_str().unwrap().to_string(),
         JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     };
 
     // Get task info
@@ -1703,6 +1745,7 @@ async fn test_task_get_info() {
             );
         }
         JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -1723,6 +1766,7 @@ async fn test_task_lifecycle_get_result() {
     let task_id = match &resp {
         JsonRpcResponse::Result(r) => r.result["task"]["taskId"].as_str().unwrap().to_string(),
         JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     };
 
     // Wait briefly for the spawned task to complete
@@ -1748,6 +1792,7 @@ async fn test_task_lifecycle_get_result() {
             assert_eq!(related_task["taskId"].as_str().unwrap(), task_id);
         }
         JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -1768,6 +1813,7 @@ async fn test_task_cancel() {
     let task_id = match &resp {
         JsonRpcResponse::Result(r) => r.result["task"]["taskId"].as_str().unwrap().to_string(),
         JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     };
 
     // Cancel the task
@@ -1782,6 +1828,7 @@ async fn test_task_cancel() {
             assert_eq!(r.result["status"].as_str().unwrap(), "cancelled");
         }
         JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -1802,6 +1849,7 @@ async fn test_task_cancel_already_terminal() {
     let task_id = match &resp {
         JsonRpcResponse::Result(r) => r.result["task"]["taskId"].as_str().unwrap().to_string(),
         JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     };
 
     // Wait for completion
@@ -1822,6 +1870,7 @@ async fn test_task_cancel_already_terminal() {
             );
         }
         JsonRpcResponse::Result(_) => panic!("Expected error for cancel of terminal task"),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -1848,6 +1897,7 @@ async fn test_task_forbidden_tool_rejects_task_params() {
             );
         }
         JsonRpcResponse::Result(_) => panic!("Expected error for forbidden tool with task params"),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -1875,6 +1925,7 @@ async fn test_task_required_tool_rejects_sync_call() {
         JsonRpcResponse::Result(_) => {
             panic!("Expected error for required tool without task params")
         }
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -1905,6 +1956,7 @@ async fn test_task_capabilities_advertised() {
             );
         }
         JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -1930,6 +1982,7 @@ async fn test_task_capabilities_not_advertised_without_task_tools() {
             );
         }
         JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -1973,6 +2026,7 @@ async fn test_task_tool_definition_includes_execution() {
             }
         }
         JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -1996,6 +2050,7 @@ async fn test_task_get_nonexistent() {
             );
         }
         JsonRpcResponse::Result(_) => panic!("Expected error for nonexistent task"),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -2026,6 +2081,7 @@ async fn test_client_tasks_capability_round_trip() {
     match resp {
         JsonRpcResponse::Result(_) => {}
         JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -2052,6 +2108,7 @@ async fn test_sampling_capability_round_trip() {
     match resp {
         JsonRpcResponse::Result(_) => {}
         JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     }
 }
 
@@ -2079,5 +2136,6 @@ async fn test_experimental_capabilities_round_trip() {
     match resp {
         JsonRpcResponse::Result(_) => {}
         JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+        _ => panic!("unexpected response variant"),
     }
 }
