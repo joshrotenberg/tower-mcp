@@ -15,6 +15,7 @@ Tower-native [Model Context Protocol](https://modelcontextprotocol.io) (MCP) imp
 tower-mcp provides a composable, middleware-friendly approach to building MCP servers using the [Tower](https://github.com/tower-rs/tower) service abstraction. Unlike framework-style MCP implementations, tower-mcp treats MCP as just another protocol that can be served through Tower's `Service` trait.
 
 This means:
+
 - Standard tower middleware (tracing, metrics, rate limiting, auth) just works
 - Same service can be exposed over multiple transports (stdio, HTTP, WebSocket)
 - Easy integration with existing tower-based applications (axum, tonic)
@@ -28,125 +29,25 @@ If you've used [axum](https://docs.rs/axum), tower-mcp's API will feel familiar:
 - **Per-handler middleware**: Apply Tower layers to individual tools, resources, or prompts via `.layer()`
 - **Builder pattern**: Fluent builders for tools, resources, and prompts
 
-## Live Demo
+## Why tower-mcp?
 
-A full-featured MCP server for querying [crates.io](https://crates.io) is available as a standalone project: [cratesio-mcp](https://github.com/joshrotenberg/cratesio-mcp). It includes tools, prompts, and resources for crate search, docs.rs integration, and vulnerability auditing via OSV.dev.
+### Strengths
 
-A demo instance is deployed at **https://cratesio-mcp.fly.dev** -- connect with any MCP client that supports HTTP transport.
+| | |
+|---|---|
+| **Tower-native middleware** | Timeout, rate-limit, auth, tracing -- on the whole server or on individual tools. Any `tower::Layer` works. |
+| **All transports** | stdio, HTTP/SSE (with stream resumption), WebSocket, and child process. Same router, any transport. |
+| **In-process testing** | `TestClient` lets you test MCP servers without spawning a subprocess or opening a socket. |
+| **Conformance** | 39/39 official MCP conformance tests pass in CI on every PR. |
+| **Capability filtering** | Session-based tool/resource/prompt visibility for multi-tenant patterns. |
+| **No proc macros required** | Builder pattern API with optional trait-based tools. Nothing hidden behind `#[derive]`. |
+| **axum ecosystem** | HTTP and WebSocket transports build on axum, so existing axum middleware and extractors work. |
 
-## Try the Examples
+### Trade-offs
 
-Clone the repo and run your MCP-enabled agent (like Claude Code) in the
-tower-mcp directory. The `.mcp.json` configures several example servers:
-
-| Server | Description |
-|--------|-------------|
-| `markdownlint-mcp` | Lint markdown with 66 rules |
-| `codegen-mcp` | Helps AI agents build tower-mcp servers |
-| `weather` | Weather forecasts via NWS API |
-| `conformance` | Full MCP spec conformance server (39/39 tests) |
-
-```bash
-git clone https://github.com/joshrotenberg/tower-mcp
-cd tower-mcp
-# Run your MCP agent here - servers will be available automatically
-```
-
-For a guided tour, ask your agent to read [`examples/README.md`](examples/README.md).
-Or jump straight in:
-
-- "Lint examples/README.md for issues" (markdownlint-mcp)
-- "What's the weather in Seattle?" (weather)
-
-## Status
-
-**Active development** - Core protocol, routing, and transports are implemented. Used in production for MCP server deployments.
-
-### Implemented
-- JSON-RPC 2.0 message types, validation, and batch request handling
-- MCP protocol types (tools, resources, prompts)
-- Tool builder with type-safe handlers and JSON Schema generation via [schemars](https://crates.io/crates/schemars)
-- `McpTool` trait for complex tools
-- `McpRouter` implementing Tower's `Service` trait
-- `JsonRpcService` layer for protocol framing
-- Session state management with reconnection support
-- Protocol version negotiation (supports `2025-11-25` with `2025-03-26` backward compat)
-- Tool annotations (behavior hints for trust/safety)
-- **Transports**: stdio (`StdioTransport`, `SyncStdioTransport`, `BidirectionalStdioTransport`, `GenericStdioTransport`), HTTP (with SSE and stream resumption), WebSocket, child process
-- **Resources**: list, read, subscribe/unsubscribe with change notifications
-- **Resource templates**: `resources/templates/list` with URI template matching (RFC 6570)
-- **Prompts**: list and get with argument support
-- **Logging**: `notifications/message` and `logging/setLevel` with structured log data
-- **Authentication**: API key and Bearer token middleware helpers
-- **Elicitation**: Server-to-client user input requests (form mode via `elicit()` and URL mode via `elicit_url()`)
-- **Client support**: MCP client for connecting to external servers
-- **Progress notifications**: Via `RequestContext` in tool handlers
-- **Request cancellation**: Via `CancellationToken` in tool handlers
-- **Completion**: Autocomplete for prompt arguments and resource URIs
-- **Sampling types**: `CreateMessageParams`/`CreateMessageResult` for LLM requests
-- **Sampling runtime**: Full support on stdio, WebSocket, and HTTP transports
-- **Async tasks**: Task ID generation, status tracking, TTL-based cleanup, per-tool `task_support` mode
-- **Per-tool guards**: Request-level access control for individual tools
-- **Capability filters**: Session-based tool/resource/prompt visibility
-- **`ResultExt`**: Ergonomic error handling in tool handlers
-- **Auto-generated instructions**: Server instructions derived from registered capabilities
-- **Convenience helpers**: `Content::text()`, `CallToolResult::from_list()`, JSON helpers
-- **Tool-level testing**: Unit test tools directly via `Tool::call()`
-- **Infallible builds**: `ToolBuilder::build()` is infallible; `try_new()` available for runtime names
-- **Cursor-based pagination**: `McpRouter::page_size()` for paginated list responses
-- **Tool output schema**: `ToolBuilder::output_schema()` for structured output validation
-- **Server metadata**: `server_title()`, `server_description()`, `server_icons()`, `server_website_url()`
-- **`McpTracingLayer`**: Built-in Tower middleware for structured request logging
-- **`list_changed` notifications**: `notify_tools_list_changed()`, `notify_resources_list_changed()`, `notify_prompts_list_changed()`
-- **Dynamic tools**: Runtime tool registration/deregistration via `DynamicToolRegistry` (feature: `dynamic-tools`)
-- **Experimental capabilities**: `experimental` field on both client and server capabilities
-- **Extension support**: `extensions` field on server and client capabilities for declared extension negotiation
-
-## Installation
-
-Add to your `Cargo.toml`:
-
-```toml
-[dependencies]
-tower-mcp = "0.6"
-```
-
-### Feature Flags
-
-| Feature | Description |
-|---------|-------------|
-| `full` | Enable all optional features |
-| `http` | HTTP transport with SSE support (adds axum, hyper) |
-| `websocket` | WebSocket transport for full-duplex communication |
-| `childproc` | Child process transport for spawning subprocess MCP servers |
-| `oauth` | OAuth 2.1 resource server support (JWT validation) |
-| `jwks` | JWKS endpoint fetching for remote key sets (requires `oauth`) |
-| `testing` | Test utilities (`TestClient`) for in-process testing |
-| `dynamic-tools` | Runtime tool registration/deregistration via `DynamicToolRegistry` |
-
-Example with features:
-
-```toml
-[dependencies]
-tower-mcp = { version = "0.6", features = ["full"] }
-```
-
-### Types Only
-
-If you only need MCP protocol types and error types -- without tower, tokio, or axum --
-use the [`tower-mcp-types`](https://crates.io/crates/tower-mcp-types) crate directly.
-This is useful for editor integrations, code generators, protocol validators, or
-any context where you want to serialize/deserialize MCP messages without a runtime.
-
-```toml
-[dependencies]
-tower-mcp-types = "0.1"
-```
-
-`tower-mcp-types` provides all types from `tower_mcp::protocol` and `tower_mcp::error`
-with minimal dependencies (`serde`, `serde_json`, `thiserror`, `base64`). The full
-`tower-mcp` crate re-exports everything from `tower-mcp-types`, so there is no
-duplication if you use both.
+- **More boilerplate than macro-based approaches** for simple servers. If you want `#[tool]` on a function and nothing else, a proc-macro SDK may be more concise.
+- **Requires Tower/Service familiarity.** The `.layer()` composition model is powerful but has a learning curve if you haven't used Tower before.
+- **Heavier dependency tree** than minimal single-transport implementations, especially with `features = ["full"]`.
 
 ## Quick Start
 
@@ -177,6 +78,52 @@ let router = McpRouter::new()
 
 // The router implements tower::Service and can be composed with middleware
 ```
+
+## Installation
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+tower-mcp = "0.7"
+```
+
+### Feature Flags
+
+| Feature | Description |
+|---------|-------------|
+| `full` | Enable all optional features |
+| `http` | HTTP transport with SSE support (adds axum, hyper) |
+| `websocket` | WebSocket transport for full-duplex communication |
+| `childproc` | Child process transport for spawning subprocess MCP servers |
+| `oauth` | OAuth 2.1 resource server support (JWT validation) |
+| `jwks` | JWKS endpoint fetching for remote key sets (requires `oauth`) |
+| `testing` | Test utilities (`TestClient`) for in-process testing |
+| `dynamic-tools` | Runtime tool registration/deregistration via `DynamicToolRegistry` |
+
+Example with features:
+
+```toml
+[dependencies]
+tower-mcp = { version = "0.7", features = ["full"] }
+```
+
+### Types Only
+
+If you only need MCP protocol types and error types -- without tower, tokio, or axum --
+use the [`tower-mcp-types`](https://crates.io/crates/tower-mcp-types) crate directly.
+This is useful for editor integrations, code generators, protocol validators, or
+any context where you want to serialize/deserialize MCP messages without a runtime.
+
+```toml
+[dependencies]
+tower-mcp-types = "0.1"
+```
+
+`tower-mcp-types` provides all types from `tower_mcp::protocol` and `tower_mcp::error`
+with minimal dependencies (`serde`, `serde_json`, `thiserror`, `base64`). The full
+`tower-mcp` crate re-exports everything from `tower-mcp-types`, so there is no
+duplication if you use both.
 
 ## Tool Definition
 
@@ -268,50 +215,7 @@ let search = ToolBuilder::new("search")
     .build();
 ```
 
-### Tool with Icons and Title
-
-```rust
-let tool = ToolBuilder::new("analyze")
-    .title("Code Analyzer")          // Human-readable display name
-    .description("Analyze code quality")
-    .icon("https://example.com/icon.svg")
-    .read_only()
-    .idempotent()
-    .build();
-```
-
-### Per-Tool Middleware
-
-Apply Tower layers to individual tools:
-
-```rust
-use std::time::Duration;
-use tower::timeout::TimeoutLayer;
-
-let slow_tool = ToolBuilder::new("slow_search")
-    .description("Thorough search (may take a while)")
-    .handler(|input: SearchInput| async move {
-        // ... slow operation ...
-        Ok(CallToolResult::text("results"))
-    })
-    .layer(TimeoutLayer::new(Duration::from_secs(60)))  // 60s for this tool
-    .build();
-```
-
-### Raw JSON Handler (Escape Hatch)
-
-Use `RawArgs` extractor when you need the raw JSON:
-
-```rust
-use tower_mcp::extract::RawArgs;
-
-let echo = ToolBuilder::new("echo")
-    .description("Echo back the input")
-    .extractor_handler((), |RawArgs(args): RawArgs| async move {
-        Ok(CallToolResult::json(args))
-    })
-    .build();
-```
+See [docs.rs](https://docs.rs/tower-mcp) for more patterns including per-tool middleware, icons and titles, raw JSON handlers, and output schemas.
 
 ## Resource Definition
 
@@ -473,9 +377,67 @@ let app = transport.into_router()
     .layer(middleware::from_fn(auth_middleware));
 ```
 
+## Testing
+
+tower-mcp includes `TestClient` (feature: `testing`) for in-process server testing -- no subprocess, no network, no port management:
+
+```rust
+use tower_mcp::TestClient;
+use serde_json::json;
+
+let mut client = TestClient::from_router(router);
+client.initialize().await;
+
+// List and call tools
+let tools = client.list_tools().await;
+assert_eq!(tools.len(), 1);
+
+let result = client.call_tool("greet", json!({"name": "World"})).await;
+assert_eq!(result.all_text(), "Hello, World!");
+
+// Typed deserialization
+let stats: ServerStats = client.call_tool_typed("stats", json!({})).await;
+
+// Assert expected errors
+let err = client.call_tool_expect_error("missing", json!({})).await;
+```
+
+`TestClient` handles JSON-RPC framing, request IDs, and protocol initialization. Methods panic on unexpected errors, keeping test code concise.
+
+## Capability Filtering
+
+Control which tools, resources, and prompts each session can see. This enables multi-tenant patterns where different clients get different capabilities based on auth claims or session state:
+
+```rust
+use tower_mcp::CapabilityFilter;
+
+// Hide write tools from sessions that aren't authorized
+let router = McpRouter::new()
+    .tool(read_tool)
+    .tool(write_tool)
+    .tool_filter(CapabilityFilter::write_guard(|session| {
+        session.get::<UserRole>()
+            .map(|r| r.is_admin())
+            .unwrap_or(false)
+    }));
+```
+
+`write_guard` uses tool annotations: tools marked `.read_only()` are always visible, while other tools are only shown to sessions where the predicate returns `true`. Hidden tools return "method not found" by default, or configure `DenialBehavior::Unauthorized` to reveal their existence without granting access.
+
+Filters work on resources and prompts too:
+
+```rust
+let router = McpRouter::new()
+    .resource(public_resource)
+    .resource(internal_resource)
+    .resource_filter(CapabilityFilter::new(|session, resource: &Resource| {
+        !resource.name().contains("internal") || session.get::<AdminClaim>().is_some()
+    }));
+```
+
 ## Architecture
 
-```
+```text
                     +-----------------+
                     |  Your App       |
                     +-----------------+
@@ -499,19 +461,9 @@ let app = transport.into_router()
          +--------+   +--------+   +--------+
 ```
 
-## Design Philosophy
-
-| Aspect | tower-mcp |
-|--------|-----------|
-| Style | Library, not framework |
-| Tool definition | Builder pattern or trait-based |
-| Middleware | Native tower layers |
-| Transport | Pluggable (stdio, HTTP, WebSocket, child process) |
-| Integration | Composable with axum/tonic |
-
 ## Protocol Compliance
 
-tower-mcp targets the [MCP specification 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) with backward compatibility for `2025-03-26`. Current compliance:
+tower-mcp targets the [MCP specification 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) with backward compatibility for `2025-03-26`. The [official MCP conformance test suite](https://github.com/joshrotenberg/tower-mcp/actions/workflows/conformance.yml) runs in CI on every PR, currently passing 39/39 tests.
 
 - [x] [JSON-RPC 2.0 message format](https://modelcontextprotocol.io/specification/2025-11-25/basic#messages)
 - [x] [Protocol version negotiation](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle#version-negotiation) (supports `2025-11-25` and `2025-03-26`)
@@ -539,6 +491,27 @@ tower-mcp targets the [MCP specification 2025-11-25](https://modelcontextprotoco
 - [x] [`_meta` field on all protocol types](https://modelcontextprotocol.io/specification/2025-11-25)
 
 We track all MCP Specification Enhancement Proposals (SEPs) as [GitHub issues](https://github.com/joshrotenberg/tower-mcp/issues?q=label%3Asep). A weekly workflow syncs status from the upstream spec repository.
+
+## Examples and Live Demo
+
+A full-featured MCP server for querying [crates.io](https://crates.io) is available as a standalone project: [cratesio-mcp](https://github.com/joshrotenberg/cratesio-mcp). A demo instance is deployed at **https://cratesio-mcp.fly.dev** -- connect with any MCP client that supports HTTP transport.
+
+The repo includes several example servers you can try with any MCP-enabled agent (like Claude Code). Clone the repo and the `.mcp.json` configures them automatically:
+
+| Server | Description |
+|--------|-------------|
+| `markdownlint-mcp` | Lint markdown with 66 rules |
+| `codegen-mcp` | Helps AI agents build tower-mcp servers |
+| `weather` | Weather forecasts via NWS API |
+| `conformance` | Full MCP spec conformance server (39/39 tests) |
+
+```bash
+git clone https://github.com/joshrotenberg/tower-mcp
+cd tower-mcp
+# Run your MCP agent here - servers will be available automatically
+```
+
+For a guided tour, ask your agent to read [`examples/README.md`](examples/README.md).
 
 ## Development
 
