@@ -121,8 +121,8 @@ name = "stdio_server"
 path = "examples/stdio_server.rs"
 
 [[example]]
-name = "stdio_server_with_middleware"
-path = "examples/stdio_server_with_middleware.rs"
+name = "transport_middleware"
+path = "examples/transport_middleware.rs"
 
 [[example]]
 name = "http_server"
@@ -130,19 +130,14 @@ path = "examples/http_server.rs"
 required-features = ["http"]
 
 [[example]]
-name = "http_server_with_auth"
-path = "examples/http_server_with_auth.rs"
-required-features = ["http"]
-
-[[example]]
-name = "http_server_with_middleware"
-path = "examples/http_server_with_middleware.rs"
-required-features = ["http"]
-
-[[example]]
-name = "http_server_with_oauth"
-path = "examples/http_server_with_oauth.rs"
+name = "http_auth"
+path = "examples/http_auth.rs"
 required-features = ["oauth"]
+
+[[example]]
+name = "websocket_server"
+path = "examples/websocket_server.rs"
+required-features = ["websocket"]
 
 [[example]]
 name = "client_cli"
@@ -166,3 +161,8 @@ required-features = ["http"]
 name = "dynamic_tools"
 path = "examples/dynamic_tools.rs"
 required-features = ["dynamic-tools"]
+
+[[example]]
+name = "testing"
+path = "examples/testing.rs"
+required-features = ["testing"]
