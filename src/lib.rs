@@ -150,7 +150,7 @@
 //!
 //! | Level | Method | Scope | Use Cases |
 //! |-------|--------|-------|-----------|
-//! | **Transport** | `HttpTransport::layer()` | All MCP requests | Global timeout, rate limit, metrics |
+//! | **Transport** | `StdioTransport::layer()`, `HttpTransport::layer()` | All MCP requests | Global timeout, rate limit, metrics |
 //! | **axum** | `.into_router().layer()` | HTTP layer only | CORS, compression, request logging |
 //! | **Per-tool** | `ToolBuilder::...layer()` | Single tool | Tool-specific timeout, concurrency |
 //! | **Per-resource** | `ResourceBuilder::...layer()` | Single resource | Caching, read timeout |
@@ -162,7 +162,7 @@
 //! Where should my middleware go?
 //! │
 //! ├─ Affects ALL MCP requests?
-//! │  └─ Yes → Transport: HttpTransport::layer() or WebSocketTransport::layer()
+//! │  └─ Yes → Transport: StdioTransport::layer(), HttpTransport::layer(), or WebSocketTransport::layer()
 //! │
 //! ├─ HTTP-specific (CORS, compression, headers)?
 //! │  └─ Yes → axum: transport.into_router().layer(...)
@@ -356,6 +356,7 @@ pub mod error;
 pub mod extract;
 pub mod filter;
 pub mod jsonrpc;
+pub mod middleware;
 #[cfg(feature = "oauth")]
 pub mod oauth;
 pub mod prompt;
@@ -385,6 +386,9 @@ pub use filter::{
     CapabilityFilter, DenialBehavior, Filterable, PromptFilter, ResourceFilter, ToolFilter,
 };
 pub use jsonrpc::{JsonRpcLayer, JsonRpcService};
+pub use middleware::{
+    McpTracingLayer, McpTracingService, ToolCallLoggingLayer, ToolCallLoggingService,
+};
 pub use prompt::{BoxPromptService, Prompt, PromptBuilder, PromptHandler, PromptRequest};
 #[allow(deprecated)]
 pub use protocol::{
@@ -428,7 +432,6 @@ pub use resource::{
 pub use router::{McpRouter, RouterRequest, RouterResponse};
 pub use session::{SessionPhase, SessionState};
 pub use tool::{BoxToolService, GuardLayer, NoParams, Tool, ToolBuilder, ToolHandler, ToolRequest};
-pub use tracing_layer::{McpTracingLayer, McpTracingService};
 pub use transport::{
     BidirectionalStdioTransport, CatchError, GenericStdioTransport, StdioTransport,
     SyncStdioTransport,

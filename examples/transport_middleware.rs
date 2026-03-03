@@ -4,11 +4,9 @@
 //! HTTP and stdio transports. Middleware errors (like timeouts) are automatically
 //! converted into JSON-RPC error responses.
 //!
-//! The two key patterns:
-//! - HTTP: `HttpTransport::new(router).layer(middleware)` handles error
-//!   conversion internally
-//! - Stdio: `CatchError::new(middleware.service(router))` + `GenericStdioTransport`
-//!   requires explicit `CatchError` wrapping to preserve `Error = Infallible`
+//! Both `HttpTransport` and `StdioTransport` support `.layer()` for composing
+//! tower middleware. This example also shows `ToolCallLoggingLayer` for audit
+//! logging of tool invocations.
 //!
 //! Run with:
 //!   HTTP:  cargo run --example transport_middleware --features http -- --transport http
@@ -35,6 +33,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tower::ServiceBuilder;
 use tower::timeout::TimeoutLayer;
+use tower_mcp::middleware::ToolCallLoggingLayer;
 use tower_mcp::{CallToolResult, McpRouter, ToolBuilder};
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -89,6 +88,7 @@ async fn serve_http(router: McpRouter) -> Result<(), tower_mcp::BoxError> {
         .disable_origin_validation()
         .layer(
             ServiceBuilder::new()
+                .layer(ToolCallLoggingLayer::new())
                 .layer(TimeoutLayer::new(Duration::from_secs(2)))
                 .concurrency_limit(10)
                 .into_inner(),
@@ -101,27 +101,21 @@ async fn serve_http(router: McpRouter) -> Result<(), tower_mcp::BoxError> {
     Ok(())
 }
 
-/// Serve over stdio with explicit CatchError wrapping.
+/// Serve over stdio with `.layer()` on the transport.
 ///
-/// GenericStdioTransport requires `Error = Infallible`, but middleware like
-/// TimeoutLayer introduces its own error type. CatchError converts these
-/// middleware errors into JSON-RPC error responses to satisfy the contract.
-///
-/// Layer ordering in ServiceBuilder:
-///   .layer(OuterLayer)  -- runs first on request, last on response
-///   .layer(InnerLayer)  -- runs last on request, first on response
-///   .service(router)    -- the inner service
+/// Like `HttpTransport`, `StdioTransport` supports `.layer()` to apply tower
+/// middleware. Error conversion (e.g., timeouts to JSON-RPC errors) and
+/// notification forwarding are handled automatically.
 async fn serve_stdio(router: McpRouter) -> Result<(), tower_mcp::BoxError> {
-    use tower_mcp::{CatchError, GenericStdioTransport};
+    use tower_mcp::StdioTransport;
 
-    let service = CatchError::new(
+    let mut transport = StdioTransport::new(router).layer(
         ServiceBuilder::new()
+            .layer(ToolCallLoggingLayer::new())
             .layer(TimeoutLayer::new(Duration::from_secs(5)))
             .concurrency_limit(10)
-            .service(router),
+            .into_inner(),
     );
-
-    let mut transport = GenericStdioTransport::new(service);
 
     tracing::info!("Starting stdio server with middleware");
     transport.run().await?;

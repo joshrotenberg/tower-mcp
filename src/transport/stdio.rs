@@ -35,6 +35,7 @@ use crate::protocol::{
     McpNotification, RequestId, notifications,
 };
 use crate::router::{McpRouter, RouterRequest, RouterResponse};
+use crate::transport::service::CatchError;
 
 // ============================================================================
 // Shared helpers
@@ -169,6 +170,47 @@ impl StdioTransport {
             router,
             notification_rx,
         }
+    }
+
+    /// Apply a tower middleware layer to this transport.
+    ///
+    /// This converts the `StdioTransport` into a [`GenericStdioTransport`] with
+    /// the middleware applied, while preserving notification forwarding.
+    ///
+    /// Use [`tower::ServiceBuilder`] to compose multiple layers:
+    ///
+    /// ```rust,no_run
+    /// use std::time::Duration;
+    /// use tower::ServiceBuilder;
+    /// use tower::timeout::TimeoutLayer;
+    /// use tower_mcp::{BoxError, McpRouter, StdioTransport};
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), BoxError> {
+    ///     let router = McpRouter::new().server_info("my-server", "1.0.0");
+    ///
+    ///     let mut transport = StdioTransport::new(router)
+    ///         .layer(
+    ///             ServiceBuilder::new()
+    ///                 .layer(TimeoutLayer::new(Duration::from_secs(5)))
+    ///                 .concurrency_limit(10)
+    ///                 .into_inner(),
+    ///         );
+    ///
+    ///     transport.run().await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn layer<L>(self, layer: L) -> GenericStdioTransport<CatchError<L::Service>>
+    where
+        L: tower::Layer<McpRouter>,
+        L::Service: Service<RouterRequest, Response = RouterResponse> + Clone + Send + 'static,
+        <L::Service as Service<RouterRequest>>::Error: std::fmt::Display + Send,
+        <L::Service as Service<RouterRequest>>::Future: Send,
+    {
+        let wrapped = layer.layer(self.router);
+        let service = CatchError::new(wrapped);
+        GenericStdioTransport::with_notifications(service, self.notification_rx)
     }
 
     /// Run the transport, processing messages until EOF or error
