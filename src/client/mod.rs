@@ -36,7 +36,7 @@ mod http;
 mod stdio;
 mod transport;
 
-pub use handler::{ClientHandler, ServerNotification};
+pub use handler::{ClientHandler, NotificationHandler, ServerNotification};
 #[cfg(feature = "http-client")]
 pub use http::{HttpClientConfig, HttpClientTransport};
 pub use stdio::StdioClientTransport;
