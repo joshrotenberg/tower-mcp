@@ -31,10 +31,14 @@
 //! ```
 
 mod handler;
+#[cfg(feature = "http-client")]
+mod http;
 mod stdio;
 mod transport;
 
 pub use handler::{ClientHandler, ServerNotification};
+#[cfg(feature = "http-client")]
+pub use http::{HttpClientConfig, HttpClientTransport};
 pub use stdio::StdioClientTransport;
 pub use transport::ClientTransport;
 
