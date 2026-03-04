@@ -96,6 +96,7 @@ These demonstrate specific features. Run them individually with `cargo run`.
 | `transport_middleware` | Tower middleware on HTTP and stdio transports | `cargo run --example transport_middleware --features http -- --transport http` |
 | `http_auth` | API key and OAuth/JWT authentication | `cargo run --example http_auth --features oauth -- --auth apikey` |
 | `tool_middleware` | Per-tool timeout and concurrency limits | `cargo run --example tool_middleware` |
+| `middleware_showcase` | Config validation via shared guards and middleware | `cargo run --example middleware_showcase` |
 | `capability_filtering` | Session-based tool/resource/prompt visibility | `cargo run --example capability_filtering --features http` |
 | `dynamic_tools` | Runtime tool registration/deregistration | `cargo run --example dynamic_tools --features dynamic-tools` |
 | `external_api_auth` | Four patterns for downstream API authentication | `cargo run --example external_api_auth` |
