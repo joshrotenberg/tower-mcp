@@ -37,7 +37,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
 
     // Spawn and connect to the server
     let transport = StdioClientTransport::spawn(cmd, &cmd_args).await?;
-    let mut client = McpClient::new(transport);
+    let client = McpClient::connect(transport).await?;
 
     // Initialize
     println!("Initializing connection...");

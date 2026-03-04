@@ -101,7 +101,7 @@
 //! async fn main() -> Result<(), BoxError> {
 //!     // Connect to server
 //!     let transport = StdioClientTransport::spawn("my-mcp-server", &[]).await?;
-//!     let mut client = McpClient::new(transport);
+//!     let client = McpClient::connect(transport).await?;
 //!
 //!     // Initialize and list tools
 //!     client.initialize("my-client", "1.0.0").await?;
@@ -374,7 +374,9 @@ pub mod transport;
 
 // Re-exports
 pub use async_task::{Task, TaskStore};
-pub use client::{ClientTransport, McpClient, StdioClientTransport};
+pub use client::{
+    ClientHandler, ClientTransport, McpClient, McpClientBuilder, StdioClientTransport,
+};
 pub use context::{
     ChannelClientRequester, ClientRequester, ClientRequesterHandle, Extensions,
     NotificationReceiver, NotificationSender, OutgoingRequest, OutgoingRequestReceiver,
