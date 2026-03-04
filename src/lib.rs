@@ -375,7 +375,8 @@ pub mod transport;
 // Re-exports
 pub use async_task::{Task, TaskStore};
 pub use client::{
-    ClientHandler, ClientTransport, McpClient, McpClientBuilder, StdioClientTransport,
+    ClientHandler, ClientTransport, McpClient, McpClientBuilder, NotificationHandler,
+    StdioClientTransport,
 };
 #[cfg(feature = "http-client")]
 pub use client::{HttpClientConfig, HttpClientTransport};
