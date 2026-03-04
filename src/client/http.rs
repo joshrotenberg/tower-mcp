@@ -19,6 +19,27 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # Authentication
+//!
+//! ```rust,no_run
+//! use tower_mcp::client::{McpClient, HttpClientTransport};
+//!
+//! # async fn example() -> Result<(), tower_mcp::BoxError> {
+//! // Bearer token
+//! let transport = HttpClientTransport::new("http://localhost:3000")
+//!     .bearer_token("sk-your-token-here");
+//!
+//! // Custom API key header
+//! let transport = HttpClientTransport::new("http://localhost:3000")
+//!     .api_key_header("X-API-Key", "your-key");
+//!
+//! // Basic auth
+//! let transport = HttpClientTransport::new("http://localhost:3000")
+//!     .basic_auth("user", "password");
+//! # Ok(())
+//! # }
+//! ```
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -81,6 +102,42 @@ impl Default for HttpClientConfig {
             sse_reconnect_delay: Duration::from_secs(1),
             max_sse_reconnect_attempts: 5,
         }
+    }
+}
+
+impl HttpClientConfig {
+    /// Set a Bearer token for authentication.
+    pub fn bearer_token(mut self, token: impl Into<String>) -> Self {
+        self.headers.insert(
+            "Authorization".to_string(),
+            format!("Bearer {}", token.into()),
+        );
+        self
+    }
+
+    /// Set an API key using a custom header name.
+    pub fn api_key_header(mut self, name: impl Into<String>, key: impl Into<String>) -> Self {
+        self.headers.insert(name.into(), key.into());
+        self
+    }
+
+    /// Set Basic authentication credentials.
+    pub fn basic_auth(mut self, username: impl AsRef<str>, password: impl AsRef<str>) -> Self {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(format!(
+            "{}:{}",
+            username.as_ref(),
+            password.as_ref()
+        ));
+        self.headers
+            .insert("Authorization".to_string(), format!("Basic {}", encoded));
+        self
+    }
+
+    /// Add a custom header.
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.insert(name.into(), value.into());
+        self
     }
 }
 
@@ -223,6 +280,104 @@ impl HttpClientTransport {
             connected: Arc::new(AtomicBool::new(true)),
             config,
         }
+    }
+
+    /// Set a Bearer token for `Authorization: Bearer <token>` authentication.
+    ///
+    /// The token is included on every HTTP request (POST and SSE GET).
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use tower_mcp::client::HttpClientTransport;
+    ///
+    /// let transport = HttpClientTransport::new("http://localhost:3000")
+    ///     .bearer_token("sk-my-secret-token");
+    /// ```
+    pub fn bearer_token(mut self, token: impl Into<String>) -> Self {
+        self.config.headers.insert(
+            "Authorization".to_string(),
+            format!("Bearer {}", token.into()),
+        );
+        self
+    }
+
+    /// Set an API key for authentication.
+    ///
+    /// Sends as `Authorization: Bearer <key>`. Use
+    /// [`api_key_header`](Self::api_key_header) for a custom header name.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use tower_mcp::client::HttpClientTransport;
+    ///
+    /// let transport = HttpClientTransport::new("http://localhost:3000")
+    ///     .api_key("sk-my-api-key");
+    /// ```
+    pub fn api_key(self, key: impl Into<String>) -> Self {
+        self.bearer_token(key)
+    }
+
+    /// Set an API key using a custom header name.
+    ///
+    /// Sends the key as the raw header value (no `Bearer` prefix).
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use tower_mcp::client::HttpClientTransport;
+    ///
+    /// let transport = HttpClientTransport::new("http://localhost:3000")
+    ///     .api_key_header("X-API-Key", "sk-my-api-key");
+    /// ```
+    pub fn api_key_header(mut self, name: impl Into<String>, key: impl Into<String>) -> Self {
+        self.config.headers.insert(name.into(), key.into());
+        self
+    }
+
+    /// Set Basic authentication credentials.
+    ///
+    /// Encodes `username:password` as Base64 and sends as
+    /// `Authorization: Basic <encoded>`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use tower_mcp::client::HttpClientTransport;
+    ///
+    /// let transport = HttpClientTransport::new("http://localhost:3000")
+    ///     .basic_auth("admin", "secret");
+    /// ```
+    pub fn basic_auth(mut self, username: impl AsRef<str>, password: impl AsRef<str>) -> Self {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(format!(
+            "{}:{}",
+            username.as_ref(),
+            password.as_ref()
+        ));
+        self.config
+            .headers
+            .insert("Authorization".to_string(), format!("Basic {}", encoded));
+        self
+    }
+
+    /// Add a custom header to every request.
+    ///
+    /// Can be called multiple times to add multiple headers.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use tower_mcp::client::HttpClientTransport;
+    ///
+    /// let transport = HttpClientTransport::new("http://localhost:3000")
+    ///     .header("X-Custom-Header", "my-value")
+    ///     .header("X-Request-Source", "my-app");
+    /// ```
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.config.headers.insert(name.into(), value.into());
+        self
     }
 
     /// Start the SSE background stream after session is established.
@@ -372,13 +527,17 @@ impl ClientTransport for HttpClientTransport {
 
         // Send DELETE to terminate the session (best effort)
         if let Some(ref session_id) = self.session_id {
-            let _ = self
+            let mut request = self
                 .client
                 .delete(&self.url)
                 .header("mcp-session-id", session_id)
-                .timeout(Duration::from_secs(5))
-                .send()
-                .await;
+                .timeout(Duration::from_secs(5));
+
+            for (key, value) in &self.config.headers {
+                request = request.header(key.as_str(), value.as_str());
+            }
+
+            let _ = request.send().await;
         }
 
         self.session_id = None;
@@ -737,5 +896,110 @@ mod tests {
         let transport = HttpClientTransport::with_client("http://example.com", client);
         assert_eq!(transport.url, "http://example.com");
         assert!(transport.is_connected());
+    }
+
+    // =========================================================================
+    // Auth builder tests
+    // =========================================================================
+
+    #[test]
+    fn test_bearer_token() {
+        let transport =
+            HttpClientTransport::new("http://localhost:3000").bearer_token("sk-test-token");
+        assert_eq!(
+            transport.config.headers.get("Authorization").unwrap(),
+            "Bearer sk-test-token"
+        );
+    }
+
+    #[test]
+    fn test_api_key() {
+        let transport = HttpClientTransport::new("http://localhost:3000").api_key("sk-api-key-123");
+        assert_eq!(
+            transport.config.headers.get("Authorization").unwrap(),
+            "Bearer sk-api-key-123"
+        );
+    }
+
+    #[test]
+    fn test_api_key_header() {
+        let transport =
+            HttpClientTransport::new("http://localhost:3000").api_key_header("X-API-Key", "my-key");
+        assert_eq!(transport.config.headers.get("X-API-Key").unwrap(), "my-key");
+        assert!(!transport.config.headers.contains_key("Authorization"));
+    }
+
+    #[test]
+    fn test_basic_auth() {
+        let transport =
+            HttpClientTransport::new("http://localhost:3000").basic_auth("admin", "secret");
+        let header = transport.config.headers.get("Authorization").unwrap();
+        assert!(header.starts_with("Basic "));
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(header.strip_prefix("Basic ").unwrap())
+            .unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap(), "admin:secret");
+    }
+
+    #[test]
+    fn test_custom_header() {
+        let transport = HttpClientTransport::new("http://localhost:3000")
+            .header("X-Custom", "value1")
+            .header("X-Another", "value2");
+        assert_eq!(transport.config.headers.get("X-Custom").unwrap(), "value1");
+        assert_eq!(transport.config.headers.get("X-Another").unwrap(), "value2");
+    }
+
+    #[test]
+    fn test_chaining_with_config() {
+        let config = HttpClientConfig {
+            request_timeout: Duration::from_secs(60),
+            ..Default::default()
+        };
+        let transport =
+            HttpClientTransport::with_config("http://localhost:3000", config).bearer_token("tk");
+        assert_eq!(transport.config.request_timeout, Duration::from_secs(60));
+        assert_eq!(
+            transport.config.headers.get("Authorization").unwrap(),
+            "Bearer tk"
+        );
+    }
+
+    #[test]
+    fn test_last_auth_wins() {
+        let transport = HttpClientTransport::new("http://localhost:3000")
+            .bearer_token("token1")
+            .basic_auth("user", "pass");
+        let header = transport.config.headers.get("Authorization").unwrap();
+        assert!(header.starts_with("Basic "));
+    }
+
+    #[test]
+    fn test_config_bearer_token() {
+        let config = HttpClientConfig::default().bearer_token("tk-123");
+        assert_eq!(
+            config.headers.get("Authorization").unwrap(),
+            "Bearer tk-123"
+        );
+    }
+
+    #[test]
+    fn test_config_header() {
+        let config = HttpClientConfig::default().header("X-Foo", "bar");
+        assert_eq!(config.headers.get("X-Foo").unwrap(), "bar");
+    }
+
+    #[test]
+    fn test_config_api_key_header() {
+        let config = HttpClientConfig::default().api_key_header("X-Key", "secret");
+        assert_eq!(config.headers.get("X-Key").unwrap(), "secret");
+    }
+
+    #[test]
+    fn test_config_basic_auth() {
+        let config = HttpClientConfig::default().basic_auth("user", "pw");
+        let header = config.headers.get("Authorization").unwrap();
+        assert!(header.starts_with("Basic "));
     }
 }

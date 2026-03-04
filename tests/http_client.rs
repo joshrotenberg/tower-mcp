@@ -209,3 +209,68 @@ async fn test_http_client_with_custom_config() {
 
     client.shutdown().await.unwrap();
 }
+
+/// Start an HTTP server with bearer token auth middleware on a random port.
+async fn start_auth_server(valid_token: &str) -> (String, tokio::task::JoinHandle<()>) {
+    use axum::{extract::Request, http::StatusCode, middleware, response::Response};
+
+    let router = test_router();
+    let transport = HttpTransport::new(router).disable_origin_validation();
+    let mcp_router = transport.into_router();
+
+    let token = valid_token.to_string();
+    let app = mcp_router.layer(middleware::from_fn(
+        move |request: Request, next: middleware::Next| {
+            let token = token.clone();
+            async move {
+                let auth = request
+                    .headers()
+                    .get("Authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                let expected = format!("Bearer {}", token);
+                if auth.as_deref() == Some(&expected) {
+                    Ok::<Response, (StatusCode, String)>(next.run(request).await)
+                } else {
+                    Err((StatusCode::UNAUTHORIZED, "Unauthorized".to_string()))
+                }
+            }
+        },
+    ));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://127.0.0.1:{}", addr.port());
+
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    (url, handle)
+}
+
+#[tokio::test]
+async fn test_http_client_bearer_auth() {
+    let (url, _server) = start_auth_server("sk-valid-key").await;
+
+    let transport = HttpClientTransport::new(&url).bearer_token("sk-valid-key");
+    let client = McpClient::connect(transport).await.unwrap();
+
+    let info = client.initialize("test-client", "1.0.0").await.unwrap();
+    assert_eq!(info.server_info.name, "test-http-server");
+
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_http_client_bearer_auth_rejected() {
+    let (url, _server) = start_auth_server("sk-valid-key").await;
+
+    let transport = HttpClientTransport::new(&url).bearer_token("sk-wrong-key");
+    let client = McpClient::connect(transport).await.unwrap();
+
+    let result = client.initialize("test-client", "1.0.0").await;
+    assert!(result.is_err());
+}

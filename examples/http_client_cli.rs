@@ -11,6 +11,11 @@
 //!
 //! You can also connect to any HTTP MCP server by passing the URL:
 //!   cargo run --example http_client_cli --features http-client -- http://example.com:3000
+//!
+//! With authentication:
+//!   cargo run --example http_client_cli --features http-client -- --bearer sk-token-123
+//!   cargo run --example http_client_cli --features http-client -- --api-key sk-key-456
+//!   cargo run --example http_client_cli --features http-client -- --header X-API-Key=my-key
 
 use tower_mcp::client::{HttpClientTransport, McpClient};
 
@@ -20,16 +25,45 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .with_env_filter("tower_mcp=info,http_client_cli=debug")
         .init();
 
-    // Get server URL from args, or default to localhost
-    let url = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "http://127.0.0.1:3000".to_string());
+    // Parse arguments
+    let mut url = "http://127.0.0.1:3000".to_string();
+    let mut bearer: Option<String> = None;
+    let mut custom_headers: Vec<(String, String)> = Vec::new();
+
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--bearer" => {
+                bearer = Some(args.next().expect("--bearer requires a token"));
+            }
+            "--api-key" => {
+                bearer = Some(args.next().expect("--api-key requires a key"));
+            }
+            "--header" => {
+                let header = args.next().expect("--header requires name=value");
+                let (name, value) = header
+                    .split_once('=')
+                    .expect("--header value must be name=value");
+                custom_headers.push((name.to_string(), value.to_string()));
+            }
+            other => {
+                url = other.to_string();
+            }
+        }
+    }
 
     println!("Connecting to MCP server at: {}", url);
     println!();
 
-    // Connect to the server
-    let transport = HttpClientTransport::new(&url);
+    // Build transport with optional auth
+    let mut transport = HttpClientTransport::new(&url);
+    if let Some(token) = bearer {
+        transport = transport.bearer_token(token);
+    }
+    for (name, value) in custom_headers {
+        transport = transport.header(name, value);
+    }
+
     let client = McpClient::connect(transport).await?;
 
     // Initialize
