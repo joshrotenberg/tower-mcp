@@ -377,6 +377,8 @@ pub use async_task::{Task, TaskStore};
 pub use client::{
     ClientHandler, ClientTransport, McpClient, McpClientBuilder, StdioClientTransport,
 };
+#[cfg(feature = "http-client")]
+pub use client::{HttpClientConfig, HttpClientTransport};
 pub use context::{
     ChannelClientRequester, ClientRequester, ClientRequesterHandle, Extensions,
     NotificationReceiver, NotificationSender, OutgoingRequest, OutgoingRequestReceiver,
