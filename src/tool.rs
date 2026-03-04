@@ -38,6 +38,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use pin_project_lite::pin_project;
+
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -113,6 +115,30 @@ impl<S: fmt::Debug> fmt::Debug for ToolCatchError<S> {
     }
 }
 
+pin_project! {
+    /// Future for [`ToolCatchError`].
+    pub struct ToolCatchErrorFuture<F> {
+        #[pin]
+        inner: F,
+    }
+}
+
+impl<F, E> Future for ToolCatchErrorFuture<F>
+where
+    F: Future<Output = std::result::Result<CallToolResult, E>>,
+    E: fmt::Display,
+{
+    type Output = std::result::Result<CallToolResult, Infallible>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.project().inner.poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(result)) => Poll::Ready(Ok(result)),
+            Poll::Ready(Err(err)) => Poll::Ready(Ok(CallToolResult::error(err.to_string()))),
+        }
+    }
+}
+
 impl<S> Service<ToolRequest> for ToolCatchError<S>
 where
     S: Service<ToolRequest, Response = CallToolResult> + Clone + Send + 'static,
@@ -121,8 +147,7 @@ where
 {
     type Response = CallToolResult;
     type Error = Infallible;
-    type Future =
-        Pin<Box<dyn Future<Output = std::result::Result<CallToolResult, Infallible>> + Send>>;
+    type Future = ToolCatchErrorFuture<S::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
         // Map any readiness error to Infallible (we catch it on call)
@@ -134,14 +159,9 @@ where
     }
 
     fn call(&mut self, req: ToolRequest) -> Self::Future {
-        let fut = self.inner.call(req);
-
-        Box::pin(async move {
-            match fut.await {
-                Ok(result) => Ok(result),
-                Err(err) => Ok(CallToolResult::error(err.to_string())),
-            }
-        })
+        ToolCatchErrorFuture {
+            inner: self.inner.call(req),
+        }
     }
 }
 

@@ -22,10 +22,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use pin_project_lite::pin_project;
+
 use tower::util::BoxCloneService;
 use tower_service::Service;
 
 use crate::error::JsonRpcError;
+use crate::protocol::RequestId;
 use crate::router::{McpRouter, RouterRequest, RouterResponse};
 
 /// A boxed, cloneable MCP service with `Error = Infallible`.
@@ -87,6 +90,39 @@ impl<S: fmt::Debug> fmt::Debug for CatchError<S> {
     }
 }
 
+pin_project! {
+    /// Future for [`CatchError`].
+    pub struct CatchErrorFuture<F> {
+        #[pin]
+        inner: F,
+        request_id: Option<RequestId>,
+    }
+}
+
+impl<F, E> Future for CatchErrorFuture<F>
+where
+    F: Future<Output = Result<RouterResponse, E>>,
+    E: fmt::Display,
+{
+    type Output = Result<RouterResponse, Infallible>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        match this.inner.poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(response)) => Poll::Ready(Ok(response)),
+            Poll::Ready(Err(err)) => {
+                let request_id =
+                    this.request_id.take().unwrap_or(RequestId::Number(0));
+                Poll::Ready(Ok(RouterResponse {
+                    id: request_id,
+                    inner: Err(JsonRpcError::internal_error(err.to_string())),
+                }))
+            }
+        }
+    }
+}
+
 impl<S> Service<RouterRequest> for CatchError<S>
 where
     S: Service<RouterRequest, Response = RouterResponse> + Clone + Send + 'static,
@@ -95,7 +131,7 @@ where
 {
     type Response = RouterResponse;
     type Error = Infallible;
-    type Future = Pin<Box<dyn Future<Output = Result<RouterResponse, Infallible>> + Send>>;
+    type Future = CatchErrorFuture<S::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx).map_err(|_| unreachable!())
@@ -107,15 +143,10 @@ where
         let request_id = req.id.clone();
         let fut = self.inner.call(req);
 
-        Box::pin(async move {
-            match fut.await {
-                Ok(response) => Ok(response),
-                Err(err) => Ok(RouterResponse {
-                    id: request_id,
-                    inner: Err(JsonRpcError::internal_error(err.to_string())),
-                }),
-            }
-        })
+        CatchErrorFuture {
+            inner: fut,
+            request_id: Some(request_id),
+        }
     }
 }
 
