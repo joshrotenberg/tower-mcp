@@ -52,11 +52,11 @@ use tokio::task::JoinHandle;
 use crate::error::{Error, Result};
 use crate::protocol::{
     CallToolParams, CallToolResult, ClientCapabilities, CompleteParams, CompleteResult,
-    CompletionArgument, CompletionReference, GetPromptParams, GetPromptResult, Implementation,
-    InitializeParams, InitializeResult, JsonRpcNotification, JsonRpcRequest, ListPromptsParams,
-    ListPromptsResult, ListResourcesParams, ListResourcesResult, ListRootsResult, ListToolsParams,
-    ListToolsResult, ReadResourceParams, ReadResourceResult, RequestId, Root, RootsCapability,
-    notifications,
+    CompletionArgument, CompletionReference, ElicitationCapability, GetPromptParams,
+    GetPromptResult, Implementation, InitializeParams, InitializeResult, JsonRpcNotification,
+    JsonRpcRequest, ListPromptsParams, ListPromptsResult, ListResourcesParams, ListResourcesResult,
+    ListRootsResult, ListToolsParams, ListToolsResult, ReadResourceParams, ReadResourceResult,
+    RequestId, Root, RootsCapability, SamplingCapability, notifications,
 };
 use tower_mcp_types::JsonRpcError;
 
@@ -129,17 +129,15 @@ pub struct McpClient {
 ///
 /// ```rust,no_run
 /// use tower_mcp::client::{McpClient, StdioClientTransport};
-/// use tower_mcp::protocol::{ClientCapabilities, Root};
+/// use tower_mcp::protocol::Root;
 ///
 /// # async fn example() -> Result<(), tower_mcp::BoxError> {
 /// let transport = StdioClientTransport::spawn("server", &[]).await?;
+/// let handler = (); // Use a real ClientHandler for bidirectional support
 /// let client = McpClient::builder()
 ///     .with_roots(vec![Root::new("file:///project")])
-///     .with_capabilities(ClientCapabilities {
-///         sampling: Some(Default::default()),
-///         ..Default::default()
-///     })
-///     .connect_simple(transport)
+///     .with_sampling()
+///     .connect(transport, handler)
 ///     .await?;
 /// # Ok(())
 /// # }
@@ -171,6 +169,28 @@ impl McpClientBuilder {
     /// Configure custom capabilities for this client.
     pub fn with_capabilities(mut self, capabilities: ClientCapabilities) -> Self {
         self.capabilities = capabilities;
+        self
+    }
+
+    /// Declare sampling support.
+    ///
+    /// Sets the sampling capability so the server knows this client can
+    /// handle `sampling/createMessage` requests. The handler passed to
+    /// [`connect()`](Self::connect) should override
+    /// [`handle_create_message()`](ClientHandler::handle_create_message).
+    pub fn with_sampling(mut self) -> Self {
+        self.capabilities.sampling = Some(SamplingCapability::default());
+        self
+    }
+
+    /// Declare elicitation support.
+    ///
+    /// Sets the elicitation capability so the server knows this client can
+    /// handle `elicitation/create` requests. The handler passed to
+    /// [`connect()`](Self::connect) should override
+    /// [`handle_elicit()`](ClientHandler::handle_elicit).
+    pub fn with_elicitation(mut self) -> Self {
+        self.capabilities.elicitation = Some(ElicitationCapability::default());
         self
     }
 
@@ -1264,6 +1284,125 @@ mod tests {
         let result = client.list_roots().await;
         assert_eq!(result.roots.len(), 2);
         assert_eq!(result.roots[1].name, Some("Project 2".to_string()));
+    }
+
+    #[test]
+    fn test_builder_with_sampling() {
+        let builder = McpClientBuilder::new().with_sampling();
+        assert!(builder.capabilities.sampling.is_some());
+    }
+
+    #[test]
+    fn test_builder_with_elicitation() {
+        let builder = McpClientBuilder::new().with_elicitation();
+        assert!(builder.capabilities.elicitation.is_some());
+    }
+
+    #[test]
+    fn test_builder_chaining() {
+        let builder = McpClientBuilder::new()
+            .with_sampling()
+            .with_elicitation()
+            .with_roots(vec![Root::new("file:///project")]);
+        assert!(builder.capabilities.sampling.is_some());
+        assert!(builder.capabilities.elicitation.is_some());
+        assert!(builder.capabilities.roots.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_bidirectional_sampling_round_trip() {
+        use crate::protocol::{
+            ContentRole, CreateMessageParams, CreateMessageResult, SamplingContent,
+            SamplingContentOrArray,
+        };
+
+        // A handler that records whether handle_create_message was called
+        struct RecordingHandler {
+            called: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl ClientHandler for RecordingHandler {
+            async fn handle_create_message(
+                &self,
+                _params: CreateMessageParams,
+            ) -> std::result::Result<CreateMessageResult, tower_mcp_types::JsonRpcError>
+            {
+                self.called.store(true, Ordering::SeqCst);
+                Ok(CreateMessageResult {
+                    content: SamplingContentOrArray::Single(SamplingContent::Text {
+                        text: "test response".to_string(),
+                        annotations: None,
+                        meta: None,
+                    }),
+                    model: "test-model".to_string(),
+                    role: ContentRole::Assistant,
+                    stop_reason: Some("end_turn".to_string()),
+                    meta: None,
+                })
+            }
+        }
+
+        let called = Arc::new(AtomicBool::new(false));
+        let handler = RecordingHandler {
+            called: called.clone(),
+        };
+
+        // Build a mock transport, keeping a clone of incoming_tx so we can
+        // inject a server-initiated request after the transport is consumed.
+        let (inject_tx, rx) = mpsc::channel::<String>(32);
+        let responses = vec![mock_initialize_response()];
+        let inject_tx_clone = inject_tx.clone();
+
+        let transport = MockTransport {
+            responses: Arc::new(Mutex::new(responses)),
+            response_idx: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            incoming_tx: inject_tx,
+            incoming_rx: rx,
+            outgoing: Arc::new(Mutex::new(Vec::new())),
+            connected: Arc::new(AtomicBool::new(true)),
+        };
+
+        let client = McpClient::builder()
+            .with_sampling()
+            .connect(transport, handler)
+            .await
+            .unwrap();
+
+        // Initialize the client (this sends initialize request + notification)
+        client.initialize("test-client", "1.0.0").await.unwrap();
+
+        // Inject a server-initiated sampling/createMessage request
+        let sampling_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 100,
+            "method": "sampling/createMessage",
+            "params": {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": {
+                            "type": "text",
+                            "text": "Hello"
+                        }
+                    }
+                ],
+                "maxTokens": 100
+            }
+        });
+        inject_tx_clone
+            .send(sampling_request.to_string())
+            .await
+            .unwrap();
+
+        // Give the background loop time to process
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Verify the handler was called
+        assert!(
+            called.load(Ordering::SeqCst),
+            "handle_create_message should have been called"
+        );
     }
 
     #[tokio::test]
