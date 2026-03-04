@@ -112,8 +112,7 @@ where
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(response)) => Poll::Ready(Ok(response)),
             Poll::Ready(Err(err)) => {
-                let request_id =
-                    this.request_id.take().unwrap_or(RequestId::Number(0));
+                let request_id = this.request_id.take().unwrap_or(RequestId::Number(0));
                 Poll::Ready(Ok(RouterResponse {
                     id: request_id,
                     inner: Err(JsonRpcError::internal_error(err.to_string())),
