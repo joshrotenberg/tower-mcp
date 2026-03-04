@@ -1408,3 +1408,165 @@ async fn test_http_client_auto_sse_disabled() {
 
     client.shutdown().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Edge Cases: Concurrent requests E2E
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_http_client_concurrent_requests() {
+    let (url, _server) = start_server().await;
+
+    let transport = HttpClientTransport::new(&url);
+    let client = McpClient::connect(transport).await.unwrap();
+    client.initialize("test-client", "1.0.0").await.unwrap();
+
+    // Fire off multiple call_tool requests concurrently
+    let mut handles = Vec::new();
+    for i in 0..5 {
+        let client_ref = &client;
+        handles.push(async move {
+            client_ref
+                .call_tool("add", serde_json::json!({"a": i, "b": i * 10}))
+                .await
+        });
+    }
+
+    let results: Vec<_> = futures::future::join_all(handles).await;
+    for result in &results {
+        assert!(result.is_ok(), "Concurrent request failed: {:?}", result);
+    }
+
+    // Verify all results are correct (order may vary)
+    let mut texts: Vec<String> = results
+        .into_iter()
+        .map(|r| r.unwrap().first_text().unwrap().to_string())
+        .collect();
+    texts.sort();
+    assert_eq!(texts, vec!["0", "11", "22", "33", "44"]);
+
+    client.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Edge Cases: Error responses E2E
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_http_client_tool_not_found_error() {
+    let (url, _server) = start_server().await;
+
+    let transport = HttpClientTransport::new(&url);
+    let client = McpClient::connect(transport).await.unwrap();
+    client.initialize("test-client", "1.0.0").await.unwrap();
+
+    let result = client
+        .call_tool("nonexistent_tool", serde_json::json!({}))
+        .await;
+    assert!(result.is_err());
+
+    let err = result.unwrap_err();
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("not found") || err_msg.contains("Unknown tool"),
+        "Expected tool-not-found error, got: {}",
+        err_msg
+    );
+
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_http_client_invalid_tool_arguments() {
+    let (url, _server) = start_server().await;
+
+    let transport = HttpClientTransport::new(&url);
+    let client = McpClient::connect(transport).await.unwrap();
+    client.initialize("test-client", "1.0.0").await.unwrap();
+
+    // "add" expects {a: i64, b: i64}, send wrong types
+    let result = client
+        .call_tool("add", serde_json::json!({"a": "not_a_number", "b": 1}))
+        .await;
+
+    // The server should return an error (either JSON-RPC error or isError in CallToolResult)
+    match result {
+        Ok(call_result) => {
+            assert!(
+                call_result.is_error,
+                "Expected error flag in CallToolResult"
+            );
+        }
+        Err(_) => {
+            // JSON-RPC error is also acceptable
+        }
+    }
+
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_http_client_prompt_not_found_error() {
+    let (url, _server) = start_extended_server().await;
+
+    let transport = HttpClientTransport::new(&url);
+    let client = McpClient::connect(transport).await.unwrap();
+    client.initialize("test-client", "1.0.0").await.unwrap();
+
+    let result = client.get_prompt("nonexistent_prompt", None).await;
+    assert!(result.is_err());
+
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_http_client_resource_not_found_error() {
+    let (url, _server) = start_server().await;
+
+    let transport = HttpClientTransport::new(&url);
+    let client = McpClient::connect(transport).await.unwrap();
+    client.initialize("test-client", "1.0.0").await.unwrap();
+
+    let result = client.read_resource("nonexistent://resource").await;
+    assert!(result.is_err());
+
+    client.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Edge Cases: Shutdown without initialize E2E
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_http_client_shutdown_without_initialize() {
+    let (url, _server) = start_server().await;
+
+    let transport = HttpClientTransport::new(&url);
+    let client = McpClient::connect(transport).await.unwrap();
+
+    // Shutdown without ever calling initialize -- should not panic
+    client.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Edge Cases: Requests before initialize E2E
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_http_client_request_before_initialize() {
+    let (url, _server) = start_server().await;
+
+    let transport = HttpClientTransport::new(&url);
+    let client = McpClient::connect(transport).await.unwrap();
+
+    // Attempting to list tools before initialize should fail
+    let result = client.list_tools().await;
+    assert!(result.is_err());
+
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("not initialized"),
+        "Expected not-initialized error, got: {}",
+        err_msg
+    );
+}
