@@ -33,12 +33,18 @@
 mod handler;
 #[cfg(feature = "http-client")]
 mod http;
+#[cfg(feature = "oauth-client")]
+mod oauth;
 mod stdio;
 mod transport;
 
 pub use handler::{ClientHandler, NotificationHandler, ServerNotification};
 #[cfg(feature = "http-client")]
 pub use http::{HttpClientConfig, HttpClientTransport};
+#[cfg(feature = "oauth-client")]
+pub use oauth::{
+    OAuthClientCredentials, OAuthClientCredentialsBuilder, OAuthClientError, TokenProvider,
+};
 pub use stdio::StdioClientTransport;
 pub use transport::ClientTransport;
 

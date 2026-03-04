@@ -59,7 +59,7 @@ jsonschema = "0.41"
 [features]
 default = []
 # Enable all optional features
-full = ["http", "websocket", "childproc", "oauth", "jwks", "testing", "dynamic-tools", "http-client"]
+full = ["http", "websocket", "childproc", "oauth", "jwks", "testing", "dynamic-tools", "http-client", "oauth-client"]
 # Transport features
 http = ["dep:axum", "dep:hyper", "dep:http", "dep:http-body-util", "dep:tokio-stream", "dep:uuid"]
 websocket = ["dep:axum", "dep:uuid"]
@@ -72,6 +72,8 @@ jwks = ["oauth", "dep:reqwest"]
 testing = []
 # HTTP client transport for connecting to remote MCP servers
 http-client = ["dep:reqwest"]
+# OAuth 2.0 client-side token acquisition (client credentials grant)
+oauth-client = ["http-client"]
 # Runtime tool (de)registration via DynamicToolRegistry
 dynamic-tools = []
 
