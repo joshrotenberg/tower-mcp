@@ -97,6 +97,7 @@ These demonstrate specific features. Run them individually with `cargo run`.
 | `http_auth` | API key and OAuth/JWT authentication | `cargo run --example http_auth --features oauth -- --auth apikey` |
 | `tool_middleware` | Per-tool timeout and concurrency limits | `cargo run --example tool_middleware` |
 | `middleware_showcase` | Config validation via shared guards and middleware | `cargo run --example middleware_showcase` |
+| `tool_selection` | Multi-layered tool filtering for large servers | `cargo run --example tool_selection` |
 | `capability_filtering` | Session-based tool/resource/prompt visibility | `cargo run --example capability_filtering --features http` |
 | `dynamic_tools` | Runtime tool registration/deregistration | `cargo run --example dynamic_tools --features dynamic-tools` |
 | `external_api_auth` | Four patterns for downstream API authentication | `cargo run --example external_api_auth` |
