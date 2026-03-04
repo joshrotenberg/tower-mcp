@@ -54,9 +54,11 @@ use crate::protocol::{
     CallToolParams, CallToolResult, ClientCapabilities, CompleteParams, CompleteResult,
     CompletionArgument, CompletionReference, ElicitationCapability, GetPromptParams,
     GetPromptResult, Implementation, InitializeParams, InitializeResult, JsonRpcNotification,
-    JsonRpcRequest, ListPromptsParams, ListPromptsResult, ListResourcesParams, ListResourcesResult,
-    ListRootsResult, ListToolsParams, ListToolsResult, ReadResourceParams, ReadResourceResult,
-    RequestId, Root, RootsCapability, SamplingCapability, notifications,
+    JsonRpcRequest, ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams,
+    ListResourceTemplatesResult, ListResourcesParams, ListResourcesResult, ListRootsResult,
+    ListToolsParams, ListToolsResult, PromptDefinition, ReadResourceParams, ReadResourceResult,
+    RequestId, ResourceDefinition, ResourceTemplateDefinition, Root, RootsCapability,
+    SamplingCapability, ToolDefinition, notifications,
 };
 use tower_mcp_types::JsonRpcError;
 
@@ -384,6 +386,137 @@ impl McpClient {
             },
         )
         .await
+    }
+
+    /// List tools with an optional pagination cursor.
+    pub async fn list_tools_with_cursor(&self, cursor: Option<String>) -> Result<ListToolsResult> {
+        self.ensure_initialized()?;
+        self.send_request("tools/list", &ListToolsParams { cursor, meta: None })
+            .await
+    }
+
+    /// List resources with an optional pagination cursor.
+    pub async fn list_resources_with_cursor(
+        &self,
+        cursor: Option<String>,
+    ) -> Result<ListResourcesResult> {
+        self.ensure_initialized()?;
+        self.send_request(
+            "resources/list",
+            &ListResourcesParams { cursor, meta: None },
+        )
+        .await
+    }
+
+    /// List resource templates.
+    pub async fn list_resource_templates(&self) -> Result<ListResourceTemplatesResult> {
+        self.ensure_initialized()?;
+        self.send_request(
+            "resources/templates/list",
+            &ListResourceTemplatesParams {
+                cursor: None,
+                meta: None,
+            },
+        )
+        .await
+    }
+
+    /// List resource templates with an optional pagination cursor.
+    pub async fn list_resource_templates_with_cursor(
+        &self,
+        cursor: Option<String>,
+    ) -> Result<ListResourceTemplatesResult> {
+        self.ensure_initialized()?;
+        self.send_request(
+            "resources/templates/list",
+            &ListResourceTemplatesParams { cursor, meta: None },
+        )
+        .await
+    }
+
+    /// List prompts with an optional pagination cursor.
+    pub async fn list_prompts_with_cursor(
+        &self,
+        cursor: Option<String>,
+    ) -> Result<ListPromptsResult> {
+        self.ensure_initialized()?;
+        self.send_request("prompts/list", &ListPromptsParams { cursor, meta: None })
+            .await
+    }
+
+    /// List all tools, following pagination cursors until exhausted.
+    pub async fn list_all_tools(&self) -> Result<Vec<ToolDefinition>> {
+        let mut all = Vec::new();
+        let mut cursor = None;
+        loop {
+            let result = self.list_tools_with_cursor(cursor).await?;
+            all.extend(result.tools);
+            match result.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        Ok(all)
+    }
+
+    /// List all resources, following pagination cursors until exhausted.
+    pub async fn list_all_resources(&self) -> Result<Vec<ResourceDefinition>> {
+        let mut all = Vec::new();
+        let mut cursor = None;
+        loop {
+            let result = self.list_resources_with_cursor(cursor).await?;
+            all.extend(result.resources);
+            match result.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        Ok(all)
+    }
+
+    /// List all resource templates, following pagination cursors until exhausted.
+    pub async fn list_all_resource_templates(&self) -> Result<Vec<ResourceTemplateDefinition>> {
+        let mut all = Vec::new();
+        let mut cursor = None;
+        loop {
+            let result = self.list_resource_templates_with_cursor(cursor).await?;
+            all.extend(result.resource_templates);
+            match result.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        Ok(all)
+    }
+
+    /// List all prompts, following pagination cursors until exhausted.
+    pub async fn list_all_prompts(&self) -> Result<Vec<PromptDefinition>> {
+        let mut all = Vec::new();
+        let mut cursor = None;
+        loop {
+            let result = self.list_prompts_with_cursor(cursor).await?;
+            all.extend(result.prompts);
+            match result.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        Ok(all)
+    }
+
+    /// Call a tool and return the concatenated text content.
+    ///
+    /// Returns the text from all [`Text`](crate::protocol::Content::Text) items joined together.
+    /// If the tool result indicates an error (`is_error` is true), returns
+    /// an error with the text content as the message.
+    ///
+    /// For more control over the result, use [`call_tool()`](Self::call_tool).
+    pub async fn call_tool_text(&self, name: &str, arguments: serde_json::Value) -> Result<String> {
+        let result = self.call_tool(name, arguments).await?;
+        if result.is_error {
+            return Err(Error::Internal(result.all_text()));
+        }
+        Ok(result.all_text())
     }
 
     /// Get a prompt.
@@ -1402,6 +1535,148 @@ mod tests {
         assert!(
             called.load(Ordering::SeqCst),
             "handle_create_message should have been called"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_resource_templates() {
+        let client = McpClient::connect(MockTransport::with_responses(vec![
+            mock_initialize_response(),
+            serde_json::json!({
+                "resourceTemplates": [
+                    {
+                        "uriTemplate": "file:///{path}",
+                        "name": "File Template",
+                        "description": "A file template"
+                    }
+                ]
+            }),
+        ]))
+        .await
+        .unwrap();
+
+        client.initialize("test-client", "1.0.0").await.unwrap();
+        let result = client.list_resource_templates().await.unwrap();
+
+        assert_eq!(result.resource_templates.len(), 1);
+        assert_eq!(result.resource_templates[0].name, "File Template");
+    }
+
+    #[tokio::test]
+    async fn test_list_all_tools_single_page() {
+        let client = McpClient::connect(MockTransport::with_responses(vec![
+            mock_initialize_response(),
+            serde_json::json!({
+                "tools": [
+                    {
+                        "name": "tool_a",
+                        "description": "Tool A",
+                        "inputSchema": { "type": "object", "properties": {} }
+                    },
+                    {
+                        "name": "tool_b",
+                        "description": "Tool B",
+                        "inputSchema": { "type": "object", "properties": {} }
+                    }
+                ]
+            }),
+        ]))
+        .await
+        .unwrap();
+
+        client.initialize("test-client", "1.0.0").await.unwrap();
+        let tools = client.list_all_tools().await.unwrap();
+
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].name, "tool_a");
+        assert_eq!(tools[1].name, "tool_b");
+    }
+
+    #[tokio::test]
+    async fn test_list_all_tools_paginated() {
+        let client = McpClient::connect(MockTransport::with_responses(vec![
+            mock_initialize_response(),
+            // First page with a next_cursor
+            serde_json::json!({
+                "tools": [
+                    {
+                        "name": "tool_a",
+                        "description": "Tool A",
+                        "inputSchema": { "type": "object", "properties": {} }
+                    }
+                ],
+                "nextCursor": "page2"
+            }),
+            // Second page with no next_cursor
+            serde_json::json!({
+                "tools": [
+                    {
+                        "name": "tool_b",
+                        "description": "Tool B",
+                        "inputSchema": { "type": "object", "properties": {} }
+                    }
+                ]
+            }),
+        ]))
+        .await
+        .unwrap();
+
+        client.initialize("test-client", "1.0.0").await.unwrap();
+        let tools = client.list_all_tools().await.unwrap();
+
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].name, "tool_a");
+        assert_eq!(tools[1].name, "tool_b");
+    }
+
+    #[tokio::test]
+    async fn test_call_tool_text_success() {
+        let client = McpClient::connect(MockTransport::with_responses(vec![
+            mock_initialize_response(),
+            serde_json::json!({
+                "content": [
+                    { "type": "text", "text": "Hello " },
+                    { "type": "text", "text": "World" }
+                ]
+            }),
+        ]))
+        .await
+        .unwrap();
+
+        client.initialize("test-client", "1.0.0").await.unwrap();
+        let text = client
+            .call_tool_text("test_tool", serde_json::json!({}))
+            .await
+            .unwrap();
+
+        assert_eq!(text, "Hello World");
+    }
+
+    #[tokio::test]
+    async fn test_call_tool_text_error() {
+        let client = McpClient::connect(MockTransport::with_responses(vec![
+            mock_initialize_response(),
+            serde_json::json!({
+                "content": [
+                    { "type": "text", "text": "something went wrong" }
+                ],
+                "isError": true
+            }),
+        ]))
+        .await
+        .unwrap();
+
+        client.initialize("test-client", "1.0.0").await.unwrap();
+        let result = client
+            .call_tool_text("test_tool", serde_json::json!({}))
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("something went wrong"),
+            "Error message should contain tool error text, got: {}",
+            err
         );
     }
 

@@ -2535,7 +2535,7 @@ pub struct UnsubscribeResourceParams {
 }
 
 /// Parameters for listing resource templates
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListResourceTemplatesParams {
     /// Pagination cursor from previous response
     #[serde(default)]
@@ -2546,7 +2546,7 @@ pub struct ListResourceTemplatesParams {
 }
 
 /// Result of listing resource templates
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListResourceTemplatesResult {
     /// Available resource templates
