@@ -1086,3 +1086,325 @@ mod token_provider_tests {
         assert!(result.is_err());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Auth: API key header E2E
+// ---------------------------------------------------------------------------
+
+/// Start an HTTP server that validates a custom header.
+async fn start_custom_header_auth_server(
+    header_name: &str,
+    expected_value: &str,
+) -> (String, tokio::task::JoinHandle<()>) {
+    use axum::{extract::Request, http::StatusCode, middleware, response::Response};
+
+    let router = test_router();
+    let transport = HttpTransport::new(router).disable_origin_validation();
+    let mcp_router = transport.into_router();
+
+    let name = header_name.to_string();
+    let value = expected_value.to_string();
+    let app = mcp_router.layer(middleware::from_fn(
+        move |request: Request, next: middleware::Next| {
+            let name = name.clone();
+            let value = value.clone();
+            async move {
+                let actual = request
+                    .headers()
+                    .get(&name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                if actual.as_deref() == Some(&value) {
+                    Ok::<Response, (StatusCode, String)>(next.run(request).await)
+                } else {
+                    Err((StatusCode::UNAUTHORIZED, "Unauthorized".to_string()))
+                }
+            }
+        },
+    ));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://127.0.0.1:{}", addr.port());
+
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    (url, handle)
+}
+
+#[tokio::test]
+async fn test_http_client_api_key_header() {
+    let (url, _server) = start_custom_header_auth_server("X-API-Key", "my-secret-key").await;
+
+    let transport = HttpClientTransport::new(&url).api_key_header("X-API-Key", "my-secret-key");
+    let client = McpClient::connect(transport).await.unwrap();
+
+    let info = client.initialize("test-client", "1.0.0").await.unwrap();
+    assert_eq!(info.server_info.name, "test-http-server");
+
+    let tools = client.list_tools().await.unwrap();
+    assert_eq!(tools.tools.len(), 2);
+
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_http_client_api_key_header_rejected() {
+    let (url, _server) = start_custom_header_auth_server("X-API-Key", "my-secret-key").await;
+
+    let transport = HttpClientTransport::new(&url).api_key_header("X-API-Key", "wrong-key");
+    let client = McpClient::connect(transport).await.unwrap();
+
+    let result = client.initialize("test-client", "1.0.0").await;
+    assert!(result.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Auth: Basic auth E2E
+// ---------------------------------------------------------------------------
+
+/// Start an HTTP server that validates Basic auth credentials.
+async fn start_basic_auth_server(
+    expected_user: &str,
+    expected_pass: &str,
+) -> (String, tokio::task::JoinHandle<()>) {
+    use axum::{extract::Request, http::StatusCode, middleware, response::Response};
+    use base64::Engine;
+
+    let router = test_router();
+    let transport = HttpTransport::new(router).disable_origin_validation();
+    let mcp_router = transport.into_router();
+
+    let expected = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD
+            .encode(format!("{}:{}", expected_user, expected_pass))
+    );
+    let app = mcp_router.layer(middleware::from_fn(
+        move |request: Request, next: middleware::Next| {
+            let expected = expected.clone();
+            async move {
+                let auth = request
+                    .headers()
+                    .get("Authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                if auth.as_deref() == Some(&expected) {
+                    Ok::<Response, (StatusCode, String)>(next.run(request).await)
+                } else {
+                    Err((StatusCode::UNAUTHORIZED, "Unauthorized".to_string()))
+                }
+            }
+        },
+    ));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://127.0.0.1:{}", addr.port());
+
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    (url, handle)
+}
+
+#[tokio::test]
+async fn test_http_client_basic_auth() {
+    let (url, _server) = start_basic_auth_server("admin", "password123").await;
+
+    let transport = HttpClientTransport::new(&url).basic_auth("admin", "password123");
+    let client = McpClient::connect(transport).await.unwrap();
+
+    let info = client.initialize("test-client", "1.0.0").await.unwrap();
+    assert_eq!(info.server_info.name, "test-http-server");
+
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_http_client_basic_auth_rejected() {
+    let (url, _server) = start_basic_auth_server("admin", "password123").await;
+
+    let transport = HttpClientTransport::new(&url).basic_auth("admin", "wrong");
+    let client = McpClient::connect(transport).await.unwrap();
+
+    let result = client.initialize("test-client", "1.0.0").await;
+    assert!(result.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Auth: Custom header E2E
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_http_client_custom_header() {
+    let (url, _server) = start_custom_header_auth_server("X-Custom-Auth", "custom-value-123").await;
+
+    let transport = HttpClientTransport::new(&url).header("X-Custom-Auth", "custom-value-123");
+    let client = McpClient::connect(transport).await.unwrap();
+
+    let info = client.initialize("test-client", "1.0.0").await.unwrap();
+    assert_eq!(info.server_info.name, "test-http-server");
+
+    client.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Auth: OAuthClientCredentials E2E
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "oauth-client")]
+mod oauth_client_credentials_tests {
+    use super::*;
+    use tower_mcp::OAuthClientCredentials;
+
+    /// Start a mock OAuth token endpoint that returns access tokens.
+    async fn start_mock_token_server(
+        expected_client_id: &str,
+        expected_client_secret: &str,
+        issued_token: &str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{Router, extract::Request, http::StatusCode, routing::post};
+        use base64::Engine;
+
+        let expected_auth = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD
+                .encode(format!("{}:{}", expected_client_id, expected_client_secret))
+        );
+        let token = issued_token.to_string();
+
+        let app = Router::new().route(
+            "/token",
+            post(move |request: Request| {
+                let expected_auth = expected_auth.clone();
+                let token = token.clone();
+                async move {
+                    let auth = request
+                        .headers()
+                        .get("Authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
+                    if auth.as_deref() != Some(&expected_auth) {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            axum::Json(serde_json::json!({"error": "invalid_client"})),
+                        );
+                    }
+                    (
+                        StatusCode::OK,
+                        axum::Json(serde_json::json!({
+                            "access_token": token,
+                            "token_type": "bearer",
+                            "expires_in": 3600
+                        })),
+                    )
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://127.0.0.1:{}", addr.port());
+
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        (url, handle)
+    }
+
+    #[tokio::test]
+    async fn test_http_client_oauth_client_credentials() {
+        let issued_token = "oauth-access-token-xyz";
+
+        // Start the mock token server
+        let (token_url, _token_server) =
+            start_mock_token_server("my-client", "my-secret", issued_token).await;
+
+        // Start the MCP server that validates bearer tokens
+        let (mcp_url, _mcp_server) = start_auth_server(issued_token).await;
+
+        // Build the OAuth provider pointing at our mock token endpoint
+        let provider = OAuthClientCredentials::builder()
+            .client_id("my-client")
+            .client_secret("my-secret")
+            .token_endpoint(format!("{}/token", token_url))
+            .build()
+            .unwrap();
+
+        let transport = HttpClientTransport::new(&mcp_url).with_token_provider(provider);
+        let client = McpClient::connect(transport).await.unwrap();
+
+        let info = client.initialize("test-client", "1.0.0").await.unwrap();
+        assert_eq!(info.server_info.name, "test-http-server");
+
+        // Verify subsequent requests also work (token is cached and reused)
+        let tools = client.list_tools().await.unwrap();
+        assert_eq!(tools.tools.len(), 2);
+
+        client.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_http_client_oauth_client_credentials_bad_secret() {
+        let (token_url, _token_server) =
+            start_mock_token_server("my-client", "my-secret", "token").await;
+
+        let (mcp_url, _mcp_server) = start_auth_server("token").await;
+
+        // Wrong secret should fail at token acquisition
+        let provider = OAuthClientCredentials::builder()
+            .client_id("my-client")
+            .client_secret("wrong-secret")
+            .token_endpoint(format!("{}/token", token_url))
+            .build()
+            .unwrap();
+
+        let transport = HttpClientTransport::new(&mcp_url).with_token_provider(provider);
+        let client = McpClient::connect(transport).await.unwrap();
+
+        let result = client.initialize("test-client", "1.0.0").await;
+        assert!(result.is_err());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Config: auto_sse disabled E2E
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_http_client_auto_sse_disabled() {
+    let (url, _server) = start_server().await;
+
+    let config = tower_mcp::client::HttpClientConfig {
+        auto_sse: false,
+        ..Default::default()
+    };
+    let transport = HttpClientTransport::with_config(&url, config);
+    let client = McpClient::connect(transport).await.unwrap();
+
+    let info = client.initialize("test-client", "1.0.0").await.unwrap();
+    assert_eq!(info.server_info.name, "test-http-server");
+
+    // Basic request/response still works without SSE
+    let tools = client.list_tools().await.unwrap();
+    assert_eq!(tools.tools.len(), 2);
+
+    let result = client
+        .call_tool("echo", serde_json::json!({"message": "no sse"}))
+        .await
+        .unwrap();
+    assert_eq!(result.first_text(), Some("no sse"));
+
+    client.shutdown().await.unwrap();
+}
