@@ -5,16 +5,23 @@
 
 #![cfg(all(feature = "http", feature = "http-client"))]
 
+use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tower_mcp::{
-    CallToolResult, CompleteParams, CompleteResult, CompletionReference, Content, GetPromptResult,
-    HttpTransport, McpRouter, PromptBuilder, PromptMessage, PromptRole, ReadResourceResult,
-    ResourceBuilder, ResourceContent, ResourceTemplateBuilder, ToolBuilder,
+    CallToolResult, ClientHandler, CompleteParams, CompleteResult, CompletionReference, Content,
+    ContentRole, CreateMessageParams, CreateMessageResult, ElicitFieldValue, ElicitRequestParams,
+    ElicitResult, GetPromptResult, HttpTransport, LogLevel, LoggingMessageParams, McpClientBuilder,
+    McpRouter, NoParams, NotificationHandler, PromptBuilder, PromptMessage, PromptRole,
+    ReadResourceResult, ResourceBuilder, ResourceContent, ResourceTemplateBuilder, Root,
+    SamplingContent, SamplingContentOrArray, SamplingMessage, ToolBuilder,
     client::{HttpClientTransport, McpClient},
+    extract::{Context, RawArgs},
 };
+use tower_mcp_types::JsonRpcError;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct EchoInput {
@@ -614,4 +621,468 @@ async fn test_http_client_complete_resource_uri() {
     assert_eq!(result.completion.values, vec!["Cargo.toml"]);
 
     client.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// P1: Pagination E2E
+// ---------------------------------------------------------------------------
+
+/// Create a test router with many items and small page size for pagination testing.
+fn pagination_test_router() -> McpRouter {
+    let mut router = McpRouter::new()
+        .server_info("test-pagination-server", "1.0.0")
+        .page_size(2);
+
+    for i in 0..5 {
+        let tool = ToolBuilder::new(format!("tool_{i}"))
+            .description(format!("Tool {i}"))
+            .handler(|_: NoParams| async move { Ok(CallToolResult::text("ok")) })
+            .build();
+        router = router.tool(tool);
+    }
+
+    for i in 0..3 {
+        let resource = ResourceBuilder::new(format!("res://item_{i}"))
+            .name(format!("Resource {i}"))
+            .text(format!("content_{i}"));
+        router = router.resource(resource);
+    }
+
+    for i in 0..3 {
+        let prompt = PromptBuilder::new(format!("prompt_{i}"))
+            .description(format!("Prompt {i}"))
+            .handler(|_: HashMap<String, String>| async move {
+                Ok(GetPromptResult {
+                    description: None,
+                    messages: vec![],
+                    meta: None,
+                })
+            })
+            .build();
+        router = router.prompt(prompt);
+    }
+
+    router
+}
+
+async fn start_pagination_server() -> (String, tokio::task::JoinHandle<()>) {
+    let router = pagination_test_router();
+    let transport = HttpTransport::new(router).disable_origin_validation();
+    let axum_router = transport.into_router();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://127.0.0.1:{}", addr.port());
+
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, axum_router).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    (url, handle)
+}
+
+#[tokio::test]
+async fn test_http_client_pagination_list_all_tools() {
+    let (url, _server) = start_pagination_server().await;
+
+    let transport = HttpClientTransport::new(&url);
+    let client = McpClient::connect(transport).await.unwrap();
+    client.initialize("test-client", "1.0.0").await.unwrap();
+
+    let tools = client.list_all_tools().await.unwrap();
+    assert_eq!(tools.len(), 5);
+
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    for i in 0..5 {
+        assert!(names.contains(&format!("tool_{i}").as_str()));
+    }
+
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_http_client_pagination_manual_cursor() {
+    let (url, _server) = start_pagination_server().await;
+
+    let transport = HttpClientTransport::new(&url);
+    let client = McpClient::connect(transport).await.unwrap();
+    client.initialize("test-client", "1.0.0").await.unwrap();
+
+    // Page 1: 2 tools + cursor
+    let page1 = client.list_tools_with_cursor(None).await.unwrap();
+    assert_eq!(page1.tools.len(), 2);
+    assert!(page1.next_cursor.is_some());
+
+    // Page 2: 2 tools + cursor
+    let page2 = client
+        .list_tools_with_cursor(page1.next_cursor)
+        .await
+        .unwrap();
+    assert_eq!(page2.tools.len(), 2);
+    assert!(page2.next_cursor.is_some());
+
+    // Page 3: 1 tool + no cursor
+    let page3 = client
+        .list_tools_with_cursor(page2.next_cursor)
+        .await
+        .unwrap();
+    assert_eq!(page3.tools.len(), 1);
+    assert!(page3.next_cursor.is_none());
+
+    // Verify all 5 unique tools were returned
+    let mut all_names: Vec<String> = Vec::new();
+    all_names.extend(page1.tools.iter().map(|t| t.name.clone()));
+    all_names.extend(page2.tools.iter().map(|t| t.name.clone()));
+    all_names.extend(page3.tools.iter().map(|t| t.name.clone()));
+    all_names.sort();
+    assert_eq!(all_names.len(), 5);
+
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_http_client_pagination_list_all_prompts() {
+    let (url, _server) = start_pagination_server().await;
+
+    let transport = HttpClientTransport::new(&url);
+    let client = McpClient::connect(transport).await.unwrap();
+    client.initialize("test-client", "1.0.0").await.unwrap();
+
+    let prompts = client.list_all_prompts().await.unwrap();
+    assert_eq!(prompts.len(), 3);
+
+    let names: Vec<&str> = prompts.iter().map(|p| p.name.as_str()).collect();
+    for i in 0..3 {
+        assert!(names.contains(&format!("prompt_{i}").as_str()));
+    }
+
+    client.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// P1: Bidirectional communication infrastructure
+// ---------------------------------------------------------------------------
+
+/// Create a test router with tools that exercise sampling, elicitation, and logging.
+fn bidirectional_test_router() -> McpRouter {
+    let sampling_tool = ToolBuilder::new("test_sampling")
+        .description("Calls ctx.sample() and returns the LLM response")
+        .extractor_handler((), |ctx: Context, _: RawArgs| async move {
+            let params =
+                CreateMessageParams::new(vec![SamplingMessage::user("Test sampling request")], 100);
+            match ctx.sample(params).await {
+                Ok(result) => {
+                    let text = result.first_text().unwrap_or("no text").to_string();
+                    Ok(CallToolResult::text(text))
+                }
+                Err(e) => Ok(CallToolResult::error(format!("sampling failed: {e}"))),
+            }
+        })
+        .build();
+
+    let confirm_tool = ToolBuilder::new("test_confirm")
+        .description("Calls ctx.confirm() and returns the result")
+        .extractor_handler((), |ctx: Context, _: RawArgs| async move {
+            match ctx.confirm("proceed?").await {
+                Ok(true) => Ok(CallToolResult::text("confirmed")),
+                Ok(false) => Ok(CallToolResult::text("declined")),
+                Err(e) => Ok(CallToolResult::error(format!("elicitation failed: {e}"))),
+            }
+        })
+        .build();
+
+    let log_tool = ToolBuilder::new("test_log")
+        .description("Sends a log notification and returns")
+        .extractor_handler((), |ctx: Context, _: RawArgs| async move {
+            ctx.send_log(LoggingMessageParams::new(
+                LogLevel::Info,
+                serde_json::json!("test log message"),
+            ));
+            Ok(CallToolResult::text("logged"))
+        })
+        .build();
+
+    McpRouter::new()
+        .server_info("test-bidirectional-server", "1.0.0")
+        .tool(sampling_tool)
+        .tool(confirm_tool)
+        .tool(log_tool)
+}
+
+/// Start a bidirectional HTTP server with sampling enabled.
+async fn start_bidirectional_server() -> (String, tokio::task::JoinHandle<()>) {
+    let router = bidirectional_test_router();
+    let transport = HttpTransport::new(router)
+        .with_sampling()
+        .disable_origin_validation();
+    let axum_router = transport.into_router();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://127.0.0.1:{}", addr.port());
+
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, axum_router).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    (url, handle)
+}
+
+// ---------------------------------------------------------------------------
+// P1: Notification Handler via SSE E2E
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_http_client_notification_log_message() {
+    let (url, _server) = start_bidirectional_server().await;
+
+    let captured: Arc<Mutex<Vec<LoggingMessageParams>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_clone = captured.clone();
+
+    let handler = NotificationHandler::new().on_log_message(move |params| {
+        captured_clone.lock().unwrap().push(params);
+    });
+
+    let transport = HttpClientTransport::new(&url);
+    let client = McpClientBuilder::new()
+        .with_sampling()
+        .connect(transport, handler)
+        .await
+        .unwrap();
+    client.initialize("test-client", "1.0.0").await.unwrap();
+
+    // Call the tool that sends a log notification
+    let result = client
+        .call_tool("test_log", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(result.first_text(), Some("logged"));
+
+    // Wait for the notification to arrive via SSE
+    let received = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if !captured.lock().unwrap().is_empty() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+
+    assert!(received, "Expected to receive log notification via SSE");
+
+    {
+        let logs = captured.lock().unwrap();
+        assert_eq!(logs.len(), 1);
+        assert!(matches!(logs[0].level, LogLevel::Info));
+        assert_eq!(logs[0].data, serde_json::json!("test log message"));
+    }
+
+    client.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// P1: Server-initiated Sampling E2E
+// ---------------------------------------------------------------------------
+
+struct MockSamplingHandler;
+
+#[async_trait]
+impl ClientHandler for MockSamplingHandler {
+    async fn handle_create_message(
+        &self,
+        _params: CreateMessageParams,
+    ) -> Result<CreateMessageResult, JsonRpcError> {
+        Ok(CreateMessageResult {
+            content: SamplingContentOrArray::Single(SamplingContent::Text {
+                text: "mock-llm-response".into(),
+                annotations: None,
+                meta: None,
+            }),
+            model: "test-model".into(),
+            role: ContentRole::Assistant,
+            stop_reason: Some("end_turn".into()),
+            meta: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn test_http_client_sampling_round_trip() {
+    let (url, _server) = start_bidirectional_server().await;
+
+    let transport = HttpClientTransport::new(&url);
+    let client = McpClientBuilder::new()
+        .with_sampling()
+        .connect(transport, MockSamplingHandler)
+        .await
+        .unwrap();
+    client.initialize("test-client", "1.0.0").await.unwrap();
+
+    // Allow time for the SSE stream to establish (needed for bidirectional channel)
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Call the tool that triggers server-side sampling
+    // Flow: client -> call_tool -> server ctx.sample() -> SSE request ->
+    //       client MockSamplingHandler -> POST response -> server returns result
+    let result = client
+        .call_tool("test_sampling", serde_json::json!({}))
+        .await
+        .unwrap();
+
+    assert_eq!(result.first_text(), Some("mock-llm-response"));
+
+    client.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// P1: Server-initiated Elicitation E2E
+// ---------------------------------------------------------------------------
+
+struct MockElicitationHandler;
+
+#[async_trait]
+impl ClientHandler for MockElicitationHandler {
+    async fn handle_elicit(
+        &self,
+        _params: ElicitRequestParams,
+    ) -> Result<ElicitResult, JsonRpcError> {
+        let mut content = HashMap::new();
+        content.insert("confirm".to_string(), ElicitFieldValue::Boolean(true));
+        Ok(ElicitResult::accept(content))
+    }
+}
+
+#[tokio::test]
+async fn test_http_client_elicitation_confirm() {
+    let (url, _server) = start_bidirectional_server().await;
+
+    let transport = HttpClientTransport::new(&url);
+    let client = McpClientBuilder::new()
+        .with_elicitation()
+        .with_sampling()
+        .connect(transport, MockElicitationHandler)
+        .await
+        .unwrap();
+    client.initialize("test-client", "1.0.0").await.unwrap();
+
+    // Allow time for the SSE stream to establish (needed for bidirectional channel)
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Call the tool that triggers server-side elicitation via ctx.confirm()
+    // Flow: client -> call_tool -> server ctx.confirm("proceed?") -> SSE request ->
+    //       client MockElicitationHandler -> POST response -> server returns "confirmed"
+    let result = client
+        .call_tool("test_confirm", serde_json::json!({}))
+        .await
+        .unwrap();
+
+    assert_eq!(result.first_text(), Some("confirmed"));
+
+    client.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// P1: Root Management E2E
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_http_client_root_management() {
+    let (url, _server) = start_server().await;
+
+    let transport = HttpClientTransport::new(&url);
+    let client = McpClientBuilder::new()
+        .with_roots(vec![Root::new("file:///project")])
+        .connect_simple(transport)
+        .await
+        .unwrap();
+    client.initialize("test-client", "1.0.0").await.unwrap();
+
+    // Initial roots
+    let roots = client.list_roots().await;
+    assert_eq!(roots.roots.len(), 1);
+    assert_eq!(roots.roots[0].uri, "file:///project");
+
+    // Add a root
+    client.add_root(Root::new("file:///other")).await.unwrap();
+    let roots = client.list_roots().await;
+    assert_eq!(roots.roots.len(), 2);
+
+    // Remove the first root
+    let removed = client.remove_root("file:///project").await.unwrap();
+    assert!(removed);
+    let roots = client.list_roots().await;
+    assert_eq!(roots.roots.len(), 1);
+    assert_eq!(roots.roots[0].uri, "file:///other");
+
+    // Remove nonexistent root returns false
+    let removed = client.remove_root("file:///nonexistent").await.unwrap();
+    assert!(!removed);
+
+    // Set roots replaces all
+    client
+        .set_roots(vec![Root::new("file:///new_a"), Root::new("file:///new_b")])
+        .await
+        .unwrap();
+    let roots = client.list_roots().await;
+    assert_eq!(roots.roots.len(), 2);
+    let uris: Vec<&str> = roots.roots.iter().map(|r| r.uri.as_str()).collect();
+    assert!(uris.contains(&"file:///new_a"));
+    assert!(uris.contains(&"file:///new_b"));
+
+    client.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// P1: Token Provider E2E
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "oauth-client")]
+mod token_provider_tests {
+    use super::*;
+    use tower_mcp::{OAuthClientError, TokenProvider};
+
+    struct StaticTokenProvider(String);
+
+    #[async_trait]
+    impl TokenProvider for StaticTokenProvider {
+        async fn get_token(&self) -> Result<String, OAuthClientError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_client_with_token_provider() {
+        let (url, _server) = start_auth_server("dynamic-test-token").await;
+
+        let transport = HttpClientTransport::new(&url)
+            .with_token_provider(StaticTokenProvider("dynamic-test-token".into()));
+        let client = McpClient::connect(transport).await.unwrap();
+
+        let info = client.initialize("test-client", "1.0.0").await.unwrap();
+        assert_eq!(info.server_info.name, "test-http-server");
+
+        // Verify we can make further requests with the dynamic token
+        let tools = client.list_tools().await.unwrap();
+        assert_eq!(tools.tools.len(), 2);
+
+        client.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_http_client_token_provider_rejected() {
+        let (url, _server) = start_auth_server("dynamic-test-token").await;
+
+        let transport = HttpClientTransport::new(&url)
+            .with_token_provider(StaticTokenProvider("wrong-token".into()));
+        let client = McpClient::connect(transport).await.unwrap();
+
+        let result = client.initialize("test-client", "1.0.0").await;
+        assert!(result.is_err());
+    }
 }

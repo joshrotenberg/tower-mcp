@@ -492,8 +492,58 @@ impl ClientTransport for HttpClientTransport {
             request = request.header("Authorization", format!("Bearer {}", token));
         }
 
+        let request = request.body(message.to_string());
+
+        // After session is established, send in a background task so the
+        // message loop can continue processing incoming SSE messages.
+        // This prevents a deadlock when the server blocks on a
+        // bidirectional request (sampling/elicitation) that requires the
+        // client to respond via the SSE channel.
+        if self.session_id.is_some() {
+            let tx = self.incoming_tx.clone();
+            let connected = self.connected.clone();
+            tokio::spawn(async move {
+                let response = match request.send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::error!(error = %e, "Background HTTP request failed");
+                        connected.store(false, Ordering::Release);
+                        return;
+                    }
+                };
+
+                let status = response.status();
+
+                // 202 Accepted = notification acknowledged, no body
+                if status == reqwest::StatusCode::ACCEPTED {
+                    return;
+                }
+
+                if !status.is_success() {
+                    let body = response.text().await.unwrap_or_default();
+                    tracing::error!(status = %status, body = %body, "HTTP error from server");
+                    connected.store(false, Ordering::Release);
+                    return;
+                }
+
+                // Read response body and queue for recv()
+                match response.text().await {
+                    Ok(body) if !body.is_empty() => {
+                        let _ = tx.send(body).await;
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to read response body");
+                        connected.store(false, Ordering::Release);
+                    }
+                    _ => {}
+                }
+            });
+            return Ok(());
+        }
+
+        // Pre-session (initialize): handle synchronously to extract
+        // session headers and start the SSE stream.
         let response = request
-            .body(message.to_string())
             .send()
             .await
             .map_err(|e| Error::Transport(format!("HTTP request failed: {}", e)))?;
