@@ -643,12 +643,67 @@ impl McpRouter {
         self
     }
 
+    /// Conditionally register a tool.
+    ///
+    /// Registers the tool only if `condition` is `true`. This keeps fluent
+    /// builder chains intact when tools are conditionally enabled.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::{McpRouter, ToolBuilder, CallToolResult};
+    /// use schemars::JsonSchema;
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Debug, Deserialize, JsonSchema)]
+    /// struct Input { value: String }
+    ///
+    /// let enable_admin = false;
+    ///
+    /// let admin_tool = ToolBuilder::new("admin")
+    ///     .description("Admin tool")
+    ///     .handler(|i: Input| async move { Ok(CallToolResult::text(&i.value)) })
+    ///     .build();
+    ///
+    /// let router = McpRouter::new()
+    ///     .tool_if(enable_admin, admin_tool);
+    /// ```
+    pub fn tool_if(self, condition: bool, tool: Tool) -> Self {
+        if condition { self.tool(tool) } else { self }
+    }
+
     /// Register a resource
     pub fn resource(mut self, resource: Resource) -> Self {
         Arc::make_mut(&mut self.inner)
             .resources
             .insert(resource.uri.clone(), Arc::new(resource));
         self
+    }
+
+    /// Conditionally register a resource.
+    ///
+    /// Registers the resource only if `condition` is `true`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::{McpRouter, ResourceBuilder};
+    ///
+    /// let enable_config = false;
+    ///
+    /// let config = ResourceBuilder::new("config://system")
+    ///     .name("config")
+    ///     .text("secret=xxx");
+    ///
+    /// let router = McpRouter::new()
+    ///     .resource_if(enable_config, config);
+    /// ```
+    pub fn resource_if(self, condition: bool, resource: Resource) -> Self {
+        if condition {
+            self.resource(resource)
+        } else {
+            self
+        }
     }
 
     /// Register a resource template
@@ -698,6 +753,28 @@ impl McpRouter {
         self
     }
 
+    /// Conditionally register a prompt.
+    ///
+    /// Registers the prompt only if `condition` is `true`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::{McpRouter, PromptBuilder};
+    ///
+    /// let enable_debug = false;
+    ///
+    /// let debug_prompt = PromptBuilder::new("debug")
+    ///     .description("Debug prompt")
+    ///     .user_message("Debug mode enabled");
+    ///
+    /// let router = McpRouter::new()
+    ///     .prompt_if(enable_debug, debug_prompt);
+    /// ```
+    pub fn prompt_if(self, condition: bool, prompt: Prompt) -> Self {
+        if condition { self.prompt(prompt) } else { self }
+    }
+
     /// Register multiple tools at once.
     ///
     /// # Example
@@ -729,6 +806,13 @@ impl McpRouter {
             .fold(self, |router, tool| router.tool(tool))
     }
 
+    /// Conditionally register multiple tools at once.
+    ///
+    /// Registers all tools only if `condition` is `true`.
+    pub fn tools_if(self, condition: bool, tools: impl IntoIterator<Item = Tool>) -> Self {
+        if condition { self.tools(tools) } else { self }
+    }
+
     /// Register multiple resources at once.
     ///
     /// # Example
@@ -753,6 +837,21 @@ impl McpRouter {
             .fold(self, |router, resource| router.resource(resource))
     }
 
+    /// Conditionally register multiple resources at once.
+    ///
+    /// Registers all resources only if `condition` is `true`.
+    pub fn resources_if(
+        self,
+        condition: bool,
+        resources: impl IntoIterator<Item = Resource>,
+    ) -> Self {
+        if condition {
+            self.resources(resources)
+        } else {
+            self
+        }
+    }
+
     /// Register multiple prompts at once.
     ///
     /// # Example
@@ -775,6 +874,17 @@ impl McpRouter {
         prompts
             .into_iter()
             .fold(self, |router, prompt| router.prompt(prompt))
+    }
+
+    /// Conditionally register multiple prompts at once.
+    ///
+    /// Registers all prompts only if `condition` is `true`.
+    pub fn prompts_if(self, condition: bool, prompts: impl IntoIterator<Item = Prompt>) -> Self {
+        if condition {
+            self.prompts(prompts)
+        } else {
+            self
+        }
     }
 
     /// Merge another router's capabilities into this one.
@@ -5440,4 +5550,123 @@ mod tests {
             assert!(names.contains(&"tool_b"));
         }
     } // mod dynamic_tools_tests
+
+    #[tokio::test]
+    async fn test_tool_if_true_registers() {
+        let tool = ToolBuilder::new("conditional")
+            .description("Conditional tool")
+            .handler(|_: AddInput| async { Ok(CallToolResult::text("ok")) })
+            .build();
+
+        let mut router = McpRouter::new().tool_if(true, tool);
+        init_router(&mut router).await;
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::ListTools(ListToolsParams::default()),
+            extensions: Extensions::new(),
+        };
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+        match resp.inner {
+            Ok(McpResponse::ListTools(result)) => {
+                assert_eq!(result.tools.len(), 1);
+                assert_eq!(result.tools[0].name, "conditional");
+            }
+            _ => panic!("Expected ListTools response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_if_false_skips() {
+        let tool = ToolBuilder::new("conditional")
+            .description("Conditional tool")
+            .handler(|_: AddInput| async { Ok(CallToolResult::text("ok")) })
+            .build();
+
+        let mut router = McpRouter::new().tool_if(false, tool);
+        init_router(&mut router).await;
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::ListTools(ListToolsParams::default()),
+            extensions: Extensions::new(),
+        };
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+        match resp.inner {
+            Ok(McpResponse::ListTools(result)) => {
+                assert_eq!(result.tools.len(), 0);
+            }
+            _ => panic!("Expected ListTools response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tools_if_batch_conditional() {
+        let tools = vec![
+            ToolBuilder::new("a")
+                .description("Tool A")
+                .handler(|_: AddInput| async { Ok(CallToolResult::text("ok")) })
+                .build(),
+            ToolBuilder::new("b")
+                .description("Tool B")
+                .handler(|_: AddInput| async { Ok(CallToolResult::text("ok")) })
+                .build(),
+        ];
+
+        let mut router = McpRouter::new().tools_if(false, tools);
+        init_router(&mut router).await;
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::ListTools(ListToolsParams::default()),
+            extensions: Extensions::new(),
+        };
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+        match resp.inner {
+            Ok(McpResponse::ListTools(result)) => {
+                assert_eq!(result.tools.len(), 0);
+            }
+            _ => panic!("Expected ListTools response"),
+        }
+    }
+
+    #[test]
+    fn test_resource_if_true_registers() {
+        let resource = crate::resource::ResourceBuilder::new("file:///test.txt")
+            .name("test")
+            .text("hello");
+
+        let router = McpRouter::new().resource_if(true, resource);
+        assert_eq!(router.inner.resources.len(), 1);
+    }
+
+    #[test]
+    fn test_resource_if_false_skips() {
+        let resource = crate::resource::ResourceBuilder::new("file:///test.txt")
+            .name("test")
+            .text("hello");
+
+        let router = McpRouter::new().resource_if(false, resource);
+        assert_eq!(router.inner.resources.len(), 0);
+    }
+
+    #[test]
+    fn test_prompt_if_true_registers() {
+        let prompt = crate::prompt::PromptBuilder::new("greet")
+            .description("Greeting")
+            .user_message("Hello!");
+
+        let router = McpRouter::new().prompt_if(true, prompt);
+        assert_eq!(router.inner.prompts.len(), 1);
+    }
+
+    #[test]
+    fn test_prompt_if_false_skips() {
+        let prompt = crate::prompt::PromptBuilder::new("greet")
+            .description("Greeting")
+            .user_message("Hello!");
+
+        let router = McpRouter::new().prompt_if(false, prompt);
+        assert_eq!(router.inner.prompts.len(), 0);
+    }
 }
