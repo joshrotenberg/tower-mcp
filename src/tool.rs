@@ -328,30 +328,31 @@ impl JsonSchema for NoParams {
     }
 }
 
-/// Validate a tool name according to MCP spec.
+/// Validate a tool name according to MCP spec (SEP-986).
 ///
 /// Tool names must be:
-/// - 1-128 characters long
-/// - Contain only alphanumeric characters, underscores, hyphens, and dots
+/// - 1-64 characters long
+/// - Contain only ASCII alphanumeric characters, underscores, hyphens, dots,
+///   and forward slashes
 ///
 /// Returns `Ok(())` if valid, `Err` with description if invalid.
 pub fn validate_tool_name(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(Error::tool("Tool name cannot be empty"));
     }
-    if name.len() > 128 {
+    if name.len() > 64 {
         return Err(Error::tool(format!(
-            "Tool name '{}' exceeds maximum length of 128 characters (got {})",
+            "Tool name '{}' exceeds maximum length of 64 characters (got {})",
             name,
             name.len()
         )));
     }
     if let Some(invalid_char) = name
         .chars()
-        .find(|c| !c.is_ascii_alphanumeric() && *c != '_' && *c != '-' && *c != '.')
+        .find(|c| !c.is_ascii_alphanumeric() && *c != '_' && *c != '-' && *c != '.' && *c != '/')
     {
         return Err(Error::tool(format!(
-            "Tool name '{}' contains invalid character '{}'. Only alphanumeric, underscore, hyphen, and dot are allowed.",
+            "Tool name '{}' contains invalid character '{}'. Only alphanumeric, underscore, hyphen, dot, and forward slash are allowed.",
             name, invalid_char
         )));
     }
@@ -705,15 +706,16 @@ pub struct ToolBuilder {
 impl ToolBuilder {
     /// Create a new tool builder with the given name.
     ///
-    /// Tool names must be 1-128 characters and contain only alphanumeric
-    /// characters, underscores, hyphens, and dots.
+    /// Tool names must be 1-64 characters and contain only ASCII alphanumeric
+    /// characters, underscores, hyphens, dots, and forward slashes (per
+    /// [SEP-986](https://github.com/modelcontextprotocol/specification/issues/986)).
     ///
     /// Use [`try_new`](Self::try_new) if the name comes from runtime input.
     ///
     /// # Panics
     ///
-    /// Panics if `name` is empty, exceeds 128 characters, or contains
-    /// characters other than ASCII alphanumerics, `_`, `-`, and `.`.
+    /// Panics if `name` is empty, exceeds 64 characters, or contains
+    /// characters other than ASCII alphanumerics, `_`, `-`, `.`, and `/`.
     pub fn new(name: impl Into<String>) -> Self {
         let name = name.into();
         if let Err(e) = validate_tool_name(&name) {
@@ -1667,7 +1669,7 @@ mod tests {
 
     #[test]
     fn test_invalid_tool_name_too_long() {
-        let long_name = "a".repeat(129);
+        let long_name = "a".repeat(65);
         let err = ToolBuilder::try_new(long_name).err().expect("should fail");
         assert!(err.to_string().contains("exceeds maximum"));
     }
@@ -1687,7 +1689,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "exceeds maximum")]
     fn test_new_panics_on_too_long_name() {
-        ToolBuilder::new("a".repeat(129));
+        ToolBuilder::new("a".repeat(65));
     }
 
     #[test]
@@ -1698,14 +1700,16 @@ mod tests {
 
     #[test]
     fn test_valid_tool_names() {
-        // All valid characters
+        // All valid characters per SEP-986
         let names = [
             "my_tool",
             "my-tool",
             "my.tool",
+            "my/tool",
+            "user-profile/update",
             "MyTool123",
             "a",
-            &"a".repeat(128),
+            &"a".repeat(64),
         ];
         for name in names {
             assert!(
