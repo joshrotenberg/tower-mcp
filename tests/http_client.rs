@@ -418,7 +418,7 @@ async fn start_extended_server() -> (String, tokio::task::JoinHandle<()>) {
 }
 
 // ---------------------------------------------------------------------------
-// P0: Prompts E2E
+// Prompts E2E
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -487,7 +487,7 @@ async fn test_http_client_get_prompt_optional_arg() {
 }
 
 // ---------------------------------------------------------------------------
-// P0: Resource Templates E2E
+// Resource Templates E2E
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -529,7 +529,7 @@ async fn test_http_client_read_resource_template() {
 }
 
 // ---------------------------------------------------------------------------
-// P0: call_tool_text() E2E
+// call_tool_text() E2E
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -556,7 +556,7 @@ async fn test_http_client_call_tool_text() {
 }
 
 // ---------------------------------------------------------------------------
-// P0: Completion API E2E
+// Completion API E2E
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -624,7 +624,7 @@ async fn test_http_client_complete_resource_uri() {
 }
 
 // ---------------------------------------------------------------------------
-// P1: Pagination E2E
+// Pagination E2E
 // ---------------------------------------------------------------------------
 
 /// Create a test router with many items and small page size for pagination testing.
@@ -762,7 +762,7 @@ async fn test_http_client_pagination_list_all_prompts() {
 }
 
 // ---------------------------------------------------------------------------
-// P1: Bidirectional communication infrastructure
+// Bidirectional communication infrastructure
 // ---------------------------------------------------------------------------
 
 /// Create a test router with tools that exercise sampling, elicitation, and logging.
@@ -833,7 +833,7 @@ async fn start_bidirectional_server() -> (String, tokio::task::JoinHandle<()>) {
 }
 
 // ---------------------------------------------------------------------------
-// P1: Notification Handler via SSE E2E
+// Notification Handler via SSE E2E
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -887,7 +887,7 @@ async fn test_http_client_notification_log_message() {
 }
 
 // ---------------------------------------------------------------------------
-// P1: Server-initiated Sampling E2E
+// Server-initiated Sampling E2E
 // ---------------------------------------------------------------------------
 
 struct MockSamplingHandler;
@@ -941,7 +941,7 @@ async fn test_http_client_sampling_round_trip() {
 }
 
 // ---------------------------------------------------------------------------
-// P1: Server-initiated Elicitation E2E
+// Server-initiated Elicitation E2E
 // ---------------------------------------------------------------------------
 
 struct MockElicitationHandler;
@@ -988,7 +988,7 @@ async fn test_http_client_elicitation_confirm() {
 }
 
 // ---------------------------------------------------------------------------
-// P1: Root Management E2E
+// Root Management E2E
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1039,7 +1039,7 @@ async fn test_http_client_root_management() {
 }
 
 // ---------------------------------------------------------------------------
-// P1: Token Provider E2E
+// Token Provider E2E
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "oauth-client")]
