@@ -33,6 +33,7 @@
 //!     }));
 //! ```
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::error::{Error, JsonRpcError};
@@ -218,6 +219,48 @@ impl<T: Filterable> CapabilityFilter<T> {
     pub fn denial_error(&self, name: &str) -> Error {
         self.denial.to_error(name)
     }
+
+    /// Create a filter that only shows capabilities whose names are in the list.
+    ///
+    /// Capabilities not in the list are hidden. This is useful for exposing
+    /// a curated subset of capabilities (e.g., from a config file or CLI flag).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::{CapabilityFilter, Tool};
+    ///
+    /// // Only expose these two tools
+    /// let filter = CapabilityFilter::<Tool>::allow_list(&["query", "list_tables"]);
+    /// ```
+    pub fn allow_list(names: &[&str]) -> Self
+    where
+        T: 'static,
+    {
+        let allowed: HashSet<String> = names.iter().map(|s| (*s).to_string()).collect();
+        Self::new(move |_session, cap: &T| allowed.contains(cap.name()))
+    }
+
+    /// Create a filter that hides capabilities whose names are in the list.
+    ///
+    /// All capabilities are visible except those explicitly listed. This is
+    /// useful for blocking specific dangerous or irrelevant capabilities.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::{CapabilityFilter, Tool};
+    ///
+    /// // Hide these destructive tools
+    /// let filter = CapabilityFilter::<Tool>::deny_list(&["delete", "drop_table"]);
+    /// ```
+    pub fn deny_list(names: &[&str]) -> Self
+    where
+        T: 'static,
+    {
+        let denied: HashSet<String> = names.iter().map(|s| (*s).to_string()).collect();
+        Self::new(move |_session, cap: &T| !denied.contains(cap.name()))
+    }
 }
 
 impl CapabilityFilter<Tool> {
@@ -384,6 +427,58 @@ mod tests {
 
         assert!(!filter.is_visible(&session, &tool));
         let error = filter.denial_error("writer");
+        match error {
+            Error::JsonRpc(e) => assert_eq!(e.code, -32007),
+            _ => panic!("Expected JsonRpc error"),
+        }
+    }
+
+    #[test]
+    fn test_allow_list_shows_listed_tools() {
+        let filter = CapabilityFilter::<Tool>::allow_list(&["query", "list_tables"]);
+        let session = SessionState::new();
+
+        assert!(filter.is_visible(&session, &make_test_tool("query")));
+        assert!(filter.is_visible(&session, &make_test_tool("list_tables")));
+        assert!(!filter.is_visible(&session, &make_test_tool("delete")));
+        assert!(!filter.is_visible(&session, &make_test_tool("drop_table")));
+    }
+
+    #[test]
+    fn test_allow_list_empty_blocks_all() {
+        let filter = CapabilityFilter::<Tool>::allow_list(&[]);
+        let session = SessionState::new();
+
+        assert!(!filter.is_visible(&session, &make_test_tool("anything")));
+    }
+
+    #[test]
+    fn test_deny_list_hides_listed_tools() {
+        let filter = CapabilityFilter::<Tool>::deny_list(&["delete", "drop_table"]);
+        let session = SessionState::new();
+
+        assert!(filter.is_visible(&session, &make_test_tool("query")));
+        assert!(filter.is_visible(&session, &make_test_tool("list_tables")));
+        assert!(!filter.is_visible(&session, &make_test_tool("delete")));
+        assert!(!filter.is_visible(&session, &make_test_tool("drop_table")));
+    }
+
+    #[test]
+    fn test_deny_list_empty_allows_all() {
+        let filter = CapabilityFilter::<Tool>::deny_list(&[]);
+        let session = SessionState::new();
+
+        assert!(filter.is_visible(&session, &make_test_tool("anything")));
+    }
+
+    #[test]
+    fn test_allow_list_with_denial_behavior() {
+        let filter = CapabilityFilter::<Tool>::allow_list(&["query"])
+            .denial_behavior(DenialBehavior::Unauthorized);
+        let session = SessionState::new();
+
+        assert!(!filter.is_visible(&session, &make_test_tool("delete")));
+        let error = filter.denial_error("delete");
         match error {
             Error::JsonRpc(e) => assert_eq!(e.code, -32007),
             _ => panic!("Expected JsonRpc error"),
