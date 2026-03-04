@@ -50,6 +50,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use pin_project_lite::pin_project;
+
 use tokio::sync::Mutex;
 use tower::util::BoxCloneService;
 use tower::{Layer, ServiceExt};
@@ -137,6 +139,42 @@ impl<S: fmt::Debug> fmt::Debug for PromptCatchError<S> {
     }
 }
 
+pin_project! {
+    /// Future for [`PromptCatchError`].
+    pub struct PromptCatchErrorFuture<F> {
+        #[pin]
+        inner: F,
+    }
+}
+
+impl<F, E> Future for PromptCatchErrorFuture<F>
+where
+    F: Future<Output = std::result::Result<GetPromptResult, E>>,
+    E: fmt::Display,
+{
+    type Output = std::result::Result<GetPromptResult, Infallible>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.project().inner.poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(response)) => Poll::Ready(Ok(response)),
+            Poll::Ready(Err(err)) => Poll::Ready(Ok(GetPromptResult {
+                description: Some(format!("Prompt error: {}", err)),
+                messages: vec![PromptMessage {
+                    role: PromptRole::Assistant,
+                    content: Content::Text {
+                        text: format!("Error generating prompt: {}", err),
+                        annotations: None,
+                        meta: None,
+                    },
+                    meta: None,
+                }],
+                meta: None,
+            })),
+        }
+    }
+}
+
 impl<S> Service<PromptRequest> for PromptCatchError<S>
 where
     S: Service<PromptRequest, Response = GetPromptResult> + Clone + Send + 'static,
@@ -145,38 +183,16 @@ where
 {
     type Response = GetPromptResult;
     type Error = Infallible;
-    type Future =
-        Pin<Box<dyn Future<Output = std::result::Result<GetPromptResult, Infallible>> + Send>>;
+    type Future = PromptCatchErrorFuture<S::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
         self.inner.poll_ready(cx).map_err(|_| unreachable!())
     }
 
     fn call(&mut self, req: PromptRequest) -> Self::Future {
-        let fut = self.inner.call(req);
-
-        Box::pin(async move {
-            match fut.await {
-                Ok(response) => Ok(response),
-                Err(err) => {
-                    // Convert middleware error to an error prompt result
-                    // We return a single error message as the prompt content
-                    Ok(GetPromptResult {
-                        description: Some(format!("Prompt error: {}", err)),
-                        messages: vec![PromptMessage {
-                            role: PromptRole::Assistant,
-                            content: Content::Text {
-                                text: format!("Error generating prompt: {}", err),
-                                annotations: None,
-                                meta: None,
-                            },
-                            meta: None,
-                        }],
-                        meta: None,
-                    })
-                }
-            }
-        })
+        PromptCatchErrorFuture {
+            inner: self.inner.call(req),
+        }
     }
 }
 

@@ -74,6 +74,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use pin_project_lite::pin_project;
+
 use tower::util::BoxCloneService;
 use tower_service::Service;
 
@@ -145,6 +147,44 @@ impl<S: fmt::Debug> fmt::Debug for ResourceCatchError<S> {
     }
 }
 
+pin_project! {
+    /// Future for [`ResourceCatchError`].
+    pub struct ResourceCatchErrorFuture<F> {
+        #[pin]
+        inner: F,
+        uri: Option<String>,
+    }
+}
+
+impl<F, E> Future for ResourceCatchErrorFuture<F>
+where
+    F: Future<Output = std::result::Result<ReadResourceResult, E>>,
+    E: fmt::Display,
+{
+    type Output = std::result::Result<ReadResourceResult, Infallible>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        match this.inner.poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(result)) => Poll::Ready(Ok(result)),
+            Poll::Ready(Err(err)) => {
+                let uri = this.uri.take().unwrap_or_default();
+                Poll::Ready(Ok(ReadResourceResult {
+                    contents: vec![ResourceContent {
+                        uri,
+                        mime_type: Some("text/plain".to_string()),
+                        text: Some(format!("Error reading resource: {}", err)),
+                        blob: None,
+                        meta: None,
+                    }],
+                    meta: None,
+                }))
+            }
+        }
+    }
+}
+
 impl<S> Service<ResourceRequest> for ResourceCatchError<S>
 where
     S: Service<ResourceRequest, Response = ReadResourceResult> + Clone + Send + 'static,
@@ -153,8 +193,7 @@ where
 {
     type Response = ReadResourceResult;
     type Error = Infallible;
-    type Future =
-        Pin<Box<dyn Future<Output = std::result::Result<ReadResourceResult, Infallible>> + Send>>;
+    type Future = ResourceCatchErrorFuture<S::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
         // Map any readiness error to Infallible (we catch it on call)
@@ -169,24 +208,10 @@ where
         let uri = req.uri.clone();
         let fut = self.inner.call(req);
 
-        Box::pin(async move {
-            match fut.await {
-                Ok(result) => Ok(result),
-                Err(err) => {
-                    // Return an error result with the error message
-                    Ok(ReadResourceResult {
-                        contents: vec![ResourceContent {
-                            uri,
-                            mime_type: Some("text/plain".to_string()),
-                            text: Some(format!("Error reading resource: {}", err)),
-                            blob: None,
-                            meta: None,
-                        }],
-                        meta: None,
-                    })
-                }
-            }
-        })
+        ResourceCatchErrorFuture {
+            inner: fut,
+            uri: Some(uri),
+        }
     }
 }
 
