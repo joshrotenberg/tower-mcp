@@ -53,6 +53,9 @@ use tokio::task::JoinHandle;
 use super::transport::ClientTransport;
 use crate::error::{Error, Result};
 
+#[cfg(feature = "oauth-client")]
+use super::oauth::TokenProvider;
+
 /// Configuration for [`HttpClientTransport`].
 ///
 /// # Example
@@ -199,6 +202,9 @@ pub struct HttpClientTransport {
     connected: Arc<AtomicBool>,
     /// Configuration options.
     config: HttpClientConfig,
+    /// Dynamic token provider for OAuth or other token-based auth.
+    #[cfg(feature = "oauth-client")]
+    token_provider: Option<Arc<dyn TokenProvider>>,
 }
 
 impl HttpClientTransport {
@@ -246,6 +252,8 @@ impl HttpClientTransport {
             last_event_id: Arc::new(AtomicU64::new(0)),
             connected: Arc::new(AtomicBool::new(true)),
             config,
+            #[cfg(feature = "oauth-client")]
+            token_provider: None,
         }
     }
 
@@ -279,6 +287,8 @@ impl HttpClientTransport {
             last_event_id: Arc::new(AtomicU64::new(0)),
             connected: Arc::new(AtomicBool::new(true)),
             config,
+            #[cfg(feature = "oauth-client")]
+            token_provider: None,
         }
     }
 
@@ -380,6 +390,40 @@ impl HttpClientTransport {
         self
     }
 
+    /// Set a dynamic token provider for authentication.
+    ///
+    /// The provider's [`TokenProvider::get_token()`] is called before each
+    /// HTTP request, and the returned token is sent as `Authorization: Bearer <token>`.
+    /// This overrides any static `Authorization` header set via [`bearer_token()`](Self::bearer_token)
+    /// or [`basic_auth()`](Self::basic_auth).
+    ///
+    /// Use [`OAuthClientCredentials`](super::OAuthClientCredentials) for
+    /// OAuth 2.0 Client Credentials grants, or implement [`TokenProvider`]
+    /// for custom token acquisition logic.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use tower_mcp::client::{HttpClientTransport, OAuthClientCredentials};
+    ///
+    /// # fn example() -> Result<(), tower_mcp::BoxError> {
+    /// let provider = OAuthClientCredentials::builder()
+    ///     .client_id("my-client")
+    ///     .client_secret("my-secret")
+    ///     .token_endpoint("https://auth.example.com/token")
+    ///     .build()?;
+    ///
+    /// let transport = HttpClientTransport::new("http://localhost:3000")
+    ///     .with_token_provider(provider);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "oauth-client")]
+    pub fn with_token_provider(mut self, provider: impl TokenProvider) -> Self {
+        self.token_provider = Some(Arc::new(provider));
+        self
+    }
+
     /// Start the SSE background stream after session is established.
     fn start_sse_stream(&mut self) {
         let url = self.url.clone();
@@ -390,6 +434,8 @@ impl HttpClientTransport {
         let last_event_id = self.last_event_id.clone();
         let connected = self.connected.clone();
         let config = self.config.clone();
+        #[cfg(feature = "oauth-client")]
+        let token_provider = self.token_provider.clone();
 
         self.sse_task = Some(tokio::spawn(async move {
             sse_stream_loop(SseLoopParams {
@@ -401,6 +447,8 @@ impl HttpClientTransport {
                 last_event_id,
                 connected,
                 config,
+                #[cfg(feature = "oauth-client")]
+                token_provider,
             })
             .await;
         }));
@@ -432,6 +480,16 @@ impl ClientTransport for HttpClientTransport {
 
         for (key, value) in &self.config.headers {
             request = request.header(key.as_str(), value.as_str());
+        }
+
+        // Dynamic token provider overrides static Authorization header
+        #[cfg(feature = "oauth-client")]
+        if let Some(ref provider) = self.token_provider {
+            let token = provider
+                .get_token()
+                .await
+                .map_err(|e| Error::Transport(format!("Token provider error: {}", e)))?;
+            request = request.header("Authorization", format!("Bearer {}", token));
         }
 
         let response = request
@@ -537,6 +595,14 @@ impl ClientTransport for HttpClientTransport {
                 request = request.header(key.as_str(), value.as_str());
             }
 
+            // Dynamic token provider overrides static Authorization header
+            #[cfg(feature = "oauth-client")]
+            if let Some(ref provider) = self.token_provider
+                && let Ok(token) = provider.get_token().await
+            {
+                request = request.header("Authorization", format!("Bearer {}", token));
+            }
+
             let _ = request.send().await;
         }
 
@@ -559,6 +625,8 @@ struct SseLoopParams {
     last_event_id: Arc<AtomicU64>,
     connected: Arc<AtomicBool>,
     config: HttpClientConfig,
+    #[cfg(feature = "oauth-client")]
+    token_provider: Option<Arc<dyn TokenProvider>>,
 }
 
 /// Background loop that maintains the SSE stream connection.
@@ -576,6 +644,8 @@ async fn sse_stream_loop(params: SseLoopParams) {
         last_event_id,
         connected,
         config,
+        #[cfg(feature = "oauth-client")]
+        token_provider,
     } = params;
     let mut reconnect_attempts = 0u32;
 
@@ -595,6 +665,20 @@ async fn sse_stream_loop(params: SseLoopParams) {
 
         for (key, value) in &config.headers {
             request = request.header(key.as_str(), value.as_str());
+        }
+
+        // Dynamic token provider overrides static Authorization header
+        #[cfg(feature = "oauth-client")]
+        if let Some(ref provider) = token_provider {
+            match provider.get_token().await {
+                Ok(token) => {
+                    request = request.header("Authorization", format!("Bearer {}", token));
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Token provider failed for SSE connection");
+                    break;
+                }
+            }
         }
 
         // Send Last-Event-ID for stream resumption
