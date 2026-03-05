@@ -96,7 +96,7 @@ pub struct InputField {
     /// Field name
     pub name: String,
 
-    /// Field type (String, i64, f64, bool, Option<T>, Vec<T>)
+    /// Field type (String, i64, f64, bool, `Option<T>`, `Vec<T>`)
     #[serde(rename = "type")]
     pub field_type: String,
 
