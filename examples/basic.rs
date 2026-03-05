@@ -56,6 +56,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
 
     // Build our tools
     let greet = ToolBuilder::new("greet")
+        .title("Greet")
         .description("Greet someone by name")
         .read_only() // This tool doesn't modify any state
         .handler(|input: GreetInput| async move {
@@ -65,6 +66,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
 
     // Demonstrates returning structured JSON using from_serialize
     let add = ToolBuilder::new("add")
+        .title("Add Numbers")
         .description("Add two numbers together")
         .read_only()
         .idempotent() // Same inputs always produce same output
@@ -79,6 +81,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .build();
 
     let echo = ToolBuilder::new("echo")
+        .title("Echo Message")
         .description("Echo a message back, optionally repeated")
         .read_only()
         .handler(|input: EchoInput| async move {

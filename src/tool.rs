@@ -771,7 +771,21 @@ impl ToolBuilder {
         })
     }
 
-    /// Set a human-readable title for the tool
+    /// Set a human-readable title for the tool.
+    ///
+    /// The title is displayed by MCP clients (e.g., Claude Code's `/mcp` tool list)
+    /// as a friendly label instead of the raw tool name. For example, a tool named
+    /// `search_crates` with title `"Search Crates"` will display the title in UIs
+    /// that support it.
+    ///
+    /// ```
+    /// # use tower_mcp::ToolBuilder;
+    /// let tool = ToolBuilder::new("search_crates")
+    ///     .title("Search Crates")
+    ///     .description("Search for Rust crates on crates.io")
+    ///     .handler(|()| async { Ok(tower_mcp::CallToolResult::text("results")) })
+    ///     .build();
+    /// ```
     pub fn title(mut self, title: impl Into<String>) -> Self {
         self.title = Some(title.into());
         self

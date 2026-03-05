@@ -64,6 +64,7 @@ struct GreetInput {
 
 // Build a tool with type-safe handler
 let greet = ToolBuilder::new("greet")
+    .title("Greet")
     .description("Greet someone by name")
     .handler(|input: GreetInput| async move {
         Ok(CallToolResult::text(format!("Hello, {}!", input.name)))

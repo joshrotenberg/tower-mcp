@@ -42,6 +42,7 @@
 //!
 //! // Looks just like an axum handler!
 //! let tool = ToolBuilder::new("search")
+//!     .title("Search Database")
 //!     .description("Search the database")
 //!     .extractor_handler(
 //!         Arc::new(AppState { db_url: "postgres://...".into() }),
@@ -73,6 +74,7 @@
 //! async fn main() -> Result<(), BoxError> {
 //!     // Define a tool
 //!     let greet = ToolBuilder::new("greet")
+//!         .title("Greet")
 //!         .description("Greet someone by name")
 //!         .handler(|input: GreetInput| async move {
 //!             Ok(CallToolResult::text(format!("Hello, {}!", input.name)))
