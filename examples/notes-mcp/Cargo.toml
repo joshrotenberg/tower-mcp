@@ -10,7 +10,7 @@ name = "notes-mcp"
 path = "src/main.rs"
 
 [dependencies]
-tower-mcp = { path = "../.." }
+tower-mcp = { path = "../../crates/tower-mcp" }
 redis = { version = "1", features = ["tokio-comp", "json"] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }

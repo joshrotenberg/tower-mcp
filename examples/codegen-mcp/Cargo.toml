@@ -9,7 +9,7 @@ publish = false
 
 [dependencies]
 # MCP server
-tower-mcp = { path = "../.." }
+tower-mcp = { path = "../../crates/tower-mcp" }
 
 # Async runtime
 tokio = { version = "1", features = ["full", "sync"] }

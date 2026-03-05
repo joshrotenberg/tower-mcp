@@ -9,7 +9,7 @@ publish = false
 
 [dependencies]
 # MCP server
-tower-mcp = { path = "../..", features = ["http"] }
+tower-mcp = { path = "../../crates/tower-mcp", features = ["http"] }
 
 # Markdown linting
 mdbook-lint-core = "0.14"

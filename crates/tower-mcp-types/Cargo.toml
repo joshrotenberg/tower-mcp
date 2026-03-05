@@ -9,7 +9,7 @@ description = "MCP protocol and error types for tower-mcp (no runtime dependenci
 documentation = "https://docs.rs/tower-mcp-types"
 homepage = "https://github.com/joshrotenberg/tower-mcp"
 repository = "https://github.com/joshrotenberg/tower-mcp"
-readme = "../README.md"
+readme = "../../README.md"
 keywords = ["mcp", "json-rpc", "ai", "llm", "protocol"]
 categories = ["network-programming"]
 
