@@ -981,8 +981,8 @@ impl ToolBuilder {
     ///
     /// When a [`Json<T>`](crate::extract::Json) extractor is used, the proper JSON
     /// schema is automatically generated from `T`'s `JsonSchema` implementation.
-    /// This means `extractor_handler` produces the same schema as
-    /// `extractor_handler_typed` for the common case, without requiring a turbofish.
+    /// No turbofish is needed -- the schema type is inferred from the closure
+    /// parameters.
     ///
     /// # Extractors
     ///
@@ -1090,33 +1090,30 @@ impl ToolBuilder {
 
     /// Create a tool using the extractor pattern with typed JSON input.
     ///
-    /// This is similar to [`extractor_handler`](Self::extractor_handler) but requires
-    /// an explicit type parameter for the JSON input type via turbofish syntax.
+    /// # Deprecated
     ///
-    /// Since `extractor_handler` now auto-detects the JSON schema from `Json<T>`
-    /// extractors, this method is typically unnecessary. It remains available for
-    /// cases where you need explicit control over the schema type parameter.
-    ///
-    /// # Example
+    /// Use [`extractor_handler`](Self::extractor_handler) instead. It auto-detects
+    /// the JSON schema from `Json<T>` extractors, producing identical results
+    /// without requiring a turbofish.
     ///
     /// ```rust
-    /// use std::sync::Arc;
-    /// use tower_mcp::{ToolBuilder, CallToolResult};
-    /// use tower_mcp::extract::{Json, State};
-    /// use schemars::JsonSchema;
-    /// use serde::Deserialize;
+    /// # use std::sync::Arc;
+    /// # use tower_mcp::{ToolBuilder, CallToolResult};
+    /// # use tower_mcp::extract::{Json, State};
+    /// # use schemars::JsonSchema;
+    /// # use serde::Deserialize;
+    /// # #[derive(Clone)]
+    /// # struct AppState { prefix: String }
+    /// # #[derive(Debug, Deserialize, JsonSchema)]
+    /// # struct GreetInput { name: String }
+    /// # let state = Arc::new(AppState { prefix: "Hello".to_string() });
+    /// // Before (deprecated):
+    /// // .extractor_handler_typed::<_, _, _, GreetInput>(state, handler)
     ///
-    /// #[derive(Clone)]
-    /// struct AppState { prefix: String }
-    ///
-    /// #[derive(Debug, Deserialize, JsonSchema)]
-    /// struct GreetInput { name: String }
-    ///
-    /// let state = Arc::new(AppState { prefix: "Hello".to_string() });
-    ///
+    /// // After:
     /// let tool = ToolBuilder::new("greet")
     ///     .description("Greet someone")
-    ///     .extractor_handler_typed::<_, _, _, GreetInput>(state, |
+    ///     .extractor_handler(state, |
     ///         State(app): State<Arc<AppState>>,
     ///         Json(input): Json<GreetInput>,
     ///     | async move {
@@ -1124,6 +1121,11 @@ impl ToolBuilder {
     ///     })
     ///     .build();
     /// ```
+    #[deprecated(
+        since = "0.8.0",
+        note = "Use `extractor_handler` instead -- it auto-detects JSON schema from `Json<T>` extractors without requiring a turbofish"
+    )]
+    #[allow(deprecated)]
     pub fn extractor_handler_typed<S, F, T, I>(
         self,
         state: S,
