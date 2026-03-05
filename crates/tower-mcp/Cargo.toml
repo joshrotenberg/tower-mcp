@@ -1,0 +1,157 @@
+[package]
+name = "tower-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Tower-native Model Context Protocol (MCP) implementation"
+documentation = "https://docs.rs/tower-mcp"
+homepage = "https://github.com/joshrotenberg/tower-mcp"
+readme = "../../README.md"
+keywords = ["mcp", "tower", "json-rpc", "ai", "llm"]
+categories = ["network-programming", "asynchronous"]
+
+[dependencies]
+tower.workspace = true
+tower-service.workspace = true
+tokio.workspace = true
+futures.workspace = true
+pin-project-lite = "0.2"
+tower-mcp-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+regex = "1"
+base64.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+tokio-test = "0.4"
+tower = { workspace = true, features = ["timeout", "limit"] }
+tower-mcp-types = { path = "../tower-mcp-types" }
+tracing-subscriber.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
+jsonschema = "0.41"
+
+[features]
+default = []
+# Enable all optional features
+full = ["http", "websocket", "childproc", "oauth", "jwks", "testing", "dynamic-tools", "http-client", "oauth-client"]
+# Transport features
+http = ["dep:axum", "dep:hyper", "dep:http", "dep:http-body-util", "dep:tokio-stream", "dep:uuid"]
+websocket = ["dep:axum", "dep:uuid"]
+childproc = []
+# OAuth 2.1 resource server support
+oauth = ["dep:jsonwebtoken", "http"]
+# JWKS endpoint fetching for JWT validation (requires oauth)
+jwks = ["oauth", "dep:reqwest"]
+# Test utilities for MCP servers
+testing = []
+# HTTP client transport for connecting to remote MCP servers
+http-client = ["dep:reqwest"]
+# OAuth 2.0 client-side token acquisition (client credentials grant)
+oauth-client = ["http-client"]
+# Runtime tool (de)registration via DynamicToolRegistry
+dynamic-tools = []
+
+[dependencies.axum]
+workspace = true
+optional = true
+
+[dependencies.hyper]
+version = "1"
+optional = true
+
+[dependencies.http]
+version = "1"
+optional = true
+
+[dependencies.http-body-util]
+version = "0.1"
+optional = true
+
+[dependencies.tokio-stream]
+version = "0.1"
+optional = true
+features = ["sync"]
+
+[dependencies.uuid]
+version = "1"
+optional = true
+features = ["v4"]
+
+[dependencies.jsonwebtoken]
+version = "10"
+optional = true
+default-features = false
+features = ["aws_lc_rs", "use_pem"]
+
+[dependencies.reqwest]
+version = "0.13"
+optional = true
+default-features = false
+features = ["rustls", "json", "stream"]
+
+[[example]]
+name = "basic"
+path = "../../examples/basic.rs"
+
+[[example]]
+name = "stdio_server"
+path = "../../examples/stdio_server.rs"
+
+[[example]]
+name = "transport_middleware"
+path = "../../examples/transport_middleware.rs"
+
+[[example]]
+name = "http_server"
+path = "../../examples/http_server.rs"
+required-features = ["http"]
+
+[[example]]
+name = "http_auth"
+path = "../../examples/http_auth.rs"
+required-features = ["oauth"]
+
+[[example]]
+name = "websocket_server"
+path = "../../examples/websocket_server.rs"
+required-features = ["websocket"]
+
+[[example]]
+name = "client_cli"
+path = "../../examples/client_cli.rs"
+
+[[example]]
+name = "weather_server"
+path = "../../examples/weather_server.rs"
+
+[[example]]
+name = "http_sse_client"
+path = "../../examples/http_sse_client.rs"
+required-features = ["http"]
+
+[[example]]
+name = "capability_filtering"
+path = "../../examples/capability_filtering.rs"
+required-features = ["http"]
+
+[[example]]
+name = "dynamic_tools"
+path = "../../examples/dynamic_tools.rs"
+required-features = ["dynamic-tools"]
+
+[[example]]
+name = "testing"
+path = "../../examples/testing.rs"
+required-features = ["testing"]
+
+[[example]]
+name = "http_client_cli"
+path = "../../examples/http_client_cli.rs"
+required-features = ["http-client"]
