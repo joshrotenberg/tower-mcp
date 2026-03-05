@@ -18,6 +18,17 @@ pub const JSONRPC_VERSION: &str = "2.0";
 pub const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 
 /// All supported MCP protocol versions (newest first).
+///
+/// During initialization, the server negotiates the protocol version with the
+/// client. The server picks the newest version that both sides support.
+/// If no common version exists, the connection is rejected.
+///
+/// ```rust
+/// use tower_mcp_types::protocol::{LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS};
+///
+/// assert_eq!(LATEST_PROTOCOL_VERSION, "2025-11-25");
+/// assert!(SUPPORTED_PROTOCOL_VERSIONS.contains(&"2025-03-26"));
+/// ```
 pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-03-26"];
 
 /// JSON-RPC 2.0 request.
@@ -627,6 +638,28 @@ pub struct ClientTasksElicitationCapability {
 pub struct ClientTasksElicitationCreateCapability {}
 
 /// Client capability for roots (filesystem access)
+/// Capabilities related to filesystem roots.
+///
+/// When `list_changed` is `true`, the client supports sending
+/// `notifications/roots/list_changed` to inform the server that the
+/// available roots have been modified. Servers should re-request the
+/// roots list when they receive this notification.
+///
+/// # Example
+///
+/// ```rust
+/// use tower_mcp_types::protocol::RootsCapability;
+///
+/// // Client advertising roots with change notification support
+/// let cap = RootsCapability { list_changed: true };
+/// assert!(cap.list_changed);
+///
+/// // The notification method is defined as a constant:
+/// assert_eq!(
+///     tower_mcp_types::protocol::notifications::ROOTS_LIST_CHANGED,
+///     "notifications/roots/list_changed"
+/// );
+/// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RootsCapability {
@@ -635,12 +668,25 @@ pub struct RootsCapability {
     pub list_changed: bool,
 }
 
-/// Represents a root directory or file that the server can operate on
+/// Represents a root directory or file that the server can operate on.
 ///
 /// Roots allow clients to expose filesystem roots to servers, enabling:
 /// - Scoped file access
 /// - Workspace awareness
 /// - Security boundaries
+///
+/// # Example
+///
+/// ```rust
+/// use tower_mcp_types::protocol::Root;
+///
+/// let root = Root::new("file:///home/user/project");
+/// assert_eq!(root.uri, "file:///home/user/project");
+/// assert!(root.name.is_none());
+///
+/// let root = Root::with_name("file:///workspace", "My Project");
+/// assert_eq!(root.name.unwrap(), "My Project");
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Root {
     /// The URI identifying the root. Must start with `file://` for now.
@@ -673,6 +719,11 @@ impl Root {
     }
 }
 
+/// Result of a roots/list request from the server.
+///
+/// Contains the list of roots the client has exposed. Clients notify
+/// the server of root changes via `notifications/roots/list_changed`.
+///
 /// Parameters for roots/list request (server to client)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListRootsParams {
@@ -1882,7 +1933,20 @@ impl CallToolResult {
         Self::from_serialize(&serde_json::json!({ key: items, "count": items.len() }))
     }
 
-    /// Create a result with an image
+    /// Create a result with a base64-encoded image.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp_types::CallToolResult;
+    /// use base64::Engine;
+    ///
+    /// let png_bytes = vec![0x89, 0x50, 0x4E, 0x47]; // PNG header
+    /// let encoded = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+    ///
+    /// let result = CallToolResult::image(encoded, "image/png");
+    /// assert!(!result.is_error);
+    /// ```
     pub fn image(data: impl Into<String>, mime_type: impl Into<String>) -> Self {
         Self {
             content: vec![Content::Image {
@@ -1897,7 +1961,20 @@ impl CallToolResult {
         }
     }
 
-    /// Create a result with audio
+    /// Create a result with base64-encoded audio.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp_types::CallToolResult;
+    /// use base64::Engine;
+    ///
+    /// let wav_bytes = vec![0x52, 0x49, 0x46, 0x46]; // RIFF header
+    /// let encoded = base64::engine::general_purpose::STANDARD.encode(&wav_bytes);
+    ///
+    /// let result = CallToolResult::audio(encoded, "audio/wav");
+    /// assert!(!result.is_error);
+    /// ```
     pub fn audio(data: impl Into<String>, mime_type: impl Into<String>) -> Self {
         Self {
             content: vec![Content::Audio {
@@ -1912,7 +1989,22 @@ impl CallToolResult {
         }
     }
 
-    /// Create a result with a resource link
+    /// Create a result with a resource link (without embedding the content).
+    ///
+    /// Use this to reference a resource by URI without including its full content
+    /// in the tool result.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp_types::CallToolResult;
+    ///
+    /// let result = CallToolResult::resource_link(
+    ///     "file:///var/log/app.log",
+    ///     "app-log",
+    /// );
+    /// assert!(!result.is_error);
+    /// ```
     pub fn resource_link(uri: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             content: vec![Content::ResourceLink {
@@ -2666,6 +2758,70 @@ pub struct GetPromptParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// The result of a prompts/get request.
+///
+/// Contains a list of messages that form the prompt, along with an optional
+/// description. Messages can include text, images, and embedded resources.
+///
+/// # Example: prompt with image content
+///
+/// ```rust
+/// use tower_mcp_types::protocol::{
+///     GetPromptResult, PromptMessage, PromptRole, Content,
+/// };
+/// use base64::Engine;
+///
+/// let image_data = base64::engine::general_purpose::STANDARD.encode(b"fake-png");
+///
+/// let result = GetPromptResult {
+///     description: Some("Analyze this image".to_string()),
+///     messages: vec![
+///         PromptMessage {
+///             role: PromptRole::User,
+///             content: Content::Image {
+///                 data: image_data,
+///                 mime_type: "image/png".to_string(),
+///                 annotations: None,
+///                 meta: None,
+///             },
+///             meta: None,
+///         },
+///     ],
+///     meta: None,
+/// };
+/// assert_eq!(result.messages.len(), 1);
+/// ```
+///
+/// # Example: prompt with embedded resource
+///
+/// ```rust
+/// use tower_mcp_types::protocol::{
+///     GetPromptResult, PromptMessage, PromptRole, Content, ResourceContent,
+/// };
+///
+/// let result = GetPromptResult {
+///     description: Some("Review this file".to_string()),
+///     messages: vec![
+///         PromptMessage {
+///             role: PromptRole::User,
+///             content: Content::Resource {
+///                 resource: ResourceContent {
+///                     uri: "file:///src/main.rs".to_string(),
+///                     mime_type: Some("text/x-rust".to_string()),
+///                     text: Some("fn main() {}".to_string()),
+///                     blob: None,
+///                     meta: None,
+///                 },
+///                 annotations: None,
+///                 meta: None,
+///             },
+///             meta: None,
+///         },
+///     ],
+///     meta: None,
+/// };
+/// assert_eq!(result.messages.len(), 1);
+/// ```
 pub struct GetPromptResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -3135,7 +3291,26 @@ pub struct ElicitFormParams {
     pub meta: Option<RequestMeta>,
 }
 
-/// Parameters for URL-based elicitation request
+/// Parameters for URL-based elicitation request.
+///
+/// URL-based elicitation allows servers to direct users to an external URL
+/// (e.g., an OAuth flow or payment page) and receive completion notification.
+///
+/// # Example
+///
+/// ```rust
+/// use tower_mcp_types::protocol::{ElicitUrlParams, ElicitMode};
+///
+/// let params = ElicitUrlParams {
+///     mode: Some(ElicitMode::Url),
+///     elicitation_id: "auth-flow-123".to_string(),
+///     message: "Please sign in to continue".to_string(),
+///     url: "https://example.com/auth?session=abc".to_string(),
+///     meta: None,
+/// };
+///
+/// assert_eq!(params.url, "https://example.com/auth?session=abc");
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ElicitUrlParams {
@@ -3173,9 +3348,45 @@ pub enum ElicitMode {
     Url,
 }
 
-/// Restricted JSON Schema for elicitation forms
+/// Restricted JSON Schema for elicitation forms.
 ///
-/// Only allows top-level properties with primitive types.
+/// Based on [JSON Schema 2020-12](https://json-schema.org/specification), but restricted
+/// to a flat object with primitive-typed properties. Complex types (arrays, nested objects)
+/// are not supported -- only `string`, `integer`, `number`, `boolean`, and `enum` fields.
+///
+/// The schema is validated by the client before submitting the form response.
+/// Required fields must be present, and each value must match its declared type.
+///
+/// Use the builder methods to construct a schema with string, integer,
+/// number, boolean, and enum fields, optionally with default values.
+///
+/// # Example
+///
+/// ```rust
+/// use tower_mcp_types::protocol::ElicitFormSchema;
+///
+/// let schema = ElicitFormSchema::new()
+///     .string_field("name", Some("Your full name"), true)
+///     .string_field_with_default("greeting", Some("How to greet"), false, "Hello")
+///     .integer_field("age", Some("Your age"), false)
+///     .enum_field(
+///         "role",
+///         Some("Select your role"),
+///         vec!["admin".into(), "user".into(), "guest".into()],
+///         true,
+///     )
+///     .enum_field_with_default(
+///         "theme",
+///         Some("Color theme"),
+///         false,
+///         &["light", "dark", "auto"],
+///         "auto",
+///     )
+///     .boolean_field("subscribe", Some("Subscribe to updates"), false);
+///
+/// assert_eq!(schema.required, vec!["name", "role"]);
+/// assert_eq!(schema.properties.len(), 6);
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ElicitFormSchema {
     /// Must be "object"
