@@ -20,6 +20,7 @@ use tower_mcp::{
     SamplingContent, SamplingContentOrArray, SamplingMessage, ToolBuilder,
     client::{HttpClientTransport, McpClient},
     extract::{Context, RawArgs},
+    transport::http::SessionConfig,
 };
 use tower_mcp_types::JsonRpcError;
 
@@ -1568,5 +1569,290 @@ async fn test_http_client_request_before_initialize() {
         err_msg.contains("not initialized"),
         "Expected not-initialized error, got: {}",
         err_msg
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SSE Event Replay on Reconnect E2E (#509)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_http_client_sse_event_replay_on_reconnect() {
+    let (url, _server) = start_bidirectional_server().await;
+    let client = reqwest::Client::new();
+
+    // 1. Initialize a session
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": { "sampling": {} },
+                    "clientInfo": { "name": "test-sse", "version": "1.0.0" }
+                }
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let session_id = resp
+        .headers()
+        .get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // 2. Open SSE stream and start consuming in a background task.
+    //    This ensures the server's broadcast subscriber is active before we
+    //    trigger notifications.
+    let sse_resp = client
+        .get(&url)
+        .header("Accept", "text/event-stream")
+        .header("mcp-session-id", &session_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sse_resp.status(), 200);
+
+    let (collected_tx, collected_rx) = tokio::sync::oneshot::channel();
+    let sse_task = tokio::spawn(async move {
+        let mut text = String::new();
+        let mut stream = sse_resp.bytes_stream();
+        use futures::StreamExt;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.unwrap();
+            text.push_str(&String::from_utf8_lossy(&chunk));
+            // Wait until we have at least 2 events with IDs
+            let id_count = text.lines().filter(|l| l.starts_with("id:")).count();
+            if id_count >= 2 {
+                break;
+            }
+        }
+        let _ = collected_tx.send(text);
+    });
+
+    // Give the SSE subscription time to be established
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 3. Send two tool calls to trigger two log notifications
+    for req_id in [2, 3] {
+        let _resp = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header("mcp-session-id", &session_id)
+            .body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "method": "tools/call",
+                    "params": { "name": "test_log", "arguments": {} }
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+    }
+
+    // 4. Wait for background task to collect both events
+    let sse_text = tokio::time::timeout(Duration::from_secs(5), collected_rx)
+        .await
+        .expect("timed out waiting for SSE events")
+        .expect("SSE task dropped sender");
+
+    // Parse event IDs from the collected SSE data
+    let event_ids: Vec<u64> = sse_text
+        .lines()
+        .filter(|l| l.starts_with("id:"))
+        .filter_map(|l| l.trim_start_matches("id:").trim().parse().ok())
+        .collect();
+
+    assert!(
+        event_ids.len() >= 2,
+        "Expected at least 2 events, got: {event_ids:?}"
+    );
+
+    let first_id = event_ids[0];
+
+    // 5. SSE task has finished; stream is dropped (connection closed)
+    let _ = sse_task.await;
+
+    // 6. Open new SSE stream with Last-Event-ID = first event ID.
+    //    The server should replay buffered events after that ID.
+    let sse_resp2 = client
+        .get(&url)
+        .header("Accept", "text/event-stream")
+        .header("mcp-session-id", &session_id)
+        .header("Last-Event-ID", first_id.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sse_resp2.status(), 200);
+
+    // 7. Read replayed events
+    let replay_text = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut text = String::new();
+        let mut stream = sse_resp2.bytes_stream();
+        use futures::StreamExt;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.unwrap();
+            text.push_str(&String::from_utf8_lossy(&chunk));
+            if text.lines().any(|l| l.starts_with("id:")) {
+                break;
+            }
+        }
+        text
+    })
+    .await
+    .unwrap_or_default();
+
+    // Parse replayed event IDs -- they should all be > first_id
+    let replayed_ids: Vec<u64> = replay_text
+        .lines()
+        .filter(|l| l.starts_with("id:"))
+        .filter_map(|l| l.trim_start_matches("id:").trim().parse().ok())
+        .collect();
+
+    assert!(
+        !replayed_ids.is_empty(),
+        "Expected replayed events after reconnection with Last-Event-ID"
+    );
+    for id in &replayed_ids {
+        assert!(
+            *id > first_id,
+            "Replayed event ID {id} should be > last seen ID {first_id}",
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session Expiry E2E (#510)
+// ---------------------------------------------------------------------------
+
+/// Start a server with very short session TTL for expiry testing.
+async fn start_expiring_server() -> (String, tokio::task::JoinHandle<()>) {
+    let router = test_router();
+    let config = SessionConfig::with_ttl(Duration::from_millis(100))
+        .cleanup_interval(Duration::from_millis(20));
+    let transport = HttpTransport::new(router)
+        .disable_origin_validation()
+        .session_config(config);
+    let axum_router = transport.into_router();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://127.0.0.1:{}", addr.port());
+
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, axum_router).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    (url, handle)
+}
+
+#[tokio::test]
+async fn test_http_client_session_expiry_error() {
+    let (url, _server) = start_expiring_server().await;
+    let client = reqwest::Client::new();
+
+    // Initialize a session
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": { "name": "test-expiry", "version": "1.0.0" }
+                }
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let session_id = resp
+        .headers()
+        .get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // Verify the session works before expiry
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header("mcp-session-id", &session_id)
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": {}
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body.get("result").is_some(),
+        "Expected successful tools/list response, got: {body}"
+    );
+
+    // Wait for session to expire and cleanup to run
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Session should be expired -- next request should return a JSON-RPC error
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header("mcp-session-id", &session_id)
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/list",
+                "params": {}
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let error = body
+        .get("error")
+        .expect("Expected JSON-RPC error after session expiry");
+    assert_eq!(
+        error["code"].as_i64().unwrap(),
+        -32005,
+        "Expected SessionNotFound error code (-32005)"
     );
 }
