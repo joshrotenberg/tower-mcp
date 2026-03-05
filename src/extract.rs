@@ -840,6 +840,10 @@ impl<T> HasSchema for Extension<T> {
 ///
 /// This trait is similar to [`ExtractorHandler`] but provides proper JSON
 /// schema generation for the input type when `Json<T>` is used.
+#[deprecated(
+    since = "0.8.0",
+    note = "Use `ExtractorHandler` instead -- `extractor_handler` auto-detects JSON schema from `Json<T>` extractors"
+)]
 pub trait TypedExtractorHandler<S, T, I>: Clone + Send + Sync + 'static
 where
     I: JsonSchema,
@@ -852,6 +856,7 @@ where
 }
 
 // Single extractor with Json<T>
+#[allow(deprecated)]
 impl<S, F, Fut, T> TypedExtractorHandler<S, (Json<T>,), T> for F
 where
     S: Clone + Send + Sync + 'static,
@@ -871,6 +876,7 @@ where
 }
 
 // Two extractors ending with Json<T>
+#[allow(deprecated)]
 impl<S, F, Fut, T1, T> TypedExtractorHandler<S, (T1, Json<T>), T> for F
 where
     S: Clone + Send + Sync + 'static,
@@ -892,6 +898,7 @@ where
 }
 
 // Three extractors ending with Json<T>
+#[allow(deprecated)]
 impl<S, F, Fut, T1, T2, T> TypedExtractorHandler<S, (T1, T2, Json<T>), T> for F
 where
     S: Clone + Send + Sync + 'static,
@@ -915,6 +922,7 @@ where
 }
 
 // Four extractors ending with Json<T>
+#[allow(deprecated)]
 impl<S, F, Fut, T1, T2, T3, T> TypedExtractorHandler<S, (T1, T2, T3, Json<T>), T> for F
 where
     S: Clone + Send + Sync + 'static,
@@ -1196,6 +1204,10 @@ where
 }
 
 /// Builder state for extractor-based handlers with typed JSON input
+#[deprecated(
+    since = "0.8.0",
+    note = "Use `ToolBuilderWithExtractor` via `extractor_handler` instead"
+)]
 pub struct ToolBuilderWithTypedExtractor<S, F, T, I> {
     pub(crate) name: String,
     pub(crate) title: Option<String>,
@@ -1209,6 +1221,7 @@ pub struct ToolBuilderWithTypedExtractor<S, F, T, I> {
     pub(crate) _phantom: PhantomData<(T, I)>,
 }
 
+#[allow(deprecated)]
 impl<S, F, T, I> ToolBuilderWithTypedExtractor<S, F, T, I>
 where
     S: Clone + Send + Sync + 'static,
@@ -1260,6 +1273,7 @@ struct TypedExtractorToolHandler<S, F, T, I> {
     _phantom: PhantomData<(T, I)>,
 }
 
+#[allow(deprecated)]
 impl<S, F, T, I> ToolHandler for TypedExtractorToolHandler<S, F, T, I>
 where
     S: Clone + Send + Sync + 'static,
@@ -1571,6 +1585,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)]
     async fn test_tool_builder_extractor_handler_typed() {
         use crate::ToolBuilder;
 
