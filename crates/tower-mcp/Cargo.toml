@@ -3,52 +3,37 @@ name = "tower-mcp"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-authors = ["Josh Rotenberg <joshrotenberg@gmail.com>"]
-license = "MIT OR Apache-2.0"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Tower-native Model Context Protocol (MCP) implementation"
 documentation = "https://docs.rs/tower-mcp"
 homepage = "https://github.com/joshrotenberg/tower-mcp"
-repository = "https://github.com/joshrotenberg/tower-mcp"
 readme = "../../README.md"
 keywords = ["mcp", "tower", "json-rpc", "ai", "llm"]
 categories = ["network-programming", "asynchronous"]
 
 [dependencies]
-# Tower ecosystem
-tower = { version = "0.5", features = ["util"] }
-tower-service = "0.3"
-
-# Async runtime
-tokio = { version = "1", features = ["full"] }
-futures = "0.3"
+tower.workspace = true
+tower-service.workspace = true
+tokio.workspace = true
+futures.workspace = true
 pin-project-lite = "0.2"
-
-# MCP protocol types
-tower-mcp-types = { version = "0.7", path = "../tower-mcp-types" }
-
-# Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-
-# Schema generation
-schemars = "1.2"
-
-# Async traits
-async-trait = "0.1"
-
-# Tracing
-tracing = "0.1"
-
-# URI template matching
+tower-mcp-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
 regex = "1"
-base64 = "0.22.1"
+base64.workspace = true
 
 [dev-dependencies]
-async-trait = "0.1"
+async-trait.workspace = true
 tokio-test = "0.4"
-tower = { version = "0.5", features = ["util", "timeout", "limit"] }
+tower = { workspace = true, features = ["timeout", "limit"] }
 tower-mcp-types = { path = "../tower-mcp-types" }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
 jsonschema = "0.41"
 
@@ -74,9 +59,8 @@ oauth-client = ["http-client"]
 dynamic-tools = []
 
 [dependencies.axum]
-version = "0.8"
+workspace = true
 optional = true
-features = ["json", "ws"]
 
 [dependencies.hyper]
 version = "1"
