@@ -42,15 +42,7 @@ Resources: `source://stdio_server.rs` - serves its own source code
 
 ## Development
 
-Before committing, run:
-
-```bash
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --lib --all-features
-cargo test --test '*' --all-features
-cargo test --doc --all-features
-```
+See [CONTRIBUTING.md](CONTRIBUTING.md) for build commands, PR guidelines, and contribution policy.
 
 ## Project Structure
 
