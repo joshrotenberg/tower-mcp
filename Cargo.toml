@@ -1,8 +1,8 @@
 [package]
 name = "tower-mcp"
-version = "0.7.0"
-edition = "2024"
-rust-version = "1.90"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 authors = ["Josh Rotenberg <joshrotenberg@gmail.com>"]
 license = "MIT OR Apache-2.0"
 description = "Tower-native Model Context Protocol (MCP) implementation"
@@ -15,6 +15,11 @@ categories = ["network-programming", "asynchronous"]
 
 [workspace]
 members = ["tower-mcp-types", "examples/conformance-server", "examples/markdownlint-mcp", "examples/codegen-mcp", "examples/notes-mcp"]
+
+[workspace.package]
+version = "0.7.0"
+edition = "2024"
+rust-version = "1.90"
 
 [workspace.dependencies]
 tower-resilience = { version = "0.7", default-features = false, features = ["bulkhead", "ratelimiter"] }
@@ -30,7 +35,7 @@ futures = "0.3"
 pin-project-lite = "0.2"
 
 # MCP protocol types
-tower-mcp-types = { version = "0.1", path = "tower-mcp-types" }
+tower-mcp-types = { version = "0.7", path = "tower-mcp-types" }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

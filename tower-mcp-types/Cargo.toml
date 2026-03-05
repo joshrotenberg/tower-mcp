@@ -1,8 +1,8 @@
 [package]
 name = "tower-mcp-types"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.90"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 authors = ["Josh Rotenberg <joshrotenberg@gmail.com>"]
 license = "MIT OR Apache-2.0"
 description = "MCP protocol and error types for tower-mcp (no runtime dependencies)"
