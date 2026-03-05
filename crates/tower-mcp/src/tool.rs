@@ -1529,7 +1529,10 @@ where
 {
     fn call(&self, args: Value) -> BoxFuture<'_, Result<CallToolResult>> {
         Box::pin(async move {
-            let input: I = serde_json::from_value(args).tool_context("Invalid input")?;
+            let input: I = match serde_json::from_value(args) {
+                Ok(input) => input,
+                Err(e) => return Ok(CallToolResult::error(format!("Invalid input: {e}"))),
+            };
             (self.handler)(input).await
         })
     }
@@ -1636,7 +1639,10 @@ impl<T: McpTool> ToolHandler for McpToolHandler<T> {
     fn call(&self, args: Value) -> BoxFuture<'_, Result<CallToolResult>> {
         let tool = self.tool.clone();
         Box::pin(async move {
-            let input: T::Input = serde_json::from_value(args).tool_context("Invalid input")?;
+            let input: T::Input = match serde_json::from_value(args) {
+                Ok(input) => input,
+                Err(e) => return Ok(CallToolResult::error(format!("Invalid input: {e}"))),
+            };
             let output = tool.call(input).await?;
             let value = serde_json::to_value(output).tool_context("Failed to serialize output")?;
             Ok(CallToolResult::json(value))
@@ -2797,5 +2803,46 @@ mod tests {
             .await;
         assert!(!r1.is_error);
         assert!(!r2.is_error);
+    }
+
+    #[tokio::test]
+    async fn test_input_validation_returns_tool_error() {
+        // Per SEP-1303: input validation errors should be returned as
+        // CallToolResult with isError=true, not as protocol errors.
+        #[derive(Debug, Deserialize, JsonSchema)]
+        struct StrictInput {
+            name: String,
+            count: u32,
+        }
+
+        let tool = ToolBuilder::new("strict_tool")
+            .description("requires specific input")
+            .handler(|input: StrictInput| async move {
+                Ok(CallToolResult::text(format!(
+                    "{}: {}",
+                    input.name, input.count
+                )))
+            })
+            .build();
+
+        // Valid input works
+        let result = tool
+            .call(serde_json::json!({"name": "test", "count": 5}))
+            .await;
+        assert!(!result.is_error);
+
+        // Missing required field returns isError, not protocol error
+        let result = tool.call(serde_json::json!({"name": "test"})).await;
+        assert!(result.is_error);
+        let text = result.first_text().unwrap();
+        assert!(text.contains("Invalid input"), "got: {text}");
+
+        // Wrong type returns isError, not protocol error
+        let result = tool
+            .call(serde_json::json!({"name": "test", "count": "not_a_number"}))
+            .await;
+        assert!(result.is_error);
+        let text = result.first_text().unwrap();
+        assert!(text.contains("Invalid input"), "got: {text}");
     }
 }
