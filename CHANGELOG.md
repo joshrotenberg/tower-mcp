@@ -4,6 +4,61 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+## [0.8.0] - 2026-03-05
+
+### Bug Fixes
+
+- Align tool name validation with SEP-986 ([#517](https://github.com/joshrotenberg/tower-mcp/pull/517))
+
+### Documentation
+
+- Add tower-mcp-types section to README ([#483](https://github.com/joshrotenberg/tower-mcp/pull/483))
+- Restructure README to highlight key differentiators ([#485](https://github.com/joshrotenberg/tower-mcp/pull/485))
+- Consolidate overlapping examples and fill coverage gaps ([#487](https://github.com/joshrotenberg/tower-mcp/pull/487))
+- Add middleware showcase example (config validation pattern) ([#511](https://github.com/joshrotenberg/tower-mcp/pull/511))
+- Add tool selection example for large server patterns ([#515](https://github.com/joshrotenberg/tower-mcp/pull/515))
+- Deprecate extractor_handler_typed in favor of extractor_handler ([#519](https://github.com/joshrotenberg/tower-mcp/pull/519))
+- Add .title() to examples and expand doc comment ([#522](https://github.com/joshrotenberg/tower-mcp/pull/522))
+- Add CONTRIBUTING.md ([#523](https://github.com/joshrotenberg/tower-mcp/pull/523))
+- Update AGENTS.md to reference CONTRIBUTING.md ([#527](https://github.com/joshrotenberg/tower-mcp/pull/527))
+
+### Features
+
+- Extract tower-mcp-types crate for lightweight MCP type access ([#481](https://github.com/joshrotenberg/tower-mcp/pull/481))
+- Add #[non_exhaustive] to all public enums ([#484](https://github.com/joshrotenberg/tower-mcp/pull/484))
+- Add middleware module and StdioTransport::layer() ([#490](https://github.com/joshrotenberg/tower-mcp/pull/490))
+- Redesign MCP client for bidirectional communication ([#497](https://github.com/joshrotenberg/tower-mcp/pull/497))
+- Add HTTP client transport for connecting to remote MCP servers ([#498](https://github.com/joshrotenberg/tower-mcp/pull/498))
+- Add client-side auth header builder methods ([#499](https://github.com/joshrotenberg/tower-mcp/pull/499))
+- Add with_sampling() and with_elicitation() builder methods ([#500](https://github.com/joshrotenberg/tower-mcp/pull/500))
+- Add NotificationHandler for typed notification callbacks ([#502](https://github.com/joshrotenberg/tower-mcp/pull/502))
+- Add client pagination helpers and convenience methods ([#501](https://github.com/joshrotenberg/tower-mcp/pull/501))
+- Add OAuth 2.0 Client Credentials token provider ([#503](https://github.com/joshrotenberg/tower-mcp/pull/503))
+- Add conditional registration and allow/deny filters (#512, #513) ([#516](https://github.com/joshrotenberg/tower-mcp/pull/516))
+
+### Miscellaneous Tasks
+
+- Skip checks on markdown-only changes ([#524](https://github.com/joshrotenberg/tower-mcp/pull/524))
+- Add repo health files for SDK tier assessment ([#547](https://github.com/joshrotenberg/tower-mcp/pull/547))
+
+### Performance
+
+- Use named future types for CatchError services ([#518](https://github.com/joshrotenberg/tower-mcp/pull/518))
+
+### Refactor
+
+- Sync tower-mcp-types version with workspace ([#525](https://github.com/joshrotenberg/tower-mcp/pull/525))
+
+### Testing
+
+- Add P0 E2E integration tests for MCP client ([#505](https://github.com/joshrotenberg/tower-mcp/pull/505))
+- Add P1 E2E integration tests and fix HTTP client deadlock ([#506](https://github.com/joshrotenberg/tower-mcp/pull/506))
+- Add auth variations and config E2E tests ([#507](https://github.com/joshrotenberg/tower-mcp/pull/507))
+- Add edge case and resilience E2E tests ([#508](https://github.com/joshrotenberg/tower-mcp/pull/508))
+- Add E2E tests for SSE event replay and session expiry ([#520](https://github.com/joshrotenberg/tower-mcp/pull/520))
+
+
+
 ## [0.7.0] - 2026-02-28
 
 ### Bug Fixes

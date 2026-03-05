@@ -17,7 +17,7 @@ categories = ["network-programming", "asynchronous"]
 members = ["tower-mcp-types", "examples/conformance-server", "examples/markdownlint-mcp", "examples/codegen-mcp", "examples/notes-mcp"]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.90"
 
@@ -35,7 +35,7 @@ futures = "0.3"
 pin-project-lite = "0.2"
 
 # MCP protocol types
-tower-mcp-types = { version = "0.7", path = "tower-mcp-types" }
+tower-mcp-types = { version = "0.8", path = "tower-mcp-types" }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
