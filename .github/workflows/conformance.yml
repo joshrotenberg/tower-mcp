@@ -19,7 +19,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v6
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Build conformance server
         run: cargo build --manifest-path examples/conformance-server/Cargo.toml
@@ -59,7 +59,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v6
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Build conformance client
         run: cargo build --manifest-path examples/conformance-client/Cargo.toml
