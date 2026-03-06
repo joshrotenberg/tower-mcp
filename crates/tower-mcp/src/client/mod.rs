@@ -30,6 +30,7 @@
 //! }
 //! ```
 
+mod channel;
 mod handler;
 #[cfg(feature = "http-client")]
 mod http;
@@ -38,6 +39,7 @@ mod oauth;
 mod stdio;
 mod transport;
 
+pub use channel::ChannelTransport;
 pub use handler::{ClientHandler, NotificationHandler, ServerNotification};
 #[cfg(feature = "http-client")]
 pub use http::{HttpClientConfig, HttpClientTransport};

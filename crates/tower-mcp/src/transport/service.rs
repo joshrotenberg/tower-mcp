@@ -207,6 +207,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::protocol::{CallToolParams, CallToolResult, RequestId, ToolAnnotations};
     use crate::router::McpRouter;

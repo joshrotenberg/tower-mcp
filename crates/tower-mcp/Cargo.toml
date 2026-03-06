@@ -33,6 +33,7 @@ async-trait.workspace = true
 tokio-test = "0.4"
 tower = { workspace = true, features = ["timeout", "limit"] }
 tower-mcp-types = { path = "../tower-mcp-types" }
+tower-resilience = { workspace = true, default-features = false, features = ["coalesce"] }
 tracing-subscriber.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
 jsonschema = "0.44"
@@ -40,7 +41,7 @@ jsonschema = "0.44"
 [features]
 default = []
 # Enable all optional features
-full = ["http", "websocket", "childproc", "oauth", "jwks", "testing", "dynamic-tools", "http-client", "oauth-client"]
+full = ["http", "websocket", "childproc", "oauth", "jwks", "testing", "dynamic-tools", "http-client", "oauth-client", "proxy"]
 # Transport features
 http = ["dep:axum", "dep:hyper", "dep:http", "dep:http-body-util", "dep:tokio-stream", "dep:uuid"]
 websocket = ["dep:axum", "dep:uuid"]
@@ -57,6 +58,8 @@ http-client = ["dep:reqwest"]
 oauth-client = ["http-client"]
 # Runtime tool (de)registration via DynamicToolRegistry
 dynamic-tools = []
+# MCP proxy for aggregating multiple backend servers
+proxy = []
 
 [dependencies.axum]
 workspace = true
@@ -168,3 +171,8 @@ path = "../../examples/client_handler.rs"
 name = "oauth_client"
 path = "../../examples/oauth_client.rs"
 required-features = ["oauth-client"]
+
+[[example]]
+name = "proxy"
+path = "../../examples/proxy.rs"
+required-features = ["proxy"]
