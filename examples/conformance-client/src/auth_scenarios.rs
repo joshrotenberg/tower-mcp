@@ -313,85 +313,119 @@ pub async fn cross_app_access(server_url: &str, context: &Option<serde_json::Val
         .get("client_id")
         .and_then(|v| v.as_str())
         .context("client_id required")?;
-    let private_key_pem = ctx.get("private_key_pem").and_then(|v| v.as_str());
+    let client_secret = ctx
+        .get("client_secret")
+        .and_then(|v| v.as_str())
+        .context("client_secret required")?;
+    let idp_id_token = ctx
+        .get("idp_id_token")
+        .and_then(|v| v.as_str())
+        .context("idp_id_token required")?;
+    let idp_token_endpoint = ctx.get("idp_token_endpoint").and_then(|v| v.as_str());
 
-    // Step 1: Do standard OAuth flow to get initial access token
-    let initial_token = perform_oauth_flow(server_url, context, None).await?;
-
-    // Step 2: Discover metadata for the target server
+    // Step 1: Discover the MCP server's AS metadata
     let probe_result = probe_server(server_url).await?;
     let metadata = discover_metadata_from_probe(&probe_result, server_url).await?;
     let token_endpoint = metadata
         .get("token_endpoint")
         .and_then(|v| v.as_str())
         .context("No token_endpoint in metadata")?;
+    let as_issuer = metadata
+        .get("issuer")
+        .and_then(|v| v.as_str())
+        .unwrap_or(token_endpoint);
 
     // Get resource from PRM
-    let resource_owned = probe_result
-        .resource
-        .clone()
-        .or_else(|| Some(server_url.to_string()));
-    let resource = resource_owned.as_deref();
+    let resource = get_resource_for_server(server_url).await.ok();
 
     let http = reqwest::Client::new();
 
-    // Step 3: Try token exchange (RFC 8693)
+    // Step 2: Token exchange at IDP (RFC 8693)
+    // Exchange the ID token for an ID-JAG at the IDP's token endpoint.
+    // The ID-JAG is then used in step 3 with the MCP AS.
+    let idp_te = idp_token_endpoint.context("idp_token_endpoint required")?;
+
     let mut exchange_params = vec![
         (
-            "grant_type",
+            "grant_type".to_string(),
             "urn:ietf:params:oauth:grant-type:token-exchange".to_string(),
         ),
-        ("subject_token", initial_token.clone()),
+        ("subject_token".to_string(), idp_id_token.to_string()),
         (
-            "subject_token_type",
-            "urn:ietf:params:oauth:token-type:access_token".to_string(),
+            "subject_token_type".to_string(),
+            "urn:ietf:params:oauth:token-type:id_token".to_string(),
         ),
-        ("client_id", client_id.to_string()),
+        (
+            "requested_token_type".to_string(),
+            "urn:ietf:params:oauth:token-type:id-jag".to_string(),
+        ),
+        ("audience".to_string(), as_issuer.to_string()),
     ];
-    if let Some(res) = resource {
-        exchange_params.push(("resource", res.to_string()));
+    if let Some(ref res) = resource {
+        exchange_params.push(("resource".to_string(), res.clone()));
     }
 
+    tracing::info!(
+        idp_token_endpoint = %idp_te,
+        audience = %as_issuer,
+        "Attempting token exchange at IDP for ID-JAG"
+    );
+
     let exchange_resp = http
-        .post(token_endpoint)
+        .post(idp_te)
+        .basic_auth(client_id, Some(client_secret))
         .form(&exchange_params)
         .send()
         .await?;
 
+    let exchange_status = exchange_resp.status();
     let exchange_body: serde_json::Value = exchange_resp.json().await?;
-    if let Some(token) = exchange_body.get("access_token").and_then(|v| v.as_str()) {
-        return run_authed_client(server_url, token).await;
+    tracing::info!(
+        status = %exchange_status,
+        body = %exchange_body,
+        "Token exchange response"
+    );
+
+    let id_jag = exchange_body
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .context("No access_token (ID-JAG) in token exchange response")?;
+
+    // Step 3: JWT bearer grant at MCP AS using the ID-JAG from step 2
+    let mut bearer_params = vec![
+        (
+            "grant_type".to_string(),
+            "urn:ietf:params:oauth:grant-type:jwt-bearer".to_string(),
+        ),
+        ("assertion".to_string(), id_jag.to_string()),
+    ];
+    if let Some(ref res) = resource {
+        bearer_params.push(("resource".to_string(), res.clone()));
     }
 
-    // Step 4: Try JWT bearer grant (RFC 7523)
-    if let Some(pem) = private_key_pem {
-        let jwt = build_jwt_assertion(client_id, token_endpoint, pem)?;
-        let mut bearer_params = vec![
-            (
-                "grant_type",
-                "urn:ietf:params:oauth:grant-type:jwt-bearer".to_string(),
-            ),
-            ("assertion", jwt),
-            ("client_id", client_id.to_string()),
-        ];
-        if let Some(res) = resource {
-            bearer_params.push(("resource", res.to_string()));
-        }
+    tracing::info!("Attempting JWT bearer grant with ID-JAG at MCP AS");
 
-        let bearer_resp = http
-            .post(token_endpoint)
-            .form(&bearer_params)
-            .send()
-            .await?;
+    let bearer_resp = http
+        .post(token_endpoint)
+        .basic_auth(client_id, Some(client_secret))
+        .form(&bearer_params)
+        .send()
+        .await?;
 
-        let bearer_body: serde_json::Value = bearer_resp.json().await?;
-        if let Some(token) = bearer_body.get("access_token").and_then(|v| v.as_str()) {
-            return run_authed_client(server_url, token).await;
-        }
-    }
+    let bearer_status = bearer_resp.status();
+    let bearer_body: serde_json::Value = bearer_resp.json().await?;
+    tracing::info!(
+        status = %bearer_status,
+        body = %bearer_body,
+        "JWT bearer response"
+    );
 
-    // Fallback: try using initial token directly
-    run_authed_client(server_url, &initial_token).await
+    let access_token = bearer_body
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .context("No access_token in JWT bearer response")?;
+
+    run_authed_client(server_url, access_token).await
 }
 
 // ============================================================================
@@ -403,7 +437,6 @@ struct ProbeResult {
     #[allow(dead_code)]
     scope: Option<String>,
     resource_metadata_url: Option<String>,
-    resource: Option<String>,
 }
 
 /// Probe the server to get auth-related hints from WWW-Authenticate.
@@ -436,13 +469,9 @@ async fn probe_server(server_url: &str) -> Result<ProbeResult> {
         .as_ref()
         .and_then(|wa| extract_www_auth_param(wa, "resource_metadata"));
 
-    // Extract resource from PRM if we already have the URL
-    let resource = None; // Will be resolved later from PRM
-
     Ok(ProbeResult {
         scope,
         resource_metadata_url,
-        resource,
     })
 }
 
