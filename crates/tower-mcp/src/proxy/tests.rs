@@ -540,6 +540,49 @@ mod proxy_tests {
     }
 
     #[tokio::test]
+    async fn test_proxy_builder_rejects_ambiguous_namespace_prefixes() {
+        // With separator "_", "redis" produces prefix "redis_" and "redis_ft"
+        // produces prefix "redis_ft_". Since "redis_ft_" starts with "redis_",
+        // routing "redis_ft_search" is ambiguous.
+        let t1 = ChannelTransport::new(math_router());
+        let t2 = ChannelTransport::new(text_router());
+
+        let result = McpProxy::builder("ambiguous", "1.0.0")
+            .backend("redis", t1)
+            .await
+            .backend("redis_ft", t2)
+            .await
+            .build()
+            .await;
+
+        let err = result.err().expect("should fail with ambiguous prefixes");
+        assert!(
+            err.to_string().contains("Ambiguous namespace prefixes"),
+            "Expected ambiguous prefix error, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_builder_allows_non_ambiguous_prefixes_with_dot_separator() {
+        // With separator ".", "redis" -> "redis." and "redis_ft" -> "redis_ft."
+        // Neither is a prefix of the other, so this is fine.
+        let t1 = ChannelTransport::new(math_router());
+        let t2 = ChannelTransport::new(text_router());
+
+        let result = McpProxy::builder("dot-sep", "1.0.0")
+            .separator(".")
+            .backend("redis", t1)
+            .await
+            .backend("redis_ft", t2)
+            .await
+            .build()
+            .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
     async fn test_proxy_unsupported_method_returns_error() {
         let mut proxy = build_test_proxy().await;
 

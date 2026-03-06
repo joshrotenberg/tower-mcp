@@ -234,9 +234,15 @@ impl McpProxyBuilder {
     /// For backends added via [`backend()`](Self::backend), a background task
     /// is spawned that watches for list-changed notifications and automatically
     /// refreshes the affected cache.
-    pub async fn build(self) -> Result<McpProxy> {
+    pub async fn build(mut self) -> Result<McpProxy> {
         if self.pending.is_empty() {
             return Err(Error::internal("No backends configured"));
+        }
+
+        // Ensure all backends use the builder's final separator.
+        // This handles the case where `.separator()` is called after `.backend()`.
+        for pb in &mut self.pending {
+            pb.backend.separator = self.separator.clone();
         }
 
         // Check for duplicate namespaces
@@ -251,6 +257,26 @@ impl McpProxyBuilder {
             sorted.dedup();
             if sorted.len() != namespaces.len() {
                 return Err(Error::internal("Duplicate backend namespaces"));
+            }
+        }
+
+        // Check for ambiguous namespace prefixes.
+        // With separator "_", namespaces "redis" and "redis_ft" both produce
+        // the prefix "redis_", making "redis_ft_search" ambiguous.
+        let prefixes: Vec<String> = namespaces
+            .iter()
+            .map(|ns| format!("{}{}", ns, self.separator))
+            .collect();
+        for (i, prefix_i) in prefixes.iter().enumerate() {
+            for (j, prefix_j) in prefixes.iter().enumerate() {
+                if i != j && prefix_j.starts_with(prefix_i.as_str()) {
+                    return Err(Error::internal(format!(
+                        "Ambiguous namespace prefixes: \"{}\" and \"{}\" with separator \"{}\". \
+                         The prefix \"{}\" is a prefix of \"{}\", which makes routing ambiguous. \
+                         Use a different separator (e.g., \".\") or rename the namespaces.",
+                        namespaces[i], namespaces[j], self.separator, prefix_i, prefix_j,
+                    )));
+                }
             }
         }
 

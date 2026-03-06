@@ -262,6 +262,8 @@ async fn handle_call_tool(
     mut service: BoxCloneService<RouterRequest, RouterResponse, Infallible>,
     stripped_name: String,
     params: CallToolParams,
+    id: RequestId,
+    extensions: Extensions,
 ) -> Result<McpResponse, JsonRpcError> {
     let inner_request = McpRequest::CallTool(CallToolParams {
         name: stripped_name,
@@ -271,9 +273,9 @@ async fn handle_call_tool(
     });
 
     let router_req = RouterRequest {
-        id: RequestId::Number(0),
+        id,
         inner: inner_request,
-        extensions: Extensions::new(),
+        extensions,
     };
 
     let resp = service.call(router_req).await.expect("infallible");
@@ -324,6 +326,8 @@ async fn handle_read_resource(
     mut service: BoxCloneService<RouterRequest, RouterResponse, Infallible>,
     stripped_uri: String,
     params: ReadResourceParams,
+    id: RequestId,
+    extensions: Extensions,
 ) -> Result<McpResponse, JsonRpcError> {
     let inner_request = McpRequest::ReadResource(ReadResourceParams {
         uri: stripped_uri,
@@ -331,9 +335,9 @@ async fn handle_read_resource(
     });
 
     let router_req = RouterRequest {
-        id: RequestId::Number(0),
+        id,
         inner: inner_request,
-        extensions: Extensions::new(),
+        extensions,
     };
 
     let resp = service.call(router_req).await.expect("infallible");
@@ -361,6 +365,8 @@ async fn handle_get_prompt(
     mut service: BoxCloneService<RouterRequest, RouterResponse, Infallible>,
     stripped_name: String,
     params: GetPromptParams,
+    id: RequestId,
+    extensions: Extensions,
 ) -> Result<McpResponse, JsonRpcError> {
     let inner_request = McpRequest::GetPrompt(GetPromptParams {
         name: stripped_name,
@@ -369,9 +375,9 @@ async fn handle_get_prompt(
     });
 
     let router_req = RouterRequest {
-        id: RequestId::Number(0),
+        id,
         inner: inner_request,
-        extensions: Extensions::new(),
+        extensions,
     };
 
     let resp = service.call(router_req).await.expect("infallible");
@@ -393,6 +399,7 @@ impl Service<RouterRequest> for McpProxy {
 
     fn call(&mut self, req: RouterRequest) -> Self::Future {
         let request_id = req.id.clone();
+        let extensions = req.extensions.clone();
 
         // All routing and data extraction happens synchronously here (no await),
         // so we never hold a &[BackendEntry] reference across an await point.
@@ -415,7 +422,13 @@ impl Service<RouterRequest> for McpProxy {
                     match Self::route_by_prefix(&self.entries, &params.name) {
                         Some((idx, stripped)) => {
                             let service = self.entries[idx].service.clone();
-                            Box::pin(handle_call_tool(service, stripped, params))
+                            Box::pin(handle_call_tool(
+                                service,
+                                stripped,
+                                params,
+                                request_id.clone(),
+                                extensions.clone(),
+                            ))
                         }
                         None => Box::pin(async move {
                             Err(JsonRpcError::invalid_params(format!(
@@ -437,7 +450,13 @@ impl Service<RouterRequest> for McpProxy {
                     match Self::route_by_uri_prefix(&self.entries, &params.uri) {
                         Some((idx, stripped)) => {
                             let service = self.entries[idx].service.clone();
-                            Box::pin(handle_read_resource(service, stripped, params))
+                            Box::pin(handle_read_resource(
+                                service,
+                                stripped,
+                                params,
+                                request_id.clone(),
+                                extensions.clone(),
+                            ))
                         }
                         None => Box::pin(async move {
                             Err(JsonRpcError::invalid_params(format!(
@@ -455,7 +474,13 @@ impl Service<RouterRequest> for McpProxy {
                     match Self::route_by_prefix(&self.entries, &params.name) {
                         Some((idx, stripped)) => {
                             let service = self.entries[idx].service.clone();
-                            Box::pin(handle_get_prompt(service, stripped, params))
+                            Box::pin(handle_get_prompt(
+                                service,
+                                stripped,
+                                params,
+                                request_id.clone(),
+                                extensions.clone(),
+                            ))
                         }
                         None => Box::pin(async move {
                             Err(JsonRpcError::invalid_params(format!(
