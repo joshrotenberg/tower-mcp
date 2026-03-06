@@ -163,3 +163,8 @@ path = "../../examples/sampling_server.rs"
 [[example]]
 name = "client_handler"
 path = "../../examples/client_handler.rs"
+
+[[example]]
+name = "oauth_client"
+path = "../../examples/oauth_client.rs"
+required-features = ["oauth-client"]
