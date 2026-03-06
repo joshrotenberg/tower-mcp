@@ -1,7 +1,7 @@
 //! MCP Proxy -- aggregate multiple backend MCP servers behind a single endpoint.
 //!
 //! The proxy connects to N backend MCP servers and exposes their combined
-//! tools, resources, and prompts through a unified [`Service<RouterRequest>`]
+//! tools, resources, and prompts through a unified `Service<RouterRequest>`
 //! interface. Each backend's capabilities are namespaced to avoid collisions.
 //!
 //! # Architecture
@@ -13,7 +13,7 @@
 //!           (stdio)    (HTTP)     (stdio)
 //! ```
 //!
-//! Each backend is an [`McpClient`] that the proxy initializes and manages.
+//! Each backend is an [`McpClient`](crate::client::McpClient) that the proxy initializes and manages.
 //! Tool/resource/prompt discovery runs concurrently across all backends with
 //! per-backend timeouts. Results are cached and refreshed on `toolListChanged`
 //! notifications.
@@ -60,3 +60,6 @@ mod tests;
 
 pub use builder::McpProxyBuilder;
 pub use service::McpProxy;
+
+// Re-export BackendService so users can write layer bounds against it
+pub use backend::BackendService;
