@@ -10,7 +10,7 @@ use std::task::{Context, Poll};
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use tower::Layer;
+use tower::{Layer, ServiceExt};
 
 use super::error::OAuthError;
 use super::metadata::ProtectedResourceMetadata;
@@ -122,17 +122,17 @@ where
         let validator = self.validator.clone();
         let metadata = self.metadata.clone();
         let scope_policy = self.scope_policy.clone();
-        let mut inner = self.inner.clone();
+        let inner = self.inner.clone();
 
         Box::pin(async move {
             // Skip validation for public paths
             if public_paths.iter().any(|p| path.starts_with(p.as_str())) {
-                return inner.call(req).await;
+                return inner.oneshot(req).await;
             }
 
             // Also skip well-known paths that may be nested under a mount point
             if path.contains("/.well-known/") {
-                return inner.call(req).await;
+                return inner.oneshot(req).await;
             }
 
             // Extract bearer token
@@ -167,7 +167,7 @@ where
             // Inject claims into request extensions
             let mut req = req;
             req.extensions_mut().insert(claims);
-            inner.call(req).await
+            inner.oneshot(req).await
         })
     }
 }

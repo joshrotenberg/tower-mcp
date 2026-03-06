@@ -39,6 +39,8 @@ use std::future::Future;
 use std::sync::Arc;
 
 use tower::Layer;
+#[cfg(feature = "http")]
+use tower::ServiceExt;
 
 /// Result of an authentication attempt
 #[derive(Debug, Clone)]
@@ -343,7 +345,7 @@ where
             .and_then(extract_api_key)
             .map(|s| s.to_owned());
 
-        let mut inner = self.inner.clone();
+        let inner = self.inner.clone();
         let validator = self.validator.clone();
 
         Box::pin(async move {
@@ -359,7 +361,7 @@ where
                     if let Some(info) = info {
                         req.extensions_mut().insert(info);
                     }
-                    inner.call(req).await
+                    inner.oneshot(req).await
                 }
                 AuthResult::Failed(err) => Ok(unauthorized_response(&err.message)),
             }

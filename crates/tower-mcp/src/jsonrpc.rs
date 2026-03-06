@@ -15,7 +15,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use tower::Layer;
+use tower::{Layer, ServiceExt};
 use tower_service::Service;
 
 use crate::error::{Error, JsonRpcError, Result};
@@ -215,7 +215,7 @@ where
     }
 
     fn call(&mut self, req: JsonRpcRequest) -> Self::Future {
-        let mut inner = self.inner.clone();
+        let inner = self.inner.clone();
         let extensions = self.extensions.clone();
         Box::pin(async move {
             // Parse the MCP request from JSON-RPC
@@ -228,8 +228,8 @@ where
                 extensions,
             };
 
-            // Call the inner service
-            let response = inner.call(router_req).await.unwrap(); // Infallible
+            // Call the inner service (oneshot handles poll_ready)
+            let response = inner.oneshot(router_req).await.unwrap(); // Infallible
 
             // Convert to JSON-RPC response
             Ok(response.into_jsonrpc())
@@ -318,7 +318,7 @@ where
 
 /// Helper function to process a single JSON-RPC request
 async fn process_single_request<S>(
-    mut inner: S,
+    inner: S,
     req: JsonRpcRequest,
     extensions: Extensions,
 ) -> std::result::Result<JsonRpcResponse, Error>
@@ -351,8 +351,8 @@ where
         extensions,
     };
 
-    // Call the inner service
-    let response = inner.call(router_req).await.unwrap(); // Infallible
+    // Call the inner service (oneshot handles poll_ready)
+    let response = inner.oneshot(router_req).await.unwrap(); // Infallible
 
     // Convert to JSON-RPC response
     Ok(response.into_jsonrpc())
