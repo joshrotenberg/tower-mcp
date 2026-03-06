@@ -113,6 +113,8 @@ pub struct McpProxyBuilder {
     pending: Vec<PendingBackend>,
     notification_tx: Option<crate::context::NotificationSender>,
     connection_failures: Vec<ConnectionFailure>,
+    /// Custom instructions override. If set, used instead of aggregated backend instructions.
+    instructions: Option<String>,
 }
 
 impl McpProxyBuilder {
@@ -125,6 +127,7 @@ impl McpProxyBuilder {
             pending: Vec::new(),
             notification_tx: None,
             connection_failures: Vec::new(),
+            instructions: None,
         }
     }
 
@@ -161,6 +164,16 @@ impl McpProxyBuilder {
     /// ```
     pub fn notification_sender(mut self, tx: crate::context::NotificationSender) -> Self {
         self.notification_tx = Some(tx);
+        self
+    }
+
+    /// Set custom instructions for the proxy's initialize response.
+    ///
+    /// When set, this overrides the default behavior of aggregating
+    /// backend instructions. Use this to provide a curated description
+    /// of the proxy's capabilities.
+    pub fn instructions(mut self, instructions: impl Into<String>) -> Self {
+        self.instructions = Some(instructions.into());
         self
     }
 
@@ -382,12 +395,13 @@ impl McpProxyBuilder {
         let init_futures: Vec<_> = self
             .pending
             .into_iter()
-            .map(|pb| {
+            .map(|mut pb| {
                 let name = name.clone();
                 let version = version.clone();
                 async move {
                     match pb.backend.initialize(&name, &version).await {
-                        Ok(()) => {
+                        Ok(instructions) => {
+                            pb.backend.instructions = instructions;
                             {
                                 let cache = pb.backend.cache.read().await;
                                 tracing::info!(
@@ -460,12 +474,34 @@ impl McpProxyBuilder {
             return Err(Error::internal("All backends failed to initialize"));
         }
 
+        // Build instructions: use custom override or aggregate from backends
+        let instructions = if let Some(custom) = self.instructions {
+            Some(custom)
+        } else {
+            let mut parts = vec![format!(
+                "MCP proxy aggregating {} backend servers.",
+                backends.len()
+            )];
+            for b in &backends {
+                if let Some(inst) = &b.instructions {
+                    parts.push(format!("[{}] {}", b.namespace, inst));
+                }
+            }
+            // Only include backend details if at least one backend has instructions
+            if parts.len() > 1 {
+                Some(parts.join("\n\n"))
+            } else {
+                Some(parts.remove(0))
+            }
+        };
+
         let proxy = McpProxy::new(
             self.name,
             self.version,
             backends,
             entries,
             self.notification_tx,
+            instructions,
         );
 
         // Spawn invalidation watchers for backends with notification handlers.

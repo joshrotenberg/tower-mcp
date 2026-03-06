@@ -975,6 +975,162 @@ mod proxy_tests {
     }
 
     // ========================================================================
+    // Instructions aggregation (#605)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_proxy_aggregates_backend_instructions() {
+        // Create routers with instructions
+        let math = McpRouter::new()
+            .server_info("math-server", "1.0.0")
+            .instructions("Provides arithmetic operations")
+            .tool(
+                ToolBuilder::new("add")
+                    .description("Add two numbers")
+                    .handler(|input: AddInput| async move {
+                        Ok(CallToolResult::text(format!("{}", input.a + input.b)))
+                    })
+                    .build(),
+            );
+
+        let text = McpRouter::new()
+            .server_info("text-server", "1.0.0")
+            .instructions("Provides text manipulation tools")
+            .tool(
+                ToolBuilder::new("echo")
+                    .description("Echo a message")
+                    .handler(
+                        |input: EchoInput| async move { Ok(CallToolResult::text(input.message)) },
+                    )
+                    .build(),
+            );
+
+        let math_transport = ChannelTransport::new(math);
+        let text_transport = ChannelTransport::new(text);
+
+        let mut proxy = McpProxy::builder("instructions-proxy", "1.0.0")
+            .backend("math", math_transport)
+            .await
+            .backend("text", text_transport)
+            .await
+            .build_strict()
+            .await
+            .expect("proxy should build");
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::Initialize(crate::protocol::InitializeParams {
+                protocol_version: "2025-11-25".to_string(),
+                capabilities: Default::default(),
+                client_info: crate::protocol::Implementation {
+                    name: "test".to_string(),
+                    version: "1.0".to_string(),
+                    ..Default::default()
+                },
+                meta: None,
+            }),
+            extensions: Extensions::new(),
+        };
+
+        let resp = proxy.call(req).await.unwrap();
+        let result = resp.inner.unwrap();
+
+        if let McpResponse::Initialize(init) = result {
+            let instructions = init.instructions.expect("should have instructions");
+            assert!(
+                instructions.contains("[math] Provides arithmetic operations"),
+                "should contain math instructions: {instructions}"
+            );
+            assert!(
+                instructions.contains("[text] Provides text manipulation tools"),
+                "should contain text instructions: {instructions}"
+            );
+        } else {
+            panic!("expected Initialize response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_proxy_custom_instructions_override() {
+        let math_transport = ChannelTransport::new(math_router());
+
+        let mut proxy = McpProxy::builder("custom-proxy", "1.0.0")
+            .instructions("Custom proxy description")
+            .backend("math", math_transport)
+            .await
+            .build_strict()
+            .await
+            .expect("proxy should build");
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::Initialize(crate::protocol::InitializeParams {
+                protocol_version: "2025-11-25".to_string(),
+                capabilities: Default::default(),
+                client_info: crate::protocol::Implementation {
+                    name: "test".to_string(),
+                    version: "1.0".to_string(),
+                    ..Default::default()
+                },
+                meta: None,
+            }),
+            extensions: Extensions::new(),
+        };
+
+        let resp = proxy.call(req).await.unwrap();
+        let result = resp.inner.unwrap();
+
+        if let McpResponse::Initialize(init) = result {
+            assert_eq!(
+                init.instructions.as_deref(),
+                Some("Custom proxy description")
+            );
+        } else {
+            panic!("expected Initialize response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_proxy_no_backend_instructions_gives_default() {
+        // math_router doesn't set instructions
+        let math_transport = ChannelTransport::new(math_router());
+
+        let mut proxy = McpProxy::builder("default-proxy", "1.0.0")
+            .backend("math", math_transport)
+            .await
+            .build_strict()
+            .await
+            .expect("proxy should build");
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::Initialize(crate::protocol::InitializeParams {
+                protocol_version: "2025-11-25".to_string(),
+                capabilities: Default::default(),
+                client_info: crate::protocol::Implementation {
+                    name: "test".to_string(),
+                    version: "1.0".to_string(),
+                    ..Default::default()
+                },
+                meta: None,
+            }),
+            extensions: Extensions::new(),
+        };
+
+        let resp = proxy.call(req).await.unwrap();
+        let result = resp.inner.unwrap();
+
+        if let McpResponse::Initialize(init) = result {
+            let instructions = init.instructions.expect("should have instructions");
+            assert_eq!(instructions, "MCP proxy aggregating 1 backend servers.");
+            // Should NOT contain any [namespace] section
+            assert!(!instructions.contains('['));
+        } else {
+            panic!("expected Initialize response");
+        }
+    }
+
+    // ========================================================================
     // CoalesceLayer integration
     // ========================================================================
 
