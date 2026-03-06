@@ -382,6 +382,20 @@ pub(crate) fn validate_tool_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Ensure a JSON Schema value has `"type": "object"`.
+///
+/// The MCP spec requires tool input schemas to be JSON objects with a `"type"` field.
+/// Some types (e.g., `serde_json::Value`) generate schemas via schemars that lack
+/// the `"type"` field, which causes MCP clients to reject the tool.
+pub(crate) fn ensure_object_schema(mut schema: Value) -> Value {
+    if let Some(obj) = schema.as_object_mut()
+        && !obj.contains_key("type")
+    {
+        obj.insert("type".to_string(), serde_json::json!("object"));
+    }
+    schema
+}
+
 /// A boxed future for tool handlers
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -670,7 +684,7 @@ impl Tool {
         task_support: TaskSupportMode,
         handler: H,
     ) -> Self {
-        let input_schema = handler.input_schema();
+        let input_schema = ensure_object_schema(handler.input_schema());
         let handler_service = ToolHandlerService::new(handler);
         let catch_error = ToolCatchError::new(handler_service);
         let service = BoxCloneService::new(catch_error);
@@ -1460,6 +1474,7 @@ where
         let input_schema = schemars::schema_for!(I);
         let input_schema = serde_json::to_value(input_schema)
             .unwrap_or_else(|_| serde_json::json!({ "type": "object" }));
+        let input_schema = ensure_object_schema(input_schema);
 
         let handler_service = ToolHandlerService::new(TypedHandler {
             handler: self.handler,
@@ -1546,11 +1561,12 @@ where
 
     fn input_schema(&self) -> Value {
         let schema = schemars::schema_for!(I);
-        serde_json::to_value(schema).unwrap_or_else(|_| {
+        let schema = serde_json::to_value(schema).unwrap_or_else(|_| {
             serde_json::json!({
                 "type": "object"
             })
-        })
+        });
+        ensure_object_schema(schema)
     }
 }
 
@@ -1663,11 +1679,12 @@ impl<T: McpTool> ToolHandler for McpToolHandler<T> {
 
     fn input_schema(&self) -> Value {
         let schema = schemars::schema_for!(T::Input);
-        serde_json::to_value(schema).unwrap_or_else(|_| {
+        let schema = serde_json::to_value(schema).unwrap_or_else(|_| {
             serde_json::json!({
                 "type": "object"
             })
-        })
+        });
+        ensure_object_schema(schema)
     }
 }
 
@@ -2321,6 +2338,23 @@ mod tests {
         // Should work with empty input
         let result = tool.call(serde_json::json!({})).await;
         assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn test_serde_json_value_handler_has_type_object() {
+        // serde_json::Value generates a schema without "type" via schemars.
+        // We must ensure "type": "object" is added for MCP compliance.
+        let tool = ToolBuilder::new("any_input")
+            .description("Accepts any input")
+            .handler(|_input: serde_json::Value| async move { Ok(CallToolResult::text("ok")) })
+            .build();
+
+        let schema = tool.definition().input_schema;
+        assert_eq!(
+            schema.get("type").and_then(|v| v.as_str()),
+            Some("object"),
+            "serde_json::Value handler should produce schema with type: object"
+        );
     }
 
     #[tokio::test]
