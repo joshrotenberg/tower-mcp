@@ -804,7 +804,9 @@ pub trait HasSchema {
 impl<T: JsonSchema> HasSchema for Json<T> {
     fn schema() -> Option<Value> {
         let schema = schemars::schema_for!(T);
-        serde_json::to_value(schema).ok()
+        serde_json::to_value(schema)
+            .ok()
+            .map(crate::tool::ensure_object_schema)
     }
 }
 
@@ -1237,11 +1239,12 @@ where
     pub fn build(self) -> Tool {
         let input_schema = {
             let schema = schemars::schema_for!(I);
-            serde_json::to_value(schema).unwrap_or_else(|_| {
+            let schema = serde_json::to_value(schema).unwrap_or_else(|_| {
                 serde_json::json!({
                     "type": "object"
                 })
-            })
+            });
+            crate::tool::ensure_object_schema(schema)
         };
 
         let handler = TypedExtractorToolHandler {
