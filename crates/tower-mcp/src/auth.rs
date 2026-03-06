@@ -38,7 +38,9 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
 
-use tower::{Layer, ServiceExt};
+use tower::Layer;
+#[cfg(feature = "http")]
+use tower::ServiceExt;
 
 /// Result of an authentication attempt
 #[derive(Debug, Clone)]
