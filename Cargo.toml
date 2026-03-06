@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/tower-mcp",
     "crates/tower-mcp-types",
+    "crates/tower-mcp-macros",
     "examples/conformance-server",
     "examples/conformance-client",
     "examples/markdownlint-mcp",
@@ -22,6 +23,7 @@ repository = "https://github.com/joshrotenberg/tower-mcp"
 # Internal crates
 tower-mcp = { version = "0.8", path = "crates/tower-mcp" }
 tower-mcp-types = { version = "0.8", path = "crates/tower-mcp-types" }
+tower-mcp-macros = { version = "0.8", path = "crates/tower-mcp-macros" }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

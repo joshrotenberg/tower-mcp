@@ -41,7 +41,7 @@ jsonschema = "0.44"
 [features]
 default = []
 # Enable all optional features
-full = ["http", "websocket", "childproc", "oauth", "jwks", "testing", "dynamic-tools", "http-client", "oauth-client", "proxy"]
+full = ["http", "websocket", "childproc", "oauth", "jwks", "testing", "dynamic-tools", "http-client", "oauth-client", "proxy", "macros"]
 # Transport features
 http = ["dep:axum", "dep:hyper", "dep:http", "dep:http-body-util", "dep:tokio-stream", "dep:uuid"]
 websocket = ["dep:axum", "dep:uuid"]
@@ -60,6 +60,8 @@ oauth-client = ["http-client"]
 dynamic-tools = []
 # MCP proxy for aggregating multiple backend servers
 proxy = []
+# Proc macros for tool/resource/prompt definitions
+macros = ["dep:tower-mcp-macros"]
 
 [dependencies.axum]
 workspace = true
@@ -92,6 +94,10 @@ version = "10"
 optional = true
 default-features = false
 features = ["aws_lc_rs", "use_pem"]
+
+[dependencies.tower-mcp-macros]
+workspace = true
+optional = true
 
 [dependencies.reqwest]
 version = "0.13"
@@ -176,3 +182,8 @@ required-features = ["oauth-client"]
 name = "proxy"
 path = "../../examples/proxy.rs"
 required-features = ["proxy"]
+
+[[example]]
+name = "tool_macro"
+path = "../../examples/tool_macro.rs"
+required-features = ["macros"]

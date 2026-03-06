@@ -405,6 +405,16 @@ pub mod tool;
 pub mod tracing_layer;
 pub mod transport;
 
+// Re-export proc macros when the `macros` feature is enabled
+#[cfg(feature = "macros")]
+pub use tower_mcp_macros::prompt_fn;
+#[cfg(feature = "macros")]
+pub use tower_mcp_macros::resource_fn;
+#[cfg(feature = "macros")]
+pub use tower_mcp_macros::resource_template_fn;
+#[cfg(feature = "macros")]
+pub use tower_mcp_macros::tool_fn;
+
 // Re-exports
 pub use async_task::{Task, TaskStore};
 pub use client::{
