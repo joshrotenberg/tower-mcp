@@ -120,6 +120,7 @@ pub type BoxResourceService = BoxCloneService<ResourceRequest, ReadResourceResul
 /// This wrapper ensures that middleware errors (e.g., timeouts, rate limits)
 /// and handler errors are converted to `Err(Error)` responses wrapped in
 /// `Ok`, rather than propagating as Tower service errors.
+#[doc(hidden)]
 pub struct ResourceCatchError<S> {
     inner: S,
 }
@@ -149,6 +150,7 @@ impl<S: fmt::Debug> fmt::Debug for ResourceCatchError<S> {
 
 pin_project! {
     /// Future for [`ResourceCatchError`].
+    #[doc(hidden)]
     pub struct ResourceCatchErrorFuture<F> {
         #[pin]
         inner: F,
@@ -695,6 +697,7 @@ impl ResourceBuilder {
 ///
 /// This builder allows applying middleware layers via `.layer()` or building
 /// the resource directly via `.build()`.
+#[doc(hidden)]
 pub struct ResourceBuilderWithHandler<F> {
     uri: String,
     name: Option<String>,
@@ -780,6 +783,7 @@ where
 /// Builder state after a layer has been applied to the handler.
 ///
 /// This builder allows chaining additional layers and building the final resource.
+#[doc(hidden)]
 pub struct ResourceBuilderWithLayer<F, L> {
     uri: String,
     name: Option<String>,
@@ -853,6 +857,7 @@ where
 }
 
 /// Builder state after context-aware handler is specified.
+#[doc(hidden)]
 pub struct ResourceBuilderWithContextHandler<F> {
     uri: String,
     name: Option<String>,
@@ -909,6 +914,7 @@ where
 }
 
 /// Builder state after a layer has been applied to a context-aware handler.
+#[doc(hidden)]
 pub struct ResourceBuilderWithContextLayer<F, L> {
     uri: String,
     name: Option<String>,

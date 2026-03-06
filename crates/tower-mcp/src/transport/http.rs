@@ -524,9 +524,9 @@ struct AppState {
 /// discovery per RFC 9728.
 #[cfg(feature = "oauth")]
 #[derive(Clone)]
-pub struct OAuthConfig {
+pub(crate) struct OAuthConfig {
     /// Protected Resource Metadata to serve at the well-known endpoint.
-    pub metadata: crate::oauth::ProtectedResourceMetadata,
+    pub(crate) metadata: crate::oauth::ProtectedResourceMetadata,
 }
 
 /// HTTP transport for MCP servers

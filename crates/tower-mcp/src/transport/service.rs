@@ -3,7 +3,7 @@
 //! This module provides the types needed to apply tower middleware layers
 //! to MCP request processing within HTTP and WebSocket transports.
 //!
-//! The key type is [`ServiceFactory`], a function that takes an [`McpRouter`]
+//! The key type is `ServiceFactory`, a function that takes an [`McpRouter`]
 //! and produces a boxed, middleware-wrapped service. Transports store this
 //! factory and use it when creating sessions.
 //!
@@ -19,6 +19,7 @@ use std::convert::Infallible;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+#[cfg(any(feature = "http", feature = "websocket"))]
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -29,7 +30,9 @@ use tower_service::Service;
 
 use crate::error::JsonRpcError;
 use crate::protocol::RequestId;
-use crate::router::{McpRouter, RouterRequest, RouterResponse};
+#[cfg(any(feature = "http", feature = "websocket"))]
+use crate::router::McpRouter;
+use crate::router::{RouterRequest, RouterResponse};
 
 /// A boxed, cloneable MCP service with `Error = Infallible`.
 ///
@@ -42,15 +45,17 @@ pub type McpBoxService = BoxCloneService<RouterRequest, RouterResponse, Infallib
 /// A factory function that produces a [`McpBoxService`] from an [`McpRouter`].
 ///
 /// Transports store this factory and call it when creating new sessions.
-/// The default factory (from [`identity_factory`]) returns the router as-is.
+/// The default factory (from `identity_factory`) returns the router as-is.
 /// When `.layer()` is called on a transport, the factory wraps the router
 /// with the given middleware and a [`CatchError`] adapter.
-pub type ServiceFactory = Arc<dyn Fn(McpRouter) -> McpBoxService + Send + Sync>;
+#[cfg(any(feature = "http", feature = "websocket"))]
+pub(crate) type ServiceFactory = Arc<dyn Fn(McpRouter) -> McpBoxService + Send + Sync>;
 
-/// Create a [`ServiceFactory`] that returns the router unchanged.
+/// Create a `ServiceFactory` that returns the router unchanged.
 ///
 /// This is the default factory used by transports when no `.layer()` is applied.
-pub fn identity_factory() -> ServiceFactory {
+#[cfg(any(feature = "http", feature = "websocket"))]
+pub(crate) fn identity_factory() -> ServiceFactory {
     Arc::new(|router: McpRouter| BoxCloneService::new(router))
 }
 
@@ -155,6 +160,7 @@ mod tests {
     use crate::protocol::RequestId;
 
     #[test]
+    #[cfg(any(feature = "http", feature = "websocket"))]
     fn test_identity_factory_produces_service() {
         let router = McpRouter::new().server_info("test", "1.0.0");
         let factory = identity_factory();

@@ -88,6 +88,7 @@ pub type BoxToolService = BoxCloneService<ToolRequest, CallToolResult, Infallibl
 /// This wrapper ensures that middleware errors (e.g., timeouts, rate limits)
 /// and handler errors are converted to tool-level error responses with
 /// `is_error: true`, rather than propagating as Tower service errors.
+#[doc(hidden)]
 pub struct ToolCatchError<S> {
     inner: S,
 }
@@ -117,6 +118,7 @@ impl<S: fmt::Debug> fmt::Debug for ToolCatchError<S> {
 
 pin_project! {
     /// Future for [`ToolCatchError`].
+    #[doc(hidden)]
     pub struct ToolCatchErrorFuture<F> {
         #[pin]
         inner: F,
@@ -227,6 +229,7 @@ where
 /// Service wrapper that runs a guard check before calling the inner service.
 ///
 /// Created by [`GuardLayer`]. See its documentation for usage.
+#[doc(hidden)]
 #[derive(Clone)]
 pub struct GuardService<G, S> {
     guard: G,
@@ -356,7 +359,7 @@ impl JsonSchema for NoParams {
 ///   and forward slashes
 ///
 /// Returns `Ok(())` if valid, `Err` with description if invalid.
-pub fn validate_tool_name(name: &str) -> Result<()> {
+pub(crate) fn validate_tool_name(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(Error::tool("Tool name cannot be empty"));
     }
@@ -1188,6 +1191,7 @@ where
 }
 
 /// Builder state after handler is specified
+#[doc(hidden)]
 pub struct ToolBuilderWithHandler<I, F> {
     name: String,
     title: Option<String>,
@@ -1203,6 +1207,7 @@ pub struct ToolBuilderWithHandler<I, F> {
 /// Builder state for tools with no parameters.
 ///
 /// Created by [`ToolBuilder::no_params_handler`].
+#[doc(hidden)]
 pub struct ToolBuilderWithNoParamsHandler<F> {
     name: String,
     title: Option<String>,
@@ -1264,6 +1269,7 @@ where
 }
 
 /// Builder state after a layer has been applied to a no-params handler.
+#[doc(hidden)]
 pub struct ToolBuilderWithNoParamsHandlerLayer<F, L> {
     name: String,
     title: Option<String>,
@@ -1422,6 +1428,7 @@ where
 /// Builder state after a layer has been applied to the handler.
 ///
 /// This builder allows chaining additional layers and building the final tool.
+#[doc(hidden)]
 pub struct ToolBuilderWithLayer<I, F, L> {
     name: String,
     title: Option<String>,
