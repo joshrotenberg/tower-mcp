@@ -122,3 +122,96 @@ fn test_prompt_fn_macro_registers_in_router() {
         .prompt(greet_prompt())
         .prompt(summarize_prompt());
 }
+
+// ---------------------------------------------------------------------------
+// resource_fn tests
+// ---------------------------------------------------------------------------
+
+use tower_mcp::protocol::ReadResourceResult;
+use tower_mcp::resource_fn;
+use tower_mcp::resource_template_fn;
+
+#[resource_fn(uri = "app://config", name = "config", description = "App config")]
+async fn config() -> Result<ReadResourceResult, tower_mcp::Error> {
+    Ok(ReadResourceResult::text("app://config", "debug=true"))
+}
+
+#[resource_fn(uri = "app://version", mime_type = "text/plain")]
+async fn version() -> Result<ReadResourceResult, tower_mcp::Error> {
+    Ok(ReadResourceResult::text("app://version", "1.0.0"))
+}
+
+#[test]
+fn test_resource_fn_macro_generates_resource() {
+    let resource = config_resource();
+    assert_eq!(resource.uri, "app://config");
+    assert_eq!(resource.name, "config");
+    assert_eq!(resource.description.as_deref(), Some("App config"));
+}
+
+#[test]
+fn test_resource_fn_macro_default_name() {
+    let resource = version_resource();
+    assert_eq!(resource.uri, "app://version");
+    assert_eq!(resource.name, "version");
+}
+
+#[test]
+fn test_resource_fn_macro_registers_in_router() {
+    use tower_mcp::McpRouter;
+
+    let _router = McpRouter::new()
+        .server_info("test", "1.0.0")
+        .resource(config_resource())
+        .resource(version_resource());
+}
+
+// ---------------------------------------------------------------------------
+// resource_template_fn tests
+// ---------------------------------------------------------------------------
+
+#[resource_template_fn(
+    uri_template = "file:///{+path}",
+    name = "file",
+    description = "Read a file"
+)]
+async fn read_file(
+    uri: String,
+    vars: HashMap<String, String>,
+) -> Result<ReadResourceResult, tower_mcp::Error> {
+    let path = vars.get("path").cloned().unwrap_or_default();
+    Ok(ReadResourceResult::text(uri, format!("contents of {path}")))
+}
+
+#[resource_template_fn(uri_template = "db://users/{id}")]
+async fn get_user(
+    uri: String,
+    _vars: HashMap<String, String>,
+) -> Result<ReadResourceResult, tower_mcp::Error> {
+    Ok(ReadResourceResult::text(uri, "user data"))
+}
+
+#[test]
+fn test_resource_template_fn_macro_generates_template() {
+    let template = read_file_resource_template();
+    assert_eq!(template.uri_template, "file:///{+path}");
+    assert_eq!(template.name, "file");
+    assert_eq!(template.description.as_deref(), Some("Read a file"));
+}
+
+#[test]
+fn test_resource_template_fn_macro_default_name() {
+    let template = get_user_resource_template();
+    assert_eq!(template.uri_template, "db://users/{id}");
+    // Default name comes from the template builder (uri_template itself)
+}
+
+#[test]
+fn test_resource_template_fn_macro_registers_in_router() {
+    use tower_mcp::McpRouter;
+
+    let _router = McpRouter::new()
+        .server_info("test", "1.0.0")
+        .resource_template(read_file_resource_template())
+        .resource_template(get_user_resource_template());
+}

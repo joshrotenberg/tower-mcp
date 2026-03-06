@@ -409,6 +409,10 @@ pub mod transport;
 #[cfg(feature = "macros")]
 pub use tower_mcp_macros::prompt_fn;
 #[cfg(feature = "macros")]
+pub use tower_mcp_macros::resource_fn;
+#[cfg(feature = "macros")]
+pub use tower_mcp_macros::resource_template_fn;
+#[cfg(feature = "macros")]
 pub use tower_mcp_macros::tool_fn;
 
 // Re-exports

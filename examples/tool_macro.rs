@@ -1,8 +1,10 @@
-//! Example: using the `#[tool_fn]` and `#[prompt_fn]` proc macros.
+//! Example: using the `#[tool_fn]`, `#[prompt_fn]`, `#[resource_fn]`, and
+//! `#[resource_template_fn]` proc macros.
 //!
-//! The macros generate constructor functions that return `Tool` / `Prompt`
-//! built via `ToolBuilder` / `PromptBuilder`. This is syntactic sugar -- the
-//! builders are the real API, and you can always eject for full control.
+//! The macros generate constructor functions that return `Tool` / `Prompt` /
+//! `Resource` / `ResourceTemplate` built via the corresponding builders.
+//! This is syntactic sugar -- the builders are the real API, and you can
+//! always eject for full control.
 //!
 //! Run with: `cargo run --example tool_macro --features macros`
 
@@ -11,7 +13,9 @@ use std::collections::HashMap;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tower_mcp::prompt_fn;
-use tower_mcp::protocol::GetPromptResult;
+use tower_mcp::protocol::{GetPromptResult, ReadResourceResult};
+use tower_mcp::resource_fn;
+use tower_mcp::resource_template_fn;
 use tower_mcp::tool_fn;
 use tower_mcp::{CallToolResult, McpRouter};
 
@@ -55,14 +59,36 @@ async fn review(args: HashMap<String, String>) -> Result<GetPromptResult, tower_
     )))
 }
 
-// --- Use them like any other tool/prompt ---
+// --- Define resources using the macros ---
+
+#[resource_fn(uri = "app://config", description = "App configuration")]
+async fn config() -> Result<ReadResourceResult, tower_mcp::Error> {
+    Ok(ReadResourceResult::text("app://config", "debug=true"))
+}
+
+#[resource_template_fn(
+    uri_template = "file:///{+path}",
+    name = "file",
+    description = "Read a file by path"
+)]
+async fn read_file(
+    uri: String,
+    vars: HashMap<String, String>,
+) -> Result<ReadResourceResult, tower_mcp::Error> {
+    let path = vars.get("path").cloned().unwrap_or_default();
+    Ok(ReadResourceResult::text(uri, format!("contents of {path}")))
+}
+
+// --- Use them like any other tool/prompt/resource ---
 
 fn main() {
     let _router = McpRouter::new()
         .server_info("macro-example", "1.0.0")
         .tool(add_tool())
         .tool(greet_tool())
-        .prompt(review_prompt());
+        .prompt(review_prompt())
+        .resource(config_resource())
+        .resource_template(read_file_resource_template());
 
     println!("Registered via macros:");
     println!("  Tools:");
@@ -70,7 +96,11 @@ fn main() {
     println!("    - say-hello (from #[tool_fn] with custom name)");
     println!("  Prompts:");
     println!("    - review (from #[prompt_fn])");
+    println!("  Resources:");
+    println!("    - app://config (from #[resource_fn])");
+    println!("  Resource Templates:");
+    println!("    - file:///{{+path}} (from #[resource_template_fn])");
     println!();
-    println!("These are identical to items built with ToolBuilder/PromptBuilder.");
+    println!("All identical to items built with the builder APIs.");
     println!("Use `cargo expand --example tool_macro` to see the generated code.");
 }
