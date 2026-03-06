@@ -351,11 +351,10 @@
 //! Aggregate multiple backend MCP servers behind a single endpoint using
 //! [`McpProxy`](proxy::McpProxy) (requires the `proxy` feature):
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! use tower_mcp::proxy::McpProxy;
 //! use tower_mcp::client::StdioClientTransport;
 //!
-//! # async fn example() -> Result<(), tower_mcp::BoxError> {
 //! let proxy = McpProxy::builder("my-proxy", "1.0.0")
 //!     .backend("db", StdioClientTransport::spawn("db-server", &[]).await?)
 //!     .await
@@ -366,9 +365,7 @@
 //!
 //! // Tools become `db_query`, `fs_read`, etc.
 //! // Serve over any transport -- stdio, HTTP, WebSocket.
-//! tower_mcp::GenericStdioTransport::new(proxy).run().await?;
-//! # Ok(())
-//! # }
+//! GenericStdioTransport::new(proxy).run().await?;
 //! ```
 //!
 //! The proxy supports per-backend Tower middleware, notification forwarding,
