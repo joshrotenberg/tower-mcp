@@ -47,7 +47,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{Notify, RwLock, mpsc};
 use tokio::task::JoinHandle;
 
 use super::transport::ClientTransport;
@@ -200,6 +200,8 @@ pub struct HttpClientTransport {
     last_event_id: Arc<RwLock<Option<String>>>,
     /// Server-requested retry delay from SSE `retry:` field.
     sse_retry_delay: Arc<RwLock<Option<Duration>>>,
+    /// Signal to tell the SSE loop to close its current stream and reconnect.
+    sse_reconnect_signal: Arc<Notify>,
     /// Whether the transport is still connected.
     connected: Arc<AtomicBool>,
     /// Configuration options.
@@ -253,6 +255,7 @@ impl HttpClientTransport {
             sse_task: None,
             last_event_id: Arc::new(RwLock::new(None)),
             sse_retry_delay: Arc::new(RwLock::new(None)),
+            sse_reconnect_signal: Arc::new(Notify::new()),
             connected: Arc::new(AtomicBool::new(true)),
             config,
             #[cfg(feature = "oauth-client")]
@@ -289,6 +292,7 @@ impl HttpClientTransport {
             sse_task: None,
             last_event_id: Arc::new(RwLock::new(None)),
             sse_retry_delay: Arc::new(RwLock::new(None)),
+            sse_reconnect_signal: Arc::new(Notify::new()),
             connected: Arc::new(AtomicBool::new(true)),
             config,
             #[cfg(feature = "oauth-client")]
@@ -437,6 +441,7 @@ impl HttpClientTransport {
         let tx = self.incoming_tx.clone();
         let last_event_id = self.last_event_id.clone();
         let sse_retry_delay = self.sse_retry_delay.clone();
+        let reconnect_signal = self.sse_reconnect_signal.clone();
         let connected = self.connected.clone();
         let config = self.config.clone();
         #[cfg(feature = "oauth-client")]
@@ -451,6 +456,7 @@ impl HttpClientTransport {
                 tx,
                 last_event_id,
                 sse_retry_delay,
+                reconnect_signal,
                 connected,
                 config,
                 #[cfg(feature = "oauth-client")]
@@ -508,6 +514,9 @@ impl ClientTransport for HttpClientTransport {
         if self.session_id.is_some() {
             let tx = self.incoming_tx.clone();
             let connected = self.connected.clone();
+            let last_event_id = self.last_event_id.clone();
+            let sse_retry_delay = self.sse_retry_delay.clone();
+            let sse_reconnect_signal = self.sse_reconnect_signal.clone();
             tokio::spawn(async move {
                 let response = match request.send().await {
                     Ok(r) => r,
@@ -532,18 +541,68 @@ impl ClientTransport for HttpClientTransport {
                     return;
                 }
 
-                // Read response body and queue for recv()
-                match response.text().await {
-                    Ok(body) if !body.is_empty() => {
-                        for msg in extract_json_messages(&body) {
-                            let _ = tx.send(msg).await;
+                // Check if response is SSE-formatted
+                let is_sse = response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|ct| ct.contains("text/event-stream"));
+
+                if is_sse {
+                    // Stream SSE response to extract id/retry fields
+                    let mut stream = response.bytes_stream();
+                    let mut parser = SseParser::new();
+                    let mut had_retry = false;
+                    let mut had_data = false;
+
+                    use futures::StreamExt;
+                    while let Some(result) = stream.next().await {
+                        match result {
+                            Ok(bytes) => {
+                                let text = String::from_utf8_lossy(&bytes);
+                                for event in parser.feed(&text) {
+                                    if let Some(ref id) = event.id {
+                                        *last_event_id.write().await = Some(id.clone());
+                                    }
+                                    if let Some(retry_ms) = event.retry {
+                                        *sse_retry_delay.write().await =
+                                            Some(Duration::from_millis(retry_ms));
+                                        had_retry = true;
+                                    }
+                                    if !event.data.is_empty() {
+                                        had_data = true;
+                                        let _ = tx.send(event.data).await;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "POST SSE stream error");
+                                break;
+                            }
                         }
                     }
-                    Err(e) => {
-                        tracing::error!(error = %e, "Failed to read response body");
-                        connected.store(false, Ordering::Release);
+
+                    // If the POST SSE stream closed with a retry hint but no data,
+                    // the server expects us to reconnect the GET notification stream.
+                    // Signal the SSE loop to close its current stream and reconnect
+                    // with the updated last_event_id and sse_retry_delay.
+                    if had_retry && !had_data {
+                        sse_reconnect_signal.notify_one();
                     }
-                    _ => {}
+                } else {
+                    // Non-SSE response: read body and queue for recv()
+                    match response.text().await {
+                        Ok(body) if !body.is_empty() => {
+                            for msg in extract_json_messages(&body) {
+                                let _ = tx.send(msg).await;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "Failed to read response body");
+                            connected.store(false, Ordering::Release);
+                        }
+                        _ => {}
+                    }
                 }
             });
             return Ok(());
@@ -682,6 +741,7 @@ struct SseLoopParams {
     tx: mpsc::Sender<String>,
     last_event_id: Arc<RwLock<Option<String>>>,
     sse_retry_delay: Arc<RwLock<Option<Duration>>>,
+    reconnect_signal: Arc<Notify>,
     connected: Arc<AtomicBool>,
     config: HttpClientConfig,
     #[cfg(feature = "oauth-client")]
@@ -702,6 +762,7 @@ async fn sse_stream_loop(params: SseLoopParams) {
         tx,
         last_event_id,
         sse_retry_delay,
+        reconnect_signal,
         connected,
         config,
         #[cfg(feature = "oauth-client")]
@@ -771,33 +832,41 @@ async fn sse_stream_loop(params: SseLoopParams) {
             }
         };
 
-        // Parse SSE stream
+        // Parse SSE stream, also listening for reconnect signals from POST handlers
         let mut stream = response.bytes_stream();
         let mut parser = SseParser::new();
 
         use futures::StreamExt;
         loop {
-            match stream.next().await {
-                Some(Ok(bytes)) => {
-                    let text = String::from_utf8_lossy(&bytes);
-                    for event in parser.feed(&text) {
-                        if let Some(ref id) = event.id {
-                            *last_event_id.write().await = Some(id.clone());
+            tokio::select! {
+                chunk = stream.next() => {
+                    match chunk {
+                        Some(Ok(bytes)) => {
+                            let text = String::from_utf8_lossy(&bytes);
+                            for event in parser.feed(&text) {
+                                if let Some(ref id) = event.id {
+                                    *last_event_id.write().await = Some(id.clone());
+                                }
+                                if let Some(retry_ms) = event.retry {
+                                    *sse_retry_delay.write().await = Some(Duration::from_millis(retry_ms));
+                                }
+                                if !event.data.is_empty() && tx.send(event.data).await.is_err() {
+                                    return; // Channel closed, transport dropped
+                                }
+                            }
                         }
-                        if let Some(retry_ms) = event.retry {
-                            *sse_retry_delay.write().await = Some(Duration::from_millis(retry_ms));
+                        Some(Err(e)) => {
+                            tracing::warn!(error = %e, "SSE stream error");
+                            break;
                         }
-                        if !event.data.is_empty() && tx.send(event.data).await.is_err() {
-                            return; // Channel closed, transport dropped
+                        None => {
+                            tracing::debug!("SSE stream ended");
+                            break;
                         }
                     }
                 }
-                Some(Err(e)) => {
-                    tracing::warn!(error = %e, "SSE stream error");
-                    break;
-                }
-                None => {
-                    tracing::debug!("SSE stream ended");
+                _ = reconnect_signal.notified() => {
+                    tracing::debug!("SSE reconnect signal received, closing current stream");
                     break;
                 }
             }

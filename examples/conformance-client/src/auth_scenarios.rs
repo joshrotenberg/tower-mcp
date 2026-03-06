@@ -15,13 +15,13 @@ use crate::handlers;
 /// Used by most auth scenarios: metadata discovery variants, CIMD, scope handling,
 /// token endpoint auth methods, and backcompat scenarios.
 pub async fn standard_auth(server_url: &str, context: &Option<serde_json::Value>) -> Result<()> {
-    let access_token = perform_oauth_flow(server_url, context).await?;
+    let access_token = perform_oauth_flow(server_url, context, None).await?;
     run_authed_client(server_url, &access_token).await
 }
 
 /// Scope step-up: connect, try tools, re-auth on failure, retry.
 pub async fn scope_step_up(server_url: &str, context: &Option<serde_json::Value>) -> Result<()> {
-    let access_token = perform_oauth_flow(server_url, context).await?;
+    let access_token = perform_oauth_flow(server_url, context, None).await?;
 
     let transport = HttpClientTransport::new(server_url).bearer_token(&access_token);
     let client = McpClient::builder()
@@ -29,22 +29,42 @@ pub async fn scope_step_up(server_url: &str, context: &Option<serde_json::Value>
         .await?;
 
     client.initialize("conformance-client", "0.1.0").await?;
-    let tools = client.list_tools().await?;
 
-    // Try calling tools -- may fail with 403
+    // Try listing/calling tools -- may fail with 403 at any point
     let mut needs_reauth = false;
-    for tool in &tools.tools {
-        let args = crate::core_scenarios::build_tool_arguments(&tool.input_schema);
-        match client.call_tool(&tool.name, args).await {
-            Ok(_) => {}
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("403") || err_str.contains("insufficient_scope") {
-                    tracing::info!("Got 403/insufficient_scope, will re-authenticate");
-                    needs_reauth = true;
-                    break;
-                }
+
+    let tools_result = client.list_tools().await;
+    let tools = match tools_result {
+        Ok(t) => Some(t),
+        Err(e) => {
+            let err_str = e.to_string();
+
+            if err_str.contains("403") || err_str.contains("insufficient_scope") {
+                tracing::info!("Got 403/insufficient_scope on list_tools, will re-authenticate");
+                needs_reauth = true;
+                None
+            } else {
                 return Err(e.into());
+            }
+        }
+    };
+
+    if let Some(tools) = &tools {
+        for tool in &tools.tools {
+            let args = crate::core_scenarios::build_tool_arguments(&tool.input_schema);
+            match client.call_tool(&tool.name, args).await {
+                Ok(_) => {}
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("403") || err_str.contains("insufficient_scope") {
+                        tracing::info!(
+                            "Got 403/insufficient_scope on call_tool, will re-authenticate"
+                        );
+                        needs_reauth = true;
+                        break;
+                    }
+                    return Err(e.into());
+                }
             }
         }
     }
@@ -52,19 +72,35 @@ pub async fn scope_step_up(server_url: &str, context: &Option<serde_json::Value>
     client.shutdown().await?;
 
     if needs_reauth {
-        // Re-authenticate with broader scope
-        let new_token = perform_oauth_flow(server_url, context).await?;
+        // Probe the server with the old token to get the required scope from 403 WWW-Authenticate
+        let escalated_scope = probe_for_scope(server_url, &access_token).await;
+        tracing::info!(scope = ?escalated_scope, "Escalated scope from 403 probe");
+
+        // Re-authenticate with escalated scope
+        let new_token = perform_oauth_flow(server_url, context, escalated_scope.as_deref()).await?;
         let transport = HttpClientTransport::new(server_url).bearer_token(&new_token);
         let client = McpClient::builder()
             .connect(transport, handlers::BasicHandler)
             .await?;
 
         client.initialize("conformance-client", "0.1.0").await?;
-        let tools = client.list_tools().await?;
 
-        for tool in &tools.tools {
-            let args = crate::core_scenarios::build_tool_arguments(&tool.input_schema);
-            client.call_tool(&tool.name, args).await?;
+        // Second attempt -- may still fail with 403 if server requires further escalation
+        match client.list_tools().await {
+            Ok(tools) => {
+                for tool in &tools.tools {
+                    let args = crate::core_scenarios::build_tool_arguments(&tool.input_schema);
+                    let _ = client.call_tool(&tool.name, args).await;
+                }
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                if !err_str.contains("403") && !err_str.contains("insufficient_scope") {
+                    client.shutdown().await?;
+                    return Err(e.into());
+                }
+                tracing::info!("Second attempt also got 403, step-up complete");
+            }
         }
         client.shutdown().await?;
     }
@@ -79,7 +115,7 @@ pub async fn scope_retry_limit(
 ) -> Result<()> {
     for attempt in 0..3 {
         tracing::info!(attempt, "Auth attempt");
-        let access_token = perform_oauth_flow(server_url, context).await?;
+        let access_token = perform_oauth_flow(server_url, context, None).await?;
         let transport = HttpClientTransport::new(server_url).bearer_token(&access_token);
         let client = McpClient::builder()
             .connect(transport, handlers::BasicHandler)
@@ -121,15 +157,13 @@ pub async fn resource_mismatch(
     context: &Option<serde_json::Value>,
 ) -> Result<()> {
     // Try the standard flow -- expect it to fail due to resource mismatch
-    match perform_oauth_flow(server_url, context).await {
+    match perform_oauth_flow(server_url, context, None).await {
         Ok(token) => {
             // If we got a token, try using it -- should fail
             let result = run_authed_client(server_url, &token).await;
             if result.is_err() {
-                // Expected: resource mismatch causes failure
                 return Ok(());
             }
-            // If it somehow succeeded, that might be fine too depending on the test
             Ok(())
         }
         Err(_) => {
@@ -175,15 +209,27 @@ pub async fn client_credentials_basic(
         .and_then(|v| v.as_str())
         .context("client_secret required")?;
 
-    // Discover token endpoint
-    let token_endpoint = discover_token_endpoint(server_url).await?;
+    // Do initial 401 probe to discover metadata
+    let metadata = discover_metadata_via_probe(server_url).await?;
+    let token_endpoint = metadata
+        .get("token_endpoint")
+        .and_then(|v| v.as_str())
+        .context("No token_endpoint in metadata")?;
+
+    // Get resource from PRM
+    let resource = get_resource_for_server(server_url).await.ok();
 
     // Request token with client_credentials grant using Basic auth
     let http = reqwest::Client::new();
+    let mut params = vec![("grant_type", "client_credentials".to_string())];
+    if let Some(ref res) = resource {
+        params.push(("resource", res.clone()));
+    }
+
     let resp = http
-        .post(&token_endpoint)
+        .post(token_endpoint)
         .basic_auth(client_id, Some(client_secret))
-        .form(&[("grant_type", "client_credentials")])
+        .form(&params)
         .send()
         .await?;
 
@@ -213,26 +259,40 @@ pub async fn client_credentials_jwt(
         .and_then(|v| v.as_str())
         .context("private_key_pem required")?;
 
-    // Discover token endpoint
-    let token_endpoint = discover_token_endpoint(server_url).await?;
+    // Do initial 401 probe to discover metadata
+    let metadata = discover_metadata_via_probe(server_url).await?;
+    let token_endpoint = metadata
+        .get("token_endpoint")
+        .and_then(|v| v.as_str())
+        .context("No token_endpoint in metadata")?;
+
+    // Use issuer as audience, falling back to token endpoint
+    let audience = metadata
+        .get("issuer")
+        .and_then(|v| v.as_str())
+        .unwrap_or(token_endpoint);
+
+    // Get resource from PRM
+    let resource = get_resource_for_server(server_url).await.ok();
 
     // Build JWT assertion
-    let jwt = build_jwt_assertion(client_id, &token_endpoint, private_key_pem)?;
+    let jwt = build_jwt_assertion(client_id, audience, private_key_pem)?;
 
     // Request token
     let http = reqwest::Client::new();
-    let resp = http
-        .post(&token_endpoint)
-        .form(&[
-            ("grant_type", "client_credentials"),
-            (
-                "client_assertion_type",
-                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-            ),
-            ("client_assertion", &jwt),
-        ])
-        .send()
-        .await?;
+    let mut params = vec![
+        ("grant_type", "client_credentials".to_string()),
+        (
+            "client_assertion_type",
+            "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".to_string(),
+        ),
+        ("client_assertion", jwt),
+    ];
+    if let Some(ref res) = resource {
+        params.push(("resource", res.clone()));
+    }
+
+    let resp = http.post(token_endpoint).form(&params).send().await?;
 
     let token_resp: serde_json::Value = resp.json().await?;
     let access_token = token_resp
@@ -243,27 +303,296 @@ pub async fn client_credentials_jwt(
     run_authed_client(server_url, access_token).await
 }
 
-/// Cross-app access (SEP-990).
+/// Cross-app access (SEP-990): token exchange + JWT bearer grant.
 pub async fn cross_app_access(server_url: &str, context: &Option<serde_json::Value>) -> Result<()> {
-    // Fall back to standard auth -- the conformance test server should handle
-    // the cross-app access flow via standard OAuth with the right context
-    standard_auth(server_url, context).await
+    let ctx = context
+        .as_ref()
+        .context("MCP_CONFORMANCE_CONTEXT required")?;
+
+    let client_id = ctx
+        .get("client_id")
+        .and_then(|v| v.as_str())
+        .context("client_id required")?;
+    let client_secret = ctx
+        .get("client_secret")
+        .and_then(|v| v.as_str())
+        .context("client_secret required")?;
+    let idp_id_token = ctx
+        .get("idp_id_token")
+        .and_then(|v| v.as_str())
+        .context("idp_id_token required")?;
+    let idp_token_endpoint = ctx.get("idp_token_endpoint").and_then(|v| v.as_str());
+
+    // Step 1: Discover the MCP server's AS metadata
+    let probe_result = probe_server(server_url).await?;
+    let metadata = discover_metadata_from_probe(&probe_result, server_url).await?;
+    let token_endpoint = metadata
+        .get("token_endpoint")
+        .and_then(|v| v.as_str())
+        .context("No token_endpoint in metadata")?;
+    let as_issuer = metadata
+        .get("issuer")
+        .and_then(|v| v.as_str())
+        .unwrap_or(token_endpoint);
+
+    // Get resource from PRM
+    let resource = get_resource_for_server(server_url).await.ok();
+
+    let http = reqwest::Client::new();
+
+    // Step 2: Token exchange at IDP (RFC 8693)
+    // Exchange the ID token for an ID-JAG at the IDP's token endpoint.
+    // The ID-JAG is then used in step 3 with the MCP AS.
+    let idp_te = idp_token_endpoint.context("idp_token_endpoint required")?;
+
+    let mut exchange_params = vec![
+        (
+            "grant_type".to_string(),
+            "urn:ietf:params:oauth:grant-type:token-exchange".to_string(),
+        ),
+        ("subject_token".to_string(), idp_id_token.to_string()),
+        (
+            "subject_token_type".to_string(),
+            "urn:ietf:params:oauth:token-type:id_token".to_string(),
+        ),
+        (
+            "requested_token_type".to_string(),
+            "urn:ietf:params:oauth:token-type:id-jag".to_string(),
+        ),
+        ("audience".to_string(), as_issuer.to_string()),
+    ];
+    if let Some(ref res) = resource {
+        exchange_params.push(("resource".to_string(), res.clone()));
+    }
+
+    tracing::info!(
+        idp_token_endpoint = %idp_te,
+        audience = %as_issuer,
+        "Attempting token exchange at IDP for ID-JAG"
+    );
+
+    let exchange_resp = http
+        .post(idp_te)
+        .basic_auth(client_id, Some(client_secret))
+        .form(&exchange_params)
+        .send()
+        .await?;
+
+    let exchange_status = exchange_resp.status();
+    let exchange_body: serde_json::Value = exchange_resp.json().await?;
+    tracing::info!(
+        status = %exchange_status,
+        body = %exchange_body,
+        "Token exchange response"
+    );
+
+    let id_jag = exchange_body
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .context("No access_token (ID-JAG) in token exchange response")?;
+
+    // Step 3: JWT bearer grant at MCP AS using the ID-JAG from step 2
+    let mut bearer_params = vec![
+        (
+            "grant_type".to_string(),
+            "urn:ietf:params:oauth:grant-type:jwt-bearer".to_string(),
+        ),
+        ("assertion".to_string(), id_jag.to_string()),
+    ];
+    if let Some(ref res) = resource {
+        bearer_params.push(("resource".to_string(), res.clone()));
+    }
+
+    tracing::info!("Attempting JWT bearer grant with ID-JAG at MCP AS");
+
+    let bearer_resp = http
+        .post(token_endpoint)
+        .basic_auth(client_id, Some(client_secret))
+        .form(&bearer_params)
+        .send()
+        .await?;
+
+    let bearer_status = bearer_resp.status();
+    let bearer_body: serde_json::Value = bearer_resp.json().await?;
+    tracing::info!(
+        status = %bearer_status,
+        body = %bearer_body,
+        "JWT bearer response"
+    );
+
+    let access_token = bearer_body
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .context("No access_token in JWT bearer response")?;
+
+    run_authed_client(server_url, access_token).await
 }
 
 // ============================================================================
 // Internal helpers
 // ============================================================================
 
+/// Result of probing the server for auth requirements.
+struct ProbeResult {
+    #[allow(dead_code)]
+    scope: Option<String>,
+    resource_metadata_url: Option<String>,
+}
+
+/// Probe the server to get auth-related hints from WWW-Authenticate.
+async fn probe_server(server_url: &str) -> Result<ProbeResult> {
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+
+    let initial_resp = http
+        .post(server_url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"conformance-client","version":"0.1.0"}}}"#)
+        .send()
+        .await?;
+
+    let status = initial_resp.status();
+    tracing::info!(status = %status, "Initial MCP request status");
+
+    let www_auth = initial_resp
+        .headers()
+        .get("www-authenticate")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    let scope = www_auth
+        .as_ref()
+        .and_then(|wa| extract_www_auth_param(wa, "scope"));
+    let resource_metadata_url = www_auth
+        .as_ref()
+        .and_then(|wa| extract_www_auth_param(wa, "resource_metadata"));
+
+    Ok(ProbeResult {
+        scope,
+        resource_metadata_url,
+    })
+}
+
+/// Discover OAuth AS metadata from probe results.
+async fn discover_metadata_from_probe(
+    probe: &ProbeResult,
+    server_url: &str,
+) -> Result<serde_json::Value> {
+    let http = reqwest::Client::new();
+
+    if let Some(ref rm_url) = probe.resource_metadata_url {
+        let rm_resp = http.get(rm_url).send().await?;
+        if rm_resp.status().is_success() {
+            let rm: serde_json::Value = rm_resp.json().await?;
+            if let Some(issuer) = rm
+                .get("authorization_servers")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.as_str())
+            {
+                return discover_oauth_metadata_from_issuer(issuer).await;
+            }
+        }
+    }
+
+    // Try PRM well-known discovery
+    if let Ok(rm) = discover_prm_from_server_url(server_url).await
+        && let Some(issuer) = rm
+            .get("authorization_servers")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|v| v.as_str())
+    {
+        return discover_oauth_metadata_from_issuer(issuer).await;
+    }
+
+    // Last resort: try AS well-known paths directly
+    discover_oauth_metadata_from_server_url(server_url).await
+}
+
+/// Discover OAuth metadata by probing the server first (for client_credentials).
+async fn discover_metadata_via_probe(server_url: &str) -> Result<serde_json::Value> {
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+
+    // Step 1: Try MCP endpoint for 401 with resource_metadata
+    let initial_resp = http
+        .post(server_url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"conformance-client","version":"0.1.0"}}}"#)
+        .send()
+        .await?;
+
+    let www_auth = initial_resp
+        .headers()
+        .get("www-authenticate")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    let resource_metadata_url = www_auth
+        .as_ref()
+        .and_then(|wa| extract_www_auth_param(wa, "resource_metadata"));
+
+    let http_plain = reqwest::Client::new();
+
+    if let Some(ref rm_url) = resource_metadata_url {
+        let rm_resp = http_plain.get(rm_url).send().await?;
+        if rm_resp.status().is_success() {
+            let rm: serde_json::Value = rm_resp.json().await?;
+            if let Some(issuer) = rm
+                .get("authorization_servers")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.as_str())
+            {
+                return discover_oauth_metadata_from_issuer(issuer).await;
+            }
+        }
+    }
+
+    // Try PRM well-known discovery
+    if let Ok(rm) = discover_prm_from_server_url(server_url).await
+        && let Some(issuer) = rm
+            .get("authorization_servers")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|v| v.as_str())
+    {
+        return discover_oauth_metadata_from_issuer(issuer).await;
+    }
+
+    // Last resort: try AS well-known paths directly
+    discover_oauth_metadata_from_server_url(server_url).await
+}
+
+/// Get the resource identifier for a server, either from PRM or constructed from URL.
+async fn get_resource_for_server(server_url: &str) -> Result<String> {
+    // Try PRM well-known discovery
+    if let Ok(rm) = discover_prm_from_url(server_url).await
+        && let Some(resource) = rm.get("resource").and_then(|v| v.as_str())
+    {
+        return Ok(resource.to_string());
+    }
+    // Use server URL as resource
+    Ok(server_url.to_string())
+}
+
 /// Perform a headless OAuth authorization-code flow.
 ///
 /// 1. Try the MCP endpoint to get 401 with resource metadata
-/// 2. Discover OAuth authorization server metadata
-/// 3. Register client (DCR or CIMD)
-/// 4. Authorize with PKCE
-/// 5. Exchange code for token
+/// 2. Discover Protected Resource Metadata (PRM)
+/// 3. Discover OAuth authorization server metadata
+/// 4. Register client (DCR or CIMD)
+/// 5. Authorize with PKCE
+/// 6. Exchange code for token
 async fn perform_oauth_flow(
     server_url: &str,
     _context: &Option<serde_json::Value>,
+    scope_override: Option<&str>,
 ) -> Result<String> {
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -273,6 +602,7 @@ async fn perform_oauth_flow(
     let initial_resp = http
         .post(server_url)
         .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
         .body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"conformance-client","version":"0.1.0"}}}"#)
         .send()
         .await?;
@@ -280,45 +610,53 @@ async fn perform_oauth_flow(
     let status = initial_resp.status();
     tracing::info!(status = %status, "Initial MCP request status");
 
-    // Extract scope from WWW-Authenticate if present
+    // Extract hints from WWW-Authenticate
     let www_auth = initial_resp
         .headers()
         .get("www-authenticate")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    let scope = www_auth.as_ref().and_then(|wa| {
-        // Parse scope="..." from WWW-Authenticate
-        wa.split(',').find_map(|part| {
-            let trimmed = part.trim();
-            if let Some(rest) = trimmed.strip_prefix("scope=\"") {
-                rest.strip_suffix('"').map(|s| s.to_string())
-            } else {
-                None
-            }
-        })
-    });
+    let scope = www_auth
+        .as_ref()
+        .and_then(|wa| extract_www_auth_param(wa, "scope"));
+    let resource_metadata_url = www_auth
+        .as_ref()
+        .and_then(|wa| extract_www_auth_param(wa, "resource_metadata"));
 
-    // Extract resource metadata URL from WWW-Authenticate or try well-known
-    let resource_metadata_url = www_auth.as_ref().and_then(|wa| {
-        wa.split(',').find_map(|part| {
-            let trimmed = part.trim();
-            if let Some(rest) = trimmed.strip_prefix("resource_metadata=\"") {
-                rest.strip_suffix('"').map(|s| s.to_string())
-            } else {
-                None
-            }
-        })
-    });
-
-    // Step 2: Discover OAuth metadata
-    let metadata = if let Some(ref rm_url) = resource_metadata_url {
-        // Fetch Protected Resource Metadata to get the authorization server
-        let rm_resp = http.get(rm_url).send().await?;
+    // Step 2: Discover PRM and get resource + authorization servers
+    let http_plain = reqwest::Client::new();
+    let (prm, resource) = if let Some(ref rm_url) = resource_metadata_url {
+        // Use the URL from WWW-Authenticate
+        let rm_resp = http_plain.get(rm_url).send().await?;
         let rm: serde_json::Value = rm_resp.json().await?;
         tracing::info!("Fetched resource metadata from {}", rm_url);
+        let res = rm
+            .get("resource")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        (Some(rm), res)
+    } else {
+        // Fallback: try PRM well-known path
+        match discover_prm_from_server_url(server_url).await {
+            Ok(rm) => {
+                let res = rm
+                    .get("resource")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                (Some(rm), res)
+            }
+            Err(_) => (None, None),
+        }
+    };
 
-        // Get authorization server URL from resource metadata
+    // Validate resource matches server URL (resource-mismatch check)
+    if let Some(ref res) = resource {
+        validate_resource(server_url, res)?;
+    }
+
+    // Step 3: Discover OAuth AS metadata
+    let metadata = if let Some(ref rm) = prm {
         let auth_servers = rm
             .get("authorization_servers")
             .and_then(|v| v.as_array())
@@ -327,11 +665,9 @@ async fn perform_oauth_flow(
             .first()
             .and_then(|v| v.as_str())
             .context("Empty authorization_servers")?;
-
-        // Discover AS metadata
         discover_oauth_metadata_from_issuer(auth_server_url).await?
     } else {
-        // Fallback: try well-known paths relative to the server URL
+        // No PRM at all -- try AS well-known paths directly
         discover_oauth_metadata_from_server_url(server_url).await?
     };
 
@@ -347,30 +683,51 @@ async fn perform_oauth_flow(
         .get("registration_endpoint")
         .and_then(|v| v.as_str());
 
-    // Check supported scopes from metadata if we don't have one from WWW-Authenticate
-    let scope = scope.or_else(|| {
-        metadata
-            .get("scopes_supported")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .filter(|s| !s.is_empty())
-    });
+    // Determine token endpoint auth method from metadata
+    let auth_method = get_token_auth_method(&metadata);
 
-    // Step 3: Dynamic client registration (if available)
+    // Determine scope for authorization request.
+    // If re-authing after 403 (scope_override), combine escalated scope with all supported scopes.
+    // Otherwise, use scope from WWW-Authenticate or scopes_supported (for initial auth).
+    let scope: Option<String> = if let Some(s) = scope_override {
+        // Combine escalated scope with all supported scopes from PRM/metadata
+        let mut all_scopes: Vec<String> = Vec::new();
+        for part in s.split_whitespace() {
+            if !all_scopes.contains(&part.to_string()) {
+                all_scopes.push(part.to_string());
+            }
+        }
+        let supported = metadata
+            .get("scopes_supported")
+            .or_else(|| prm.as_ref().and_then(|p| p.get("scopes_supported")))
+            .and_then(|v| v.as_array());
+        if let Some(arr) = supported {
+            for v in arr {
+                if let Some(s) = v.as_str()
+                    && !all_scopes.contains(&s.to_string())
+                {
+                    all_scopes.push(s.to_string());
+                }
+            }
+        }
+        Some(all_scopes.join(" "))
+    } else {
+        // Initial auth: only use scope from WWW-Authenticate header.
+        // Don't use scopes_supported from metadata/PRM here to avoid requesting
+        // more scope than needed (which would prevent step-up auth from working).
+        scope
+    };
+
+    // Step 4: Dynamic client registration (if available)
     let (client_id, client_secret) = if let Some(reg_endpoint) = registration_endpoint {
-        let reg_resp = http
+        let reg_resp = http_plain
             .post(reg_endpoint)
             .json(&serde_json::json!({
                 "client_name": "conformance-client",
                 "redirect_uris": ["http://localhost:23456/callback"],
                 "grant_types": ["authorization_code"],
                 "response_types": ["code"],
-                "token_endpoint_auth_method": "client_secret_post"
+                "token_endpoint_auth_method": auth_method
             }))
             .send()
             .await?;
@@ -394,7 +751,7 @@ async fn perform_oauth_flow(
         )
     };
 
-    // Step 4: Build authorization URL with PKCE
+    // Step 5: Build authorization URL with PKCE
     let code_verifier = generate_code_verifier();
     let code_challenge = generate_code_challenge(&code_verifier);
     let state = generate_random_string();
@@ -412,7 +769,12 @@ async fn perform_oauth_flow(
         auth_url.push_str(&format!("&scope={}", urlencoded(s)));
     }
 
-    // Step 5: Fetch auth URL (auto-approved, get redirect)
+    // Add resource parameter (RFC 8707)
+    if let Some(ref res) = resource {
+        auth_url.push_str(&format!("&resource={}", urlencoded(res)));
+    }
+
+    // Step 6: Fetch auth URL (auto-approved, get redirect)
     let auth_resp = http.get(&auth_url).send().await?;
     let location = auth_resp
         .headers()
@@ -430,7 +792,7 @@ async fn perform_oauth_flow(
         .map(|(_, v)| v.to_string())
         .context("No code in redirect")?;
 
-    // Step 6: Exchange code for token
+    // Step 7: Exchange code for token
     let mut token_params = vec![
         ("grant_type", "authorization_code".to_string()),
         ("code", code),
@@ -438,15 +800,24 @@ async fn perform_oauth_flow(
             "redirect_uri",
             "http://localhost:23456/callback".to_string(),
         ),
-        ("client_id", client_id.clone()),
         ("code_verifier", code_verifier),
     ];
 
-    if let Some(secret) = &client_secret {
-        token_params.push(("client_secret", secret.clone()));
+    // Add resource parameter (RFC 8707)
+    if let Some(ref res) = resource {
+        token_params.push(("resource", res.clone()));
     }
 
-    let token_resp = http.post(token_endpoint).form(&token_params).send().await?;
+    // Build token request based on auth method
+    let token_resp = send_token_request(
+        &http_plain,
+        token_endpoint,
+        &token_params,
+        &auth_method,
+        &client_id,
+        client_secret.as_deref(),
+    )
+    .await?;
 
     let token_body: serde_json::Value = token_resp.json().await?;
     let access_token = token_body
@@ -459,6 +830,7 @@ async fn perform_oauth_flow(
 }
 
 /// OAuth flow with pre-registered credentials (no DCR).
+/// Uses Basic auth for token endpoint per spec.
 async fn perform_oauth_flow_with_credentials(
     server_url: &str,
     client_id: &str,
@@ -472,6 +844,7 @@ async fn perform_oauth_flow_with_credentials(
     let initial_resp = http
         .post(server_url)
         .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
         .body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"conformance-client","version":"0.1.0"}}}"#)
         .send()
         .await?;
@@ -482,29 +855,49 @@ async fn perform_oauth_flow_with_credentials(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    let resource_metadata_url = www_auth.as_ref().and_then(|wa| {
-        wa.split(',').find_map(|part| {
-            let trimmed = part.trim();
-            if let Some(rest) = trimmed.strip_prefix("resource_metadata=\"") {
-                rest.strip_suffix('"').map(|s| s.to_string())
-            } else {
-                None
-            }
-        })
-    });
+    let resource_metadata_url = www_auth
+        .as_ref()
+        .and_then(|wa| extract_www_auth_param(wa, "resource_metadata"));
 
-    let metadata = if let Some(ref rm_url) = resource_metadata_url {
-        let rm_resp = http.get(rm_url).send().await?;
+    let http_plain = reqwest::Client::new();
+
+    let (metadata, resource) = if let Some(ref rm_url) = resource_metadata_url {
+        let rm_resp = http_plain.get(rm_url).send().await?;
         let rm: serde_json::Value = rm_resp.json().await?;
+        let res = rm
+            .get("resource")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         let auth_server_url = rm
             .get("authorization_servers")
             .and_then(|v| v.as_array())
             .and_then(|arr| arr.first())
             .and_then(|v| v.as_str())
             .context("No authorization_servers in resource metadata")?;
-        discover_oauth_metadata_from_issuer(auth_server_url).await?
+        let md = discover_oauth_metadata_from_issuer(auth_server_url).await?;
+        (md, res)
     } else {
-        discover_oauth_metadata_from_server_url(server_url).await?
+        // Try PRM well-known
+        match discover_prm_from_server_url(server_url).await {
+            Ok(rm) => {
+                let res = rm
+                    .get("resource")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let auth_server_url = rm
+                    .get("authorization_servers")
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|v| v.as_str())
+                    .context("No authorization_servers in PRM")?;
+                let md = discover_oauth_metadata_from_issuer(auth_server_url).await?;
+                (md, res)
+            }
+            Err(_) => {
+                let md = discover_oauth_metadata_from_server_url(server_url).await?;
+                (md, None)
+            }
+        }
     };
 
     let authorization_endpoint = metadata
@@ -520,7 +913,7 @@ async fn perform_oauth_flow_with_credentials(
     let code_challenge = generate_code_challenge(&code_verifier);
     let state = generate_random_string();
 
-    let auth_url = format!(
+    let mut auth_url = format!(
         "{}?response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256",
         authorization_endpoint,
         urlencoded(client_id),
@@ -528,6 +921,10 @@ async fn perform_oauth_flow_with_credentials(
         urlencoded(&state),
         urlencoded(&code_challenge),
     );
+
+    if let Some(ref res) = resource {
+        auth_url.push_str(&format!("&resource={}", urlencoded(res)));
+    }
 
     let auth_resp = http.get(&auth_url).send().await?;
     let location = auth_resp
@@ -545,16 +942,21 @@ async fn perform_oauth_flow_with_credentials(
         .map(|(_, v)| v.to_string())
         .context("No code in redirect")?;
 
-    let token_resp = http
+    // Use Basic auth for pre-registered credentials
+    let mut token_params = vec![
+        ("grant_type", "authorization_code"),
+        ("code", &code),
+        ("redirect_uri", "http://localhost:23456/callback"),
+        ("code_verifier", &code_verifier),
+    ];
+    if let Some(ref res) = resource {
+        token_params.push(("resource", res));
+    }
+
+    let token_resp = http_plain
         .post(token_endpoint)
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", &code),
-            ("redirect_uri", "http://localhost:23456/callback"),
-            ("client_id", client_id),
-            ("client_secret", client_secret),
-            ("code_verifier", &code_verifier),
-        ])
+        .basic_auth(client_id, Some(client_secret))
+        .form(&token_params)
         .send()
         .await?;
 
@@ -590,31 +992,100 @@ async fn run_authed_client(server_url: &str, access_token: &str) -> Result<()> {
     Ok(())
 }
 
-/// Discover OAuth metadata from an authorization server issuer URL.
-/// Follows RFC 8414: `{issuer}/.well-known/oauth-authorization-server`
-async fn discover_oauth_metadata_from_issuer(issuer_url: &str) -> Result<serde_json::Value> {
+// ============================================================================
+// Discovery helpers
+// ============================================================================
+
+/// Discover Protected Resource Metadata from the server URL's well-known path.
+/// `{origin}/.well-known/oauth-protected-resource{path}`
+async fn discover_prm_from_server_url(server_url: &str) -> Result<serde_json::Value> {
     let http = reqwest::Client::new();
-    let url = format!(
-        "{}/.well-known/oauth-authorization-server",
-        issuer_url.trim_end_matches('/')
-    );
-    let resp = http.get(&url).send().await?;
-    if resp.status().is_success() {
-        let metadata: serde_json::Value = resp.json().await?;
-        tracing::info!(url = %url, "Discovered OAuth metadata from issuer");
-        return Ok(metadata);
+    let parsed = url::Url::parse(server_url)?;
+    let origin = format!("{}://{}", parsed.scheme(), parsed.authority());
+    let path = parsed.path().trim_end_matches('/');
+
+    let paths = if path.is_empty() || path == "/" {
+        vec![format!("{}/.well-known/oauth-protected-resource", origin)]
+    } else {
+        vec![
+            format!("{}/.well-known/oauth-protected-resource{}", origin, path),
+            format!("{}/.well-known/oauth-protected-resource", origin),
+        ]
+    };
+
+    for url in &paths {
+        match http.get(url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                let rm: serde_json::Value = resp.json().await?;
+                tracing::info!(url = %url, "Discovered PRM");
+                return Ok(rm);
+            }
+            _ => continue,
+        }
     }
 
-    // Fallback to openid-configuration
-    let url = format!(
-        "{}/.well-known/openid-configuration",
-        issuer_url.trim_end_matches('/')
-    );
+    anyhow::bail!("Could not discover PRM from {}", server_url)
+}
+
+/// Discover PRM from a specific URL (used when we already have a URL).
+async fn discover_prm_from_url(server_url: &str) -> Result<serde_json::Value> {
+    let http = reqwest::Client::new();
+    let parsed = url::Url::parse(server_url)?;
+    let origin = format!("{}://{}", parsed.scheme(), parsed.authority());
+    let path = parsed.path().trim_end_matches('/');
+
+    let url = if path.is_empty() || path == "/" {
+        format!("{}/.well-known/oauth-protected-resource", origin)
+    } else {
+        format!("{}/.well-known/oauth-protected-resource{}", origin, path)
+    };
+
     let resp = http.get(&url).send().await?;
     if resp.status().is_success() {
-        let metadata: serde_json::Value = resp.json().await?;
-        tracing::info!(url = %url, "Discovered OAuth metadata via OIDC");
-        return Ok(metadata);
+        let rm: serde_json::Value = resp.json().await?;
+        return Ok(rm);
+    }
+    anyhow::bail!("Could not discover PRM from {}", url)
+}
+
+/// Discover OAuth metadata from an authorization server issuer URL.
+/// Follows RFC 8414: `{origin}/.well-known/oauth-authorization-server{path}`
+async fn discover_oauth_metadata_from_issuer(issuer_url: &str) -> Result<serde_json::Value> {
+    let http = reqwest::Client::new();
+    let parsed = url::Url::parse(issuer_url)?;
+    let origin = format!("{}://{}", parsed.scheme(), parsed.authority());
+    let path = parsed.path().trim_end_matches('/');
+
+    // Build candidate URLs in priority order
+    let trimmed = issuer_url.trim_end_matches('/');
+    let mut urls = Vec::new();
+    if !path.is_empty() && path != "/" {
+        // RFC 8414 path-aware: {origin}/.well-known/oauth-authorization-server{path}
+        urls.push(format!(
+            "{}/.well-known/oauth-authorization-server{}",
+            origin, path
+        ));
+        // Append to issuer: {issuer}/.well-known/oauth-authorization-server
+        urls.push(format!(
+            "{}/.well-known/oauth-authorization-server",
+            trimmed
+        ));
+        // OIDC with path
+        urls.push(format!("{}/.well-known/openid-configuration", trimmed));
+    } else {
+        urls.push(format!("{}/.well-known/oauth-authorization-server", origin));
+        urls.push(format!("{}/.well-known/openid-configuration", origin));
+    }
+
+    for url in &urls {
+        match http.get(url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                let metadata: serde_json::Value = resp.json().await?;
+                tracing::info!(url = %url, "Discovered OAuth metadata from issuer");
+                return Ok(metadata);
+            }
+            _ => continue,
+        }
     }
 
     anyhow::bail!(
@@ -624,7 +1095,7 @@ async fn discover_oauth_metadata_from_issuer(issuer_url: &str) -> Result<serde_j
 }
 
 /// Discover OAuth metadata relative to a server URL.
-/// Tries RFC 8414 path-aware format and fallbacks.
+/// Tries RFC 8414 path-aware format, then 2025-03-26 backcompat paths.
 async fn discover_oauth_metadata_from_server_url(server_url: &str) -> Result<serde_json::Value> {
     let http = reqwest::Client::new();
     let parsed = url::Url::parse(server_url)?;
@@ -632,18 +1103,25 @@ async fn discover_oauth_metadata_from_server_url(server_url: &str) -> Result<ser
     let path = parsed.path().trim_end_matches('/');
 
     // RFC 8414 path-aware: {origin}/.well-known/oauth-authorization-server{path}
-    let paths = if path.is_empty() || path == "/" {
-        vec![
-            format!("{}/.well-known/oauth-authorization-server", origin),
-            format!("{}/.well-known/openid-configuration", origin),
-        ]
-    } else {
-        vec![
-            format!("{}/.well-known/oauth-authorization-server{}", origin, path),
-            format!("{}/.well-known/oauth-authorization-server", origin),
-            format!("{}/.well-known/openid-configuration", origin),
-        ]
-    };
+    // Then origin-only, then OIDC, then 2025-03-26 backcompat paths
+    let mut paths = Vec::new();
+
+    if !path.is_empty() && path != "/" {
+        paths.push(format!(
+            "{}/.well-known/oauth-authorization-server{}",
+            origin, path
+        ));
+    }
+    paths.push(format!("{}/.well-known/oauth-authorization-server", origin));
+    paths.push(format!("{}/.well-known/openid-configuration", origin));
+
+    // 2025-03-26 backcompat: try {server_url}/.well-known/oauth-authorization-server
+    if !path.is_empty() && path != "/" {
+        paths.push(format!(
+            "{}{}/.well-known/oauth-authorization-server",
+            origin, path
+        ));
+    }
 
     for url in &paths {
         match http.get(url).send().await {
@@ -656,27 +1134,162 @@ async fn discover_oauth_metadata_from_server_url(server_url: &str) -> Result<ser
         }
     }
 
-    anyhow::bail!("Could not discover OAuth metadata from {}", server_url)
+    // 2025-03-26 endpoint fallback: construct endpoints directly from origin
+    tracing::info!("Using 2025-03-26 endpoint fallback");
+    Ok(serde_json::json!({
+        "authorization_endpoint": format!("{}/authorize", origin),
+        "token_endpoint": format!("{}/token", origin),
+        "registration_endpoint": format!("{}/register", origin),
+    }))
 }
 
-/// Discover the token endpoint from OAuth metadata.
-async fn discover_token_endpoint(server_url: &str) -> Result<String> {
-    let metadata = discover_oauth_metadata_from_server_url(server_url).await?;
+// ============================================================================
+// Auth method helpers
+// ============================================================================
+
+/// Get the preferred token endpoint auth method from AS metadata.
+fn get_token_auth_method(metadata: &serde_json::Value) -> String {
     metadata
-        .get("token_endpoint")
+        .get("token_endpoint_auth_methods_supported")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .context("No token_endpoint in metadata")
+        .unwrap_or("client_secret_post")
+        .to_string()
 }
+
+/// Send a token request with the appropriate auth method.
+async fn send_token_request(
+    http: &reqwest::Client,
+    token_endpoint: &str,
+    params: &[(&str, String)],
+    auth_method: &str,
+    client_id: &str,
+    client_secret: Option<&str>,
+) -> Result<reqwest::Response> {
+    match auth_method {
+        "client_secret_basic" => {
+            // Use HTTP Basic auth header
+            let resp = http
+                .post(token_endpoint)
+                .basic_auth(client_id, client_secret)
+                .form(params)
+                .send()
+                .await?;
+            Ok(resp)
+        }
+        "none" => {
+            // Only include client_id, no secret
+            let mut full_params: Vec<(&str, String)> = params.to_vec();
+            full_params.push(("client_id", client_id.to_string()));
+            let resp = http.post(token_endpoint).form(&full_params).send().await?;
+            Ok(resp)
+        }
+        _ => {
+            // client_secret_post (default): include credentials in form body
+            let mut full_params: Vec<(&str, String)> = params.to_vec();
+            full_params.push(("client_id", client_id.to_string()));
+            if let Some(secret) = client_secret {
+                full_params.push(("client_secret", secret.to_string()));
+            }
+            let resp = http.post(token_endpoint).form(&full_params).send().await?;
+            Ok(resp)
+        }
+    }
+}
+
+/// Validate that the PRM resource matches the server URL.
+fn validate_resource(server_url: &str, resource: &str) -> Result<()> {
+    // Parse both URLs for comparison
+    let server = url::Url::parse(server_url);
+    let res = url::Url::parse(resource);
+
+    match (server, res) {
+        (Ok(s), Ok(r)) => {
+            // Resource must have same origin and path prefix
+            if s.scheme() != r.scheme() || s.host_str() != r.host_str() || s.port() != r.port() {
+                anyhow::bail!(
+                    "Resource mismatch: server origin {}://{} does not match resource origin {}://{}",
+                    s.scheme(),
+                    s.authority(),
+                    r.scheme(),
+                    r.authority()
+                );
+            }
+            Ok(())
+        }
+        _ => {
+            // If we can't parse, just check string prefix
+            if !server_url.starts_with(resource) && !resource.starts_with(server_url) {
+                anyhow::bail!(
+                    "Resource mismatch: {} does not match {}",
+                    server_url,
+                    resource
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+// ============================================================================
+// WWW-Authenticate parsing
+// ============================================================================
+
+/// Probe the server with a token to extract scope from 403 WWW-Authenticate.
+async fn probe_for_scope(server_url: &str, token: &str) -> Option<String> {
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .ok()?;
+
+    let resp = http
+        .post(server_url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("Authorization", format!("Bearer {}", token))
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#)
+        .send()
+        .await
+        .ok()?;
+
+    let www_auth = resp
+        .headers()
+        .get("www-authenticate")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())?;
+
+    extract_www_auth_param(&www_auth, "scope")
+}
+
+/// Extract a parameter value from a WWW-Authenticate header.
+/// Handles: `param="value"` in comma-or-space-separated list.
+fn extract_www_auth_param(header: &str, param: &str) -> Option<String> {
+    let prefix = format!("{}=\"", param);
+    // Try splitting by comma first, then by space
+    for part in header.split(',').chain(header.split_whitespace()) {
+        let trimmed = part.trim().trim_end_matches(',');
+        if let Some(rest) = trimmed.strip_prefix(&prefix) {
+            return rest.strip_suffix('"').map(|s| s.to_string());
+        }
+    }
+    None
+}
+
+// ============================================================================
+// JWT / crypto
+// ============================================================================
 
 /// Build a JWT assertion for client_credentials with private_key_jwt.
 fn build_jwt_assertion(client_id: &str, audience: &str, private_key_pem: &str) -> Result<String> {
     use base64::Engine;
     use p256::ecdsa::{SigningKey, signature::Signer};
+    use p256::pkcs8::DecodePrivateKey;
     use sec1::DecodeEcPrivateKey;
 
-    // Parse the PEM-encoded private key
-    let signing_key = SigningKey::from_sec1_pem(private_key_pem)
+    // Parse the PEM-encoded private key (try PKCS#8 first, then SEC1)
+    let signing_key = SigningKey::from_pkcs8_pem(private_key_pem)
+        .or_else(|_| SigningKey::from_sec1_pem(private_key_pem))
         .map_err(|e| anyhow::anyhow!("Failed to parse private key: {}", e))?;
 
     let b64url = base64::engine::general_purpose::URL_SAFE_NO_PAD;
