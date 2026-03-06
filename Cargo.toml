@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.90"
 authors = ["Josh Rotenberg <joshrotenberg@gmail.com>"]
@@ -20,8 +20,8 @@ repository = "https://github.com/joshrotenberg/tower-mcp"
 
 [workspace.dependencies]
 # Internal crates
-tower-mcp = { version = "0.7", path = "crates/tower-mcp" }
-tower-mcp-types = { version = "0.7", path = "crates/tower-mcp-types" }
+tower-mcp = { version = "0.8", path = "crates/tower-mcp" }
+tower-mcp-types = { version = "0.8", path = "crates/tower-mcp-types" }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
