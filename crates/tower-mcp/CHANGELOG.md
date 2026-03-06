@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.1] - 2026-03-06
+
+### Bug Fixes
+
+- Use oneshot() to ensure poll_ready before call in JsonRpcService ([#598](https://github.com/joshrotenberg/tower-mcp/pull/598))
+
+### Features
+
+- Add client handler and sampling server examples ([#589](https://github.com/joshrotenberg/tower-mcp/pull/589))
+- Add OAuth client example ([#590](https://github.com/joshrotenberg/tower-mcp/pull/590))
+
+
+
 ## [0.8.0] - 2026-03-06
 
 ### Bug Fixes
