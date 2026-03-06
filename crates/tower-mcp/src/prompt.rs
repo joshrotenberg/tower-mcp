@@ -300,10 +300,15 @@ pub trait PromptHandler: Send + Sync {
 
 /// A complete prompt definition with handler
 pub struct Prompt {
+    /// The prompt name (must be unique within the router).
     pub name: String,
+    /// Optional human-readable title.
     pub title: Option<String>,
+    /// Optional description of the prompt.
     pub description: Option<String>,
+    /// Optional icons for the prompt.
     pub icons: Option<Vec<ToolIcon>>,
+    /// The arguments this prompt accepts.
     pub arguments: Vec<PromptArgument>,
     handler: Arc<dyn PromptHandler>,
 }
@@ -420,6 +425,7 @@ pub struct PromptBuilder {
 }
 
 impl PromptBuilder {
+    /// Create a new prompt builder with the given name.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -947,7 +953,9 @@ impl PromptHandler for ServiceContextHandler {
 /// assert_eq!(prompt.name, "code_review");
 /// ```
 pub trait McpPrompt: Send + Sync + 'static {
+    /// The prompt name (must be unique within the router).
     const NAME: &'static str;
+    /// A human-readable description of the prompt.
     const DESCRIPTION: &'static str;
 
     /// Define the arguments for this prompt
@@ -955,6 +963,7 @@ pub trait McpPrompt: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// Generate the prompt messages for the given arguments.
     fn get(
         &self,
         arguments: HashMap<String, String>,

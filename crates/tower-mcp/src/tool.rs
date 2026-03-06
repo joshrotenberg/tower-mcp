@@ -1595,12 +1595,17 @@ where
 /// assert_eq!(tool.name, "add");
 /// ```
 pub trait McpTool: Send + Sync + 'static {
+    /// The tool name (must be unique within the router).
     const NAME: &'static str;
+    /// A human-readable description of the tool.
     const DESCRIPTION: &'static str;
 
+    /// The input type, deserialized from tool call arguments.
     type Input: JsonSchema + DeserializeOwned + Send;
+    /// The output type, serialized into the tool call result.
     type Output: Serialize + Send;
 
+    /// Execute the tool with the given input.
     fn call(&self, input: Self::Input) -> impl Future<Output = Result<Self::Output>> + Send;
 
     /// Optional annotations for the tool
