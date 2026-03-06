@@ -145,6 +145,7 @@
 //! - `oauth` - OAuth 2.1 resource server support (token validation, metadata endpoint)
 //! - `testing` - Test utilities (`TestClient`) for ergonomic MCP server testing
 //! - `dynamic-tools` - Runtime tool (de)registration via `DynamicToolRegistry`
+//! - `proxy` - Multi-server aggregation proxy ([`McpProxy`](proxy::McpProxy))
 //!
 //! ## Middleware Placement Guide
 //!
@@ -344,6 +345,34 @@
 //!     .merge(db_router)
 //!     .merge(api_router);
 //! ```
+//!
+//! ### Multi-Server Proxy
+//!
+//! Aggregate multiple backend MCP servers behind a single endpoint using
+//! [`McpProxy`](proxy::McpProxy) (requires the `proxy` feature):
+//!
+//! ```rust,no_run
+//! use tower_mcp::proxy::McpProxy;
+//! use tower_mcp::client::StdioClientTransport;
+//!
+//! # async fn example() -> Result<(), tower_mcp::BoxError> {
+//! let proxy = McpProxy::builder("my-proxy", "1.0.0")
+//!     .backend("db", StdioClientTransport::spawn("db-server", &[]).await?)
+//!     .await
+//!     .backend("fs", StdioClientTransport::spawn("fs-server", &[]).await?)
+//!     .await
+//!     .build()
+//!     .await?;
+//!
+//! // Tools become `db_query`, `fs_read`, etc.
+//! // Serve over any transport -- stdio, HTTP, WebSocket.
+//! tower_mcp::GenericStdioTransport::new(proxy).run().await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The proxy supports per-backend Tower middleware, notification forwarding,
+//! health checks, and request coalescing. See the [`proxy`] module for details.
 //!
 //! ## MCP Specification
 //!
