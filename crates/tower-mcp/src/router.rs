@@ -29,7 +29,7 @@ use crate::session::SessionState;
 use crate::tool::Tool;
 
 /// Type alias for completion handler function
-pub type CompletionHandler = Arc<
+pub(crate) type CompletionHandler = Arc<
     dyn Fn(CompleteParams) -> Pin<Box<dyn Future<Output = Result<CompleteResult>> + Send>>
         + Send
         + Sync,

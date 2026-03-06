@@ -112,6 +112,7 @@ pub type BoxPromptService = BoxCloneService<PromptRequest, GetPromptResult, Infa
 /// wrapper converts it into a prompt error. This allows error information to
 /// flow through the normal response path rather than requiring special
 /// error handling.
+#[doc(hidden)]
 pub struct PromptCatchError<S> {
     inner: S,
 }
@@ -141,6 +142,7 @@ impl<S: fmt::Debug> fmt::Debug for PromptCatchError<S> {
 
 pin_project! {
     /// Future for [`PromptCatchError`].
+    #[doc(hidden)]
     pub struct PromptCatchErrorFuture<F> {
         #[pin]
         inner: F,
@@ -200,6 +202,7 @@ where
 ///
 /// This allows the handler to be wrapped with tower middleware layers.
 /// Used by `.layer()` on `PromptBuilderWithHandler`.
+#[doc(hidden)]
 pub struct PromptHandlerService<F> {
     handler: F,
 }
@@ -237,6 +240,7 @@ where
 /// Adapts a context-aware prompt handler function into a `Service<PromptRequest>`.
 ///
 /// Used by `.layer()` on `PromptBuilderWithContextHandler`.
+#[doc(hidden)]
 pub struct PromptContextHandlerService<F> {
     handler: F,
 }
@@ -620,6 +624,7 @@ impl PromptBuilder {
 ///
 /// This allows either calling `.build()` to create the prompt directly,
 /// or `.layer()` to apply middleware before building.
+#[doc(hidden)]
 pub struct PromptBuilderWithHandler<F> {
     name: String,
     title: Option<String>,
@@ -708,6 +713,7 @@ where
 }
 
 /// Builder state after context-aware handler is specified
+#[doc(hidden)]
 pub struct PromptBuilderWithContextHandler<F> {
     name: String,
     title: Option<String>,

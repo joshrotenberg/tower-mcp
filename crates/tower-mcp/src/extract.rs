@@ -996,6 +996,7 @@ where
 }
 
 /// Builder state for extractor-based handlers
+#[doc(hidden)]
 pub struct ToolBuilderWithExtractor<S, F, T> {
     pub(crate) name: String,
     pub(crate) title: Option<String>,
@@ -1108,6 +1109,7 @@ where
 /// Builder state after a layer has been applied to an extractor handler.
 ///
 /// This builder allows chaining additional layers and building the final tool.
+#[doc(hidden)]
 pub struct ToolBuilderWithExtractorLayer<S, F, T, L> {
     name: String,
     title: Option<String>,
@@ -1204,6 +1206,7 @@ where
 }
 
 /// Builder state for extractor-based handlers with typed JSON input
+#[doc(hidden)]
 #[deprecated(
     since = "0.8.0",
     note = "Use `ToolBuilderWithExtractor` via `extractor_handler` instead"
