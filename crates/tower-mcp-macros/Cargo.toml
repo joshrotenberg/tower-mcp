@@ -1,0 +1,18 @@
+[package]
+name = "tower-mcp-macros"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Proc macros for tower-mcp (optional convenience layer)"
+documentation = "https://docs.rs/tower-mcp-macros"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = "1"
+proc-macro2 = "1"
