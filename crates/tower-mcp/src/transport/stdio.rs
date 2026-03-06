@@ -35,7 +35,7 @@ use crate::protocol::{
     McpNotification, RequestId, notifications,
 };
 use crate::router::{McpRouter, RouterRequest, RouterResponse};
-use crate::transport::service::CatchError;
+use crate::transport::service::{CatchError, InjectAnnotations};
 
 // ============================================================================
 // Shared helpers
@@ -201,15 +201,19 @@ impl StdioTransport {
     ///     Ok(())
     /// }
     /// ```
-    pub fn layer<L>(self, layer: L) -> GenericStdioTransport<CatchError<L::Service>>
+    pub fn layer<L>(
+        self,
+        layer: L,
+    ) -> GenericStdioTransport<InjectAnnotations<CatchError<L::Service>>>
     where
         L: tower::Layer<McpRouter>,
         L::Service: Service<RouterRequest, Response = RouterResponse> + Clone + Send + 'static,
         <L::Service as Service<RouterRequest>>::Error: std::fmt::Display + Send,
         <L::Service as Service<RouterRequest>>::Future: Send,
     {
+        let annotations = self.router.tool_annotations_map();
         let wrapped = layer.layer(self.router);
-        let service = CatchError::new(wrapped);
+        let service = InjectAnnotations::new(CatchError::new(wrapped), annotations);
         GenericStdioTransport::with_notifications(service, self.notification_rx)
     }
 

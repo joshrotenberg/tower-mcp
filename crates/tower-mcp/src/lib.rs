@@ -438,7 +438,7 @@ pub use resource::{
     BoxResourceService, Resource, ResourceBuilder, ResourceHandler, ResourceRequest,
     ResourceTemplate, ResourceTemplateBuilder, ResourceTemplateHandler,
 };
-pub use router::{McpRouter, RouterRequest, RouterResponse};
+pub use router::{McpRouter, RouterRequest, RouterResponse, ToolAnnotationsMap};
 pub use session::{SessionPhase, SessionState};
 pub use tool::{BoxToolService, GuardLayer, NoParams, Tool, ToolBuilder, ToolHandler, ToolRequest};
 pub use transport::{

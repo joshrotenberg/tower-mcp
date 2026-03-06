@@ -19,7 +19,7 @@ pub mod childproc;
 
 pub mod service;
 
-pub use service::CatchError;
+pub use service::{CatchError, InjectAnnotations};
 pub use stdio::{
     BidirectionalStdioTransport, GenericStdioTransport, StdioTransport, SyncStdioTransport,
 };

@@ -29,10 +29,10 @@ use tower::util::BoxCloneService;
 use tower_service::Service;
 
 use crate::error::JsonRpcError;
-use crate::protocol::RequestId;
+use crate::protocol::{McpRequest, RequestId};
 #[cfg(any(feature = "http", feature = "websocket"))]
 use crate::router::McpRouter;
-use crate::router::{RouterRequest, RouterResponse};
+use crate::router::{RouterRequest, RouterResponse, ToolAnnotationsMap};
 
 /// A boxed, cloneable MCP service with `Error = Infallible`.
 ///
@@ -54,9 +54,60 @@ pub(crate) type ServiceFactory = Arc<dyn Fn(McpRouter) -> McpBoxService + Send +
 /// Create a `ServiceFactory` that returns the router unchanged.
 ///
 /// This is the default factory used by transports when no `.layer()` is applied.
+/// Tool annotations are still injected into request extensions.
 #[cfg(any(feature = "http", feature = "websocket"))]
 pub(crate) fn identity_factory() -> ServiceFactory {
-    Arc::new(|router: McpRouter| BoxCloneService::new(router))
+    Arc::new(|router: McpRouter| {
+        let annotations = router.tool_annotations_map();
+        BoxCloneService::new(InjectAnnotations::new(router, annotations))
+    })
+}
+
+/// A service wrapper that injects [`ToolAnnotationsMap`] into request
+/// extensions for `tools/call` requests.
+///
+/// This allows middleware to inspect tool annotations (e.g., `read_only_hint`,
+/// `destructive_hint`) without needing direct access to the router.
+/// Transports apply this wrapper automatically.
+#[derive(Clone)]
+pub struct InjectAnnotations<S> {
+    inner: S,
+    annotations: ToolAnnotationsMap,
+}
+
+impl<S> InjectAnnotations<S> {
+    /// Create a new `InjectAnnotations` wrapping the given service.
+    pub fn new(inner: S, annotations: ToolAnnotationsMap) -> Self {
+        Self { inner, annotations }
+    }
+}
+
+impl<S: fmt::Debug> fmt::Debug for InjectAnnotations<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InjectAnnotations")
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
+
+impl<S> Service<RouterRequest> for InjectAnnotations<S>
+where
+    S: Service<RouterRequest, Response = RouterResponse>,
+{
+    type Response = RouterResponse;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: RouterRequest) -> Self::Future {
+        if matches!(&req.inner, McpRequest::CallTool(_)) {
+            req.extensions.insert(self.annotations.clone());
+        }
+        self.inner.call(req)
+    }
 }
 
 /// A service wrapper that catches errors from middleware and converts them
@@ -157,7 +208,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::RequestId;
+    use crate::protocol::{CallToolParams, CallToolResult, RequestId, ToolAnnotations};
+    use crate::router::McpRouter;
 
     #[test]
     #[cfg(any(feature = "http", feature = "websocket"))]
@@ -197,5 +249,197 @@ mod tests {
         let service = CatchError::new(router);
         let debug = format!("{:?}", service);
         assert!(debug.contains("CatchError"));
+    }
+
+    #[tokio::test]
+    async fn test_inject_annotations_for_call_tool() {
+        use crate::{CallToolResult, ToolBuilder};
+
+        let tool = ToolBuilder::new("read_data")
+            .description("Read some data")
+            .annotations(ToolAnnotations {
+                read_only_hint: true,
+                destructive_hint: false,
+                ..Default::default()
+            })
+            .handler(|_: serde_json::Value| async move { Ok(CallToolResult::text("ok")) })
+            .build();
+
+        let router = McpRouter::new().server_info("test", "1.0.0").tool(tool);
+        let annotations = router.tool_annotations_map();
+        let mut service = InjectAnnotations::new(router, annotations);
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::CallTool(CallToolParams {
+                name: "read_data".to_string(),
+                arguments: serde_json::json!({}),
+                meta: None,
+                task: None,
+            }),
+            extensions: crate::router::Extensions::new(),
+        };
+
+        // Verify the service processes the request (we can't inspect extensions
+        // after call, but we test the map is built correctly below)
+        let result = Service::call(&mut service, req).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_inject_annotations_skips_non_call_tool() {
+        let router = McpRouter::new().server_info("test", "1.0.0");
+        let annotations = router.tool_annotations_map();
+        let mut service = InjectAnnotations::new(router, annotations);
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::Ping,
+            extensions: crate::router::Extensions::new(),
+        };
+
+        let result = Service::call(&mut service, req).await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_tool_annotations_map_methods() {
+        use crate::ToolBuilder;
+
+        let read_tool = ToolBuilder::new("reader")
+            .description("Read-only tool")
+            .annotations(ToolAnnotations {
+                read_only_hint: true,
+                destructive_hint: false,
+                idempotent_hint: true,
+                ..Default::default()
+            })
+            .handler(|_: serde_json::Value| async move { Ok(CallToolResult::text("ok")) })
+            .build();
+
+        let write_tool = ToolBuilder::new("writer")
+            .description("Destructive tool")
+            .annotations(ToolAnnotations {
+                read_only_hint: false,
+                destructive_hint: true,
+                idempotent_hint: false,
+                ..Default::default()
+            })
+            .handler(|_: serde_json::Value| async move { Ok(CallToolResult::text("ok")) })
+            .build();
+
+        let plain_tool = ToolBuilder::new("plain")
+            .description("No annotations")
+            .handler(|_: serde_json::Value| async move { Ok(CallToolResult::text("ok")) })
+            .build();
+
+        let router = McpRouter::new()
+            .server_info("test", "1.0.0")
+            .tool(read_tool)
+            .tool(write_tool)
+            .tool(plain_tool);
+
+        let map = router.tool_annotations_map();
+
+        // read-only tool
+        assert!(map.is_read_only("reader"));
+        assert!(!map.is_destructive("reader"));
+        assert!(map.is_idempotent("reader"));
+
+        // destructive tool
+        assert!(!map.is_read_only("writer"));
+        assert!(map.is_destructive("writer"));
+        assert!(!map.is_idempotent("writer"));
+
+        // tool without annotations: not in map, defaults apply
+        assert!(!map.is_read_only("plain"));
+        assert!(map.is_destructive("plain")); // default is true
+        assert!(!map.is_idempotent("plain"));
+
+        // nonexistent tool: same defaults as no annotations
+        assert!(!map.is_read_only("nonexistent"));
+        assert!(map.is_destructive("nonexistent"));
+        assert!(!map.is_idempotent("nonexistent"));
+
+        // get() returns None for plain and nonexistent
+        assert!(map.get("reader").is_some());
+        assert!(map.get("writer").is_some());
+        assert!(map.get("plain").is_none());
+        assert!(map.get("nonexistent").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_annotations_visible_in_middleware() {
+        use crate::ToolBuilder;
+        use crate::router::ToolAnnotationsMap;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // A minimal middleware that checks for annotations in extensions.
+        #[derive(Clone)]
+        struct CheckAnnotations<S> {
+            inner: S,
+            found: Arc<AtomicBool>,
+        }
+
+        impl<S> Service<RouterRequest> for CheckAnnotations<S>
+        where
+            S: Service<RouterRequest, Response = RouterResponse, Error = Infallible>,
+        {
+            type Response = RouterResponse;
+            type Error = Infallible;
+            type Future = S::Future;
+
+            fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                self.inner.poll_ready(cx)
+            }
+
+            fn call(&mut self, req: RouterRequest) -> Self::Future {
+                if let Some(map) = req.extensions.get::<ToolAnnotationsMap>()
+                    && map.is_read_only("reader")
+                {
+                    self.found.store(true, Ordering::SeqCst);
+                }
+                self.inner.call(req)
+            }
+        }
+
+        let tool = ToolBuilder::new("reader")
+            .description("A read-only tool")
+            .annotations(ToolAnnotations {
+                read_only_hint: true,
+                ..Default::default()
+            })
+            .handler(|_: serde_json::Value| async move { Ok(CallToolResult::text("ok")) })
+            .build();
+
+        let router = McpRouter::new().server_info("test", "1.0.0").tool(tool);
+        let annotations = router.tool_annotations_map();
+        let found = Arc::new(AtomicBool::new(false));
+
+        // InjectAnnotations is outer (runs first, injects into extensions),
+        // then CheckAnnotations sees the enriched request.
+        let inner = CheckAnnotations {
+            inner: router,
+            found: found.clone(),
+        };
+        let mut service = InjectAnnotations::new(inner, annotations);
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::CallTool(CallToolParams {
+                name: "reader".to_string(),
+                arguments: serde_json::json!({}),
+                meta: None,
+                task: None,
+            }),
+            extensions: crate::router::Extensions::new(),
+        };
+
+        let result = Service::call(&mut service, req).await;
+        assert!(result.is_ok());
+        assert!(
+            found.load(Ordering::SeqCst),
+            "Middleware should see annotations in extensions"
+        );
     }
 }
