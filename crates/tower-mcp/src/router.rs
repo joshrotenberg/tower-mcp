@@ -317,6 +317,36 @@ impl McpRouter {
         }
     }
 
+    /// Build a map of tool names to their annotations.
+    ///
+    /// The returned [`ToolAnnotationsMap`] includes annotations from all
+    /// currently registered tools (both static and dynamic). Tools without
+    /// annotations are omitted from the map.
+    ///
+    /// This is used internally by transports to inject annotations into
+    /// request extensions, but can also be called directly for custom
+    /// middleware setups.
+    pub fn tool_annotations_map(&self) -> ToolAnnotationsMap {
+        let mut map = HashMap::new();
+        for (name, tool) in &self.inner.tools {
+            if let Some(annotations) = &tool.annotations {
+                map.insert(name.clone(), annotations.clone());
+            }
+        }
+        #[cfg(feature = "dynamic-tools")]
+        if let Some(dynamic) = &self.inner.dynamic_tools {
+            for tool in dynamic.list() {
+                // Static tools take precedence
+                if !map.contains_key(&tool.name)
+                    && let Some(ref annotations) = tool.annotations
+                {
+                    map.insert(tool.name.clone(), annotations.clone());
+                }
+            }
+        }
+        ToolAnnotationsMap { map: Arc::new(map) }
+    }
+
     /// Get access to the task store for async operations
     pub fn task_store(&self) -> &TaskStore {
         &self.inner.task_store
@@ -1969,6 +1999,68 @@ impl Default for McpRouter {
 
 // Re-export Extensions from context for backwards compatibility
 pub use crate::context::Extensions;
+
+/// A map of tool names to their annotations, for use by middleware.
+///
+/// This is automatically inserted into [`RouterRequest::extensions`] for
+/// `tools/call` requests, allowing middleware to inspect tool safety hints
+/// (e.g., `read_only_hint`, `destructive_hint`) without needing direct
+/// access to the router's tool registry.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use tower_mcp::router::ToolAnnotationsMap;
+/// use tower_mcp::protocol::McpRequest;
+///
+/// // In a middleware Service::call():
+/// fn call(&mut self, req: RouterRequest) -> Self::Future {
+///     if let McpRequest::CallTool(params) = &req.inner {
+///         if let Some(map) = req.extensions.get::<ToolAnnotationsMap>() {
+///             let annotations = map.get(&params.name);
+///             // Check annotations.read_only_hint, destructive_hint, etc.
+///         }
+///     }
+///     self.inner.call(req)
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct ToolAnnotationsMap {
+    map: Arc<HashMap<String, ToolAnnotations>>,
+}
+
+impl ToolAnnotationsMap {
+    /// Look up annotations for a tool by name.
+    ///
+    /// Returns `None` if the tool has no annotations or doesn't exist.
+    pub fn get(&self, tool_name: &str) -> Option<&ToolAnnotations> {
+        self.map.get(tool_name)
+    }
+
+    /// Check if a tool is read-only (does not modify state).
+    ///
+    /// Returns `false` if the tool has no annotations or doesn't exist
+    /// (the MCP spec default for `readOnlyHint` is `false`).
+    pub fn is_read_only(&self, tool_name: &str) -> bool {
+        self.map.get(tool_name).is_some_and(|a| a.read_only_hint)
+    }
+
+    /// Check if a tool may have destructive effects.
+    ///
+    /// Returns `true` if the tool has no annotations or doesn't exist
+    /// (the MCP spec default for `destructiveHint` is `true`).
+    pub fn is_destructive(&self, tool_name: &str) -> bool {
+        self.map.get(tool_name).is_none_or(|a| a.destructive_hint)
+    }
+
+    /// Check if a tool is idempotent.
+    ///
+    /// Returns `false` if the tool has no annotations or doesn't exist
+    /// (the MCP spec default for `idempotentHint` is `false`).
+    pub fn is_idempotent(&self, tool_name: &str) -> bool {
+        self.map.get(tool_name).is_some_and(|a| a.idempotent_hint)
+    }
+}
 
 /// Request type for the tower Service implementation
 #[derive(Debug, Clone)]

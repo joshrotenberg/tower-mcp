@@ -38,7 +38,7 @@ use tower_service::Service;
 use tracing::Level;
 
 use crate::protocol::McpRequest;
-use crate::router::{RouterRequest, RouterResponse};
+use crate::router::{RouterRequest, RouterResponse, ToolAnnotationsMap};
 
 /// JSON-RPC error code for "invalid params", which may indicate a denied tool call.
 const JSONRPC_INVALID_PARAMS: i32 = -32602;
@@ -133,6 +133,16 @@ where
             }
         };
 
+        // Extract annotation hints if the transport injected them.
+        let read_only = req
+            .extensions
+            .get::<ToolAnnotationsMap>()
+            .map(|m| m.is_read_only(&tool_name));
+        let destructive = req
+            .extensions
+            .get::<ToolAnnotationsMap>()
+            .map(|m| m.is_destructive(&tool_name));
+
         let start = Instant::now();
         let fut = self.inner.call(req);
         let level = self.level;
@@ -144,7 +154,15 @@ where
             if let Ok(response) = &result {
                 match &response.inner {
                     Ok(_) => {
-                        log_tool_call(level, &tool_name, duration_ms, "success", None);
+                        log_tool_call(
+                            level,
+                            &tool_name,
+                            duration_ms,
+                            "success",
+                            None,
+                            read_only,
+                            destructive,
+                        );
                     }
                     Err(err) => {
                         let status = if err.code == JSONRPC_INVALID_PARAMS {
@@ -158,6 +176,8 @@ where
                             duration_ms,
                             status,
                             Some((err.code, &err.message)),
+                            read_only,
+                            destructive,
                         );
                     }
                 }
@@ -175,37 +195,39 @@ fn log_tool_call(
     duration_ms: f64,
     status: &str,
     error: Option<(i32, &str)>,
+    read_only: Option<bool>,
+    destructive: Option<bool>,
 ) {
     match (level, error) {
         (Level::TRACE, None) => {
-            tracing::trace!(target: "mcp::tools", tool, duration_ms, status, "tool call completed")
+            tracing::trace!(target: "mcp::tools", tool, duration_ms, status, ?read_only, ?destructive, "tool call completed")
         }
         (Level::TRACE, Some((code, message))) => {
-            tracing::trace!(target: "mcp::tools", tool, duration_ms, status, error_code = code, error_message = message, "tool call completed")
+            tracing::trace!(target: "mcp::tools", tool, duration_ms, status, error_code = code, error_message = message, ?read_only, ?destructive, "tool call completed")
         }
         (Level::DEBUG, None) => {
-            tracing::debug!(target: "mcp::tools", tool, duration_ms, status, "tool call completed")
+            tracing::debug!(target: "mcp::tools", tool, duration_ms, status, ?read_only, ?destructive, "tool call completed")
         }
         (Level::DEBUG, Some((code, message))) => {
-            tracing::debug!(target: "mcp::tools", tool, duration_ms, status, error_code = code, error_message = message, "tool call completed")
+            tracing::debug!(target: "mcp::tools", tool, duration_ms, status, error_code = code, error_message = message, ?read_only, ?destructive, "tool call completed")
         }
         (Level::INFO, None) => {
-            tracing::info!(target: "mcp::tools", tool, duration_ms, status, "tool call completed")
+            tracing::info!(target: "mcp::tools", tool, duration_ms, status, ?read_only, ?destructive, "tool call completed")
         }
         (Level::INFO, Some((code, message))) => {
-            tracing::info!(target: "mcp::tools", tool, duration_ms, status, error_code = code, error_message = message, "tool call completed")
+            tracing::info!(target: "mcp::tools", tool, duration_ms, status, error_code = code, error_message = message, ?read_only, ?destructive, "tool call completed")
         }
         (Level::WARN, None) => {
-            tracing::warn!(target: "mcp::tools", tool, duration_ms, status, "tool call completed")
+            tracing::warn!(target: "mcp::tools", tool, duration_ms, status, ?read_only, ?destructive, "tool call completed")
         }
         (Level::WARN, Some((code, message))) => {
-            tracing::warn!(target: "mcp::tools", tool, duration_ms, status, error_code = code, error_message = message, "tool call completed")
+            tracing::warn!(target: "mcp::tools", tool, duration_ms, status, error_code = code, error_message = message, ?read_only, ?destructive, "tool call completed")
         }
         (Level::ERROR, None) => {
-            tracing::error!(target: "mcp::tools", tool, duration_ms, status, "tool call completed")
+            tracing::error!(target: "mcp::tools", tool, duration_ms, status, ?read_only, ?destructive, "tool call completed")
         }
         (Level::ERROR, Some((code, message))) => {
-            tracing::error!(target: "mcp::tools", tool, duration_ms, status, error_code = code, error_message = message, "tool call completed")
+            tracing::error!(target: "mcp::tools", tool, duration_ms, status, error_code = code, error_message = message, ?read_only, ?destructive, "tool call completed")
         }
     }
 }

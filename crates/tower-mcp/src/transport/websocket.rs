@@ -93,7 +93,9 @@ use crate::protocol::{
     RequestId,
 };
 use crate::router::{McpRouter, RouterRequest, RouterResponse};
-use crate::transport::service::{CatchError, McpBoxService, ServiceFactory, identity_factory};
+use crate::transport::service::{
+    CatchError, InjectAnnotations, McpBoxService, ServiceFactory, identity_factory,
+};
 
 /// Session state for WebSocket transport
 struct Session {
@@ -264,8 +266,12 @@ impl WebSocketTransport {
         <L::Service as tower::Service<RouterRequest>>::Future: Send,
     {
         self.service_factory = Arc::new(move |router: McpRouter| {
+            let annotations = router.tool_annotations_map();
             let wrapped = layer.layer(router);
-            tower::util::BoxCloneService::new(CatchError::new(wrapped))
+            tower::util::BoxCloneService::new(InjectAnnotations::new(
+                CatchError::new(wrapped),
+                annotations,
+            ))
         });
         self
     }

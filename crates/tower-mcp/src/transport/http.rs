@@ -173,7 +173,9 @@ use crate::protocol::{
     RequestId, SUPPORTED_PROTOCOL_VERSIONS,
 };
 use crate::router::{McpRouter, RouterRequest, RouterResponse};
-use crate::transport::service::{CatchError, McpBoxService, ServiceFactory, identity_factory};
+use crate::transport::service::{
+    CatchError, InjectAnnotations, McpBoxService, ServiceFactory, identity_factory,
+};
 
 /// Header name for MCP session ID
 pub const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
@@ -695,8 +697,12 @@ impl HttpTransport {
         <L::Service as tower::Service<RouterRequest>>::Future: Send,
     {
         self.service_factory = Arc::new(move |router: McpRouter| {
+            let annotations = router.tool_annotations_map();
             let wrapped = layer.layer(router);
-            tower::util::BoxCloneService::new(CatchError::new(wrapped))
+            tower::util::BoxCloneService::new(InjectAnnotations::new(
+                CatchError::new(wrapped),
+                annotations,
+            ))
         });
         self
     }
