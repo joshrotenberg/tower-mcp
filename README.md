@@ -41,6 +41,7 @@ If you've used [axum](https://docs.rs/axum), tower-mcp's API will feel familiar:
 | **Conformance** | 39/39 official MCP conformance tests pass in CI on every PR. |
 | **Capability filtering** | Session-based tool/resource/prompt visibility for multi-tenant patterns. |
 | **No proc macros required** | Builder pattern API with optional trait-based tools. Nothing hidden behind `#[derive]`. |
+| **Multi-server proxy** | Aggregate N backend servers behind a single endpoint with per-backend middleware and namespace isolation. |
 | **axum ecosystem** | HTTP and WebSocket transports build on axum, so existing axum middleware and extractors work. |
 
 ### Trade-offs
@@ -101,6 +102,7 @@ tower-mcp = "0.7"
 | `jwks` | JWKS endpoint fetching for remote key sets (requires `oauth`) |
 | `testing` | Test utilities (`TestClient`) for in-process testing |
 | `dynamic-tools` | Runtime tool registration/deregistration via `DynamicToolRegistry` |
+| `proxy` | Multi-server aggregation proxy (`McpProxy`) |
 
 Example with features:
 
@@ -302,6 +304,43 @@ let versioned = McpRouter::new()
     .nest("v1", v1)   // Tools become "v1_legacy_tool"
     .nest("v2", v2);  // Tools become "v2_new_tool"
 ```
+
+## Multi-Server Proxy
+
+Aggregate multiple backend MCP servers behind a single endpoint with `McpProxy` (feature: `proxy`). Each backend's tools, resources, and prompts are namespaced to avoid collisions:
+
+```rust
+use tower_mcp::proxy::McpProxy;
+use tower_mcp::client::StdioClientTransport;
+
+let proxy = McpProxy::builder("my-proxy", "1.0.0")
+    .backend("db", StdioClientTransport::spawn("db-server", &[]).await?)
+    .await
+    .backend("fs", StdioClientTransport::spawn("fs-server", &[]).await?)
+    .await
+    .build()
+    .await?;
+
+// Tools become db_query, fs_read, etc.
+// Serve over any transport.
+StdioTransport::new(proxy).run().await?;
+```
+
+Per-backend Tower middleware applies to individual backends:
+
+```rust
+use std::time::Duration;
+use tower::timeout::TimeoutLayer;
+
+let proxy = McpProxy::builder("proxy", "1.0.0")
+    .backend("fast", cache_transport).await
+    .backend_layer(TimeoutLayer::new(Duration::from_secs(2)))
+    .backend("slow", llm_transport).await
+    .backend_layer(TimeoutLayer::new(Duration::from_secs(60)))
+    .build().await?;
+```
+
+The proxy also supports notification forwarding (backend list-changed events propagate to clients), health checks (`proxy.health_check().await`), and request coalescing via `tower-resilience`'s `CoalesceLayer`. See the [`proxy` module docs](https://docs.rs/tower-mcp/latest/tower_mcp/proxy/) and `examples/proxy.rs`.
 
 ## Router-Level State
 
@@ -505,6 +544,7 @@ The repo includes several example servers you can try with any MCP-enabled agent
 | `codegen-mcp` | Helps AI agents build tower-mcp servers |
 | `weather` | Weather forecasts via NWS API |
 | `conformance` | Full MCP spec conformance server (39/39 tests) |
+| `proxy` | Multi-server proxy with per-backend middleware |
 
 ```bash
 git clone https://github.com/joshrotenberg/tower-mcp
