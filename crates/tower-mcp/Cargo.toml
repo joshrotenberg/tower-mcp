@@ -155,3 +155,11 @@ required-features = ["testing"]
 name = "http_client_cli"
 path = "../../examples/http_client_cli.rs"
 required-features = ["http-client"]
+
+[[example]]
+name = "sampling_server"
+path = "../../examples/sampling_server.rs"
+
+[[example]]
+name = "client_handler"
+path = "../../examples/client_handler.rs"
