@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use tokio::sync::RwLock;
+use tower::ServiceExt;
 use tower::util::BoxCloneService;
 use tower_service::Service;
 
@@ -259,7 +260,7 @@ async fn handle_list_tools(infos: Vec<EntryInfo>) -> Result<McpResponse, JsonRpc
 }
 
 async fn handle_call_tool(
-    mut service: BoxCloneService<RouterRequest, RouterResponse, Infallible>,
+    service: BoxCloneService<RouterRequest, RouterResponse, Infallible>,
     stripped_name: String,
     params: CallToolParams,
     id: RequestId,
@@ -278,7 +279,7 @@ async fn handle_call_tool(
         extensions,
     };
 
-    let resp = service.call(router_req).await.expect("infallible");
+    let resp = service.oneshot(router_req).await.expect("infallible");
     resp.inner
 }
 
@@ -323,7 +324,7 @@ async fn handle_list_resource_templates(
 }
 
 async fn handle_read_resource(
-    mut service: BoxCloneService<RouterRequest, RouterResponse, Infallible>,
+    service: BoxCloneService<RouterRequest, RouterResponse, Infallible>,
     stripped_uri: String,
     params: ReadResourceParams,
     id: RequestId,
@@ -340,7 +341,7 @@ async fn handle_read_resource(
         extensions,
     };
 
-    let resp = service.call(router_req).await.expect("infallible");
+    let resp = service.oneshot(router_req).await.expect("infallible");
     resp.inner
 }
 
@@ -362,7 +363,7 @@ async fn handle_list_prompts(infos: Vec<EntryInfo>) -> Result<McpResponse, JsonR
 }
 
 async fn handle_get_prompt(
-    mut service: BoxCloneService<RouterRequest, RouterResponse, Infallible>,
+    service: BoxCloneService<RouterRequest, RouterResponse, Infallible>,
     stripped_name: String,
     params: GetPromptParams,
     id: RequestId,
@@ -380,7 +381,7 @@ async fn handle_get_prompt(
         extensions,
     };
 
-    let resp = service.call(router_req).await.expect("infallible");
+    let resp = service.oneshot(router_req).await.expect("infallible");
     resp.inner
 }
 

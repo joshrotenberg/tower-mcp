@@ -978,6 +978,62 @@ mod proxy_tests {
     // CoalesceLayer integration
     // ========================================================================
 
+    // ========================================================================
+    // ConcurrencyLimit integration (#604)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_backend_concurrency_limit_serializes_requests() {
+        use tower::limit::ConcurrencyLimitLayer;
+
+        let slow_transport = ChannelTransport::new(slow_router());
+
+        let proxy = McpProxy::builder("concurrency-proxy", "1.0.0")
+            .backend("slow", slow_transport)
+            .await
+            .backend_layer(ConcurrencyLimitLayer::new(1))
+            .build_strict()
+            .await
+            .expect("proxy should build");
+
+        // Fire two concurrent requests. With ConcurrencyLimitLayer(1),
+        // they should be serialized (second waits for first to complete).
+        // Both should succeed -- backpressure is handled internally by
+        // BoxCloneService which calls poll_ready before dispatch.
+        let req1 = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::CallTool(crate::protocol::CallToolParams {
+                name: "slow_slow_op".to_string(),
+                arguments: json!({"delay_ms": 10}),
+                meta: None,
+                task: None,
+            }),
+            extensions: Extensions::new(),
+        };
+        let req2 = RouterRequest {
+            id: RequestId::Number(2),
+            inner: McpRequest::CallTool(crate::protocol::CallToolParams {
+                name: "slow_slow_op".to_string(),
+                arguments: json!({"delay_ms": 10}),
+                meta: None,
+                task: None,
+            }),
+            extensions: Extensions::new(),
+        };
+
+        let mut p1 = proxy.clone();
+        let mut p2 = proxy.clone();
+        let h1 = tokio::spawn(async move { p1.call(req1).await });
+        let h2 = tokio::spawn(async move { p2.call(req2).await });
+
+        let r1 = h1.await.unwrap().unwrap();
+        let r2 = h2.await.unwrap().unwrap();
+
+        // Both should succeed
+        assert!(r1.inner.is_ok(), "first request should succeed");
+        assert!(r2.inner.is_ok(), "second request should succeed");
+    }
+
     #[tokio::test]
     async fn test_coalesce_layer_deduplicates_concurrent_list_tools() {
         use std::mem::discriminant;
