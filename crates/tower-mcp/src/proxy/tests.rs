@@ -4,6 +4,7 @@ mod proxy_tests {
     use std::time::Duration;
 
     use serde_json::json;
+    use tower::Layer;
     use tower::timeout::TimeoutLayer;
     use tower_service::Service;
 
@@ -708,5 +709,126 @@ mod proxy_tests {
 
         // Verify proxy built successfully with notification sender
         assert!(proxy.shared.notification_tx.is_some());
+    }
+
+    // ========================================================================
+    // CoalesceLayer integration
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_coalesce_layer_deduplicates_concurrent_list_tools() {
+        use std::mem::discriminant;
+        use tower::ServiceExt;
+        use tower_resilience::coalesce::{CoalesceError, CoalesceLayer};
+
+        type CoalesceResult =
+            Result<crate::router::RouterResponse, CoalesceError<std::convert::Infallible>>;
+
+        let proxy = build_test_proxy().await;
+
+        // Wrap the proxy in CoalesceLayer keyed by McpRequest discriminant.
+        // This means concurrent list_tools calls share a single execution.
+        let coalesced =
+            CoalesceLayer::new(|req: &RouterRequest| discriminant(&req.inner)).layer(proxy);
+
+        // Fire 5 concurrent list_tools requests
+        let mut handles = vec![];
+        for _ in 0..5 {
+            let mut svc = coalesced.clone();
+            handles.push(tokio::spawn(async move {
+                let req = RouterRequest {
+                    id: RequestId::Number(1),
+                    inner: McpRequest::ListTools(Default::default()),
+                    extensions: Extensions::new(),
+                };
+                let result: CoalesceResult = svc.ready().await.unwrap().call(req).await;
+                result
+            }));
+        }
+
+        // All should succeed with identical tool lists
+        let mut tool_lists: Vec<Vec<String>> = Vec::new();
+        for handle in handles {
+            let resp = handle.await.unwrap().unwrap();
+            let mcp_resp = resp.inner.expect("should be Ok");
+            match mcp_resp {
+                McpResponse::ListTools(list) => {
+                    let names: Vec<String> = list.tools.iter().map(|t| t.name.clone()).collect();
+                    tool_lists.push(names);
+                }
+                other => panic!("expected ListTools, got: {:?}", other),
+            }
+        }
+
+        // All responses should be identical (coalesced from the same execution)
+        assert_eq!(tool_lists.len(), 5);
+        for list in &tool_lists {
+            assert_eq!(list, &tool_lists[0], "all responses should match");
+        }
+        // Should contain tools from both backends
+        assert!(tool_lists[0].contains(&"math_add".to_string()));
+        assert!(tool_lists[0].contains(&"text_echo".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_coalesce_layer_does_not_affect_different_methods() {
+        use std::mem::discriminant;
+        use tower::ServiceExt;
+        use tower_resilience::coalesce::{CoalesceError, CoalesceLayer};
+
+        type CoalesceResult =
+            Result<crate::router::RouterResponse, CoalesceError<std::convert::Infallible>>;
+
+        let proxy = build_test_proxy().await;
+
+        let coalesced =
+            CoalesceLayer::new(|req: &RouterRequest| discriminant(&req.inner)).layer(proxy);
+
+        // Fire list_tools and call_tool concurrently -- they have different
+        // discriminants so they should NOT be coalesced.
+        let mut list_svc = coalesced.clone();
+        let mut call_svc = coalesced.clone();
+
+        let list_handle: tokio::task::JoinHandle<CoalesceResult> = tokio::spawn(async move {
+            let req = RouterRequest {
+                id: RequestId::Number(1),
+                inner: McpRequest::ListTools(Default::default()),
+                extensions: Extensions::new(),
+            };
+            list_svc.ready().await.unwrap().call(req).await
+        });
+
+        let call_handle: tokio::task::JoinHandle<CoalesceResult> = tokio::spawn(async move {
+            let req = RouterRequest {
+                id: RequestId::Number(2),
+                inner: McpRequest::CallTool(crate::protocol::CallToolParams {
+                    name: "math_add".to_string(),
+                    arguments: json!({"a": 10, "b": 20}),
+                    meta: None,
+                    task: None,
+                }),
+                extensions: Extensions::new(),
+            };
+            call_svc.ready().await.unwrap().call(req).await
+        });
+
+        let list_resp = list_handle.await.unwrap().unwrap();
+        let call_resp = call_handle.await.unwrap().unwrap();
+
+        // list_tools should return tool definitions
+        match list_resp.inner.unwrap() {
+            McpResponse::ListTools(list) => {
+                assert!(!list.tools.is_empty());
+            }
+            other => panic!("expected ListTools, got: {:?}", other),
+        }
+
+        // call_tool should return the computation result
+        match call_resp.inner.unwrap() {
+            McpResponse::CallTool(result) => {
+                assert_eq!(result.all_text(), "30");
+            }
+            other => panic!("expected CallTool, got: {:?}", other),
+        }
     }
 }
