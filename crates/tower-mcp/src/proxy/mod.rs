@@ -157,6 +157,28 @@
 //! Note that `CoalesceLayer` changes the error type from `Infallible` to
 //! `CoalesceError<Infallible>`. Use [`CatchError`](crate::transport::CatchError)
 //! to convert back to `Infallible` for transport compatibility.
+//!
+//! # Language-Agnostic Backends
+//!
+//! The proxy communicates with backends over standard MCP (JSON-RPC), so
+//! backends can be written in any language or framework -- Python (FastMCP),
+//! TypeScript, Go, or anything that speaks the protocol. This makes
+//! tower-mcp a natural aggregation and middleware layer for polyglot MCP
+//! deployments:
+//!
+//! ```rust,ignore
+//! let proxy = McpProxy::builder("polyglot-proxy", "1.0.0")
+//!     // Python FastMCP server
+//!     .backend("ml", StdioClientTransport::spawn("python", &["-m", "ml_server"]).await?)
+//!     .await
+//!     // TypeScript MCP server
+//!     .backend("docs", StdioClientTransport::spawn("npx", &["docs-server"]).await?)
+//!     .await
+//!     // Rust tower-mcp server
+//!     .backend("data", StdioClientTransport::spawn("data-server", &[]).await?)
+//!     .await
+//!     .build().await?;
+//! ```
 
 mod backend;
 mod builder;

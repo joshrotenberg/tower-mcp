@@ -340,7 +340,11 @@ let proxy = McpProxy::builder("proxy", "1.0.0")
     .build().await?;
 ```
 
-The proxy also supports notification forwarding (backend list-changed events propagate to clients), health checks (`proxy.health_check().await`), and request coalescing via `tower-resilience`'s `CoalesceLayer`. See the [`proxy` module docs](https://docs.rs/tower-mcp/latest/tower_mcp/proxy/) and `examples/proxy.rs`.
+The proxy also supports notification forwarding (backend list-changed events propagate to clients), health checks (`proxy.health_check().await`), and request coalescing via `tower-resilience`'s `CoalesceLayer`.
+
+Backends don't need to be built with tower-mcp -- the proxy communicates over standard MCP (JSON-RPC), so it works with servers written in any language or framework: Python (FastMCP), TypeScript, Go, or anything that speaks the MCP protocol. This makes tower-mcp a natural aggregation and middleware layer for polyglot MCP deployments.
+
+See the [`proxy` module docs](https://docs.rs/tower-mcp/latest/tower_mcp/proxy/) and `examples/proxy.rs`.
 
 ## Router-Level State
 
