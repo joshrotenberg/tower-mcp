@@ -102,7 +102,7 @@ mod proxy_tests {
             .await
             .backend("text", text_transport)
             .await
-            .build()
+            .build_strict()
             .await
             .expect("proxy should build")
     }
@@ -476,7 +476,7 @@ mod proxy_tests {
             .separator(".")
             .backend("math", math_transport)
             .await
-            .build()
+            .build_strict()
             .await
             .expect("proxy should build");
 
@@ -612,7 +612,7 @@ mod proxy_tests {
         // Use backend_client (pre-connected McpClient) instead of backend (transport)
         let mut proxy = McpProxy::builder("client-proxy", "1.0.0")
             .backend_client("math", client)
-            .build()
+            .build_strict()
             .await
             .expect("proxy should build");
 
@@ -763,7 +763,7 @@ mod proxy_tests {
         let good_transport = ChannelTransport::new(math_router());
 
         // Build with one broken and one good backend
-        let mut proxy = McpProxy::builder("mixed-init", "1.0.0")
+        let result = McpProxy::builder("mixed-init", "1.0.0")
             .backend("broken", BrokenTransport)
             .await
             .backend("math", good_transport)
@@ -771,6 +771,11 @@ mod proxy_tests {
             .build()
             .await
             .expect("proxy should build with at least one good backend");
+
+        // The broken backend should be in the skipped list
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.skipped[0].namespace, "broken");
+        let mut proxy = result.proxy;
 
         // Only the math backend should be available
         let resp = call_proxy(&mut proxy, McpRequest::ListTools(Default::default()))
@@ -818,7 +823,7 @@ mod proxy_tests {
             .backend("slow", slow_transport)
             .await
             .backend_layer(TimeoutLayer::new(Duration::from_millis(50)))
-            .build()
+            .build_strict()
             .await
             .expect("proxy should build");
 
@@ -853,7 +858,7 @@ mod proxy_tests {
             .backend("slow", slow_transport)
             .await
             .backend_layer(TimeoutLayer::new(Duration::from_secs(5)))
-            .build()
+            .build_strict()
             .await
             .expect("proxy should build");
 
@@ -891,7 +896,7 @@ mod proxy_tests {
             .backend("slow", slow_transport)
             .await
             .backend_layer(TimeoutLayer::new(Duration::from_millis(50)))
-            .build()
+            .build_strict()
             .await
             .expect("proxy should build");
 
@@ -961,7 +966,7 @@ mod proxy_tests {
             .notification_sender(notif_tx)
             .backend("math", math_transport)
             .await
-            .build()
+            .build_strict()
             .await
             .expect("proxy should build");
 

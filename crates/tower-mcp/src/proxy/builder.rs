@@ -16,6 +16,44 @@ use crate::transport::CatchError;
 use super::backend::{Backend, BackendService, ListChanged};
 use super::service::{BackendEntry, McpProxy};
 
+/// A backend that was skipped during proxy construction.
+#[derive(Debug)]
+pub struct SkippedBackend {
+    /// The namespace that was assigned to this backend.
+    pub namespace: String,
+    /// The error that caused the backend to be skipped.
+    pub error: Error,
+    /// The phase where the failure occurred.
+    pub phase: SkippedPhase,
+}
+
+/// Which phase a backend failed in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkippedPhase {
+    /// Failed to connect the transport.
+    Connect,
+    /// Failed during MCP initialization handshake.
+    Initialize,
+}
+
+impl fmt::Display for SkippedBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "[{}] {:?} failed: {}",
+            self.namespace, self.phase, self.error
+        )
+    }
+}
+
+/// Result of building an [`McpProxy`], including any backends that were skipped.
+pub struct ProxyBuildResult {
+    /// The constructed proxy.
+    pub proxy: McpProxy,
+    /// Backends that failed to connect or initialize and were skipped.
+    pub skipped: Vec<SkippedBackend>,
+}
+
 /// Pending backend before the proxy is built.
 struct PendingBackend {
     namespace: String,
@@ -24,6 +62,12 @@ struct PendingBackend {
     /// Type-erased service (set by `.backend_layer()`).
     /// If None, BackendService is used directly.
     custom_service: Option<BoxCloneService<RouterRequest, RouterResponse, Infallible>>,
+}
+
+/// Backends that failed during `backend()` connection, tracked until `build()`.
+struct ConnectionFailure {
+    namespace: String,
+    error: Error,
 }
 
 /// Builder for constructing an [`McpProxy`].
@@ -68,6 +112,7 @@ pub struct McpProxyBuilder {
     separator: String,
     pending: Vec<PendingBackend>,
     notification_tx: Option<crate::context::NotificationSender>,
+    connection_failures: Vec<ConnectionFailure>,
 }
 
 impl McpProxyBuilder {
@@ -79,6 +124,7 @@ impl McpProxyBuilder {
             separator: "_".to_string(),
             pending: Vec::new(),
             notification_tx: None,
+            connection_failures: Vec::new(),
         }
     }
 
@@ -169,9 +215,50 @@ impl McpProxyBuilder {
                     error = %e,
                     "Failed to connect backend"
                 );
+                self.connection_failures.push(ConnectionFailure {
+                    namespace,
+                    error: e,
+                });
             }
         }
         self
+    }
+
+    /// Add a backend from a transport, returning an error on connection failure.
+    ///
+    /// Unlike [`backend()`](Self::backend) which silently skips failed connections,
+    /// this method returns an error so the caller can decide how to handle it.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let builder = McpProxy::builder("proxy", "1.0.0")
+    ///     .backend_try("db", transport).await?;
+    /// ```
+    pub async fn backend_try(
+        mut self,
+        namespace: impl Into<String>,
+        transport: impl ClientTransport,
+    ) -> Result<Self> {
+        let namespace = namespace.into();
+        let (invalidation_tx, invalidation_rx) = mpsc::channel(16);
+
+        let backend = Backend::connect(
+            namespace.clone(),
+            transport,
+            self.separator.clone(),
+            invalidation_tx,
+        )
+        .await?;
+
+        self.pending.push(PendingBackend {
+            namespace,
+            backend,
+            invalidation_rx: Some(invalidation_rx),
+            custom_service: None,
+        });
+
+        Ok(self)
     }
 
     /// Apply a Tower layer to the most recently added backend.
@@ -231,10 +318,19 @@ impl McpProxyBuilder {
     /// capabilities (tools, resources, prompts). Backends that fail to
     /// initialize are logged and skipped.
     ///
+    /// Returns a [`ProxyBuildResult`] containing the proxy and any backends
+    /// that were skipped due to initialization failures. Check
+    /// `result.skipped` to see which backends failed and why.
+    ///
     /// For backends added via [`backend()`](Self::backend), a background task
     /// is spawned that watches for list-changed notifications and automatically
     /// refreshes the affected cache.
-    pub async fn build(mut self) -> Result<McpProxy> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no backends were configured or if all backends
+    /// failed to initialize.
+    pub async fn build(mut self) -> Result<ProxyBuildResult> {
         if self.pending.is_empty() {
             return Err(Error::internal("No backends configured"));
         }
@@ -302,7 +398,7 @@ impl McpProxyBuilder {
                                     "Backend initialized"
                                 );
                             }
-                            Some(pb)
+                            Ok(pb)
                         }
                         Err(e) => {
                             tracing::error!(
@@ -310,7 +406,11 @@ impl McpProxyBuilder {
                                 error = %e,
                                 "Failed to initialize backend, skipping"
                             );
-                            None
+                            Err(SkippedBackend {
+                                namespace: pb.namespace,
+                                error: e,
+                                phase: SkippedPhase::Initialize,
+                            })
                         }
                     }
                 }
@@ -323,7 +423,25 @@ impl McpProxyBuilder {
         let mut entries = Vec::new();
         let mut invalidation_rxs = Vec::new();
 
-        for pb in results.into_iter().flatten() {
+        // Start with connection failures from the `backend()` phase
+        let mut skipped: Vec<SkippedBackend> = self
+            .connection_failures
+            .into_iter()
+            .map(|f| SkippedBackend {
+                namespace: f.namespace,
+                error: f.error,
+                phase: SkippedPhase::Connect,
+            })
+            .collect();
+
+        for result in results {
+            let pb = match result {
+                Ok(pb) => pb,
+                Err(s) => {
+                    skipped.push(s);
+                    continue;
+                }
+            };
             let entry = if let Some(svc) = pb.custom_service {
                 BackendEntry::from_backend_with_service(&pb.backend, svc)
             } else {
@@ -393,6 +511,27 @@ impl McpProxyBuilder {
             });
         }
 
-        Ok(proxy)
+        Ok(ProxyBuildResult { proxy, skipped })
+    }
+
+    /// Build the proxy, failing if any backend fails to initialize.
+    ///
+    /// Unlike [`build()`](Self::build) which skips failed backends,
+    /// this method returns an error if any backend fails to connect or
+    /// initialize.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first initialization failure encountered (after
+    /// waiting for all backends to attempt initialization).
+    pub async fn build_strict(self) -> Result<McpProxy> {
+        let result = self.build().await?;
+        if let Some(first) = result.skipped.into_iter().next() {
+            return Err(Error::internal(format!(
+                "Backend \"{}\" failed to initialize: {}",
+                first.namespace, first.error
+            )));
+        }
+        Ok(result.proxy)
     }
 }

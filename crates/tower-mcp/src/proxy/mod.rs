@@ -31,7 +31,7 @@
 //!     .await
 //!     .backend("fs", StdioClientTransport::spawn("fs-server", &[]).await?)
 //!     .await
-//!     .build()
+//!     .build_strict()
 //!     .await?;
 //!
 //! // Tools become db_query, fs_read, etc. (namespace + separator + name)
@@ -56,6 +56,23 @@
 //!     .separator(".")   // tools become "db.query" instead of "db_query"
 //!     .build().await?;
 //! ```
+//!
+//! # Separator Selection
+//!
+//! The separator appears in every namespaced name, so choose carefully:
+//!
+//! | Separator | Example | Pros | Cons |
+//! |-----------|---------|------|------|
+//! | `_` (default) | `db_query` | Natural for tool names | Ambiguous if namespaces contain `_` (e.g., `redis` vs `redis_ft`) |
+//! | `.` | `db.query` | Unambiguous, hierarchical feel | Some MCP clients may not handle dots in names |
+//! | `:` | `db:query` | Clear delimiter, rarely in names | Less common convention |
+//!
+//! The builder validates at build time that no namespace prefix is ambiguous
+//! with the chosen separator. If you use namespaces that contain the separator
+//! character, the build will fail with an error.
+//!
+//! **Recommendation:** Use `.` or `:` when namespace names might share prefixes
+//! or contain underscores.
 //!
 //! # Per-Backend Middleware
 //!
@@ -185,7 +202,7 @@ mod builder;
 mod service;
 mod tests;
 
-pub use builder::McpProxyBuilder;
+pub use builder::{McpProxyBuilder, ProxyBuildResult, SkippedBackend, SkippedPhase};
 pub use service::{BackendHealth, McpProxy};
 
 // Re-export BackendService so users can write layer bounds against it

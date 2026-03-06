@@ -43,7 +43,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     let (notif_tx, notif_rx) = notification_channel(32);
 
     // Build the proxy -- backends initialize concurrently
-    let proxy = McpProxy::builder("mcp-proxy-example", "1.0.0")
+    let result = McpProxy::builder("mcp-proxy-example", "1.0.0")
         .notification_sender(notif_tx)
         .backend("basic", basic_transport)
         .await
@@ -53,6 +53,14 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .backend_layer(TimeoutLayer::new(Duration::from_secs(30)))
         .build()
         .await?;
+
+    // Check for skipped backends
+    if !result.skipped.is_empty() {
+        for s in &result.skipped {
+            tracing::warn!("Skipped backend: {s}");
+        }
+    }
+    let proxy = result.proxy;
 
     // Health check all backends
     let health = proxy.health_check().await;
