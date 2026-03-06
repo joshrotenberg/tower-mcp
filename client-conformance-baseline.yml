@@ -1,8 +1,0 @@
-# MCP Client Conformance Suite -- Expected Failures Baseline
-#
-# All 24 scenarios currently pass (265/265 checks, 0 failures).
-# Add entries here if a conformance test covers a feature that is
-# intentionally unsupported or deferred.
-#
-# Format:
-#   - test_name: "reason for expected failure"
