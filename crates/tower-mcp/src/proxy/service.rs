@@ -91,6 +91,17 @@ pub(super) struct McpProxyShared {
     name: String,
     version: String,
     pub(super) backends: Vec<Backend>,
+    /// Optional sender for forwarding list-changed notifications downstream.
+    pub(super) notification_tx: Option<crate::context::NotificationSender>,
+}
+
+/// Health status of a single backend.
+#[derive(Debug, Clone)]
+pub struct BackendHealth {
+    /// The backend's namespace.
+    pub namespace: String,
+    /// Whether the backend responded to a ping.
+    pub healthy: bool,
 }
 
 /// Namespace + cache extracted from a `BackendEntry` for `Send`-safe async use.
@@ -113,15 +124,39 @@ impl McpProxy {
         version: String,
         backends: Vec<Backend>,
         entries: Vec<BackendEntry>,
+        notification_tx: Option<crate::context::NotificationSender>,
     ) -> Self {
         Self {
             shared: Arc::new(McpProxyShared {
                 name,
                 version,
                 backends,
+                notification_tx,
             }),
             entries,
         }
+    }
+
+    /// Check the health of all backends by pinging them concurrently.
+    ///
+    /// Returns a map of namespace to health status. Backends that respond
+    /// to ping within a reasonable time are considered healthy.
+    pub async fn health_check(&self) -> Vec<BackendHealth> {
+        let futures: Vec<_> = self
+            .shared
+            .backends
+            .iter()
+            .map(|backend| {
+                let client = Arc::clone(&backend.client);
+                let namespace = backend.namespace.clone();
+                async move {
+                    let healthy = client.ping().await.is_ok();
+                    BackendHealth { namespace, healthy }
+                }
+            })
+            .collect();
+
+        futures::future::join_all(futures).await
     }
 
     /// Extract Send-safe info from entries (synchronous, no borrow across await).

@@ -1,11 +1,14 @@
 #[cfg(test)]
 mod proxy_tests {
     use std::collections::HashMap;
+    use std::time::Duration;
 
     use serde_json::json;
+    use tower::timeout::TimeoutLayer;
     use tower_service::Service;
 
     use crate::client::{ChannelTransport, McpClient};
+    use crate::context::notification_channel;
     use crate::protocol::{McpRequest, McpResponse, RequestId};
     use crate::proxy::McpProxy;
     use crate::router::{Extensions, RouterRequest};
@@ -522,5 +525,188 @@ mod proxy_tests {
             .await
             .expect("should get prompt");
         assert!(prompt.first_message_text().unwrap().contains("Bob"));
+    }
+
+    // ========================================================================
+    // Per-backend middleware
+    // ========================================================================
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    struct SlowInput {
+        delay_ms: u64,
+    }
+
+    /// Create a "slow" backend router with a tool that sleeps.
+    fn slow_router() -> McpRouter {
+        let slow = ToolBuilder::new("slow_op")
+            .description("A slow operation")
+            .handler(|input: SlowInput| async move {
+                tokio::time::sleep(Duration::from_millis(input.delay_ms)).await;
+                Ok(CallToolResult::text("done"))
+            })
+            .build();
+
+        McpRouter::new()
+            .server_info("slow-server", "1.0.0")
+            .tool(slow)
+    }
+
+    #[tokio::test]
+    async fn test_backend_layer_timeout_triggers() {
+        let slow_transport = ChannelTransport::new(slow_router());
+
+        let mut proxy = McpProxy::builder("timeout-proxy", "1.0.0")
+            .backend("slow", slow_transport)
+            .await
+            .backend_layer(TimeoutLayer::new(Duration::from_millis(50)))
+            .build()
+            .await
+            .expect("proxy should build");
+
+        // Call with a delay that exceeds the timeout
+        let result = call_proxy(
+            &mut proxy,
+            McpRequest::CallTool(crate::protocol::CallToolParams {
+                name: "slow_slow_op".to_string(),
+                arguments: json!({"delay_ms": 500}),
+                meta: None,
+                task: None,
+            }),
+        )
+        .await;
+
+        // Should get a JSON-RPC error from the CatchError wrapper
+        assert!(result.is_err(), "should timeout");
+        let err = result.unwrap_err();
+        assert!(
+            err.message.to_lowercase().contains("timed out")
+                || err.message.to_lowercase().contains("timeout"),
+            "error should mention timeout, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_backend_layer_timeout_allows_fast_requests() {
+        let slow_transport = ChannelTransport::new(slow_router());
+
+        let mut proxy = McpProxy::builder("timeout-proxy", "1.0.0")
+            .backend("slow", slow_transport)
+            .await
+            .backend_layer(TimeoutLayer::new(Duration::from_secs(5)))
+            .build()
+            .await
+            .expect("proxy should build");
+
+        // Call with no delay -- should succeed
+        let resp = call_proxy(
+            &mut proxy,
+            McpRequest::CallTool(crate::protocol::CallToolParams {
+                name: "slow_slow_op".to_string(),
+                arguments: json!({"delay_ms": 0}),
+                meta: None,
+                task: None,
+            }),
+        )
+        .await
+        .expect("fast call should succeed");
+
+        match resp {
+            McpResponse::CallTool(result) => {
+                assert_eq!(result.all_text(), "done");
+            }
+            other => panic!("expected CallTool response, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_backend_layer_only_affects_target_backend() {
+        let math_transport = ChannelTransport::new(math_router());
+        let slow_transport = ChannelTransport::new(slow_router());
+
+        let mut proxy = McpProxy::builder("mixed-proxy", "1.0.0")
+            // math backend: no middleware
+            .backend("math", math_transport)
+            .await
+            // slow backend: tight timeout
+            .backend("slow", slow_transport)
+            .await
+            .backend_layer(TimeoutLayer::new(Duration::from_millis(50)))
+            .build()
+            .await
+            .expect("proxy should build");
+
+        // math backend should work fine (no timeout layer)
+        let resp = call_proxy(
+            &mut proxy,
+            McpRequest::CallTool(crate::protocol::CallToolParams {
+                name: "math_add".to_string(),
+                arguments: json!({"a": 1, "b": 2}),
+                meta: None,
+                task: None,
+            }),
+        )
+        .await
+        .expect("math should succeed");
+
+        match resp {
+            McpResponse::CallTool(result) => assert_eq!(result.all_text(), "3"),
+            other => panic!("expected CallTool, got: {:?}", other),
+        }
+
+        // slow backend should timeout
+        let result = call_proxy(
+            &mut proxy,
+            McpRequest::CallTool(crate::protocol::CallToolParams {
+                name: "slow_slow_op".to_string(),
+                arguments: json!({"delay_ms": 500}),
+                meta: None,
+                task: None,
+            }),
+        )
+        .await;
+
+        assert!(result.is_err(), "slow backend should timeout");
+    }
+
+    // ========================================================================
+    // Health check
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_proxy_health_check_all_healthy() {
+        let proxy = build_test_proxy().await;
+
+        let health = proxy.health_check().await;
+        assert_eq!(health.len(), 2);
+        assert!(
+            health.iter().all(|h| h.healthy),
+            "all backends should be healthy"
+        );
+
+        let namespaces: Vec<&str> = health.iter().map(|h| h.namespace.as_str()).collect();
+        assert!(namespaces.contains(&"math"));
+        assert!(namespaces.contains(&"text"));
+    }
+
+    // ========================================================================
+    // Notification forwarding
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_proxy_notification_sender_configured() {
+        let (notif_tx, _notif_rx) = notification_channel(32);
+        let math_transport = ChannelTransport::new(math_router());
+
+        let proxy = McpProxy::builder("notif-proxy", "1.0.0")
+            .notification_sender(notif_tx)
+            .backend("math", math_transport)
+            .await
+            .build()
+            .await
+            .expect("proxy should build");
+
+        // Verify proxy built successfully with notification sender
+        assert!(proxy.shared.notification_tx.is_some());
     }
 }

@@ -67,6 +67,7 @@ pub struct McpProxyBuilder {
     version: String,
     separator: String,
     pending: Vec<PendingBackend>,
+    notification_tx: Option<crate::context::NotificationSender>,
 }
 
 impl McpProxyBuilder {
@@ -77,6 +78,7 @@ impl McpProxyBuilder {
             version: version.into(),
             separator: "_".to_string(),
             pending: Vec::new(),
+            notification_tx: None,
         }
     }
 
@@ -87,6 +89,32 @@ impl McpProxyBuilder {
     /// namespace `"db"`, a tool named `"query"` becomes `"db_query"`.
     pub fn separator(mut self, sep: impl Into<String>) -> Self {
         self.separator = sep.into();
+        self
+    }
+
+    /// Set a notification sender for forwarding backend list-changed
+    /// notifications to downstream clients.
+    ///
+    /// When a backend emits `tools/list_changed`, `resources/list_changed`,
+    /// or `prompts/list_changed`, the proxy refreshes its cache and then
+    /// forwards the notification through this sender so transports can
+    /// relay it to connected clients.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use tower_mcp::context::notification_channel;
+    ///
+    /// let (notif_tx, notif_rx) = notification_channel(32);
+    /// let proxy = McpProxy::builder("proxy", "1.0.0")
+    ///     .notification_sender(notif_tx)
+    ///     .backend("db", transport).await
+    ///     .build().await?;
+    ///
+    /// let mut transport = GenericStdioTransport::with_notifications(proxy, notif_rx);
+    /// ```
+    pub fn notification_sender(mut self, tx: crate::context::NotificationSender) -> Self {
+        self.notification_tx = Some(tx);
         self
     }
 
@@ -288,9 +316,17 @@ impl McpProxyBuilder {
             return Err(Error::internal("All backends failed to initialize"));
         }
 
-        let proxy = McpProxy::new(self.name, self.version, backends, entries);
+        let proxy = McpProxy::new(
+            self.name,
+            self.version,
+            backends,
+            entries,
+            self.notification_tx,
+        );
 
-        // Spawn invalidation watchers for backends with notification handlers
+        // Spawn invalidation watchers for backends with notification handlers.
+        // After refreshing the cache, forward list-changed notifications
+        // downstream so transports can relay them to connected clients.
         for (backend_idx, mut rx) in invalidation_rxs {
             let shared = Arc::clone(&proxy.shared);
             tokio::spawn(async move {
@@ -302,9 +338,30 @@ impl McpProxyBuilder {
                         "Backend list changed, refreshing cache"
                     );
                     match changed {
-                        ListChanged::Tools => backend.refresh_tools().await,
-                        ListChanged::Resources => backend.refresh_resources().await,
-                        ListChanged::Prompts => backend.refresh_prompts().await,
+                        ListChanged::Tools => {
+                            backend.refresh_tools().await;
+                            if let Some(tx) = &shared.notification_tx {
+                                let _ = tx
+                                    .send(crate::context::ServerNotification::ToolsListChanged)
+                                    .await;
+                            }
+                        }
+                        ListChanged::Resources => {
+                            backend.refresh_resources().await;
+                            if let Some(tx) = &shared.notification_tx {
+                                let _ = tx
+                                    .send(crate::context::ServerNotification::ResourcesListChanged)
+                                    .await;
+                            }
+                        }
+                        ListChanged::Prompts => {
+                            backend.refresh_prompts().await;
+                            if let Some(tx) = &shared.notification_tx {
+                                let _ = tx
+                                    .send(crate::context::ServerNotification::PromptsListChanged)
+                                    .await;
+                            }
+                        }
                     }
                 }
             });

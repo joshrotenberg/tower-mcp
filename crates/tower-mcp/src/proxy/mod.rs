@@ -59,7 +59,7 @@ mod service;
 mod tests;
 
 pub use builder::McpProxyBuilder;
-pub use service::McpProxy;
+pub use service::{BackendHealth, McpProxy};
 
 // Re-export BackendService so users can write layer bounds against it
 pub use backend::BackendService;
