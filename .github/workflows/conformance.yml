@@ -10,8 +10,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  conformance:
-    name: MCP Conformance Suite
+  server-conformance:
+    name: Server Conformance Suite
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -19,7 +19,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v6
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Build conformance server
         run: cargo build --manifest-path examples/conformance-server/Cargo.toml
@@ -44,8 +44,32 @@ jobs:
           exit 1
 
       - name: Run conformance suite
-        run: npx @modelcontextprotocol/conformance@0.1.13 server --url http://127.0.0.1:3001/mcp --expected-failures ./conformance-baseline.yml
+        run: npx @modelcontextprotocol/conformance@0.1.15 server --url http://127.0.0.1:3001/mcp --expected-failures ./conformance-baseline.yml
 
       - name: Show server logs on failure
         if: failure()
         run: cat /tmp/conformance-server.log
+
+  client-conformance:
+    name: Client Conformance Suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Build conformance client
+        run: cargo build --manifest-path examples/conformance-client/Cargo.toml
+
+      - name: Run client conformance suite
+        run: |
+          npx @modelcontextprotocol/conformance@0.1.15 client \
+            --suite all \
+            --command "cargo run --manifest-path examples/conformance-client/Cargo.toml --" \
+            2>&1 | tee /tmp/client-conformance.log
+          # The conformance tool exits non-zero on SHOULD-level warnings.
+          # Check for actual failures (0 failed) to determine pass/fail.
+          grep -q "0 failed" /tmp/client-conformance.log
