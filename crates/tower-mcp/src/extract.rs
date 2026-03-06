@@ -797,6 +797,7 @@ where
 
 /// Helper trait to get schema from `Json<T>` extractor
 pub trait HasSchema {
+    /// Returns the JSON Schema for this type, if available.
     fn schema() -> Option<Value>;
 }
 

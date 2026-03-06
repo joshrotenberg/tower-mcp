@@ -1973,7 +1973,9 @@ pub use crate::context::Extensions;
 /// Request type for the tower Service implementation
 #[derive(Debug, Clone)]
 pub struct RouterRequest {
+    /// The JSON-RPC request ID.
     pub id: RequestId,
+    /// The parsed MCP request.
     pub inner: McpRequest,
     /// Type-map for passing data (e.g., `TokenClaims`) through middleware.
     pub extensions: Extensions,
@@ -1982,7 +1984,9 @@ pub struct RouterRequest {
 /// Response type for the tower Service implementation
 #[derive(Debug, Clone)]
 pub struct RouterResponse {
+    /// The JSON-RPC request ID this response corresponds to.
     pub id: RequestId,
+    /// The MCP response or JSON-RPC error.
     pub inner: std::result::Result<McpResponse, JsonRpcError>,
 }
 

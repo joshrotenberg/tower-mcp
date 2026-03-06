@@ -481,6 +481,7 @@ pub struct ResourceBuilder {
 }
 
 impl ResourceBuilder {
+    /// Create a new resource builder with the given URI.
     pub fn new(uri: impl Into<String>) -> Self {
         Self {
             uri: uri.into(),
@@ -1070,11 +1071,16 @@ where
 /// assert_eq!(resource.uri, "file:///config.json");
 /// ```
 pub trait McpResource: Send + Sync + 'static {
+    /// The resource URI.
     const URI: &'static str;
+    /// The resource name.
     const NAME: &'static str;
+    /// Optional human-readable description.
     const DESCRIPTION: Option<&'static str> = None;
+    /// Optional MIME type for the resource content.
     const MIME_TYPE: Option<&'static str> = None;
 
+    /// Read the resource content.
     fn read(&self) -> impl Future<Output = Result<ReadResourceResult>> + Send;
 
     /// Convert to a Resource instance
