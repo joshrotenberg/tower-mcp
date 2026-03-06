@@ -14,7 +14,8 @@ mod proxy_tests {
     use crate::proxy::McpProxy;
     use crate::router::{Extensions, RouterRequest};
     use crate::{
-        CallToolResult, GetPromptResult, McpRouter, PromptBuilder, ResourceBuilder, ToolBuilder,
+        CallToolResult, GetPromptResult, McpRouter, PromptBuilder, ReadResourceResult,
+        ResourceBuilder, ResourceContent, ResourceTemplateBuilder, ToolBuilder,
     };
 
     use schemars::JsonSchema;
@@ -57,6 +58,23 @@ mod proxy_tests {
             .description("Project readme")
             .text("# Hello");
 
+        let file_template = ResourceTemplateBuilder::new("file:///{path}")
+            .name("File Template")
+            .description("Read a file by path")
+            .handler(|uri: String, vars: HashMap<String, String>| async move {
+                let path = vars.get("path").cloned().unwrap_or_default();
+                Ok(ReadResourceResult {
+                    contents: vec![ResourceContent {
+                        uri,
+                        mime_type: Some("text/plain".to_string()),
+                        text: Some(format!("contents of {}", path)),
+                        blob: None,
+                        meta: None,
+                    }],
+                    meta: None,
+                })
+            });
+
         let greet = PromptBuilder::new("greet")
             .description("Greet someone")
             .required_arg("name", "Name to greet")
@@ -70,6 +88,7 @@ mod proxy_tests {
             .server_info("text-server", "1.0.0")
             .tool(echo)
             .resource(readme)
+            .resource_template(file_template)
             .prompt(greet)
     }
 
@@ -249,6 +268,51 @@ mod proxy_tests {
     // ========================================================================
 
     #[tokio::test]
+    async fn test_proxy_call_unknown_resource_returns_error() {
+        let mut proxy = build_test_proxy().await;
+
+        let result = call_proxy(
+            &mut proxy,
+            McpRequest::ReadResource(crate::protocol::ReadResourceParams {
+                uri: "unknown://resource".to_string(),
+                meta: None,
+            }),
+        )
+        .await;
+
+        assert!(result.is_err(), "should return error for unknown resource");
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("Unknown resource"),
+            "error should mention unknown resource, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_call_unknown_prompt_returns_error() {
+        let mut proxy = build_test_proxy().await;
+
+        let result = call_proxy(
+            &mut proxy,
+            McpRequest::GetPrompt(crate::protocol::GetPromptParams {
+                name: "nonexistent_prompt".to_string(),
+                arguments: Default::default(),
+                meta: None,
+            }),
+        )
+        .await;
+
+        assert!(result.is_err(), "should return error for unknown prompt");
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("Unknown prompt"),
+            "error should mention unknown prompt, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
     async fn test_proxy_list_resources() {
         let mut proxy = build_test_proxy().await;
 
@@ -293,6 +357,42 @@ mod proxy_tests {
                 assert_eq!(result.first_text(), Some("# Hello"));
             }
             other => panic!("expected ReadResource response, got: {:?}", other),
+        }
+    }
+
+    // ========================================================================
+    // List resource templates
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_proxy_list_resource_templates() {
+        let mut proxy = build_test_proxy().await;
+
+        let resp = call_proxy(
+            &mut proxy,
+            McpRequest::ListResourceTemplates(Default::default()),
+        )
+        .await
+        .expect("list resource templates should succeed");
+
+        match resp {
+            McpResponse::ListResourceTemplates(result) => {
+                // text backend has one resource template
+                assert_eq!(result.resource_templates.len(), 1);
+                let template = &result.resource_templates[0];
+                // Should be namespaced
+                assert!(
+                    template.name.starts_with("text_"),
+                    "template name should be namespaced, got: {}",
+                    template.name
+                );
+                assert!(
+                    template.uri_template.starts_with("text_"),
+                    "template URI should be namespaced, got: {}",
+                    template.uri_template
+                );
+            }
+            other => panic!("expected ListResourceTemplates, got: {:?}", other),
         }
     }
 
@@ -439,6 +539,71 @@ mod proxy_tests {
         assert!(result.is_err());
     }
 
+    #[tokio::test]
+    async fn test_proxy_unsupported_method_returns_error() {
+        let mut proxy = build_test_proxy().await;
+
+        let result = call_proxy(
+            &mut proxy,
+            McpRequest::SetLoggingLevel(crate::protocol::SetLogLevelParams {
+                level: crate::protocol::LogLevel::Info,
+                meta: None,
+            }),
+        )
+        .await;
+
+        assert!(result.is_err(), "unsupported method should return error");
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("not supported"),
+            "error should mention not supported, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_backend_client_path() {
+        let transport = ChannelTransport::new(math_router());
+        let client = McpClient::connect(transport).await.expect("should connect");
+
+        // Use backend_client (pre-connected McpClient) instead of backend (transport)
+        let mut proxy = McpProxy::builder("client-proxy", "1.0.0")
+            .backend_client("math", client)
+            .build()
+            .await
+            .expect("proxy should build");
+
+        // Should still be able to list and call tools
+        let resp = call_proxy(&mut proxy, McpRequest::ListTools(Default::default()))
+            .await
+            .expect("list tools should succeed");
+
+        match resp {
+            McpResponse::ListTools(result) => {
+                assert_eq!(result.tools.len(), 1);
+                assert_eq!(result.tools[0].name, "math_add");
+            }
+            other => panic!("expected ListTools, got: {:?}", other),
+        }
+
+        let resp = call_proxy(
+            &mut proxy,
+            McpRequest::CallTool(crate::protocol::CallToolParams {
+                name: "math_add".to_string(),
+                arguments: json!({"a": 5, "b": 7}),
+                meta: None,
+                task: None,
+            }),
+        )
+        .await
+        .expect("call tool should succeed");
+
+        match resp {
+            McpResponse::CallTool(result) => assert_eq!(result.all_text(), "12"),
+            other => panic!("expected CallTool, got: {:?}", other),
+        }
+    }
+
     // ========================================================================
     // Clone
     // ========================================================================
@@ -526,6 +691,56 @@ mod proxy_tests {
             .await
             .expect("should get prompt");
         assert!(prompt.first_message_text().unwrap().contains("Bob"));
+    }
+
+    /// A transport that immediately returns EOF, causing initialization to fail.
+    struct BrokenTransport;
+
+    #[async_trait::async_trait]
+    impl crate::client::ClientTransport for BrokenTransport {
+        async fn send(&mut self, _message: &str) -> crate::error::Result<()> {
+            Err(crate::error::Error::internal("broken transport"))
+        }
+
+        async fn recv(&mut self) -> crate::error::Result<Option<String>> {
+            Ok(None) // EOF
+        }
+
+        fn is_connected(&self) -> bool {
+            false
+        }
+
+        async fn close(&mut self) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_proxy_skips_failed_backend_initialization() {
+        let good_transport = ChannelTransport::new(math_router());
+
+        // Build with one broken and one good backend
+        let mut proxy = McpProxy::builder("mixed-init", "1.0.0")
+            .backend("broken", BrokenTransport)
+            .await
+            .backend("math", good_transport)
+            .await
+            .build()
+            .await
+            .expect("proxy should build with at least one good backend");
+
+        // Only the math backend should be available
+        let resp = call_proxy(&mut proxy, McpRequest::ListTools(Default::default()))
+            .await
+            .expect("list tools should succeed");
+
+        match resp {
+            McpResponse::ListTools(result) => {
+                assert_eq!(result.tools.len(), 1);
+                assert_eq!(result.tools[0].name, "math_add");
+            }
+            other => panic!("expected ListTools, got: {:?}", other),
+        }
     }
 
     // ========================================================================
