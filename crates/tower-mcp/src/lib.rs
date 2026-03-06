@@ -363,6 +363,8 @@ pub mod middleware;
 pub mod oauth;
 pub mod prompt;
 pub mod protocol;
+#[cfg(feature = "proxy")]
+pub mod proxy;
 #[cfg(feature = "dynamic-tools")]
 pub mod registry;
 pub mod resource;
@@ -377,8 +379,8 @@ pub mod transport;
 // Re-exports
 pub use async_task::{Task, TaskStore};
 pub use client::{
-    ClientHandler, ClientTransport, McpClient, McpClientBuilder, NotificationHandler,
-    StdioClientTransport,
+    ChannelTransport, ClientHandler, ClientTransport, McpClient, McpClientBuilder,
+    NotificationHandler, StdioClientTransport,
 };
 #[cfg(feature = "http-client")]
 pub use client::{HttpClientConfig, HttpClientTransport};
