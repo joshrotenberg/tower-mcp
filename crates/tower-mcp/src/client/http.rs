@@ -43,11 +43,11 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
 
 use super::transport::ClientTransport;
@@ -197,7 +197,9 @@ pub struct HttpClientTransport {
     /// Handle to the SSE background task, if running.
     sse_task: Option<JoinHandle<()>>,
     /// The last SSE event ID received, for stream resumption.
-    last_event_id: Arc<AtomicU64>,
+    last_event_id: Arc<RwLock<Option<String>>>,
+    /// Server-requested retry delay from SSE `retry:` field.
+    sse_retry_delay: Arc<RwLock<Option<Duration>>>,
     /// Whether the transport is still connected.
     connected: Arc<AtomicBool>,
     /// Configuration options.
@@ -249,7 +251,8 @@ impl HttpClientTransport {
             incoming_rx: rx,
             incoming_tx: tx,
             sse_task: None,
-            last_event_id: Arc::new(AtomicU64::new(0)),
+            last_event_id: Arc::new(RwLock::new(None)),
+            sse_retry_delay: Arc::new(RwLock::new(None)),
             connected: Arc::new(AtomicBool::new(true)),
             config,
             #[cfg(feature = "oauth-client")]
@@ -284,7 +287,8 @@ impl HttpClientTransport {
             incoming_rx: rx,
             incoming_tx: tx,
             sse_task: None,
-            last_event_id: Arc::new(AtomicU64::new(0)),
+            last_event_id: Arc::new(RwLock::new(None)),
+            sse_retry_delay: Arc::new(RwLock::new(None)),
             connected: Arc::new(AtomicBool::new(true)),
             config,
             #[cfg(feature = "oauth-client")]
@@ -432,6 +436,7 @@ impl HttpClientTransport {
         let protocol_version = self.protocol_version.clone();
         let tx = self.incoming_tx.clone();
         let last_event_id = self.last_event_id.clone();
+        let sse_retry_delay = self.sse_retry_delay.clone();
         let connected = self.connected.clone();
         let config = self.config.clone();
         #[cfg(feature = "oauth-client")]
@@ -445,6 +450,7 @@ impl HttpClientTransport {
                 protocol_version,
                 tx,
                 last_event_id,
+                sse_retry_delay,
                 connected,
                 config,
                 #[cfg(feature = "oauth-client")]
@@ -529,7 +535,9 @@ impl ClientTransport for HttpClientTransport {
                 // Read response body and queue for recv()
                 match response.text().await {
                     Ok(body) if !body.is_empty() => {
-                        let _ = tx.send(body).await;
+                        for msg in extract_json_messages(&body) {
+                            let _ = tx.send(msg).await;
+                        }
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "Failed to read response body");
@@ -601,9 +609,9 @@ impl ClientTransport for HttpClientTransport {
             .await
             .map_err(|e| Error::Transport(format!("Failed to read response: {}", e)))?;
 
-        if !body.is_empty() {
+        for msg in extract_json_messages(&body) {
             self.incoming_tx
-                .send(body)
+                .send(msg)
                 .await
                 .map_err(|_| Error::Transport("Internal channel closed".to_string()))?;
         }
@@ -672,7 +680,8 @@ struct SseLoopParams {
     session_id: String,
     protocol_version: Option<String>,
     tx: mpsc::Sender<String>,
-    last_event_id: Arc<AtomicU64>,
+    last_event_id: Arc<RwLock<Option<String>>>,
+    sse_retry_delay: Arc<RwLock<Option<Duration>>>,
     connected: Arc<AtomicBool>,
     config: HttpClientConfig,
     #[cfg(feature = "oauth-client")]
@@ -692,6 +701,7 @@ async fn sse_stream_loop(params: SseLoopParams) {
         protocol_version,
         tx,
         last_event_id,
+        sse_retry_delay,
         connected,
         config,
         #[cfg(feature = "oauth-client")]
@@ -732,9 +742,8 @@ async fn sse_stream_loop(params: SseLoopParams) {
         }
 
         // Send Last-Event-ID for stream resumption
-        let lei = last_event_id.load(Ordering::Acquire);
-        if lei > 0 {
-            request = request.header("Last-Event-ID", lei.to_string());
+        if let Some(ref lei) = *last_event_id.read().await {
+            request = request.header("Last-Event-ID", lei.clone());
         }
 
         let response = match request.send().await {
@@ -753,7 +762,11 @@ async fn sse_stream_loop(params: SseLoopParams) {
                     break;
                 }
                 reconnect_attempts += 1;
-                tokio::time::sleep(config.sse_reconnect_delay).await;
+                let delay = sse_retry_delay
+                    .read()
+                    .await
+                    .unwrap_or(config.sse_reconnect_delay);
+                tokio::time::sleep(delay).await;
                 continue;
             }
         };
@@ -768,8 +781,11 @@ async fn sse_stream_loop(params: SseLoopParams) {
                 Some(Ok(bytes)) => {
                     let text = String::from_utf8_lossy(&bytes);
                     for event in parser.feed(&text) {
-                        if let Some(id) = event.id {
-                            last_event_id.store(id, Ordering::Release);
+                        if let Some(ref id) = event.id {
+                            *last_event_id.write().await = Some(id.clone());
+                        }
+                        if let Some(retry_ms) = event.retry {
+                            *sse_retry_delay.write().await = Some(Duration::from_millis(retry_ms));
                         }
                         if !event.data.is_empty() && tx.send(event.data).await.is_err() {
                             return; // Channel closed, transport dropped
@@ -795,12 +811,17 @@ async fn sse_stream_loop(params: SseLoopParams) {
             break;
         }
         reconnect_attempts += 1;
+        let delay = sse_retry_delay
+            .read()
+            .await
+            .unwrap_or(config.sse_reconnect_delay);
         tracing::info!(
             attempt = reconnect_attempts,
             max = config.max_sse_reconnect_attempts,
+            delay_ms = delay.as_millis() as u64,
             "Reconnecting SSE stream"
         );
-        tokio::time::sleep(config.sse_reconnect_delay).await;
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -808,13 +829,40 @@ async fn sse_stream_loop(params: SseLoopParams) {
 // SSE Parser
 // =============================================================================
 
+/// Extract JSON messages from a response body.
+///
+/// If the body is SSE-formatted (`event: message\ndata: ...\n\n`), extracts the
+/// `data:` content from each event. Otherwise returns the body as-is.
+fn extract_json_messages(body: &str) -> Vec<String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    // Heuristic: SSE bodies start with "event:" or "data:" or "id:" or ":"
+    let looks_like_sse = trimmed.starts_with("event:")
+        || trimmed.starts_with("data:")
+        || trimmed.starts_with("id:")
+        || trimmed.starts_with(':');
+
+    if looks_like_sse {
+        let mut parser = SseParser::new();
+        let events = parser.feed(body);
+        events.into_iter().map(|e| e.data).collect()
+    } else {
+        vec![trimmed.to_string()]
+    }
+}
+
 /// A parsed SSE event.
 #[derive(Debug)]
 struct SseEvent {
-    /// Event ID (from `id:` line), if present.
-    id: Option<u64>,
+    /// Event ID (from `id:` line), if present. String per SSE spec.
+    id: Option<String>,
     /// Event data (from `data:` lines, joined with newlines).
     data: String,
+    /// Server-requested retry delay in milliseconds (from `retry:` line).
+    retry: Option<u64>,
 }
 
 /// Incremental SSE parser.
@@ -825,8 +873,9 @@ struct SseParser {
     /// Partial line buffer (when a chunk ends mid-line).
     buffer: String,
     /// Current event being parsed.
-    current_id: Option<u64>,
+    current_id: Option<String>,
     current_data: Vec<String>,
+    current_retry: Option<u64>,
 }
 
 impl SseParser {
@@ -835,6 +884,7 @@ impl SseParser {
             buffer: String::new(),
             current_id: None,
             current_data: Vec::new(),
+            current_retry: None,
         }
     }
 
@@ -852,18 +902,25 @@ impl SseParser {
 
             if line.is_empty() {
                 // Empty line = end of event
-                if !self.current_data.is_empty() {
+                if !self.current_data.is_empty() || self.current_retry.is_some() {
                     events.push(SseEvent {
                         id: self.current_id.take(),
                         data: self.current_data.join("\n"),
+                        retry: self.current_retry.take(),
                     });
                     self.current_data.clear();
                 }
                 self.current_id = None;
+                self.current_retry = None;
             } else if let Some(value) = line.strip_prefix("id:") {
-                self.current_id = value.trim().parse().ok();
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    self.current_id = Some(trimmed.to_string());
+                }
             } else if let Some(value) = line.strip_prefix("data:") {
                 self.current_data.push(value.trim().to_string());
+            } else if let Some(value) = line.strip_prefix("retry:") {
+                self.current_retry = value.trim().parse().ok();
             }
             // Lines starting with ':' are comments (keep-alive) -- ignored
             // Lines starting with 'event:' are event types -- ignored (we only care about data)
@@ -887,7 +944,7 @@ mod tests {
         let events = parser.feed("id: 1\nevent: message\ndata: {\"hello\":\"world\"}\n\n");
 
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].id, Some(1));
+        assert_eq!(events[0].id, Some("1".to_string()));
         assert_eq!(events[0].data, "{\"hello\":\"world\"}");
     }
 
@@ -901,9 +958,9 @@ mod tests {
         assert_eq!(events[0].data, "first");
         assert_eq!(events[1].data, "second");
         assert_eq!(events[2].data, "third");
-        assert_eq!(events[0].id, Some(1));
-        assert_eq!(events[1].id, Some(2));
-        assert_eq!(events[2].id, Some(3));
+        assert_eq!(events[0].id, Some("1".to_string()));
+        assert_eq!(events[1].id, Some("2".to_string()));
+        assert_eq!(events[2].id, Some("3".to_string()));
     }
 
     #[test]
@@ -917,7 +974,7 @@ mod tests {
         // Second chunk: completes the event
         let events = parser.feed("ta: hello\n\n");
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].id, Some(1));
+        assert_eq!(events[0].id, Some("1".to_string()));
         assert_eq!(events[0].data, "hello");
     }
 
@@ -975,7 +1032,7 @@ mod tests {
         let events = parser.feed(&input);
 
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].id, Some(42));
+        assert_eq!(events[0].id, Some("42".to_string()));
 
         // Verify it's valid JSON
         let parsed: serde_json::Value = serde_json::from_str(&events[0].data).unwrap();
