@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use tokio::sync::RwLock;
+use tower::ServiceExt;
 use tower::util::BoxCloneService;
 use tower_service::Service;
 
@@ -93,6 +94,8 @@ pub(super) struct McpProxyShared {
     pub(super) backends: Vec<Backend>,
     /// Optional sender for forwarding list-changed notifications downstream.
     pub(super) notification_tx: Option<crate::context::NotificationSender>,
+    /// Aggregated or custom instructions for the initialize response.
+    instructions: Option<String>,
 }
 
 /// Health status of a single backend.
@@ -125,6 +128,7 @@ impl McpProxy {
         backends: Vec<Backend>,
         entries: Vec<BackendEntry>,
         notification_tx: Option<crate::context::NotificationSender>,
+        instructions: Option<String>,
     ) -> Self {
         Self {
             shared: Arc::new(McpProxyShared {
@@ -132,6 +136,7 @@ impl McpProxy {
                 version,
                 backends,
                 notification_tx,
+                instructions,
             }),
             entries,
         }
@@ -210,7 +215,7 @@ impl EntryInfo {
 async fn handle_initialize(
     name: String,
     version: String,
-    num_backends: usize,
+    instructions: Option<String>,
 ) -> Result<McpResponse, JsonRpcError> {
     Ok(McpResponse::Initialize(InitializeResult {
         protocol_version: "2025-11-25".to_string(),
@@ -233,10 +238,7 @@ async fn handle_initialize(
             experimental: None,
             extensions: None,
         },
-        instructions: Some(format!(
-            "MCP proxy aggregating {} backend servers",
-            num_backends
-        )),
+        instructions,
         meta: None,
     }))
 }
@@ -259,7 +261,7 @@ async fn handle_list_tools(infos: Vec<EntryInfo>) -> Result<McpResponse, JsonRpc
 }
 
 async fn handle_call_tool(
-    mut service: BoxCloneService<RouterRequest, RouterResponse, Infallible>,
+    service: BoxCloneService<RouterRequest, RouterResponse, Infallible>,
     stripped_name: String,
     params: CallToolParams,
     id: RequestId,
@@ -278,7 +280,7 @@ async fn handle_call_tool(
         extensions,
     };
 
-    let resp = service.call(router_req).await.expect("infallible");
+    let resp = service.oneshot(router_req).await.expect("infallible");
     resp.inner
 }
 
@@ -323,7 +325,7 @@ async fn handle_list_resource_templates(
 }
 
 async fn handle_read_resource(
-    mut service: BoxCloneService<RouterRequest, RouterResponse, Infallible>,
+    service: BoxCloneService<RouterRequest, RouterResponse, Infallible>,
     stripped_uri: String,
     params: ReadResourceParams,
     id: RequestId,
@@ -340,7 +342,7 @@ async fn handle_read_resource(
         extensions,
     };
 
-    let resp = service.call(router_req).await.expect("infallible");
+    let resp = service.oneshot(router_req).await.expect("infallible");
     resp.inner
 }
 
@@ -362,7 +364,7 @@ async fn handle_list_prompts(infos: Vec<EntryInfo>) -> Result<McpResponse, JsonR
 }
 
 async fn handle_get_prompt(
-    mut service: BoxCloneService<RouterRequest, RouterResponse, Infallible>,
+    service: BoxCloneService<RouterRequest, RouterResponse, Infallible>,
     stripped_name: String,
     params: GetPromptParams,
     id: RequestId,
@@ -380,7 +382,7 @@ async fn handle_get_prompt(
         extensions,
     };
 
-    let resp = service.call(router_req).await.expect("infallible");
+    let resp = service.oneshot(router_req).await.expect("infallible");
     resp.inner
 }
 
@@ -410,8 +412,8 @@ impl Service<RouterRequest> for McpProxy {
                 McpRequest::Initialize(_params) => {
                     let name = self.shared.name.clone();
                     let version = self.shared.version.clone();
-                    let num = self.entries.len();
-                    Box::pin(handle_initialize(name, version, num))
+                    let instructions = self.shared.instructions.clone();
+                    Box::pin(handle_initialize(name, version, instructions))
                 }
                 McpRequest::Ping => Box::pin(async { Ok(McpResponse::Pong(Default::default())) }),
                 McpRequest::ListTools(_params) => {

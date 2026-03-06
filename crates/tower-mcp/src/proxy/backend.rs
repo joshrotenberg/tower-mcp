@@ -49,6 +49,8 @@ pub(crate) struct Backend {
     pub client: Arc<McpClient>,
     /// Cached capabilities, refreshed on list-changed notifications.
     pub cache: Arc<RwLock<CachedCapabilities>>,
+    /// Instructions from the backend's initialize response.
+    pub instructions: Option<String>,
 }
 
 impl Backend {
@@ -83,16 +85,21 @@ impl Backend {
             separator,
             client: Arc::new(client),
             cache,
+            instructions: None,
         })
     }
 
     /// Create a backend from an already-connected client (no notification forwarding).
     pub fn from_client(namespace: impl Into<String>, client: McpClient, separator: String) -> Self {
+        let instructions = client
+            .server_info()
+            .and_then(|info| info.instructions.clone());
         Self {
             namespace: namespace.into(),
             separator,
             client: Arc::new(client),
             cache: Arc::new(RwLock::new(CachedCapabilities::default())),
+            instructions,
         }
     }
 
@@ -104,10 +111,17 @@ impl Backend {
     }
 
     /// Initialize the backend: run MCP initialize handshake and discover capabilities.
-    pub async fn initialize(&self, proxy_name: &str, proxy_version: &str) -> Result<()> {
-        self.client.initialize(proxy_name, proxy_version).await?;
+    ///
+    /// Returns the backend's instructions (if any) from the initialize response.
+    pub async fn initialize(
+        &self,
+        proxy_name: &str,
+        proxy_version: &str,
+    ) -> Result<Option<String>> {
+        let result = self.client.initialize(proxy_name, proxy_version).await?;
+        let instructions = result.instructions.clone();
         self.refresh_capabilities().await?;
-        Ok(())
+        Ok(instructions)
     }
 
     /// Refresh cached capabilities from the backend.

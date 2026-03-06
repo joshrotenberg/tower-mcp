@@ -102,7 +102,7 @@ mod proxy_tests {
             .await
             .backend("text", text_transport)
             .await
-            .build()
+            .build_strict()
             .await
             .expect("proxy should build")
     }
@@ -476,7 +476,7 @@ mod proxy_tests {
             .separator(".")
             .backend("math", math_transport)
             .await
-            .build()
+            .build_strict()
             .await
             .expect("proxy should build");
 
@@ -612,7 +612,7 @@ mod proxy_tests {
         // Use backend_client (pre-connected McpClient) instead of backend (transport)
         let mut proxy = McpProxy::builder("client-proxy", "1.0.0")
             .backend_client("math", client)
-            .build()
+            .build_strict()
             .await
             .expect("proxy should build");
 
@@ -763,7 +763,7 @@ mod proxy_tests {
         let good_transport = ChannelTransport::new(math_router());
 
         // Build with one broken and one good backend
-        let mut proxy = McpProxy::builder("mixed-init", "1.0.0")
+        let result = McpProxy::builder("mixed-init", "1.0.0")
             .backend("broken", BrokenTransport)
             .await
             .backend("math", good_transport)
@@ -771,6 +771,11 @@ mod proxy_tests {
             .build()
             .await
             .expect("proxy should build with at least one good backend");
+
+        // The broken backend should be in the skipped list
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.skipped[0].namespace, "broken");
+        let mut proxy = result.proxy;
 
         // Only the math backend should be available
         let resp = call_proxy(&mut proxy, McpRequest::ListTools(Default::default()))
@@ -818,7 +823,7 @@ mod proxy_tests {
             .backend("slow", slow_transport)
             .await
             .backend_layer(TimeoutLayer::new(Duration::from_millis(50)))
-            .build()
+            .build_strict()
             .await
             .expect("proxy should build");
 
@@ -853,7 +858,7 @@ mod proxy_tests {
             .backend("slow", slow_transport)
             .await
             .backend_layer(TimeoutLayer::new(Duration::from_secs(5)))
-            .build()
+            .build_strict()
             .await
             .expect("proxy should build");
 
@@ -891,7 +896,7 @@ mod proxy_tests {
             .backend("slow", slow_transport)
             .await
             .backend_layer(TimeoutLayer::new(Duration::from_millis(50)))
-            .build()
+            .build_strict()
             .await
             .expect("proxy should build");
 
@@ -961,7 +966,7 @@ mod proxy_tests {
             .notification_sender(notif_tx)
             .backend("math", math_transport)
             .await
-            .build()
+            .build_strict()
             .await
             .expect("proxy should build");
 
@@ -970,8 +975,220 @@ mod proxy_tests {
     }
 
     // ========================================================================
+    // Instructions aggregation (#605)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_proxy_aggregates_backend_instructions() {
+        // Create routers with instructions
+        let math = McpRouter::new()
+            .server_info("math-server", "1.0.0")
+            .instructions("Provides arithmetic operations")
+            .tool(
+                ToolBuilder::new("add")
+                    .description("Add two numbers")
+                    .handler(|input: AddInput| async move {
+                        Ok(CallToolResult::text(format!("{}", input.a + input.b)))
+                    })
+                    .build(),
+            );
+
+        let text = McpRouter::new()
+            .server_info("text-server", "1.0.0")
+            .instructions("Provides text manipulation tools")
+            .tool(
+                ToolBuilder::new("echo")
+                    .description("Echo a message")
+                    .handler(
+                        |input: EchoInput| async move { Ok(CallToolResult::text(input.message)) },
+                    )
+                    .build(),
+            );
+
+        let math_transport = ChannelTransport::new(math);
+        let text_transport = ChannelTransport::new(text);
+
+        let mut proxy = McpProxy::builder("instructions-proxy", "1.0.0")
+            .backend("math", math_transport)
+            .await
+            .backend("text", text_transport)
+            .await
+            .build_strict()
+            .await
+            .expect("proxy should build");
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::Initialize(crate::protocol::InitializeParams {
+                protocol_version: "2025-11-25".to_string(),
+                capabilities: Default::default(),
+                client_info: crate::protocol::Implementation {
+                    name: "test".to_string(),
+                    version: "1.0".to_string(),
+                    ..Default::default()
+                },
+                meta: None,
+            }),
+            extensions: Extensions::new(),
+        };
+
+        let resp = proxy.call(req).await.unwrap();
+        let result = resp.inner.unwrap();
+
+        if let McpResponse::Initialize(init) = result {
+            let instructions = init.instructions.expect("should have instructions");
+            assert!(
+                instructions.contains("[math] Provides arithmetic operations"),
+                "should contain math instructions: {instructions}"
+            );
+            assert!(
+                instructions.contains("[text] Provides text manipulation tools"),
+                "should contain text instructions: {instructions}"
+            );
+        } else {
+            panic!("expected Initialize response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_proxy_custom_instructions_override() {
+        let math_transport = ChannelTransport::new(math_router());
+
+        let mut proxy = McpProxy::builder("custom-proxy", "1.0.0")
+            .instructions("Custom proxy description")
+            .backend("math", math_transport)
+            .await
+            .build_strict()
+            .await
+            .expect("proxy should build");
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::Initialize(crate::protocol::InitializeParams {
+                protocol_version: "2025-11-25".to_string(),
+                capabilities: Default::default(),
+                client_info: crate::protocol::Implementation {
+                    name: "test".to_string(),
+                    version: "1.0".to_string(),
+                    ..Default::default()
+                },
+                meta: None,
+            }),
+            extensions: Extensions::new(),
+        };
+
+        let resp = proxy.call(req).await.unwrap();
+        let result = resp.inner.unwrap();
+
+        if let McpResponse::Initialize(init) = result {
+            assert_eq!(
+                init.instructions.as_deref(),
+                Some("Custom proxy description")
+            );
+        } else {
+            panic!("expected Initialize response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_proxy_no_backend_instructions_gives_default() {
+        // math_router doesn't set instructions
+        let math_transport = ChannelTransport::new(math_router());
+
+        let mut proxy = McpProxy::builder("default-proxy", "1.0.0")
+            .backend("math", math_transport)
+            .await
+            .build_strict()
+            .await
+            .expect("proxy should build");
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::Initialize(crate::protocol::InitializeParams {
+                protocol_version: "2025-11-25".to_string(),
+                capabilities: Default::default(),
+                client_info: crate::protocol::Implementation {
+                    name: "test".to_string(),
+                    version: "1.0".to_string(),
+                    ..Default::default()
+                },
+                meta: None,
+            }),
+            extensions: Extensions::new(),
+        };
+
+        let resp = proxy.call(req).await.unwrap();
+        let result = resp.inner.unwrap();
+
+        if let McpResponse::Initialize(init) = result {
+            let instructions = init.instructions.expect("should have instructions");
+            assert_eq!(instructions, "MCP proxy aggregating 1 backend servers.");
+            // Should NOT contain any [namespace] section
+            assert!(!instructions.contains('['));
+        } else {
+            panic!("expected Initialize response");
+        }
+    }
+
+    // ========================================================================
     // CoalesceLayer integration
     // ========================================================================
+
+    // ========================================================================
+    // ConcurrencyLimit integration (#604)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_backend_concurrency_limit_serializes_requests() {
+        use tower::limit::ConcurrencyLimitLayer;
+
+        let slow_transport = ChannelTransport::new(slow_router());
+
+        let proxy = McpProxy::builder("concurrency-proxy", "1.0.0")
+            .backend("slow", slow_transport)
+            .await
+            .backend_layer(ConcurrencyLimitLayer::new(1))
+            .build_strict()
+            .await
+            .expect("proxy should build");
+
+        // Fire two concurrent requests. With ConcurrencyLimitLayer(1),
+        // they should be serialized (second waits for first to complete).
+        // Both should succeed -- backpressure is handled internally by
+        // BoxCloneService which calls poll_ready before dispatch.
+        let req1 = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::CallTool(crate::protocol::CallToolParams {
+                name: "slow_slow_op".to_string(),
+                arguments: json!({"delay_ms": 10}),
+                meta: None,
+                task: None,
+            }),
+            extensions: Extensions::new(),
+        };
+        let req2 = RouterRequest {
+            id: RequestId::Number(2),
+            inner: McpRequest::CallTool(crate::protocol::CallToolParams {
+                name: "slow_slow_op".to_string(),
+                arguments: json!({"delay_ms": 10}),
+                meta: None,
+                task: None,
+            }),
+            extensions: Extensions::new(),
+        };
+
+        let mut p1 = proxy.clone();
+        let mut p2 = proxy.clone();
+        let h1 = tokio::spawn(async move { p1.call(req1).await });
+        let h2 = tokio::spawn(async move { p2.call(req2).await });
+
+        let r1 = h1.await.unwrap().unwrap();
+        let r2 = h2.await.unwrap().unwrap();
+
+        // Both should succeed
+        assert!(r1.inner.is_ok(), "first request should succeed");
+        assert!(r2.inner.is_ok(), "second request should succeed");
+    }
 
     #[tokio::test]
     async fn test_coalesce_layer_deduplicates_concurrent_list_tools() {
