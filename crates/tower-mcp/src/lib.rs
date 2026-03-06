@@ -407,6 +407,8 @@ pub mod transport;
 
 // Re-export proc macros when the `macros` feature is enabled
 #[cfg(feature = "macros")]
+pub use tower_mcp_macros::prompt_fn;
+#[cfg(feature = "macros")]
 pub use tower_mcp_macros::tool_fn;
 
 // Re-exports

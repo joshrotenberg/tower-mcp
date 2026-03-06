@@ -1,13 +1,17 @@
-//! Example: using the `#[tool_fn]` proc macro.
+//! Example: using the `#[tool_fn]` and `#[prompt_fn]` proc macros.
 //!
-//! The macro generates a `{fn_name}_tool()` constructor that returns a `Tool`
-//! built via `ToolBuilder`. This is syntactic sugar -- the builder is the
-//! real API, and you can always eject to it for full control.
+//! The macros generate constructor functions that return `Tool` / `Prompt`
+//! built via `ToolBuilder` / `PromptBuilder`. This is syntactic sugar -- the
+//! builders are the real API, and you can always eject for full control.
 //!
 //! Run with: `cargo run --example tool_macro --features macros`
 
+use std::collections::HashMap;
+
 use schemars::JsonSchema;
 use serde::Deserialize;
+use tower_mcp::prompt_fn;
+use tower_mcp::protocol::GetPromptResult;
 use tower_mcp::tool_fn;
 use tower_mcp::{CallToolResult, McpRouter};
 
@@ -37,19 +41,36 @@ async fn greet(input: GreetInput) -> Result<CallToolResult, tower_mcp::Error> {
     Ok(CallToolResult::text(format!("Hello, {}!", input.name)))
 }
 
-// --- Use them like any other tool ---
+// --- Define prompts using the macro ---
+
+#[prompt_fn(description = "Review code in a given language", args(code = "Code to review", ?language = "Programming language"))]
+async fn review(args: HashMap<String, String>) -> Result<GetPromptResult, tower_mcp::Error> {
+    let code = args.get("code").cloned().unwrap_or_default();
+    let language = args
+        .get("language")
+        .cloned()
+        .unwrap_or_else(|| "unknown".into());
+    Ok(GetPromptResult::user_message(format!(
+        "Please review this {language} code:\n\n```\n{code}\n```"
+    )))
+}
+
+// --- Use them like any other tool/prompt ---
 
 fn main() {
-    // The macro generates add_tool() and greet_tool() functions
     let _router = McpRouter::new()
         .server_info("macro-example", "1.0.0")
         .tool(add_tool())
-        .tool(greet_tool());
+        .tool(greet_tool())
+        .prompt(review_prompt());
 
-    println!("Tools registered:");
-    println!("  - add (from #[tool_fn])");
-    println!("  - say-hello (from #[tool_fn] with custom name)");
+    println!("Registered via macros:");
+    println!("  Tools:");
+    println!("    - add (from #[tool_fn])");
+    println!("    - say-hello (from #[tool_fn] with custom name)");
+    println!("  Prompts:");
+    println!("    - review (from #[prompt_fn])");
     println!();
-    println!("These are identical to tools built with ToolBuilder.");
+    println!("These are identical to items built with ToolBuilder/PromptBuilder.");
     println!("Use `cargo expand --example tool_macro` to see the generated code.");
 }
