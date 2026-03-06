@@ -40,13 +40,13 @@ If you've used [axum](https://docs.rs/axum), tower-mcp's API will feel familiar:
 | **In-process testing** | `TestClient` lets you test MCP servers without spawning a subprocess or opening a socket. |
 | **Conformance** | 39/39 official MCP conformance tests pass in CI on every PR. |
 | **Capability filtering** | Session-based tool/resource/prompt visibility for multi-tenant patterns. |
-| **No proc macros required** | Builder pattern API with optional trait-based tools. Nothing hidden behind `#[derive]`. |
+| **No proc macros required** | Builder pattern API with optional trait-based tools. Nothing hidden behind `#[derive]`. Optional `#[tool_fn]` / `#[prompt_fn]` / `#[resource_fn]` macros available for convenience (feature: `macros`). |
 | **Multi-server proxy** | Aggregate N backend servers behind a single endpoint with per-backend middleware and namespace isolation. |
 | **axum ecosystem** | HTTP and WebSocket transports build on axum, so existing axum middleware and extractors work. |
 
 ### Trade-offs
 
-- **More boilerplate than macro-based approaches** for simple servers. If you want `#[tool]` on a function and nothing else, a proc-macro SDK may be more concise.
+- **More boilerplate than macro-based approaches** for simple servers, though the optional `macros` feature narrows this gap significantly.
 - **Requires Tower/Service familiarity.** The `.layer()` composition model is powerful but has a learning curve if you haven't used Tower before.
 - **Heavier dependency tree** than minimal single-transport implementations, especially with `features = ["full"]`.
 
@@ -103,6 +103,7 @@ tower-mcp = "0.7"
 | `testing` | Test utilities (`TestClient`) for in-process testing |
 | `dynamic-tools` | Runtime tool registration/deregistration via `DynamicToolRegistry` |
 | `proxy` | Multi-server aggregation proxy (`McpProxy`) |
+| `macros` | Optional proc macros (`#[tool_fn]`, `#[prompt_fn]`, `#[resource_fn]`, `#[resource_template_fn]`) |
 
 Example with features:
 
@@ -150,6 +151,42 @@ let add = ToolBuilder::new("add")
         Ok(CallToolResult::text(format!("{}", input.a + input.b)))
     })
     .build();
+```
+
+### Proc Macros (Optional)
+
+Enable with `features = ["macros"]`. The macros generate builder code -- you can always eject to the builder pattern for full control.
+
+```rust
+use tower_mcp::{tool_fn, prompt_fn, resource_fn, resource_template_fn};
+use tower_mcp::{CallToolResult, McpRouter};
+use tower_mcp::protocol::{GetPromptResult, ReadResourceResult};
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct AddInput { a: i64, b: i64 }
+
+#[tool_fn(description = "Add two numbers")]
+async fn add(input: AddInput) -> Result<CallToolResult, tower_mcp::Error> {
+    Ok(CallToolResult::text(format!("{}", input.a + input.b)))
+}
+
+#[prompt_fn(description = "Greet someone", args(name = "Name to greet"))]
+async fn greet(args: HashMap<String, String>) -> Result<GetPromptResult, tower_mcp::Error> {
+    let name = args.get("name").cloned().unwrap_or_default();
+    Ok(GetPromptResult::user_message(format!("Hello, {name}!")))
+}
+
+#[resource_fn(uri = "app://config", description = "App configuration")]
+async fn config() -> Result<ReadResourceResult, tower_mcp::Error> {
+    Ok(ReadResourceResult::text("app://config", "debug=true"))
+}
+
+// Each macro generates a constructor: add_tool(), greet_prompt(), config_resource()
+let router = McpRouter::new()
+    .server_info("my-server", "1.0.0")
+    .tool(add_tool())
+    .prompt(greet_prompt())
+    .resource(config_resource());
 ```
 
 ### Trait-Based (For Complex Tools)
