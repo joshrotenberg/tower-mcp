@@ -54,7 +54,7 @@ base64 = "0.22.1"
 # Tower ecosystem
 tower = { version = "0.5", features = ["util"] }
 tower-service = "0.3"
-tower-resilience = { version = "0.7", default-features = false, features = ["bulkhead", "ratelimiter", "coalesce"] }
+tower-resilience = { version = "0.8", default-features = false, features = ["bulkhead", "ratelimiter", "coalesce"] }
 
 # Async
 futures = "0.3"
