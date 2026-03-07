@@ -144,7 +144,9 @@
 //! - `childproc` - Child process transport for subprocess management
 //! - `oauth` - OAuth 2.1 resource server support (token validation, metadata endpoint)
 //! - `testing` - Test utilities (`TestClient`) for ergonomic MCP server testing
-//! - `dynamic-tools` - Runtime tool (de)registration via `DynamicToolRegistry`
+//! - `dynamic-tools` - Runtime registration/deregistration of tools, prompts, and resources via
+//!   [`DynamicToolRegistry`], [`DynamicPromptRegistry`], [`DynamicResourceRegistry`],
+//!   [`DynamicResourceTemplateRegistry`]
 //! - `proxy` - Multi-server aggregation proxy ([`McpProxy`](proxy::McpProxy))
 //!
 //! ## Middleware Placement Guide
@@ -434,7 +436,8 @@ pub use filter::{
 };
 pub use jsonrpc::{JsonRpcLayer, JsonRpcService};
 pub use middleware::{
-    McpTracingLayer, McpTracingService, ToolCallLoggingLayer, ToolCallLoggingService,
+    AuditLayer, AuditService, McpTracingLayer, McpTracingService, ToolCallLoggingLayer,
+    ToolCallLoggingService,
 };
 pub use prompt::{BoxPromptService, Prompt, PromptBuilder, PromptHandler, PromptRequest};
 #[allow(deprecated)]
