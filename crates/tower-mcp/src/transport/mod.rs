@@ -25,7 +25,7 @@ pub use stdio::{
 };
 
 #[cfg(feature = "http")]
-pub use http::HttpTransport;
+pub use http::{HttpTransport, SessionHandle};
 
 #[cfg(feature = "websocket")]
 pub use websocket::WebSocketTransport;

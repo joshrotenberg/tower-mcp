@@ -581,6 +581,35 @@ impl SessionStore {
     }
 }
 
+/// A handle for querying HTTP transport session metrics.
+///
+/// Obtained from [`HttpTransport::into_router_with_handle()`] or
+/// [`HttpTransport::into_router_at_with_handle()`]. The handle is cheap to
+/// clone and can be shared across threads.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use tower_mcp::transport::http::HttpTransport;
+///
+/// let transport = HttpTransport::new(router);
+/// let (router, handle) = transport.into_router_with_handle();
+///
+/// // Later, in an admin endpoint:
+/// let count = handle.session_count().await;
+/// ```
+#[derive(Clone)]
+pub struct SessionHandle {
+    store: Arc<SessionStore>,
+}
+
+impl SessionHandle {
+    /// Returns the number of currently active sessions.
+    pub async fn session_count(&self) -> usize {
+        self.store.sessions.read().await.len()
+    }
+}
+
 /// The source of the MCP service for session creation.
 #[derive(Clone)]
 enum ServiceSource {
@@ -868,9 +897,29 @@ impl HttpTransport {
         })
     }
 
-    /// Build the axum router for this transport
+    /// Build the axum router for this transport.
     pub fn into_router(self) -> Router {
+        let (router, _handle) = self.into_router_with_handle();
+        router
+    }
+
+    /// Build the axum router and return a [`SessionHandle`] for querying
+    /// session metrics (e.g., active session count).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let transport = HttpTransport::new(router);
+    /// let (router, handle) = transport.into_router_with_handle();
+    ///
+    /// // Use handle in an admin endpoint
+    /// let count = handle.session_count().await;
+    /// ```
+    pub fn into_router_with_handle(self) -> (Router, SessionHandle) {
         let state = self.build_state();
+        let handle = SessionHandle {
+            store: state.sessions.clone(),
+        };
 
         let router = Router::new()
             .route("/", post(handle_post))
@@ -882,12 +931,22 @@ impl HttpTransport {
         #[cfg(feature = "oauth")]
         let router = self.add_oauth_route(router, "");
 
+        (router, handle)
+    }
+
+    /// Build an axum router mounted at a specific path.
+    pub fn into_router_at(self, path: &str) -> Router {
+        let (router, _handle) = self.into_router_at_with_handle(path);
         router
     }
 
-    /// Build an axum router mounted at a specific path
-    pub fn into_router_at(self, path: &str) -> Router {
+    /// Build an axum router mounted at a specific path and return a
+    /// [`SessionHandle`] for querying session metrics.
+    pub fn into_router_at_with_handle(self, path: &str) -> (Router, SessionHandle) {
         let state = self.build_state();
+        let handle = SessionHandle {
+            store: state.sessions.clone(),
+        };
 
         let mcp_router = Router::new()
             .route("/", post(handle_post))
@@ -901,7 +960,7 @@ impl HttpTransport {
         #[cfg(feature = "oauth")]
         let router = self.add_oauth_route(router, path);
 
-        router
+        (router, handle)
     }
 
     /// Serve the transport on the given address
@@ -2188,5 +2247,44 @@ mod tests {
         let events = session.get_events_after(0).await;
         // Events after 0 should be 1-9 (9 events)
         assert_eq!(events.len(), 9);
+    }
+
+    #[tokio::test]
+    async fn test_session_handle_count() {
+        let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
+        let (app, handle) = transport.into_router_with_handle();
+
+        // No sessions initially
+        assert_eq!(handle.session_count().await, 0);
+
+        // Initialize to create a session
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": {
+                            "name": "test-client",
+                            "version": "1.0.0"
+                        }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), 200);
+
+        // Now we should have 1 session
+        assert_eq!(handle.session_count().await, 1);
     }
 }
