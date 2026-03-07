@@ -471,7 +471,10 @@ pub use protocol::{
     ToolDefinition, ToolExecution, ToolIcon, ToolsCapability, UnsubscribeResourceParams,
 };
 #[cfg(feature = "dynamic-tools")]
-pub use registry::{DynamicPromptRegistry, DynamicToolRegistry};
+pub use registry::{
+    DynamicPromptRegistry, DynamicResourceRegistry, DynamicResourceTemplateRegistry,
+    DynamicToolRegistry,
+};
 pub use resource::{
     BoxResourceService, Resource, ResourceBuilder, ResourceHandler, ResourceRequest,
     ResourceTemplate, ResourceTemplateBuilder, ResourceTemplateHandler,
