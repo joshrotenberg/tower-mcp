@@ -156,6 +156,11 @@ path = "../../examples/dynamic_tools.rs"
 required-features = ["dynamic-tools"]
 
 [[example]]
+name = "skill_prompts"
+path = "../../examples/skill_prompts.rs"
+required-features = ["dynamic-tools"]
+
+[[example]]
 name = "testing"
 path = "../../examples/testing.rs"
 required-features = ["testing"]
