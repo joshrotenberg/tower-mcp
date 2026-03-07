@@ -1386,20 +1386,46 @@ impl ResourceTemplateBuilder {
         self
     }
 
-    /// Set the handler function for reading template resources
+    /// Set the handler function for reading template resources.
     ///
     /// The handler receives:
     /// - `uri`: The full URI being read
     /// - `variables`: A map of variable names to their values extracted from the URI
+    ///
+    /// # Panics
+    ///
+    /// Panics if the URI template produces an invalid regex pattern. For a
+    /// non-panicking alternative (useful with dynamic/user-supplied templates),
+    /// use [`try_handler`](Self::try_handler).
     pub fn handler<F, Fut>(self, handler: F) -> ResourceTemplate
     where
         F: Fn(String, HashMap<String, String>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<ReadResourceResult>> + Send + 'static,
     {
-        let (pattern, variables) = compile_uri_template(&self.uri_template);
+        self.try_handler(handler).unwrap_or_else(|e| {
+            panic!("Invalid URI template: {e}");
+        })
+    }
+
+    /// Set the handler function for reading template resources, returning an
+    /// error if the URI template is invalid.
+    ///
+    /// This is the fallible version of [`handler`](Self::handler), suitable for
+    /// use with dynamically created templates where the URI pattern may come
+    /// from user input.
+    ///
+    /// The handler receives:
+    /// - `uri`: The full URI being read
+    /// - `variables`: A map of variable names to their values extracted from the URI
+    pub fn try_handler<F, Fut>(self, handler: F) -> std::result::Result<ResourceTemplate, Error>
+    where
+        F: Fn(String, HashMap<String, String>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ReadResourceResult>> + Send + 'static,
+    {
+        let (pattern, variables) = compile_uri_template(&self.uri_template)?;
         let name = self.name.unwrap_or_else(|| self.uri_template.clone());
 
-        ResourceTemplate {
+        Ok(ResourceTemplate {
             uri_template: self.uri_template,
             name,
             title: self.title,
@@ -1410,7 +1436,7 @@ impl ResourceTemplateBuilder {
             pattern,
             variables,
             handler: Arc::new(FnTemplateHandler { handler }),
-        }
+        })
     }
 }
 
@@ -1434,14 +1460,15 @@ where
     }
 }
 
-/// Compile a URI template into a regex pattern and extract variable names
+/// Compile a URI template into a regex pattern and extract variable names.
 ///
 /// Supports RFC 6570 Level 1 (simple expansion):
 /// - `{var}` matches any characters except `/`
 /// - `{+var}` matches any characters including `/` (reserved expansion)
 ///
-/// Returns the compiled regex and a list of variable names in order.
-fn compile_uri_template(template: &str) -> (regex::Regex, Vec<String>) {
+/// Returns the compiled regex and a list of variable names in order,
+/// or an error if the template produces an invalid regex pattern.
+fn compile_uri_template(template: &str) -> std::result::Result<(regex::Regex, Vec<String>), Error> {
     let mut pattern = String::from("^");
     let mut variables = Vec::new();
 
@@ -1481,11 +1508,10 @@ fn compile_uri_template(template: &str) -> (regex::Regex, Vec<String>) {
 
     pattern.push('$');
 
-    // Compile the regex - panic if template is malformed
     let regex = regex::Regex::new(&pattern)
-        .unwrap_or_else(|e| panic!("Invalid URI template '{}': {}", template, e));
+        .map_err(|e| Error::Internal(format!("Invalid URI template '{}': {}", template, e)))?;
 
-    (regex, variables)
+    Ok((regex, variables))
 }
 
 #[cfg(test)]
@@ -1738,7 +1764,7 @@ mod tests {
 
     #[test]
     fn test_compile_uri_template_simple() {
-        let (regex, vars) = compile_uri_template("file:///{path}");
+        let (regex, vars) = compile_uri_template("file:///{path}").unwrap();
         assert_eq!(vars, vec!["path"]);
         assert!(regex.is_match("file:///README.md"));
         assert!(!regex.is_match("file:///foo/bar")); // no slashes in simple expansion
@@ -1746,7 +1772,7 @@ mod tests {
 
     #[test]
     fn test_compile_uri_template_multiple_vars() {
-        let (regex, vars) = compile_uri_template("api://v1/{resource}/{id}");
+        let (regex, vars) = compile_uri_template("api://v1/{resource}/{id}").unwrap();
         assert_eq!(vars, vec!["resource", "id"]);
         assert!(regex.is_match("api://v1/users/123"));
         assert!(regex.is_match("api://v1/posts/abc"));
@@ -1755,7 +1781,7 @@ mod tests {
 
     #[test]
     fn test_compile_uri_template_reserved_expansion() {
-        let (regex, vars) = compile_uri_template("file:///{+path}");
+        let (regex, vars) = compile_uri_template("file:///{+path}").unwrap();
         assert_eq!(vars, vec!["path"]);
         assert!(regex.is_match("file:///README.md"));
         assert!(regex.is_match("file:///foo/bar/baz.txt")); // slashes allowed
@@ -1763,7 +1789,7 @@ mod tests {
 
     #[test]
     fn test_compile_uri_template_special_chars() {
-        let (regex, vars) = compile_uri_template("http://example.com/api?query={q}");
+        let (regex, vars) = compile_uri_template("http://example.com/api?query={q}").unwrap();
         assert_eq!(vars, vec!["q"]);
         assert!(regex.is_match("http://example.com/api?query=hello"));
     }
@@ -1961,5 +1987,37 @@ mod tests {
 
         let def = resource.definition();
         assert!(def.annotations.is_none());
+    }
+
+    #[test]
+    fn test_try_handler_success() {
+        let result = ResourceTemplateBuilder::new("db://users/{id}")
+            .name("Users")
+            .try_handler(|uri: String, _vars: HashMap<String, String>| async move {
+                Ok(ReadResourceResult {
+                    contents: vec![ResourceContent {
+                        uri,
+                        mime_type: None,
+                        text: Some("ok".to_string()),
+                        blob: None,
+                        meta: None,
+                    }],
+                    meta: None,
+                })
+            });
+
+        assert!(result.is_ok());
+        let template = result.unwrap();
+        assert_eq!(template.uri_template, "db://users/{id}");
+    }
+
+    #[test]
+    fn test_compile_uri_template_returns_result() {
+        // Valid templates should succeed
+        assert!(compile_uri_template("file:///{path}").is_ok());
+        assert!(compile_uri_template("api://v1/{resource}/{id}").is_ok());
+        assert!(compile_uri_template("file:///{+path}").is_ok());
+        assert!(compile_uri_template("no-vars").is_ok());
+        assert!(compile_uri_template("").is_ok());
     }
 }
