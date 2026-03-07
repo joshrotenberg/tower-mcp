@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.3] - 2026-03-07
+
+### Features
+
+- Add StdioClientTransport::spawn_command for custom Command config ([#624](https://github.com/joshrotenberg/tower-mcp/pull/624))
+- Add HttpTransport::from_service() for generic service support ([#626](https://github.com/joshrotenberg/tower-mcp/pull/626))
+- Expose session count via SessionHandle from HttpTransport ([#629](https://github.com/joshrotenberg/tower-mcp/pull/629))
+- Add dynamic backend addition to McpProxy ([#630](https://github.com/joshrotenberg/tower-mcp/pull/630))
+
+
+
 ## [0.8.2] - 2026-03-07
 
 ### Bug Fixes
