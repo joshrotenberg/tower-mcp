@@ -1,16 +1,18 @@
 //! Core proxy service implementing `Service<RouterRequest>`.
 
 use std::convert::Infallible;
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 use tower::ServiceExt;
 use tower::util::BoxCloneService;
 use tower_service::Service;
 
+use crate::client::ClientTransport;
 use crate::protocol::{
     CallToolParams, GetPromptParams, Implementation, InitializeResult, ListPromptsResult,
     ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, McpRequest, McpResponse,
@@ -18,9 +20,10 @@ use crate::protocol::{
     ResourceTemplateDefinition, ServerCapabilities, ToolDefinition, ToolsCapability,
 };
 use crate::router::{Extensions, RouterRequest, RouterResponse};
+use crate::transport::CatchError;
 use tower_mcp_types::JsonRpcError;
 
-use super::backend::{Backend, CachedCapabilities};
+use super::backend::{Backend, BackendService, CachedCapabilities, ListChanged};
 
 /// A backend entry in the proxy, combining cached capabilities with a
 /// type-erased service for dispatching routed requests.
@@ -79,23 +82,30 @@ impl BackendEntry {
 /// Each backend's capabilities are namespaced to avoid collisions, and
 /// individual backends can have their own Tower middleware stack applied
 /// via [`McpProxyBuilder::backend_layer()`](super::McpProxyBuilder::backend_layer).
+///
+/// Backends can be added dynamically at runtime via [`add_backend()`](Self::add_backend).
+/// All clones of the proxy share the same backend list, so additions are
+/// immediately visible to all request handlers.
 #[derive(Clone)]
 pub struct McpProxy {
     pub(super) shared: Arc<McpProxyShared>,
-    /// Per-backend entries with type-erased services. Kept outside `Arc`
-    /// because `BoxCloneService` is `Send + Clone` but not `Sync`.
-    pub(super) entries: Vec<BackendEntry>,
+    /// Per-backend entries with type-erased services. Shared across all clones
+    /// via `Arc<Mutex<_>>`. The mutex is only held during synchronous routing
+    /// and cloning operations (microseconds), never across await points.
+    pub(super) entries: Arc<Mutex<Vec<BackendEntry>>>,
 }
 
 /// Shared, `Send + Sync` state for the proxy (no `BoxCloneService`).
 pub(super) struct McpProxyShared {
     name: String,
     version: String,
-    pub(super) backends: Vec<Backend>,
+    pub(super) backends: RwLock<Vec<Backend>>,
     /// Optional sender for forwarding list-changed notifications downstream.
     pub(super) notification_tx: Option<crate::context::NotificationSender>,
     /// Aggregated or custom instructions for the initialize response.
     instructions: Option<String>,
+    /// Separator used for namespace prefixing.
+    separator: String,
 }
 
 /// Health status of a single backend.
@@ -115,6 +125,42 @@ struct EntryInfo {
     cache: Arc<RwLock<CachedCapabilities>>,
 }
 
+/// Error returned when adding a dynamic backend fails.
+#[derive(Debug)]
+pub enum AddBackendError {
+    /// The namespace is already in use by an existing backend.
+    DuplicateNamespace(String),
+    /// The namespace would create an ambiguous prefix with an existing backend.
+    AmbiguousPrefix {
+        new_namespace: String,
+        existing_namespace: String,
+    },
+    /// Failed to connect the transport.
+    Connect(crate::error::Error),
+    /// Failed during MCP initialization handshake.
+    Initialize(crate::error::Error),
+}
+
+impl fmt::Display for AddBackendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateNamespace(ns) => write!(f, "namespace \"{}\" already exists", ns),
+            Self::AmbiguousPrefix {
+                new_namespace,
+                existing_namespace,
+            } => write!(
+                f,
+                "namespace \"{}\" creates ambiguous prefix with \"{}\"",
+                new_namespace, existing_namespace
+            ),
+            Self::Connect(e) => write!(f, "failed to connect: {}", e),
+            Self::Initialize(e) => write!(f, "failed to initialize: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for AddBackendError {}
+
 impl McpProxy {
     /// Create a builder for configuring the proxy.
     pub fn builder(name: impl Into<String>, version: impl Into<String>) -> super::McpProxyBuilder {
@@ -129,17 +175,260 @@ impl McpProxy {
         entries: Vec<BackendEntry>,
         notification_tx: Option<crate::context::NotificationSender>,
         instructions: Option<String>,
+        separator: String,
     ) -> Self {
         Self {
             shared: Arc::new(McpProxyShared {
                 name,
                 version,
-                backends,
+                backends: RwLock::new(backends),
                 notification_tx,
                 instructions,
+                separator,
             }),
-            entries,
+            entries: Arc::new(Mutex::new(entries)),
         }
+    }
+
+    /// Add a backend dynamically from a [`ClientTransport`].
+    ///
+    /// The transport is connected, the MCP initialize handshake runs, and
+    /// capabilities are discovered. The new backend is immediately available
+    /// to all clones of this proxy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The namespace is already in use
+    /// - The namespace creates an ambiguous prefix with an existing backend
+    /// - The transport fails to connect
+    /// - The MCP initialize handshake fails
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// proxy.add_backend("new-db", StdioClientTransport::spawn("db-server", &[]).await?).await?;
+    /// // New backend is immediately available for requests
+    /// ```
+    pub async fn add_backend(
+        &self,
+        namespace: impl Into<String>,
+        transport: impl ClientTransport,
+    ) -> Result<(), AddBackendError> {
+        let namespace = namespace.into();
+        let separator = self.shared.separator.clone();
+
+        // Validate namespace uniqueness and prefix ambiguity
+        {
+            let entries = self.entries.lock().expect("entries lock poisoned");
+            self.validate_namespace(&namespace, &separator, &entries)?;
+        }
+
+        // Connect and initialize (no lock held during async operations)
+        let (invalidation_tx, invalidation_rx) = mpsc::channel(16);
+        let backend = Backend::connect(namespace.clone(), transport, separator, invalidation_tx)
+            .await
+            .map_err(AddBackendError::Connect)?;
+
+        backend
+            .initialize(&self.shared.name, &self.shared.version)
+            .await
+            .map_err(AddBackendError::Initialize)?;
+
+        let entry = BackendEntry::from_backend(&backend);
+
+        // Add to shared state
+        {
+            let mut entries = self.entries.lock().expect("entries lock poisoned");
+            entries.push(entry);
+        }
+
+        // Spawn invalidation watcher
+        let backend_idx = {
+            let mut backends = self.shared.backends.write().await;
+            let idx = backends.len();
+            backends.push(backend);
+            idx
+        };
+
+        self.spawn_invalidation_watcher(backend_idx, invalidation_rx);
+
+        // Notify downstream clients that capabilities changed
+        if let Some(tx) = &self.shared.notification_tx {
+            let _ = tx
+                .send(crate::context::ServerNotification::ToolsListChanged)
+                .await;
+            let _ = tx
+                .send(crate::context::ServerNotification::ResourcesListChanged)
+                .await;
+            let _ = tx
+                .send(crate::context::ServerNotification::PromptsListChanged)
+                .await;
+        }
+
+        Ok(())
+    }
+
+    /// Add a backend dynamically with a custom middleware-wrapped service.
+    ///
+    /// Like [`add_backend()`](Self::add_backend), but applies a Tower layer
+    /// to the backend's dispatch service before adding it.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use std::time::Duration;
+    /// use tower::timeout::TimeoutLayer;
+    ///
+    /// proxy.add_backend_with_layer(
+    ///     "slow-api",
+    ///     transport,
+    ///     TimeoutLayer::new(Duration::from_secs(60)),
+    /// ).await?;
+    /// ```
+    pub async fn add_backend_with_layer<L>(
+        &self,
+        namespace: impl Into<String>,
+        transport: impl ClientTransport,
+        layer: L,
+    ) -> Result<(), AddBackendError>
+    where
+        L: tower::Layer<BackendService> + Send + 'static,
+        L::Service: Service<RouterRequest, Response = RouterResponse> + Clone + Send + 'static,
+        <L::Service as Service<RouterRequest>>::Error: fmt::Display + Send,
+        <L::Service as Service<RouterRequest>>::Future: Send,
+    {
+        let namespace = namespace.into();
+        let separator = self.shared.separator.clone();
+
+        {
+            let entries = self.entries.lock().expect("entries lock poisoned");
+            self.validate_namespace(&namespace, &separator, &entries)?;
+        }
+
+        let (invalidation_tx, invalidation_rx) = mpsc::channel(16);
+        let backend = Backend::connect(namespace.clone(), transport, separator, invalidation_tx)
+            .await
+            .map_err(AddBackendError::Connect)?;
+
+        backend
+            .initialize(&self.shared.name, &self.shared.version)
+            .await
+            .map_err(AddBackendError::Initialize)?;
+
+        // Apply middleware layer
+        let base = backend.service();
+        let layered = layer.layer(base);
+        let caught = CatchError::new(layered);
+        let service = BoxCloneService::new(caught);
+        let entry = BackendEntry::from_backend_with_service(&backend, service);
+
+        {
+            let mut entries = self.entries.lock().expect("entries lock poisoned");
+            entries.push(entry);
+        }
+
+        let backend_idx = {
+            let mut backends = self.shared.backends.write().await;
+            let idx = backends.len();
+            backends.push(backend);
+            idx
+        };
+
+        self.spawn_invalidation_watcher(backend_idx, invalidation_rx);
+
+        if let Some(tx) = &self.shared.notification_tx {
+            let _ = tx
+                .send(crate::context::ServerNotification::ToolsListChanged)
+                .await;
+            let _ = tx
+                .send(crate::context::ServerNotification::ResourcesListChanged)
+                .await;
+            let _ = tx
+                .send(crate::context::ServerNotification::PromptsListChanged)
+                .await;
+        }
+
+        Ok(())
+    }
+
+    /// Validate that a namespace can be added without conflicts.
+    fn validate_namespace(
+        &self,
+        namespace: &str,
+        separator: &str,
+        entries: &[BackendEntry],
+    ) -> Result<(), AddBackendError> {
+        let new_prefix = format!("{}{}", namespace, separator);
+
+        for entry in entries {
+            if entry.namespace == namespace {
+                return Err(AddBackendError::DuplicateNamespace(namespace.to_string()));
+            }
+            let existing_prefix = format!("{}{}", entry.namespace, entry.separator);
+            if new_prefix.starts_with(&existing_prefix) || existing_prefix.starts_with(&new_prefix)
+            {
+                return Err(AddBackendError::AmbiguousPrefix {
+                    new_namespace: namespace.to_string(),
+                    existing_namespace: entry.namespace.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Spawn a background task that watches for list-changed notifications
+    /// from a backend and refreshes the cache.
+    pub(super) fn spawn_invalidation_watcher(
+        &self,
+        backend_idx: usize,
+        mut rx: mpsc::Receiver<ListChanged>,
+    ) {
+        let shared = Arc::clone(&self.shared);
+        tokio::spawn(async move {
+            while let Some(changed) = rx.recv().await {
+                let backends = shared.backends.read().await;
+                let Some(backend) = backends.get(backend_idx) else {
+                    break;
+                };
+                tracing::debug!(
+                    namespace = %backend.namespace,
+                    kind = ?changed,
+                    "Backend list changed, refreshing cache"
+                );
+                match changed {
+                    ListChanged::Tools => {
+                        backend.refresh_tools().await;
+                        if let Some(tx) = &shared.notification_tx {
+                            let _ = tx
+                                .send(crate::context::ServerNotification::ToolsListChanged)
+                                .await;
+                        }
+                    }
+                    ListChanged::Resources => {
+                        backend.refresh_resources().await;
+                        if let Some(tx) = &shared.notification_tx {
+                            let _ = tx
+                                .send(crate::context::ServerNotification::ResourcesListChanged)
+                                .await;
+                        }
+                    }
+                    ListChanged::Prompts => {
+                        backend.refresh_prompts().await;
+                        if let Some(tx) = &shared.notification_tx {
+                            let _ = tx
+                                .send(crate::context::ServerNotification::PromptsListChanged)
+                                .await;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// Return the number of currently registered backends.
+    pub fn backend_count(&self) -> usize {
+        self.entries.lock().expect("entries lock poisoned").len()
     }
 
     /// Check the health of all backends by pinging them concurrently.
@@ -147,9 +436,8 @@ impl McpProxy {
     /// Returns a map of namespace to health status. Backends that respond
     /// to ping within a reasonable time are considered healthy.
     pub async fn health_check(&self) -> Vec<BackendHealth> {
-        let futures: Vec<_> = self
-            .shared
-            .backends
+        let backends = self.shared.backends.read().await;
+        let futures: Vec<_> = backends
             .iter()
             .map(|backend| {
                 let client = Arc::clone(&backend.client);
@@ -160,6 +448,7 @@ impl McpProxy {
                 }
             })
             .collect();
+        drop(backends);
 
         futures::future::join_all(futures).await
     }
@@ -403,10 +692,11 @@ impl Service<RouterRequest> for McpProxy {
         let request_id = req.id.clone();
         let extensions = req.extensions.clone();
 
-        // All routing and data extraction happens synchronously here (no await),
-        // so we never hold a &[BackendEntry] reference across an await point.
-        // Only Send+Sync data (EntryInfo, cloned BoxCloneService, Arc<McpProxyShared>)
-        // is moved into the returned future.
+        // Lock entries for synchronous routing and data extraction.
+        // The lock is held only for cloning services and extracting EntryInfo —
+        // no await points occur while the lock is held.
+        let entries = self.entries.lock().expect("entries lock poisoned");
+
         let result_future: Pin<Box<dyn Future<Output = Result<McpResponse, JsonRpcError>> + Send>> =
             match req.inner {
                 McpRequest::Initialize(_params) => {
@@ -417,13 +707,13 @@ impl Service<RouterRequest> for McpProxy {
                 }
                 McpRequest::Ping => Box::pin(async { Ok(McpResponse::Pong(Default::default())) }),
                 McpRequest::ListTools(_params) => {
-                    let infos = Self::entry_infos(&self.entries);
+                    let infos = Self::entry_infos(&entries);
                     Box::pin(handle_list_tools(infos))
                 }
                 McpRequest::CallTool(params) => {
-                    match Self::route_by_prefix(&self.entries, &params.name) {
+                    match Self::route_by_prefix(&entries, &params.name) {
                         Some((idx, stripped)) => {
-                            let service = self.entries[idx].service.clone();
+                            let service = entries[idx].service.clone();
                             Box::pin(handle_call_tool(
                                 service,
                                 stripped,
@@ -441,17 +731,17 @@ impl Service<RouterRequest> for McpProxy {
                     }
                 }
                 McpRequest::ListResources(_params) => {
-                    let infos = Self::entry_infos(&self.entries);
+                    let infos = Self::entry_infos(&entries);
                     Box::pin(handle_list_resources(infos))
                 }
                 McpRequest::ListResourceTemplates(_params) => {
-                    let infos = Self::entry_infos(&self.entries);
+                    let infos = Self::entry_infos(&entries);
                     Box::pin(handle_list_resource_templates(infos))
                 }
                 McpRequest::ReadResource(params) => {
-                    match Self::route_by_uri_prefix(&self.entries, &params.uri) {
+                    match Self::route_by_uri_prefix(&entries, &params.uri) {
                         Some((idx, stripped)) => {
-                            let service = self.entries[idx].service.clone();
+                            let service = entries[idx].service.clone();
                             Box::pin(handle_read_resource(
                                 service,
                                 stripped,
@@ -469,13 +759,13 @@ impl Service<RouterRequest> for McpProxy {
                     }
                 }
                 McpRequest::ListPrompts(_params) => {
-                    let infos = Self::entry_infos(&self.entries);
+                    let infos = Self::entry_infos(&entries);
                     Box::pin(handle_list_prompts(infos))
                 }
                 McpRequest::GetPrompt(params) => {
-                    match Self::route_by_prefix(&self.entries, &params.name) {
+                    match Self::route_by_prefix(&entries, &params.name) {
                         Some((idx, stripped)) => {
-                            let service = self.entries[idx].service.clone();
+                            let service = entries[idx].service.clone();
                             Box::pin(handle_get_prompt(
                                 service,
                                 stripped,
@@ -498,6 +788,9 @@ impl Service<RouterRequest> for McpProxy {
                     ))
                 }),
             };
+
+        // Drop the lock before returning the future
+        drop(entries);
 
         Box::pin(async move {
             let result = result_future.await;
