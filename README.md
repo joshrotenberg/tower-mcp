@@ -101,7 +101,7 @@ tower-mcp = "0.7"
 | `oauth` | OAuth 2.1 resource server support (JWT validation) |
 | `jwks` | JWKS endpoint fetching for remote key sets (requires `oauth`) |
 | `testing` | Test utilities (`TestClient`) for in-process testing |
-| `dynamic-tools` | Runtime tool registration/deregistration via `DynamicToolRegistry` |
+| `dynamic-tools` | Runtime registration/deregistration of tools, prompts, and resources |
 | `proxy` | Multi-server aggregation proxy (`McpProxy`) |
 | `macros` | Optional proc macros (`#[tool_fn]`, `#[prompt_fn]`, `#[resource_fn]`, `#[resource_template_fn]`) |
 
