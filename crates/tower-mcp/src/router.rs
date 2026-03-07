@@ -23,7 +23,9 @@ use crate::filter::{PromptFilter, ResourceFilter, ToolFilter};
 use crate::prompt::Prompt;
 use crate::protocol::*;
 #[cfg(feature = "dynamic-tools")]
-use crate::registry::{DynamicToolRegistry, DynamicToolsInner};
+use crate::registry::{
+    DynamicPromptRegistry, DynamicPromptsInner, DynamicToolRegistry, DynamicToolsInner,
+};
 use crate::resource::{Resource, ResourceTemplate};
 use crate::session::SessionState;
 use crate::tool::Tool;
@@ -182,6 +184,9 @@ struct McpRouterInner {
     /// Dynamic tools registry for runtime tool (de)registration
     #[cfg(feature = "dynamic-tools")]
     dynamic_tools: Option<Arc<DynamicToolsInner>>,
+    /// Dynamic prompts registry for runtime prompt (de)registration
+    #[cfg(feature = "dynamic-tools")]
+    dynamic_prompts: Option<Arc<DynamicPromptsInner>>,
 }
 
 impl McpRouterInner {
@@ -298,6 +303,8 @@ impl McpRouter {
                 page_size: None,
                 #[cfg(feature = "dynamic-tools")]
                 dynamic_tools: None,
+                #[cfg(feature = "dynamic-tools")]
+                dynamic_prompts: None,
             }),
             session: SessionState::new(),
         }
@@ -388,16 +395,49 @@ impl McpRouter {
         (self, DynamicToolRegistry::new(inner_dyn))
     }
 
+    /// Enable dynamic prompt registration and return a registry handle.
+    ///
+    /// The returned [`DynamicPromptRegistry`] can be used to add and remove
+    /// prompts at runtime. Dynamic prompts are merged with static prompts
+    /// when handling `prompts/list` and `prompts/get` requests. Static
+    /// prompts take precedence over dynamic prompts when names collide.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::{McpRouter, PromptBuilder};
+    ///
+    /// let (router, registry) = McpRouter::new()
+    ///     .server_info("my-server", "1.0.0")
+    ///     .with_dynamic_prompts();
+    ///
+    /// let prompt = PromptBuilder::new("greet")
+    ///     .description("Greet someone")
+    ///     .user_message("Hello!");
+    ///
+    /// registry.register(prompt);
+    /// ```
+    #[cfg(feature = "dynamic-tools")]
+    pub fn with_dynamic_prompts(mut self) -> (Self, DynamicPromptRegistry) {
+        let inner_dyn = Arc::new(DynamicPromptsInner::new());
+        Arc::make_mut(&mut self.inner).dynamic_prompts = Some(inner_dyn.clone());
+        (self, DynamicPromptRegistry::new(inner_dyn))
+    }
+
     /// Set the notification sender for progress reporting
     ///
     /// This is typically called by the transport layer to receive notifications.
     pub fn with_notification_sender(mut self, tx: NotificationSender) -> Self {
         let inner = Arc::make_mut(&mut self.inner);
-        // Also register the sender with the dynamic tools registry so it can
-        // broadcast ToolsListChanged notifications to this session.
+        // Also register the sender with dynamic registries so they can
+        // broadcast list-changed notifications to this session.
         #[cfg(feature = "dynamic-tools")]
         if let Some(ref dynamic_tools) = inner.dynamic_tools {
             dynamic_tools.add_notification_sender(tx.clone());
+        }
+        #[cfg(feature = "dynamic-tools")]
+        if let Some(ref dynamic_prompts) = inner.dynamic_prompts {
+            dynamic_prompts.add_notification_sender(tx.clone());
         }
         inner.notification_tx = Some(tx);
         self
@@ -1363,6 +1403,11 @@ impl McpRouter {
         #[cfg(not(feature = "dynamic-tools"))]
         let has_dynamic_tools = false;
 
+        #[cfg(feature = "dynamic-tools")]
+        let has_dynamic_prompts = self.inner.dynamic_prompts.is_some();
+        #[cfg(not(feature = "dynamic-tools"))]
+        let has_dynamic_prompts = false;
+
         ServerCapabilities {
             tools: if self.inner.tools.is_empty() && !has_dynamic_tools {
                 None
@@ -1379,7 +1424,7 @@ impl McpRouter {
             } else {
                 None
             },
-            prompts: if self.inner.prompts.is_empty() {
+            prompts: if self.inner.prompts.is_empty() && !has_dynamic_prompts {
                 None
             } else {
                 Some(PromptsCapability {
@@ -1739,20 +1784,34 @@ impl McpRouter {
             }
 
             McpRequest::ListPrompts(params) => {
+                let is_visible = |p: &Prompt| -> bool {
+                    self.inner
+                        .prompt_filter
+                        .as_ref()
+                        .map(|f| f.is_visible(&self.session, p))
+                        .unwrap_or(true)
+                };
+
                 let mut prompts: Vec<PromptDefinition> = self
                     .inner
                     .prompts
                     .values()
-                    .filter(|p| {
-                        // Apply prompt filter if configured
-                        self.inner
-                            .prompt_filter
-                            .as_ref()
-                            .map(|f| f.is_visible(&self.session, p))
-                            .unwrap_or(true)
-                    })
+                    .filter(|p| is_visible(p))
                     .map(|p| p.definition())
                     .collect();
+
+                // Merge dynamic prompts (static prompts win on name collision)
+                #[cfg(feature = "dynamic-tools")]
+                if let Some(ref dynamic) = self.inner.dynamic_prompts {
+                    let static_names: HashSet<String> =
+                        prompts.iter().map(|p| p.name.clone()).collect();
+                    for p in dynamic.list() {
+                        if !static_names.contains(&p.name) && is_visible(&p) {
+                            prompts.push(p.definition());
+                        }
+                    }
+                }
+
                 prompts.sort_by(|a, b| a.name.cmp(&b.name));
 
                 let (prompts, next_cursor) =
@@ -1766,7 +1825,16 @@ impl McpRouter {
             }
 
             McpRequest::GetPrompt(params) => {
-                let prompt = self.inner.prompts.get(&params.name).ok_or_else(|| {
+                // Look up static prompts first, then dynamic
+                let prompt = self.inner.prompts.get(&params.name).cloned();
+                #[cfg(feature = "dynamic-tools")]
+                let prompt = prompt.or_else(|| {
+                    self.inner
+                        .dynamic_prompts
+                        .as_ref()
+                        .and_then(|d| d.get(&params.name))
+                });
+                let prompt = prompt.ok_or_else(|| {
                     Error::JsonRpc(JsonRpcError::method_not_found(&format!(
                         "Prompt not found: {}",
                         params.name
@@ -1775,7 +1843,7 @@ impl McpRouter {
 
                 // Check prompt filter if configured
                 if let Some(filter) = &self.inner.prompt_filter
-                    && !filter.is_visible(&self.session, prompt)
+                    && !filter.is_visible(&self.session, &prompt)
                 {
                     return Err(filter.denial_error(&params.name));
                 }

@@ -136,6 +136,130 @@ impl DynamicToolRegistry {
     }
 }
 
+// =============================================================================
+// Dynamic Prompt Registry
+// =============================================================================
+
+/// Inner state shared between the prompt registry handle and the router.
+pub(crate) struct DynamicPromptsInner {
+    prompts: RwLock<HashMap<String, Arc<crate::prompt::Prompt>>>,
+    notification_senders: RwLock<Vec<NotificationSender>>,
+}
+
+impl DynamicPromptsInner {
+    pub(crate) fn new() -> Self {
+        Self {
+            prompts: RwLock::new(HashMap::new()),
+            notification_senders: RwLock::new(Vec::new()),
+        }
+    }
+
+    /// Register a notification sender for a new session.
+    pub(crate) fn add_notification_sender(&self, sender: NotificationSender) {
+        let mut senders = self.notification_senders.write().unwrap();
+        senders.push(sender);
+    }
+
+    /// Broadcast `PromptsListChanged` to all sessions, lazily cleaning up closed channels.
+    fn broadcast_prompts_changed(&self) {
+        let mut senders = self.notification_senders.write().unwrap();
+        senders.retain(|tx| !tx.is_closed());
+        for tx in senders.iter() {
+            let _ = tx.try_send(ServerNotification::PromptsListChanged);
+        }
+    }
+
+    /// Get a snapshot of all dynamic prompts.
+    pub(crate) fn list(&self) -> Vec<Arc<crate::prompt::Prompt>> {
+        let prompts = self.prompts.read().unwrap();
+        prompts.values().cloned().collect()
+    }
+
+    /// Look up a dynamic prompt by name.
+    pub(crate) fn get(&self, name: &str) -> Option<Arc<crate::prompt::Prompt>> {
+        let prompts = self.prompts.read().unwrap();
+        prompts.get(name).cloned()
+    }
+
+    /// Check if a dynamic prompt exists.
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        let prompts = self.prompts.read().unwrap();
+        prompts.contains_key(name)
+    }
+}
+
+/// A thread-safe, cloneable handle for runtime prompt management.
+///
+/// Obtained from [`McpRouter::with_dynamic_prompts()`](crate::McpRouter::with_dynamic_prompts).
+/// Prompts registered here are merged with the router's static prompts when
+/// handling `prompts/list` and `prompts/get` requests.
+///
+/// When a prompt is registered or unregistered, all connected sessions receive a
+/// `notifications/prompts/list_changed` notification.
+///
+/// # Example
+///
+/// ```rust
+/// use tower_mcp::{McpRouter, PromptBuilder};
+///
+/// let (router, registry) = McpRouter::new()
+///     .server_info("my-server", "1.0.0")
+///     .with_dynamic_prompts();
+///
+/// // Register a prompt at runtime
+/// let prompt = PromptBuilder::new("greet")
+///     .description("Greet someone")
+///     .user_message("Hello!");
+///
+/// registry.register(prompt);
+/// ```
+#[derive(Clone)]
+pub struct DynamicPromptRegistry {
+    inner: Arc<DynamicPromptsInner>,
+}
+
+impl DynamicPromptRegistry {
+    pub(crate) fn new(inner: Arc<DynamicPromptsInner>) -> Self {
+        Self { inner }
+    }
+
+    /// Register a prompt, replacing any existing prompt with the same name.
+    ///
+    /// Broadcasts `PromptsListChanged` to all connected sessions.
+    pub fn register(&self, prompt: crate::prompt::Prompt) {
+        {
+            let mut prompts = self.inner.prompts.write().unwrap();
+            prompts.insert(prompt.name.clone(), Arc::new(prompt));
+        }
+        self.inner.broadcast_prompts_changed();
+    }
+
+    /// Unregister a prompt by name.
+    ///
+    /// Returns `true` if the prompt existed and was removed.
+    /// Broadcasts `PromptsListChanged` only if the prompt was actually removed.
+    pub fn unregister(&self, name: &str) -> bool {
+        let removed = {
+            let mut prompts = self.inner.prompts.write().unwrap();
+            prompts.remove(name).is_some()
+        };
+        if removed {
+            self.inner.broadcast_prompts_changed();
+        }
+        removed
+    }
+
+    /// List all currently registered dynamic prompts.
+    pub fn list(&self) -> Vec<Arc<crate::prompt::Prompt>> {
+        self.inner.list()
+    }
+
+    /// Check if a prompt with the given name is registered.
+    pub fn contains(&self, name: &str) -> bool {
+        self.inner.contains(name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,5 +404,89 @@ mod tests {
         registry.register(make_tool("tool_b"));
         let notification = rx2.try_recv().unwrap();
         assert!(matches!(notification, ServerNotification::ToolsListChanged));
+    }
+
+    // =========================================================================
+    // DynamicPromptRegistry tests
+    // =========================================================================
+
+    fn make_prompt(name: &str) -> crate::prompt::Prompt {
+        crate::prompt::PromptBuilder::new(name)
+            .description(format!("Test prompt: {name}"))
+            .user_message("ok")
+    }
+
+    fn make_prompt_registry() -> (DynamicPromptRegistry, Arc<DynamicPromptsInner>) {
+        let inner = Arc::new(DynamicPromptsInner::new());
+        let registry = DynamicPromptRegistry::new(inner.clone());
+        (registry, inner)
+    }
+
+    #[test]
+    fn test_prompt_register_and_list() {
+        let (registry, _) = make_prompt_registry();
+
+        assert!(registry.list().is_empty());
+
+        registry.register(make_prompt("prompt_a"));
+        assert_eq!(registry.list().len(), 1);
+        assert!(registry.contains("prompt_a"));
+
+        registry.register(make_prompt("prompt_b"));
+        assert_eq!(registry.list().len(), 2);
+        assert!(registry.contains("prompt_b"));
+    }
+
+    #[test]
+    fn test_prompt_unregister() {
+        let (registry, _) = make_prompt_registry();
+
+        registry.register(make_prompt("prompt_a"));
+        registry.register(make_prompt("prompt_b"));
+
+        assert!(registry.unregister("prompt_a"));
+        assert_eq!(registry.list().len(), 1);
+        assert!(!registry.contains("prompt_a"));
+        assert!(registry.contains("prompt_b"));
+    }
+
+    #[test]
+    fn test_prompt_unregister_nonexistent() {
+        let (registry, _) = make_prompt_registry();
+        assert!(!registry.unregister("no_such_prompt"));
+    }
+
+    #[tokio::test]
+    async fn test_prompt_broadcast_on_register() {
+        let (registry, inner) = make_prompt_registry();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        inner.add_notification_sender(tx);
+
+        registry.register(make_prompt("prompt_a"));
+
+        let notification = rx.try_recv().unwrap();
+        assert!(matches!(
+            notification,
+            ServerNotification::PromptsListChanged
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_prompt_broadcast_on_unregister() {
+        let (registry, inner) = make_prompt_registry();
+
+        registry.register(make_prompt("prompt_a"));
+
+        let (tx, mut rx) = mpsc::channel(16);
+        inner.add_notification_sender(tx);
+
+        registry.unregister("prompt_a");
+
+        let notification = rx.try_recv().unwrap();
+        assert!(matches!(
+            notification,
+            ServerNotification::PromptsListChanged
+        ));
     }
 }
