@@ -44,14 +44,40 @@ impl StdioClientTransport {
     /// handles cannot be acquired.
     pub async fn spawn(program: &str, args: &[&str]) -> Result<Self> {
         let mut cmd = Command::new(program);
-        cmd.args(args)
-            .stdin(Stdio::piped())
+        cmd.args(args);
+        Self::spawn_command(&mut cmd).await
+    }
+
+    /// Spawn from a pre-configured [`Command`].
+    ///
+    /// This allows setting environment variables, working directory, and
+    /// other process configuration before spawning.
+    ///
+    /// Stdin and stdout are automatically set to piped. Stderr is set to
+    /// inherited unless already configured.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use tokio::process::Command;
+    /// use tower_mcp::client::StdioClientTransport;
+    ///
+    /// # async fn example() -> Result<(), tower_mcp::BoxError> {
+    /// let mut cmd = Command::new("npx");
+    /// cmd.args(["-y", "@modelcontextprotocol/server-github"])
+    ///    .env("GITHUB_TOKEN", "ghp_...");
+    /// let transport = StdioClientTransport::spawn_command(&mut cmd).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn spawn_command(cmd: &mut Command) -> Result<Self> {
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
 
         let mut child = cmd
             .spawn()
-            .map_err(|e| Error::Transport(format!("Failed to spawn {}: {}", program, e)))?;
+            .map_err(|e| Error::Transport(format!("Failed to spawn process: {}", e)))?;
 
         let stdin = child
             .stdin
@@ -62,7 +88,7 @@ impl StdioClientTransport {
             .take()
             .ok_or_else(|| Error::Transport("Failed to get child stdout".to_string()))?;
 
-        tracing::info!(program = %program, "Spawned MCP server process");
+        tracing::info!("Spawned MCP server process");
 
         Ok(Self {
             child: Some(child),
