@@ -87,7 +87,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tower-mcp = "0.7"
+tower-mcp = "0.8"
 ```
 
 ### Feature Flags
@@ -109,7 +109,7 @@ Example with features:
 
 ```toml
 [dependencies]
-tower-mcp = { version = "0.7", features = ["full"] }
+tower-mcp = { version = "0.8", features = ["full"] }
 ```
 
 ### Types Only
@@ -121,7 +121,7 @@ any context where you want to serialize/deserialize MCP messages without a runti
 
 ```toml
 [dependencies]
-tower-mcp-types = "0.1"
+tower-mcp-types = "0.8"
 ```
 
 `tower-mcp-types` provides all types from `tower_mcp::protocol` and `tower_mcp::error`
@@ -458,6 +458,31 @@ let app = transport.into_router()
     .layer(middleware::from_fn(auth_middleware));
 ```
 
+## MCP Middleware
+
+tower-mcp ships three MCP-specific middleware layers alongside standard tower middleware:
+
+| Layer | Target | Purpose |
+|-------|--------|---------|
+| `McpTracingLayer` | All requests | Structured tracing with spans for request lifecycle |
+| `ToolCallLoggingLayer` | `tools/call` only | Focused tool call audit logging with annotation hints |
+| `AuditLayer` | All requests | Comprehensive audit events (`mcp::audit` tracing target) |
+
+```rust
+use tower::ServiceBuilder;
+use tower_mcp::middleware::{AuditLayer, McpTracingLayer};
+
+let transport = StdioTransport::new(router)
+    .layer(
+        ServiceBuilder::new()
+            .layer(McpTracingLayer::new())
+            .layer(AuditLayer::new())
+            .into_inner(),
+    );
+```
+
+Standard tower middleware (timeout, rate limiting, concurrency) also composes naturally via `.layer()` on transports and individual tools.
+
 ## Testing
 
 tower-mcp includes `TestClient` (feature: `testing`) for in-process server testing -- no subprocess, no network, no port management:
@@ -586,6 +611,7 @@ The repo includes several example servers you can try with any MCP-enabled agent
 | `weather` | Weather forecasts via NWS API |
 | `conformance` | Full MCP spec conformance server (39/39 tests) |
 | `proxy` | Multi-server proxy with per-backend middleware |
+| `skill_prompts` | Load Agent Skills markdown files as MCP prompts |
 
 ```bash
 git clone https://github.com/joshrotenberg/tower-mcp
