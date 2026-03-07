@@ -24,7 +24,9 @@ use crate::prompt::Prompt;
 use crate::protocol::*;
 #[cfg(feature = "dynamic-tools")]
 use crate::registry::{
-    DynamicPromptRegistry, DynamicPromptsInner, DynamicToolRegistry, DynamicToolsInner,
+    DynamicPromptRegistry, DynamicPromptsInner, DynamicResourceRegistry,
+    DynamicResourceTemplateRegistry, DynamicResourceTemplatesInner, DynamicResourcesInner,
+    DynamicToolRegistry, DynamicToolsInner,
 };
 use crate::resource::{Resource, ResourceTemplate};
 use crate::session::SessionState;
@@ -187,6 +189,12 @@ struct McpRouterInner {
     /// Dynamic prompts registry for runtime prompt (de)registration
     #[cfg(feature = "dynamic-tools")]
     dynamic_prompts: Option<Arc<DynamicPromptsInner>>,
+    /// Dynamic resources registry for runtime resource (de)registration
+    #[cfg(feature = "dynamic-tools")]
+    dynamic_resources: Option<Arc<DynamicResourcesInner>>,
+    /// Dynamic resource templates registry for runtime template (de)registration
+    #[cfg(feature = "dynamic-tools")]
+    dynamic_resource_templates: Option<Arc<DynamicResourceTemplatesInner>>,
 }
 
 impl McpRouterInner {
@@ -305,6 +313,10 @@ impl McpRouter {
                 dynamic_tools: None,
                 #[cfg(feature = "dynamic-tools")]
                 dynamic_prompts: None,
+                #[cfg(feature = "dynamic-tools")]
+                dynamic_resources: None,
+                #[cfg(feature = "dynamic-tools")]
+                dynamic_resource_templates: None,
             }),
             session: SessionState::new(),
         }
@@ -424,6 +436,63 @@ impl McpRouter {
         (self, DynamicPromptRegistry::new(inner_dyn))
     }
 
+    /// Enable dynamic resource registration and return a registry handle.
+    ///
+    /// The returned [`DynamicResourceRegistry`] can be used to add and remove
+    /// resources at runtime. Dynamic resources are merged with static resources
+    /// when handling `resources/list` and `resources/read` requests. Static
+    /// resources take precedence over dynamic resources when URIs collide.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::{McpRouter, ResourceBuilder};
+    ///
+    /// let (router, registry) = McpRouter::new()
+    ///     .server_info("my-server", "1.0.0")
+    ///     .with_dynamic_resources();
+    ///
+    /// let resource = ResourceBuilder::new("file:///data.json")
+    ///     .name("Data")
+    ///     .text(r#"{"key": "value"}"#);
+    ///
+    /// registry.register(resource);
+    /// ```
+    #[cfg(feature = "dynamic-tools")]
+    pub fn with_dynamic_resources(mut self) -> (Self, DynamicResourceRegistry) {
+        let inner_dyn = Arc::new(DynamicResourcesInner::new());
+        Arc::make_mut(&mut self.inner).dynamic_resources = Some(inner_dyn.clone());
+        (self, DynamicResourceRegistry::new(inner_dyn))
+    }
+
+    /// Enable dynamic resource template registration and return a registry handle.
+    ///
+    /// The returned [`DynamicResourceTemplateRegistry`] can be used to add and
+    /// remove resource templates at runtime. Dynamic templates are checked
+    /// after static templates when handling `resources/read` requests.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use tower_mcp::{McpRouter, ResourceTemplateBuilder};
+    ///
+    /// let (router, registry) = McpRouter::new()
+    ///     .server_info("my-server", "1.0.0")
+    ///     .with_dynamic_resource_templates();
+    ///
+    /// let template = ResourceTemplateBuilder::new("db://tables/{table}")
+    ///     .name("Database Table")
+    ///     .handler(|uri, vars| async move { /* ... */ });
+    ///
+    /// registry.register(template);
+    /// ```
+    #[cfg(feature = "dynamic-tools")]
+    pub fn with_dynamic_resource_templates(mut self) -> (Self, DynamicResourceTemplateRegistry) {
+        let inner_dyn = Arc::new(DynamicResourceTemplatesInner::new());
+        Arc::make_mut(&mut self.inner).dynamic_resource_templates = Some(inner_dyn.clone());
+        (self, DynamicResourceTemplateRegistry::new(inner_dyn))
+    }
+
     /// Set the notification sender for progress reporting
     ///
     /// This is typically called by the transport layer to receive notifications.
@@ -438,6 +507,14 @@ impl McpRouter {
         #[cfg(feature = "dynamic-tools")]
         if let Some(ref dynamic_prompts) = inner.dynamic_prompts {
             dynamic_prompts.add_notification_sender(tx.clone());
+        }
+        #[cfg(feature = "dynamic-tools")]
+        if let Some(ref dynamic_resources) = inner.dynamic_resources {
+            dynamic_resources.add_notification_sender(tx.clone());
+        }
+        #[cfg(feature = "dynamic-tools")]
+        if let Some(ref dynamic_resource_templates) = inner.dynamic_resource_templates {
+            dynamic_resource_templates.add_notification_sender(tx.clone());
         }
         inner.notification_tx = Some(tx);
         self
@@ -1408,6 +1485,12 @@ impl McpRouter {
         #[cfg(not(feature = "dynamic-tools"))]
         let has_dynamic_prompts = false;
 
+        #[cfg(feature = "dynamic-tools")]
+        let has_dynamic_resources = self.inner.dynamic_resources.is_some()
+            || self.inner.dynamic_resource_templates.is_some();
+        #[cfg(not(feature = "dynamic-tools"))]
+        let has_dynamic_resources = false;
+
         ServerCapabilities {
             tools: if self.inner.tools.is_empty() && !has_dynamic_tools {
                 None
@@ -1416,7 +1499,7 @@ impl McpRouter {
                     list_changed: has_notifications,
                 })
             },
-            resources: if has_resources {
+            resources: if has_resources || has_dynamic_resources {
                 Some(ResourcesCapability {
                     subscribe: true,
                     list_changed: has_notifications,
@@ -1671,20 +1754,34 @@ impl McpRouter {
             }
 
             McpRequest::ListResources(params) => {
+                let is_visible = |r: &Resource| -> bool {
+                    self.inner
+                        .resource_filter
+                        .as_ref()
+                        .map(|f| f.is_visible(&self.session, r))
+                        .unwrap_or(true)
+                };
+
                 let mut resources: Vec<ResourceDefinition> = self
                     .inner
                     .resources
                     .values()
-                    .filter(|r| {
-                        // Apply resource filter if configured
-                        self.inner
-                            .resource_filter
-                            .as_ref()
-                            .map(|f| f.is_visible(&self.session, r))
-                            .unwrap_or(true)
-                    })
+                    .filter(|r| is_visible(r))
                     .map(|r| r.definition())
                     .collect();
+
+                // Merge dynamic resources (static resources win on URI collision)
+                #[cfg(feature = "dynamic-tools")]
+                if let Some(ref dynamic) = self.inner.dynamic_resources {
+                    let static_uris: HashSet<String> =
+                        resources.iter().map(|r| r.uri.clone()).collect();
+                    for r in dynamic.list() {
+                        if !static_uris.contains(&r.uri) && is_visible(&r) {
+                            resources.push(r.definition());
+                        }
+                    }
+                }
+
                 resources.sort_by(|a, b| a.uri.cmp(&b.uri));
 
                 let (resources, next_cursor) =
@@ -1704,6 +1801,21 @@ impl McpRouter {
                     .iter()
                     .map(|t| t.definition())
                     .collect();
+
+                // Merge dynamic resource templates (static win on collision)
+                #[cfg(feature = "dynamic-tools")]
+                if let Some(ref dynamic) = self.inner.dynamic_resource_templates {
+                    let static_patterns: HashSet<String> = resource_templates
+                        .iter()
+                        .map(|t| t.uri_template.clone())
+                        .collect();
+                    for t in dynamic.list() {
+                        if !static_patterns.contains(&t.uri_template) {
+                            resource_templates.push(t.definition());
+                        }
+                    }
+                }
+
                 resource_templates.sort_by(|a, b| a.uri_template.cmp(&b.uri_template));
 
                 let (resource_templates, next_cursor) = paginate(
@@ -1736,13 +1848,44 @@ impl McpRouter {
                     return Ok(McpResponse::ReadResource(result));
                 }
 
-                // If no static resource found, try to match against templates
+                // Try dynamic resources
+                #[cfg(feature = "dynamic-tools")]
+                #[allow(clippy::collapsible_if)]
+                if let Some(ref dynamic) = self.inner.dynamic_resources {
+                    if let Some(resource) = dynamic.get(&params.uri) {
+                        if let Some(filter) = &self.inner.resource_filter
+                            && !filter.is_visible(&self.session, &resource)
+                        {
+                            return Err(filter.denial_error(&params.uri));
+                        }
+                        tracing::debug!(uri = %params.uri, "Reading dynamic resource");
+                        let result = resource.read().await;
+                        return Ok(McpResponse::ReadResource(result));
+                    }
+                }
+
+                // Try static templates
                 for template in &self.inner.resource_templates {
                     if let Some(variables) = template.match_uri(&params.uri) {
                         tracing::debug!(
                             uri = %params.uri,
                             template = %template.uri_template,
                             "Reading resource via template"
+                        );
+                        let result = template.read(&params.uri, variables).await?;
+                        return Ok(McpResponse::ReadResource(result));
+                    }
+                }
+
+                // Try dynamic templates
+                #[cfg(feature = "dynamic-tools")]
+                #[allow(clippy::collapsible_if)]
+                if let Some(ref dynamic) = self.inner.dynamic_resource_templates {
+                    if let Some((template, variables)) = dynamic.match_uri(&params.uri) {
+                        tracing::debug!(
+                            uri = %params.uri,
+                            template = %template.uri_template,
+                            "Reading resource via dynamic template"
                         );
                         let result = template.read(&params.uri, variables).await?;
                         return Ok(McpResponse::ReadResource(result));

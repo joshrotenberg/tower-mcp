@@ -260,6 +260,251 @@ impl DynamicPromptRegistry {
     }
 }
 
+// =============================================================================
+// Dynamic Resource Registry
+// =============================================================================
+
+/// Inner state shared between the resource registry handle and the router.
+pub(crate) struct DynamicResourcesInner {
+    resources: RwLock<HashMap<String, Arc<crate::resource::Resource>>>,
+    notification_senders: RwLock<Vec<NotificationSender>>,
+}
+
+impl DynamicResourcesInner {
+    pub(crate) fn new() -> Self {
+        Self {
+            resources: RwLock::new(HashMap::new()),
+            notification_senders: RwLock::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn add_notification_sender(&self, sender: NotificationSender) {
+        let mut senders = self.notification_senders.write().unwrap();
+        senders.push(sender);
+    }
+
+    fn broadcast_resources_changed(&self) {
+        let mut senders = self.notification_senders.write().unwrap();
+        senders.retain(|tx| !tx.is_closed());
+        for tx in senders.iter() {
+            let _ = tx.try_send(ServerNotification::ResourcesListChanged);
+        }
+    }
+
+    pub(crate) fn list(&self) -> Vec<Arc<crate::resource::Resource>> {
+        let resources = self.resources.read().unwrap();
+        resources.values().cloned().collect()
+    }
+
+    pub(crate) fn get(&self, uri: &str) -> Option<Arc<crate::resource::Resource>> {
+        let resources = self.resources.read().unwrap();
+        resources.get(uri).cloned()
+    }
+}
+
+/// A thread-safe, cloneable handle for runtime resource management.
+///
+/// Obtained from [`McpRouter::with_dynamic_resources()`](crate::McpRouter::with_dynamic_resources).
+/// Resources registered here are merged with the router's static resources
+/// when handling `resources/list` and `resources/read` requests. Static
+/// resources take precedence over dynamic resources when URIs collide.
+///
+/// When a resource is registered or unregistered, all connected sessions
+/// receive a `notifications/resources/list_changed` notification.
+///
+/// # Example
+///
+/// ```rust
+/// use tower_mcp::{McpRouter, ResourceBuilder};
+///
+/// let (router, registry) = McpRouter::new()
+///     .server_info("my-server", "1.0.0")
+///     .with_dynamic_resources();
+///
+/// let resource = ResourceBuilder::new("file:///data.json")
+///     .name("Data")
+///     .text(r#"{"key": "value"}"#);
+///
+/// registry.register(resource);
+/// ```
+#[derive(Clone)]
+pub struct DynamicResourceRegistry {
+    inner: Arc<DynamicResourcesInner>,
+}
+
+impl DynamicResourceRegistry {
+    pub(crate) fn new(inner: Arc<DynamicResourcesInner>) -> Self {
+        Self { inner }
+    }
+
+    /// Register a resource, replacing any existing resource with the same URI.
+    ///
+    /// Broadcasts `ResourcesListChanged` to all connected sessions.
+    pub fn register(&self, resource: crate::resource::Resource) {
+        {
+            let mut resources = self.inner.resources.write().unwrap();
+            resources.insert(resource.uri.clone(), Arc::new(resource));
+        }
+        self.inner.broadcast_resources_changed();
+    }
+
+    /// Unregister a resource by URI.
+    ///
+    /// Returns `true` if the resource existed and was removed.
+    /// Broadcasts `ResourcesListChanged` only if the resource was actually removed.
+    pub fn unregister(&self, uri: &str) -> bool {
+        let removed = {
+            let mut resources = self.inner.resources.write().unwrap();
+            resources.remove(uri).is_some()
+        };
+        if removed {
+            self.inner.broadcast_resources_changed();
+        }
+        removed
+    }
+
+    /// List all currently registered dynamic resources.
+    pub fn list(&self) -> Vec<Arc<crate::resource::Resource>> {
+        self.inner.list()
+    }
+
+    /// Check if a resource with the given URI is registered.
+    pub fn contains(&self, uri: &str) -> bool {
+        let resources = self.inner.resources.read().unwrap();
+        resources.contains_key(uri)
+    }
+}
+
+// =============================================================================
+// Dynamic Resource Template Registry
+// =============================================================================
+
+/// Inner state shared between the resource template registry handle and the router.
+pub(crate) struct DynamicResourceTemplatesInner {
+    templates: RwLock<Vec<Arc<crate::resource::ResourceTemplate>>>,
+    notification_senders: RwLock<Vec<NotificationSender>>,
+}
+
+impl DynamicResourceTemplatesInner {
+    pub(crate) fn new() -> Self {
+        Self {
+            templates: RwLock::new(Vec::new()),
+            notification_senders: RwLock::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn add_notification_sender(&self, sender: NotificationSender) {
+        let mut senders = self.notification_senders.write().unwrap();
+        senders.push(sender);
+    }
+
+    fn broadcast_resources_changed(&self) {
+        let mut senders = self.notification_senders.write().unwrap();
+        senders.retain(|tx| !tx.is_closed());
+        for tx in senders.iter() {
+            let _ = tx.try_send(ServerNotification::ResourcesListChanged);
+        }
+    }
+
+    pub(crate) fn list(&self) -> Vec<Arc<crate::resource::ResourceTemplate>> {
+        let templates = self.templates.read().unwrap();
+        templates.clone()
+    }
+
+    pub(crate) fn match_uri(
+        &self,
+        uri: &str,
+    ) -> Option<(
+        Arc<crate::resource::ResourceTemplate>,
+        std::collections::HashMap<String, String>,
+    )> {
+        let templates = self.templates.read().unwrap();
+        for template in templates.iter() {
+            if let Some(variables) = template.match_uri(uri) {
+                return Some((Arc::clone(template), variables));
+            }
+        }
+        None
+    }
+}
+
+/// A thread-safe, cloneable handle for runtime resource template management.
+///
+/// Obtained from [`McpRouter::with_dynamic_resource_templates()`](crate::McpRouter::with_dynamic_resource_templates).
+/// Templates registered here are merged with the router's static templates
+/// when handling `resources/templates/list` and `resources/read` requests.
+/// Static templates are checked before dynamic ones.
+///
+/// When a template is registered or unregistered, all connected sessions
+/// receive a `notifications/resources/list_changed` notification.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use tower_mcp::{McpRouter, ResourceTemplateBuilder};
+///
+/// let (router, registry) = McpRouter::new()
+///     .server_info("my-server", "1.0.0")
+///     .with_dynamic_resource_templates();
+///
+/// let template = ResourceTemplateBuilder::new("db://tables/{table}")
+///     .name("Database Table")
+///     .handler(|uri, vars| async move { /* ... */ });
+///
+/// registry.register(template);
+/// ```
+#[derive(Clone)]
+pub struct DynamicResourceTemplateRegistry {
+    inner: Arc<DynamicResourceTemplatesInner>,
+}
+
+impl DynamicResourceTemplateRegistry {
+    pub(crate) fn new(inner: Arc<DynamicResourceTemplatesInner>) -> Self {
+        Self { inner }
+    }
+
+    /// Register a resource template.
+    ///
+    /// Broadcasts `ResourcesListChanged` to all connected sessions.
+    pub fn register(&self, template: crate::resource::ResourceTemplate) {
+        {
+            let mut templates = self.inner.templates.write().unwrap();
+            // Remove any existing template with the same URI pattern
+            templates.retain(|t| t.uri_template != template.uri_template);
+            templates.push(Arc::new(template));
+        }
+        self.inner.broadcast_resources_changed();
+    }
+
+    /// Unregister a resource template by URI pattern.
+    ///
+    /// Returns `true` if the template existed and was removed.
+    /// Broadcasts `ResourcesListChanged` only if the template was actually removed.
+    pub fn unregister(&self, uri_template: &str) -> bool {
+        let removed = {
+            let mut templates = self.inner.templates.write().unwrap();
+            let before = templates.len();
+            templates.retain(|t| t.uri_template != uri_template);
+            templates.len() < before
+        };
+        if removed {
+            self.inner.broadcast_resources_changed();
+        }
+        removed
+    }
+
+    /// List all currently registered dynamic resource templates.
+    pub fn list(&self) -> Vec<Arc<crate::resource::ResourceTemplate>> {
+        self.inner.list()
+    }
+
+    /// Check if a template with the given URI pattern is registered.
+    pub fn contains(&self, uri_template: &str) -> bool {
+        let templates = self.inner.templates.read().unwrap();
+        templates.iter().any(|t| t.uri_template == uri_template)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,5 +733,212 @@ mod tests {
             notification,
             ServerNotification::PromptsListChanged
         ));
+    }
+
+    // =========================================================================
+    // DynamicResourceRegistry tests
+    // =========================================================================
+
+    fn make_resource(uri: &str) -> crate::resource::Resource {
+        crate::resource::ResourceBuilder::new(uri)
+            .name(uri)
+            .text("content")
+    }
+
+    fn make_resource_registry() -> (DynamicResourceRegistry, Arc<DynamicResourcesInner>) {
+        let inner = Arc::new(DynamicResourcesInner::new());
+        let registry = DynamicResourceRegistry::new(inner.clone());
+        (registry, inner)
+    }
+
+    #[test]
+    fn test_resource_register_and_list() {
+        let (registry, _) = make_resource_registry();
+
+        assert!(registry.list().is_empty());
+
+        registry.register(make_resource("file:///a.txt"));
+        assert_eq!(registry.list().len(), 1);
+        assert!(registry.contains("file:///a.txt"));
+
+        registry.register(make_resource("file:///b.txt"));
+        assert_eq!(registry.list().len(), 2);
+    }
+
+    #[test]
+    fn test_resource_unregister() {
+        let (registry, _) = make_resource_registry();
+
+        registry.register(make_resource("file:///a.txt"));
+        registry.register(make_resource("file:///b.txt"));
+
+        assert!(registry.unregister("file:///a.txt"));
+        assert_eq!(registry.list().len(), 1);
+        assert!(!registry.contains("file:///a.txt"));
+        assert!(registry.contains("file:///b.txt"));
+    }
+
+    #[test]
+    fn test_resource_unregister_nonexistent() {
+        let (registry, _) = make_resource_registry();
+        assert!(!registry.unregister("file:///nope"));
+    }
+
+    #[tokio::test]
+    async fn test_resource_broadcast_on_register() {
+        let (registry, inner) = make_resource_registry();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        inner.add_notification_sender(tx);
+
+        registry.register(make_resource("file:///a.txt"));
+
+        let notification = rx.try_recv().unwrap();
+        assert!(matches!(
+            notification,
+            ServerNotification::ResourcesListChanged
+        ));
+    }
+
+    // =========================================================================
+    // DynamicResourceTemplateRegistry tests
+    // =========================================================================
+
+    fn make_template_registry() -> (
+        DynamicResourceTemplateRegistry,
+        Arc<DynamicResourceTemplatesInner>,
+    ) {
+        let inner = Arc::new(DynamicResourceTemplatesInner::new());
+        let registry = DynamicResourceTemplateRegistry::new(inner.clone());
+        (registry, inner)
+    }
+
+    #[test]
+    fn test_template_register_and_list() {
+        use crate::resource::ResourceTemplateBuilder;
+
+        let (registry, _) = make_template_registry();
+        assert!(registry.list().is_empty());
+
+        let template = ResourceTemplateBuilder::new("db://tables/{table}")
+            .name("Tables")
+            .handler(
+                |uri: String, _vars: std::collections::HashMap<String, String>| async move {
+                    Ok(crate::protocol::ReadResourceResult {
+                        contents: vec![crate::protocol::ResourceContent {
+                            uri,
+                            mime_type: None,
+                            text: Some("data".to_string()),
+                            blob: None,
+                            meta: None,
+                        }],
+                        meta: None,
+                    })
+                },
+            );
+
+        registry.register(template);
+        assert_eq!(registry.list().len(), 1);
+        assert!(registry.contains("db://tables/{table}"));
+    }
+
+    #[test]
+    fn test_template_unregister() {
+        use crate::resource::ResourceTemplateBuilder;
+
+        let (registry, _) = make_template_registry();
+
+        let template = ResourceTemplateBuilder::new("db://tables/{table}")
+            .name("Tables")
+            .handler(
+                |uri: String, _vars: std::collections::HashMap<String, String>| async move {
+                    Ok(crate::protocol::ReadResourceResult {
+                        contents: vec![crate::protocol::ResourceContent {
+                            uri,
+                            mime_type: None,
+                            text: Some("data".to_string()),
+                            blob: None,
+                            meta: None,
+                        }],
+                        meta: None,
+                    })
+                },
+            );
+
+        registry.register(template);
+        assert!(registry.unregister("db://tables/{table}"));
+        assert!(registry.list().is_empty());
+        assert!(!registry.unregister("db://tables/{table}"));
+    }
+
+    #[tokio::test]
+    async fn test_template_broadcast_on_register() {
+        use crate::resource::ResourceTemplateBuilder;
+
+        let (registry, inner) = make_template_registry();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        inner.add_notification_sender(tx);
+
+        let template = ResourceTemplateBuilder::new("db://tables/{table}")
+            .name("Tables")
+            .handler(
+                |uri: String, _vars: std::collections::HashMap<String, String>| async move {
+                    Ok(crate::protocol::ReadResourceResult {
+                        contents: vec![crate::protocol::ResourceContent {
+                            uri,
+                            mime_type: None,
+                            text: Some("data".to_string()),
+                            blob: None,
+                            meta: None,
+                        }],
+                        meta: None,
+                    })
+                },
+            );
+
+        registry.register(template);
+
+        let notification = rx.try_recv().unwrap();
+        assert!(matches!(
+            notification,
+            ServerNotification::ResourcesListChanged
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_template_match_uri() {
+        use crate::resource::ResourceTemplateBuilder;
+
+        let (_, inner) = make_template_registry();
+
+        let template = ResourceTemplateBuilder::new("db://tables/{table}")
+            .name("Tables")
+            .handler(
+                |uri: String, _vars: std::collections::HashMap<String, String>| async move {
+                    Ok(crate::protocol::ReadResourceResult {
+                        contents: vec![crate::protocol::ResourceContent {
+                            uri,
+                            mime_type: None,
+                            text: Some("data".to_string()),
+                            blob: None,
+                            meta: None,
+                        }],
+                        meta: None,
+                    })
+                },
+            );
+
+        {
+            let mut templates = inner.templates.write().unwrap();
+            templates.push(Arc::new(template));
+        }
+
+        let result = inner.match_uri("db://tables/users");
+        assert!(result.is_some());
+        let (_, vars) = result.unwrap();
+        assert_eq!(vars.get("table").unwrap(), "users");
+
+        assert!(inner.match_uri("db://other/path").is_none());
     }
 }

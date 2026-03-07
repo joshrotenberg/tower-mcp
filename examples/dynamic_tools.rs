@@ -1,9 +1,11 @@
-//! Dynamic tools example showing meta-tools that create/remove tools at runtime.
+//! Dynamic registration example -- tools, prompts, and resources at runtime.
 //!
 //! This example demonstrates:
-//! - Using `DynamicToolRegistry` for runtime tool registration
-//! - Building meta-tools (`create_tool`, `remove_tool`) that manage other tools
-//! - `ToolsListChanged` notifications when the tool set changes
+//! - `DynamicToolRegistry` for runtime tool registration
+//! - `DynamicPromptRegistry` for runtime prompt registration
+//! - `DynamicResourceRegistry` for runtime resource registration
+//! - Meta-tools (`create_tool`, `remove_tool`) that manage other tools
+//! - List-changed notifications when capabilities change
 //!
 //! Run with: `cargo run --example dynamic_tools --features dynamic-tools`
 
@@ -12,7 +14,8 @@ use serde::Deserialize;
 use tower_mcp::context::notification_channel;
 use tower_mcp::extract::{Json, State};
 use tower_mcp::{
-    CallToolResult, DynamicToolRegistry, JsonRpcRequest, JsonRpcService, McpRouter, ToolBuilder,
+    CallToolResult, DynamicToolRegistry, JsonRpcRequest, JsonRpcService, McpRouter, PromptBuilder,
+    ResourceBuilder, ToolBuilder,
 };
 
 /// Input for the `create_tool` meta-tool.
@@ -46,16 +49,18 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .with_env_filter("tower_mcp=debug")
         .init();
 
-    // Set up router with dynamic tool support
-    let (router, registry) = McpRouter::new()
-        .server_info("dynamic-tools-example", "0.1.0")
+    // Set up router with dynamic tools, prompts, and resources
+    let (router, tool_registry) = McpRouter::new()
+        .server_info("dynamic-example", "0.1.0")
         .with_dynamic_tools();
+    let (router, prompt_registry) = router.with_dynamic_prompts();
+    let (router, resource_registry) = router.with_dynamic_resources();
 
-    // Meta-tool: create_tool — registers a new dynamic tool
+    // Meta-tool: create_tool -- registers a new dynamic tool
     let create_tool = ToolBuilder::new("create_tool")
         .description("Create a new tool that prefixes messages")
         .extractor_handler(
-            registry.clone(),
+            tool_registry.clone(),
             |State(reg): State<DynamicToolRegistry>, Json(input): Json<CreateToolInput>| async move {
                 let prefix = input.prefix.clone();
                 let tool = ToolBuilder::new(&input.name)
@@ -72,11 +77,11 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         )
         .build();
 
-    // Meta-tool: remove_tool — unregisters a dynamic tool
+    // Meta-tool: remove_tool -- unregisters a dynamic tool
     let remove_tool = ToolBuilder::new("remove_tool")
         .description("Remove a previously created tool")
         .extractor_handler(
-            registry.clone(),
+            tool_registry.clone(),
             |State(reg): State<DynamicToolRegistry>, Json(input): Json<RemoveToolInput>| async move {
                 if reg.unregister(&input.name) {
                     Ok(CallToolResult::text(format!("Removed tool '{}'", input.name)))
@@ -96,7 +101,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
 
     let mut service = JsonRpcService::new(router);
 
-    println!("=== Dynamic Tools Example ===\n");
+    println!("=== Dynamic Registration Example ===\n");
 
     // 1. Initialize
     println!("1. Initialize:");
@@ -111,18 +116,53 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .await?;
     println!("   {}\n", serde_json::to_string_pretty(&resp)?);
 
-    // 2. List tools — only meta-tools exist
-    println!("2. List tools (before creating any):");
+    // 2. Register a dynamic prompt
+    println!("2. Register dynamic prompt 'code-review':");
+    let prompt = PromptBuilder::new("code-review")
+        .description("Structured code review guidance")
+        .user_message("Review the code for security, performance, and maintainability.");
+    prompt_registry.register(prompt);
+    println!("   Done.\n");
+
+    // 3. List prompts
+    println!("3. List prompts:");
     let resp = service
-        .call_single(JsonRpcRequest::new(2, "tools/list"))
+        .call_single(JsonRpcRequest::new(3, "prompts/list"))
         .await?;
     println!("   {}\n", serde_json::to_string_pretty(&resp)?);
 
-    // 3. Create a dynamic "greet" tool
-    println!("3. Call create_tool to make 'greet':");
+    // 4. Register a dynamic resource
+    println!("4. Register dynamic resource 'config://app':");
+    let resource = ResourceBuilder::new("config://app")
+        .name("App Config")
+        .description("Current application configuration")
+        .text(r#"{"debug": true, "log_level": "info"}"#);
+    resource_registry.register(resource);
+    println!("   Done.\n");
+
+    // 5. List resources
+    println!("5. List resources:");
+    let resp = service
+        .call_single(JsonRpcRequest::new(5, "resources/list"))
+        .await?;
+    println!("   {}\n", serde_json::to_string_pretty(&resp)?);
+
+    // 6. Read the dynamic resource
+    println!("6. Read 'config://app':");
     let resp = service
         .call_single(
-            JsonRpcRequest::new(3, "tools/call").with_params(serde_json::json!({
+            JsonRpcRequest::new(6, "resources/read").with_params(serde_json::json!({
+                "uri": "config://app"
+            })),
+        )
+        .await?;
+    println!("   {}\n", serde_json::to_string_pretty(&resp)?);
+
+    // 7. Create a dynamic tool via meta-tool
+    println!("7. Create dynamic tool 'greet':");
+    let resp = service
+        .call_single(
+            JsonRpcRequest::new(7, "tools/call").with_params(serde_json::json!({
                 "name": "create_tool",
                 "arguments": {
                     "name": "greet",
@@ -134,18 +174,11 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .await?;
     println!("   {}\n", serde_json::to_string_pretty(&resp)?);
 
-    // 4. List tools — now includes "greet"
-    println!("4. List tools (after creating 'greet'):");
-    let resp = service
-        .call_single(JsonRpcRequest::new(4, "tools/list"))
-        .await?;
-    println!("   {}\n", serde_json::to_string_pretty(&resp)?);
-
-    // 5. Call the dynamic "greet" tool
-    println!("5. Call dynamic 'greet' tool:");
+    // 8. Call the dynamic tool
+    println!("8. Call dynamic 'greet' tool:");
     let resp = service
         .call_single(
-            JsonRpcRequest::new(5, "tools/call").with_params(serde_json::json!({
+            JsonRpcRequest::new(8, "tools/call").with_params(serde_json::json!({
                 "name": "greet",
                 "arguments": { "message": "World" }
             })),
@@ -153,26 +186,16 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .await?;
     println!("   {}\n", serde_json::to_string_pretty(&resp)?);
 
-    // 6. Remove the "greet" tool
-    println!("6. Call remove_tool to remove 'greet':");
-    let resp = service
-        .call_single(
-            JsonRpcRequest::new(6, "tools/call").with_params(serde_json::json!({
-                "name": "remove_tool",
-                "arguments": { "name": "greet" }
-            })),
-        )
-        .await?;
-    println!("   {}\n", serde_json::to_string_pretty(&resp)?);
+    // 9. Unregister everything
+    println!("9. Unregister dynamic capabilities:");
+    tool_registry.unregister("greet");
+    println!("   Removed tool 'greet'");
+    prompt_registry.unregister("code-review");
+    println!("   Removed prompt 'code-review'");
+    resource_registry.unregister("config://app");
+    println!("   Removed resource 'config://app'\n");
 
-    // 7. List tools — back to meta-tools only
-    println!("7. List tools (after removing 'greet'):");
-    let resp = service
-        .call_single(JsonRpcRequest::new(7, "tools/list"))
-        .await?;
-    println!("   {}\n", serde_json::to_string_pretty(&resp)?);
-
-    // 8. Drain and display notifications
+    // 10. Drain and display notifications
     println!("=== Notifications received ===");
     let mut count = 0;
     while let Ok(notification) = rx.try_recv() {
