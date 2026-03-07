@@ -2,7 +2,6 @@
 
 use std::convert::Infallible;
 use std::fmt;
-use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tower::Layer;
@@ -502,49 +501,12 @@ impl McpProxyBuilder {
             entries,
             self.notification_tx,
             instructions,
+            self.separator.clone(),
         );
 
         // Spawn invalidation watchers for backends with notification handlers.
-        // After refreshing the cache, forward list-changed notifications
-        // downstream so transports can relay them to connected clients.
-        for (backend_idx, mut rx) in invalidation_rxs {
-            let shared = Arc::clone(&proxy.shared);
-            tokio::spawn(async move {
-                while let Some(changed) = rx.recv().await {
-                    let backend = &shared.backends[backend_idx];
-                    tracing::debug!(
-                        namespace = %backend.namespace,
-                        kind = ?changed,
-                        "Backend list changed, refreshing cache"
-                    );
-                    match changed {
-                        ListChanged::Tools => {
-                            backend.refresh_tools().await;
-                            if let Some(tx) = &shared.notification_tx {
-                                let _ = tx
-                                    .send(crate::context::ServerNotification::ToolsListChanged)
-                                    .await;
-                            }
-                        }
-                        ListChanged::Resources => {
-                            backend.refresh_resources().await;
-                            if let Some(tx) = &shared.notification_tx {
-                                let _ = tx
-                                    .send(crate::context::ServerNotification::ResourcesListChanged)
-                                    .await;
-                            }
-                        }
-                        ListChanged::Prompts => {
-                            backend.refresh_prompts().await;
-                            if let Some(tx) = &shared.notification_tx {
-                                let _ = tx
-                                    .send(crate::context::ServerNotification::PromptsListChanged)
-                                    .await;
-                            }
-                        }
-                    }
-                }
-            });
+        for (backend_idx, rx) in invalidation_rxs {
+            proxy.spawn_invalidation_watcher(backend_idx, rx);
         }
 
         Ok(ProxyBuildResult { proxy, skipped })

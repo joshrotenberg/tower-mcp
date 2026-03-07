@@ -203,7 +203,7 @@ mod service;
 mod tests;
 
 pub use builder::{McpProxyBuilder, ProxyBuildResult, SkippedBackend, SkippedPhase};
-pub use service::{BackendHealth, McpProxy};
+pub use service::{AddBackendError, BackendHealth, McpProxy};
 
 // Re-export BackendService so users can write layer bounds against it
 pub use backend::BackendService;

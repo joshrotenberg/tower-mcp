@@ -1245,6 +1245,229 @@ mod proxy_tests {
         assert!(tool_lists[0].contains(&"text_echo".to_string()));
     }
 
+    // ========================================================================
+    // Dynamic backend addition (#628)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_add_backend_dynamically() {
+        // Start with just the math backend
+        let math_transport = ChannelTransport::new(math_router());
+        let mut proxy = McpProxy::builder("dynamic-proxy", "1.0.0")
+            .backend("math", math_transport)
+            .await
+            .build_strict()
+            .await
+            .expect("proxy should build");
+
+        // Initially only 1 backend with 1 tool
+        assert_eq!(proxy.backend_count(), 1);
+        let resp = call_proxy(&mut proxy, McpRequest::ListTools(Default::default()))
+            .await
+            .expect("list tools should succeed");
+        match &resp {
+            McpResponse::ListTools(result) => assert_eq!(result.tools.len(), 1),
+            other => panic!("expected ListTools, got: {:?}", other),
+        }
+
+        // Add text backend dynamically
+        let text_transport = ChannelTransport::new(text_router());
+        proxy
+            .add_backend("text", text_transport)
+            .await
+            .expect("add_backend should succeed");
+
+        // Now 2 backends
+        assert_eq!(proxy.backend_count(), 2);
+
+        // List tools should show tools from both backends
+        let resp = call_proxy(&mut proxy, McpRequest::ListTools(Default::default()))
+            .await
+            .expect("list tools should succeed");
+        match resp {
+            McpResponse::ListTools(result) => {
+                assert_eq!(result.tools.len(), 2);
+                let names: Vec<&str> = result.tools.iter().map(|t| t.name.as_str()).collect();
+                assert!(names.contains(&"math_add"));
+                assert!(names.contains(&"text_echo"));
+            }
+            other => panic!("expected ListTools, got: {:?}", other),
+        }
+
+        // Call tool on the dynamically-added backend
+        let resp = call_proxy(
+            &mut proxy,
+            McpRequest::CallTool(crate::protocol::CallToolParams {
+                name: "text_echo".to_string(),
+                arguments: json!({"message": "dynamic!"}),
+                meta: None,
+                task: None,
+            }),
+        )
+        .await
+        .expect("call tool should succeed");
+
+        match resp {
+            McpResponse::CallTool(result) => assert_eq!(result.all_text(), "dynamic!"),
+            other => panic!("expected CallTool, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_add_backend_visible_to_clones() {
+        let math_transport = ChannelTransport::new(math_router());
+        let proxy = McpProxy::builder("clone-proxy", "1.0.0")
+            .backend("math", math_transport)
+            .await
+            .build_strict()
+            .await
+            .expect("proxy should build");
+
+        // Clone the proxy before adding a backend
+        let mut clone = proxy.clone();
+
+        // Add text backend to the original
+        let text_transport = ChannelTransport::new(text_router());
+        proxy
+            .add_backend("text", text_transport)
+            .await
+            .expect("add_backend should succeed");
+
+        // The clone should also see the new backend (shared entries)
+        assert_eq!(clone.backend_count(), 2);
+
+        let resp = call_proxy(&mut clone, McpRequest::ListTools(Default::default()))
+            .await
+            .expect("list tools should succeed");
+        match resp {
+            McpResponse::ListTools(result) => {
+                assert_eq!(result.tools.len(), 2);
+            }
+            other => panic!("expected ListTools, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_add_backend_rejects_duplicate_namespace() {
+        let math_transport = ChannelTransport::new(math_router());
+        let proxy = McpProxy::builder("dup-proxy", "1.0.0")
+            .backend("math", math_transport)
+            .await
+            .build_strict()
+            .await
+            .expect("proxy should build");
+
+        let text_transport = ChannelTransport::new(text_router());
+        let result = proxy.add_backend("math", text_transport).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            crate::proxy::AddBackendError::DuplicateNamespace(ns) => {
+                assert_eq!(ns, "math");
+            }
+            other => panic!("expected DuplicateNamespace, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_add_backend_rejects_ambiguous_prefix() {
+        let t1 = ChannelTransport::new(math_router());
+        let proxy = McpProxy::builder("ambig-proxy", "1.0.0")
+            .backend("redis", t1)
+            .await
+            .build_strict()
+            .await
+            .expect("proxy should build");
+
+        let t2 = ChannelTransport::new(text_router());
+        let result = proxy.add_backend("redis_ft", t2).await;
+        assert!(result.is_err());
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                crate::proxy::AddBackendError::AmbiguousPrefix { .. }
+            ),
+            "should be AmbiguousPrefix error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_backend_with_layer() {
+        let math_transport = ChannelTransport::new(math_router());
+        let mut proxy = McpProxy::builder("layered-proxy", "1.0.0")
+            .backend("math", math_transport)
+            .await
+            .build_strict()
+            .await
+            .expect("proxy should build");
+
+        // Add slow backend with a tight timeout
+        let slow_transport = ChannelTransport::new(slow_router());
+        proxy
+            .add_backend_with_layer(
+                "slow",
+                slow_transport,
+                TimeoutLayer::new(Duration::from_millis(50)),
+            )
+            .await
+            .expect("add_backend_with_layer should succeed");
+
+        // The slow backend should timeout
+        let result = call_proxy(
+            &mut proxy,
+            McpRequest::CallTool(crate::protocol::CallToolParams {
+                name: "slow_slow_op".to_string(),
+                arguments: json!({"delay_ms": 500}),
+                meta: None,
+                task: None,
+            }),
+        )
+        .await;
+
+        assert!(result.is_err(), "should timeout");
+
+        // The math backend should still work
+        let resp = call_proxy(
+            &mut proxy,
+            McpRequest::CallTool(crate::protocol::CallToolParams {
+                name: "math_add".to_string(),
+                arguments: json!({"a": 3, "b": 4}),
+                meta: None,
+                task: None,
+            }),
+        )
+        .await
+        .expect("math should succeed");
+
+        match resp {
+            McpResponse::CallTool(result) => assert_eq!(result.all_text(), "7"),
+            other => panic!("expected CallTool, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_add_backend_health_check_includes_new_backend() {
+        let math_transport = ChannelTransport::new(math_router());
+        let proxy = McpProxy::builder("health-proxy", "1.0.0")
+            .backend("math", math_transport)
+            .await
+            .build_strict()
+            .await
+            .expect("proxy should build");
+
+        let text_transport = ChannelTransport::new(text_router());
+        proxy
+            .add_backend("text", text_transport)
+            .await
+            .expect("add_backend should succeed");
+
+        let health = proxy.health_check().await;
+        assert_eq!(health.len(), 2);
+        let namespaces: Vec<&str> = health.iter().map(|h| h.namespace.as_str()).collect();
+        assert!(namespaces.contains(&"math"));
+        assert!(namespaces.contains(&"text"));
+        assert!(health.iter().all(|h| h.healthy));
+    }
+
     #[tokio::test]
     async fn test_coalesce_layer_does_not_affect_different_methods() {
         use std::mem::discriminant;
