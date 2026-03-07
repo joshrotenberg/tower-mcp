@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.2] - 2026-03-07
+
+### Documentation
+
+- Pre-release documentation fixes ([#621](https://github.com/joshrotenberg/tower-mcp/pull/621))
+
+### Features
+
+- MCP proxy for multi-server aggregation ([#600](https://github.com/joshrotenberg/tower-mcp/pull/600))
+- Optional proc macros for tools, prompts, and resources ([#613](https://github.com/joshrotenberg/tower-mcp/pull/613))
+- Dynamic resource and resource template registries ([#616](https://github.com/joshrotenberg/tower-mcp/pull/616))
+
+
+
 ## [0.8.1] - 2026-03-06
 
 

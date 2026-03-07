@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.2] - 2026-03-07
+
+### Bug Fixes
+
+- Proxy improvements -- error visibility, poll_ready, instructions, docs ([#614](https://github.com/joshrotenberg/tower-mcp/pull/614))
+- Make compile_uri_template fallible, add try_handler ([#619](https://github.com/joshrotenberg/tower-mcp/pull/619))
+
+### Documentation
+
+- Pre-release documentation fixes ([#621](https://github.com/joshrotenberg/tower-mcp/pull/621))
+
+### Features
+
+- MCP proxy for multi-server aggregation ([#600](https://github.com/joshrotenberg/tower-mcp/pull/600))
+- Optional proc macros for tools, prompts, and resources ([#613](https://github.com/joshrotenberg/tower-mcp/pull/613))
+- Dynamic prompt registry and skill-to-prompt example ([#615](https://github.com/joshrotenberg/tower-mcp/pull/615))
+- Dynamic resource and resource template registries ([#616](https://github.com/joshrotenberg/tower-mcp/pull/616))
+- Add AuditLayer middleware for structured audit logging ([#618](https://github.com/joshrotenberg/tower-mcp/pull/618))
+
+
+
 ## [0.8.1] - 2026-03-06
 
 ### Bug Fixes
