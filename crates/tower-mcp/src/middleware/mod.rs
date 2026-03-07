@@ -11,6 +11,7 @@
 //! |-------|---------|
 //! | [`McpTracingLayer`] | Structured tracing for all MCP requests |
 //! | [`ToolCallLoggingLayer`] | Focused audit logging for tool calls |
+//! | [`AuditLayer`] | Comprehensive audit events for all MCP requests |
 //!
 //! # Usage
 //!
@@ -18,19 +19,21 @@
 //!
 //! ```rust,ignore
 //! use tower::ServiceBuilder;
-//! use tower_mcp::middleware::{McpTracingLayer, ToolCallLoggingLayer};
+//! use tower_mcp::middleware::{AuditLayer, McpTracingLayer, ToolCallLoggingLayer};
 //!
 //! let transport = StdioTransport::new(router)
 //!     .layer(
 //!         ServiceBuilder::new()
 //!             .layer(McpTracingLayer::new())
-//!             .layer(ToolCallLoggingLayer::new())
+//!             .layer(AuditLayer::new())
 //!             .into_inner(),
 //!     );
 //! ```
 
+mod audit;
 mod tool_call_logging;
 mod tracing;
 
+pub use audit::{AuditLayer, AuditService};
 pub use tool_call_logging::{ToolCallLoggingLayer, ToolCallLoggingService};
 pub use tracing::{McpTracingLayer, McpTracingService};
