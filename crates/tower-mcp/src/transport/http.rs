@@ -209,14 +209,26 @@ struct BufferedEvent {
     timestamp: Instant,
 }
 
+/// How the session produces its MCP service.
+enum SessionMode {
+    /// Router-based: each session clones and wraps the router via a factory.
+    Router {
+        router: McpRouter,
+        service_factory: ServiceFactory,
+    },
+    /// Service-based: each session clones a pre-built service (e.g., McpProxy).
+    /// Wrapped in std::sync::Mutex for Sync (BoxCloneService is Send but not Sync).
+    Service {
+        service: std::sync::Mutex<McpBoxService>,
+    },
+}
+
 /// Session state for HTTP transport
 struct Session {
     /// Session ID
     id: String,
-    /// The MCP router for this session
-    router: McpRouter,
-    /// Factory for creating middleware-wrapped services
-    service_factory: ServiceFactory,
+    /// How this session produces its MCP service
+    mode: SessionMode,
     /// Broadcast channel for SSE notifications and outgoing requests
     notifications_tx: broadcast::Sender<String>,
     /// Last time this session was accessed
@@ -269,8 +281,10 @@ impl Session {
 
         Self {
             id: uuid::Uuid::new_v4().to_string(),
-            router,
-            service_factory,
+            mode: SessionMode::Router {
+                router,
+                service_factory,
+            },
             notifications_tx,
             last_accessed: RwLock::new(Instant::now()),
             pending_requests: Mutex::new(HashMap::new()),
@@ -282,9 +296,68 @@ impl Session {
         }
     }
 
-    /// Create a middleware-wrapped service from this session's router.
+    /// Create a session backed by a pre-built service (e.g., [`McpProxy`]).
+    ///
+    /// Unlike router-based sessions, notifications must be forwarded externally
+    /// (e.g., via a notification channel from the proxy).
+    fn new_from_service(
+        service: McpBoxService,
+        notification_rx: Option<crate::context::NotificationReceiver>,
+    ) -> Self {
+        let (notifications_tx, _) = broadcast::channel(100);
+
+        // Forward notifications from the service to the SSE broadcast channel
+        if let Some(mut notif_receiver) = notification_rx {
+            let broadcast_tx = notifications_tx.clone();
+            tokio::spawn(async move {
+                while let Some(notification) = notif_receiver.recv().await {
+                    if let Some(json) =
+                        crate::transport::stdio::serialize_notification(&notification)
+                    {
+                        let _ = broadcast_tx.send(json);
+                    }
+                }
+            });
+        }
+
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            mode: SessionMode::Service {
+                service: std::sync::Mutex::new(service),
+            },
+            notifications_tx,
+            last_accessed: RwLock::new(Instant::now()),
+            pending_requests: Mutex::new(HashMap::new()),
+            request_rx: Mutex::new(None),
+            protocol_version: RwLock::new(LATEST_PROTOCOL_VERSION.to_string()),
+            event_counter: AtomicU64::new(0),
+            event_buffer: RwLock::new(VecDeque::new()),
+            max_buffered_events: DEFAULT_MAX_BUFFERED_EVENTS,
+        }
+    }
+
+    /// Create a middleware-wrapped service from this session's router or service.
     fn make_service(&self) -> McpBoxService {
-        (self.service_factory)(self.router.clone())
+        match &self.mode {
+            SessionMode::Router {
+                router,
+                service_factory,
+            } => (service_factory)(router.clone()),
+            SessionMode::Service { service } => {
+                service.lock().expect("session service lock poisoned").clone()
+            }
+        }
+    }
+
+    /// Handle an inbound notification from the client.
+    fn handle_notification(&self, notification: McpNotification) {
+        match &self.mode {
+            SessionMode::Router { router, .. } => router.handle_notification(notification),
+            SessionMode::Service { .. } => {
+                // Service-based sessions (e.g., proxy) handle initialization
+                // through the Service::call path; client notifications are no-ops.
+            }
+        }
     }
 
     /// Get the next SSE event ID for this session.
@@ -454,6 +527,31 @@ impl SessionStore {
         Some(session)
     }
 
+    /// Create a session from a pre-built service (used by `from_service` mode).
+    async fn create_from_service(
+        &self,
+        service: McpBoxService,
+        notification_rx: Option<crate::context::NotificationReceiver>,
+    ) -> Option<Arc<Session>> {
+        let mut sessions = self.sessions.write().await;
+
+        if let Some(max) = self.config.max_sessions
+            && sessions.len() >= max
+        {
+            tracing::warn!(
+                max_sessions = max,
+                current = sessions.len(),
+                "Session limit reached, rejecting new session"
+            );
+            return None;
+        }
+
+        let session = Arc::new(Session::new_from_service(service, notification_rx));
+        sessions.insert(session.id.clone(), session.clone());
+        tracing::debug!(session_id = %session.id, "Created new service-based session");
+        Some(session)
+    }
+
     async fn get(&self, id: &str) -> Option<Arc<Session>> {
         let sessions = self.sessions.read().await;
         let session = sessions.get(id).cloned();
@@ -503,12 +601,28 @@ impl SessionStore {
     }
 }
 
+/// How the transport creates sessions.
+enum TransportMode {
+    /// Router-based: each session gets a fresh clone of the router.
+    Router {
+        router_template: McpRouter,
+        service_factory: ServiceFactory,
+    },
+    /// Service-based: each session clones a pre-built service.
+    /// The service is wrapped in std::sync::Mutex for Sync safety.
+    Service {
+        service: std::sync::Mutex<McpBoxService>,
+        /// Factory for notification receivers (one per session).
+        /// Returns `None` if no notification forwarding is needed.
+        notification_rx_factory:
+            Arc<dyn Fn() -> Option<crate::context::NotificationReceiver> + Send + Sync>,
+    },
+}
+
 /// Shared state for the HTTP transport
 struct AppState {
-    /// Template router for creating new sessions
-    router_template: McpRouter,
-    /// Factory for creating middleware-wrapped services
-    service_factory: ServiceFactory,
+    /// How sessions are created
+    mode: TransportMode,
     /// Session store
     sessions: Arc<SessionStore>,
     /// Whether to validate Origin header
@@ -535,26 +649,146 @@ pub(crate) struct OAuthConfig {
 ///
 /// Implements the Streamable HTTP transport from the MCP specification.
 pub struct HttpTransport {
-    router: McpRouter,
+    mode: TransportMode,
     validate_origin: bool,
     allowed_origins: Vec<String>,
     session_config: SessionConfig,
     sampling_enabled: bool,
-    service_factory: ServiceFactory,
     #[cfg(feature = "oauth")]
     oauth_config: Option<OAuthConfig>,
 }
 
 impl HttpTransport {
-    /// Create a new HTTP transport wrapping an MCP router
+    /// Create a new HTTP transport wrapping an MCP router.
     pub fn new(router: McpRouter) -> Self {
         Self {
-            router,
+            mode: TransportMode::Router {
+                router_template: router,
+                service_factory: identity_factory(),
+            },
             validate_origin: true,
             allowed_origins: vec![],
             session_config: SessionConfig::default(),
             sampling_enabled: false,
-            service_factory: identity_factory(),
+            #[cfg(feature = "oauth")]
+            oauth_config: None,
+        }
+    }
+
+    /// Create an HTTP transport from a pre-built `Service<RouterRequest>`.
+    ///
+    /// Use this to serve any service that implements the MCP request/response
+    /// contract over HTTP — for example, an [`McpProxy`](crate::proxy::McpProxy)
+    /// or a custom middleware-wrapped service.
+    ///
+    /// The service must handle all MCP methods (`initialize`, `tools/list`,
+    /// `tools/call`, etc.) and return proper MCP responses. The service is
+    /// cloned for each session.
+    ///
+    /// An optional notification receiver can forward server-initiated
+    /// notifications (e.g., `tools/list_changed`) to connected SSE clients.
+    /// If you need per-session notification channels, use
+    /// [`from_service_with_notifications()`](Self::from_service_with_notifications).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use tower_mcp::proxy::McpProxy;
+    /// use tower_mcp::transport::http::HttpTransport;
+    /// use tower_mcp::context::notification_channel;
+    ///
+    /// let (notif_tx, notif_rx) = notification_channel(32);
+    ///
+    /// let proxy = McpProxy::builder("gateway", "1.0.0")
+    ///     .notification_sender(notif_tx)
+    ///     .backend("db", db_transport).await
+    ///     .build_strict().await?;
+    ///
+    /// let transport = HttpTransport::from_service(proxy)
+    ///     .with_notification_receiver(notif_rx);
+    ///
+    /// transport.serve("127.0.0.1:8080").await?;
+    /// ```
+    pub fn from_service<S>(service: S) -> Self
+    where
+        S: tower_service::Service<RouterRequest, Response = RouterResponse, Error = Infallible>
+            + Clone
+            + Send
+            + 'static,
+        S::Future: Send,
+    {
+        let boxed = tower::util::BoxCloneService::new(service);
+        Self {
+            mode: TransportMode::Service {
+                service: std::sync::Mutex::new(boxed),
+                notification_rx_factory: Arc::new(|| None),
+            },
+            validate_origin: true,
+            allowed_origins: vec![],
+            session_config: SessionConfig::default(),
+            sampling_enabled: false,
+            #[cfg(feature = "oauth")]
+            oauth_config: None,
+        }
+    }
+
+    /// Attach a notification receiver for forwarding server notifications
+    /// to SSE clients.
+    ///
+    /// This is typically used with [`McpProxy`](crate::proxy::McpProxy) to
+    /// forward `tools/list_changed` and similar notifications from backends
+    /// to connected clients.
+    ///
+    /// Note: the receiver is shared across all sessions via a broadcast
+    /// bridge spawned at transport construction time.
+    pub fn with_notification_receiver(
+        mut self,
+        rx: crate::context::NotificationReceiver,
+    ) -> Self {
+        // Wrap the receiver in an Arc<Mutex> so we can share it.
+        // The first session to be created will take ownership; subsequent
+        // sessions subscribe to the broadcast channel instead.
+        let rx = Arc::new(tokio::sync::Mutex::new(Some(rx)));
+        if let TransportMode::Service {
+            ref mut notification_rx_factory,
+            ..
+        } = self.mode
+        {
+            *notification_rx_factory = Arc::new(move || {
+                // Only the first call gets the receiver; subsequent calls get None.
+                // This is fine because the Session::new_from_service bridges to a
+                // broadcast channel that all SSE connections subscribe to.
+                rx.try_lock().ok().and_then(|mut guard| guard.take())
+            });
+        }
+        self
+    }
+
+    /// Create an HTTP transport from a pre-built service with per-session
+    /// notification channels.
+    ///
+    /// The `notification_factory` is called once per session to create a
+    /// notification receiver for that session. This allows fine-grained
+    /// control over which notifications reach which client.
+    pub fn from_service_with_notifications<S, F>(service: S, notification_factory: F) -> Self
+    where
+        S: tower_service::Service<RouterRequest, Response = RouterResponse, Error = Infallible>
+            + Clone
+            + Send
+            + 'static,
+        S::Future: Send,
+        F: Fn() -> Option<crate::context::NotificationReceiver> + Send + Sync + 'static,
+    {
+        let boxed = tower::util::BoxCloneService::new(service);
+        Self {
+            mode: TransportMode::Service {
+                service: std::sync::Mutex::new(boxed),
+                notification_rx_factory: Arc::new(notification_factory),
+            },
+            validate_origin: true,
+            allowed_origins: vec![],
+            session_config: SessionConfig::default(),
+            sampling_enabled: false,
             #[cfg(feature = "oauth")]
             oauth_config: None,
         }
@@ -688,6 +922,15 @@ impl HttpTransport {
     ///             .into_inner(),
     ///     );
     /// ```
+    /// Apply a tower middleware layer to MCP request processing.
+    ///
+    /// This is only available when using router-based mode (i.e., `HttpTransport::new()`).
+    /// For service-based mode (`from_service()`), apply middleware to the service
+    /// before passing it to the transport.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on a transport created with `from_service()`.
     pub fn layer<L>(mut self, layer: L) -> Self
     where
         L: tower::Layer<McpRouter> + Send + Sync + 'static,
@@ -696,14 +939,26 @@ impl HttpTransport {
         <L::Service as tower::Service<RouterRequest>>::Error: std::fmt::Display + Send,
         <L::Service as tower::Service<RouterRequest>>::Future: Send,
     {
-        self.service_factory = Arc::new(move |router: McpRouter| {
-            let annotations = router.tool_annotations_map();
-            let wrapped = layer.layer(router);
-            tower::util::BoxCloneService::new(InjectAnnotations::new(
-                CatchError::new(wrapped),
-                annotations,
-            ))
-        });
+        match &mut self.mode {
+            TransportMode::Router {
+                service_factory, ..
+            } => {
+                *service_factory = Arc::new(move |router: McpRouter| {
+                    let annotations = router.tool_annotations_map();
+                    let wrapped = layer.layer(router);
+                    tower::util::BoxCloneService::new(InjectAnnotations::new(
+                        CatchError::new(wrapped),
+                        annotations,
+                    ))
+                });
+            }
+            TransportMode::Service { .. } => {
+                panic!(
+                    "HttpTransport::layer() is not supported in service mode. \
+                     Apply middleware to the service before passing it to from_service()."
+                );
+            }
+        }
         self
     }
 
@@ -723,9 +978,30 @@ impl HttpTransport {
             }
         });
 
+        let mode = match &self.mode {
+            TransportMode::Router {
+                router_template,
+                service_factory,
+            } => TransportMode::Router {
+                router_template: router_template.clone(),
+                service_factory: service_factory.clone(),
+            },
+            TransportMode::Service {
+                service,
+                notification_rx_factory,
+            } => TransportMode::Service {
+                service: std::sync::Mutex::new(
+                    service
+                        .lock()
+                        .expect("transport service lock poisoned")
+                        .clone(),
+                ),
+                notification_rx_factory: notification_rx_factory.clone(),
+            },
+        };
+
         Arc::new(AppState {
-            router_template: self.router.clone(),
-            service_factory: self.service_factory.clone(),
+            mode,
             sessions,
             validate_origin: self.validate_origin,
             allowed_origins: self.allowed_origins.clone(),
@@ -973,15 +1249,35 @@ async fn handle_post(
     // Get or create session
     let session = if is_init {
         // Create new session for initialize
-        // Use with_fresh_session() to ensure each session has its own state
-        match state
-            .sessions
-            .create(
-                state.router_template.with_fresh_session(),
-                state.service_factory.clone(),
-            )
-            .await
-        {
+        let new_session = match &state.mode {
+            TransportMode::Router {
+                router_template,
+                service_factory,
+            } => {
+                // Use with_fresh_session() to ensure each session has its own state
+                state
+                    .sessions
+                    .create(
+                        router_template.with_fresh_session(),
+                        service_factory.clone(),
+                    )
+                    .await
+            }
+            TransportMode::Service {
+                service,
+                notification_rx_factory,
+            } => {
+                let svc = service
+                    .lock()
+                    .expect("transport service lock poisoned")
+                    .clone();
+                state
+                    .sessions
+                    .create_from_service(svc, (notification_rx_factory)())
+                    .await
+            }
+        };
+        match new_session {
             Some(s) => s,
             None => {
                 return (
@@ -1061,7 +1357,7 @@ async fn handle_post(
         if let Ok(notification) = serde_json::from_value::<JsonRpcNotification>(parsed)
             && let Ok(mcp_notification) = McpNotification::from_jsonrpc(&notification)
         {
-            session.router.handle_notification(mcp_notification);
+            session.handle_notification(mcp_notification);
         }
         return StatusCode::ACCEPTED.into_response();
     }

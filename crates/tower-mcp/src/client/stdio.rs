@@ -15,6 +15,7 @@
 //! # }
 //! ```
 
+use std::ffi::OsStr;
 use std::process::Stdio;
 
 use async_trait::async_trait;
@@ -69,6 +70,93 @@ impl StdioClientTransport {
             stdin: Some(stdin),
             stdout: BufReader::new(stdout),
         })
+    }
+
+    /// Spawn a subprocess with full control over the [`Command`].
+    ///
+    /// Use this when you need to set environment variables, working directory,
+    /// or other process attributes beyond what [`spawn()`](Self::spawn) offers.
+    ///
+    /// The provided `Command` is configured with piped stdin/stdout and
+    /// inherited stderr before spawning.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use tokio::process::Command;
+    /// use tower_mcp::client::StdioClientTransport;
+    ///
+    /// # async fn example() -> Result<(), tower_mcp::BoxError> {
+    /// let mut cmd = Command::new("npx");
+    /// cmd.args(["-y", "@modelcontextprotocol/server-github"]);
+    /// cmd.env("GITHUB_TOKEN", "ghp_...");
+    /// cmd.current_dir("/tmp");
+    ///
+    /// let transport = StdioClientTransport::spawn_command(cmd).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn spawn_command(mut cmd: Command) -> Result<Self> {
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+
+        let program = format!("{:?}", cmd.as_std().get_program());
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| Error::Transport(format!("Failed to spawn {}: {}", program, e)))?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::Transport("Failed to get child stdin".to_string()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::Transport("Failed to get child stdout".to_string()))?;
+
+        tracing::info!(program = %program, "Spawned MCP server process");
+
+        Ok(Self {
+            child: Some(child),
+            stdin: Some(stdin),
+            stdout: BufReader::new(stdout),
+        })
+    }
+
+    /// Spawn a subprocess with environment variables.
+    ///
+    /// Convenience method for the common case of spawning a server
+    /// with specific environment variables (e.g., API tokens).
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use tower_mcp::client::StdioClientTransport;
+    ///
+    /// # async fn example() -> Result<(), tower_mcp::BoxError> {
+    /// let transport = StdioClientTransport::spawn_with_env(
+    ///     "npx",
+    ///     &["-y", "@modelcontextprotocol/server-github"],
+    ///     &[("GITHUB_TOKEN", "ghp_...")],
+    /// ).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn spawn_with_env<K, V>(
+        program: &str,
+        args: &[&str],
+        env: &[(K, V)],
+    ) -> Result<Self>
+    where
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+    {
+        let mut cmd = Command::new(program);
+        cmd.args(args);
+        cmd.envs(env.iter().map(|(k, v)| (k.as_ref(), v.as_ref())));
+        Self::spawn_command(cmd).await
     }
 
     /// Create from an existing child process.
