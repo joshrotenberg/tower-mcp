@@ -176,6 +176,7 @@ use crate::router::{McpRouter, RouterRequest, RouterResponse};
 use crate::transport::service::{
     CatchError, InjectAnnotations, McpBoxService, ServiceFactory, identity_factory,
 };
+use tower::util::BoxCloneService;
 
 /// Header name for MCP session ID
 pub const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
@@ -210,13 +211,24 @@ struct BufferedEvent {
 }
 
 /// Session state for HTTP transport
+/// How a session produces its MCP service for request processing.
+enum SessionServiceSource {
+    /// Session was created from an McpRouter with a factory for middleware wrapping.
+    Router {
+        router: McpRouter,
+        factory: ServiceFactory,
+    },
+    /// Session was created from a pre-built boxed service (e.g., McpProxy).
+    /// Wrapped in Mutex because BoxCloneService is Send but not Sync,
+    /// and Session must be Sync for Arc<Session> to be Send.
+    Boxed(std::sync::Mutex<McpBoxService>),
+}
+
 struct Session {
     /// Session ID
     id: String,
-    /// The MCP router for this session
-    router: McpRouter,
-    /// Factory for creating middleware-wrapped services
-    service_factory: ServiceFactory,
+    /// Source for creating the MCP service
+    service_source: SessionServiceSource,
     /// Broadcast channel for SSE notifications and outgoing requests
     notifications_tx: broadcast::Sender<String>,
     /// Last time this session was accessed
@@ -269,8 +281,10 @@ impl Session {
 
         Self {
             id: uuid::Uuid::new_v4().to_string(),
-            router,
-            service_factory,
+            service_source: SessionServiceSource::Router {
+                router,
+                factory: service_factory,
+            },
             notifications_tx,
             last_accessed: RwLock::new(Instant::now()),
             pending_requests: Mutex::new(HashMap::new()),
@@ -282,9 +296,53 @@ impl Session {
         }
     }
 
-    /// Create a middleware-wrapped service from this session's router.
+    /// Create a session from a pre-built boxed service.
+    ///
+    /// This is used when the transport is created via [`HttpTransport::from_service()`].
+    /// Notification bridging and sampling setup are skipped — the caller is
+    /// responsible for configuring these on the service before passing it in.
+    fn from_service(service: McpBoxService) -> Self {
+        let (notifications_tx, _) = broadcast::channel(100);
+
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            service_source: SessionServiceSource::Boxed(std::sync::Mutex::new(service)),
+            notifications_tx,
+            last_accessed: RwLock::new(Instant::now()),
+            pending_requests: Mutex::new(HashMap::new()),
+            request_rx: Mutex::new(None),
+            protocol_version: RwLock::new(LATEST_PROTOCOL_VERSION.to_string()),
+            event_counter: AtomicU64::new(0),
+            event_buffer: RwLock::new(VecDeque::new()),
+            max_buffered_events: DEFAULT_MAX_BUFFERED_EVENTS,
+        }
+    }
+
+    /// Create a middleware-wrapped service from this session's service source.
     fn make_service(&self) -> McpBoxService {
-        (self.service_factory)(self.router.clone())
+        match &self.service_source {
+            SessionServiceSource::Router { router, factory } => (factory)(router.clone()),
+            SessionServiceSource::Boxed(mutex) => mutex.lock().unwrap().clone(),
+        }
+    }
+
+    /// Handle a client notification (fire-and-forget, no response).
+    ///
+    /// For router-based sessions, delegates to the router's notification handler.
+    /// For service-based sessions, notifications are logged but not processed
+    /// (the service should handle its own notification needs).
+    fn handle_notification(&self, notification: McpNotification) {
+        match &self.service_source {
+            SessionServiceSource::Router { router, .. } => {
+                router.handle_notification(notification);
+            }
+            SessionServiceSource::Boxed(_) => {
+                tracing::debug!(
+                    notification = ?notification,
+                    "Notification received on service-based session (not forwarded)"
+                );
+            }
+        }
     }
 
     /// Get the next SSE event ID for this session.
@@ -454,6 +512,26 @@ impl SessionStore {
         Some(session)
     }
 
+    async fn create_from_service(&self, service: McpBoxService) -> Option<Arc<Session>> {
+        let mut sessions = self.sessions.write().await;
+
+        if let Some(max) = self.config.max_sessions
+            && sessions.len() >= max
+        {
+            tracing::warn!(
+                max_sessions = max,
+                current = sessions.len(),
+                "Session limit reached, rejecting new session"
+            );
+            return None;
+        }
+
+        let session = Arc::new(Session::from_service(service));
+        sessions.insert(session.id.clone(), session.clone());
+        tracing::debug!(session_id = %session.id, "Created new session from service");
+        Some(session)
+    }
+
     async fn get(&self, id: &str) -> Option<Arc<Session>> {
         let sessions = self.sessions.read().await;
         let session = sessions.get(id).cloned();
@@ -503,12 +581,23 @@ impl SessionStore {
     }
 }
 
+/// The source of the MCP service for session creation.
+#[derive(Clone)]
+enum ServiceSource {
+    /// Created from an McpRouter with a factory for middleware wrapping.
+    Router {
+        router: McpRouter,
+        factory: ServiceFactory,
+    },
+    /// Created from a pre-built boxed service (e.g., McpProxy).
+    /// Wrapped in Arc<Mutex<_>> because BoxCloneService is Send but not Sync.
+    Service(Arc<std::sync::Mutex<McpBoxService>>),
+}
+
 /// Shared state for the HTTP transport
 struct AppState {
-    /// Template router for creating new sessions
-    router_template: McpRouter,
-    /// Factory for creating middleware-wrapped services
-    service_factory: ServiceFactory,
+    /// Source for creating new session services
+    service_source: ServiceSource,
     /// Session store
     sessions: Arc<SessionStore>,
     /// Whether to validate Origin header
@@ -534,27 +623,89 @@ pub(crate) struct OAuthConfig {
 /// HTTP transport for MCP servers
 ///
 /// Implements the Streamable HTTP transport from the MCP specification.
+///
+/// # Construction
+///
+/// There are two ways to create an `HttpTransport`:
+///
+/// - [`HttpTransport::new(router)`](HttpTransport::new) — wraps an [`McpRouter`], with full
+///   support for per-session notification bridging, sampling, and `.layer()` middleware.
+///
+/// - [`HttpTransport::from_service(service)`](HttpTransport::from_service) — wraps any
+///   `Service<RouterRequest>` (e.g., [`McpProxy`](crate::proxy::McpProxy)). The service is
+///   cloned for each session. Notification bridging and sampling are not set up automatically;
+///   the caller should configure these on the service before passing it in.
+///   `.layer()` is not supported in this mode.
 pub struct HttpTransport {
-    router: McpRouter,
+    service_source: ServiceSource,
     validate_origin: bool,
     allowed_origins: Vec<String>,
     session_config: SessionConfig,
     sampling_enabled: bool,
-    service_factory: ServiceFactory,
     #[cfg(feature = "oauth")]
     oauth_config: Option<OAuthConfig>,
 }
 
 impl HttpTransport {
-    /// Create a new HTTP transport wrapping an MCP router
+    /// Create a new HTTP transport wrapping an MCP router.
+    ///
+    /// Supports per-session notification bridging, sampling, and `.layer()` middleware.
     pub fn new(router: McpRouter) -> Self {
         Self {
-            router,
+            service_source: ServiceSource::Router {
+                router,
+                factory: identity_factory(),
+            },
             validate_origin: true,
             allowed_origins: vec![],
             session_config: SessionConfig::default(),
             sampling_enabled: false,
-            service_factory: identity_factory(),
+            #[cfg(feature = "oauth")]
+            oauth_config: None,
+        }
+    }
+
+    /// Create an HTTP transport from a pre-built service.
+    ///
+    /// This accepts any `Service<RouterRequest>` implementation, such as
+    /// [`McpProxy`](crate::proxy::McpProxy). The service is cloned for each
+    /// HTTP session.
+    ///
+    /// Notification bridging and sampling are **not** set up automatically.
+    /// The caller should configure these on the service before passing it in.
+    ///
+    /// `.layer()` is not supported when using `from_service()` — wrap the
+    /// service with middleware before passing it in.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use tower_mcp::transport::http::HttpTransport;
+    /// use tower_mcp::proxy::McpProxy;
+    ///
+    /// let proxy: McpProxy = /* ... */;
+    /// let transport = HttpTransport::from_service(proxy);
+    /// transport.serve("127.0.0.1:3000").await?;
+    /// ```
+    pub fn from_service<S>(service: S) -> Self
+    where
+        S: tower::Service<
+                RouterRequest,
+                Response = RouterResponse,
+                Error = std::convert::Infallible,
+            > + Clone
+            + Send
+            + 'static,
+        S::Future: Send,
+    {
+        Self {
+            service_source: ServiceSource::Service(Arc::new(std::sync::Mutex::new(
+                BoxCloneService::new(service),
+            ))),
+            validate_origin: true,
+            allowed_origins: vec![],
+            session_config: SessionConfig::default(),
+            sampling_enabled: false,
             #[cfg(feature = "oauth")]
             oauth_config: None,
         }
@@ -659,35 +810,10 @@ impl HttpTransport {
 
     /// Apply a tower middleware layer to MCP request processing.
     ///
-    /// The layer is applied to the [`McpRouter`] service within each session,
-    /// wrapping the `Service<RouterRequest>` pipeline. This allows middleware
-    /// like timeouts, rate limiting, or custom instrumentation to be applied
-    /// at the MCP request level.
+    /// # Panics
     ///
-    /// Middleware errors are automatically converted into JSON-RPC error
-    /// responses, so the transport's error handling remains unchanged.
-    ///
-    /// Note: this is separate from axum-level middleware on `into_router()`.
-    /// Axum middleware operates on HTTP requests; this operates on MCP requests.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// use std::time::Duration;
-    /// use tower::ServiceBuilder;
-    /// use tower::timeout::TimeoutLayer;
-    /// use tower_mcp::McpRouter;
-    /// use tower_mcp::transport::http::HttpTransport;
-    ///
-    /// let router = McpRouter::new().server_info("my-server", "1.0.0");
-    /// let transport = HttpTransport::new(router)
-    ///     .layer(
-    ///         ServiceBuilder::new()
-    ///             .layer(TimeoutLayer::new(Duration::from_secs(30)))
-    ///             .concurrency_limit(10)
-    ///             .into_inner(),
-    ///     );
-    /// ```
+    /// Panics if this transport was created via [`from_service()`](Self::from_service).
+    /// When using `from_service()`, wrap the service with middleware before passing it in.
     pub fn layer<L>(mut self, layer: L) -> Self
     where
         L: tower::Layer<McpRouter> + Send + Sync + 'static,
@@ -696,14 +822,24 @@ impl HttpTransport {
         <L::Service as tower::Service<RouterRequest>>::Error: std::fmt::Display + Send,
         <L::Service as tower::Service<RouterRequest>>::Future: Send,
     {
-        self.service_factory = Arc::new(move |router: McpRouter| {
-            let annotations = router.tool_annotations_map();
-            let wrapped = layer.layer(router);
-            tower::util::BoxCloneService::new(InjectAnnotations::new(
-                CatchError::new(wrapped),
-                annotations,
-            ))
-        });
+        match &mut self.service_source {
+            ServiceSource::Router { factory, .. } => {
+                *factory = Arc::new(move |router: McpRouter| {
+                    let annotations = router.tool_annotations_map();
+                    let wrapped = layer.layer(router);
+                    tower::util::BoxCloneService::new(InjectAnnotations::new(
+                        CatchError::new(wrapped),
+                        annotations,
+                    ))
+                });
+            }
+            ServiceSource::Service(_) => {
+                panic!(
+                    "layer() cannot be used with from_service() — \
+                     wrap the service with middleware before passing it in"
+                );
+            }
+        }
         self
     }
 
@@ -724,8 +860,7 @@ impl HttpTransport {
         });
 
         Arc::new(AppState {
-            router_template: self.router.clone(),
-            service_factory: self.service_factory.clone(),
+            service_source: self.service_source.clone(),
             sessions,
             validate_origin: self.validate_origin,
             allowed_origins: self.allowed_origins.clone(),
@@ -973,15 +1108,20 @@ async fn handle_post(
     // Get or create session
     let session = if is_init {
         // Create new session for initialize
-        // Use with_fresh_session() to ensure each session has its own state
-        match state
-            .sessions
-            .create(
-                state.router_template.with_fresh_session(),
-                state.service_factory.clone(),
-            )
-            .await
-        {
+        let create_result = match &state.service_source {
+            ServiceSource::Router { router, factory } => {
+                // Use with_fresh_session() to ensure each session has its own state
+                state
+                    .sessions
+                    .create(router.with_fresh_session(), factory.clone())
+                    .await
+            }
+            ServiceSource::Service(mutex) => {
+                let service = mutex.lock().unwrap().clone();
+                state.sessions.create_from_service(service).await
+            }
+        };
+        match create_result {
             Some(s) => s,
             None => {
                 return (
@@ -1061,7 +1201,7 @@ async fn handle_post(
         if let Ok(notification) = serde_json::from_value::<JsonRpcNotification>(parsed)
             && let Ok(mcp_notification) = McpNotification::from_jsonrpc(&notification)
         {
-            session.router.handle_notification(mcp_notification);
+            session.handle_notification(mcp_notification);
         }
         return StatusCode::ACCEPTED.into_response();
     }
