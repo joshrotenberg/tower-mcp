@@ -1662,13 +1662,29 @@ impl McpRouter {
                         .and_then(|d| d.get(&params.name))
                 });
 
-                let tool = tool
-                    .ok_or_else(|| Error::JsonRpc(JsonRpcError::method_not_found(&params.name)))?;
+                let tool = match tool {
+                    Some(t) => t,
+                    None => {
+                        tracing::info!(
+                            target: "mcp::tools",
+                            tool = %params.name,
+                            status = "not_found",
+                            "tool call completed"
+                        );
+                        return Err(Error::JsonRpc(JsonRpcError::method_not_found(&params.name)));
+                    }
+                };
 
                 // Check tool filter if configured
                 if let Some(filter) = &self.inner.tool_filter
                     && !filter.is_visible(&self.session, &tool)
                 {
+                    tracing::info!(
+                        target: "mcp::tools",
+                        tool = %params.name,
+                        status = "denied",
+                        "tool call completed"
+                    );
                     return Err(filter.denial_error(&params.name));
                 }
 
@@ -1700,6 +1716,7 @@ impl McpRouter {
                     let arguments = params.arguments;
                     let task_id_clone = task_id.clone();
 
+                    let tool_name = params.name.clone();
                     tokio::spawn(async move {
                         // Check for cancellation before starting
                         if cancellation_token.is_cancelled() {
@@ -1708,7 +1725,9 @@ impl McpRouter {
                         }
 
                         // Execute the tool
+                        let start = std::time::Instant::now();
                         let result = tool.call_with_context(ctx, arguments).await;
+                        let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
                         if cancellation_token.is_cancelled() {
                             tracing::debug!(task_id = %task_id_clone, "Task cancelled during execution");
@@ -1716,10 +1735,25 @@ impl McpRouter {
                             // Tool returned an error result
                             let error_msg = result.first_text().unwrap_or("Tool execution failed");
                             task_store.fail_task(&task_id_clone, error_msg);
-                            tracing::warn!(task_id = %task_id_clone, error = %error_msg, "Task failed");
+                            tracing::info!(
+                                target: "mcp::tools",
+                                tool = %tool_name,
+                                task_id = %task_id_clone,
+                                duration_ms,
+                                status = "error",
+                                error = %error_msg,
+                                "tool call completed"
+                            );
                         } else {
                             task_store.complete_task(&task_id_clone, result);
-                            tracing::debug!(task_id = %task_id_clone, "Task completed successfully");
+                            tracing::info!(
+                                target: "mcp::tools",
+                                tool = %tool_name,
+                                task_id = %task_id_clone,
+                                duration_ms,
+                                status = "success",
+                                "tool call completed"
+                            );
                         }
                     });
 
@@ -1746,8 +1780,27 @@ impl McpRouter {
                     let progress_token = params.meta.and_then(|m| m.progress_token);
                     let ctx = self.create_context(request_id, progress_token);
 
-                    tracing::debug!(tool = %params.name, "Calling tool");
+                    let start = std::time::Instant::now();
                     let result = tool.call_with_context(ctx, params.arguments).await;
+                    let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+                    if result.is_error {
+                        tracing::info!(
+                            target: "mcp::tools",
+                            tool = %params.name,
+                            duration_ms,
+                            status = "error",
+                            "tool call completed"
+                        );
+                    } else {
+                        tracing::info!(
+                            target: "mcp::tools",
+                            tool = %params.name,
+                            duration_ms,
+                            status = "success",
+                            "tool call completed"
+                        );
+                    }
 
                     Ok(McpResponse::CallTool(result))
                 }

@@ -5,6 +5,11 @@
 //! [`McpTracingLayer`](super::McpTracingLayer) which traces all MCP requests,
 //! this layer focuses on tool invocations and provides richer audit information.
 //!
+//! Note: [`McpRouter`](crate::McpRouter) now emits basic tool call logging
+//! (tool name, duration, status) by default at `INFO` level on the `mcp::tools`
+//! target. Use this layer when you need additional detail such as annotation
+//! hints (`read_only`, `destructive`) or a custom log level.
+//!
 //! # Logged Information
 //!
 //! For each tool call, the layer emits a single event after completion with:
