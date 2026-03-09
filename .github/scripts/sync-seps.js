@@ -7,9 +7,10 @@
  * The script:
  * 1. Fetches all issues with the "SEP" label from upstream
  * 2. Matches them against our existing spec-tracking issues by SEP number
- * 3. Creates new tracking issues for untracked SEPs
+ * 3. Creates tracking issues only for SEPs in tracked statuses (draft, in-review, accepted, final)
  * 4. Updates title prefixes when upstream status changes
- * 5. Skips closed issues (already implemented or not applicable)
+ * 5. Closes tracking issues when SEPs move to untracked statuses (proposal, dormant, rejected)
+ * 6. Reopens tracking issues when SEPs advance back to a tracked status
  *
  * @param {Object} params - GitHub Actions context
  * @param {Object} params.github - Octokit REST client
@@ -31,6 +32,16 @@ module.exports = async ({ github, context, core }) => {
     'rejected': '[rejected]',
     'proposal': '[proposal]',
   };
+
+  // Only create/keep tracking issues for SEPs in these statuses.
+  // Draft and above are worth tracking; dormant, proposal, and rejected are not
+  // actionable enough to warrant an issue.
+  const TRACKED_STATUSES = new Set([
+    '[accepted]',
+    '[final]',
+    '[in-review]',
+    '[draft]',
+  ]);
 
   // Fetch all SEP-labeled issues from upstream
   core.info('Fetching SEPs from upstream...');
@@ -67,6 +78,7 @@ module.exports = async ({ github, context, core }) => {
   let created = 0;
   let updated = 0;
   let skipped = 0;
+  let closed = 0;
 
   for (const sep of upstreamIssues) {
     const sepMatch = sep.title.match(/SEP-(\d+)/i);
@@ -91,13 +103,55 @@ module.exports = async ({ github, context, core }) => {
     }
 
     const newTitle = `${prefix} SEP-${sepNumber}: ${sepTitle}`;
+    const isTracked = TRACKED_STATUSES.has(prefix);
 
     if (sepToIssue.has(sepNumber)) {
       const existing = sepToIssue.get(sepNumber);
 
-      // Skip closed issues (implemented, not-applicable, etc.)
+      // Reopen closed issues if the SEP has advanced to a tracked status
       if (existing.state === 'closed') {
-        skipped++;
+        if (isTracked) {
+          core.info(`Reopening SEP-${sepNumber}: status advanced to ${prefix}`);
+          await github.rest.issues.update({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: existing.number,
+            title: newTitle,
+            state: 'open',
+          });
+          await github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: existing.number,
+            body: `Reopening: SEP status advanced to ${prefix.replace(/[\[\]]/g, '')}.`,
+          });
+          updated++;
+        } else {
+          skipped++;
+        }
+        continue;
+      }
+
+      // Close issues that have moved to a status we don't track
+      if (!isTracked) {
+        core.info(`Closing SEP-${sepNumber}: status ${prefix} is not tracked`);
+        await github.rest.issues.update({
+          owner: context.repo.owner,
+          repo: context.repo.repo,
+          issue_number: existing.number,
+          title: newTitle,
+          state: 'closed',
+          state_reason: 'not_planned',
+        });
+        await github.rest.issues.createComment({
+          owner: context.repo.owner,
+          repo: context.repo.repo,
+          issue_number: existing.number,
+          body: `Closing: SEP status is ${prefix.replace(/[\[\]]/g, '')}. ` +
+            'Only draft, in-review, accepted, and final SEPs are tracked. ' +
+            'This issue will be reopened automatically if the SEP advances.',
+        });
+        closed++;
         continue;
       }
 
@@ -115,7 +169,12 @@ module.exports = async ({ github, context, core }) => {
         skipped++;
       }
     } else {
-      // Create new tracking issue
+      // Only create issues for statuses we track
+      if (!isTracked) {
+        skipped++;
+        continue;
+      }
+
       core.info(`Creating issue for SEP-${sepNumber}: ${sepTitle}`);
 
       const body = [
@@ -152,11 +211,12 @@ module.exports = async ({ github, context, core }) => {
     }
   }
 
-  core.info(`SEP sync complete. Created: ${created}, Updated: ${updated}, Skipped: ${skipped}`);
+  core.info(`SEP sync complete. Created: ${created}, Updated: ${updated}, Closed: ${closed}, Skipped: ${skipped}`);
 
   // Set outputs for workflow summary
   core.setOutput('created', created);
   core.setOutput('updated', updated);
+  core.setOutput('closed', closed);
   core.setOutput('skipped', skipped);
   core.setOutput('total_upstream', upstreamIssues.length);
 };
