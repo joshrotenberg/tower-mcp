@@ -1529,4 +1529,26 @@ mod proxy_tests {
             other => panic!("expected CallTool, got: {:?}", other),
         }
     }
+
+    // Static assertions: McpProxy must be Send + Sync so that &McpProxy is Send
+    // and methods like health_check() can be called from tokio::spawn.
+    #[allow(dead_code)]
+    const _: () = {
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+        fn assert_send_sync() {
+            assert_send::<McpProxy>();
+            assert_sync::<McpProxy>();
+        }
+    };
+
+    #[tokio::test]
+    async fn test_health_check_is_spawnable() {
+        // Verify that health_check future can be spawned (requires Send)
+        let proxy = std::sync::Arc::new(build_test_proxy().await);
+        let proxy_clone = proxy.clone();
+        let handle = tokio::spawn(async move { proxy_clone.health_check().await });
+        let results = handle.await.unwrap();
+        assert!(!results.is_empty());
+    }
 }
