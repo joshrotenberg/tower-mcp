@@ -1547,9 +1547,7 @@ mod proxy_tests {
         // Verify that health_check future can be spawned (requires Send)
         let proxy = std::sync::Arc::new(build_test_proxy().await);
         let proxy_clone = proxy.clone();
-        let handle = tokio::spawn(async move {
-            proxy_clone.health_check().await
-        });
+        let handle = tokio::spawn(async move { proxy_clone.health_check().await });
         let results = handle.await.unwrap();
         assert!(!results.is_empty());
     }
