@@ -34,4 +34,5 @@ jobs:
           echo "| Upstream SEPs | ${{ steps.sync.outputs.total_upstream }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Created | ${{ steps.sync.outputs.created }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Updated | ${{ steps.sync.outputs.updated }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Closed | ${{ steps.sync.outputs.closed }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Skipped | ${{ steps.sync.outputs.skipped }} |" >> $GITHUB_STEP_SUMMARY
