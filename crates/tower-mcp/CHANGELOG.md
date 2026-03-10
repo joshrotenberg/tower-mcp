@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.5] - 2026-03-10
+
+### Features
+
+- Add request rewrite helpers and response error checking ([#707](https://github.com/joshrotenberg/tower-mcp/pull/707))
+
+### Testing
+
+- Add Send+Sync assertions for McpProxy ([#705](https://github.com/joshrotenberg/tower-mcp/pull/705))
+
+
+
 ## [0.8.4] - 2026-03-09
 
 ### Features
