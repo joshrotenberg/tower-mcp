@@ -2326,7 +2326,27 @@ impl ToolAnnotationsMap {
     }
 }
 
-/// Request type for the tower Service implementation
+/// Request type for the tower Service implementation.
+///
+/// # Preserving extensions in middleware
+///
+/// When rewriting a request in middleware, use [`with_inner`](Self::with_inner)
+/// or [`clone_with_inner`](Self::clone_with_inner) instead of constructing a
+/// new `RouterRequest` directly. Constructing with `Extensions::new()` will
+/// silently drop extensions set by earlier middleware layers (token claims,
+/// RBAC context, etc.).
+///
+/// ```rust,ignore
+/// // WRONG: drops extensions from earlier middleware
+/// let rewritten = RouterRequest {
+///     id: req.id.clone(),
+///     inner: new_inner,
+///     extensions: Extensions::new(),
+/// };
+///
+/// // RIGHT: preserves extensions
+/// let rewritten = req.with_inner(new_inner);
+/// ```
 #[derive(Debug, Clone)]
 pub struct RouterRequest {
     /// The JSON-RPC request ID.
@@ -2335,6 +2355,58 @@ pub struct RouterRequest {
     pub inner: McpRequest,
     /// Type-map for passing data (e.g., `TokenClaims`) through middleware.
     pub extensions: Extensions,
+}
+
+impl RouterRequest {
+    /// Create a new `RouterRequest` with empty extensions.
+    pub fn new(id: RequestId, inner: McpRequest) -> Self {
+        Self {
+            id,
+            inner,
+            extensions: Extensions::new(),
+        }
+    }
+
+    /// Replace the inner MCP request, preserving the id and extensions.
+    ///
+    /// This is the recommended way to rewrite requests in middleware,
+    /// as it ensures extensions set by earlier middleware layers
+    /// (e.g., token claims, RBAC context) are not lost.
+    pub fn with_inner(self, inner: McpRequest) -> Self {
+        Self {
+            id: self.id,
+            inner,
+            extensions: self.extensions,
+        }
+    }
+
+    /// Replace both the id and inner MCP request, preserving extensions.
+    ///
+    /// Useful when middleware needs to assign a new request id
+    /// (e.g., for fan-out or request duplication) while keeping
+    /// the extensions from the original request.
+    pub fn with_id_and_inner(self, id: RequestId, inner: McpRequest) -> Self {
+        Self {
+            id,
+            inner,
+            extensions: self.extensions,
+        }
+    }
+
+    /// Create a copy of this request with a different inner request,
+    /// cloning the id and extensions from the original.
+    ///
+    /// Unlike [`with_inner`](Self::with_inner), this borrows `self`,
+    /// which is useful when the original request is still needed
+    /// (e.g., for traffic mirroring where you send the request to
+    /// two backends).
+    pub fn clone_with_inner(&self, inner: McpRequest) -> Self {
+        Self {
+            id: self.id.clone(),
+            inner,
+            extensions: self.extensions.clone(),
+        }
+    }
 }
 
 /// Response type for the tower Service implementation
@@ -2347,6 +2419,25 @@ pub struct RouterResponse {
 }
 
 impl RouterResponse {
+    /// Returns `true` if the response contains a JSON-RPC error.
+    ///
+    /// Since tower-mcp services use `Error = Infallible` (errors are carried
+    /// inside the response, not in the `Result`), this method is useful for
+    /// middleware that needs to inspect whether a request failed -- for example,
+    /// retry or circuit breaker middleware.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Response-based retry predicate for tower-resilience or similar
+    /// fn is_retriable(response: &RouterResponse) -> bool {
+    ///     response.is_error()
+    /// }
+    /// ```
+    pub fn is_error(&self) -> bool {
+        self.inner.is_err()
+    }
+
     /// Convert to JSON-RPC response
     pub fn into_jsonrpc(self) -> JsonRpcResponse {
         match self.inner {
@@ -6028,5 +6119,85 @@ mod tests {
 
         let router = McpRouter::new().prompt_if(false, prompt);
         assert_eq!(router.inner.prompts.len(), 0);
+    }
+
+    #[test]
+    fn test_router_request_new() {
+        let req = RouterRequest::new(RequestId::Number(1), McpRequest::Ping);
+        assert_eq!(req.id, RequestId::Number(1));
+        assert!(req.extensions.is_empty());
+    }
+
+    #[test]
+    fn test_with_inner_preserves_extensions() {
+        let mut req = RouterRequest::new(RequestId::Number(1), McpRequest::Ping);
+        req.extensions.insert(42u32);
+
+        let rewritten = req.with_inner(McpRequest::ListTools(Default::default()));
+        assert!(matches!(rewritten.inner, McpRequest::ListTools(_)));
+        assert_eq!(rewritten.id, RequestId::Number(1));
+        assert_eq!(rewritten.extensions.get::<u32>(), Some(&42));
+    }
+
+    #[test]
+    fn test_with_id_and_inner_preserves_extensions() {
+        let mut req = RouterRequest::new(RequestId::Number(1), McpRequest::Ping);
+        req.extensions.insert(String::from("token-abc"));
+
+        let rewritten = req.with_id_and_inner(
+            RequestId::Number(99),
+            McpRequest::ListResources(Default::default()),
+        );
+        assert_eq!(rewritten.id, RequestId::Number(99));
+        assert!(matches!(rewritten.inner, McpRequest::ListResources(_)));
+        assert_eq!(
+            rewritten.extensions.get::<String>(),
+            Some(&String::from("token-abc"))
+        );
+    }
+
+    #[test]
+    fn test_clone_with_inner_preserves_extensions() {
+        let mut req = RouterRequest::new(RequestId::Number(1), McpRequest::Ping);
+        req.extensions.insert(true);
+
+        let cloned = req.clone_with_inner(McpRequest::ListTools(Default::default()));
+
+        // Original still intact
+        assert!(matches!(req.inner, McpRequest::Ping));
+        assert_eq!(req.extensions.get::<bool>(), Some(&true));
+
+        // Clone has new inner but same extensions
+        assert!(matches!(cloned.inner, McpRequest::ListTools(_)));
+        assert_eq!(cloned.extensions.get::<bool>(), Some(&true));
+    }
+
+    #[test]
+    fn test_router_response_is_error() {
+        let ok_resp = RouterResponse {
+            id: RequestId::Number(1),
+            inner: Ok(McpResponse::Pong(Default::default())),
+        };
+        assert!(!ok_resp.is_error());
+
+        let err_resp = RouterResponse {
+            id: RequestId::Number(2),
+            inner: Err(JsonRpcError::internal_error("boom")),
+        };
+        assert!(err_resp.is_error());
+    }
+
+    #[test]
+    fn test_extensions_len_and_is_empty() {
+        let mut ext = Extensions::new();
+        assert!(ext.is_empty());
+        assert_eq!(ext.len(), 0);
+
+        ext.insert(42u32);
+        assert!(!ext.is_empty());
+        assert_eq!(ext.len(), 1);
+
+        ext.insert(String::from("hello"));
+        assert_eq!(ext.len(), 2);
     }
 }
