@@ -29,6 +29,46 @@
 //!             .into_inner(),
 //!     );
 //! ```
+//!
+//! # Writing Custom Middleware
+//!
+//! ## Preserving extensions when rewriting requests
+//!
+//! When middleware rewrites a [`RouterRequest`](crate::router::RouterRequest),
+//! use [`with_inner`](crate::router::RouterRequest::with_inner) or
+//! [`clone_with_inner`](crate::router::RouterRequest::clone_with_inner) to
+//! preserve extensions set by earlier layers (token claims, RBAC context, etc.):
+//!
+//! ```rust,ignore
+//! fn call(&mut self, req: RouterRequest) -> Self::Future {
+//!     let rewritten = req.with_inner(new_mcp_request);
+//!     self.inner.call(rewritten)
+//! }
+//! ```
+//!
+//! For traffic mirroring or fan-out (where the original request is still
+//! needed), use `clone_with_inner`:
+//!
+//! ```rust,ignore
+//! let mirror_req = req.clone_with_inner(req.inner.clone());
+//! ```
+//!
+//! ## Error handling and retry
+//!
+//! tower-mcp services use `Error = Infallible` -- errors are carried inside
+//! [`RouterResponse::inner`](crate::router::RouterResponse) as
+//! `Result<McpResponse, JsonRpcError>`, not in the outer `Result`. This means
+//! standard tower retry middleware (which checks `Result::Err`) will never
+//! trigger retries.
+//!
+//! Use [`RouterResponse::is_error()`](crate::router::RouterResponse::is_error)
+//! with a response-based retry predicate:
+//!
+//! ```rust,ignore
+//! fn should_retry(response: &RouterResponse) -> bool {
+//!     response.is_error()
+//! }
+//! ```
 
 mod audit;
 mod tool_call_logging;

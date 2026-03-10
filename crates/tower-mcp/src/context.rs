@@ -309,6 +309,16 @@ impl Extensions {
             self.map.insert(*k, v.clone());
         }
     }
+
+    /// Returns the number of entries in the extensions map.
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Returns `true` if the extensions map contains no entries.
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
 }
 
 impl std::fmt::Debug for Extensions {
