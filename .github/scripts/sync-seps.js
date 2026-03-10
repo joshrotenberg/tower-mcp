@@ -43,6 +43,11 @@ module.exports = async ({ github, context, core }) => {
     '[draft]',
   ]);
 
+  // SEPs to skip entirely (not actionable for tower-mcp).
+  const SKIP_SEPS = new Set([
+    '1',   // SEP-001: MCP Governance
+  ]);
+
   // Fetch all SEP-labeled issues from upstream
   core.info('Fetching SEPs from upstream...');
   const upstreamIssues = await github.paginate(github.rest.issues.listForRepo, {
@@ -85,6 +90,12 @@ module.exports = async ({ github, context, core }) => {
     if (!sepMatch) continue;
 
     const sepNumber = sepMatch[1];
+
+    if (SKIP_SEPS.has(sepNumber)) {
+      skipped++;
+      continue;
+    }
+
     const sepTitle = sep.title.replace(/^SEP-\d+[:\s]*/, '').trim();
     const upstreamLabels = sep.labels.map(l => l.name);
 
