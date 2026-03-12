@@ -36,7 +36,7 @@ tower-mcp-types = { path = "../tower-mcp-types" }
 tower-resilience = { workspace = true, default-features = false, features = ["coalesce"] }
 tracing-subscriber.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
-jsonschema = "0.44"
+jsonschema = "0.45"
 
 [features]
 default = []
