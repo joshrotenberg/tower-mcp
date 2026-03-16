@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.6] - 2026-03-16
+
+### Documentation
+
+- Update README, lib.rs, and AGENTS.md for accuracy and completeness ([#726](https://github.com/joshrotenberg/tower-mcp/pull/726))
+
+
+
 ## [0.8.5] - 2026-03-16
 
 
