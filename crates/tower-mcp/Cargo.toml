@@ -189,6 +189,38 @@ path = "../../examples/proxy.rs"
 required-features = ["proxy"]
 
 [[example]]
+name = "tool_middleware"
+path = "../../examples/tool_middleware.rs"
+
+[[example]]
+name = "tool_selection"
+path = "../../examples/tool_selection.rs"
+
+[[example]]
+name = "middleware_showcase"
+path = "../../examples/middleware_showcase.rs"
+
+[[example]]
+name = "external_api_auth"
+path = "../../examples/external_api_auth.rs"
+
+[[example]]
+name = "structured_output"
+path = "../../examples/structured_output.rs"
+
+[[example]]
+name = "resource_templates"
+path = "../../examples/resource_templates.rs"
+
+[[example]]
+name = "error_handling"
+path = "../../examples/error_handling.rs"
+
+[[example]]
+name = "rate_limiting"
+path = "../../examples/rate_limiting.rs"
+
+[[example]]
 name = "tool_macro"
 path = "../../examples/tool_macro.rs"
 required-features = ["macros"]
