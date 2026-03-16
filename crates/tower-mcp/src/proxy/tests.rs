@@ -1551,4 +1551,130 @@ mod proxy_tests {
         let results = handle.await.unwrap();
         assert!(!results.is_empty());
     }
+
+    // ========================================================================
+    // Remove / replace / namespaces
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_remove_backend() {
+        let proxy = build_test_proxy().await;
+        assert_eq!(proxy.backend_count(), 2);
+        assert!(proxy.backend_namespaces().contains(&"math".to_string()));
+
+        // Remove the math backend
+        assert!(proxy.remove_backend("math").await);
+        assert_eq!(proxy.backend_count(), 1);
+        assert!(!proxy.backend_namespaces().contains(&"math".to_string()));
+        assert!(proxy.backend_namespaces().contains(&"text".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_remove_backend_not_found() {
+        let proxy = build_test_proxy().await;
+        assert!(!proxy.remove_backend("nonexistent").await);
+        assert_eq!(proxy.backend_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_remove_backend_tools_no_longer_listed() {
+        let mut proxy = build_test_proxy().await;
+
+        // Before removal: math/add should be listed
+        let resp = call_proxy(&mut proxy, McpRequest::ListTools(Default::default()))
+            .await
+            .unwrap();
+        let tools = match resp {
+            McpResponse::ListTools(r) => r.tools,
+            _ => panic!("expected ListTools"),
+        };
+        assert!(tools.iter().any(|t| t.name.contains("math")));
+
+        // Remove math
+        proxy.remove_backend("math").await;
+
+        // After removal: math tools should be gone
+        let resp = call_proxy(&mut proxy, McpRequest::ListTools(Default::default()))
+            .await
+            .unwrap();
+        let tools = match resp {
+            McpResponse::ListTools(r) => r.tools,
+            _ => panic!("expected ListTools"),
+        };
+        assert!(!tools.iter().any(|t| t.name.contains("math")));
+        // text tools should still be there
+        assert!(tools.iter().any(|t| t.name.contains("text")));
+    }
+
+    #[tokio::test]
+    async fn test_remove_backend_tool_calls_fail() {
+        let mut proxy = build_test_proxy().await;
+        proxy.remove_backend("math").await;
+
+        // Calling a removed backend's tool should fail
+        let resp = call_proxy(
+            &mut proxy,
+            McpRequest::CallTool(crate::protocol::CallToolParams {
+                name: "math_add".to_string(),
+                arguments: json!({"a": 1, "b": 2}),
+                meta: None,
+                task: None,
+            }),
+        )
+        .await;
+
+        assert!(resp.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_replace_backend() {
+        let mut proxy = build_test_proxy().await;
+
+        // Replace math with a new math backend
+        let new_math_transport = ChannelTransport::new(math_router());
+        proxy
+            .replace_backend("math", new_math_transport)
+            .await
+            .expect("replace should succeed");
+
+        assert_eq!(proxy.backend_count(), 2);
+
+        // The replaced backend should still work
+        let resp = call_proxy(
+            &mut proxy,
+            McpRequest::CallTool(crate::protocol::CallToolParams {
+                name: "math_add".to_string(),
+                arguments: json!({"a": 10, "b": 20}),
+                meta: None,
+                task: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        match resp {
+            McpResponse::CallTool(r) => {
+                let text = r.content[0].as_text().unwrap();
+                assert_eq!(text, "30");
+            }
+            _ => panic!("expected CallTool"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_backend_namespaces() {
+        let proxy = build_test_proxy().await;
+        let mut namespaces = proxy.backend_namespaces();
+        namespaces.sort();
+        assert_eq!(namespaces, vec!["math", "text"]);
+    }
+
+    #[tokio::test]
+    async fn test_remove_all_backends() {
+        let proxy = build_test_proxy().await;
+        proxy.remove_backend("math").await;
+        proxy.remove_backend("text").await;
+        assert_eq!(proxy.backend_count(), 0);
+        assert!(proxy.backend_namespaces().is_empty());
+    }
 }

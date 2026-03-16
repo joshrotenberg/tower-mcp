@@ -254,17 +254,7 @@ impl McpProxy {
         self.spawn_invalidation_watcher(backend_idx, invalidation_rx);
 
         // Notify downstream clients that capabilities changed
-        if let Some(tx) = &self.shared.notification_tx {
-            let _ = tx
-                .send(crate::context::ServerNotification::ToolsListChanged)
-                .await;
-            let _ = tx
-                .send(crate::context::ServerNotification::ResourcesListChanged)
-                .await;
-            let _ = tx
-                .send(crate::context::ServerNotification::PromptsListChanged)
-                .await;
-        }
+        self.notify_all_changed().await;
 
         Ok(())
     }
@@ -426,6 +416,84 @@ impl McpProxy {
         });
     }
 
+    /// Remove a backend by namespace name.
+    ///
+    /// The backend's tools, resources, and prompts are immediately removed from
+    /// aggregated lists. Downstream clients are notified via list-changed
+    /// notifications.
+    ///
+    /// Returns `true` if the backend was found and removed, `false` if no
+    /// backend with that namespace exists.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// if proxy.remove_backend("old-db").await {
+    ///     println!("Backend removed");
+    /// }
+    /// ```
+    pub async fn remove_backend(&self, namespace: &str) -> bool {
+        // Remove from entries (synchronous)
+        let found = {
+            let mut entries = self.entries.lock().expect("entries lock poisoned");
+            let before = entries.len();
+            entries.retain(|e| e.namespace != namespace);
+            entries.len() < before
+        };
+
+        if !found {
+            return false;
+        }
+
+        // Remove from backends (async)
+        // Dropping the Backend drops its invalidation_tx sender, which
+        // causes the spawned invalidation watcher to exit naturally.
+        {
+            let mut backends = self.shared.backends.write().await;
+            backends.retain(|b| b.namespace != namespace);
+        }
+
+        // Notify downstream clients that capabilities changed
+        self.notify_all_changed().await;
+
+        tracing::info!(namespace, "Backend removed");
+        true
+    }
+
+    /// Replace a backend by removing the old one and adding a new one with
+    /// the same namespace.
+    ///
+    /// This is a convenience for `remove_backend()` + `add_backend()`. If
+    /// the add fails, the old backend is already gone (no rollback).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// proxy.replace_backend("db", new_transport).await?;
+    /// ```
+    pub async fn replace_backend(
+        &self,
+        namespace: impl Into<String>,
+        transport: impl ClientTransport,
+    ) -> Result<(), AddBackendError> {
+        let namespace = namespace.into();
+        self.remove_backend(&namespace).await;
+        self.add_backend(namespace, transport).await
+    }
+
+    /// Return the namespaces of all currently registered backends.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let namespaces = proxy.backend_namespaces();
+    /// println!("Backends: {:?}", namespaces);
+    /// ```
+    pub fn backend_namespaces(&self) -> Vec<String> {
+        let entries = self.entries.lock().expect("entries lock poisoned");
+        entries.iter().map(|e| e.namespace.clone()).collect()
+    }
+
     /// Return the number of currently registered backends.
     pub fn backend_count(&self) -> usize {
         self.entries.lock().expect("entries lock poisoned").len()
@@ -451,6 +519,21 @@ impl McpProxy {
         drop(backends);
 
         futures::future::join_all(futures).await
+    }
+
+    /// Notify downstream clients that all capability lists have changed.
+    async fn notify_all_changed(&self) {
+        if let Some(tx) = &self.shared.notification_tx {
+            let _ = tx
+                .send(crate::context::ServerNotification::ToolsListChanged)
+                .await;
+            let _ = tx
+                .send(crate::context::ServerNotification::ResourcesListChanged)
+                .await;
+            let _ = tx
+                .send(crate::context::ServerNotification::PromptsListChanged)
+                .await;
+        }
     }
 
     /// Extract Send-safe info from entries (synchronous, no borrow across await).
