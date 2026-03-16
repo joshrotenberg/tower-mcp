@@ -9,6 +9,7 @@ members = [
     "examples/markdownlint-mcp",
     "examples/codegen-mcp",
     "examples/notes-mcp",
+    "examples/sql-mcp",
 ]
 
 [workspace.package]

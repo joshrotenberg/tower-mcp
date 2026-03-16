@@ -1,0 +1,27 @@
+[package]
+name = "sql-mcp"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "SQL database MCP server with tower middleware for safety"
+readme = "../../README.md"
+
+[[bin]]
+name = "sql-mcp"
+path = "src/main.rs"
+
+[dependencies]
+tower-mcp = { workspace = true, features = ["http", "testing"] }
+tower = { workspace = true, features = ["timeout"] }
+tokio.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "postgres", "any"] }
+sqlparser = { version = "0.55", features = ["visitor"] }
+toml = "0.8"
+anyhow = "1"
