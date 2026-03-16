@@ -1,4 +1,7 @@
-# sql-mcp example configuration
+# sql-mcp test configuration
+# Start databases: docker compose -f examples/sql-mcp/docker-compose.yml up -d
+# Seed SQLite:     sqlite3 /tmp/sql-mcp-test.db < examples/sql-mcp/seed/sqlite.sql
+# Run server:      cargo run -p sql-mcp -- --config examples/sql-mcp/config.toml
 
 [server]
 name = "sql-mcp"
@@ -9,18 +12,26 @@ read_only = true
 row_limit = 1000
 query_timeout_seconds = 30
 
-# SQLite database (for testing)
+# SQLite (local file, writable)
 [[databases]]
-name = "local"
+name = "sqlite"
 url = "sqlite:///tmp/sql-mcp-test.db"
 read_only = false
 row_limit = 500
 pool_size = 1
 
-# Postgres (uncomment and configure)
-# [[databases]]
-# name = "prod"
-# url = "${DATABASE_URL}"
-# read_only = true
-# query_timeout_seconds = 10
-# pool_size = 5
+# Postgres (docker compose)
+[[databases]]
+name = "postgres"
+url = "postgres://sqlmcp:sqlmcp@localhost:5432/testdb"
+read_only = true
+pool_size = 5
+query_timeout_seconds = 10
+
+# MySQL (docker compose)
+[[databases]]
+name = "mysql"
+url = "mysql://sqlmcp:sqlmcp@localhost:3306/testdb"
+read_only = true
+pool_size = 5
+query_timeout_seconds = 10
