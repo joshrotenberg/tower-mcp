@@ -12,9 +12,18 @@ pub struct DatabaseManager {
     pools: HashMap<String, DatabaseConnection>,
 }
 
+/// Database dialect, detected from the connection URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    Postgres,
+    Mysql,
+    Sqlite,
+}
+
 /// A single database connection with its resolved config.
 pub struct DatabaseConnection {
     pub pool: AnyPool,
+    pub dialect: Dialect,
     pub read_only: bool,
     pub row_limit: u32,
     pub query_timeout_seconds: u64,
@@ -39,6 +48,7 @@ impl DatabaseManager {
         safety: &SafetyConfig,
     ) -> Result<DatabaseConnection> {
         let url = db_config.resolved_url();
+        let dialect = Dialect::from_url(&url);
         let pool = AnyPoolOptions::new()
             .max_connections(db_config.pool_size)
             .connect(&url)
@@ -47,6 +57,7 @@ impl DatabaseManager {
 
         Ok(DatabaseConnection {
             pool,
+            dialect,
             read_only: db_config.is_read_only(safety),
             row_limit: db_config.row_limit(safety),
             query_timeout_seconds: db_config.query_timeout_seconds(safety),
@@ -62,9 +73,17 @@ impl DatabaseManager {
         names.sort();
         names
     }
+}
 
-    pub fn is_sqlite(pool: &AnyPool) -> bool {
-        format!("{:?}", pool.connect_options()).contains("Sqlite")
+impl Dialect {
+    pub fn from_url(url: &str) -> Self {
+        if url.starts_with("sqlite") {
+            Dialect::Sqlite
+        } else if url.starts_with("mysql") || url.starts_with("mariadb") {
+            Dialect::Mysql
+        } else {
+            Dialect::Postgres
+        }
     }
 }
 

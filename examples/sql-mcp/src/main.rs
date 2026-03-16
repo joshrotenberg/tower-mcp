@@ -1,17 +1,20 @@
 //! sql-mcp -- SQL database MCP server with tower middleware for safety
 //!
-//! A multi-database MCP server supporting Postgres and SQLite via sqlx.
+//! A multi-database MCP server supporting Postgres, MySQL, and SQLite via sqlx.
 //! Safety features (read-only mode, row limits, query timeouts) are implemented
 //! as tower middleware layers, not application logic.
 //!
 //! Run with a config file:
 //!   cargo run -p sql-mcp -- --config examples/sql-mcp/config.toml
 //!
-//! Or with an inline SQLite database:
+//! Or with an inline database:
 //!   cargo run -p sql-mcp -- --sqlite /tmp/test.db
+//!   cargo run -p sql-mcp -- --postgres postgres://localhost/mydb
+//!   cargo run -p sql-mcp -- --mysql mysql://localhost/mydb
 
 mod config;
 mod db;
+mod prompts;
 mod resources;
 mod safety;
 mod tools;
@@ -37,6 +40,10 @@ struct Cli {
     /// Quick-start: connect to a Postgres database URL
     #[arg(long)]
     postgres: Option<String>,
+
+    /// Quick-start: connect to a MySQL database URL
+    #[arg(long)]
+    mysql: Option<String>,
 }
 
 #[tokio::main]
@@ -54,13 +61,12 @@ async fn main() -> Result<()> {
     let config = if let Some(config_path) = &cli.config {
         config::Config::load(config_path)?
     } else {
-        // Build config from CLI flags
         let mut databases = Vec::new();
 
-        if let Some(sqlite_path) = &cli.sqlite {
+        if let Some(path) = &cli.sqlite {
             databases.push(config::DatabaseConfig {
                 name: "default".to_string(),
-                url: format!("sqlite://{sqlite_path}"),
+                url: format!("sqlite://{path}"),
                 read_only: None,
                 row_limit: None,
                 query_timeout_seconds: None,
@@ -68,10 +74,21 @@ async fn main() -> Result<()> {
             });
         }
 
-        if let Some(pg_url) = &cli.postgres {
+        if let Some(url) = &cli.postgres {
             databases.push(config::DatabaseConfig {
                 name: "default".to_string(),
-                url: pg_url.clone(),
+                url: url.clone(),
+                read_only: None,
+                row_limit: None,
+                query_timeout_seconds: None,
+                pool_size: 5,
+            });
+        }
+
+        if let Some(url) = &cli.mysql {
+            databases.push(config::DatabaseConfig {
+                name: "default".to_string(),
+                url: url.clone(),
                 read_only: None,
                 row_limit: None,
                 query_timeout_seconds: None,
@@ -81,7 +98,7 @@ async fn main() -> Result<()> {
 
         if databases.is_empty() {
             anyhow::bail!(
-                "Provide --config, --sqlite, or --postgres. \
+                "Provide --config, --sqlite, --postgres, or --mysql. \
                  Example: sql-mcp --sqlite /tmp/test.db"
             );
         }
@@ -100,18 +117,30 @@ async fn main() -> Result<()> {
         .server_info(&config.server.name, &config.server.version)
         .instructions(format!(
             "SQL database server. Available databases: {}. \
-             Use the `query` tool to execute SQL, `list_tables` to see available tables, \
-             and `describe_table` to see column details. \
-             Read the `db://connections` resource for connection settings.",
+             Use `list_connections` to see all connections and their settings. \
+             Use `list_tables` and `describe_table` for schema discovery. \
+             Use `query` to execute SQL. Use `explain` to check query plans. \
+             Read `db://connections` or `db://{{name}}/tables` resources for context.",
             db.names().join(", ")
         ))
-        // Tools
+        // Query tools
         .tool(tools::query_tool(Arc::clone(&db), default_timeout))
+        .tool(tools::explain_tool(Arc::clone(&db), default_timeout))
+        // Schema discovery tools
+        .tool(tools::list_schemas_tool(Arc::clone(&db)))
         .tool(tools::list_tables_tool(Arc::clone(&db)))
         .tool(tools::describe_table_tool(Arc::clone(&db)))
+        .tool(tools::list_indexes_tool(Arc::clone(&db)))
+        // Connection management tools
+        .tool(tools::list_connections_tool(Arc::clone(&db)))
+        .tool(tools::test_connection_tool(Arc::clone(&db)))
         // Resources
         .resource(resources::connections_resource(Arc::clone(&db)))
-        .resource_template(resources::tables_resource_template(Arc::clone(&db)));
+        .resource_template(resources::tables_resource_template(Arc::clone(&db)))
+        .resource_template(resources::schemas_resource_template(Arc::clone(&db)))
+        .resource_template(resources::table_detail_resource_template(Arc::clone(&db)))
+        // Prompts
+        .prompt(prompts::sql_assistant_prompt(Arc::clone(&db)));
 
     eprintln!("sql-mcp ready. Databases: {}", db.names().join(", "));
     StdioTransport::new(router).run().await?;
