@@ -5,8 +5,10 @@
 //! - Setting up an McpRouter
 //! - Using the JsonRpcService for protocol framing
 //!
-//! Note: This example doesn't include a transport layer yet.
+//! Note: This example doesn't include a transport layer.
 //! It shows how to manually process requests for testing.
+//!
+//! Run with: cargo run --example basic
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
