@@ -219,12 +219,12 @@ pub fn list_schemas_tool(db: Arc<DatabaseManager>) -> Tool {
 
                 let sql = match conn.dialect {
                     Dialect::Postgres => {
-                        "SELECT schema_name as name FROM information_schema.schemata \
+                        "SELECT schema_name::TEXT as name FROM information_schema.schemata \
                          WHERE schema_name NOT IN ('information_schema', 'pg_catalog', 'pg_toast') \
                          ORDER BY schema_name"
                     }
                     Dialect::Mysql => {
-                        "SELECT schema_name as name FROM information_schema.schemata \
+                        "SELECT CAST(schema_name AS CHAR) as name FROM information_schema.schemata \
                          WHERE schema_name NOT IN ('information_schema', 'performance_schema', 'mysql', 'sys') \
                          ORDER BY schema_name"
                     }
@@ -277,14 +277,14 @@ pub fn list_tables_tool(db: Arc<DatabaseManager>) -> Tool {
                          WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
                         .to_string(),
                     Dialect::Postgres => {
-                        "SELECT table_name as name, table_schema as schema, table_type as type \
+                        "SELECT table_name::TEXT as name, table_schema::TEXT as schema, table_type::TEXT as type \
                          FROM information_schema.tables \
                          WHERE table_schema NOT IN ('information_schema', 'pg_catalog') \
                          ORDER BY table_schema, table_name"
                             .to_string()
                     }
                     Dialect::Mysql => {
-                        "SELECT table_name as name, table_schema as schema, table_type as type \
+                        "SELECT CAST(table_name AS CHAR) as name, CAST(table_schema AS CHAR) as `schema`, CAST(table_type AS CHAR) as `type` \
                          FROM information_schema.tables \
                          WHERE table_schema = DATABASE() \
                          ORDER BY table_name"
@@ -342,7 +342,7 @@ pub fn describe_table_tool(db: Arc<DatabaseManager>) -> Tool {
                     Dialect::Postgres => {
                         let schema = input.schema.as_deref().unwrap_or("public");
                         format!(
-                            "SELECT column_name, data_type, is_nullable, column_default \
+                            "SELECT column_name::TEXT, data_type::TEXT, is_nullable::TEXT, column_default::TEXT \
                              FROM information_schema.columns \
                              WHERE table_schema = '{schema}' AND table_name = '{}' \
                              ORDER BY ordinal_position",
@@ -350,7 +350,8 @@ pub fn describe_table_tool(db: Arc<DatabaseManager>) -> Tool {
                         )
                     }
                     Dialect::Mysql => format!(
-                        "SELECT column_name, data_type, is_nullable, column_default \
+                        "SELECT CAST(column_name AS CHAR) as column_name, CAST(data_type AS CHAR) as data_type, \
+                         CAST(is_nullable AS CHAR) as is_nullable, CAST(column_default AS CHAR) as column_default \
                          FROM information_schema.columns \
                          WHERE table_schema = DATABASE() AND table_name = '{}' \
                          ORDER BY ordinal_position",
@@ -409,7 +410,7 @@ pub fn describe_table_tool(db: Arc<DatabaseManager>) -> Tool {
                     Dialect::Postgres => {
                         let schema = input.schema.as_deref().unwrap_or("public");
                         format!(
-                            "SELECT indexname as name, indexdef as columns \
+                            "SELECT indexname::TEXT as name, indexdef::TEXT as columns \
                              FROM pg_indexes \
                              WHERE schemaname = '{schema}' AND tablename = '{}' \
                              ORDER BY indexname",
@@ -487,12 +488,12 @@ pub fn list_indexes_tool(db: Arc<DatabaseManager>) -> Tool {
                         let schema = input.schema.as_deref().unwrap_or("public");
                         if input.table.is_empty() {
                             format!(
-                                "SELECT indexname as name, tablename as tbl, indexdef as columns \
+                                "SELECT indexname::TEXT as name, tablename::TEXT as tbl, indexdef::TEXT as columns \
                                  FROM pg_indexes WHERE schemaname = '{schema}' ORDER BY tablename, indexname"
                             )
                         } else {
                             format!(
-                                "SELECT indexname as name, tablename as tbl, indexdef as columns \
+                                "SELECT indexname::TEXT as name, tablename::TEXT as tbl, indexdef::TEXT as columns \
                                  FROM pg_indexes WHERE schemaname = '{schema}' AND tablename = '{}' \
                                  ORDER BY indexname",
                                 input.table

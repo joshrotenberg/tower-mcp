@@ -64,8 +64,8 @@ pub fn tables_resource_template(db: Arc<DatabaseManager>) -> tower_mcp::resource
 
                 let sql = match conn.dialect {
                     Dialect::Sqlite => "SELECT name, 'table' as type FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-                    Dialect::Postgres => "SELECT table_name as name, table_schema as schema, table_type as type FROM information_schema.tables WHERE table_schema NOT IN ('information_schema', 'pg_catalog') ORDER BY table_schema, table_name",
-                    Dialect::Mysql => "SELECT table_name as name, table_schema as schema, table_type as type FROM information_schema.tables WHERE table_schema = DATABASE() ORDER BY table_name",
+                    Dialect::Postgres => "SELECT table_name::TEXT as name, table_schema::TEXT as schema, table_type::TEXT as type FROM information_schema.tables WHERE table_schema NOT IN ('information_schema', 'pg_catalog') ORDER BY table_schema, table_name",
+                    Dialect::Mysql => "SELECT CAST(table_name AS CHAR) as name, CAST(table_schema AS CHAR) as `schema`, CAST(table_type AS CHAR) as `type` FROM information_schema.tables WHERE table_schema = DATABASE() ORDER BY table_name",
                 };
 
                 let rows = execute_query(&conn.pool, sql)
@@ -111,7 +111,7 @@ pub fn schemas_resource_template(
                     Dialect::Postgres => {
                         execute_query(
                             &conn.pool,
-                            "SELECT schema_name as name FROM information_schema.schemata \
+                            "SELECT schema_name::TEXT as name FROM information_schema.schemata \
                              WHERE schema_name NOT IN ('information_schema', 'pg_catalog', 'pg_toast') \
                              ORDER BY schema_name",
                         )
@@ -121,7 +121,7 @@ pub fn schemas_resource_template(
                     Dialect::Mysql => {
                         execute_query(
                             &conn.pool,
-                            "SELECT schema_name as name FROM information_schema.schemata \
+                            "SELECT CAST(schema_name AS CHAR) as name FROM information_schema.schemata \
                              WHERE schema_name NOT IN ('information_schema', 'performance_schema', 'mysql', 'sys') \
                              ORDER BY schema_name",
                         )
@@ -167,14 +167,15 @@ pub fn table_detail_resource_template(
                 let col_sql = match conn.dialect {
                     Dialect::Sqlite => format!("PRAGMA table_info('{table_name}')"),
                     Dialect::Postgres => format!(
-                        "SELECT column_name, data_type, is_nullable, column_default \
+                        "SELECT column_name::TEXT, data_type::TEXT, is_nullable::TEXT, column_default::TEXT \
                          FROM information_schema.columns \
                          WHERE table_name = '{table_name}' \
                          AND table_schema = 'public' \
                          ORDER BY ordinal_position"
                     ),
                     Dialect::Mysql => format!(
-                        "SELECT column_name, data_type, is_nullable, column_default \
+                        "SELECT CAST(column_name AS CHAR) as column_name, CAST(data_type AS CHAR) as data_type, \
+                         CAST(is_nullable AS CHAR) as is_nullable, CAST(column_default AS CHAR) as column_default \
                          FROM information_schema.columns \
                          WHERE table_name = '{table_name}' \
                          AND table_schema = DATABASE() \
@@ -190,11 +191,12 @@ pub fn table_detail_resource_template(
                 let idx_sql = match conn.dialect {
                     Dialect::Sqlite => format!("PRAGMA index_list('{table_name}')"),
                     Dialect::Postgres => format!(
-                        "SELECT indexname, indexdef FROM pg_indexes \
+                        "SELECT indexname::TEXT, indexdef::TEXT FROM pg_indexes \
                          WHERE tablename = '{table_name}' AND schemaname = 'public'"
                     ),
                     Dialect::Mysql => format!(
-                        "SELECT index_name, GROUP_CONCAT(column_name ORDER BY seq_in_index) as columns, non_unique \
+                        "SELECT CAST(index_name AS CHAR) as index_name, \
+                         GROUP_CONCAT(CAST(column_name AS CHAR) ORDER BY seq_in_index) as columns, non_unique \
                          FROM information_schema.statistics \
                          WHERE table_name = '{table_name}' AND table_schema = DATABASE() \
                          GROUP BY index_name, non_unique"
