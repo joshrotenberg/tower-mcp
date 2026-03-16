@@ -4,6 +4,11 @@ This repo has MCP servers configured in `.mcp.json` that you can use directly.
 
 ## Available MCP Servers
 
+### tower-mcp-example
+Simple demo server with `echo`, `add`, `reverse` tools.
+
+Resources: `source://stdio_server.rs` - serves its own source code
+
 ### markdownlint-mcp
 Lint markdown files with 66 rules.
 
@@ -23,16 +28,14 @@ Tools: `init_project`, `add_tool`, `remove_tool`, `get_project`,
 
 Resources: `project://Cargo.toml`, `project://src/main.rs`, `project://state.json`
 
-### conformance
-Full MCP protocol conformance server (39/39 tests passing).
+### notes-mcp
+Full-featured MCP server with tools, resources, and prompts.
 
-Tools: `test_simple_text`, `test_tool_with_progress`, `test_sampling`,
-`test_elicitation`, and more
+Tools: note management (create, list, search, delete)
 
-### tower-mcp-example
-Simple demo server with `echo`, `add`, `reverse` tools.
+Resources: `notes://` URI scheme for individual notes
 
-Resources: `source://stdio_server.rs` - serves its own source code
+Prompts: note summarization and analysis
 
 ## Getting Started
 
@@ -46,10 +49,14 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for build commands, PR guidelines, and co
 
 ## Project Structure
 
-- `src/` - Main library code
+- `crates/tower-mcp/src/` - Main library code
+- `crates/tower-mcp-types/src/` - Protocol types (no runtime deps)
 - `examples/` - Example MCP servers
   - `markdownlint-mcp/` - Markdown linting server
   - `codegen-mcp/` - MCP server builder (generates tower-mcp code)
-  - `conformance-server/` - MCP spec conformance tests
+  - `notes-mcp/` - Full-featured note-taking server
+  - `conformance-server/` - MCP spec conformance tests (39/39)
+  - `conformance-client/` - MCP spec conformance client (265/265 checks)
   - `stdio_server.rs` - Minimal example
+  - `http_server.rs` - HTTP transport example
   - `weather_server.rs` - External API example

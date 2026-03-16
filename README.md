@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/crates/l/tower-mcp.svg)](https://github.com/joshrotenberg/tower-mcp#license)
 [![MSRV](https://img.shields.io/crates/msrv/tower-mcp.svg)](https://github.com/joshrotenberg/tower-mcp)
 [![MCP](https://img.shields.io/badge/MCP-2025--11--25-blue)](https://modelcontextprotocol.io/specification/2025-11-25)
-[![Conformance](https://img.shields.io/badge/conformance-39%2F39-brightgreen)](https://github.com/joshrotenberg/tower-mcp/actions/workflows/conformance.yml)
+[![Conformance](https://img.shields.io/badge/conformance-39%2F39_server_%7C_265%2F265_client-brightgreen)](https://github.com/joshrotenberg/tower-mcp/actions/workflows/conformance.yml)
 
 Tower-native [Model Context Protocol](https://modelcontextprotocol.io) (MCP) implementation for Rust.
 
@@ -38,9 +38,10 @@ If you've used [axum](https://docs.rs/axum), tower-mcp's API will feel familiar:
 | **Tower-native middleware** | Timeout, rate-limit, auth, tracing -- on the whole server or on individual tools. Any `tower::Layer` works. |
 | **All transports** | stdio, HTTP/SSE (with stream resumption), WebSocket, and child process. Same router, any transport. |
 | **In-process testing** | `TestClient` lets you test MCP servers without spawning a subprocess or opening a socket. |
-| **Conformance** | 39/39 official MCP conformance tests pass in CI on every PR. |
+| **Conformance** | 39/39 server and 265/265 client conformance checks pass in CI on every PR. |
 | **Capability filtering** | Session-based tool/resource/prompt visibility for multi-tenant patterns. |
 | **No proc macros required** | Builder pattern API with optional trait-based tools. Nothing hidden behind `#[derive]`. Optional `#[tool_fn]` / `#[prompt_fn]` / `#[resource_fn]` macros available for convenience (feature: `macros`). |
+| **Async tasks** | Full task lifecycle -- background execution, cancellation, TTL cleanup, per-tool task support mode. Clients can poll or wait for long-running tool results. |
 | **Multi-server proxy** | Aggregate N backend servers behind a single endpoint with per-backend middleware and namespace isolation. |
 | **axum ecosystem** | HTTP and WebSocket transports build on axum, so existing axum middleware and extractors work. |
 
@@ -98,8 +99,10 @@ tower-mcp = "0.8"
 | `http` | HTTP transport with SSE support (adds axum, hyper) |
 | `websocket` | WebSocket transport for full-duplex communication |
 | `childproc` | Child process transport for spawning subprocess MCP servers |
-| `oauth` | OAuth 2.1 resource server support (JWT validation) |
+| `oauth` | OAuth 2.1 resource server support -- JWT validation, protected resource metadata (requires `http`) |
 | `jwks` | JWKS endpoint fetching for remote key sets (requires `oauth`) |
+| `http-client` | HTTP client transport for connecting to remote MCP servers |
+| `oauth-client` | OAuth 2.0 client-side token acquisition -- client credentials grant, auto-discovery, token caching (requires `http-client`) |
 | `testing` | Test utilities (`TestClient`) for in-process testing |
 | `dynamic-tools` | Runtime registration/deregistration of tools, prompts, and resources |
 | `proxy` | Multi-server aggregation proxy (`McpProxy`) |
@@ -569,7 +572,7 @@ let router = McpRouter::new()
 
 ## Protocol Compliance
 
-tower-mcp targets the [MCP specification 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) with backward compatibility for `2025-03-26`. The [official MCP conformance test suite](https://github.com/joshrotenberg/tower-mcp/actions/workflows/conformance.yml) runs in CI on every PR, currently passing 39/39 tests.
+tower-mcp targets the [MCP specification 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) with backward compatibility for `2025-03-26`. The [official MCP conformance test suite](https://github.com/joshrotenberg/tower-mcp/actions/workflows/conformance.yml) runs in CI on every PR, currently passing 39/39 server tests and 265/265 client checks (24/24 scenarios).
 
 - [x] [JSON-RPC 2.0 message format](https://modelcontextprotocol.io/specification/2025-11-25/basic#messages)
 - [x] [Protocol version negotiation](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle#version-negotiation) (supports `2025-11-25` and `2025-03-26`)
@@ -606,12 +609,11 @@ The repo includes several example servers you can try with any MCP-enabled agent
 
 | Server | Description |
 |--------|-------------|
+| `tower-mcp-example` | Simple demo with `echo`, `add`, `reverse` tools |
 | `markdownlint-mcp` | Lint markdown with 66 rules |
 | `codegen-mcp` | Helps AI agents build tower-mcp servers |
 | `weather` | Weather forecasts via NWS API |
-| `conformance` | Full MCP spec conformance server (39/39 tests) |
-| `proxy` | Multi-server proxy with per-backend middleware |
-| `skill_prompts` | Load Agent Skills markdown files as MCP prompts |
+| `notes-mcp` | Full-featured server with tools, resources, and prompts |
 
 ```bash
 git clone https://github.com/joshrotenberg/tower-mcp

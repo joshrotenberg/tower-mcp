@@ -139,15 +139,19 @@
 //! ## Feature Flags
 //!
 //! - `full` - Enable all optional features
-//! - `http` - HTTP/SSE transport for web servers
+//! - `http` - HTTP/SSE transport for web servers (adds axum, hyper)
 //! - `websocket` - WebSocket transport for bidirectional communication
 //! - `childproc` - Child process transport for subprocess management
-//! - `oauth` - OAuth 2.1 resource server support (token validation, metadata endpoint)
+//! - `oauth` - OAuth 2.1 resource server support (JWT validation, metadata endpoint; requires `http`)
+//! - `jwks` - JWKS endpoint fetching for remote key sets (requires `oauth`)
 //! - `testing` - Test utilities (`TestClient`) for ergonomic MCP server testing
 //! - `dynamic-tools` - Runtime registration/deregistration of tools, prompts, and resources via
 //!   [`DynamicToolRegistry`], [`DynamicPromptRegistry`], [`DynamicResourceRegistry`],
 //!   [`DynamicResourceTemplateRegistry`]
 //! - `proxy` - Multi-server aggregation proxy ([`McpProxy`](proxy::McpProxy))
+//! - `http-client` - HTTP client transport for connecting to remote MCP servers
+//! - `oauth-client` - OAuth 2.0 client-side token acquisition via client credentials grant (requires `http-client`)
+//! - `macros` - Optional proc macros (`#[tool_fn]`, `#[prompt_fn]`, `#[resource_fn]`, `#[resource_template_fn]`)
 //!
 //! ## Middleware Placement Guide
 //!
