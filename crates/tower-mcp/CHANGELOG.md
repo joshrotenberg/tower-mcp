@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.7] - 2026-03-16
+
+### Features
+
+- Add McpProxy::remove_backend(), replace_backend(), backend_namespaces() ([#730](https://github.com/joshrotenberg/tower-mcp/pull/730))
+
+
+
 ## [0.8.6] - 2026-03-16
 
 ### Documentation
