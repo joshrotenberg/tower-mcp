@@ -33,7 +33,7 @@ async-trait.workspace = true
 tokio-test = "0.4"
 tower = { workspace = true, features = ["timeout", "limit"] }
 tower-mcp-types = { path = "../tower-mcp-types" }
-tower-resilience = { workspace = true, default-features = false, features = ["coalesce"] }
+tower-resilience = { workspace = true, default-features = false, features = ["coalesce", "ratelimiter"] }
 tracing-subscriber.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
 jsonschema = "0.45"
