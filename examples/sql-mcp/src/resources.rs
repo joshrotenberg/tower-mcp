@@ -65,7 +65,7 @@ pub fn tables_resource_template(db: Arc<DatabaseManager>) -> tower_mcp::resource
                 let sql = match conn.dialect {
                     Dialect::Sqlite => "SELECT name, 'table' as type FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
                     Dialect::Postgres => "SELECT table_name::TEXT as name, table_schema::TEXT as schema, table_type::TEXT as type FROM information_schema.tables WHERE table_schema NOT IN ('information_schema', 'pg_catalog') ORDER BY table_schema, table_name",
-                    Dialect::Mysql => "SELECT CAST(table_name AS CHAR) as name, CAST(table_schema AS CHAR) as `schema`, CAST(table_type AS CHAR) as `type` FROM information_schema.tables WHERE table_schema = DATABASE() ORDER BY table_name",
+                    Dialect::Mysql => "SELECT CONCAT(table_name, '') as name, CONCAT(table_schema, '') as `schema`, CONCAT(table_type, '') as `type` FROM information_schema.tables WHERE table_schema = DATABASE() ORDER BY table_name",
                 };
 
                 let rows = execute_query(&conn.pool, sql)
@@ -121,7 +121,7 @@ pub fn schemas_resource_template(
                     Dialect::Mysql => {
                         execute_query(
                             &conn.pool,
-                            "SELECT CAST(schema_name AS CHAR) as name FROM information_schema.schemata \
+                            "SELECT CONCAT(schema_name, '') as name FROM information_schema.schemata \
                              WHERE schema_name NOT IN ('information_schema', 'performance_schema', 'mysql', 'sys') \
                              ORDER BY schema_name",
                         )
@@ -174,8 +174,15 @@ pub fn table_detail_resource_template(
                          ORDER BY ordinal_position"
                     ),
                     Dialect::Mysql => format!(
-                        "SELECT CAST(column_name AS CHAR) as column_name, CAST(data_type AS CHAR) as data_type, \
-                         CAST(is_nullable AS CHAR) as is_nullable, CAST(column_default AS CHAR) as column_default \
+                        "SELECT CONCAT(column_name, '') as column_name, \
+                         CASE \
+                           WHEN numeric_precision IS NOT NULL AND numeric_scale > 0 THEN CONCAT('decimal(', numeric_precision, ',', numeric_scale, ')') \
+                           WHEN numeric_precision IS NOT NULL THEN CONCAT('int(', numeric_precision, ')') \
+                           WHEN character_maximum_length IS NOT NULL THEN CONCAT('varchar(', character_maximum_length, ')') \
+                           WHEN datetime_precision IS NOT NULL THEN 'timestamp' \
+                           ELSE 'unknown' \
+                         END as data_type, \
+                         CONCAT(is_nullable, '') as is_nullable, column_default \
                          FROM information_schema.columns \
                          WHERE table_name = '{table_name}' \
                          AND table_schema = DATABASE() \
@@ -195,8 +202,8 @@ pub fn table_detail_resource_template(
                          WHERE tablename = '{table_name}' AND schemaname = 'public'"
                     ),
                     Dialect::Mysql => format!(
-                        "SELECT CAST(index_name AS CHAR) as index_name, \
-                         GROUP_CONCAT(CAST(column_name AS CHAR) ORDER BY seq_in_index) as columns, non_unique \
+                        "SELECT CONCAT(index_name, '') as index_name, \
+                         GROUP_CONCAT(CONCAT(column_name, '') ORDER BY seq_in_index) as columns, non_unique \
                          FROM information_schema.statistics \
                          WHERE table_name = '{table_name}' AND table_schema = DATABASE() \
                          GROUP BY index_name, non_unique"

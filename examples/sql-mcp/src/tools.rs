@@ -224,7 +224,7 @@ pub fn list_schemas_tool(db: Arc<DatabaseManager>) -> Tool {
                          ORDER BY schema_name"
                     }
                     Dialect::Mysql => {
-                        "SELECT CAST(schema_name AS CHAR) as name FROM information_schema.schemata \
+                        "SELECT CONCAT(schema_name, '') as name FROM information_schema.schemata \
                          WHERE schema_name NOT IN ('information_schema', 'performance_schema', 'mysql', 'sys') \
                          ORDER BY schema_name"
                     }
@@ -284,7 +284,7 @@ pub fn list_tables_tool(db: Arc<DatabaseManager>) -> Tool {
                             .to_string()
                     }
                     Dialect::Mysql => {
-                        "SELECT CAST(table_name AS CHAR) as name, CAST(table_schema AS CHAR) as `schema`, CAST(table_type AS CHAR) as `type` \
+                        "SELECT CONCAT(table_name, '') as name, CONCAT(table_schema, '') as `schema`, CONCAT(table_type, '') as `type` \
                          FROM information_schema.tables \
                          WHERE table_schema = DATABASE() \
                          ORDER BY table_name"
@@ -349,14 +349,28 @@ pub fn describe_table_tool(db: Arc<DatabaseManager>) -> Tool {
                             input.table
                         )
                     }
-                    Dialect::Mysql => format!(
-                        "SELECT CAST(column_name AS CHAR) as column_name, CAST(data_type AS CHAR) as data_type, \
-                         CAST(is_nullable AS CHAR) as is_nullable, CAST(column_default AS CHAR) as column_default \
-                         FROM information_schema.columns \
-                         WHERE table_schema = DATABASE() AND table_name = '{}' \
-                         ORDER BY ordinal_position",
-                        input.table
-                    ),
+                    Dialect::Mysql => {
+                        // MySQL's information_schema type columns (data_type, column_type)
+                        // are enum/set types that the sqlx Any driver can't decode.
+                        // We extract what we can: column_name, is_nullable, defaults.
+                        // Type info is reconstructed from numeric_precision/character_maximum_length.
+                        format!(
+                            "SELECT CONCAT(column_name, '') as column_name, \
+                             CASE \
+                               WHEN numeric_precision IS NOT NULL AND numeric_scale > 0 THEN CONCAT('decimal(', numeric_precision, ',', numeric_scale, ')') \
+                               WHEN numeric_precision IS NOT NULL THEN CONCAT('int(', numeric_precision, ')') \
+                               WHEN character_maximum_length IS NOT NULL THEN CONCAT('varchar(', character_maximum_length, ')') \
+                               WHEN datetime_precision IS NOT NULL THEN 'timestamp' \
+                               ELSE 'unknown' \
+                             END as data_type, \
+                             CONCAT(is_nullable, '') as is_nullable, \
+                             column_default \
+                             FROM information_schema.columns \
+                             WHERE table_schema = DATABASE() AND table_name = '{}' \
+                             ORDER BY ordinal_position",
+                            input.table
+                        )
+                    }
                 };
 
                 let columns = match execute_query(&conn.pool, &col_sql).await {
@@ -377,8 +391,8 @@ pub fn describe_table_tool(db: Arc<DatabaseManager>) -> Tool {
                                     .map(String::from),
                             },
                             _ => ColumnInfo {
-                                name: json_str(row, "column_name"),
-                                data_type: json_str(row, "data_type"),
+                                name: json_str_or(row, "column_name", "?"),
+                                data_type: json_str_or(row, "data_type", "unknown"),
                                 nullable: row
                                     .get("is_nullable")
                                     .and_then(|v| v.as_str())
@@ -621,5 +635,12 @@ fn json_str(row: &serde_json::Value, key: &str) -> String {
     row.get(key)
         .and_then(|v| v.as_str())
         .unwrap_or("")
+        .to_string()
+}
+
+fn json_str_or(row: &serde_json::Value, key: &str, default: &str) -> String {
+    row.get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or(default)
         .to_string()
 }
