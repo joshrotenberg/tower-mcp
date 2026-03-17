@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.8] - 2026-03-17
+
+### Features
+
+- Derive Serialize/Deserialize on RouterResponse and inner types ([#735](https://github.com/joshrotenberg/tower-mcp/pull/735))
+- Add list_sessions() and terminate_session() to SessionHandle ([#736](https://github.com/joshrotenberg/tower-mcp/pull/736))
+- Add CircuitBreakerLayer with observable state handle ([#738](https://github.com/joshrotenberg/tower-mcp/pull/738))
+
+
+
 ## [0.8.7] - 2026-03-16
 
 ### Features
