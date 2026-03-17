@@ -2410,7 +2410,7 @@ impl RouterRequest {
 }
 
 /// Response type for the tower Service implementation
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RouterResponse {
     /// The JSON-RPC request ID this response corresponds to.
     pub id: RequestId,
@@ -6199,5 +6199,28 @@ mod tests {
 
         ext.insert(String::from("hello"));
         assert_eq!(ext.len(), 2);
+    }
+
+    #[test]
+    fn test_router_response_serde_roundtrip() {
+        // Success response
+        let response = RouterResponse {
+            id: RequestId::Number(1),
+            inner: Ok(McpResponse::Empty(EmptyResult {})),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let deserialized: RouterResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.id, RequestId::Number(1));
+        assert!(!deserialized.is_error());
+
+        // Error response
+        let response = RouterResponse {
+            id: RequestId::String("req-2".into()),
+            inner: Err(JsonRpcError::method_not_found("unknown")),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let deserialized: RouterResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.id, RequestId::String("req-2".into()));
+        assert!(deserialized.is_error());
     }
 }
