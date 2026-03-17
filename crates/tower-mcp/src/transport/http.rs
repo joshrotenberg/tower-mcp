@@ -231,6 +231,8 @@ struct Session {
     service_source: SessionServiceSource,
     /// Broadcast channel for SSE notifications and outgoing requests
     notifications_tx: broadcast::Sender<String>,
+    /// When this session was created
+    created_at: Instant,
     /// Last time this session was accessed
     last_accessed: RwLock<Instant>,
     /// Pending outgoing requests waiting for responses
@@ -279,6 +281,7 @@ impl Session {
             (router, None)
         };
 
+        let now = Instant::now();
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             service_source: SessionServiceSource::Router {
@@ -286,7 +289,8 @@ impl Session {
                 factory: service_factory,
             },
             notifications_tx,
-            last_accessed: RwLock::new(Instant::now()),
+            created_at: now,
+            last_accessed: RwLock::new(now),
             pending_requests: Mutex::new(HashMap::new()),
             request_rx: Mutex::new(request_rx),
             protocol_version: RwLock::new(LATEST_PROTOCOL_VERSION.to_string()),
@@ -304,11 +308,13 @@ impl Session {
     fn from_service(service: McpBoxService) -> Self {
         let (notifications_tx, _) = broadcast::channel(100);
 
+        let now = Instant::now();
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             service_source: SessionServiceSource::Boxed(std::sync::Mutex::new(service)),
             notifications_tx,
-            last_accessed: RwLock::new(Instant::now()),
+            created_at: now,
+            last_accessed: RwLock::new(now),
             pending_requests: Mutex::new(HashMap::new()),
             request_rx: Mutex::new(None),
             protocol_version: RwLock::new(LATEST_PROTOCOL_VERSION.to_string()),
@@ -581,7 +587,20 @@ impl SessionStore {
     }
 }
 
-/// A handle for querying HTTP transport session metrics.
+/// Metadata about an active session.
+///
+/// Returned by [`SessionHandle::list_sessions()`].
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    /// The session ID.
+    pub id: String,
+    /// How long ago this session was created.
+    pub created_at: Duration,
+    /// How long ago this session was last accessed.
+    pub last_activity: Duration,
+}
+
+/// A handle for querying and managing HTTP transport sessions.
 ///
 /// Obtained from [`HttpTransport::into_router_with_handle()`] or
 /// [`HttpTransport::into_router_at_with_handle()`]. The handle is cheap to
@@ -597,6 +616,10 @@ impl SessionStore {
 ///
 /// // Later, in an admin endpoint:
 /// let count = handle.session_count().await;
+/// for info in handle.list_sessions().await {
+///     println!("{}: created {:?} ago", info.id, info.created_at);
+/// }
+/// handle.terminate_session("session-id").await;
 /// ```
 #[derive(Clone)]
 pub struct SessionHandle {
@@ -607,6 +630,26 @@ impl SessionHandle {
     /// Returns the number of currently active sessions.
     pub async fn session_count(&self) -> usize {
         self.store.sessions.read().await.len()
+    }
+
+    /// Returns metadata for all active sessions.
+    pub async fn list_sessions(&self) -> Vec<SessionInfo> {
+        let sessions = self.store.sessions.read().await;
+        let mut infos = Vec::with_capacity(sessions.len());
+        for session in sessions.values() {
+            let last_accessed = session.last_accessed.read().await;
+            infos.push(SessionInfo {
+                id: session.id.clone(),
+                created_at: session.created_at.elapsed(),
+                last_activity: last_accessed.elapsed(),
+            });
+        }
+        infos
+    }
+
+    /// Terminates a session by ID, returning `true` if the session existed.
+    pub async fn terminate_session(&self, id: &str) -> bool {
+        self.store.remove(id).await
     }
 }
 
@@ -2286,5 +2329,54 @@ mod tests {
 
         // Now we should have 1 session
         assert_eq!(handle.session_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_session_handle_list_and_terminate() {
+        let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
+        let (app, handle) = transport.into_router_with_handle();
+
+        // No sessions initially
+        assert!(handle.list_sessions().await.is_empty());
+
+        // Initialize to create a session
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": {
+                            "name": "test-client",
+                            "version": "1.0.0"
+                        }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), 200);
+
+        // list_sessions should return 1 session with valid metadata
+        let sessions = handle.list_sessions().await;
+        assert_eq!(sessions.len(), 1);
+        assert!(!sessions[0].id.is_empty());
+
+        // Terminate the session
+        let session_id = sessions[0].id.clone();
+        assert!(handle.terminate_session(&session_id).await);
+        assert_eq!(handle.session_count().await, 0);
+
+        // Terminating again returns false
+        assert!(!handle.terminate_session(&session_id).await);
     }
 }
