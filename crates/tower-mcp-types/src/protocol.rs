@@ -499,7 +499,7 @@ pub struct RequestMeta {
 }
 
 /// High-level MCP response
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 #[non_exhaustive]
 pub enum McpResponse {
@@ -3194,7 +3194,7 @@ pub struct ListTasksParams {
 }
 
 /// Result of listing tasks
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListTasksResult {
     /// List of tasks
@@ -3883,7 +3883,7 @@ pub struct ElicitationCompleteParams {
 // Common
 // =============================================================================
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EmptyResult {}
 
 // =============================================================================
@@ -5070,5 +5070,39 @@ mod tests {
             meta: None,
         };
         assert!(result.as_json().is_none());
+    }
+
+    #[test]
+    fn test_mcp_response_serde_roundtrip() {
+        // CallToolResult variant - has distinctive fields
+        let response = McpResponse::CallTool(CallToolResult {
+            content: vec![Content::text("hello")],
+            structured_content: None,
+            is_error: false,
+            meta: None,
+        });
+        let json = serde_json::to_string(&response).unwrap();
+        let deserialized: McpResponse = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            McpResponse::CallTool(result) => {
+                assert_eq!(result.content[0].as_text(), Some("hello"));
+            }
+            _ => panic!("expected CallTool variant"),
+        }
+
+        // ListToolsResult variant
+        let response = McpResponse::ListTools(ListToolsResult {
+            tools: vec![],
+            next_cursor: Some("cursor123".to_string()),
+            meta: None,
+        });
+        let json = serde_json::to_string(&response).unwrap();
+        let deserialized: McpResponse = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            McpResponse::ListTools(result) => {
+                assert_eq!(result.next_cursor.as_deref(), Some("cursor123"));
+            }
+            _ => panic!("expected ListTools variant"),
+        }
     }
 }
