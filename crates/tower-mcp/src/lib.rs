@@ -495,7 +495,7 @@ pub use transport::{
 };
 
 #[cfg(feature = "http")]
-pub use transport::{HttpTransport, SessionHandle};
+pub use transport::{HttpTransport, SessionHandle, SessionInfo};
 
 #[cfg(feature = "websocket")]
 pub use transport::WebSocketTransport;
