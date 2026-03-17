@@ -12,6 +12,7 @@
 //! | [`McpTracingLayer`] | Structured tracing for all MCP requests |
 //! | [`ToolCallLoggingLayer`] | Focused audit logging for tool calls |
 //! | [`AuditLayer`] | Comprehensive audit events for all MCP requests |
+//! | [`CircuitBreakerLayer`] | Circuit breaker with observable state handle |
 //!
 //! # Usage
 //!
@@ -71,9 +72,13 @@
 //! ```
 
 mod audit;
+mod circuit_breaker;
 mod tool_call_logging;
 mod tracing;
 
 pub use audit::{AuditLayer, AuditService};
+pub use circuit_breaker::{
+    CircuitBreakerHandle, CircuitBreakerLayer, CircuitBreakerService, CircuitState,
+};
 pub use tool_call_logging::{ToolCallLoggingLayer, ToolCallLoggingService};
 pub use tracing::{McpTracingLayer, McpTracingService};
