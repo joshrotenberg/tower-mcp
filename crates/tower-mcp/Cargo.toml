@@ -27,13 +27,14 @@ async-trait.workspace = true
 tracing.workspace = true
 regex = "1"
 base64.workspace = true
+tower-resilience = { workspace = true, optional = true, default-features = false, features = ["circuitbreaker", "ratelimiter", "bulkhead"] }
 
 [dev-dependencies]
 async-trait.workspace = true
 tokio-test = "0.4"
 tower = { workspace = true, features = ["timeout", "limit"] }
 tower-mcp-types = { path = "../tower-mcp-types" }
-tower-resilience = { workspace = true, default-features = false, features = ["coalesce", "ratelimiter"] }
+tower-resilience = { workspace = true, default-features = false, features = ["coalesce", "ratelimiter", "circuitbreaker"] }
 tracing-subscriber.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
 jsonschema = "0.45"
@@ -41,7 +42,7 @@ jsonschema = "0.45"
 [features]
 default = []
 # Enable all optional features
-full = ["http", "websocket", "childproc", "oauth", "jwks", "testing", "dynamic-tools", "http-client", "oauth-client", "proxy", "macros"]
+full = ["http", "websocket", "childproc", "oauth", "jwks", "testing", "dynamic-tools", "http-client", "oauth-client", "proxy", "macros", "resilience"]
 # Transport features
 http = ["dep:axum", "dep:hyper", "dep:http", "dep:http-body-util", "dep:tokio-stream", "dep:uuid"]
 websocket = ["dep:axum", "dep:uuid"]
@@ -60,6 +61,8 @@ oauth-client = ["http-client"]
 dynamic-tools = []
 # MCP proxy for aggregating multiple backend servers
 proxy = []
+# Re-export tower-resilience circuit breaker, rate limiter, and bulkhead with observable handles
+resilience = ["dep:tower-resilience"]
 # Proc macros for tool/resource/prompt definitions
 macros = ["dep:tower-mcp-macros"]
 
