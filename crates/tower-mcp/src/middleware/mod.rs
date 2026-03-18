@@ -12,7 +12,33 @@
 //! | [`McpTracingLayer`] | Structured tracing for all MCP requests |
 //! | [`ToolCallLoggingLayer`] | Focused audit logging for tool calls |
 //! | [`AuditLayer`] | Comprehensive audit events for all MCP requests |
-//! | [`CircuitBreakerLayer`] | Circuit breaker with observable state handle |
+//!
+//! # Resilience Middleware (feature = "resilience")
+//!
+//! With the `resilience` feature enabled, tower-resilience middleware is
+//! re-exported with observable state handles for admin/monitoring APIs:
+//!
+//! | Layer | Handle | Purpose |
+//! |-------|--------|---------|
+//! | `CircuitBreakerLayer` | `CircuitBreakerHandle` | Failure-rate circuit breaking |
+//! | `RateLimiterLayer` | `RateLimiterHandle` | Rate limiting |
+//! | `BulkheadLayer` | `BulkheadHandle` | Concurrency limiting |
+//!
+//! Use `build_with_handle()` on any builder to get both a layer and a handle:
+//!
+//! ```rust,ignore
+//! use tower_mcp::middleware::CircuitBreakerLayer;
+//!
+//! let (layer, handle) = CircuitBreakerLayer::builder()
+//!     .failure_rate_threshold(0.5)
+//!     .build_with_handle();
+//!
+//! // handle.state(), handle.health_status(), handle.metrics().await
+//! ```
+//!
+//! Errors from resilience layers are automatically converted to JSON-RPC
+//! errors by `CatchError` when used with `HttpTransport::layer()` or
+//! `McpProxyBuilder::backend_layer()`.
 //!
 //! # Usage
 //!
@@ -72,13 +98,20 @@
 //! ```
 
 mod audit;
-mod circuit_breaker;
 mod tool_call_logging;
 mod tracing;
 
 pub use audit::{AuditLayer, AuditService};
-pub use circuit_breaker::{
-    CircuitBreakerHandle, CircuitBreakerLayer, CircuitBreakerService, CircuitState,
-};
 pub use tool_call_logging::{ToolCallLoggingLayer, ToolCallLoggingService};
 pub use tracing::{McpTracingLayer, McpTracingService};
+
+#[cfg(feature = "resilience")]
+pub use tower_resilience::circuitbreaker::{
+    CircuitBreakerError, CircuitBreakerHandle, CircuitBreakerLayer, CircuitState,
+};
+
+#[cfg(feature = "resilience")]
+pub use tower_resilience::ratelimiter::{RateLimiterHandle, RateLimiterLayer};
+
+#[cfg(feature = "resilience")]
+pub use tower_resilience::bulkhead::{BulkheadHandle, BulkheadLayer};
