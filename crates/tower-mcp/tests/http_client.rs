@@ -1856,3 +1856,320 @@ async fn test_http_client_session_expiry_error() {
         "Expected SessionNotFound error code (-32005)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Optional sessions (#742) -- Codex CLI / Cursor compatibility
+// ---------------------------------------------------------------------------
+
+/// Start a server with optional_sessions enabled.
+async fn start_optional_sessions_server() -> (String, tokio::task::JoinHandle<()>) {
+    let router = test_router();
+    let transport = HttpTransport::new(router)
+        .disable_origin_validation()
+        .optional_sessions();
+    let axum_router = transport.into_router();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://127.0.0.1:{}", addr.port());
+
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, axum_router).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    (url, handle)
+}
+
+/// Simulate Codex CLI behavior: initialize + tools/list during setup,
+/// then tools/call without session ID on a fresh connection.
+#[tokio::test]
+async fn test_optional_sessions_codex_pattern() {
+    let (url, _server) = start_optional_sessions_server().await;
+    let client = reqwest::Client::new();
+
+    // Phase 1: Setup -- Codex initializes and discovers tools (normal flow)
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": { "name": "codex-cli", "version": "0.1.0" }
+                }
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let session_id = resp
+        .headers()
+        .get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // tools/list with session ID (setup phase)
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header("mcp-session-id", &session_id)
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": {}
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let tools = body["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 2, "Should discover echo and add tools");
+
+    // Phase 2: Execution -- Codex sends tools/call WITHOUT session ID
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        // No mcp-session-id header!
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "echo",
+                    "arguments": { "message": "hello from codex" }
+                }
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body.get("error").is_none(),
+        "tools/call without session ID should succeed with optional_sessions, got: {body}"
+    );
+    let content = &body["result"]["content"][0]["text"];
+    assert_eq!(content.as_str().unwrap(), "hello from codex");
+}
+
+/// Simulate Cursor behavior: tools/list without session ID.
+#[tokio::test]
+async fn test_optional_sessions_cursor_tools_list_no_session() {
+    let (url, _server) = start_optional_sessions_server().await;
+    let client = reqwest::Client::new();
+
+    // Cursor sends tools/list directly without initializing or session ID
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        // No mcp-session-id header!
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {}
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body.get("error").is_none(),
+        "tools/list without session ID should succeed with optional_sessions, got: {body}"
+    );
+    let tools = body["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 2);
+}
+
+/// Multiple sessionless requests should each work independently.
+#[tokio::test]
+async fn test_optional_sessions_multiple_stateless_calls() {
+    let (url, _server) = start_optional_sessions_server().await;
+    let client = reqwest::Client::new();
+
+    // Send multiple tools/call requests without session IDs
+    for i in 0..3 {
+        let resp = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": i + 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "add",
+                        "arguments": { "a": i, "b": 10 }
+                    }
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body.get("error").is_none(),
+            "Stateless call {i} failed: {body}"
+        );
+        let expected = format!("{}", i + 10);
+        assert_eq!(
+            body["result"]["content"][0]["text"].as_str().unwrap(),
+            expected
+        );
+    }
+}
+
+/// Without optional_sessions, missing session ID should still be rejected.
+#[tokio::test]
+async fn test_sessions_required_rejects_without_session_id() {
+    let (url, _server) = start_server().await; // Uses default (sessions required)
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        // No mcp-session-id header!
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {}
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let error = body
+        .get("error")
+        .expect("Expected JSON-RPC error when session ID is missing");
+    assert_eq!(
+        error["code"].as_i64().unwrap(),
+        -32006,
+        "Expected SessionRequired error code (-32006)"
+    );
+}
+
+/// With optional_sessions, clients that DO send session IDs should still work.
+#[tokio::test]
+async fn test_optional_sessions_with_session_id_still_works() {
+    let (url, _server) = start_optional_sessions_server().await;
+    let client = reqwest::Client::new();
+
+    // Initialize normally
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": { "name": "good-client", "version": "1.0.0" }
+                }
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let session_id = resp
+        .headers()
+        .get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // Send initialized notification
+    let _resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header("mcp-session-id", &session_id)
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {}
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    // Use session normally
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header("mcp-session-id", &session_id)
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "echo",
+                    "arguments": { "message": "session works" }
+                }
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body.get("error").is_none(),
+        "Session-based call should work: {body}"
+    );
+    assert_eq!(
+        body["result"]["content"][0]["text"].as_str().unwrap(),
+        "session works"
+    );
+}
