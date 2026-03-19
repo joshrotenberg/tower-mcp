@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.1] - 2026-03-19
+
+### Features
+
+- Add optional_sessions() to HttpTransport for client compatibility ([#743](https://github.com/joshrotenberg/tower-mcp/pull/743))
+
+
+
 ## [0.9.0] - 2026-03-18
 
 ### Features
