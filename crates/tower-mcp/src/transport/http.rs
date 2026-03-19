@@ -78,6 +78,19 @@
 //! | -32005  | SessionNotFound| Session expired or server restarted      |
 //! | -32006  | SessionRequired| MCP-Session-Id header missing            |
 //!
+//! ## Optional Sessions
+//!
+//! Some MCP clients (Codex CLI, Cursor, etc.) don't carry the `mcp-session-id`
+//! header forward after initialization. Use [`HttpTransport::optional_sessions()`]
+//! to allow requests without a session ID:
+//!
+//! ```rust,ignore
+//! let transport = HttpTransport::new(router).optional_sessions();
+//! ```
+//!
+//! When enabled, requests without a session ID get a transient, pre-initialized
+//! session. Clients that do send session IDs continue to work normally.
+//!
 //! ## CORS Support
 //!
 //! Browser-based MCP clients require CORS headers. Since [`HttpTransport::into_router()`]
@@ -538,6 +551,51 @@ impl SessionStore {
         Some(session)
     }
 
+    /// Create a new session with its router already marked as initialized.
+    ///
+    /// Used by the optional-sessions feature to serve requests from clients
+    /// that skip the initialize handshake.
+    async fn create_initialized(
+        &self,
+        router: McpRouter,
+        service_factory: ServiceFactory,
+    ) -> Option<Arc<Session>> {
+        // Pre-initialize the router's session state so it won't reject requests
+        router.session().mark_initialized();
+
+        let mut sessions = self.sessions.write().await;
+
+        if let Some(max) = self.config.max_sessions
+            && sessions.len() >= max
+        {
+            return None;
+        }
+
+        let session = Arc::new(Session::new(router, self.sampling_enabled, service_factory));
+        sessions.insert(session.id.clone(), session.clone());
+        tracing::debug!(session_id = %session.id, "Created pre-initialized session (optional_sessions)");
+        Some(session)
+    }
+
+    /// Create a pre-initialized session from a boxed service.
+    async fn create_initialized_from_service(
+        &self,
+        service: McpBoxService,
+    ) -> Option<Arc<Session>> {
+        let mut sessions = self.sessions.write().await;
+
+        if let Some(max) = self.config.max_sessions
+            && sessions.len() >= max
+        {
+            return None;
+        }
+
+        let session = Arc::new(Session::from_service(service));
+        sessions.insert(session.id.clone(), session.clone());
+        tracing::debug!(session_id = %session.id, "Created pre-initialized session from service (optional_sessions)");
+        Some(session)
+    }
+
     async fn get(&self, id: &str) -> Option<Arc<Session>> {
         let sessions = self.sessions.read().await;
         let session = sessions.get(id).cloned();
@@ -678,6 +736,8 @@ struct AppState {
     allowed_origins: Vec<String>,
     /// Whether sampling is enabled
     sampling_enabled: bool,
+    /// Whether sessions are optional (for clients that don't track session IDs)
+    optional_sessions: bool,
 }
 
 /// Configuration for OAuth 2.1 Protected Resource Metadata.
@@ -714,6 +774,7 @@ pub struct HttpTransport {
     allowed_origins: Vec<String>,
     session_config: SessionConfig,
     sampling_enabled: bool,
+    optional_sessions: bool,
     #[cfg(feature = "oauth")]
     oauth_config: Option<OAuthConfig>,
 }
@@ -732,6 +793,7 @@ impl HttpTransport {
             allowed_origins: vec![],
             session_config: SessionConfig::default(),
             sampling_enabled: false,
+            optional_sessions: false,
             #[cfg(feature = "oauth")]
             oauth_config: None,
         }
@@ -778,6 +840,7 @@ impl HttpTransport {
             allowed_origins: vec![],
             session_config: SessionConfig::default(),
             sampling_enabled: false,
+            optional_sessions: false,
             #[cfg(feature = "oauth")]
             oauth_config: None,
         }
@@ -821,6 +884,37 @@ impl HttpTransport {
     /// ```
     pub fn with_sampling(mut self) -> Self {
         self.sampling_enabled = true;
+        self
+    }
+
+    /// Make sessions optional for compatibility with clients that don't track session IDs.
+    ///
+    /// When enabled, requests without an `mcp-session-id` header are allowed.
+    /// The server creates a transient, pre-initialized session for each such request,
+    /// bypassing the normal `initialize` handshake requirement.
+    ///
+    /// This is useful for clients like Codex CLI, Cursor, and others that perform
+    /// `initialize` + `tools/list` during setup but don't carry the session ID
+    /// forward to subsequent `tools/call` requests.
+    ///
+    /// Clients that do send session IDs continue to work normally.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use tower_mcp::McpRouter;
+    /// use tower_mcp::transport::http::HttpTransport;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let router = McpRouter::new().server_info("my-server", "1.0.0");
+    ///     let transport = HttpTransport::new(router).optional_sessions();
+    ///     transport.serve("127.0.0.1:3000").await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn optional_sessions(mut self) -> Self {
+        self.optional_sessions = true;
         self
     }
 
@@ -937,6 +1031,7 @@ impl HttpTransport {
             validate_origin: self.validate_origin,
             allowed_origins: self.allowed_origins.clone(),
             sampling_enabled: self.sampling_enabled,
+            optional_sessions: self.optional_sessions,
         })
     }
 
@@ -1233,16 +1328,8 @@ async fn handle_post(
                     .into_response();
             }
         }
-    } else {
-        // Require existing session
-        let session_id = match get_session_id(&headers) {
-            Some(id) => id,
-            None => {
-                // Return JSON-RPC error so clients can detect and handle this
-                return json_rpc_error_response(None, JsonRpcError::session_required());
-            }
-        };
-
+    } else if let Some(session_id) = get_session_id(&headers) {
+        // Client sent a session ID -- look it up
         match state.sessions.get(&session_id).await {
             Some(s) => s,
             None => {
@@ -1253,6 +1340,40 @@ async fn handle_post(
                 );
             }
         }
+    } else if state.optional_sessions {
+        // No session ID, but sessions are optional -- create a transient,
+        // pre-initialized session so the router won't reject the request.
+        // This supports clients (Codex CLI, Cursor, etc.) that perform
+        // initialize + tools/list during setup but don't carry the session
+        // ID forward to subsequent requests.
+        let create_result = match &state.service_source {
+            ServiceSource::Router { router, factory } => {
+                state
+                    .sessions
+                    .create_initialized(router.with_fresh_session(), factory.clone())
+                    .await
+            }
+            ServiceSource::Service(mutex) => {
+                let service = mutex.lock().unwrap().clone();
+                state
+                    .sessions
+                    .create_initialized_from_service(service)
+                    .await
+            }
+        };
+        match create_result {
+            Some(s) => s,
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Maximum session limit reached",
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        // No session ID and sessions are required
+        return json_rpc_error_response(None, JsonRpcError::session_required());
     };
 
     // Validate protocol version (if present and not init request)
