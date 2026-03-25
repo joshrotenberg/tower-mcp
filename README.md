@@ -114,7 +114,7 @@ Example with features:
 
 ```toml
 [dependencies]
-tower-mcp = { version = "0.8", features = ["full"] }
+tower-mcp = { version = "0.9", features = ["full"] }
 ```
 
 ### Types Only
