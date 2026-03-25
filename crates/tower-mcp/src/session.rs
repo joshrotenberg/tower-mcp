@@ -197,7 +197,8 @@ impl SessionState {
     pub fn is_request_allowed(&self, method: &str) -> bool {
         match self.phase() {
             SessionPhase::Uninitialized => {
-                matches!(method, "initialize" | "ping")
+                // server/discover (SEP-1442) is allowed before initialization
+                matches!(method, "initialize" | "ping" | "server/discover")
             }
             SessionPhase::Initializing | SessionPhase::Initialized => true,
         }

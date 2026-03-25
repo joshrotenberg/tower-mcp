@@ -2179,6 +2179,35 @@ impl McpRouter {
                 }
             }
 
+            McpRequest::Unknown { ref method, .. } if method == "server/discover" => {
+                #[cfg(feature = "stateless")]
+                {
+                    use crate::protocol::SUPPORTED_PROTOCOL_VERSIONS;
+                    let result = crate::stateless::DiscoverResult {
+                        supported_versions: SUPPORTED_PROTOCOL_VERSIONS
+                            .iter()
+                            .map(|v| v.to_string())
+                            .collect(),
+                        capabilities: self.capabilities(),
+                        server_info: Implementation {
+                            name: self.inner.server_name.clone(),
+                            version: self.inner.server_version.clone(),
+                            title: self.inner.server_title.clone(),
+                            description: self.inner.server_description.clone(),
+                            icons: self.inner.server_icons.clone(),
+                            website_url: None,
+                            meta: None,
+                        },
+                        instructions: self.inner.instructions.clone(),
+                    };
+                    Ok(McpResponse::Raw(serde_json::to_value(result).unwrap()))
+                }
+                #[cfg(not(feature = "stateless"))]
+                {
+                    Err(Error::JsonRpc(JsonRpcError::method_not_found(method)))
+                }
+            }
+
             McpRequest::Unknown { method, .. } => {
                 Err(Error::JsonRpc(JsonRpcError::method_not_found(&method)))
             }
