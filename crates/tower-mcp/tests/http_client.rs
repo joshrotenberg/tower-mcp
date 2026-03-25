@@ -2173,3 +2173,308 @@ async fn test_optional_sessions_with_session_id_still_works() {
         "session works"
     );
 }
+
+// =============================================================================
+// SEP-1442 Stateless mode tests
+// =============================================================================
+
+#[cfg(feature = "stateless")]
+mod stateless_tests {
+    use super::*;
+    use tower_mcp::stateless::StatelessConfig;
+
+    /// Start a server with stateless mode enabled.
+    async fn start_stateless_server() -> (String, tokio::task::JoinHandle<()>) {
+        let router = test_router();
+        let transport = HttpTransport::new(router)
+            .disable_origin_validation()
+            .stateless(StatelessConfig::new());
+        let axum_router = transport.into_router();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://127.0.0.1:{}", addr.port());
+
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, axum_router).await.unwrap();
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        (url, handle)
+    }
+
+    /// tools/list works without initialize or session, just protocol version header.
+    #[tokio::test]
+    async fn test_stateless_tools_list() {
+        let (url, _server) = start_stateless_server().await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header("mcp-protocol-version", "2025-11-25")
+            .body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list",
+                    "params": {}
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        // Should echo back the protocol version
+        assert_eq!(
+            resp.headers()
+                .get("mcp-protocol-version")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "2025-11-25"
+        );
+        // Should NOT have a session ID
+        assert!(resp.headers().get("mcp-session-id").is_none());
+
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let tools = body["result"]["tools"].as_array().unwrap();
+        assert!(tools.len() >= 2, "Should list tools without session");
+    }
+
+    /// tools/call works in stateless mode.
+    #[tokio::test]
+    async fn test_stateless_tools_call() {
+        let (url, _server) = start_stateless_server().await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header("mcp-protocol-version", "2025-11-25")
+            .body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "echo",
+                        "arguments": { "message": "stateless!" }
+                    }
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["result"]["content"][0]["text"].as_str().unwrap(),
+            "stateless!"
+        );
+    }
+
+    /// Unsupported protocol version returns SEP-1442 error code -32000.
+    #[tokio::test]
+    async fn test_stateless_unsupported_version() {
+        let (url, _server) = start_stateless_server().await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header("mcp-protocol-version", "1999-01-01")
+            .body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list",
+                    "params": {}
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["code"].as_i64().unwrap(), -32000);
+        assert!(body["error"]["data"]["supportedVersions"].is_array());
+    }
+
+    /// Protocol version in _meta field (body) works as alternative to header.
+    #[tokio::test]
+    async fn test_stateless_version_in_meta() {
+        let (url, _server) = start_stateless_server().await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            // No mcp-protocol-version header!
+            .body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list",
+                    "params": {
+                        "_meta": {
+                            "modelcontextprotocol.io/mcpProtocolVersion": "2025-11-25"
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(body["result"]["tools"].is_array());
+    }
+
+    /// Stateful clients (with session ID) still work alongside stateless.
+    #[tokio::test]
+    async fn test_stateless_mixed_mode() {
+        let (url, _server) = start_stateless_server().await;
+        let client = reqwest::Client::new();
+
+        // Stateful: initialize and get session
+        let resp = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": { "name": "test", "version": "1.0" }
+                    }
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let session_id = resp
+            .headers()
+            .get("mcp-session-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Send initialized notification
+        client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("mcp-session-id", &session_id)
+            .body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized"
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        // Stateful request with session ID
+        let resp = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header("mcp-session-id", &session_id)
+            .body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/list",
+                    "params": {}
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(body["result"]["tools"].is_array());
+
+        // Stateless request on same server (no session ID, protocol version header)
+        let resp = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header("mcp-protocol-version", "2025-11-25")
+            .body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "add",
+                        "arguments": { "a": 10, "b": 20 }
+                    }
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["result"]["content"][0]["text"].as_str().unwrap(), "30");
+    }
+
+    /// server/discover works without any session or protocol version.
+    #[tokio::test]
+    async fn test_stateless_discover() {
+        let (url, _server) = start_stateless_server().await;
+        let client = reqwest::Client::new();
+
+        // server/discover should work even without protocol version header
+        // (it's allowed before initialization per session.rs)
+        let resp = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header("mcp-protocol-version", "2025-11-25")
+            .body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "server/discover",
+                    "params": {}
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let result = &body["result"];
+        assert!(result["supportedVersions"].is_array());
+        assert!(result["serverInfo"]["name"].is_string());
+        assert!(result["capabilities"].is_object());
+    }
+}

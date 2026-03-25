@@ -738,6 +738,9 @@ struct AppState {
     sampling_enabled: bool,
     /// Whether sessions are optional (for clients that don't track session IDs)
     optional_sessions: bool,
+    /// SEP-1442 stateless mode configuration
+    #[cfg(feature = "stateless")]
+    stateless_config: Option<crate::stateless::StatelessConfig>,
 }
 
 /// Configuration for OAuth 2.1 Protected Resource Metadata.
@@ -775,6 +778,8 @@ pub struct HttpTransport {
     session_config: SessionConfig,
     sampling_enabled: bool,
     optional_sessions: bool,
+    #[cfg(feature = "stateless")]
+    stateless_config: Option<crate::stateless::StatelessConfig>,
     #[cfg(feature = "oauth")]
     oauth_config: Option<OAuthConfig>,
 }
@@ -794,6 +799,8 @@ impl HttpTransport {
             session_config: SessionConfig::default(),
             sampling_enabled: false,
             optional_sessions: false,
+            #[cfg(feature = "stateless")]
+            stateless_config: None,
             #[cfg(feature = "oauth")]
             oauth_config: None,
         }
@@ -841,6 +848,8 @@ impl HttpTransport {
             session_config: SessionConfig::default(),
             sampling_enabled: false,
             optional_sessions: false,
+            #[cfg(feature = "stateless")]
+            stateless_config: None,
             #[cfg(feature = "oauth")]
             oauth_config: None,
         }
@@ -915,6 +924,41 @@ impl HttpTransport {
     /// ```
     pub fn optional_sessions(mut self) -> Self {
         self.optional_sessions = true;
+        self
+    }
+
+    /// Enable SEP-1442 stateless mode (experimental).
+    ///
+    /// When enabled, requests with an `MCP-Protocol-Version` header (or
+    /// `_meta.protocolVersion` in the body) are processed without requiring a
+    /// session. Each stateless request gets an ephemeral, pre-initialized
+    /// router that is discarded after the response is sent.
+    ///
+    /// This enables horizontal scaling and serverless deployments where
+    /// sessions cannot be maintained across instances.
+    ///
+    /// Stateful clients (those that send `mcp-session-id`) continue to work
+    /// normally alongside stateless clients.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use tower_mcp::McpRouter;
+    /// use tower_mcp::transport::http::HttpTransport;
+    /// use tower_mcp::stateless::StatelessConfig;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let router = McpRouter::new().server_info("my-server", "1.0.0");
+    ///     let transport = HttpTransport::new(router)
+    ///         .stateless(StatelessConfig::new());
+    ///     transport.serve("127.0.0.1:3000").await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    #[cfg(feature = "stateless")]
+    pub fn stateless(mut self, config: crate::stateless::StatelessConfig) -> Self {
+        self.stateless_config = Some(config);
         self
     }
 
@@ -1032,6 +1076,8 @@ impl HttpTransport {
             allowed_origins: self.allowed_origins.clone(),
             sampling_enabled: self.sampling_enabled,
             optional_sessions: self.optional_sessions,
+            #[cfg(feature = "stateless")]
+            stateless_config: self.stateless_config.clone(),
         })
     }
 
@@ -1301,6 +1347,75 @@ async fn handle_post(
 
     // Check if this is an initialize request (creates new session)
     let is_init = is_initialize_request(&parsed);
+
+    // SEP-1442: Handle stateless requests (no session needed).
+    // Stateless requests have a protocol version but no session ID and are not
+    // initialize requests. They are processed with an ephemeral service and
+    // return immediately without storing any session state.
+    #[cfg(feature = "stateless")]
+    if !is_init && state.stateless_config.is_some() && get_session_id(&headers).is_none() {
+        let version_from_header = get_protocol_version(&headers);
+        let params = parsed.get("params").unwrap_or(&parsed);
+        let version_from_meta = crate::stateless::StatelessRequestMeta::from_params(params)
+            .and_then(|m| m.protocol_version);
+
+        if let Some(version) = version_from_header.or(version_from_meta) {
+            if let Err(err) = crate::stateless::validate_protocol_version(&version) {
+                return json_rpc_error_response(None, err);
+            }
+
+            // Notifications and responses don't make sense without a session
+            if parsed.get("id").is_none() || is_response(&parsed) {
+                return StatusCode::ACCEPTED.into_response();
+            }
+
+            let request: JsonRpcRequest = match serde_json::from_value(parsed) {
+                Ok(r) => r,
+                Err(e) => {
+                    return json_rpc_error_response(
+                        None,
+                        JsonRpcError::parse_error(format!("Invalid request: {}", e)),
+                    );
+                }
+            };
+
+            // Ephemeral pre-initialized service -- no session stored
+            let mut service = match &state.service_source {
+                ServiceSource::Router { router, factory } => {
+                    let ephemeral = router.with_fresh_session();
+                    ephemeral.session().mark_initialized();
+                    JsonRpcService::new(factory(ephemeral))
+                }
+                ServiceSource::Service(mutex) => JsonRpcService::new(mutex.lock().unwrap().clone()),
+            };
+
+            #[cfg(feature = "oauth")]
+            {
+                if let Some(claims) = http_extensions.get::<crate::oauth::token::TokenClaims>() {
+                    let mut ext = crate::router::Extensions::new();
+                    ext.insert(claims.clone());
+                    service = service.with_extensions(ext);
+                }
+            }
+
+            let response = match service.call_single(request).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    return json_rpc_error_response(
+                        None,
+                        JsonRpcError::internal_error(e.to_string()),
+                    );
+                }
+            };
+
+            let mut resp = axum::Json(response).into_response();
+            resp.headers_mut().insert(
+                MCP_PROTOCOL_VERSION_HEADER,
+                HeaderValue::from_str(&version).unwrap(),
+            );
+            return resp;
+        }
+    }
 
     // Get or create session
     let session = if is_init {
