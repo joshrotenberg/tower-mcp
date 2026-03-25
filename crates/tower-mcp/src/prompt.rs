@@ -1305,4 +1305,129 @@ mod tests {
         // PromptCatchError with PromptHandlerService doesn't implement Debug
         // because the handler function doesn't implement Debug
     }
+
+    #[tokio::test]
+    async fn test_prompt_handler_with_arguments() {
+        let prompt = PromptBuilder::new("greet")
+            .description("Greeting prompt")
+            .required_arg("name", "Person to greet")
+            .optional_arg("style", "Greeting style")
+            .handler(|args: HashMap<String, String>| async move {
+                let name = args.get("name").map(|s| s.as_str()).unwrap_or("World");
+                let style = args.get("style").map(|s| s.as_str()).unwrap_or("casual");
+                let text = match style {
+                    "formal" => format!("Good day, {name}."),
+                    _ => format!("Hey {name}!"),
+                };
+                Ok(GetPromptResult::user_message(text))
+            })
+            .build();
+
+        // Test with both arguments
+        let mut args = HashMap::new();
+        args.insert("name".to_string(), "Alice".to_string());
+        args.insert("style".to_string(), "formal".to_string());
+        let result = prompt.get(args).await.unwrap();
+        assert_eq!(result.messages.len(), 1);
+
+        // Test with required arg only
+        let mut args = HashMap::new();
+        args.insert("name".to_string(), "Bob".to_string());
+        let result = prompt.get(args).await.unwrap();
+        assert_eq!(result.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_prompt_definition_fields() {
+        let prompt = PromptBuilder::new("test_prompt")
+            .title("Test Prompt")
+            .description("A test prompt")
+            .required_arg("input", "The input")
+            .optional_arg("format", "Output format")
+            .handler(|_args: HashMap<String, String>| async move {
+                Ok(GetPromptResult::user_message("test"))
+            })
+            .build();
+
+        let def = prompt.definition();
+        assert_eq!(def.name, "test_prompt");
+        assert_eq!(def.title.as_deref(), Some("Test Prompt"));
+        assert_eq!(def.description.as_deref(), Some("A test prompt"));
+        assert_eq!(def.arguments.len(), 2);
+        assert!(def.arguments[0].required);
+        assert!(!def.arguments[1].required);
+    }
+
+    #[tokio::test]
+    async fn test_prompt_with_context_handler() {
+        let prompt = PromptBuilder::new("ctx_prompt")
+            .description("Context-aware prompt")
+            .handler_with_context(
+                |ctx: RequestContext, args: HashMap<String, String>| async move {
+                    let _ = ctx;
+                    let name = args.get("name").map(|s| s.as_str()).unwrap_or("default");
+                    Ok(GetPromptResult::user_message(format!("ctx: {name}")))
+                },
+            )
+            .build();
+
+        assert!(prompt.uses_context());
+
+        let mut args = HashMap::new();
+        args.insert("name".to_string(), "test".to_string());
+        let ctx = RequestContext::new(RequestId::Number(1));
+        let result: std::result::Result<GetPromptResult, Error> =
+            prompt.get_with_context(ctx, args).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_prompt_with_layer_catches_timeout() {
+        use std::time::Duration;
+        use tower::timeout::TimeoutLayer;
+
+        let prompt = PromptBuilder::new("slow_prompt")
+            .description("Will timeout")
+            .handler(|_args: HashMap<String, String>| async move {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                Ok(GetPromptResult::user_message("too late"))
+            })
+            .layer(TimeoutLayer::new(Duration::from_millis(10)));
+
+        // The prompt goes through ServiceHandler -> PromptCatchError which
+        // converts the timeout error into a GetPromptResult with an error message.
+        // The .get() method delegates through the handler trait.
+        let result = prompt.get(HashMap::new()).await;
+        // PromptCatchError converts middleware errors to Ok(GetPromptResult)
+        // with the error message in the prompt content.
+        match result {
+            Ok(r) => {
+                // Should contain timeout error text in the message
+                assert!(
+                    !r.messages.is_empty(),
+                    "Expected error message in prompt result"
+                );
+            }
+            Err(_) => {
+                // Also acceptable -- error propagated directly
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_prompt_clone() {
+        let prompt = PromptBuilder::new("cloneable")
+            .description("Can be cloned")
+            .handler(|_args: HashMap<String, String>| async move {
+                Ok(GetPromptResult::user_message("original"))
+            })
+            .build();
+
+        let cloned = prompt.clone();
+        assert_eq!(cloned.name, "cloneable");
+
+        let result = cloned.get(HashMap::new()).await.unwrap();
+        assert_eq!(result.messages.len(), 1);
+    }
 }

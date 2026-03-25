@@ -509,4 +509,198 @@ mod tests {
         let _cloned = layer;
         let _copied = layer;
     }
+
+    #[tokio::test]
+    async fn test_invalid_jsonrpc_version() {
+        let router = create_test_router();
+        let mut service = JsonRpcService::new(router);
+
+        // Request with wrong jsonrpc version
+        let req = JsonRpcRequest {
+            jsonrpc: "1.0".to_string(),
+            id: crate::protocol::RequestId::Number(1),
+            method: "ping".to_string(),
+            params: None,
+        };
+        let resp = service.call_single(req).await.unwrap();
+        match resp {
+            JsonRpcResponse::Error(e) => {
+                assert_eq!(e.error.code, -32600); // Invalid request
+            }
+            _ => panic!("Expected error for invalid jsonrpc version"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unknown_method() {
+        let router = create_test_router();
+        let mut service = JsonRpcService::new(router.clone());
+
+        // Initialize
+        let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": { "name": "test", "version": "1.0" }
+        }));
+        service.call_single(init_req).await.unwrap();
+        router.handle_notification(crate::protocol::McpNotification::Initialized);
+
+        let req = JsonRpcRequest::new(2, "nonexistent/method");
+        let resp = service.call_single(req).await.unwrap();
+        match resp {
+            JsonRpcResponse::Error(e) => {
+                assert_eq!(e.error.code, -32601); // Method not found
+            }
+            _ => panic!("Expected error for unknown method"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_invalid_params() {
+        let router = create_test_router();
+        let mut service = JsonRpcService::new(router.clone());
+
+        // Initialize
+        let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": { "name": "test", "version": "1.0" }
+        }));
+        service.call_single(init_req).await.unwrap();
+        router.handle_notification(crate::protocol::McpNotification::Initialized);
+
+        // tools/call without required "name" field
+        let req = JsonRpcRequest::new(2, "tools/call").with_params(serde_json::json!({
+            "wrong_field": "value"
+        }));
+        let resp = service.call_single(req).await.unwrap();
+        match resp {
+            JsonRpcResponse::Error(e) => {
+                assert_eq!(e.error.code, -32602); // Invalid params
+            }
+            _ => panic!("Expected error for invalid params"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_request_before_initialize() {
+        let router = create_test_router();
+        let mut service = JsonRpcService::new(router);
+
+        // tools/list before initialize should fail
+        let req = JsonRpcRequest::new(1, "tools/list").with_params(serde_json::json!({}));
+        let resp = service.call_single(req).await.unwrap();
+        match resp {
+            JsonRpcResponse::Error(e) => {
+                assert_eq!(e.error.code, -32600); // Invalid request (session not initialized)
+            }
+            _ => panic!("Expected error for request before initialize"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ping_before_initialize() {
+        let router = create_test_router();
+        let mut service = JsonRpcService::new(router);
+
+        // Ping should work even before initialize
+        let req = JsonRpcRequest::new(1, "ping");
+        let resp = service.call_single(req).await.unwrap();
+        assert!(matches!(resp, JsonRpcResponse::Result(_)));
+    }
+
+    #[tokio::test]
+    async fn test_call_message_single() {
+        let router = create_test_router();
+        let mut service = JsonRpcService::new(router);
+
+        let msg = JsonRpcMessage::Single(JsonRpcRequest::new(1, "ping"));
+        let resp = service.call_message(msg).await.unwrap();
+        assert!(matches!(resp, JsonRpcResponseMessage::Single(_)));
+    }
+
+    #[tokio::test]
+    async fn test_call_message_batch() {
+        let router = create_test_router();
+        let mut service = JsonRpcService::new(router.clone());
+
+        // Initialize
+        let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": { "name": "test", "version": "1.0" }
+        }));
+        service.call_single(init_req).await.unwrap();
+        router.handle_notification(crate::protocol::McpNotification::Initialized);
+
+        let msg = JsonRpcMessage::Batch(vec![
+            JsonRpcRequest::new(2, "ping"),
+            JsonRpcRequest::new(3, "tools/list").with_params(serde_json::json!({})),
+        ]);
+        let resp = service.call_message(msg).await.unwrap();
+        match resp {
+            JsonRpcResponseMessage::Batch(responses) => {
+                assert_eq!(responses.len(), 2);
+            }
+            _ => panic!("Expected batch response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_call_message_empty_batch() {
+        let router = create_test_router();
+        let mut service = JsonRpcService::new(router);
+
+        // call_message delegates to call_batch which returns Err for empty batch
+        let msg = JsonRpcMessage::Batch(vec![]);
+        let result = service.call_message(msg).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_extensions_bridging() {
+        let router = create_test_router();
+
+        #[derive(Debug, Clone)]
+        #[allow(dead_code)]
+        struct TestClaim(String);
+
+        let mut ext = Extensions::new();
+        ext.insert(TestClaim("admin".to_string()));
+
+        let mut service = JsonRpcService::new(router).with_extensions(ext);
+
+        // Ping should work -- extensions are injected into RouterRequest
+        let req = JsonRpcRequest::new(1, "ping");
+        let resp = service.call_single(req).await.unwrap();
+        assert!(matches!(resp, JsonRpcResponse::Result(_)));
+    }
+
+    #[tokio::test]
+    async fn test_batch_with_mixed_valid_invalid() {
+        let router = create_test_router();
+        let mut service = JsonRpcService::new(router.clone());
+
+        // Initialize
+        let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": { "name": "test", "version": "1.0" }
+        }));
+        service.call_single(init_req).await.unwrap();
+        router.handle_notification(crate::protocol::McpNotification::Initialized);
+
+        // Batch with one valid and one invalid request
+        let requests = vec![
+            JsonRpcRequest::new(2, "ping"),
+            JsonRpcRequest::new(3, "nonexistent/method"),
+        ];
+        let responses = service.call_batch(requests).await.unwrap();
+        assert_eq!(responses.len(), 2);
+
+        // First should succeed (ping)
+        assert!(matches!(&responses[0], JsonRpcResponse::Result(_)));
+        // Second should be an error (method not found)
+        assert!(matches!(&responses[1], JsonRpcResponse::Error(_)));
+    }
 }
