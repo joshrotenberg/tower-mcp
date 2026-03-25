@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.2] - 2026-03-25
+
+### Documentation
+
+- Update all top-level docs for v0.9 and example reorganization ([#756](https://github.com/joshrotenberg/tower-mcp/pull/756))
+
+### Features
+
+- WebSocket spec compliance, stateless mode, and resource/prompt context ([#751](https://github.com/joshrotenberg/tower-mcp/pull/751))
+- SEP-1442 stateless HTTP transport ([#753](https://github.com/joshrotenberg/tower-mcp/pull/753))
+
+### Refactor
+
+- Consolidate examples from 27 to 23 ([#755](https://github.com/joshrotenberg/tower-mcp/pull/755))
+
+### Testing
+
+- Close critical test coverage gaps ([#758](https://github.com/joshrotenberg/tower-mcp/pull/758))
+
+
+
 ## [0.9.1] - 2026-03-19
 
 ### Features
