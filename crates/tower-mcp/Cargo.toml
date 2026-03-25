@@ -110,45 +110,30 @@ optional = true
 default-features = false
 features = ["rustls", "json", "stream"]
 
+# --- Getting started ---
 [[example]]
-name = "basic"
-path = "../../examples/basic.rs"
+name = "getting_started"
+path = "../../examples/getting_started.rs"
 
-[[example]]
-name = "stdio_server"
-path = "../../examples/stdio_server.rs"
-
-[[example]]
-name = "transport_middleware"
-path = "../../examples/transport_middleware.rs"
-
+# --- Transports ---
 [[example]]
 name = "http_server"
 path = "../../examples/http_server.rs"
 required-features = ["http"]
 
 [[example]]
-name = "http_auth"
-path = "../../examples/http_auth.rs"
-required-features = ["oauth"]
-
-[[example]]
 name = "websocket_server"
 path = "../../examples/websocket_server.rs"
 required-features = ["websocket"]
 
+# --- Middleware ---
 [[example]]
-name = "client_cli"
-path = "../../examples/client_cli.rs"
+name = "middleware"
+path = "../../examples/middleware.rs"
 
 [[example]]
-name = "weather_server"
-path = "../../examples/weather_server.rs"
-
-[[example]]
-name = "http_sse_client"
-path = "../../examples/http_sse_client.rs"
-required-features = ["http"]
+name = "rate_limiting"
+path = "../../examples/rate_limiting.rs"
 
 [[example]]
 name = "capability_filtering"
@@ -156,25 +141,40 @@ path = "../../examples/capability_filtering.rs"
 required-features = ["http"]
 
 [[example]]
-name = "dynamic_tools"
-path = "../../examples/dynamic_tools.rs"
-required-features = ["dynamic-tools"]
+name = "tool_selection"
+path = "../../examples/tool_selection.rs"
+
+# --- Authentication ---
+[[example]]
+name = "http_auth"
+path = "../../examples/http_auth.rs"
+required-features = ["oauth"]
 
 [[example]]
-name = "skill_prompts"
-path = "../../examples/skill_prompts.rs"
-required-features = ["dynamic-tools"]
+name = "oauth_client"
+path = "../../examples/oauth_client.rs"
+required-features = ["oauth-client"]
 
 [[example]]
-name = "testing"
-path = "../../examples/testing.rs"
-required-features = ["testing"]
+name = "external_api_auth"
+path = "../../examples/external_api_auth.rs"
+
+# --- Clients ---
+[[example]]
+name = "client_cli"
+path = "../../examples/client_cli.rs"
 
 [[example]]
-name = "http_client_cli"
-path = "../../examples/http_client_cli.rs"
+name = "http_client"
+path = "../../examples/http_client.rs"
 required-features = ["http-client"]
 
+[[example]]
+name = "http_sse_client"
+path = "../../examples/http_sse_client.rs"
+required-features = ["http"]
+
+# --- Sampling and bidirectional ---
 [[example]]
 name = "sampling_server"
 path = "../../examples/sampling_server.rs"
@@ -183,48 +183,40 @@ path = "../../examples/sampling_server.rs"
 name = "client_handler"
 path = "../../examples/client_handler.rs"
 
+# --- Dynamic capabilities ---
 [[example]]
-name = "oauth_client"
-path = "../../examples/oauth_client.rs"
-required-features = ["oauth-client"]
+name = "dynamic_capabilities"
+path = "../../examples/dynamic_capabilities.rs"
+required-features = ["dynamic-tools"]
 
+# --- Advanced patterns ---
 [[example]]
 name = "proxy"
 path = "../../examples/proxy.rs"
 required-features = ["proxy"]
 
 [[example]]
-name = "tool_middleware"
-path = "../../examples/tool_middleware.rs"
-
-[[example]]
-name = "tool_selection"
-path = "../../examples/tool_selection.rs"
-
-[[example]]
-name = "middleware_showcase"
-path = "../../examples/middleware_showcase.rs"
-
-[[example]]
-name = "external_api_auth"
-path = "../../examples/external_api_auth.rs"
+name = "resource_templates"
+path = "../../examples/resource_templates.rs"
 
 [[example]]
 name = "structured_output"
 path = "../../examples/structured_output.rs"
 
 [[example]]
-name = "resource_templates"
-path = "../../examples/resource_templates.rs"
-
-[[example]]
 name = "error_handling"
 path = "../../examples/error_handling.rs"
 
 [[example]]
-name = "rate_limiting"
-path = "../../examples/rate_limiting.rs"
+name = "testing"
+path = "../../examples/testing.rs"
+required-features = ["testing"]
 
+[[example]]
+name = "weather_server"
+path = "../../examples/weather_server.rs"
+
+# --- Macros ---
 [[example]]
 name = "tool_macro"
 path = "../../examples/tool_macro.rs"
