@@ -2,16 +2,9 @@
   "mcpServers": {
     "tower-mcp-example": {
       "command": "cargo",
-      "args": ["run", "-p", "tower-mcp", "--example", "stdio_server"],
+      "args": ["run", "-p", "tower-mcp", "--example", "getting_started"],
       "env": {
         "RUST_LOG": "tower_mcp=debug"
-      }
-    },
-    "markdownlint-mcp": {
-      "command": "cargo",
-      "args": ["run", "--manifest-path", "examples/markdownlint-mcp/Cargo.toml", "--", "--transport", "stdio"],
-      "env": {
-        "RUST_LOG": "markdownlint_mcp=info"
       }
     },
     "weather": {
@@ -26,13 +19,6 @@
       "args": ["run", "-p", "codegen-mcp"],
       "env": {
         "RUST_LOG": "codegen_mcp=info"
-      }
-    },
-    "notes-mcp": {
-      "command": "cargo",
-      "args": ["run", "-p", "notes-mcp", "--", "--seed"],
-      "env": {
-        "RUST_LOG": "notes_mcp=info"
       }
     }
   }
