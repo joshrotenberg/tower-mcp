@@ -42,7 +42,7 @@ jsonschema = "0.45"
 [features]
 default = []
 # Enable all optional features
-full = ["http", "websocket", "childproc", "oauth", "jwks", "testing", "dynamic-tools", "http-client", "oauth-client", "proxy", "macros", "resilience"]
+full = ["http", "websocket", "childproc", "oauth", "jwks", "testing", "dynamic-tools", "http-client", "oauth-client", "proxy", "macros", "resilience", "stateless"]
 # Transport features
 http = ["dep:axum", "dep:hyper", "dep:http", "dep:http-body-util", "dep:tokio-stream", "dep:uuid"]
 websocket = ["dep:axum", "dep:uuid"]
@@ -65,6 +65,8 @@ proxy = []
 resilience = ["dep:tower-resilience"]
 # Proc macros for tool/resource/prompt definitions
 macros = ["dep:tower-mcp-macros"]
+# SEP-1442 stateless MCP mode (experimental)
+stateless = []
 
 [dependencies.axum]
 workspace = true

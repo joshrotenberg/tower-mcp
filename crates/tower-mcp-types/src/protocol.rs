@@ -522,6 +522,8 @@ pub enum McpResponse {
     Complete(CompleteResult),
     Pong(EmptyResult),
     Empty(EmptyResult),
+    /// Raw JSON value for experimental/extension methods.
+    Raw(Value),
 }
 
 // =============================================================================

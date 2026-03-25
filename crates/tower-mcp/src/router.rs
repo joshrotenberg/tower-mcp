@@ -1897,7 +1897,8 @@ impl McpRouter {
                     }
 
                     tracing::debug!(uri = %params.uri, "Reading static resource");
-                    let result = resource.read().await;
+                    let ctx = self.create_context(request_id, None);
+                    let result = resource.read_with_context(ctx).await;
                     return Ok(McpResponse::ReadResource(result));
                 }
 
@@ -1912,7 +1913,8 @@ impl McpRouter {
                             return Err(filter.denial_error(&params.uri));
                         }
                         tracing::debug!(uri = %params.uri, "Reading dynamic resource");
-                        let result = resource.read().await;
+                        let ctx = self.create_context(request_id, None);
+                        let result = resource.read_with_context(ctx).await;
                         return Ok(McpResponse::ReadResource(result));
                     }
                 }
@@ -2045,7 +2047,8 @@ impl McpRouter {
                 }
 
                 tracing::debug!(name = %params.name, "Getting prompt");
-                let result = prompt.get(params.arguments).await?;
+                let ctx = self.create_context(request_id, None);
+                let result = prompt.get_with_context(ctx, params.arguments).await?;
 
                 Ok(McpResponse::GetPrompt(result))
             }
@@ -2173,6 +2176,35 @@ impl McpRouter {
                 } else {
                     // No completion handler registered, return empty completions
                     Ok(McpResponse::Complete(CompleteResult::new(vec![])))
+                }
+            }
+
+            McpRequest::Unknown { ref method, .. } if method == "server/discover" => {
+                #[cfg(feature = "stateless")]
+                {
+                    use crate::protocol::SUPPORTED_PROTOCOL_VERSIONS;
+                    let result = crate::stateless::DiscoverResult {
+                        supported_versions: SUPPORTED_PROTOCOL_VERSIONS
+                            .iter()
+                            .map(|v| v.to_string())
+                            .collect(),
+                        capabilities: self.capabilities(),
+                        server_info: Implementation {
+                            name: self.inner.server_name.clone(),
+                            version: self.inner.server_version.clone(),
+                            title: self.inner.server_title.clone(),
+                            description: self.inner.server_description.clone(),
+                            icons: self.inner.server_icons.clone(),
+                            website_url: None,
+                            meta: None,
+                        },
+                        instructions: self.inner.instructions.clone(),
+                    };
+                    Ok(McpResponse::Raw(serde_json::to_value(result).unwrap()))
+                }
+                #[cfg(not(feature = "stateless"))]
+                {
+                    Err(Error::JsonRpc(JsonRpcError::method_not_found(method)))
                 }
             }
 
