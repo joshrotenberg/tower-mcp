@@ -1,84 +1,63 @@
 # Roadmap
 
-This document tracks tower-mcp's path from Tier 3 to Tier 2 (and eventually Tier 1) per the [MCP SDK Tiering System](https://modelcontextprotocol.io/community/sdk-tiers).
-
 ## Current Status
 
-- **Tier**: 3
+- **Version**: 0.9.x
 - **Spec version**: 2025-11-25
-- **Server conformance**: 30/30 (100%)
-- **Client conformance**: Not yet tested (no conformance client)
+- **Server conformance**: 39/39 (100%)
+- **Client conformance**: 265/265 checks, 24/24 scenarios (100%)
+- **MSRV**: 1.90 (Rust 2024 edition)
 
-## Tier 2 Requirements
+## SDK Tier Assessment
 
-| # | Requirement | Status | Tracking |
-|---|-------------|--------|----------|
-| 1 | Server conformance >= 80% | 100% (30/30) | Done |
-| 2 | Client conformance >= 80% | No client yet | #538 |
-| 3 | Issue triage within 1 month | 97% within 2BD | Done |
-| 4 | P0 resolution within 2 weeks | 0 open | Done |
-| 5 | Stable release >= 1.0.0 | 0.7.0 | #539 |
-| 6 | Spec tracking within 6 months | 64-day gap | #540 |
-| 7 | Documentation coverage | Not assessed | #541 |
-| 8 | Dependency update policy | dependabot.yml | Done |
-| 9 | Roadmap | This file | Done |
+tower-mcp targets Tier 2 per the [MCP SDK Tiering System](https://modelcontextprotocol.io/community/sdk-tiers).
 
-## Tier 2 Blockers
+| # | Requirement | Status |
+|---|-------------|--------|
+| 1 | Server conformance >= 80% | 100% (39/39) |
+| 2 | Client conformance >= 80% | 100% (265/265) |
+| 3 | Issue triage within 1 month | Active |
+| 4 | P0 resolution within 2 weeks | 0 open |
+| 5 | Stable release >= 1.0.0 | 0.9.x -- pre-1.0 |
+| 6 | Spec tracking within 6 months | Current (2025-11-25) |
+| 7 | Documentation coverage | In progress |
+| 8 | Dependency update policy | dependabot.yml |
+| 9 | Roadmap | This file |
 
-### Conformance client (#538)
+### Remaining for Tier 2
 
-Build a conformance client binary that exercises all 20 scored client scenarios (4 core + 16 auth). This overlaps with the planned CLI client (#172) and should share infrastructure.
-
-### Stable release (#539)
-
-Resolve before 1.0.0:
-- Workspace layout migration (#526)
-- Public API audit (ensure nothing leaks that shouldn't)
-- Feature flag naming finalized
-- Error type stability review
-
-### Documentation gaps (#541)
-
-The tier assessment evaluates 48 features across tools, resources, prompts, sampling, elicitation, roots, logging, completions, transports, and protocol mechanics. Audit against this list and fill gaps.
+- **1.0.0 release**: Public API audit, feature flag naming finalized, error type stability
+- **Documentation**: Audit against tier assessment feature checklist
 
 ## Spec Tracking
 
-### Accepted SEPs (implemented)
+### Implemented SEPs
 
-tower-mcp tracks the 2025-11-25 spec. All features from accepted SEPs in that version are implemented, including:
-- Streamable HTTP transport
-- WebSocket transport
+All features from the 2025-11-25 spec are implemented, including:
+- Streamable HTTP transport with session management
+- WebSocket transport (SEP-1288 compliant)
 - OAuth 2.1 resource server support (with JWKS)
-- Elicitation (form mode, enum inference, defaults)
-- Tool annotations (readOnlyHint, idempotentHint, etc.)
-- DNS rebinding protection
-- Session management (mcp-session-id)
+- Elicitation (form and URL modes)
+- Tool annotations
+- Async tasks with lifecycle management
+- SSE event IDs and stream resumption (SEP-1699)
+- Sampling (all transports)
+- Completion (autocomplete)
 
-### Draft SEPs (monitoring)
-
-| SEP | Title | Impact | Issue |
-|-----|-------|--------|-------|
-| 2357 | `application/mcp+json` media type | Low | #528 |
-| 2356 | File input support | Medium | #529 |
-| 2339 | Task continuity | Medium | #530 |
-| 2342 | Memory interchange format | Low | #531 |
-| 2350/2351/2352 | OAuth clarifications | Medium | #532 |
-| 2322 | Multi round-trip requests | High | #533 |
-| 2317 | Content negotiation | Low | #534 |
-| 2325 | SSH transport | Low | #535 |
-
-### Existing spec feature tracking
+### In Progress
 
 | SEP | Title | Status | Issue |
 |-----|-------|--------|-------|
-| 1442 | Stateless mode | Draft | #263 |
-| 2127 | Server cards / .well-known | Draft | #155 |
+| 1442 | Stateless MCP mode | Implemented (experimental, `stateless` feature) | #748 |
+| 1288 | WebSocket transport | Implemented (binary rejection, subprotocols, zombie prevention) | #745-#747 |
 
-## Tier 1 Path
+### Monitoring
 
-Tier 1 requirements (beyond Tier 2) are not yet fully published but are expected to include:
-- 95%+ conformance pass rate (server and client)
-- Comprehensive documentation (all 48 features)
-- Published versioning policy (VERSIONING.md)
-- Published security policy (SECURITY.md)
-- Active maintenance with rapid spec tracking
+Open SEPs are tracked automatically via `.github/workflows/sep-sync.yml` and labeled `spec-tracking` in issues.
+
+## Future Directions
+
+- **1.0.0 stable release**: API freeze and stability guarantees
+- **SEP-1442 transport completion**: WebSocket stateless mode, per-request capabilities wiring
+- **SEP-1763 interceptors**: tower middleware maps naturally to this proposal
+- **Distributed session support**: sticky routing documentation, stateless mode as primary solution

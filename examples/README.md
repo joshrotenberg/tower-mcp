@@ -1,206 +1,116 @@
-# tower-mcp Examples Tour
+# tower-mcp Examples
 
+Focused examples demonstrating tower-mcp features. Each file is self-contained
+and covers a specific topic.
 
-Welcome! This guide walks through the example MCP servers in tower-mcp.
+## Running Examples
 
-## Getting Started
+```bash
+# Stdio examples (no feature flags needed)
+cargo run --example getting_started
+cargo run --example middleware
+cargo run --example rate_limiting
 
-Make sure you're in the tower-mcp directory with your MCP-enabled agent
-(like Claude Code). The `.mcp.json` file configures all example servers.
+# HTTP transport
+cargo run --example http_server --features http
 
-#### Wait, Did You Notice?
+# WebSocket transport
+cargo run --example websocket_server --features websocket
 
-This README has some markdown issues! Try asking your agent:
+# Clients (start http_server first)
+cargo run --example http_client --features http-client
+cargo run --example http_sse_client --features http
 
-> "Lint examples/README.md for markdown issues"
+# Dynamic capabilities
+cargo run --example dynamic_capabilities --features dynamic-tools
 
-The markdownlint-mcp server will find them. Then try:
+# Testing
+cargo run --example testing --features testing
 
-> "Fix the markdown issues in examples/README.md"
-
-## Interactive MCP Servers
-
-These servers are configured in `.mcp.json` and available to MCP agents
-automatically.
-
-### 1. markdownlint-mcp
-
-Lint markdown files with 66 rules from mdbook-lint. Demonstrates tools
-with different input types and auto-fix capabilities.
-
-**Try these:**
-
-- "Lint this file: examples/README.md"
-- "What does rule MD001 check for?"
-- "List all available markdown lint rules"
-
-**Source:** `examples/markdownlint-mcp/`
-
-### 3. weather
-
-Weather forecasts using the National Weather Service API. A simple
-example showing external API integration.
-
-**Try these:**
-
-- "What's the weather forecast for Seattle?"
-- "Are there any weather alerts in California?"
-- "Get the forecast for coordinates 40.7128, -74.0060"
-
-**Source:** `examples/weather_server.rs`
-
-### 3. tower-mcp-example
-
-The simplest possible MCP server - echo, add, and reverse tools. Good
-starting point for understanding the basics. This server is
-self-documenting: it serves its own source code as a resource!
-
-**Try these:**
-
-- "Echo 'Hello World' using tower-mcp-example"
-- "Reverse the string 'tower-mcp'"
-- "Read the source://stdio_server.rs resource from tower-mcp-example"
-
-**Source:** `examples/stdio_server.rs`
-
-### 4. codegen-mcp
-
-An MCP server that helps you build MCP servers. Define your server
-incrementally through tool calls, then generate complete Rust code.
-
-**Try these (tools):**
-
-- "Initialize a project called my-server with stdio transport"
-- "Add an echo tool that takes a message string"
-- "Remove the echo tool"
-- "Validate that the generated code compiles"
-- "Generate the code for my server"
-
-**Try these (resources):**
-
-- "Read project://Cargo.toml from codegen-mcp"
-- "Read project://src/main.rs from codegen-mcp"
-- "Read project://state.json from codegen-mcp"
-
-**Source:** `examples/codegen-mcp/`
-
-## Standalone Examples
-
-These demonstrate specific features. Run them individually with `cargo run`.
-
-| Example | Feature | Run |
-|---------|---------|-----|
-| `basic` | Core `JsonRpcService` without transport | `cargo run --example basic` |
-| `http_server` | HTTP/SSE transport, progress, resources, prompts | `cargo run --example http_server --features http` |
-| `websocket_server` | WebSocket transport with middleware | `cargo run --example websocket_server --features websocket` |
-| `transport_middleware` | Tower middleware on HTTP and stdio transports | `cargo run --example transport_middleware --features http -- --transport http` |
-| `http_auth` | API key and OAuth/JWT authentication | `cargo run --example http_auth --features oauth -- --auth apikey` |
-| `tool_middleware` | Per-tool timeout and concurrency limits | `cargo run --example tool_middleware` |
-| `middleware_showcase` | Config validation via shared guards and middleware | `cargo run --example middleware_showcase` |
-| `tool_selection` | Multi-layered tool filtering for large servers | `cargo run --example tool_selection` |
-| `capability_filtering` | Session-based tool/resource/prompt visibility | `cargo run --example capability_filtering --features http` |
-| `dynamic_tools` | Runtime tool registration/deregistration | `cargo run --example dynamic_tools --features dynamic-tools` |
-| `external_api_auth` | Four patterns for downstream API authentication | `cargo run --example external_api_auth` |
-| `testing` | In-process testing with `TestClient` | `cargo run --example testing --features testing` |
-| `client_cli` | MCP client connecting to a subprocess server | `cargo run --example client_cli` |
-| `http_sse_client` | HTTP SSE client with stream resumption | `cargo run --example http_sse_client --features http` |
-| `conformance-server` | Full MCP conformance server (39/39 tests) | `cargo run -p conformance-server` |
-
-## How It's Built
-
-Ask your agent to read the `source://stdio_server.rs` resource from
-tower-mcp-example. You'll see the complete server in ~90 lines.
-
-Here's the key pattern - defining a tool:
-
-```rust
-let echo = ToolBuilder::new("echo")
-    .description("Echo a message back")
-    .handler(|input: EchoInput| async move {
-        Ok(CallToolResult::text(input.message))
-    })
-    .build();
+# Macros
+cargo run --example tool_macro --features macros
 ```
 
-And the input type with automatic JSON Schema generation:
+## Example Index
 
-```rust
-#[derive(Debug, Deserialize, JsonSchema)]
-struct EchoInput {
-    /// The message to echo back  <-- becomes the schema description
-    message: String,
-}
-```
+### Getting Started
 
-That's the core pattern. For more complex examples:
+| Example | What it shows |
+|---------|---------------|
+| [getting_started](getting_started.rs) | Tools, resources, prompts, and stdio transport |
 
-- **In-process testing**: `examples/testing.rs` - test servers with `TestClient`
-- **Shared state**: `examples/markdownlint-mcp/src/tools.rs` - tools
-  sharing a lint engine via `Arc<LintState>`
-- **External APIs**: `examples/weather_server.rs` - calling the NWS API
-- **Full application**: See [cratesio-mcp](https://github.com/joshrotenberg/cratesio-mcp) for a complete MCP server with tools, resources, and prompts
+### Transports
 
-## What You Just Explored
+| Example | What it shows |
+|---------|---------------|
+| [http_server](http_server.rs) | HTTP/SSE transport with sessions, progress, resources |
+| [websocket_server](websocket_server.rs) | WebSocket transport with sampling support |
 
-If you linted and fixed this README, you've seen:
+### Middleware
 
-1. **Tool discovery** - Your agent found the markdownlint-mcp tools
-2. **Tool execution** - lint_file analyzed this document
-3. **Structured output** - Violations returned as JSON
-4. **Auto-fix** - fix_content corrected the issues
+| Example | What it shows |
+|---------|---------------|
+| [middleware](middleware.rs) | All four levels: transport, per-tool, per-resource, per-prompt, and guards |
+| [rate_limiting](rate_limiting.rs) | Per-tool rate limiting with tower-resilience |
+| [capability_filtering](capability_filtering.rs) | Session-based tool/resource/prompt visibility |
+| [tool_selection](tool_selection.rs) | Tool groups, safety tiers, allow/deny lists |
 
-The intentional errors were:
+### Authentication
 
-- Extra blank lines after the title (MD012)
-- Skipped heading level - jumped from h2 to h4 (MD001)
-- Extra space before a list item (MD030)
+| Example | What it shows |
+|---------|---------------|
+| [http_auth](http_auth.rs) | API key and OAuth/JWT server-side auth |
+| [oauth_client](oauth_client.rs) | Client-side OAuth token acquisition |
+| [external_api_auth](external_api_auth.rs) | Downstream API authentication patterns |
 
-## Build Your Own
+### Clients
 
-Now that you've seen what's possible, want to build your own MCP server?
+| Example | What it shows |
+|---------|---------------|
+| [client_cli](client_cli.rs) | Stdio client connecting to subprocess servers |
+| [http_client](http_client.rs) | HTTP client with McpClient API |
+| [http_sse_client](http_sse_client.rs) | SSE stream resumption (Last-Event-ID) |
 
-The codegen-mcp server can help. Here's the workflow:
+### Bidirectional Communication
 
-1. **Design your server** - Tell codegen-mcp what you want:
-   - "Initialize a project called my-server"
-   - "Add a tool that does X with inputs Y and Z"
-   - "Validate the generated code compiles"
+| Example | What it shows |
+|---------|---------------|
+| [sampling_server](sampling_server.rs) | Server-to-client LLM requests and elicitation |
+| [client_handler](client_handler.rs) | Client-side sampling and notification handling |
 
-2. **Generate and iterate** - Get complete Rust code:
-   - "Generate the code for my server"
-   - Write it to disk, customize the handlers, run it
+### Dynamic Capabilities
 
-### Ideas to Get Started
+| Example | What it shows |
+|---------|---------------|
+| [dynamic_capabilities](dynamic_capabilities.rs) | Runtime tool/prompt/resource registration |
 
-Ask your agent to help you build:
+### Advanced Patterns
 
-- **A Hacker News server** - The [HN API](https://github.com/HackerNews/API)
-  is perfect for learning: no auth required, simple JSON responses, and
-  lots of tool ideas (top stories, new stories, get item, get user, etc.)
-- **A Git MCP server** - Wrap git commands (status, diff, log, blame)
-- **A Docker MCP server** - Container and image management
-- **A database MCP server** - Query SQLite, PostgreSQL, or Redis
-- **A file search server** - Ripgrep or fd wrapper
-- **An API client** - Wrap any REST API you use frequently
+| Example | What it shows |
+|---------|---------------|
+| [proxy](proxy.rs) | Multi-server aggregation with namespace isolation |
+| [resource_templates](resource_templates.rs) | URI template matching (RFC 6570) |
+| [structured_output](structured_output.rs) | Typed JSON output with schemas |
+| [error_handling](error_handling.rs) | Tool error patterns and propagation |
+| [testing](testing.rs) | In-process testing with TestClient |
+| [weather_server](weather_server.rs) | External API integration (NWS) |
 
-Or tell your agent what problem you're trying to solve and let it
-suggest what tools your server should have.
+### Macros
 
-### Example Session
+| Example | What it shows |
+|---------|---------------|
+| [tool_macro](tool_macro.rs) | `#[tool_fn]`, `#[prompt_fn]`, `#[resource_fn]` proc macros |
 
-```text
-You: "I want to build an MCP server that searches my notes"
+## Workspace Examples
 
-Agent: [uses codegen-mcp to design tools: index_directory, search, get_document]
-Agent: [generates and validates the code]
-Agent: "Here's your server. The search tool uses tantivy for full-text
-        search. Want me to write this to examples/notes-mcp/?"
-```
+These are standalone crates in the workspace:
 
-The codegen-mcp server lets you go from idea to working server quickly.
+| Crate | Purpose |
+|-------|---------|
+| [conformance-server](conformance-server/) | MCP conformance test suite server (39/39) |
+| [conformance-client](conformance-client/) | MCP conformance test suite client (265/265) |
+| [codegen-mcp](codegen-mcp/) | MCP server that helps build MCP servers |
 
-## Learn More
+## Full Application
 
-- Browse the source code in `examples/` to see how each server is built
-- Check the main [README](../README.md) for API documentation
-- Read the generated code from codegen-mcp to understand the patterns
+For a complete production MCP server, see [cratesio-mcp](https://github.com/joshrotenberg/cratesio-mcp).
