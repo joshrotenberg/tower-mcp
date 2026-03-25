@@ -209,6 +209,36 @@ impl StatelessConfig {
 }
 
 // =============================================================================
+// Protocol version validation
+// =============================================================================
+
+/// Validate a protocol version string against supported versions.
+///
+/// Returns `Ok(())` if valid, or a JSON-RPC error with the SEP-1442 error code
+/// and `supportedVersions` data if the version is not supported.
+pub fn validate_protocol_version(
+    version: &str,
+) -> std::result::Result<(), crate::error::JsonRpcError> {
+    use crate::protocol::SUPPORTED_PROTOCOL_VERSIONS;
+
+    if SUPPORTED_PROTOCOL_VERSIONS.contains(&version) {
+        Ok(())
+    } else {
+        let data = UnsupportedVersionData {
+            supported_versions: SUPPORTED_PROTOCOL_VERSIONS
+                .iter()
+                .map(|v| v.to_string())
+                .collect(),
+        };
+        Err(crate::error::JsonRpcError {
+            code: error_codes::UNSUPPORTED_VERSION,
+            message: format!("Unsupported protocol version: {}", version),
+            data: Some(serde_json::to_value(data).unwrap()),
+        })
+    }
+}
+
+// =============================================================================
 // Helper functions
 // =============================================================================
 
