@@ -1897,7 +1897,8 @@ impl McpRouter {
                     }
 
                     tracing::debug!(uri = %params.uri, "Reading static resource");
-                    let result = resource.read().await;
+                    let ctx = self.create_context(request_id, None);
+                    let result = resource.read_with_context(ctx).await;
                     return Ok(McpResponse::ReadResource(result));
                 }
 
@@ -1912,7 +1913,8 @@ impl McpRouter {
                             return Err(filter.denial_error(&params.uri));
                         }
                         tracing::debug!(uri = %params.uri, "Reading dynamic resource");
-                        let result = resource.read().await;
+                        let ctx = self.create_context(request_id, None);
+                        let result = resource.read_with_context(ctx).await;
                         return Ok(McpResponse::ReadResource(result));
                     }
                 }
@@ -2045,7 +2047,8 @@ impl McpRouter {
                 }
 
                 tracing::debug!(name = %params.name, "Getting prompt");
-                let result = prompt.get(params.arguments).await?;
+                let ctx = self.create_context(request_id, None);
+                let result = prompt.get_with_context(ctx, params.arguments).await?;
 
                 Ok(McpResponse::GetPrompt(result))
             }
