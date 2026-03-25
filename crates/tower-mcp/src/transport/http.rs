@@ -2615,4 +2615,269 @@ mod tests {
         // Terminating again returns false
         assert!(!handle.terminate_session(&session_id).await);
     }
+
+    #[tokio::test]
+    async fn test_request_without_session_id_rejected() {
+        let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
+        let app = transport.into_router();
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            // No mcp-session-id header
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list",
+                    "params": {}
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK); // JSON-RPC errors still 200
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Should return session required error
+        assert!(json["error"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_invalid_session_id_returns_error() {
+        let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
+        let app = transport.into_router();
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header("mcp-session-id", "nonexistent-session-id")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list",
+                    "params": {}
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"].as_i64().unwrap(), -32005); // SessionNotFound
+    }
+
+    #[tokio::test]
+    async fn test_notification_returns_accepted() {
+        let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
+        let app = transport.into_router();
+
+        // First initialize to get a session
+        let init_req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": { "name": "test", "version": "1.0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let resp = app.clone().oneshot(init_req).await.unwrap();
+        let session_id = resp
+            .headers()
+            .get(MCP_SESSION_ID_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Send a notification (no id field) -- should return 202 Accepted
+        let notif = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("mcp-session-id", &session_id)
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(notif).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_json_returns_parse_error() {
+        let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
+        let app = transport.into_router();
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .body(Body::from("not valid json{{{"))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"].as_i64().unwrap(), -32700); // Parse error
+    }
+
+    #[tokio::test]
+    async fn test_session_config_max_sessions() {
+        let transport = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .session_config(SessionConfig::default().max_sessions(1));
+        let app = transport.into_router();
+
+        // First initialize succeeds
+        let init1 = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": { "name": "test1", "version": "1.0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let resp1 = app.clone().oneshot(init1).await.unwrap();
+        assert_eq!(resp1.status(), StatusCode::OK);
+
+        // Second initialize should fail (max 1 session)
+        let init2 = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": { "name": "test2", "version": "1.0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let resp2 = app.oneshot(init2).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_delete_terminates_session() {
+        let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
+        let app = transport.into_router();
+
+        // Initialize
+        let init_req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": { "name": "test", "version": "1.0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let resp = app.clone().oneshot(init_req).await.unwrap();
+        let session_id = resp
+            .headers()
+            .get(MCP_SESSION_ID_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // DELETE should terminate the session
+        let delete_req = Request::builder()
+            .method("DELETE")
+            .uri("/")
+            .header("mcp-session-id", &session_id)
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.clone().oneshot(delete_req).await.unwrap();
+        assert!(resp.status().is_success());
+
+        // Subsequent request with that session ID should fail
+        let list_req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header("mcp-session-id", &session_id)
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/list",
+                    "params": {}
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(list_req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"].as_i64().unwrap(), -32005);
+    }
 }
