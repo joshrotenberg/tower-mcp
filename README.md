@@ -88,7 +88,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tower-mcp = "0.8"
+tower-mcp = "0.9"
 ```
 
 ### Feature Flags
@@ -107,6 +107,8 @@ tower-mcp = "0.8"
 | `dynamic-tools` | Runtime registration/deregistration of tools, prompts, and resources |
 | `proxy` | Multi-server aggregation proxy (`McpProxy`) |
 | `macros` | Optional proc macros (`#[tool_fn]`, `#[prompt_fn]`, `#[resource_fn]`, `#[resource_template_fn]`) |
+| `resilience` | Re-export tower-resilience circuit breaker, rate limiter, and bulkhead layers |
+| `stateless` | SEP-1442 stateless MCP mode (experimental) -- serve requests without sessions |
 
 Example with features:
 
@@ -124,7 +126,7 @@ any context where you want to serialize/deserialize MCP messages without a runti
 
 ```toml
 [dependencies]
-tower-mcp-types = "0.8"
+tower-mcp-types = "0.9"
 ```
 
 `tower-mcp-types` provides all types from `tower_mcp::protocol` and `tower_mcp::error`
@@ -601,27 +603,32 @@ tower-mcp targets the [MCP specification 2025-11-25](https://modelcontextprotoco
 
 We track all MCP Specification Enhancement Proposals (SEPs) as [GitHub issues](https://github.com/joshrotenberg/tower-mcp/issues?q=label%3Asep). A weekly workflow syncs status from the upstream spec repository.
 
-## Examples and Live Demo
+## Examples
 
 A full-featured MCP server for querying [crates.io](https://crates.io) is available as a standalone project: [cratesio-mcp](https://github.com/joshrotenberg/cratesio-mcp). A demo instance is deployed at **https://cratesio-mcp.fly.dev** -- connect with any MCP client that supports HTTP transport.
 
-The repo includes several example servers you can try with any MCP-enabled agent (like Claude Code). Clone the repo and the `.mcp.json` configures them automatically:
+The repo includes 23 focused examples organized by topic:
 
-| Server | Description |
-|--------|-------------|
-| `tower-mcp-example` | Simple demo with `echo`, `add`, `reverse` tools |
-| `markdownlint-mcp` | Lint markdown with 66 rules |
-| `codegen-mcp` | Helps AI agents build tower-mcp servers |
-| `weather` | Weather forecasts via NWS API |
-| `notes-mcp` | Full-featured server with tools, resources, and prompts |
+| Category | Examples |
+|----------|----------|
+| **Getting started** | [`getting_started`](examples/getting_started.rs) -- tools, resources, prompts, stdio transport |
+| **Transports** | [`http_server`](examples/http_server.rs), [`websocket_server`](examples/websocket_server.rs) |
+| **Middleware** | [`middleware`](examples/middleware.rs) (transport, per-tool, per-resource, per-prompt, guards), [`rate_limiting`](examples/rate_limiting.rs), [`capability_filtering`](examples/capability_filtering.rs), [`tool_selection`](examples/tool_selection.rs) |
+| **Authentication** | [`http_auth`](examples/http_auth.rs), [`oauth_client`](examples/oauth_client.rs), [`external_api_auth`](examples/external_api_auth.rs) |
+| **Clients** | [`client_cli`](examples/client_cli.rs), [`http_client`](examples/http_client.rs), [`http_sse_client`](examples/http_sse_client.rs) |
+| **Bidirectional** | [`sampling_server`](examples/sampling_server.rs), [`client_handler`](examples/client_handler.rs) |
+| **Dynamic** | [`dynamic_capabilities`](examples/dynamic_capabilities.rs) -- runtime tool/prompt/resource registration |
+| **Advanced** | [`proxy`](examples/proxy.rs), [`resource_templates`](examples/resource_templates.rs), [`structured_output`](examples/structured_output.rs), [`error_handling`](examples/error_handling.rs), [`testing`](examples/testing.rs) |
+| **Real-world** | [`weather_server`](examples/weather_server.rs) -- external API integration |
+| **Macros** | [`tool_macro`](examples/tool_macro.rs) -- `#[tool_fn]`, `#[prompt_fn]`, `#[resource_fn]` |
+
+Clone the repo and the `.mcp.json` configures example servers automatically:
 
 ```bash
 git clone https://github.com/joshrotenberg/tower-mcp
 cd tower-mcp
 # Run your MCP agent here - servers will be available automatically
 ```
-
-For a guided tour, ask your agent to read [`examples/README.md`](examples/README.md).
 
 ## Development
 
