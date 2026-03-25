@@ -6,9 +6,7 @@ members = [
     "crates/tower-mcp-macros",
     "examples/conformance-server",
     "examples/conformance-client",
-    "examples/markdownlint-mcp",
     "examples/codegen-mcp",
-    "examples/notes-mcp",
 ]
 
 [workspace.package]

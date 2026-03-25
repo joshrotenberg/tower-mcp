@@ -102,4 +102,3 @@ jobs:
           cargo build -p tower-mcp --examples --all-features
           cargo build --manifest-path examples/conformance-server/Cargo.toml
           cargo build --manifest-path examples/codegen-mcp/Cargo.toml
-          cargo build --manifest-path examples/markdownlint-mcp/Cargo.toml

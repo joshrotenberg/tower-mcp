@@ -1,13 +1,13 @@
-//! Dynamic registration example -- tools, prompts, and resources at runtime.
+//! Dynamic capabilities -- register tools, prompts, and resources at runtime.
 //!
 //! This example demonstrates:
-//! - `DynamicToolRegistry` for runtime tool registration
-//! - `DynamicPromptRegistry` for runtime prompt registration
-//! - `DynamicResourceRegistry` for runtime resource registration
+//! - `DynamicToolRegistry` for runtime tool registration/removal
+//! - `DynamicPromptRegistry` for runtime prompt registration/removal
+//! - `DynamicResourceRegistry` for runtime resource registration/removal
 //! - Meta-tools (`create_tool`, `remove_tool`) that manage other tools
 //! - List-changed notifications when capabilities change
 //!
-//! Run with: `cargo run --example dynamic_tools --features dynamic-tools`
+//! Run with: `cargo run --example dynamic_capabilities --features dynamic-tools`
 
 use schemars::JsonSchema;
 use serde::Deserialize;

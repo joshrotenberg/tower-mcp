@@ -1,21 +1,22 @@
-//! HTTP MCP Client CLI example
+//! HTTP MCP client example
 //!
 //! Demonstrates using McpClient with HttpClientTransport to connect to
-//! a remote MCP server over Streamable HTTP.
+//! a remote MCP server over Streamable HTTP. Covers initialization,
+//! tool discovery, tool calls, and authentication.
 //!
 //! Run the HTTP server first:
 //!   cargo run --example http_server --features http
 //!
 //! Then run this client:
-//!   cargo run --example http_client_cli --features http-client
+//!   cargo run --example http_client --features http-client
 //!
-//! You can also connect to any HTTP MCP server by passing the URL:
-//!   cargo run --example http_client_cli --features http-client -- http://example.com:3000
+//! Connect to any HTTP MCP server by passing the URL:
+//!   cargo run --example http_client --features http-client -- http://example.com:3000
 //!
 //! With authentication:
-//!   cargo run --example http_client_cli --features http-client -- --bearer sk-token-123
-//!   cargo run --example http_client_cli --features http-client -- --api-key sk-key-456
-//!   cargo run --example http_client_cli --features http-client -- --header X-API-Key=my-key
+//!   cargo run --example http_client --features http-client -- --bearer sk-token-123
+//!   cargo run --example http_client --features http-client -- --api-key sk-key-456
+//!   cargo run --example http_client --features http-client -- --header X-API-Key=my-key
 
 use tower_mcp::client::{HttpClientTransport, McpClient};
 
