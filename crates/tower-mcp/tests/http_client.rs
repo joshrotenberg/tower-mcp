@@ -1858,15 +1858,33 @@ async fn test_http_client_session_expiry_error() {
 }
 
 // ---------------------------------------------------------------------------
-// Optional sessions (#742) -- Codex CLI / Cursor compatibility
+// Session handling -- optional by default, strict via require_sessions()
 // ---------------------------------------------------------------------------
 
-/// Start a server with optional_sessions enabled.
-async fn start_optional_sessions_server() -> (String, tokio::task::JoinHandle<()>) {
+/// Start a server with require_sessions() for strict session enforcement.
+async fn start_required_sessions_server() -> (String, tokio::task::JoinHandle<()>) {
     let router = test_router();
     let transport = HttpTransport::new(router)
         .disable_origin_validation()
-        .optional_sessions();
+        .require_sessions();
+    let axum_router = transport.into_router();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://127.0.0.1:{}", addr.port());
+
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, axum_router).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    (url, handle)
+}
+
+/// Start a server with optional sessions (the default).
+async fn start_optional_sessions_server() -> (String, tokio::task::JoinHandle<()>) {
+    let router = test_router();
+    let transport = HttpTransport::new(router).disable_origin_validation();
     let axum_router = transport.into_router();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2051,10 +2069,10 @@ async fn test_optional_sessions_multiple_stateless_calls() {
     }
 }
 
-/// Without optional_sessions, missing session ID should still be rejected.
+/// With require_sessions(), missing session ID should be rejected.
 #[tokio::test]
 async fn test_sessions_required_rejects_without_session_id() {
-    let (url, _server) = start_server().await; // Uses default (sessions required)
+    let (url, _server) = start_required_sessions_server().await;
     let client = reqwest::Client::new();
 
     let resp = client
