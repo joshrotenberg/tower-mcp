@@ -49,6 +49,13 @@ thiserror = "2"
 # Encoding
 base64 = "0.22.1"
 
+# Crypto
+sha2 = "0.10"
+getrandom = "0.3"
+
+# URL handling
+urlencoding = "2"
+
 # Tower ecosystem
 tower = { version = "0.5", features = ["util"] }
 tower-service = "0.3"

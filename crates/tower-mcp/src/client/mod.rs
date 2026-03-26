@@ -36,6 +36,8 @@ mod handler;
 mod http;
 #[cfg(feature = "oauth-client")]
 mod oauth;
+#[cfg(feature = "oauth-client")]
+mod oauth_authcode;
 mod stdio;
 mod transport;
 
@@ -47,6 +49,8 @@ pub use http::{HttpClientConfig, HttpClientTransport};
 pub use oauth::{
     OAuthClientCredentials, OAuthClientCredentialsBuilder, OAuthClientError, TokenProvider,
 };
+#[cfg(feature = "oauth-client")]
+pub use oauth_authcode::{OAuthAuthCodeConfig, OAuthAuthorizationCode};
 pub use stdio::StdioClientTransport;
 pub use transport::ClientTransport;
 
