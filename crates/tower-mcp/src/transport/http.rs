@@ -78,18 +78,21 @@
 //! | -32005  | SessionNotFound| Session expired or server restarted      |
 //! | -32006  | SessionRequired| MCP-Session-Id header missing            |
 //!
-//! ## Optional Sessions
+//! ## Session Handling
 //!
-//! Some MCP clients (Codex CLI, Cursor, etc.) don't carry the `mcp-session-id`
-//! header forward after initialization. Use [`HttpTransport::optional_sessions()`]
-//! to allow requests without a session ID:
+//! By default, sessions are optional: requests without an `mcp-session-id`
+//! header are allowed and receive a transient, pre-initialized session. This
+//! ensures compatibility with clients (Codex CLI, Cursor, etc.) that don't
+//! carry the session ID forward after initialization.
+//!
+//! Clients that do send session IDs continue to work normally.
+//!
+//! To require strict session management (reject requests without a session ID),
+//! use [`HttpTransport::require_sessions()`]:
 //!
 //! ```rust,ignore
-//! let transport = HttpTransport::new(router).optional_sessions();
+//! let transport = HttpTransport::new(router).require_sessions();
 //! ```
-//!
-//! When enabled, requests without a session ID get a transient, pre-initialized
-//! session. Clients that do send session IDs continue to work normally.
 //!
 //! ## CORS Support
 //!
@@ -798,7 +801,7 @@ impl HttpTransport {
             allowed_origins: vec![],
             session_config: SessionConfig::default(),
             sampling_enabled: false,
-            optional_sessions: false,
+            optional_sessions: true,
             #[cfg(feature = "stateless")]
             stateless_config: None,
             #[cfg(feature = "oauth")]
@@ -847,7 +850,7 @@ impl HttpTransport {
             allowed_origins: vec![],
             session_config: SessionConfig::default(),
             sampling_enabled: false,
-            optional_sessions: false,
+            optional_sessions: true,
             #[cfg(feature = "stateless")]
             stateless_config: None,
             #[cfg(feature = "oauth")]
@@ -896,17 +899,16 @@ impl HttpTransport {
         self
     }
 
-    /// Make sessions optional for compatibility with clients that don't track session IDs.
+    /// Require strict session management.
     ///
-    /// When enabled, requests without an `mcp-session-id` header are allowed.
-    /// The server creates a transient, pre-initialized session for each such request,
-    /// bypassing the normal `initialize` handshake requirement.
+    /// When enabled, requests without an `mcp-session-id` header are rejected
+    /// with a `SessionRequired` error (-32006). Clients must complete the
+    /// `initialize` handshake and include the session ID on all subsequent
+    /// requests, as specified by the MCP 2025-11-25 spec.
     ///
-    /// This is useful for clients like Codex CLI, Cursor, and others that perform
-    /// `initialize` + `tools/list` during setup but don't carry the session ID
-    /// forward to subsequent `tools/call` requests.
-    ///
-    /// Clients that do send session IDs continue to work normally.
+    /// By default, sessions are optional for compatibility with clients
+    /// (Codex CLI, Cursor, etc.) that don't carry the session ID forward
+    /// after initialization.
     ///
     /// # Example
     ///
@@ -917,13 +919,13 @@ impl HttpTransport {
     /// #[tokio::main]
     /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ///     let router = McpRouter::new().server_info("my-server", "1.0.0");
-    ///     let transport = HttpTransport::new(router).optional_sessions();
+    ///     let transport = HttpTransport::new(router).require_sessions();
     ///     transport.serve("127.0.0.1:3000").await?;
     ///     Ok(())
     /// }
     /// ```
-    pub fn optional_sessions(mut self) -> Self {
-        self.optional_sessions = true;
+    pub fn require_sessions(mut self) -> Self {
+        self.optional_sessions = false;
         self
     }
 
@@ -2054,7 +2056,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_without_session_fails() {
-        let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
+        let transport = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .require_sessions();
         let app = transport.into_router();
 
         let request = Request::builder()
@@ -2618,7 +2622,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_without_session_id_rejected() {
-        let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
+        let transport = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .require_sessions();
         let app = transport.into_router();
 
         let request = Request::builder()
