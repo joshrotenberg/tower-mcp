@@ -333,4 +333,111 @@ mod tests {
         // The response should be an error (tool not found)
         assert!(result.unwrap().inner.is_err());
     }
+
+    #[tokio::test]
+    async fn test_list_tools_passthrough() {
+        use crate::protocol::ListToolsParams;
+
+        let router = crate::McpRouter::new().server_info("test", "1.0.0");
+        let layer = ToolCallLoggingLayer::new();
+        let mut service = layer.layer(router);
+
+        // ListTools should pass through without tool call logging
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::ListTools(ListToolsParams {
+                cursor: None,
+                meta: None,
+            }),
+            extensions: Extensions::new(),
+        };
+
+        let result = Service::call(&mut service, req).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_success_response() {
+        let tool = crate::ToolBuilder::new("add")
+            .description("Add numbers")
+            .handler(|_: serde_json::Value| async move { Ok(crate::CallToolResult::text("42")) })
+            .build();
+
+        let mut router = crate::McpRouter::new()
+            .server_info("test", "1.0.0")
+            .tool(tool);
+
+        // Manually initialize the session so tool calls work
+        use crate::router::RouterRequest;
+        use tower_service::Service;
+
+        let init_req = RouterRequest {
+            id: RequestId::Number(0),
+            inner: McpRequest::Initialize(crate::protocol::InitializeParams {
+                protocol_version: "2025-11-25".to_string(),
+                capabilities: crate::protocol::ClientCapabilities::default(),
+                client_info: crate::protocol::Implementation {
+                    name: "test".to_string(),
+                    version: "1.0".to_string(),
+                    ..Default::default()
+                },
+                meta: None,
+            }),
+            extensions: Extensions::new(),
+        };
+        let _ = Service::call(&mut router, init_req).await;
+
+        // Now send initialized notification to transition session state
+        // (handled internally by the router)
+
+        let layer = ToolCallLoggingLayer::new();
+        let mut service = layer.layer(router);
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::CallTool(CallToolParams {
+                name: "add".to_string(),
+                arguments: serde_json::json!({}),
+                meta: None,
+                task: None,
+            }),
+            extensions: Extensions::new(),
+        };
+
+        let result = Service::call(&mut service, req).await;
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        // After initialization, tool calls should succeed
+        assert!(response.inner.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_resource_read_passthrough() {
+        use crate::protocol::ReadResourceParams;
+
+        let router = crate::McpRouter::new().server_info("test", "1.0.0");
+        let layer = ToolCallLoggingLayer::new();
+        let mut service = layer.layer(router);
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::ReadResource(ReadResourceParams {
+                uri: "file:///test".to_string(),
+                meta: None,
+            }),
+            extensions: Extensions::new(),
+        };
+
+        let result = Service::call(&mut service, req).await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_layer_copy() {
+        let layer = ToolCallLoggingLayer::new().level(Level::DEBUG);
+        let copied = layer; // Copy, not clone
+        assert_eq!(copied.level, Level::DEBUG);
+        // Original is still usable (Copy)
+        assert_eq!(layer.level, Level::DEBUG);
+    }
 }

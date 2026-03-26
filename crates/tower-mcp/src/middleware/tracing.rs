@@ -354,4 +354,139 @@ mod tests {
         assert_eq!(name, Some("ping"));
         assert_eq!(target, None);
     }
+
+    #[test]
+    fn test_extract_operation_details_list_operations() {
+        use crate::protocol::{
+            ListPromptsParams, ListResourceTemplatesParams, ListResourcesParams, ListToolsParams,
+        };
+
+        let (name, target) = extract_operation_details(&McpRequest::ListTools(ListToolsParams {
+            cursor: None,
+            meta: None,
+        }));
+        assert_eq!(name, Some("list"));
+        assert_eq!(target, Some("tools".to_string()));
+
+        let (name, target) =
+            extract_operation_details(&McpRequest::ListResources(ListResourcesParams {
+                cursor: None,
+                meta: None,
+            }));
+        assert_eq!(name, Some("list"));
+        assert_eq!(target, Some("resources".to_string()));
+
+        let (name, target) = extract_operation_details(&McpRequest::ListResourceTemplates(
+            ListResourceTemplatesParams {
+                cursor: None,
+                meta: None,
+            },
+        ));
+        assert_eq!(name, Some("list"));
+        assert_eq!(target, Some("resource_templates".to_string()));
+
+        let (name, target) =
+            extract_operation_details(&McpRequest::ListPrompts(ListPromptsParams {
+                cursor: None,
+                meta: None,
+            }));
+        assert_eq!(name, Some("list"));
+        assert_eq!(target, Some("prompts".to_string()));
+    }
+
+    #[test]
+    fn test_extract_operation_details_initialize() {
+        use crate::protocol::{ClientCapabilities, Implementation, InitializeParams};
+
+        let req = McpRequest::Initialize(InitializeParams {
+            protocol_version: "2025-11-25".to_string(),
+            capabilities: ClientCapabilities::default(),
+            client_info: Implementation {
+                name: "test".to_string(),
+                version: "1.0".to_string(),
+                ..Default::default()
+            },
+            meta: None,
+        });
+        let (name, target) = extract_operation_details(&req);
+        assert_eq!(name, Some("init"));
+        assert_eq!(target, None);
+    }
+
+    #[test]
+    fn test_extract_operation_details_subscribe() {
+        use crate::protocol::SubscribeResourceParams;
+
+        let req = McpRequest::SubscribeResource(SubscribeResourceParams {
+            uri: "file:///watched.txt".to_string(),
+            meta: None,
+        });
+        let (name, target) = extract_operation_details(&req);
+        assert_eq!(name, Some("subscribe"));
+        assert_eq!(target, Some("file:///watched.txt".to_string()));
+    }
+
+    #[test]
+    fn test_extract_operation_details_logging_level() {
+        use crate::protocol::{LogLevel, SetLogLevelParams};
+
+        let req = McpRequest::SetLoggingLevel(SetLogLevelParams {
+            level: LogLevel::Debug,
+            meta: None,
+        });
+        let (name, target) = extract_operation_details(&req);
+        assert_eq!(name, Some("logging"));
+        assert!(target.is_some());
+    }
+
+    #[test]
+    fn test_extract_operation_details_completion() {
+        use crate::protocol::{CompleteParams, CompletionArgument, CompletionReference};
+
+        let req = McpRequest::Complete(CompleteParams {
+            reference: CompletionReference::Prompt {
+                name: "my-prompt".to_string(),
+            },
+            argument: CompletionArgument::new("arg1", "val"),
+            context: None,
+            meta: None,
+        });
+        let (name, target) = extract_operation_details(&req);
+        assert_eq!(name, Some("complete"));
+        assert_eq!(target, Some("prompt:my-prompt".to_string()));
+
+        let req = McpRequest::Complete(CompleteParams {
+            reference: CompletionReference::Resource {
+                uri: "file:///test".to_string(),
+            },
+            argument: CompletionArgument::new("arg1", "val"),
+            context: None,
+            meta: None,
+        });
+        let (_, target) = extract_operation_details(&req);
+        assert_eq!(target, Some("resource:file:///test".to_string()));
+    }
+
+    #[test]
+    fn test_extract_operation_details_unknown_method() {
+        let req = McpRequest::Unknown {
+            method: "custom/method".to_string(),
+            params: None,
+        };
+        let (name, target) = extract_operation_details(&req);
+        assert_eq!(name, Some("unknown"));
+        assert_eq!(target, Some("custom/method".to_string()));
+    }
+
+    #[test]
+    fn test_layer_level_configuration() {
+        let layer = McpTracingLayer::new().level(Level::TRACE);
+        assert_eq!(layer.level, Level::TRACE);
+
+        let layer = McpTracingLayer::new().level(Level::ERROR);
+        assert_eq!(layer.level, Level::ERROR);
+
+        let layer = McpTracingLayer::new().level(Level::WARN);
+        assert_eq!(layer.level, Level::WARN);
+    }
 }

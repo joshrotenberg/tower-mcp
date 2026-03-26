@@ -331,4 +331,66 @@ mod tests {
 
         assert_eq!(transport.args, vec!["--flag1", "--flag2"]);
     }
+
+    #[tokio::test]
+    async fn test_transport_env() {
+        let transport = ChildProcessTransport::new("prog")
+            .env("KEY1", "val1")
+            .env("KEY2", "val2");
+
+        assert_eq!(transport.envs.len(), 2);
+        assert_eq!(transport.envs[0], ("KEY1".to_string(), "val1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_nonexistent_fails() {
+        let result = ChildProcessTransport::new("nonexistent-program-xyz-123")
+            .spawn()
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_spawn_and_communicate() {
+        // Use `cat` as a simple echo server
+        let mut conn = ChildProcessTransport::new("cat").spawn().await.unwrap();
+
+        assert!(conn.is_running());
+
+        // Send a JSON-RPC request
+        let response = conn
+            .send_request("echo", serde_json::json!({"msg": "hello"}))
+            .await;
+
+        // cat will echo our request back, but it won't be a valid JSON-RPC response.
+        // That's OK - we're testing that I/O works, not protocol correctness.
+        // The response will be a parse error since cat echoes the request verbatim.
+        assert!(response.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_graceful() {
+        let conn = ChildProcessTransport::new("cat").spawn().await.unwrap();
+        // Shutdown should succeed - cat exits when stdin is closed
+        conn.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_is_running_after_exit() {
+        // `true` exits immediately
+        let mut conn = ChildProcessTransport::new("true").spawn().await.unwrap();
+        // Give it a moment to exit
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!conn.is_running());
+    }
+
+    #[tokio::test]
+    async fn test_send_notification() {
+        let mut conn = ChildProcessTransport::new("cat").spawn().await.unwrap();
+        // Notification should succeed (no response expected)
+        conn.send_notification("test/notify", serde_json::json!({"data": 1}))
+            .await
+            .unwrap();
+        conn.shutdown().await.unwrap();
+    }
 }

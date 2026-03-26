@@ -185,3 +185,84 @@ impl ClientTransport for StdioClientTransport {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_spawn_nonexistent_program() {
+        let result = StdioClientTransport::spawn("nonexistent-program-xyz", &[]).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_send_and_recv_via_cat() {
+        // `cat` echoes stdin to stdout line-by-line
+        let mut transport = StdioClientTransport::spawn("cat", &[]).await.unwrap();
+
+        assert!(transport.is_connected());
+
+        // Send a JSON message
+        let msg = r#"{"jsonrpc":"2.0","id":1,"method":"test"}"#;
+        transport.send(msg).await.unwrap();
+
+        // cat echoes it back
+        let received = transport.recv().await.unwrap();
+        assert_eq!(received.as_deref(), Some(msg));
+    }
+
+    #[tokio::test]
+    async fn test_close_signals_eof() {
+        let mut transport = StdioClientTransport::spawn("cat", &[]).await.unwrap();
+        assert!(transport.is_connected());
+
+        transport.close().await.unwrap();
+        assert!(!transport.is_connected());
+    }
+
+    #[tokio::test]
+    async fn test_recv_returns_none_on_eof() {
+        // `true` exits immediately with no output
+        let mut transport = StdioClientTransport::spawn("true", &[]).await.unwrap();
+
+        // Should get None (EOF) since `true` produces no output and exits
+        let result = transport.recv().await.unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn test_send_after_close_fails() {
+        let mut transport = StdioClientTransport::spawn("cat", &[]).await.unwrap();
+        transport.close().await.unwrap();
+
+        let result = transport.send("hello").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_spawn_command_with_env() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo $TEST_VAR"]);
+        cmd.env("TEST_VAR", "hello_from_test");
+
+        let mut transport = StdioClientTransport::spawn_command(&mut cmd).await.unwrap();
+
+        let received = transport.recv().await.unwrap();
+        assert_eq!(received.as_deref(), Some("hello_from_test"));
+    }
+
+    #[tokio::test]
+    async fn test_multiple_send_recv_roundtrips() {
+        let mut transport = StdioClientTransport::spawn("cat", &[]).await.unwrap();
+
+        for i in 0..5 {
+            let msg = format!(r#"{{"id":{i},"msg":"test"}}"#);
+            transport.send(&msg).await.unwrap();
+            let received = transport.recv().await.unwrap();
+            assert_eq!(received.as_deref(), Some(msg.as_str()));
+        }
+
+        transport.close().await.unwrap();
+    }
+}
