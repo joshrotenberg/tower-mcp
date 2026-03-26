@@ -2496,3 +2496,79 @@ mod stateless_tests {
         assert!(result["capabilities"].is_object());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Session recovery (#762) -- automatic re-initialization on session expiry
+// ---------------------------------------------------------------------------
+
+/// Start a server that returns a handle for session management.
+async fn start_server_with_handle() -> (
+    String,
+    tower_mcp::transport::http::SessionHandle,
+    tokio::task::JoinHandle<()>,
+) {
+    let router = test_router();
+    let transport = HttpTransport::new(router).disable_origin_validation();
+    let (axum_router, handle) = transport.into_router_with_handle();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://127.0.0.1:{}", addr.port());
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, axum_router).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    (url, handle, server)
+}
+
+/// Verify that the client automatically recovers from session expiry.
+#[tokio::test]
+async fn test_session_recovery_after_expiry() {
+    let (url, handle, _server) = start_server_with_handle().await;
+
+    let transport = HttpClientTransport::new(&url);
+    let client = McpClient::connect(transport).await.unwrap();
+    let init_result = client.initialize("test-recovery", "1.0.0").await.unwrap();
+    assert_eq!(init_result.server_info.name, "test-http-server");
+
+    // Verify tools work
+    let tools = client.list_tools().await.unwrap();
+    assert_eq!(tools.tools.len(), 2);
+
+    // Terminate the session to simulate expiry
+    let sessions = handle.list_sessions().await;
+    assert_eq!(sessions.len(), 1);
+    let terminated = handle.terminate_session(&sessions[0].id).await;
+    assert!(terminated, "Session should have been terminated");
+
+    // The next request should fail with session expired, but auto-recover
+    let tools = client.list_tools().await.unwrap();
+    assert_eq!(tools.tools.len(), 2, "Should recover and list tools again");
+
+    // Verify a new session was created
+    let sessions = handle.list_sessions().await;
+    assert_eq!(sessions.len(), 1, "Should have exactly one new session");
+}
+
+/// Verify that session recovery is disabled when configured.
+#[tokio::test]
+async fn test_session_recovery_disabled() {
+    let (url, handle, _server) = start_server_with_handle().await;
+
+    let transport = HttpClientTransport::new(&url).disable_session_recovery();
+    let client = McpClient::connect(transport).await.unwrap();
+    client
+        .initialize("test-no-recovery", "1.0.0")
+        .await
+        .unwrap();
+
+    // Terminate the session
+    let sessions = handle.list_sessions().await;
+    handle.terminate_session(&sessions[0].id).await;
+
+    // Without recovery, the next request should fail
+    let result = client.list_tools().await;
+    assert!(result.is_err(), "Should fail without session recovery");
+}

@@ -298,6 +298,14 @@ pub enum Error {
     #[error("Transport error: {0}")]
     Transport(String),
 
+    /// The server indicated the session has expired or is not found.
+    ///
+    /// This corresponds to JSON-RPC error code `-32005` (SessionNotFound)
+    /// or an HTTP 404 response when a session ID was attached.
+    /// Clients should re-initialize the connection.
+    #[error("Session expired")]
+    SessionExpired,
+
     #[error("Internal error: {0}")]
     Internal(String),
 }

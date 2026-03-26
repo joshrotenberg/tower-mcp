@@ -92,6 +92,11 @@ pub struct HttpClientConfig {
     /// Maximum SSE reconnection attempts before giving up.
     /// Default: 5.
     pub max_sse_reconnect_attempts: u32,
+    /// Whether to support automatic session recovery on expiry.
+    /// When enabled, HTTP 404 responses (with a session ID attached) and
+    /// JSON-RPC -32005 errors trigger re-initialization.
+    /// Default: `true`.
+    pub session_recovery: bool,
 }
 
 impl Default for HttpClientConfig {
@@ -104,6 +109,7 @@ impl Default for HttpClientConfig {
             sse_reconnect: true,
             sse_reconnect_delay: Duration::from_secs(1),
             max_sse_reconnect_attempts: 5,
+            session_recovery: true,
         }
     }
 }
@@ -398,6 +404,17 @@ impl HttpClientTransport {
         self
     }
 
+    /// Disable automatic session recovery.
+    ///
+    /// By default, if the server returns a session expired error (HTTP 404
+    /// with session ID or JSON-RPC -32005), the client will automatically
+    /// re-initialize and retry the failed operation. Call this to disable
+    /// that behavior and surface the error to the caller instead.
+    pub fn disable_session_recovery(mut self) -> Self {
+        self.config.session_recovery = false;
+        self
+    }
+
     /// Set a dynamic token provider for authentication.
     ///
     /// The provider's [`TokenProvider::get_token()`] is called before each
@@ -536,6 +553,19 @@ impl ClientTransport for HttpClientTransport {
 
                 if !status.is_success() {
                     let body = response.text().await.unwrap_or_default();
+
+                    // Try to parse the error body as JSON-RPC and forward it
+                    // so the message loop can detect -32005 (SessionNotFound)
+                    // and trigger session recovery.
+                    if !body.is_empty()
+                        && serde_json::from_str::<serde_json::Value>(&body)
+                            .ok()
+                            .is_some_and(|v| v.get("error").is_some())
+                    {
+                        let _ = tx.send(body).await;
+                        return;
+                    }
+
                     tracing::error!(status = %status, body = %body, "HTTP error from server");
                     connected.store(false, Ordering::Release);
                     return;
@@ -642,6 +672,9 @@ impl ClientTransport for HttpClientTransport {
         }
 
         if !status.is_success() {
+            if status == reqwest::StatusCode::NOT_FOUND && self.config.session_recovery {
+                return Err(Error::SessionExpired);
+            }
             let body = response.text().await.unwrap_or_default();
             return Err(Error::Transport(format!(
                 "HTTP {} from server: {}",
@@ -725,6 +758,28 @@ impl ClientTransport for HttpClientTransport {
 
         self.session_id = None;
         Ok(())
+    }
+
+    async fn reset_session(&mut self) {
+        tracing::info!("Resetting session for re-initialization");
+
+        // Abort SSE task
+        if let Some(task) = self.sse_task.take() {
+            task.abort();
+        }
+
+        // Clear session state but keep the transport alive
+        self.session_id = None;
+        self.protocol_version = None;
+        *self.last_event_id.write().await = None;
+        *self.sse_retry_delay.write().await = None;
+
+        // Drain any stale messages from the channel
+        while self.incoming_rx.try_recv().is_ok() {}
+    }
+
+    fn supports_session_recovery(&self) -> bool {
+        self.config.session_recovery
     }
 }
 

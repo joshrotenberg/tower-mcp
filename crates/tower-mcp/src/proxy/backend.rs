@@ -92,7 +92,7 @@ impl Backend {
     /// Create a backend from an already-connected client (no notification forwarding).
     pub fn from_client(namespace: impl Into<String>, client: McpClient, separator: String) -> Self {
         let instructions = client
-            .server_info()
+            .server_info_blocking()
             .and_then(|info| info.instructions.clone());
         Self {
             namespace: namespace.into(),

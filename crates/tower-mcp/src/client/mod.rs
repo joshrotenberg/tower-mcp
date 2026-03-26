@@ -51,10 +51,10 @@ pub use stdio::StdioClientTransport;
 pub use transport::ClientTransport;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, OnceLock};
 
-use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::error::{Error, Result};
@@ -83,6 +83,8 @@ enum LoopCommand {
         method: String,
         params: serde_json::Value,
     },
+    /// Reset the transport's session state for re-initialization.
+    ResetSession { done_tx: oneshot::Sender<()> },
     /// Graceful shutdown.
     Shutdown,
 }
@@ -124,13 +126,19 @@ pub struct McpClient {
     /// Whether `initialize()` has been called successfully.
     initialized: AtomicBool,
     /// Server info (set after successful initialization).
-    server_info: OnceLock<InitializeResult>,
+    server_info: RwLock<Option<InitializeResult>>,
     /// Client capabilities declared during initialization.
     capabilities: ClientCapabilities,
     /// Current roots (shared with the loop for roots/list responses).
     roots: Arc<RwLock<Vec<Root>>>,
     /// Whether the transport is still connected.
     connected: Arc<AtomicBool>,
+    /// Whether the transport supports session recovery.
+    supports_session_recovery: bool,
+    /// Stored init params for session recovery re-initialization.
+    init_params: RwLock<Option<(String, String)>>,
+    /// Lock to prevent concurrent session recovery attempts.
+    recovery_lock: Mutex<()>,
 }
 
 /// Builder for configuring and connecting an [`McpClient`].
@@ -263,6 +271,7 @@ impl McpClient {
         T: ClientTransport,
         H: ClientHandler,
     {
+        let supports_session_recovery = transport.supports_session_recovery();
         let (command_tx, command_rx) = mpsc::channel::<LoopCommand>(64);
         let connected = Arc::new(AtomicBool::new(true));
         let roots = Arc::new(RwLock::new(roots));
@@ -278,10 +287,13 @@ impl McpClient {
             command_tx,
             task: Some(task),
             initialized: AtomicBool::new(false),
-            server_info: OnceLock::new(),
+            server_info: RwLock::new(None),
             capabilities,
             roots,
             connected,
+            supports_session_recovery,
+            init_params: RwLock::new(None),
+            recovery_lock: Mutex::new(()),
         })
     }
 
@@ -296,8 +308,17 @@ impl McpClient {
     }
 
     /// Get the server info (available after initialization).
-    pub fn server_info(&self) -> Option<&InitializeResult> {
-        self.server_info.get()
+    pub async fn server_info(&self) -> Option<InitializeResult> {
+        self.server_info.read().await.clone()
+    }
+
+    /// Get the server info synchronously (best-effort, non-blocking).
+    ///
+    /// Returns `None` if the lock is currently held by a writer or if
+    /// initialization hasn't completed. Prefer [`server_info()`](Self::server_info)
+    /// in async contexts.
+    pub fn server_info_blocking(&self) -> Option<InitializeResult> {
+        self.server_info.try_read().ok()?.clone()
     }
 
     /// Initialize the MCP connection.
@@ -308,7 +329,7 @@ impl McpClient {
         &self,
         client_name: &str,
         client_version: &str,
-    ) -> Result<&InitializeResult> {
+    ) -> Result<InitializeResult> {
         let params = InitializeParams {
             protocol_version: crate::protocol::LATEST_PROTOCOL_VERSION.to_string(),
             capabilities: self.capabilities.clone(),
@@ -321,14 +342,18 @@ impl McpClient {
         };
 
         let result: InitializeResult = self.send_request("initialize", &params).await?;
-        let _ = self.server_info.set(result);
+        *self.server_info.write().await = Some(result.clone());
+
+        // Store init params for potential session recovery
+        *self.init_params.write().await =
+            Some((client_name.to_string(), client_version.to_string()));
 
         // Send initialized notification
         self.send_notification("notifications/initialized", &serde_json::json!({}))
             .await?;
         self.initialized.store(true, Ordering::Release);
 
-        Ok(self.server_info.get().unwrap())
+        Ok(result)
     }
 
     /// List available tools.
@@ -673,6 +698,23 @@ impl McpClient {
         method: &str,
         params: &P,
     ) -> Result<R> {
+        match self.send_request_once(method, params).await {
+            Err(Error::SessionExpired)
+                if self.supports_session_recovery && method != "initialize" =>
+            {
+                tracing::info!(method = %method, "Session expired, attempting recovery");
+                self.recover_session().await?;
+                self.send_request_once(method, params).await
+            }
+            other => other,
+        }
+    }
+
+    async fn send_request_once<P: serde::Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        params: &P,
+    ) -> Result<R> {
         self.ensure_connected()?;
         let params_value = serde_json::to_value(params)
             .map_err(|e| Error::Transport(format!("Failed to serialize params: {}", e)))?;
@@ -693,6 +735,60 @@ impl McpClient {
 
         serde_json::from_value(result)
             .map_err(|e| Error::Transport(format!("Failed to deserialize response: {}", e)))
+    }
+
+    /// Recover from a session expiry by resetting the transport and re-initializing.
+    async fn recover_session(&self) -> Result<()> {
+        // Serialize recovery attempts
+        let _guard = self.recovery_lock.lock().await;
+
+        // Check if another task already recovered while we waited
+        // (the init_params being present means we were initialized before)
+        let init_params = self.init_params.read().await.clone();
+        let (client_name, client_version) = match init_params {
+            Some(params) => params,
+            None => {
+                return Err(Error::Transport(
+                    "Cannot recover: never initialized".to_string(),
+                ));
+            }
+        };
+
+        // Tell the message loop to reset the transport
+        let (done_tx, done_rx) = oneshot::channel();
+        self.command_tx
+            .send(LoopCommand::ResetSession { done_tx })
+            .await
+            .map_err(|_| Error::Transport("Connection closed".to_string()))?;
+        done_rx
+            .await
+            .map_err(|_| Error::Transport("Connection closed during recovery".to_string()))?;
+
+        // Clear initialized state
+        self.initialized.store(false, Ordering::Release);
+        *self.server_info.write().await = None;
+
+        // Re-initialize (using send_request_once to avoid recursion)
+        tracing::info!("Re-initializing session after expiry");
+        let params = InitializeParams {
+            protocol_version: crate::protocol::LATEST_PROTOCOL_VERSION.to_string(),
+            capabilities: self.capabilities.clone(),
+            client_info: Implementation {
+                name: client_name,
+                version: client_version,
+                ..Default::default()
+            },
+            meta: None,
+        };
+
+        let result: InitializeResult = self.send_request_once("initialize", &params).await?;
+        *self.server_info.write().await = Some(result);
+
+        self.send_notification("notifications/initialized", &serde_json::json!({}))
+            .await?;
+        self.initialized.store(true, Ordering::Release);
+
+        Ok(())
     }
 
     async fn send_notification<P: serde::Serialize>(&self, method: &str, params: &P) -> Result<()> {
@@ -792,6 +888,15 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
                             let _ = transport.send(&json).await;
                         }
                     }
+                    Some(LoopCommand::ResetSession { done_tx }) => {
+                        tracing::info!("Resetting transport session for re-initialization");
+                        transport.reset_session().await;
+                        // Fail any pending requests with session expired
+                        for (_, pending) in pending_requests.drain() {
+                            let _ = pending.response_tx.send(Err(Error::SessionExpired));
+                        }
+                        let _ = done_tx.send(());
+                    }
                     Some(LoopCommand::Shutdown) | None => {
                         tracing::debug!("Message loop shutting down");
                         break;
@@ -850,6 +955,22 @@ async fn handle_incoming<T: ClientTransport, H: ClientHandler>(
     if parsed.get("method").is_none()
         && (parsed.get("result").is_some() || parsed.get("error").is_some())
     {
+        // Check for session-level errors (id: null with -32005) that affect
+        // all pending requests, not just a specific one.
+        if let Some(error) = parsed.get("error") {
+            let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(0) as i32;
+            let id_missing_or_null = parsed.get("id").is_none_or(|id| id.is_null());
+            if code == -32005 && id_missing_or_null {
+                tracing::warn!(
+                    "Session expired (-32005 with null id), failing all pending requests"
+                );
+                for (_, pending) in pending_requests.drain() {
+                    let _ = pending.response_tx.send(Err(Error::SessionExpired));
+                }
+                return;
+            }
+        }
+
         handle_response(&parsed, pending_requests);
         return;
     }
@@ -933,6 +1054,13 @@ fn handle_response(
             .unwrap_or("Unknown error")
             .to_string();
         let data = error.get("data").cloned();
+
+        // -32005 = SessionNotFound: signal session expiry for recovery
+        if code == -32005 {
+            let _ = pending.response_tx.send(Err(Error::SessionExpired));
+            return;
+        }
+
         let json_rpc_error = JsonRpcError {
             code,
             message,
@@ -1205,7 +1333,7 @@ mod tests {
         assert!(result.is_ok());
         assert!(client.is_initialized());
 
-        let server_info = client.server_info().unwrap();
+        let server_info = client.server_info().await.unwrap();
         assert_eq!(server_info.server_info.name, "test-server");
     }
 
