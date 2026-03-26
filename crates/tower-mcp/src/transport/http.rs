@@ -1201,9 +1201,18 @@ fn is_localhost_origin(origin: &str) -> bool {
         .strip_prefix("http://")
         .or_else(|| origin.strip_prefix("https://"))
     {
-        // Strip port if present
-        let host = rest.split(':').next().unwrap_or(rest);
-        matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
+        // Handle bracketed IPv6 (e.g., [::1]:3000)
+        let host = if rest.starts_with('[') {
+            // Extract everything between [ and ]
+            rest.split(']')
+                .next()
+                .unwrap_or(rest)
+                .trim_start_matches('[')
+        } else {
+            // Strip port if present
+            rest.split(':').next().unwrap_or(rest)
+        };
+        matches!(host, "localhost" | "127.0.0.1" | "::1")
     } else {
         false
     }
@@ -2885,5 +2894,218 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"]["code"].as_i64().unwrap(), -32005);
+    }
+
+    // -----------------------------------------------------------------------
+    // Origin validation / DNS rebinding protection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_localhost_origin_http() {
+        assert!(is_localhost_origin("http://localhost"));
+        assert!(is_localhost_origin("http://localhost:3000"));
+        assert!(is_localhost_origin("http://127.0.0.1"));
+        assert!(is_localhost_origin("http://127.0.0.1:8080"));
+        assert!(is_localhost_origin("http://[::1]"));
+        assert!(is_localhost_origin("http://[::1]:3000"));
+    }
+
+    #[test]
+    fn test_is_localhost_origin_https() {
+        assert!(is_localhost_origin("https://localhost"));
+        assert!(is_localhost_origin("https://127.0.0.1:443"));
+    }
+
+    #[test]
+    fn test_is_not_localhost_origin() {
+        assert!(!is_localhost_origin("http://example.com"));
+        assert!(!is_localhost_origin("http://evil-localhost.com"));
+        assert!(!is_localhost_origin("http://localhost.evil.com"));
+        assert!(!is_localhost_origin("ftp://localhost"));
+        assert!(!is_localhost_origin("localhost"));
+        assert!(!is_localhost_origin(""));
+    }
+
+    #[tokio::test]
+    async fn test_origin_validation_rejects_cross_origin() {
+        let transport = HttpTransport::new(create_test_router());
+        let app = transport.into_router();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header("Origin", "http://evil.com")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": { "name": "test", "version": "1.0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_origin_validation_allows_localhost() {
+        let transport = HttpTransport::new(create_test_router());
+        let app = transport.into_router();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header("Origin", "http://localhost:3000")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": { "name": "test", "version": "1.0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_origin_validation_allows_configured_origin() {
+        let transport = HttpTransport::new(create_test_router())
+            .allowed_origins(vec!["https://my-app.example.com".to_string()]);
+        let app = transport.into_router();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header("Origin", "https://my-app.example.com")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": { "name": "test", "version": "1.0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_origin_validation_rejects_unconfigured_origin() {
+        let transport = HttpTransport::new(create_test_router())
+            .allowed_origins(vec!["https://my-app.example.com".to_string()]);
+        let app = transport.into_router();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header("Origin", "https://other-app.example.com")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": { "name": "test", "version": "1.0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_origin_validation_no_header_allowed() {
+        // Requests without Origin header should be allowed (same-origin)
+        let transport = HttpTransport::new(create_test_router());
+        let app = transport.into_router();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            // No Origin header
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": { "name": "test", "version": "1.0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_disabled_origin_validation_allows_any() {
+        let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
+        let app = transport.into_router();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header("Origin", "http://evil.com")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": { "name": "test", "version": "1.0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }
