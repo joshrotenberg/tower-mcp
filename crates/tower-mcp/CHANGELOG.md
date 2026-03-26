@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.0] - 2026-03-26
+
+### Documentation
+
+- Fix remaining 0.8 version reference in README ([#759](https://github.com/joshrotenberg/tower-mcp/pull/759))
+
+### Features
+
+- Default to optional sessions for HTTP transport ([#761](https://github.com/joshrotenberg/tower-mcp/pull/761))
+- HTTP client session expiry detection and automatic recovery ([#764](https://github.com/joshrotenberg/tower-mcp/pull/764))
+- OAuth 2.0 Authorization Code grant with PKCE for HTTP client ([#765](https://github.com/joshrotenberg/tower-mcp/pull/765))
+
+
+
 ## [0.9.2] - 2026-03-25
 
 ### Documentation

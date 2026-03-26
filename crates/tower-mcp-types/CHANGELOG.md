@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.0] - 2026-03-26
+
+### Documentation
+
+- Fix remaining 0.8 version reference in README ([#759](https://github.com/joshrotenberg/tower-mcp/pull/759))
+
+### Features
+
+- HTTP client session expiry detection and automatic recovery ([#764](https://github.com/joshrotenberg/tower-mcp/pull/764))
+
+
+
 ## [0.9.2] - 2026-03-25
 
 ### Documentation
