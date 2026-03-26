@@ -65,4 +65,24 @@ pub trait ClientTransport: Send + 'static {
     ///
     /// After calling this, `recv()` should return `Ok(None)`.
     async fn close(&mut self) -> Result<()>;
+
+    /// Reset the transport's session state for re-initialization.
+    ///
+    /// Called when the server indicates the session has expired. The
+    /// transport should clear its session ID, stop any SSE streams,
+    /// and prepare for a new `initialize` handshake.
+    ///
+    /// The default implementation is a no-op (for transports like stdio
+    /// that don't have sessions).
+    async fn reset_session(&mut self) {}
+
+    /// Whether this transport supports automatic session recovery.
+    ///
+    /// When true, the client will attempt to re-initialize and retry
+    /// failed operations when the server returns a session expired error.
+    ///
+    /// Default: `false`.
+    fn supports_session_recovery(&self) -> bool {
+        false
+    }
 }
