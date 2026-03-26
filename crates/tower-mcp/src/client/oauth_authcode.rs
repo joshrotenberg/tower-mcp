@@ -120,10 +120,7 @@ async fn try_discover_via_prm(
         return None;
     }
     let prm: serde_json::Value = resp.json().await.ok()?;
-    let auth_server = prm["authorization_servers"]
-        .as_array()?
-        .first()?
-        .as_str()?;
+    let auth_server = prm["authorization_servers"].as_array()?.first()?.as_str()?;
     let meta_url = format!(
         "{}/.well-known/oauth-authorization-server",
         auth_server.trim_end_matches('/')
