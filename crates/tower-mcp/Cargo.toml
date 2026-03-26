@@ -27,6 +27,9 @@ async-trait.workspace = true
 tracing.workspace = true
 regex = "1"
 base64.workspace = true
+sha2 = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }
+urlencoding = { workspace = true, optional = true }
 tower-resilience = { workspace = true, optional = true, default-features = false, features = ["circuitbreaker", "ratelimiter", "bulkhead"] }
 
 [dev-dependencies]
@@ -55,8 +58,8 @@ jwks = ["oauth", "dep:reqwest"]
 testing = []
 # HTTP client transport for connecting to remote MCP servers
 http-client = ["dep:reqwest"]
-# OAuth 2.0 client-side token acquisition (client credentials grant)
-oauth-client = ["http-client"]
+# OAuth 2.0 client-side token acquisition (client credentials + authorization code)
+oauth-client = ["http-client", "dep:sha2", "dep:getrandom", "dep:urlencoding"]
 # Runtime tool (de)registration via DynamicToolRegistry
 dynamic-tools = []
 # MCP proxy for aggregating multiple backend servers
