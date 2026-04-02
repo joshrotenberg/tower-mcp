@@ -20,7 +20,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 reqwest = { version = "0.13", features = ["rustls", "json", "form"], default-features = false }
 p256 = { version = "0.13", features = ["jwk", "ecdsa", "pem"] }
-sec1 = { version = "0.7", features = ["pem"] }
+sec1 = { version = "0.8", features = ["pem"] }
 base64.workspace = true
 anyhow = "1"
 async-trait.workspace = true
