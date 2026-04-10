@@ -19,7 +19,7 @@ jobs:
 
       - name: Sync SEP tracking issues
         id: sync
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const script = require('./.github/scripts/sync-seps.js');
