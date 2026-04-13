@@ -129,7 +129,6 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     #[cfg(not(unix))]
     {
         eprintln!("Unix socket transport is only supported on Unix platforms (Linux, macOS, BSD).");
-        std::process::exit(1);
     }
     Ok(())
 }
