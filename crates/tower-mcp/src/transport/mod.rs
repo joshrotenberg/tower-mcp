@@ -14,6 +14,9 @@ pub mod http;
 #[cfg(feature = "websocket")]
 pub mod websocket;
 
+#[cfg(all(unix, feature = "unix"))]
+pub mod unix;
+
 #[cfg(feature = "childproc")]
 pub mod childproc;
 
@@ -30,8 +33,11 @@ pub use http::{HttpTransport, SessionHandle, SessionInfo};
 #[cfg(feature = "websocket")]
 pub use websocket::WebSocketTransport;
 
+#[cfg(all(unix, feature = "unix"))]
+pub use unix::UnixSocketTransport;
+
 #[cfg(feature = "childproc")]
 pub use childproc::{ChildProcessConnection, ChildProcessTransport};
 
-#[cfg(any(feature = "http", feature = "websocket"))]
+#[cfg(any(feature = "http", feature = "websocket", feature = "unix"))]
 pub use service::McpBoxService;

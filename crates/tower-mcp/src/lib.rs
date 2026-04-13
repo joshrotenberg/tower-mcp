@@ -502,8 +502,11 @@ pub use transport::{HttpTransport, SessionHandle, SessionInfo};
 #[cfg(feature = "websocket")]
 pub use transport::WebSocketTransport;
 
-#[cfg(any(feature = "http", feature = "websocket"))]
+#[cfg(any(feature = "http", feature = "websocket", feature = "unix"))]
 pub use transport::McpBoxService;
+
+#[cfg(all(unix, feature = "unix"))]
+pub use transport::UnixSocketTransport;
 
 #[cfg(feature = "childproc")]
 pub use transport::{ChildProcessConnection, ChildProcessTransport};
