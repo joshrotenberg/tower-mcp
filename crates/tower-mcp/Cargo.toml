@@ -45,10 +45,11 @@ jsonschema = "0.45"
 [features]
 default = []
 # Enable all optional features
-full = ["http", "websocket", "childproc", "oauth", "jwks", "testing", "dynamic-tools", "http-client", "oauth-client", "proxy", "macros", "resilience", "stateless"]
+full = ["http", "websocket", "unix", "childproc", "oauth", "jwks", "testing", "dynamic-tools", "http-client", "oauth-client", "proxy", "macros", "resilience", "stateless"]
 # Transport features
 http = ["dep:axum", "dep:hyper", "dep:http", "dep:http-body-util", "dep:tokio-stream", "dep:uuid"]
 websocket = ["dep:axum", "dep:uuid"]
+unix = ["http"]
 childproc = []
 # OAuth 2.1 resource server support
 oauth = ["dep:jsonwebtoken", "http"]
@@ -128,6 +129,11 @@ required-features = ["http"]
 name = "websocket_server"
 path = "../../examples/websocket_server.rs"
 required-features = ["websocket"]
+
+[[example]]
+name = "unix_socket_server"
+path = "../../examples/unix_socket_server.rs"
+required-features = ["unix"]
 
 # --- Middleware ---
 [[example]]
