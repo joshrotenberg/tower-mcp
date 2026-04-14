@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.1] - 2026-04-14
+
+### Documentation
+
+- Production deployment guide ([#780](https://github.com/joshrotenberg/tower-mcp/pull/780))
+
+### Features
+
+- Unix Domain Socket transport ([#773](https://github.com/joshrotenberg/tower-mcp/pull/773))
+- Pluggable SessionStore for horizontal scaling ([#778](https://github.com/joshrotenberg/tower-mcp/pull/778))
+- **event-store:** Pluggable SSE event store for stream resumption ([#779](https://github.com/joshrotenberg/tower-mcp/pull/779))
+- **session:** Restore unknown sessions from SessionStore + auto-reinitialize ([#782](https://github.com/joshrotenberg/tower-mcp/pull/782))
+
+### Testing
+
+- Close critical test coverage gaps ([#757](https://github.com/joshrotenberg/tower-mcp/pull/757)) ([#766](https://github.com/joshrotenberg/tower-mcp/pull/766))
+
+
+
 ## [0.10.0] - 2026-03-26
 
 ### Documentation
