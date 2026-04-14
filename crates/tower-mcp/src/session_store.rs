@@ -232,8 +232,8 @@ impl SessionStore for MemorySessionStore {
 /// use std::sync::Arc;
 /// use tower_mcp::session_store::{CachingSessionStore, MemorySessionStore, SessionStore};
 ///
-/// // let backend: Arc<dyn SessionStore> = Arc::new(RedisSessionStore::new(...));
-/// # let backend: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
+/// // In production the backend would be a Redis/Postgres/etc store type.
+/// let backend = MemorySessionStore::new();
 /// let cache = MemorySessionStore::new();
 /// let store: Arc<dyn SessionStore> =
 ///     Arc::new(CachingSessionStore::new(cache, backend));
