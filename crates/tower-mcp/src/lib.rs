@@ -387,6 +387,8 @@ pub mod auth;
 pub mod client;
 pub mod context;
 pub mod error;
+#[cfg(any(feature = "http", feature = "websocket"))]
+pub mod event_store;
 pub mod extract;
 pub mod filter;
 pub mod jsonrpc;
