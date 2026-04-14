@@ -136,6 +136,11 @@ name = "unix_socket_server"
 path = "../../examples/unix_socket_server.rs"
 required-features = ["unix"]
 
+[[example]]
+name = "session_store"
+path = "../../examples/session_store.rs"
+required-features = ["http"]
+
 # --- Middleware ---
 [[example]]
 name = "middleware"

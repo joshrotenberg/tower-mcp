@@ -215,6 +215,84 @@ impl SessionStore for MemorySessionStore {
     }
 }
 
+/// Two-tier [`SessionStore`] composed of a cache frontend and a store backend.
+///
+/// Reads hit the cache first; on miss, they fall through to the backend and
+/// populate the cache. Writes go to both tiers. Deletes remove from both.
+///
+/// This lets users pair a fast in-process cache (e.g. [`MemorySessionStore`])
+/// with a durable backend (e.g. a Redis-backed store), keeping in-memory
+/// read performance while gaining cross-instance durability.
+///
+/// Mirrors `tower_sessions_core::session_store::CachingSessionStore`.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use std::sync::Arc;
+/// use tower_mcp::session_store::{CachingSessionStore, MemorySessionStore, SessionStore};
+///
+/// // let backend: Arc<dyn SessionStore> = Arc::new(RedisSessionStore::new(...));
+/// # let backend: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
+/// let cache = MemorySessionStore::new();
+/// let store: Arc<dyn SessionStore> =
+///     Arc::new(CachingSessionStore::new(cache, backend));
+/// ```
+#[derive(Debug, Clone)]
+pub struct CachingSessionStore<Cache, Store> {
+    cache: Cache,
+    store: Store,
+}
+
+impl<Cache, Store> CachingSessionStore<Cache, Store> {
+    /// Create a new caching store with the given cache and backend.
+    pub fn new(cache: Cache, store: Store) -> Self {
+        Self { cache, store }
+    }
+}
+
+#[async_trait]
+impl<Cache, Store> SessionStore for CachingSessionStore<Cache, Store>
+where
+    Cache: SessionStore,
+    Store: SessionStore,
+{
+    async fn create(&self, record: &mut SessionRecord) -> Result<()> {
+        // Create in the backend first so the authoritative ID is established,
+        // then mirror into the cache.
+        self.store.create(record).await?;
+        self.cache.save(record).await?;
+        Ok(())
+    }
+
+    async fn save(&self, record: &SessionRecord) -> Result<()> {
+        self.store.save(record).await?;
+        self.cache.save(record).await?;
+        Ok(())
+    }
+
+    async fn load(&self, id: &str) -> Result<Option<SessionRecord>> {
+        if let Some(record) = self.cache.load(id).await? {
+            return Ok(Some(record));
+        }
+        match self.store.load(id).await? {
+            Some(record) => {
+                // Populate the cache for subsequent reads. Failures here are
+                // non-fatal — we still return the record.
+                let _ = self.cache.save(&record).await;
+                Ok(Some(record))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn delete(&self, id: &str) -> Result<()> {
+        let cache_result = self.cache.delete(id).await;
+        let store_result = self.store.delete(id).await;
+        cache_result.and(store_result)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,5 +395,50 @@ mod tests {
         let mut record = sample_record("dyn");
         store.create(&mut record).await.unwrap();
         assert!(store.load(&record.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn caching_store_writes_to_both_tiers() {
+        let cache = MemorySessionStore::new();
+        let backend = MemorySessionStore::new();
+        let store = CachingSessionStore::new(cache.clone(), backend.clone());
+
+        let mut record = sample_record("cached");
+        store.create(&mut record).await.unwrap();
+
+        assert!(cache.load(&record.id).await.unwrap().is_some());
+        assert!(backend.load(&record.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn caching_store_populates_cache_on_miss() {
+        let cache = MemorySessionStore::new();
+        let backend = MemorySessionStore::new();
+
+        // Prime the backend directly; cache is empty.
+        let mut record = sample_record("warm");
+        backend.create(&mut record).await.unwrap();
+        let id = record.id.clone();
+        assert!(cache.load(&id).await.unwrap().is_none());
+
+        // A load through the caching store should populate the cache.
+        let store = CachingSessionStore::new(cache.clone(), backend);
+        let loaded = store.load(&id).await.unwrap();
+        assert!(loaded.is_some());
+        assert!(cache.load(&id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn caching_store_delete_clears_both() {
+        let cache = MemorySessionStore::new();
+        let backend = MemorySessionStore::new();
+        let store = CachingSessionStore::new(cache.clone(), backend.clone());
+
+        let mut record = sample_record("gone");
+        store.create(&mut record).await.unwrap();
+        store.delete(&record.id).await.unwrap();
+
+        assert!(cache.load(&record.id).await.unwrap().is_none());
+        assert!(backend.load(&record.id).await.unwrap().is_none());
     }
 }
