@@ -377,6 +377,13 @@
 //! The proxy supports per-backend Tower middleware, notification forwarding,
 //! health checks, and request coalescing. See the [`proxy`] module for details.
 //!
+//! ## Production Deployment
+//!
+//! See the [`deployment`] module for load balancer patterns, session
+//! affinity, horizontal scaling with the [`session_store`] and
+//! [`event_store`] traits, reverse proxy configuration (nginx, Caddy,
+//! Traefik), observability, and sidecar deployments.
+//!
 //! ## MCP Specification
 //!
 //! This crate implements the MCP specification (2025-11-25):
@@ -386,6 +393,8 @@ pub mod async_task;
 pub mod auth;
 pub mod client;
 pub mod context;
+#[cfg(any(feature = "http", feature = "websocket"))]
+pub mod deployment;
 pub mod error;
 #[cfg(any(feature = "http", feature = "websocket"))]
 pub mod event_store;
