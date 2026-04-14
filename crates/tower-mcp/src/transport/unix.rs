@@ -118,6 +118,18 @@ impl UnixSocketTransport {
         self
     }
 
+    /// Configure a pluggable [`EventStore`](crate::event_store::EventStore)
+    /// for SSE event buffering and stream resumption.
+    ///
+    /// See [`HttpTransport::event_store`] for details.
+    pub fn event_store(
+        mut self,
+        store: std::sync::Arc<dyn crate::event_store::EventStore>,
+    ) -> Self {
+        self.inner = self.inner.event_store(store);
+        self
+    }
+
     /// Disable origin validation.
     ///
     /// Origin validation is less relevant for Unix sockets since they are

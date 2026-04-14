@@ -141,6 +141,11 @@ name = "session_store"
 path = "../../examples/session_store.rs"
 required-features = ["http"]
 
+[[example]]
+name = "event_store"
+path = "../../examples/event_store.rs"
+required-features = ["http"]
+
 # --- Middleware ---
 [[example]]
 name = "middleware"

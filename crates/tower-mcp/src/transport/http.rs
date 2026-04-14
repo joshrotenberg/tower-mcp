@@ -161,7 +161,7 @@
 //! }
 //! ```
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -206,24 +206,9 @@ const SSE_MESSAGE_EVENT: &str = "message";
 /// Header name for Last-Event-ID (for SSE stream resumption per SEP-1699)
 const LAST_EVENT_ID_HEADER: &str = "last-event-id";
 
-/// Default maximum buffered events per session for stream resumption (SEP-1699)
-const DEFAULT_MAX_BUFFERED_EVENTS: usize = 1000;
-
 /// Pending request waiting for a response from the client
 struct PendingRequest {
     response_tx: oneshot::Sender<Result<serde_json::Value>>,
-}
-
-/// A buffered SSE event for stream resumption (SEP-1699)
-#[derive(Clone)]
-struct BufferedEvent {
-    /// Event ID
-    id: u64,
-    /// Event data (JSON string)
-    data: String,
-    /// When the event was created (for future time-based expiration)
-    #[allow(dead_code)]
-    timestamp: Instant,
 }
 
 /// Session state for HTTP transport
@@ -259,14 +244,17 @@ struct Session {
     protocol_version: RwLock<String>,
     /// Counter for SSE event IDs (for stream resumption per SEP-1699)
     event_counter: AtomicU64,
-    /// Buffer of recent events for stream resumption (SEP-1699)
-    event_buffer: RwLock<VecDeque<BufferedEvent>>,
-    /// Maximum number of events to buffer per session
-    max_buffered_events: usize,
+    /// Pluggable store for SSE events (enables cross-instance replay)
+    event_store: Arc<dyn crate::event_store::EventStore>,
 }
 
 impl Session {
-    fn new(router: McpRouter, sampling_enabled: bool, service_factory: ServiceFactory) -> Self {
+    fn new(
+        router: McpRouter,
+        sampling_enabled: bool,
+        service_factory: ServiceFactory,
+        event_store: Arc<dyn crate::event_store::EventStore>,
+    ) -> Self {
         let (notifications_tx, _) = broadcast::channel(100);
 
         // Set up notification forwarding: mpsc -> broadcast
@@ -311,8 +299,7 @@ impl Session {
             request_rx: Mutex::new(request_rx),
             protocol_version: RwLock::new(LATEST_PROTOCOL_VERSION.to_string()),
             event_counter: AtomicU64::new(0),
-            event_buffer: RwLock::new(VecDeque::new()),
-            max_buffered_events: DEFAULT_MAX_BUFFERED_EVENTS,
+            event_store,
         }
     }
 
@@ -321,7 +308,10 @@ impl Session {
     /// This is used when the transport is created via [`HttpTransport::from_service()`].
     /// Notification bridging and sampling setup are skipped — the caller is
     /// responsible for configuring these on the service before passing it in.
-    fn from_service(service: McpBoxService) -> Self {
+    fn from_service(
+        service: McpBoxService,
+        event_store: Arc<dyn crate::event_store::EventStore>,
+    ) -> Self {
         let (notifications_tx, _) = broadcast::channel(100);
 
         let now = Instant::now();
@@ -335,8 +325,7 @@ impl Session {
             request_rx: Mutex::new(None),
             protocol_version: RwLock::new(LATEST_PROTOCOL_VERSION.to_string()),
             event_counter: AtomicU64::new(0),
-            event_buffer: RwLock::new(VecDeque::new()),
-            max_buffered_events: DEFAULT_MAX_BUFFERED_EVENTS,
+            event_store,
         }
     }
 
@@ -377,29 +366,30 @@ impl Session {
 
     /// Buffer an event for potential replay (SEP-1699).
     ///
-    /// Events are buffered in a ring buffer. When the buffer is full,
-    /// the oldest event is evicted. Clients can request replay of
-    /// buffered events via the Last-Event-ID header.
+    /// Delegates to the configured [`EventStore`](crate::event_store::EventStore).
+    /// Store errors are logged but non-fatal — the transport continues
+    /// serving the client even if the external event buffer is unavailable,
+    /// since the event has already been sent on the live SSE stream.
     async fn buffer_event(&self, id: u64, data: String) {
-        let mut buffer = self.event_buffer.write().await;
-        if buffer.len() >= self.max_buffered_events {
-            buffer.pop_front();
+        let record = crate::event_store::EventRecord::new(id, data);
+        if let Err(e) = self.event_store.append(&self.id, record).await {
+            tracing::warn!(session_id = %self.id, event_id = id, error = %e, "Failed to append event to event store");
         }
-        buffer.push_back(BufferedEvent {
-            id,
-            data,
-            timestamp: Instant::now(),
-        });
     }
 
     /// Get buffered events after the given event ID.
     ///
-    /// Returns events with IDs greater than `after_id`, in order.
-    /// Used for stream resumption when a client reconnects with
-    /// the Last-Event-ID header.
-    async fn get_events_after(&self, after_id: u64) -> Vec<BufferedEvent> {
-        let buffer = self.event_buffer.read().await;
-        buffer.iter().filter(|e| e.id > after_id).cloned().collect()
+    /// Returns events with IDs greater than `after_id`, in order. Used for
+    /// stream resumption when a client reconnects with the `Last-Event-ID`
+    /// header. Store errors produce an empty replay list and are logged.
+    async fn get_events_after(&self, after_id: u64) -> Vec<crate::event_store::EventRecord> {
+        match self.event_store.replay_after(&self.id, after_id).await {
+            Ok(events) => events,
+            Err(e) => {
+                tracing::warn!(session_id = %self.id, error = %e, "Failed to replay events from event store");
+                Vec::new()
+            }
+        }
     }
 
     /// Update the last accessed time
@@ -507,6 +497,7 @@ struct SessionRegistry {
     config: SessionConfig,
     sampling_enabled: bool,
     persistent: Arc<dyn crate::session_store::SessionStore>,
+    events: Arc<dyn crate::event_store::EventStore>,
 }
 
 impl SessionRegistry {
@@ -514,12 +505,14 @@ impl SessionRegistry {
         config: SessionConfig,
         sampling_enabled: bool,
         persistent: Arc<dyn crate::session_store::SessionStore>,
+        events: Arc<dyn crate::event_store::EventStore>,
     ) -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
             config,
             sampling_enabled,
             persistent,
+            events,
         }
     }
 
@@ -576,7 +569,12 @@ impl SessionRegistry {
                 return None;
             }
 
-            let session = Arc::new(Session::new(router, self.sampling_enabled, service_factory));
+            let session = Arc::new(Session::new(
+                router,
+                self.sampling_enabled,
+                service_factory,
+                self.events.clone(),
+            ));
             sessions.insert(session.id.clone(), session.clone());
             tracing::debug!(session_id = %session.id, sampling = self.sampling_enabled, "Created new session");
             session
@@ -600,7 +598,7 @@ impl SessionRegistry {
                 return None;
             }
 
-            let session = Arc::new(Session::from_service(service));
+            let session = Arc::new(Session::from_service(service, self.events.clone()));
             sessions.insert(session.id.clone(), session.clone());
             tracing::debug!(session_id = %session.id, "Created new session from service");
             session
@@ -630,7 +628,12 @@ impl SessionRegistry {
                 return None;
             }
 
-            let session = Arc::new(Session::new(router, self.sampling_enabled, service_factory));
+            let session = Arc::new(Session::new(
+                router,
+                self.sampling_enabled,
+                service_factory,
+                self.events.clone(),
+            ));
             sessions.insert(session.id.clone(), session.clone());
             tracing::debug!(session_id = %session.id, "Created pre-initialized session (optional_sessions)");
             session
@@ -653,7 +656,7 @@ impl SessionRegistry {
                 return None;
             }
 
-            let session = Arc::new(Session::from_service(service));
+            let session = Arc::new(Session::from_service(service, self.events.clone()));
             sessions.insert(session.id.clone(), session.clone());
             tracing::debug!(session_id = %session.id, "Created pre-initialized session from service (optional_sessions)");
             session
@@ -681,6 +684,9 @@ impl SessionRegistry {
             tracing::debug!(session_id = %id, "Removed session");
             if let Err(e) = self.persistent.delete(id).await {
                 tracing::warn!(session_id = %id, error = %e, "Failed to delete session record");
+            }
+            if let Err(e) = self.events.purge_session(id).await {
+                tracing::warn!(session_id = %id, error = %e, "Failed to purge session events");
             }
         }
         removed
@@ -717,6 +723,9 @@ impl SessionRegistry {
         for id in &expired {
             if let Err(e) = self.persistent.delete(id).await {
                 tracing::warn!(session_id = %id, error = %e, "Failed to delete expired session record");
+            }
+            if let Err(e) = self.events.purge_session(id).await {
+                tracing::warn!(session_id = %id, error = %e, "Failed to purge expired session events");
             }
         }
 
@@ -858,6 +867,7 @@ pub struct HttpTransport {
     sampling_enabled: bool,
     optional_sessions: bool,
     session_store: Arc<dyn crate::session_store::SessionStore>,
+    event_store: Arc<dyn crate::event_store::EventStore>,
     #[cfg(feature = "stateless")]
     stateless_config: Option<crate::stateless::StatelessConfig>,
     #[cfg(feature = "oauth")]
@@ -880,6 +890,7 @@ impl HttpTransport {
             sampling_enabled: false,
             optional_sessions: true,
             session_store: Arc::new(crate::session_store::MemorySessionStore::new()),
+            event_store: Arc::new(crate::event_store::MemoryEventStore::new()),
             #[cfg(feature = "stateless")]
             stateless_config: None,
             #[cfg(feature = "oauth")]
@@ -930,6 +941,7 @@ impl HttpTransport {
             sampling_enabled: false,
             optional_sessions: true,
             session_store: Arc::new(crate::session_store::MemorySessionStore::new()),
+            event_store: Arc::new(crate::event_store::MemoryEventStore::new()),
             #[cfg(feature = "stateless")]
             stateless_config: None,
             #[cfg(feature = "oauth")]
@@ -1101,6 +1113,35 @@ impl HttpTransport {
         self
     }
 
+    /// Configure a pluggable [`EventStore`](crate::event_store::EventStore)
+    /// for SSE event buffering and stream resumption.
+    ///
+    /// The default is an in-process
+    /// [`MemoryEventStore`](crate::event_store::MemoryEventStore) with a
+    /// 1000-event ring buffer per session — supply an external store (Redis,
+    /// etc.) so clients can resume SSE streams after reconnecting to a
+    /// different server instance behind a load balancer (SEP-1699).
+    ///
+    /// Typically paired with a matching
+    /// [`session_store`](Self::session_store) so both session metadata and
+    /// buffered events survive across instances.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use std::sync::Arc;
+    /// use tower_mcp::{HttpTransport, McpRouter};
+    /// use tower_mcp::event_store::{EventStore, MemoryEventStore};
+    ///
+    /// let router = McpRouter::new();
+    /// let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
+    /// let transport = HttpTransport::new(router).event_store(store);
+    /// ```
+    pub fn event_store(mut self, store: Arc<dyn crate::event_store::EventStore>) -> Self {
+        self.event_store = store;
+        self
+    }
+
     /// Configure OAuth 2.1 Protected Resource Metadata for this transport.
     ///
     /// When set, adds a `GET /.well-known/oauth-protected-resource` endpoint
@@ -1167,6 +1208,7 @@ impl HttpTransport {
             self.session_config.clone(),
             self.sampling_enabled,
             self.session_store.clone(),
+            self.event_store.clone(),
         ));
 
         // Spawn cleanup task
@@ -2340,6 +2382,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_custom_event_store_buffers_and_purges() {
+        use crate::event_store::{EventStore as PublicEventStore, MemoryEventStore};
+
+        let events = Arc::new(MemoryEventStore::new());
+        let events_dyn: Arc<dyn PublicEventStore> = events.clone();
+
+        // Build a session directly so we can exercise buffer_event/get_events_after
+        // without needing a live SSE subscriber.
+        let session = Arc::new(Session::new(
+            create_test_router(),
+            false,
+            identity_factory(),
+            events_dyn,
+        ));
+
+        session.buffer_event(0, "first".to_string()).await;
+        session.buffer_event(1, "second".to_string()).await;
+
+        // Custom store should have both events.
+        assert_eq!(events.total_events().await, 2);
+        let replayed = events.replay_after(&session.id, 0).await.unwrap();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].id, 1);
+        assert_eq!(replayed[0].data, "second");
+
+        // Purging should clear the session's log.
+        events.purge_session(&session.id).await.unwrap();
+        assert_eq!(events.total_events().await, 0);
+    }
+
+    #[tokio::test]
     async fn test_session_expiration() {
         // Create transport with very short TTL
         let config = SessionConfig::with_ttl(Duration::from_millis(50))
@@ -2651,7 +2724,12 @@ mod tests {
     #[tokio::test]
     async fn test_session_event_buffering() {
         // Test that events are buffered and can be retrieved for replay (SEP-1699)
-        let session = Session::new(create_test_router(), false, identity_factory());
+        let session = Session::new(
+            create_test_router(),
+            false,
+            identity_factory(),
+            Arc::new(crate::event_store::MemoryEventStore::new()),
+        );
 
         // Buffer some events
         session.buffer_event(0, "event0".to_string()).await;
@@ -2679,7 +2757,12 @@ mod tests {
     #[tokio::test]
     async fn test_session_event_counter_increments() {
         // Test that event IDs increment monotonically (SEP-1699)
-        let session = Session::new(create_test_router(), false, identity_factory());
+        let session = Session::new(
+            create_test_router(),
+            false,
+            identity_factory(),
+            Arc::new(crate::event_store::MemoryEventStore::new()),
+        );
 
         assert_eq!(session.next_event_id(), 0);
         assert_eq!(session.next_event_id(), 1);
@@ -2690,7 +2773,12 @@ mod tests {
     async fn test_session_event_buffer_limit() {
         // Test that buffer respects max size limit
         // Create a session - buffer limit is DEFAULT_MAX_BUFFERED_EVENTS (1000)
-        let session = Session::new(create_test_router(), false, identity_factory());
+        let session = Session::new(
+            create_test_router(),
+            false,
+            identity_factory(),
+            Arc::new(crate::event_store::MemoryEventStore::new()),
+        );
 
         // Buffer more events than we can test practically, but verify the mechanism works
         // by checking that old events are evicted when we exceed the limit
