@@ -329,6 +329,92 @@ impl Session {
         }
     }
 
+    /// Rebuild a session from a [`SessionRecord`] so a request for an
+    /// unknown session ID can be served transparently.
+    ///
+    /// The router is pre-marked initialized and the protocol version is
+    /// restored from the record. Runtime state (broadcast channels,
+    /// pending-request table) is freshly allocated — in-flight state from
+    /// before the rebuild is not recovered. The `event_counter` is left at
+    /// zero; the [`SessionRegistry`] seeds it from the event store so
+    /// future event IDs don't collide with buffered ones.
+    fn restored(
+        record: &crate::session_store::SessionRecord,
+        router: McpRouter,
+        sampling_enabled: bool,
+        service_factory: ServiceFactory,
+        event_store: Arc<dyn crate::event_store::EventStore>,
+    ) -> Self {
+        // Skip the Initializing intermediate state — this session was
+        // already initialized on the original instance.
+        router.session().mark_initialized();
+
+        let (notifications_tx, _) = broadcast::channel(100);
+        let (notif_sender, mut notif_receiver) = notification_channel(256);
+        let router = router.with_notification_sender(notif_sender);
+
+        let broadcast_tx = notifications_tx.clone();
+        tokio::spawn(async move {
+            while let Some(notification) = notif_receiver.recv().await {
+                if let Some(json) = crate::transport::stdio::serialize_notification(&notification) {
+                    let _ = broadcast_tx.send(json);
+                }
+            }
+        });
+
+        let (router, request_rx) = if sampling_enabled {
+            let (request_tx, request_rx) = outgoing_request_channel(32);
+            let client_requester: ClientRequesterHandle =
+                Arc::new(ChannelClientRequester::new(request_tx));
+            let router = router.with_client_requester(client_requester);
+            (router, Some(request_rx))
+        } else {
+            (router, None)
+        };
+
+        let now = Instant::now();
+        Self {
+            id: record.id.clone(),
+            service_source: SessionServiceSource::Router {
+                router,
+                factory: service_factory,
+            },
+            notifications_tx,
+            created_at: now,
+            last_accessed: RwLock::new(now),
+            pending_requests: Mutex::new(HashMap::new()),
+            request_rx: Mutex::new(request_rx),
+            protocol_version: RwLock::new(record.protocol_version.clone()),
+            event_counter: AtomicU64::new(0),
+            event_store,
+        }
+    }
+
+    /// Rebuild a session from a [`SessionRecord`] for transports built
+    /// with [`HttpTransport::from_service`]. The service's internal state
+    /// (if any) is not restored — the caller is responsible for anything
+    /// beyond the metadata in the record.
+    fn from_service_restored(
+        service: McpBoxService,
+        record: &crate::session_store::SessionRecord,
+        event_store: Arc<dyn crate::event_store::EventStore>,
+    ) -> Self {
+        let (notifications_tx, _) = broadcast::channel(100);
+        let now = Instant::now();
+        Self {
+            id: record.id.clone(),
+            service_source: SessionServiceSource::Boxed(std::sync::Mutex::new(service)),
+            notifications_tx,
+            created_at: now,
+            last_accessed: RwLock::new(now),
+            pending_requests: Mutex::new(HashMap::new()),
+            request_rx: Mutex::new(None),
+            protocol_version: RwLock::new(record.protocol_version.clone()),
+            event_counter: AtomicU64::new(0),
+            event_store,
+        }
+    }
+
     /// Create a middleware-wrapped service from this session's service source.
     fn make_service(&self) -> McpBoxService {
         match &self.service_source {
@@ -498,6 +584,13 @@ struct SessionRegistry {
     sampling_enabled: bool,
     persistent: Arc<dyn crate::session_store::SessionStore>,
     events: Arc<dyn crate::event_store::EventStore>,
+    /// Source for rebuilding services when restoring a session.
+    service_source: ServiceSource,
+    /// If `true`, a request for an unknown session ID whose record is not
+    /// in the persistent store spins up a new session with synthetic
+    /// client info instead of returning 404 (see anubis-mcp #125 for the
+    /// precedent).
+    auto_reinit: bool,
 }
 
 impl SessionRegistry {
@@ -506,6 +599,8 @@ impl SessionRegistry {
         sampling_enabled: bool,
         persistent: Arc<dyn crate::session_store::SessionStore>,
         events: Arc<dyn crate::event_store::EventStore>,
+        service_source: ServiceSource,
+        auto_reinit: bool,
     ) -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
@@ -513,6 +608,8 @@ impl SessionRegistry {
             sampling_enabled,
             persistent,
             events,
+            service_source,
+            auto_reinit,
         }
     }
 
@@ -666,13 +763,146 @@ impl SessionRegistry {
     }
 
     async fn get(&self, id: &str) -> Option<Arc<Session>> {
-        let sessions = self.sessions.read().await;
-        let session = sessions.get(id).cloned();
-        if let Some(ref s) = session {
-            // Touch the session to update last_accessed
-            s.touch().await;
+        // Fast path: the session is live in this process.
+        {
+            let sessions = self.sessions.read().await;
+            if let Some(s) = sessions.get(id).cloned() {
+                s.touch().await;
+                return Some(s);
+            }
         }
-        session
+
+        // Slow path #1: the session is unknown locally but the persistent
+        // store has a record — rebuild it.
+        match self.persistent.load(id).await {
+            Ok(Some(record)) => {
+                tracing::info!(session_id = %id, "Restoring session from persistent store");
+                if let Some(session) = self.restore_from_record(record).await {
+                    return Some(session);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(session_id = %id, error = %e, "Failed to load session record");
+            }
+        }
+
+        // Slow path #2 (opt-in): auto-reinitialize with synthetic client
+        // info so the client can continue without a re-handshake. Useful
+        // for single-instance restarts where no external store is
+        // configured; loses original client identity.
+        if self.auto_reinit {
+            tracing::info!(session_id = %id, "Auto-reinitializing unknown session");
+            return self.auto_reinitialize(id).await;
+        }
+
+        None
+    }
+
+    /// Restore a live [`Session`] from a persisted [`SessionRecord`].
+    ///
+    /// The caller must ensure the record's ID is not already live locally;
+    /// on success the session is inserted into the local registry, the
+    /// event counter is seeded so new event IDs don't collide with
+    /// buffered ones, and the record's `last_accessed` is refreshed and
+    /// saved back to the store.
+    async fn restore_from_record(
+        &self,
+        record: crate::session_store::SessionRecord,
+    ) -> Option<Arc<Session>> {
+        let session = {
+            let mut sessions = self.sessions.write().await;
+
+            if let Some(max) = self.config.max_sessions
+                && sessions.len() >= max
+            {
+                tracing::warn!(
+                    max_sessions = max,
+                    "Session limit reached, cannot restore session"
+                );
+                return None;
+            }
+
+            // Guard against a concurrent create that beat us here.
+            if let Some(existing) = sessions.get(&record.id).cloned() {
+                existing.touch().await;
+                return Some(existing);
+            }
+
+            let session: Arc<Session> = match &self.service_source {
+                ServiceSource::Router { router, factory } => Arc::new(Session::restored(
+                    &record,
+                    router.with_fresh_session(),
+                    self.sampling_enabled,
+                    factory.clone(),
+                    self.events.clone(),
+                )),
+                ServiceSource::Service(svc) => {
+                    let service = svc.lock().unwrap().clone();
+                    Arc::new(Session::from_service_restored(
+                        service,
+                        &record,
+                        self.events.clone(),
+                    ))
+                }
+            };
+
+            sessions.insert(record.id.clone(), session.clone());
+            tracing::debug!(session_id = %session.id, "Restored session into local registry");
+            session
+        };
+
+        // Seed the event counter past the highest buffered event ID so new
+        // SSE events don't collide with ones the client may still replay.
+        if let Ok(events) = self.events.replay_after(&record.id, 0).await
+            && let Some(max_id) = events.iter().map(|e| e.id).max()
+        {
+            session
+                .event_counter
+                .store(max_id + 1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        // Refresh last_accessed in the store so the record doesn't expire
+        // immediately after restore.
+        let mut refreshed = record;
+        refreshed.touch(self.config.ttl);
+        if let Err(e) = self.persistent.save(&refreshed).await {
+            tracing::warn!(session_id = %refreshed.id, error = %e, "Failed to refresh restored session record");
+        }
+
+        Some(session)
+    }
+
+    /// Create a new session with the requested ID and synthetic client
+    /// info, skipping the initialize handshake. Used when `auto_reinit`
+    /// is enabled and no stored record exists.
+    ///
+    /// Loses the original client's identity and capabilities — the server
+    /// sees a session from client `"auto-recovered"`.
+    async fn auto_reinitialize(&self, id: &str) -> Option<Arc<Session>> {
+        let mut record = crate::session_store::SessionRecord::new(
+            id.to_string(),
+            LATEST_PROTOCOL_VERSION.to_string(),
+            self.config.ttl,
+        );
+        record.client_info = Some(crate::protocol::Implementation {
+            name: "auto-recovered".into(),
+            version: "unknown".into(),
+            title: None,
+            description: None,
+            icons: None,
+            website_url: None,
+            meta: None,
+        });
+        record.client_capabilities = Some(crate::protocol::ClientCapabilities::default());
+
+        // Persist first so a concurrent request sees the record. Ignore
+        // persistence errors; the in-memory session will still work.
+        if let Err(e) = self.persistent.create(&mut record).await {
+            tracing::warn!(session_id = %id, error = %e, "Failed to persist auto-reinitialized session");
+        }
+
+        self.restore_from_record(record).await
     }
 
     async fn remove(&self, id: &str) -> bool {
@@ -868,6 +1098,7 @@ pub struct HttpTransport {
     optional_sessions: bool,
     session_store: Arc<dyn crate::session_store::SessionStore>,
     event_store: Arc<dyn crate::event_store::EventStore>,
+    auto_reinit_sessions: bool,
     #[cfg(feature = "stateless")]
     stateless_config: Option<crate::stateless::StatelessConfig>,
     #[cfg(feature = "oauth")]
@@ -891,6 +1122,7 @@ impl HttpTransport {
             optional_sessions: true,
             session_store: Arc::new(crate::session_store::MemorySessionStore::new()),
             event_store: Arc::new(crate::event_store::MemoryEventStore::new()),
+            auto_reinit_sessions: false,
             #[cfg(feature = "stateless")]
             stateless_config: None,
             #[cfg(feature = "oauth")]
@@ -942,6 +1174,7 @@ impl HttpTransport {
             optional_sessions: true,
             session_store: Arc::new(crate::session_store::MemorySessionStore::new()),
             event_store: Arc::new(crate::event_store::MemoryEventStore::new()),
+            auto_reinit_sessions: false,
             #[cfg(feature = "stateless")]
             stateless_config: None,
             #[cfg(feature = "oauth")]
@@ -1142,6 +1375,38 @@ impl HttpTransport {
         self
     }
 
+    /// Enable auto-reinitialization for unknown session IDs.
+    ///
+    /// When a request arrives with an `mcp-session-id` that is not live
+    /// locally and has no record in the configured
+    /// [`session_store`](Self::session_store), the transport normally
+    /// returns a session-not-found error. With this flag enabled, the
+    /// transport instead spins up a new session claiming that ID and
+    /// completes the initialize handshake internally with synthetic
+    /// client info (`name = "auto-recovered"`, empty capabilities).
+    ///
+    /// This lets tolerant clients continue after a server restart without
+    /// repeating the handshake, at the cost of losing the original
+    /// client's identity and negotiated capabilities. Prefer pairing this
+    /// with a real [`session_store`](Self::session_store) — the store
+    /// path runs first and preserves full identity when a record exists.
+    ///
+    /// Disabled by default. This is the pattern established by
+    /// [anubis-mcp #125](https://github.com/zoedsoupe/anubis-mcp/pull/125).
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use tower_mcp::{HttpTransport, McpRouter};
+    ///
+    /// let router = McpRouter::new();
+    /// let transport = HttpTransport::new(router).auto_reinitialize_sessions(true);
+    /// ```
+    pub fn auto_reinitialize_sessions(mut self, enabled: bool) -> Self {
+        self.auto_reinit_sessions = enabled;
+        self
+    }
+
     /// Configure OAuth 2.1 Protected Resource Metadata for this transport.
     ///
     /// When set, adds a `GET /.well-known/oauth-protected-resource` endpoint
@@ -1209,6 +1474,8 @@ impl HttpTransport {
             self.sampling_enabled,
             self.session_store.clone(),
             self.event_store.clone(),
+            self.service_source.clone(),
+            self.auto_reinit_sessions,
         ));
 
         // Spawn cleanup task
@@ -2410,6 +2677,128 @@ mod tests {
         // Purging should clear the session's log.
         events.purge_session(&session.id).await.unwrap();
         assert_eq!(events.total_events().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_restore_from_store_serves_unknown_session_id() {
+        use crate::session_store::{MemorySessionStore, SessionRecord, SessionStore};
+
+        // Two transports share a single session store (simulating two
+        // server instances behind a load balancer).
+        let store = Arc::new(MemorySessionStore::new());
+        let store_dyn: Arc<dyn SessionStore> = store.clone();
+
+        // Seed the store with a record as if a peer instance had created it.
+        let mut seeded = SessionRecord::new(
+            "shared-session".to_string(),
+            "2025-11-25".to_string(),
+            Duration::from_secs(60),
+        );
+        store.create(&mut seeded).await.unwrap();
+        let seeded_id = seeded.id;
+
+        // This transport has never seen the session locally.
+        let transport = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .session_store(store_dyn);
+        let app = transport.into_router();
+
+        let list_request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header(MCP_SESSION_ID_HEADER, &seeded_id)
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(list_request).await.unwrap();
+        // Without restore this would produce a SessionNotFound JSON-RPC
+        // error; with restore the request is served normally.
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json.get("result").is_some(),
+            "expected tools/list result, got {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auto_reinitialize_serves_unknown_session_without_store_record() {
+        // No seeded store record — the client just shows up with a
+        // session ID the server has never heard of. With auto-reinit
+        // enabled the transport spins up a synthetic session.
+        let transport = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .auto_reinitialize_sessions(true);
+        let app = transport.into_router();
+
+        let list_request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header(MCP_SESSION_ID_HEADER, "client-made-up-id")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(list_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json.get("result").is_some(),
+            "expected tools/list result, got {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_session_without_restore_or_auto_reinit_returns_error() {
+        // Default transport: no store seeded, no auto-reinit.
+        let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
+        let app = transport.into_router();
+
+        let list_request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header(MCP_SESSION_ID_HEADER, "never-seen-before")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(list_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("error").is_some(), "expected error, got {json}");
+        assert_eq!(json["error"]["code"], -32005); // SessionNotFound
     }
 
     #[tokio::test]
