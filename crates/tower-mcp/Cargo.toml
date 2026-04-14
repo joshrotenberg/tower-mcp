@@ -27,6 +27,7 @@ async-trait.workspace = true
 tracing.workspace = true
 regex = "1"
 base64.workspace = true
+thiserror = { workspace = true }
 sha2 = { workspace = true, optional = true }
 getrandom = { workspace = true, optional = true }
 urlencoding = { workspace = true, optional = true }
@@ -134,6 +135,11 @@ required-features = ["websocket"]
 name = "unix_socket_server"
 path = "../../examples/unix_socket_server.rs"
 required-features = ["unix"]
+
+[[example]]
+name = "session_store"
+path = "../../examples/session_store.rs"
+required-features = ["http"]
 
 # --- Middleware ---
 [[example]]

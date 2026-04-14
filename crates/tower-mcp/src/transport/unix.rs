@@ -106,6 +106,18 @@ impl UnixSocketTransport {
         self
     }
 
+    /// Configure a pluggable [`SessionStore`](crate::session_store::SessionStore)
+    /// for persisting session metadata.
+    ///
+    /// See [`HttpTransport::session_store`] for details.
+    pub fn session_store(
+        mut self,
+        store: std::sync::Arc<dyn crate::session_store::SessionStore>,
+    ) -> Self {
+        self.inner = self.inner.session_store(store);
+        self
+    }
+
     /// Disable origin validation.
     ///
     /// Origin validation is less relevant for Unix sockets since they are

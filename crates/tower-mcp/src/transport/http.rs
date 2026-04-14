@@ -493,19 +493,66 @@ impl SessionConfig {
     }
 }
 
-/// Session store for managing multiple client sessions
-struct SessionStore {
+/// Registry coordinating live session runtime state with a pluggable
+/// persistent [`SessionStore`](crate::session_store::SessionStore).
+///
+/// - Runtime state (broadcast channels, pending requests, live services) is
+///   kept in the in-process `sessions` map and cannot be serialized.
+/// - Persistent metadata (IDs, timestamps, protocol version) is mirrored into
+///   the caller-supplied [`SessionStore`]. The default
+///   [`MemorySessionStore`](crate::session_store::MemorySessionStore) keeps
+///   metadata in-process (same behavior as before this trait existed).
+struct SessionRegistry {
     sessions: RwLock<HashMap<String, Arc<Session>>>,
     config: SessionConfig,
     sampling_enabled: bool,
+    persistent: Arc<dyn crate::session_store::SessionStore>,
 }
 
-impl SessionStore {
-    fn new(config: SessionConfig, sampling_enabled: bool) -> Self {
+impl SessionRegistry {
+    fn new(
+        config: SessionConfig,
+        sampling_enabled: bool,
+        persistent: Arc<dyn crate::session_store::SessionStore>,
+    ) -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
             config,
             sampling_enabled,
+            persistent,
+        }
+    }
+
+    /// Build a SessionRecord reflecting the given live Session.
+    async fn record_for(&self, session: &Session) -> crate::session_store::SessionRecord {
+        let protocol_version = session.protocol_version.read().await.clone();
+        let last_accessed = session.last_accessed.read().await;
+        let mut record = crate::session_store::SessionRecord::new(
+            session.id.clone(),
+            protocol_version,
+            self.config.ttl,
+        );
+        // Convert from monotonic Instant to SystemTime approximation. We
+        // don't persist the client_info/capabilities here -- those can be
+        // populated by a future restore-aware refactor.
+        let now = std::time::SystemTime::now();
+        let created_ago = session.created_at.elapsed();
+        let last_accessed_ago = last_accessed.elapsed();
+        record.created_at = now.checked_sub(created_ago).unwrap_or(now);
+        record.last_accessed = now.checked_sub(last_accessed_ago).unwrap_or(now);
+        record.expires_at = record.last_accessed + self.config.ttl;
+        record
+    }
+
+    /// Persist metadata for a newly created session, logging on failure.
+    ///
+    /// Persistence errors are intentionally non-fatal: the live runtime
+    /// session is already registered locally, so the transport can continue
+    /// serving requests even if the external store is briefly unavailable.
+    async fn persist_new(&self, session: &Session) {
+        let record = self.record_for(session).await;
+        if let Err(e) = self.persistent.create(&mut record.clone()).await {
+            tracing::warn!(session_id = %session.id, error = %e, "Failed to persist session record");
         }
     }
 
@@ -514,43 +561,51 @@ impl SessionStore {
         router: McpRouter,
         service_factory: ServiceFactory,
     ) -> Option<Arc<Session>> {
-        let mut sessions = self.sessions.write().await;
+        let session = {
+            let mut sessions = self.sessions.write().await;
 
-        // Check max sessions limit
-        if let Some(max) = self.config.max_sessions
-            && sessions.len() >= max
-        {
-            tracing::warn!(
-                max_sessions = max,
-                current = sessions.len(),
-                "Session limit reached, rejecting new session"
-            );
-            return None;
-        }
+            // Check max sessions limit
+            if let Some(max) = self.config.max_sessions
+                && sessions.len() >= max
+            {
+                tracing::warn!(
+                    max_sessions = max,
+                    current = sessions.len(),
+                    "Session limit reached, rejecting new session"
+                );
+                return None;
+            }
 
-        let session = Arc::new(Session::new(router, self.sampling_enabled, service_factory));
-        sessions.insert(session.id.clone(), session.clone());
-        tracing::debug!(session_id = %session.id, sampling = self.sampling_enabled, "Created new session");
+            let session = Arc::new(Session::new(router, self.sampling_enabled, service_factory));
+            sessions.insert(session.id.clone(), session.clone());
+            tracing::debug!(session_id = %session.id, sampling = self.sampling_enabled, "Created new session");
+            session
+        };
+        self.persist_new(&session).await;
         Some(session)
     }
 
     async fn create_from_service(&self, service: McpBoxService) -> Option<Arc<Session>> {
-        let mut sessions = self.sessions.write().await;
+        let session = {
+            let mut sessions = self.sessions.write().await;
 
-        if let Some(max) = self.config.max_sessions
-            && sessions.len() >= max
-        {
-            tracing::warn!(
-                max_sessions = max,
-                current = sessions.len(),
-                "Session limit reached, rejecting new session"
-            );
-            return None;
-        }
+            if let Some(max) = self.config.max_sessions
+                && sessions.len() >= max
+            {
+                tracing::warn!(
+                    max_sessions = max,
+                    current = sessions.len(),
+                    "Session limit reached, rejecting new session"
+                );
+                return None;
+            }
 
-        let session = Arc::new(Session::from_service(service));
-        sessions.insert(session.id.clone(), session.clone());
-        tracing::debug!(session_id = %session.id, "Created new session from service");
+            let session = Arc::new(Session::from_service(service));
+            sessions.insert(session.id.clone(), session.clone());
+            tracing::debug!(session_id = %session.id, "Created new session from service");
+            session
+        };
+        self.persist_new(&session).await;
         Some(session)
     }
 
@@ -566,17 +621,21 @@ impl SessionStore {
         // Pre-initialize the router's session state so it won't reject requests
         router.session().mark_initialized();
 
-        let mut sessions = self.sessions.write().await;
+        let session = {
+            let mut sessions = self.sessions.write().await;
 
-        if let Some(max) = self.config.max_sessions
-            && sessions.len() >= max
-        {
-            return None;
-        }
+            if let Some(max) = self.config.max_sessions
+                && sessions.len() >= max
+            {
+                return None;
+            }
 
-        let session = Arc::new(Session::new(router, self.sampling_enabled, service_factory));
-        sessions.insert(session.id.clone(), session.clone());
-        tracing::debug!(session_id = %session.id, "Created pre-initialized session (optional_sessions)");
+            let session = Arc::new(Session::new(router, self.sampling_enabled, service_factory));
+            sessions.insert(session.id.clone(), session.clone());
+            tracing::debug!(session_id = %session.id, "Created pre-initialized session (optional_sessions)");
+            session
+        };
+        self.persist_new(&session).await;
         Some(session)
     }
 
@@ -585,17 +644,21 @@ impl SessionStore {
         &self,
         service: McpBoxService,
     ) -> Option<Arc<Session>> {
-        let mut sessions = self.sessions.write().await;
+        let session = {
+            let mut sessions = self.sessions.write().await;
 
-        if let Some(max) = self.config.max_sessions
-            && sessions.len() >= max
-        {
-            return None;
-        }
+            if let Some(max) = self.config.max_sessions
+                && sessions.len() >= max
+            {
+                return None;
+            }
 
-        let session = Arc::new(Session::from_service(service));
-        sessions.insert(session.id.clone(), session.clone());
-        tracing::debug!(session_id = %session.id, "Created pre-initialized session from service (optional_sessions)");
+            let session = Arc::new(Session::from_service(service));
+            sessions.insert(session.id.clone(), session.clone());
+            tracing::debug!(session_id = %session.id, "Created pre-initialized session from service (optional_sessions)");
+            session
+        };
+        self.persist_new(&session).await;
         Some(session)
     }
 
@@ -610,41 +673,54 @@ impl SessionStore {
     }
 
     async fn remove(&self, id: &str) -> bool {
-        let mut sessions = self.sessions.write().await;
-        let removed = sessions.remove(id).is_some();
+        let removed = {
+            let mut sessions = self.sessions.write().await;
+            sessions.remove(id).is_some()
+        };
         if removed {
             tracing::debug!(session_id = %id, "Removed session");
+            if let Err(e) = self.persistent.delete(id).await {
+                tracing::warn!(session_id = %id, error = %e, "Failed to delete session record");
+            }
         }
         removed
     }
 
     /// Remove expired sessions, returns count of removed sessions
     async fn cleanup_expired(&self) -> usize {
-        let mut sessions = self.sessions.write().await;
-        let ttl = self.config.ttl;
+        let expired = {
+            let mut sessions = self.sessions.write().await;
+            let ttl = self.config.ttl;
 
-        let mut expired = Vec::new();
-        for (id, session) in sessions.iter() {
-            if session.is_expired(ttl).await {
-                expired.push(id.clone());
+            let mut expired = Vec::new();
+            for (id, session) in sessions.iter() {
+                if session.is_expired(ttl).await {
+                    expired.push(id.clone());
+                }
+            }
+
+            for id in &expired {
+                sessions.remove(id);
+                tracing::debug!(session_id = %id, "Expired session removed");
+            }
+
+            if !expired.is_empty() {
+                tracing::info!(
+                    expired_count = expired.len(),
+                    remaining = sessions.len(),
+                    "Session cleanup completed"
+                );
+            }
+            expired
+        };
+
+        for id in &expired {
+            if let Err(e) = self.persistent.delete(id).await {
+                tracing::warn!(session_id = %id, error = %e, "Failed to delete expired session record");
             }
         }
 
-        let count = expired.len();
-        for id in expired {
-            sessions.remove(&id);
-            tracing::debug!(session_id = %id, "Expired session removed");
-        }
-
-        if count > 0 {
-            tracing::info!(
-                expired_count = count,
-                remaining = sessions.len(),
-                "Session cleanup completed"
-            );
-        }
-
-        count
+        expired.len()
     }
 }
 
@@ -684,7 +760,7 @@ pub struct SessionInfo {
 /// ```
 #[derive(Clone)]
 pub struct SessionHandle {
-    store: Arc<SessionStore>,
+    store: Arc<SessionRegistry>,
 }
 
 impl SessionHandle {
@@ -732,7 +808,7 @@ struct AppState {
     /// Source for creating new session services
     service_source: ServiceSource,
     /// Session store
-    sessions: Arc<SessionStore>,
+    sessions: Arc<SessionRegistry>,
     /// Whether to validate Origin header
     validate_origin: bool,
     /// Allowed origins (if validation is enabled)
@@ -781,6 +857,7 @@ pub struct HttpTransport {
     session_config: SessionConfig,
     sampling_enabled: bool,
     optional_sessions: bool,
+    session_store: Arc<dyn crate::session_store::SessionStore>,
     #[cfg(feature = "stateless")]
     stateless_config: Option<crate::stateless::StatelessConfig>,
     #[cfg(feature = "oauth")]
@@ -802,6 +879,7 @@ impl HttpTransport {
             session_config: SessionConfig::default(),
             sampling_enabled: false,
             optional_sessions: true,
+            session_store: Arc::new(crate::session_store::MemorySessionStore::new()),
             #[cfg(feature = "stateless")]
             stateless_config: None,
             #[cfg(feature = "oauth")]
@@ -851,6 +929,7 @@ impl HttpTransport {
             session_config: SessionConfig::default(),
             sampling_enabled: false,
             optional_sessions: true,
+            session_store: Arc::new(crate::session_store::MemorySessionStore::new()),
             #[cfg(feature = "stateless")]
             stateless_config: None,
             #[cfg(feature = "oauth")]
@@ -994,6 +1073,34 @@ impl HttpTransport {
         self
     }
 
+    /// Configure a pluggable [`SessionStore`](crate::session_store::SessionStore)
+    /// for persisting session metadata.
+    ///
+    /// The default is an in-process
+    /// [`MemorySessionStore`](crate::session_store::MemorySessionStore) —
+    /// supply an external store (Redis, Postgres, etc.) to share session
+    /// metadata across server instances behind a load balancer.
+    ///
+    /// Runtime state (broadcast channels, pending requests, service
+    /// instances) is always kept per-instance; only persistent metadata is
+    /// mirrored to the store.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use std::sync::Arc;
+    /// use tower_mcp::{HttpTransport, McpRouter};
+    /// use tower_mcp::session_store::{MemorySessionStore, SessionStore};
+    ///
+    /// let router = McpRouter::new();
+    /// let store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
+    /// let transport = HttpTransport::new(router).session_store(store);
+    /// ```
+    pub fn session_store(mut self, store: Arc<dyn crate::session_store::SessionStore>) -> Self {
+        self.session_store = store;
+        self
+    }
+
     /// Configure OAuth 2.1 Protected Resource Metadata for this transport.
     ///
     /// When set, adds a `GET /.well-known/oauth-protected-resource` endpoint
@@ -1056,9 +1163,10 @@ impl HttpTransport {
     }
 
     fn build_state(&self) -> Arc<AppState> {
-        let sessions = Arc::new(SessionStore::new(
+        let sessions = Arc::new(SessionRegistry::new(
             self.session_config.clone(),
             self.sampling_enabled,
+            self.session_store.clone(),
         ));
 
         // Spawn cleanup task
@@ -2174,6 +2282,61 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json.get("error").is_some());
         assert_eq!(json["error"]["code"], -32005); // SessionNotFound
+    }
+
+    #[tokio::test]
+    async fn test_custom_session_store_receives_create_and_delete() {
+        use crate::session_store::{MemorySessionStore, SessionStore as PublicSessionStore};
+
+        let store = Arc::new(MemorySessionStore::new());
+        let store_dyn: Arc<dyn PublicSessionStore> = store.clone();
+
+        let transport = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .session_store(store_dyn);
+        let (app, handle) = transport.into_router_with_handle();
+
+        // Initialize to create a session.
+        let init_request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": { "name": "test-client", "version": "1.0.0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.clone().oneshot(init_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let session_id = response
+            .headers()
+            .get(MCP_SESSION_ID_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Custom store should have the record.
+        assert_eq!(store.len().await, 1);
+        let record = store.load(&session_id).await.unwrap();
+        assert!(record.is_some(), "expected session to be persisted");
+        assert_eq!(record.unwrap().id, session_id);
+
+        // Terminate session via the handle — store should be cleared.
+        assert!(handle.terminate_session(&session_id).await);
+        assert_eq!(store.len().await, 0);
+        assert!(store.load(&session_id).await.unwrap().is_none());
     }
 
     #[tokio::test]

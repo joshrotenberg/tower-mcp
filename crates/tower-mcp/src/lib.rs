@@ -402,6 +402,8 @@ pub mod registry;
 pub mod resource;
 pub mod router;
 pub mod session;
+#[cfg(any(feature = "http", feature = "websocket"))]
+pub mod session_store;
 #[cfg(feature = "stateless")]
 pub mod stateless;
 #[cfg(feature = "testing")]
