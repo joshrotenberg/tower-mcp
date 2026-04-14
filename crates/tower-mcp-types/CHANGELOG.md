@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.1] - 2026-04-14
+
+### Miscellaneous Tasks
+
+- Verify tower-mcp-types compiles for wasm32-unknown-unknown ([#784](https://github.com/joshrotenberg/tower-mcp/pull/784))
+
+
+
 ## [0.10.0] - 2026-03-26
 
 ### Documentation
