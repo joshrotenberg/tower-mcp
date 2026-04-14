@@ -130,6 +130,14 @@ impl UnixSocketTransport {
         self
     }
 
+    /// Enable auto-reinitialization for unknown session IDs.
+    ///
+    /// See [`HttpTransport::auto_reinitialize_sessions`] for details.
+    pub fn auto_reinitialize_sessions(mut self, enabled: bool) -> Self {
+        self.inner = self.inner.auto_reinitialize_sessions(enabled);
+        self
+    }
+
     /// Disable origin validation.
     ///
     /// Origin validation is less relevant for Unix sockets since they are

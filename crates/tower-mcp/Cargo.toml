@@ -146,6 +146,11 @@ name = "event_store"
 path = "../../examples/event_store.rs"
 required-features = ["http"]
 
+[[example]]
+name = "horizontal_scaling"
+path = "../../examples/horizontal_scaling.rs"
+required-features = ["http"]
+
 # --- Middleware ---
 [[example]]
 name = "middleware"
