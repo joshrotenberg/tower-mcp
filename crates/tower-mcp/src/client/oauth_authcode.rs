@@ -632,11 +632,7 @@ fn parse_callback_query(path: &str, expected_state: &str) -> Result<CallbackResu
             "code" => code = Some(decoded),
             "state" => state = Some(decoded),
             "error" => error = Some(decoded),
-            "error_description" => {
-                if error.is_none() {
-                    error = Some(decoded);
-                }
-            }
+            "error_description" if error.is_none() => error = Some(decoded),
             _ => {}
         }
     }
