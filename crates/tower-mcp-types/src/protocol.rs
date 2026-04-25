@@ -3181,7 +3181,7 @@ pub struct CreateTaskResult {
 }
 
 /// Parameters for listing tasks
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListTasksParams {
     /// Filter by status (optional)
@@ -3207,7 +3207,7 @@ pub struct ListTasksResult {
 }
 
 /// Parameters for getting task info
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetTaskInfoParams {
     /// Task ID to query
@@ -3218,7 +3218,7 @@ pub struct GetTaskInfoParams {
 }
 
 /// Parameters for getting task result
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetTaskResultParams {
     /// Task ID to get result for
@@ -3229,7 +3229,7 @@ pub struct GetTaskResultParams {
 }
 
 /// Parameters for cancelling a task
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CancelTaskParams {
     /// Task ID to cancel

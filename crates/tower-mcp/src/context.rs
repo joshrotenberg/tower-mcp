@@ -77,8 +77,10 @@ use tokio::sync::mpsc;
 
 use crate::error::{Error, Result};
 use crate::protocol::{
-    CreateMessageParams, CreateMessageResult, ElicitFormParams, ElicitRequestParams, ElicitResult,
-    ElicitUrlParams, LogLevel, LoggingMessageParams, ProgressParams, ProgressToken, RequestId,
+    CallToolResult, CancelTaskParams, CreateMessageParams, CreateMessageResult, ElicitFormParams,
+    ElicitRequestParams, ElicitResult, ElicitUrlParams, GetTaskInfoParams, GetTaskResultParams,
+    ListTasksParams, ListTasksResult, LogLevel, LoggingMessageParams, ProgressParams,
+    ProgressToken, RequestId, TaskObject, TaskStatus,
 };
 
 /// A notification to be sent to the client
@@ -122,8 +124,8 @@ pub fn notification_channel(buffer: usize) -> (NotificationSender, NotificationR
 /// Trait for sending requests from server to client
 ///
 /// This enables bidirectional communication where the server can request
-/// actions from the client, such as sampling (LLM requests) and elicitation
-/// (user input requests).
+/// actions from the client, such as sampling (LLM requests), elicitation
+/// (user input requests), and task polling (per SEP-1686).
 #[async_trait]
 pub trait ClientRequester: Send + Sync {
     /// Send a sampling request to the client
@@ -138,6 +140,24 @@ pub trait ClientRequester: Send + Sync {
     ///
     /// Returns the elicitation result with the user's action and any submitted data.
     async fn elicit(&self, params: ElicitRequestParams) -> Result<ElicitResult>;
+
+    /// Send a generic JSON-RPC request to the client.
+    ///
+    /// Used by typed helpers ([`RequestContext::get_task_info`] etc.) to
+    /// dispatch arbitrary request methods. The default implementation returns
+    /// an error so existing custom implementations of this trait keep
+    /// compiling; they only need to override this if they want to support
+    /// methods beyond `sample` and `elicit`.
+    async fn request(
+        &self,
+        method: String,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let _ = (method, params);
+        Err(Error::Internal(
+            "ClientRequester does not support arbitrary requests".to_string(),
+        ))
+    }
 }
 
 /// A clonable handle to a client requester
@@ -189,19 +209,15 @@ impl ChannelClientRequester {
     }
 }
 
-#[async_trait]
-impl ClientRequester for ChannelClientRequester {
-    async fn sample(&self, params: CreateMessageParams) -> Result<CreateMessageResult> {
+impl ChannelClientRequester {
+    async fn dispatch(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
         let id = self.next_request_id();
-        let params_json = serde_json::to_value(&params)
-            .map_err(|e| Error::Internal(format!("Failed to serialize params: {}", e)))?;
-
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
 
         let request = OutgoingRequest {
-            id: id.clone(),
-            method: "sampling/createMessage".to_string(),
-            params: params_json,
+            id,
+            method: method.to_string(),
+            params,
             response_tx,
         };
 
@@ -210,39 +226,36 @@ impl ClientRequester for ChannelClientRequester {
             .await
             .map_err(|_| Error::Internal("Failed to send request: channel closed".to_string()))?;
 
-        let response = response_rx.await.map_err(|_| {
+        response_rx.await.map_err(|_| {
             Error::Internal("Failed to receive response: channel closed".to_string())
-        })??;
+        })?
+    }
+}
 
+#[async_trait]
+impl ClientRequester for ChannelClientRequester {
+    async fn sample(&self, params: CreateMessageParams) -> Result<CreateMessageResult> {
+        let params_json = serde_json::to_value(&params)
+            .map_err(|e| Error::Internal(format!("Failed to serialize params: {}", e)))?;
+        let response = self.dispatch("sampling/createMessage", params_json).await?;
         serde_json::from_value(response)
             .map_err(|e| Error::Internal(format!("Failed to deserialize response: {}", e)))
     }
 
     async fn elicit(&self, params: ElicitRequestParams) -> Result<ElicitResult> {
-        let id = self.next_request_id();
         let params_json = serde_json::to_value(&params)
             .map_err(|e| Error::Internal(format!("Failed to serialize params: {}", e)))?;
-
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-
-        let request = OutgoingRequest {
-            id: id.clone(),
-            method: "elicitation/create".to_string(),
-            params: params_json,
-            response_tx,
-        };
-
-        self.request_tx
-            .send(request)
-            .await
-            .map_err(|_| Error::Internal("Failed to send request: channel closed".to_string()))?;
-
-        let response = response_rx.await.map_err(|_| {
-            Error::Internal("Failed to receive response: channel closed".to_string())
-        })??;
-
+        let response = self.dispatch("elicitation/create", params_json).await?;
         serde_json::from_value(response)
             .map_err(|e| Error::Internal(format!("Failed to deserialize response: {}", e)))
+    }
+
+    async fn request(
+        &self,
+        method: String,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.dispatch(&method, params).await
     }
 }
 
@@ -692,6 +705,102 @@ impl RequestContext {
         let result = self.elicit_form(params).await?;
         Ok(result.action == ElicitAction::Accept)
     }
+
+    /// List tasks tracked by the connected client (SEP-1686).
+    ///
+    /// Sends a `tasks/list` request to the client and returns the result.
+    /// Pass `Some(status)` to filter to a single status, or `None` for all
+    /// tasks. Pagination is exposed via [`ListTasksResult::next_cursor`];
+    /// use [`request_raw`](Self::request_raw) for cursor-driven calls.
+    ///
+    /// Returns an error if no client requester is configured or the client
+    /// does not advertise task support.
+    pub async fn list_tasks(&self, status: Option<TaskStatus>) -> Result<ListTasksResult> {
+        let params = ListTasksParams {
+            status,
+            cursor: None,
+            meta: None,
+        };
+        let value = self
+            .request_raw("tasks/list", serde_json::to_value(&params)?)
+            .await?;
+        serde_json::from_value(value)
+            .map_err(|e| Error::Internal(format!("Failed to deserialize tasks/list: {e}")))
+    }
+
+    /// Fetch metadata for a single task tracked by the client (SEP-1686).
+    ///
+    /// Sends a `tasks/get` request and returns the task object, including
+    /// the current status, timestamps, and TTL.
+    pub async fn get_task_info(&self, task_id: impl Into<String>) -> Result<TaskObject> {
+        let params = GetTaskInfoParams {
+            task_id: task_id.into(),
+            meta: None,
+        };
+        let value = self
+            .request_raw("tasks/get", serde_json::to_value(&params)?)
+            .await?;
+        serde_json::from_value(value)
+            .map_err(|e| Error::Internal(format!("Failed to deserialize tasks/get: {e}")))
+    }
+
+    /// Fetch the terminal result for a task tracked by the client (SEP-1686).
+    ///
+    /// Sends a `tasks/result` request. The client is expected to block until
+    /// the task reaches a terminal state and then return the underlying
+    /// `CallToolResult`. For long-running tasks, prefer polling with
+    /// [`get_task_info`](Self::get_task_info) and only call this once the
+    /// status is terminal.
+    pub async fn get_task_result(&self, task_id: impl Into<String>) -> Result<CallToolResult> {
+        let params = GetTaskResultParams {
+            task_id: task_id.into(),
+            meta: None,
+        };
+        let value = self
+            .request_raw("tasks/result", serde_json::to_value(&params)?)
+            .await?;
+        serde_json::from_value(value)
+            .map_err(|e| Error::Internal(format!("Failed to deserialize tasks/result: {e}")))
+    }
+
+    /// Cancel a task tracked by the client (SEP-1686).
+    ///
+    /// Sends a `tasks/cancel` request and returns the resulting task object,
+    /// which will reflect the cancelled status.
+    pub async fn cancel_task(
+        &self,
+        task_id: impl Into<String>,
+        reason: Option<String>,
+    ) -> Result<TaskObject> {
+        let params = CancelTaskParams {
+            task_id: task_id.into(),
+            reason,
+            meta: None,
+        };
+        let value = self
+            .request_raw("tasks/cancel", serde_json::to_value(&params)?)
+            .await?;
+        serde_json::from_value(value)
+            .map_err(|e| Error::Internal(format!("Failed to deserialize tasks/cancel: {e}")))
+    }
+
+    /// Send an arbitrary JSON-RPC request to the client.
+    ///
+    /// Escape hatch for methods not covered by the typed helpers (e.g. when
+    /// a `tasks/list` cursor needs to be passed). Most callers should prefer
+    /// the typed methods.
+    pub async fn request_raw(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let requester = self.client_requester.as_ref().ok_or_else(|| {
+            Error::Internal(
+                "Client request not available: no client requester configured".to_string(),
+            )
+        })?;
+        requester.request(method.to_string(), params).await
+    }
 }
 
 /// A token that can be used to check for cancellation
@@ -1054,5 +1163,121 @@ mod tests {
             rx.try_recv().is_ok(),
             "Debug should pass when no min level is set"
         );
+    }
+
+    fn make_task_object(id: &str, status: TaskStatus) -> serde_json::Value {
+        serde_json::json!({
+            "taskId": id,
+            "status": status,
+            "createdAt": "2026-04-24T00:00:00Z",
+            "lastUpdatedAt": "2026-04-24T00:00:00Z",
+            "ttl": null
+        })
+    }
+
+    fn spawn_mock_client(
+        mut rx: OutgoingRequestReceiver,
+        responder: impl Fn(&str, serde_json::Value) -> serde_json::Value + Send + 'static,
+    ) {
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                let response = responder(&req.method, req.params);
+                let _ = req.response_tx.send(Ok(response));
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn test_get_task_info_round_trips() {
+        let (tx, rx) = outgoing_request_channel(10);
+        spawn_mock_client(rx, |method, params| {
+            assert_eq!(method, "tasks/get");
+            let task_id = params["taskId"].as_str().unwrap().to_string();
+            make_task_object(&task_id, TaskStatus::Working)
+        });
+        let requester: ClientRequesterHandle = Arc::new(ChannelClientRequester::new(tx));
+        let ctx = RequestContext::new(RequestId::Number(1)).with_client_requester(requester);
+
+        let info = ctx.get_task_info("task-123").await.unwrap();
+        assert_eq!(info.task_id, "task-123");
+        assert!(matches!(info.status, TaskStatus::Working));
+    }
+
+    #[tokio::test]
+    async fn test_list_tasks_round_trips() {
+        let (tx, rx) = outgoing_request_channel(10);
+        spawn_mock_client(rx, |method, params| {
+            assert_eq!(method, "tasks/list");
+            // Status filter should be forwarded
+            assert_eq!(params["status"], serde_json::json!("working"));
+            serde_json::json!({
+                "tasks": [
+                    make_task_object("task-1", TaskStatus::Working),
+                    make_task_object("task-2", TaskStatus::Working),
+                ]
+            })
+        });
+        let requester: ClientRequesterHandle = Arc::new(ChannelClientRequester::new(tx));
+        let ctx = RequestContext::new(RequestId::Number(1)).with_client_requester(requester);
+
+        let result = ctx.list_tasks(Some(TaskStatus::Working)).await.unwrap();
+        assert_eq!(result.tasks.len(), 2);
+        assert_eq!(result.tasks[0].task_id, "task-1");
+    }
+
+    #[tokio::test]
+    async fn test_cancel_task_forwards_reason() {
+        let (tx, rx) = outgoing_request_channel(10);
+        spawn_mock_client(rx, |method, params| {
+            assert_eq!(method, "tasks/cancel");
+            assert_eq!(params["reason"], serde_json::json!("user requested"));
+            let task_id = params["taskId"].as_str().unwrap().to_string();
+            make_task_object(&task_id, TaskStatus::Cancelled)
+        });
+        let requester: ClientRequesterHandle = Arc::new(ChannelClientRequester::new(tx));
+        let ctx = RequestContext::new(RequestId::Number(1)).with_client_requester(requester);
+
+        let task = ctx
+            .cancel_task("task-99", Some("user requested".into()))
+            .await
+            .unwrap();
+        assert_eq!(task.task_id, "task-99");
+        assert!(matches!(task.status, TaskStatus::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn test_get_task_info_without_requester_fails() {
+        let ctx = RequestContext::new(RequestId::Number(1));
+        let result = ctx.get_task_info("task-1").await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Client request not available")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_default_request_impl_errors() {
+        // A custom requester that only implements sample/elicit (not request)
+        // should reject task helpers.
+        struct OnlySampleAndElicit;
+
+        #[async_trait]
+        impl ClientRequester for OnlySampleAndElicit {
+            async fn sample(&self, _: CreateMessageParams) -> Result<CreateMessageResult> {
+                unreachable!()
+            }
+            async fn elicit(&self, _: ElicitRequestParams) -> Result<ElicitResult> {
+                unreachable!()
+            }
+        }
+
+        let requester: ClientRequesterHandle = Arc::new(OnlySampleAndElicit);
+        let ctx = RequestContext::new(RequestId::Number(1)).with_client_requester(requester);
+
+        let err = ctx.get_task_info("x").await.unwrap_err();
+        assert!(err.to_string().contains("does not support arbitrary"));
     }
 }
