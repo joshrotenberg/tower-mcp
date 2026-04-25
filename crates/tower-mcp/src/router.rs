@@ -183,6 +183,12 @@ struct McpRouterInner {
     min_log_level: Arc<RwLock<LogLevel>>,
     /// Page size for list method pagination (None = return all results)
     page_size: Option<usize>,
+    /// Names of tools that are currently disabled (hidden from list/call).
+    disabled_tools: Arc<RwLock<HashSet<String>>>,
+    /// URIs of resources that are currently disabled (hidden from list/read).
+    disabled_resources: Arc<RwLock<HashSet<String>>>,
+    /// Names of prompts that are currently disabled (hidden from list/get).
+    disabled_prompts: Arc<RwLock<HashSet<String>>>,
     /// Dynamic tools registry for runtime tool (de)registration
     #[cfg(feature = "dynamic-tools")]
     dynamic_tools: Option<Arc<DynamicToolsInner>>,
@@ -309,6 +315,9 @@ impl McpRouter {
                 prompt_filter: None,
                 min_log_level: Arc::new(RwLock::new(LogLevel::Debug)),
                 page_size: None,
+                disabled_tools: Arc::new(RwLock::new(HashSet::new())),
+                disabled_resources: Arc::new(RwLock::new(HashSet::new())),
+                disabled_prompts: Arc::new(RwLock::new(HashSet::new())),
                 #[cfg(feature = "dynamic-tools")]
                 dynamic_tools: None,
                 #[cfg(feature = "dynamic-tools")]
@@ -346,8 +355,12 @@ impl McpRouter {
     /// request extensions, but can also be called directly for custom
     /// middleware setups.
     pub fn tool_annotations_map(&self) -> ToolAnnotationsMap {
+        let disabled = self.inner.disabled_tools.read().unwrap();
         let mut map = HashMap::new();
         for (name, tool) in &self.inner.tools {
+            if disabled.contains(name) {
+                continue;
+            }
             if let Some(annotations) = &tool.annotations {
                 map.insert(name.clone(), annotations.clone());
             }
@@ -355,6 +368,9 @@ impl McpRouter {
         #[cfg(feature = "dynamic-tools")]
         if let Some(dynamic) = &self.inner.dynamic_tools {
             for tool in dynamic.list() {
+                if disabled.contains(&tool.name) {
+                    continue;
+                }
                 // Static tools take precedence
                 if !map.contains_key(&tool.name)
                     && let Some(ref annotations) = tool.annotations
@@ -1469,6 +1485,71 @@ impl McpRouter {
         tx.try_send(ServerNotification::PromptsListChanged).is_ok()
     }
 
+    /// Disable a tool by name. Disabled tools are hidden from `tools/list`
+    /// and return a method-not-found error from `tools/call`, but the tool
+    /// definition stays attached to the router and can be flipped back on
+    /// with [`enable_tool`](Self::enable_tool).
+    ///
+    /// State is shared across all clones produced by
+    /// [`with_fresh_session`](Self::with_fresh_session), so flipping it once
+    /// affects every connected session at the next request boundary. Call
+    /// [`notify_tools_list_changed`](Self::notify_tools_list_changed) to nudge
+    /// clients to re-fetch.
+    pub fn disable_tool(&self, name: impl Into<String>) {
+        let mut set = self.inner.disabled_tools.write().unwrap();
+        set.insert(name.into());
+    }
+
+    /// Re-enable a previously disabled tool. No-op if the tool was not
+    /// disabled.
+    pub fn enable_tool(&self, name: &str) {
+        let mut set = self.inner.disabled_tools.write().unwrap();
+        set.remove(name);
+    }
+
+    /// Returns `true` if the named tool is currently enabled (i.e. not in
+    /// the disabled set). Returns `true` even for unknown tool names; this
+    /// only reports disable state, not registration.
+    pub fn is_tool_enabled(&self, name: &str) -> bool {
+        !self.inner.disabled_tools.read().unwrap().contains(name)
+    }
+
+    /// Disable a resource by URI. Disabled resources are hidden from
+    /// `resources/list` and return a not-found error from `resources/read`.
+    pub fn disable_resource(&self, uri: impl Into<String>) {
+        let mut set = self.inner.disabled_resources.write().unwrap();
+        set.insert(uri.into());
+    }
+
+    /// Re-enable a previously disabled resource.
+    pub fn enable_resource(&self, uri: &str) {
+        let mut set = self.inner.disabled_resources.write().unwrap();
+        set.remove(uri);
+    }
+
+    /// Returns `true` if the resource at this URI is currently enabled.
+    pub fn is_resource_enabled(&self, uri: &str) -> bool {
+        !self.inner.disabled_resources.read().unwrap().contains(uri)
+    }
+
+    /// Disable a prompt by name. Disabled prompts are hidden from
+    /// `prompts/list` and return a method-not-found error from `prompts/get`.
+    pub fn disable_prompt(&self, name: impl Into<String>) {
+        let mut set = self.inner.disabled_prompts.write().unwrap();
+        set.insert(name.into());
+    }
+
+    /// Re-enable a previously disabled prompt.
+    pub fn enable_prompt(&self, name: &str) {
+        let mut set = self.inner.disabled_prompts.write().unwrap();
+        set.remove(name);
+    }
+
+    /// Returns `true` if the named prompt is currently enabled.
+    pub fn is_prompt_enabled(&self, name: &str) -> bool {
+        !self.inner.disabled_prompts.read().unwrap().contains(name)
+    }
+
     /// Get server capabilities based on registered handlers
     fn capabilities(&self) -> ServerCapabilities {
         let has_resources =
@@ -1612,10 +1693,12 @@ impl McpRouter {
 
             McpRequest::ListTools(params) => {
                 let filter = self.inner.tool_filter.as_ref();
+                let disabled = self.inner.disabled_tools.read().unwrap().clone();
                 let is_visible = |t: &Tool| {
-                    filter
-                        .map(|f| f.is_visible(&self.session, t))
-                        .unwrap_or(true)
+                    !disabled.contains(&t.name)
+                        && filter
+                            .map(|f| f.is_visible(&self.session, t))
+                            .unwrap_or(true)
                 };
 
                 // Collect static tools
@@ -1652,6 +1735,23 @@ impl McpRouter {
             }
 
             McpRequest::CallTool(params) => {
+                // Disabled tools are reported as if they don't exist.
+                if self
+                    .inner
+                    .disabled_tools
+                    .read()
+                    .unwrap()
+                    .contains(&params.name)
+                {
+                    tracing::info!(
+                        target: "mcp::tools",
+                        tool = %params.name,
+                        status = "disabled",
+                        "tool call completed"
+                    );
+                    return Err(Error::JsonRpc(JsonRpcError::method_not_found(&params.name)));
+                }
+
                 // Look up static tools first, then dynamic
                 let tool = self.inner.tools.get(&params.name).cloned();
                 #[cfg(feature = "dynamic-tools")]
@@ -1807,12 +1907,15 @@ impl McpRouter {
             }
 
             McpRequest::ListResources(params) => {
+                let disabled = self.inner.disabled_resources.read().unwrap().clone();
                 let is_visible = |r: &Resource| -> bool {
-                    self.inner
-                        .resource_filter
-                        .as_ref()
-                        .map(|f| f.is_visible(&self.session, r))
-                        .unwrap_or(true)
+                    !disabled.contains(&r.uri)
+                        && self
+                            .inner
+                            .resource_filter
+                            .as_ref()
+                            .map(|f| f.is_visible(&self.session, r))
+                            .unwrap_or(true)
                 };
 
                 let mut resources: Vec<ResourceDefinition> = self
@@ -1887,6 +1990,19 @@ impl McpRouter {
             }
 
             McpRequest::ReadResource(params) => {
+                // Disabled resources are reported as if they don't exist.
+                if self
+                    .inner
+                    .disabled_resources
+                    .read()
+                    .unwrap()
+                    .contains(&params.uri)
+                {
+                    return Err(Error::JsonRpc(JsonRpcError::resource_not_found(
+                        &params.uri,
+                    )));
+                }
+
                 // First, try to find a static resource
                 if let Some(resource) = self.inner.resources.get(&params.uri) {
                     // Check resource filter if configured
@@ -1982,12 +2098,15 @@ impl McpRouter {
             }
 
             McpRequest::ListPrompts(params) => {
+                let disabled = self.inner.disabled_prompts.read().unwrap().clone();
                 let is_visible = |p: &Prompt| -> bool {
-                    self.inner
-                        .prompt_filter
-                        .as_ref()
-                        .map(|f| f.is_visible(&self.session, p))
-                        .unwrap_or(true)
+                    !disabled.contains(&p.name)
+                        && self
+                            .inner
+                            .prompt_filter
+                            .as_ref()
+                            .map(|f| f.is_visible(&self.session, p))
+                            .unwrap_or(true)
                 };
 
                 let mut prompts: Vec<PromptDefinition> = self
@@ -2023,6 +2142,20 @@ impl McpRouter {
             }
 
             McpRequest::GetPrompt(params) => {
+                // Disabled prompts are reported as if they don't exist.
+                if self
+                    .inner
+                    .disabled_prompts
+                    .read()
+                    .unwrap()
+                    .contains(&params.name)
+                {
+                    return Err(Error::JsonRpc(JsonRpcError::method_not_found(&format!(
+                        "Prompt not found: {}",
+                        params.name
+                    ))));
+                }
+
                 // Look up static prompts first, then dynamic
                 let prompt = self.inner.prompts.get(&params.name).cloned();
                 #[cfg(feature = "dynamic-tools")]
@@ -6151,6 +6284,197 @@ mod tests {
 
         let router = McpRouter::new().prompt_if(false, prompt);
         assert_eq!(router.inner.prompts.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_disable_tool_hides_from_list() {
+        let safe = ToolBuilder::new("safe")
+            .description("Safe tool")
+            .handler(|_: AddInput| async { Ok(CallToolResult::text("ok")) })
+            .build();
+        let dangerous = ToolBuilder::new("dangerous")
+            .description("Dangerous tool")
+            .handler(|_: AddInput| async { Ok(CallToolResult::text("ok")) })
+            .build();
+        let mut router = McpRouter::new().tool(safe).tool(dangerous);
+        init_router(&mut router).await;
+
+        router.disable_tool("dangerous");
+        assert!(router.is_tool_enabled("safe"));
+        assert!(!router.is_tool_enabled("dangerous"));
+
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::ListTools(ListToolsParams::default()),
+            extensions: Extensions::new(),
+        };
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+        match resp.inner {
+            Ok(McpResponse::ListTools(result)) => {
+                let names: Vec<&str> = result.tools.iter().map(|t| t.name.as_str()).collect();
+                assert_eq!(names, vec!["safe"]);
+            }
+            _ => panic!("Expected ListTools response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_disable_tool_blocks_call() {
+        let dangerous = ToolBuilder::new("dangerous")
+            .description("Dangerous tool")
+            .handler(|_: AddInput| async { Ok(CallToolResult::text("ran")) })
+            .build();
+        let mut router = McpRouter::new().tool(dangerous);
+        init_router(&mut router).await;
+
+        router.disable_tool("dangerous");
+
+        let req = RouterRequest {
+            id: RequestId::Number(2),
+            inner: McpRequest::CallTool(CallToolParams {
+                name: "dangerous".to_string(),
+                arguments: serde_json::json!({"a": 1, "b": 2}),
+                meta: None,
+                task: None,
+            }),
+            extensions: Extensions::new(),
+        };
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+        let err = resp.inner.expect_err("disabled tool should error");
+        assert_eq!(err.code, crate::error::ErrorCode::MethodNotFound as i32);
+    }
+
+    #[tokio::test]
+    async fn test_enable_tool_restores_visibility() {
+        let tool = ToolBuilder::new("flippy")
+            .description("Toggleable tool")
+            .handler(|_: AddInput| async { Ok(CallToolResult::text("ran")) })
+            .build();
+        let mut router = McpRouter::new().tool(tool);
+        init_router(&mut router).await;
+
+        router.disable_tool("flippy");
+        router.enable_tool("flippy");
+        assert!(router.is_tool_enabled("flippy"));
+
+        let req = RouterRequest {
+            id: RequestId::Number(3),
+            inner: McpRequest::CallTool(CallToolParams {
+                name: "flippy".to_string(),
+                arguments: serde_json::json!({"a": 1, "b": 2}),
+                meta: None,
+                task: None,
+            }),
+            extensions: Extensions::new(),
+        };
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+        match resp.inner {
+            Ok(McpResponse::CallTool(result)) => {
+                assert_eq!(result.first_text(), Some("ran"));
+            }
+            _ => panic!("Expected CallTool response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_disable_propagates_through_fresh_session() {
+        let tool = ToolBuilder::new("shared")
+            .description("Shared across sessions")
+            .handler(|_: AddInput| async { Ok(CallToolResult::text("ok")) })
+            .build();
+        let router = McpRouter::new().tool(tool);
+
+        // Disable on the parent, observe via with_fresh_session clone.
+        router.disable_tool("shared");
+        let mut child = router.with_fresh_session();
+        init_router(&mut child).await;
+        assert!(!child.is_tool_enabled("shared"));
+
+        let req = RouterRequest {
+            id: RequestId::Number(4),
+            inner: McpRequest::ListTools(ListToolsParams::default()),
+            extensions: Extensions::new(),
+        };
+        let resp = child.ready().await.unwrap().call(req).await.unwrap();
+        match resp.inner {
+            Ok(McpResponse::ListTools(result)) => {
+                assert!(result.tools.is_empty());
+            }
+            _ => panic!("Expected ListTools response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_disable_resource_and_prompt() {
+        let resource = crate::resource::ResourceBuilder::new("file:///hidden.txt")
+            .name("hidden")
+            .text("secret");
+        let prompt = crate::prompt::PromptBuilder::new("hidden_prompt")
+            .description("hidden")
+            .user_message("hello");
+
+        let mut router = McpRouter::new().resource(resource).prompt(prompt);
+        init_router(&mut router).await;
+
+        router.disable_resource("file:///hidden.txt");
+        router.disable_prompt("hidden_prompt");
+        assert!(!router.is_resource_enabled("file:///hidden.txt"));
+        assert!(!router.is_prompt_enabled("hidden_prompt"));
+
+        // resources/list excludes
+        let req = RouterRequest {
+            id: RequestId::Number(5),
+            inner: McpRequest::ListResources(ListResourcesParams::default()),
+            extensions: Extensions::new(),
+        };
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+        match resp.inner {
+            Ok(McpResponse::ListResources(result)) => {
+                assert!(result.resources.is_empty());
+            }
+            _ => panic!("Expected ListResources response"),
+        }
+
+        // resources/read returns not found
+        let req = RouterRequest {
+            id: RequestId::Number(6),
+            inner: McpRequest::ReadResource(ReadResourceParams {
+                uri: "file:///hidden.txt".to_string(),
+                meta: None,
+            }),
+            extensions: Extensions::new(),
+        };
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+        let err = resp.inner.expect_err("disabled resource should error");
+        assert_eq!(err.code, -32002);
+
+        // prompts/list excludes
+        let req = RouterRequest {
+            id: RequestId::Number(7),
+            inner: McpRequest::ListPrompts(ListPromptsParams::default()),
+            extensions: Extensions::new(),
+        };
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+        match resp.inner {
+            Ok(McpResponse::ListPrompts(result)) => {
+                assert!(result.prompts.is_empty());
+            }
+            _ => panic!("Expected ListPrompts response"),
+        }
+
+        // prompts/get returns not found
+        let req = RouterRequest {
+            id: RequestId::Number(8),
+            inner: McpRequest::GetPrompt(GetPromptParams {
+                name: "hidden_prompt".to_string(),
+                arguments: Default::default(),
+                meta: None,
+            }),
+            extensions: Extensions::new(),
+        };
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+        let err = resp.inner.expect_err("disabled prompt should error");
+        assert_eq!(err.code, crate::error::ErrorCode::MethodNotFound as i32);
     }
 
     #[test]
