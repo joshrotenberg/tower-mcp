@@ -1052,6 +1052,10 @@ struct AppState {
     validate_origin: bool,
     /// Allowed origins (if validation is enabled)
     allowed_origins: Vec<String>,
+    /// Whether to validate Host header (defense against direct DNS rebinding)
+    validate_host: bool,
+    /// Allowed hosts (host:port). Localhost variants are always allowed.
+    allowed_hosts: Vec<String>,
     /// Whether sampling is enabled
     sampling_enabled: bool,
     /// Whether sessions are optional (for clients that don't track session IDs)
@@ -1093,6 +1097,8 @@ pub struct HttpTransport {
     service_source: ServiceSource,
     validate_origin: bool,
     allowed_origins: Vec<String>,
+    validate_host: bool,
+    allowed_hosts: Vec<String>,
     session_config: SessionConfig,
     sampling_enabled: bool,
     optional_sessions: bool,
@@ -1117,6 +1123,8 @@ impl HttpTransport {
             },
             validate_origin: true,
             allowed_origins: vec![],
+            validate_host: true,
+            allowed_hosts: vec![],
             session_config: SessionConfig::default(),
             sampling_enabled: false,
             optional_sessions: true,
@@ -1169,6 +1177,8 @@ impl HttpTransport {
             ))),
             validate_origin: true,
             allowed_origins: vec![],
+            validate_host: true,
+            allowed_hosts: vec![],
             session_config: SessionConfig::default(),
             sampling_enabled: false,
             optional_sessions: true,
@@ -1297,6 +1307,34 @@ impl HttpTransport {
     /// Set allowed origins for CORS/security validation
     pub fn allowed_origins(mut self, origins: Vec<String>) -> Self {
         self.allowed_origins = origins;
+        self
+    }
+
+    /// Disable Host header validation (not recommended when binding to a
+    /// non-loopback interface).
+    ///
+    /// Host validation is the defense-in-depth pair to Origin validation: it
+    /// rejects requests whose `Host` header doesn't match the server's
+    /// expected hostname, blocking direct DNS-rebinding attacks where a
+    /// malicious site resolves its own domain to `127.0.0.1`.
+    pub fn disable_host_validation(mut self) -> Self {
+        self.validate_host = false;
+        self
+    }
+
+    /// Set allowed hosts for the `Host` header allowlist.
+    ///
+    /// Each entry should be a `host:port` pair (e.g. `"api.example.com"`,
+    /// `"api.example.com:8443"`). Localhost variants (`localhost`,
+    /// `127.0.0.1`, `::1`, with any port) are always accepted regardless
+    /// of this list.
+    ///
+    /// When the `Host` header is missing, the validator falls back to the
+    /// HTTP/2 `:authority` pseudo-header from `request.uri().authority()`,
+    /// since middleware like `axum::Router::nest` can strip the synthesized
+    /// `Host` header before it reaches our handler.
+    pub fn allowed_hosts(mut self, hosts: Vec<String>) -> Self {
+        self.allowed_hosts = hosts;
         self
     }
 
@@ -1493,6 +1531,8 @@ impl HttpTransport {
             sessions,
             validate_origin: self.validate_origin,
             allowed_origins: self.allowed_origins.clone(),
+            validate_host: self.validate_host,
+            allowed_hosts: self.allowed_hosts.clone(),
             sampling_enabled: self.sampling_enabled,
             optional_sessions: self.optional_sessions,
             #[cfg(feature = "stateless")]
@@ -1618,21 +1658,82 @@ fn is_localhost_origin(origin: &str) -> bool {
         .strip_prefix("http://")
         .or_else(|| origin.strip_prefix("https://"))
     {
-        // Handle bracketed IPv6 (e.g., [::1]:3000)
-        let host = if rest.starts_with('[') {
-            // Extract everything between [ and ]
-            rest.split(']')
-                .next()
-                .unwrap_or(rest)
-                .trim_start_matches('[')
-        } else {
-            // Strip port if present
-            rest.split(':').next().unwrap_or(rest)
-        };
-        matches!(host, "localhost" | "127.0.0.1" | "::1")
+        is_localhost_host(rest)
     } else {
         false
     }
+}
+
+/// Check if a `host:port` (or `[ipv6]:port`) value refers to localhost.
+///
+/// Used by both Origin validation (after stripping the `http(s)://` scheme)
+/// and Host validation (where there's no scheme to begin with).
+fn is_localhost_host(host: &str) -> bool {
+    let host_only = if host.starts_with('[') {
+        // Bracketed IPv6: [::1]:3000 -> ::1
+        host.split(']')
+            .next()
+            .unwrap_or(host)
+            .trim_start_matches('[')
+    } else {
+        // Strip port if present
+        host.split(':').next().unwrap_or(host)
+    };
+    matches!(host_only, "localhost" | "127.0.0.1" | "::1")
+}
+
+/// Resolve the effective host for validation.
+///
+/// Prefers the `Host` header, falling back to the HTTP/2 `:authority`
+/// pseudo-header (`request.uri().authority()`) when the header is missing.
+/// This matters behind middleware like `axum::Router::nest`, which can
+/// strip Hyper's synthesized `Host` before our handler sees it.
+fn effective_host<'a>(headers: &'a HeaderMap, uri: &'a axum::http::Uri) -> Option<&'a str> {
+    if let Some(value) = headers.get(header::HOST)
+        && let Ok(s) = value.to_str()
+    {
+        return Some(s);
+    }
+    uri.authority().map(|a| a.as_str())
+}
+
+/// Validate the `Host` header (defense-in-depth alongside Origin).
+///
+/// Returns Some(Response) if validation fails, None if it passes.
+fn validate_host(headers: &HeaderMap, uri: &axum::http::Uri, state: &AppState) -> Option<Response> {
+    if !state.validate_host {
+        return None;
+    }
+
+    let Some(host) = effective_host(headers, uri) else {
+        if state.allowed_hosts.is_empty() {
+            // No Host header and no allowlist: fall back to permissive
+            // behavior matching pre-validation defaults so we don't break
+            // existing deployments. (Origin already protects browsers.)
+            return None;
+        }
+        tracing::warn!("Rejecting request: missing Host header and no :authority fallback");
+        return Some((StatusCode::BAD_REQUEST, "Missing Host header").into_response());
+    };
+
+    if is_localhost_host(host) {
+        return None;
+    }
+
+    if state.allowed_hosts.is_empty() {
+        // Non-localhost host with no explicit allowlist: keep accepting it.
+        // Operators who want strict Host validation must opt in via
+        // `.allowed_hosts(...)`. This preserves the historical behavior of
+        // not enforcing Host on non-loopback deployments by default.
+        return None;
+    }
+
+    if state.allowed_hosts.iter().any(|h| h == host) {
+        return None;
+    }
+
+    tracing::warn!(host = %host, "Rejecting request: Host not in allowlist");
+    Some((StatusCode::BAD_REQUEST, "Host not allowed").into_response())
 }
 
 /// Validate Origin header for security.
@@ -1659,6 +1760,10 @@ fn validate_origin(headers: &HeaderMap, state: &AppState) -> Option<Response> {
 
         // Non-localhost origin: check against allowed list
         if state.allowed_origins.is_empty() {
+            tracing::warn!(
+                origin = %origin_str,
+                "Rejecting request: cross-origin not allowed (no allowlist configured)"
+            );
             return Some(
                 (StatusCode::FORBIDDEN, "Cross-origin requests not allowed").into_response(),
             );
@@ -1669,6 +1774,7 @@ fn validate_origin(headers: &HeaderMap, state: &AppState) -> Option<Response> {
             .iter()
             .any(|o| o == origin_str || o == "*")
         {
+            tracing::warn!(origin = %origin_str, "Rejecting request: Origin not in allowlist");
             return Some((StatusCode::FORBIDDEN, "Origin not allowed").into_response());
         }
     }
@@ -1732,6 +1838,12 @@ async fn handle_post(
 ) -> Response {
     let (parts, body_bytes) = request.into_parts();
     let headers = parts.headers;
+    let uri = parts.uri.clone();
+
+    // Validate Host (DNS rebinding defense, complement to Origin)
+    if let Some(resp) = validate_host(&headers, &uri, &state) {
+        return resp;
+    }
 
     // Validate Origin
     if let Some(resp) = validate_origin(&headers, &state) {
@@ -2034,7 +2146,19 @@ async fn handle_post(
 }
 
 /// Handle GET requests (SSE stream for server notifications and outgoing requests)
-async fn handle_get(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+async fn handle_get(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+) -> Response {
+    let (parts, _body) = request.into_parts();
+    let headers = parts.headers;
+    let uri = parts.uri.clone();
+
+    // Validate Host (DNS rebinding defense, complement to Origin)
+    if let Some(resp) = validate_host(&headers, &uri, &state) {
+        return resp;
+    }
+
     // Validate Origin
     if let Some(resp) = validate_origin(&headers, &state) {
         return resp;
@@ -2291,7 +2415,19 @@ async fn handle_get_bidirectional(session: Arc<Session>, last_event_id: Option<u
 }
 
 /// Handle DELETE requests (session termination)
-async fn handle_delete(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+async fn handle_delete(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+) -> Response {
+    let (parts, _body) = request.into_parts();
+    let headers = parts.headers;
+    let uri = parts.uri.clone();
+
+    // Validate Host (DNS rebinding defense, complement to Origin)
+    if let Some(resp) = validate_host(&headers, &uri, &state) {
+        return resp;
+    }
+
     // Validate Origin
     if let Some(resp) = validate_origin(&headers, &state) {
         return resp;
@@ -3747,5 +3883,161 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // =========================================================================
+    // Host header validation (DNS rebinding defense complement to Origin)
+    // =========================================================================
+
+    fn initialize_body() -> Body {
+        Body::from(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": { "name": "test", "version": "1.0" }
+                }
+            })
+            .to_string(),
+        )
+    }
+
+    #[test]
+    fn test_is_localhost_host_variants() {
+        assert!(is_localhost_host("localhost"));
+        assert!(is_localhost_host("localhost:3000"));
+        assert!(is_localhost_host("127.0.0.1"));
+        assert!(is_localhost_host("127.0.0.1:8080"));
+        assert!(is_localhost_host("[::1]"));
+        assert!(is_localhost_host("[::1]:3000"));
+
+        assert!(!is_localhost_host("evil.com"));
+        assert!(!is_localhost_host("api.example.com:8443"));
+        assert!(!is_localhost_host("10.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn test_host_validation_allows_localhost() {
+        let transport = HttpTransport::new(create_test_router())
+            .allowed_hosts(vec!["api.example.com".to_string()]);
+        let app = transport.into_router();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header("Host", "127.0.0.1:3000")
+            .body(initialize_body())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_host_validation_allows_configured_host() {
+        let transport = HttpTransport::new(create_test_router())
+            .allowed_hosts(vec!["api.example.com".to_string()]);
+        let app = transport.into_router();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header("Host", "api.example.com")
+            .body(initialize_body())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_host_validation_rejects_unconfigured_host() {
+        let transport = HttpTransport::new(create_test_router())
+            .allowed_hosts(vec!["api.example.com".to_string()]);
+        let app = transport.into_router();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header("Host", "evil.com")
+            .body(initialize_body())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_host_validation_no_allowlist_accepts_any_host() {
+        // Existing deployments that haven't opted into Host validation
+        // (no `.allowed_hosts(...)`) should keep accepting non-localhost
+        // hosts; Origin still protects browsers.
+        let transport = HttpTransport::new(create_test_router());
+        let app = transport.into_router();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header("Host", "any.example.com")
+            .body(initialize_body())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_disabled_host_validation_allows_any_with_allowlist() {
+        let transport = HttpTransport::new(create_test_router())
+            .disable_host_validation()
+            .allowed_hosts(vec!["api.example.com".to_string()]);
+        let app = transport.into_router();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header("Host", "evil.com")
+            .body(initialize_body())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn test_effective_host_prefers_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("api.example.com"));
+        let uri: axum::http::Uri = "http://other.example.com/path".parse().unwrap();
+        assert_eq!(effective_host(&headers, &uri), Some("api.example.com"));
+    }
+
+    #[test]
+    fn test_effective_host_falls_back_to_authority() {
+        // When Host header is missing (HTTP/2 + middleware that strips it),
+        // we should fall back to the URI authority.
+        let headers = HeaderMap::new();
+        let uri: axum::http::Uri = "http://api.example.com/path".parse().unwrap();
+        assert_eq!(effective_host(&headers, &uri), Some("api.example.com"));
+    }
+
+    #[test]
+    fn test_effective_host_returns_none_when_both_missing() {
+        let headers = HeaderMap::new();
+        let uri: axum::http::Uri = "/path".parse().unwrap();
+        assert_eq!(effective_host(&headers, &uri), None);
     }
 }
