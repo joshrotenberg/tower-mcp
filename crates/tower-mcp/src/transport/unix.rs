@@ -154,6 +154,21 @@ impl UnixSocketTransport {
         self
     }
 
+    /// Disable Host header validation.
+    ///
+    /// Like origin validation, host validation is less relevant for Unix
+    /// sockets, but is still enabled by default for consistency.
+    pub fn disable_host_validation(mut self) -> Self {
+        self.inner = self.inner.disable_host_validation();
+        self
+    }
+
+    /// Set allowed hosts for the `Host` header allowlist.
+    pub fn allowed_hosts(mut self, hosts: Vec<String>) -> Self {
+        self.inner = self.inner.allowed_hosts(hosts);
+        self
+    }
+
     /// Apply a tower middleware layer to MCP request processing.
     ///
     /// See [`HttpTransport::layer`] for details.
