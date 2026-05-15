@@ -179,8 +179,8 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::context::{
-    ChannelClientRequester, ClientRequesterHandle, OutgoingRequestReceiver, notification_channel,
-    outgoing_request_channel,
+    ChannelClientRequester, ClientRequesterHandle, NotificationReceiver, OutgoingRequestReceiver,
+    notification_channel, outgoing_request_channel,
 };
 use crate::error::{Error, JsonRpcError, Result};
 use crate::jsonrpc::JsonRpcService;
@@ -922,6 +922,19 @@ impl SessionRegistry {
         removed
     }
 
+    /// Send a pre-serialized JSON notification to every live session's SSE
+    /// broadcast channel.
+    ///
+    /// Used by the external-notification fan-out task. Failures to send
+    /// (no SSE subscribers attached to a session yet) are silent — the
+    /// broadcast channel drops the message naturally.
+    async fn broadcast_to_all(&self, json: &str) {
+        let sessions = self.sessions.read().await;
+        for session in sessions.values() {
+            let _ = session.notifications_tx.send(json.to_string());
+        }
+    }
+
     /// Remove expired sessions, returns count of removed sessions
     async fn cleanup_expired(&self) -> usize {
         let expired = {
@@ -1105,6 +1118,10 @@ pub struct HttpTransport {
     session_store: Arc<dyn crate::session_store::SessionStore>,
     event_store: Arc<dyn crate::event_store::EventStore>,
     auto_reinit_sessions: bool,
+    /// Caller-owned receiver for notifications pushed from outside any
+    /// request handler. Drained by a background task and fanned out to
+    /// every live session's SSE stream.
+    external_notifications: Option<NotificationReceiver>,
     #[cfg(feature = "stateless")]
     stateless_config: Option<crate::stateless::StatelessConfig>,
     #[cfg(feature = "oauth")]
@@ -1131,6 +1148,7 @@ impl HttpTransport {
             session_store: Arc::new(crate::session_store::MemorySessionStore::new()),
             event_store: Arc::new(crate::event_store::MemoryEventStore::new()),
             auto_reinit_sessions: false,
+            external_notifications: None,
             #[cfg(feature = "stateless")]
             stateless_config: None,
             #[cfg(feature = "oauth")]
@@ -1185,11 +1203,71 @@ impl HttpTransport {
             session_store: Arc::new(crate::session_store::MemorySessionStore::new()),
             event_store: Arc::new(crate::event_store::MemoryEventStore::new()),
             auto_reinit_sessions: false,
+            external_notifications: None,
             #[cfg(feature = "stateless")]
             stateless_config: None,
             #[cfg(feature = "oauth")]
             oauth_config: None,
         }
+    }
+
+    /// Create an HTTP transport that drains a caller-owned notification
+    /// channel and fans the items out to every live session's SSE stream.
+    ///
+    /// This mirrors [`GenericStdioTransport::with_notifications`](crate::transport::stdio::GenericStdioTransport::with_notifications)
+    /// and is the supported way to push server-originated notifications
+    /// (e.g. `notifications/resources/updated`) from outside any request
+    /// handler — background tasks, lifecycle hooks, anything async that
+    /// needs to notify subscribed clients.
+    ///
+    /// Per-session notification channels (in-handler `ctx.send_log()`,
+    /// progress updates) are unaffected. The external channel runs in
+    /// parallel and broadcasts to every active session; MCP clients are
+    /// expected to ignore notifications they didn't subscribe to.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use tower_mcp::{BoxError, McpRouter};
+    /// use tower_mcp::context::{ServerNotification, notification_channel};
+    /// use tower_mcp::transport::http::HttpTransport;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), BoxError> {
+    ///     let (notif_tx, notif_rx) = notification_channel(256);
+    ///
+    ///     let router = McpRouter::new().server_info("my-server", "1.0.0");
+    ///
+    ///     // Hold onto notif_tx in your application state so background tasks
+    ///     // can push notifications. tx is `Clone`.
+    ///     let pusher = notif_tx.clone();
+    ///     tokio::spawn(async move {
+    ///         let _ = pusher.send(ServerNotification::ResourceUpdated {
+    ///             uri: "claude://chats/123".to_string(),
+    ///         }).await;
+    ///     });
+    ///
+    ///     let transport = HttpTransport::with_notifications(router, notif_rx);
+    ///     transport.serve("127.0.0.1:3000").await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn with_notifications(router: McpRouter, notification_rx: NotificationReceiver) -> Self {
+        Self {
+            external_notifications: Some(notification_rx),
+            ..Self::new(router)
+        }
+    }
+
+    /// Attach a caller-owned notification receiver after construction.
+    ///
+    /// Useful when wrapping a pre-built service via
+    /// [`from_service`](Self::from_service), where setting a sender on the
+    /// router isn't part of the flow. See [`with_notifications`](Self::with_notifications)
+    /// for the typical router-based path.
+    pub fn external_notifications(mut self, notification_rx: NotificationReceiver) -> Self {
+        self.external_notifications = Some(notification_rx);
+        self
     }
 
     /// Enable sampling support for this transport.
@@ -1558,11 +1636,14 @@ impl HttpTransport {
     /// // Use handle in an admin endpoint
     /// let count = handle.session_count().await;
     /// ```
-    pub fn into_router_with_handle(self) -> (Router, SessionHandle) {
+    pub fn into_router_with_handle(mut self) -> (Router, SessionHandle) {
+        let external_rx = self.external_notifications.take();
         let state = self.build_state();
         let handle = SessionHandle {
             store: state.sessions.clone(),
         };
+
+        spawn_external_notification_fanout(external_rx, state.sessions.clone());
 
         let router = Router::new()
             .route("/", post(handle_post))
@@ -1585,11 +1666,14 @@ impl HttpTransport {
 
     /// Build an axum router mounted at a specific path and return a
     /// [`SessionHandle`] for querying session metrics.
-    pub fn into_router_at_with_handle(self, path: &str) -> (Router, SessionHandle) {
+    pub fn into_router_at_with_handle(mut self, path: &str) -> (Router, SessionHandle) {
+        let external_rx = self.external_notifications.take();
         let state = self.build_state();
         let handle = SessionHandle {
             store: state.sessions.clone(),
         };
+
+        spawn_external_notification_fanout(external_rx, state.sessions.clone());
 
         let mcp_router = Router::new()
             .route("/", post(handle_post))
@@ -1652,6 +1736,28 @@ impl HttpTransport {
 }
 
 /// Check if an origin is a localhost origin (safe from DNS rebinding).
+/// Drain a caller-supplied notification channel and fan items out to every
+/// live session's SSE broadcast.
+///
+/// No-op when `rx` is `None`. When present, spawns a long-running task that
+/// runs for the lifetime of the transport (until the channel closes).
+fn spawn_external_notification_fanout(
+    rx: Option<NotificationReceiver>,
+    sessions: Arc<SessionRegistry>,
+) {
+    let Some(mut rx) = rx else {
+        return;
+    };
+    tokio::spawn(async move {
+        while let Some(notification) = rx.recv().await {
+            if let Some(json) = crate::transport::stdio::serialize_notification(&notification) {
+                sessions.broadcast_to_all(&json).await;
+            }
+        }
+        tracing::debug!("External notification channel closed; fan-out task exiting");
+    });
+}
+
 fn is_localhost_origin(origin: &str) -> bool {
     // Parse the origin to extract the host
     if let Some(rest) = origin
@@ -4039,5 +4145,148 @@ mod tests {
         let headers = HeaderMap::new();
         let uri: axum::http::Uri = "/path".parse().unwrap();
         assert_eq!(effective_host(&headers, &uri), None);
+    }
+
+    // =========================================================================
+    // External notification fan-out
+    // =========================================================================
+
+    /// Initialize a session against `app` and return its session id.
+    async fn init_session(app: &Router) -> String {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": { "name": "test", "version": "1.0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        resp.headers()
+            .get(MCP_SESSION_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .expect("initialize must return a session id")
+    }
+
+    #[tokio::test]
+    async fn test_external_notification_reaches_single_session() {
+        let (notif_tx, notif_rx) = notification_channel(8);
+        let transport = HttpTransport::with_notifications(create_test_router(), notif_rx);
+        let (app, session_handle) = transport.into_router_with_handle();
+
+        let session_id = init_session(&app).await;
+
+        // Subscribe to the session's broadcast channel before firing.
+        let mut rx = {
+            let sessions = session_handle.store.sessions.read().await;
+            let session = sessions
+                .get(&session_id)
+                .expect("session should be registered");
+            session.notifications_tx.subscribe()
+        };
+
+        notif_tx
+            .send(crate::context::ServerNotification::ResourceUpdated {
+                uri: "claude://chats/abc".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let json = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("notification should arrive within timeout")
+            .expect("broadcast channel closed");
+        assert!(json.contains("notifications/resources/updated"));
+        assert!(json.contains("claude://chats/abc"));
+    }
+
+    #[tokio::test]
+    async fn test_external_notification_fans_out_to_all_sessions() {
+        let (notif_tx, notif_rx) = notification_channel(8);
+        let transport = HttpTransport::with_notifications(create_test_router(), notif_rx);
+        let (app, session_handle) = transport.into_router_with_handle();
+
+        let session_a = init_session(&app).await;
+        let session_b = init_session(&app).await;
+        assert_ne!(session_a, session_b);
+
+        let (mut rx_a, mut rx_b) = {
+            let sessions = session_handle.store.sessions.read().await;
+            let a = sessions.get(&session_a).unwrap();
+            let b = sessions.get(&session_b).unwrap();
+            (
+                a.notifications_tx.subscribe(),
+                b.notifications_tx.subscribe(),
+            )
+        };
+
+        notif_tx
+            .send(crate::context::ServerNotification::ResourcesListChanged)
+            .await
+            .unwrap();
+
+        let json_a = tokio::time::timeout(Duration::from_secs(1), rx_a.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let json_b = tokio::time::timeout(Duration::from_secs(1), rx_b.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(json_a.contains("notifications/resources/list_changed"));
+        assert!(json_b.contains("notifications/resources/list_changed"));
+    }
+
+    #[tokio::test]
+    async fn test_external_notifications_builder_method() {
+        // `external_notifications` should be equivalent to the constructor.
+        let (notif_tx, notif_rx) = notification_channel(8);
+        let transport = HttpTransport::new(create_test_router()).external_notifications(notif_rx);
+        let (app, session_handle) = transport.into_router_with_handle();
+
+        let session_id = init_session(&app).await;
+        let mut rx = {
+            let sessions = session_handle.store.sessions.read().await;
+            sessions
+                .get(&session_id)
+                .unwrap()
+                .notifications_tx
+                .subscribe()
+        };
+
+        notif_tx
+            .send(crate::context::ServerNotification::ToolsListChanged)
+            .await
+            .unwrap();
+
+        let json = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(json.contains("notifications/tools/list_changed"));
+    }
+
+    #[tokio::test]
+    async fn test_default_transport_has_no_external_fanout_task() {
+        // Smoke test: a transport without external notifications builds and
+        // serves normally. (Verifying the fan-out task is *not* spawned is
+        // hard to do directly; this just confirms we didn't accidentally
+        // gate the happy path on the channel being present.)
+        let transport = HttpTransport::new(create_test_router());
+        let (app, _handle) = transport.into_router_with_handle();
+        let _session_id = init_session(&app).await;
     }
 }

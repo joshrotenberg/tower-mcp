@@ -151,6 +151,11 @@ name = "horizontal_scaling"
 path = "../../examples/horizontal_scaling.rs"
 required-features = ["http"]
 
+[[example]]
+name = "external_notifications"
+path = "../../examples/external_notifications.rs"
+required-features = ["http"]
+
 # --- Middleware ---
 [[example]]
 name = "middleware"
