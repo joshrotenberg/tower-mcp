@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.1] - 2026-05-15
+
+### Bug Fixes
+
+- **client:** Use match guard for OAuth error_description fallback ([#794](https://github.com/joshrotenberg/tower-mcp/pull/794))
+- **stdio:** Bidi transport closes on parse error; strip UTF-8 BOM ([#797](https://github.com/joshrotenberg/tower-mcp/pull/797))
+
+### Documentation
+
+- Production deployment guide ([#780](https://github.com/joshrotenberg/tower-mcp/pull/780))
+
+### Features
+
+- Unix Domain Socket transport ([#773](https://github.com/joshrotenberg/tower-mcp/pull/773))
+- Pluggable SessionStore for horizontal scaling ([#778](https://github.com/joshrotenberg/tower-mcp/pull/778))
+- **event-store:** Pluggable SSE event store for stream resumption ([#779](https://github.com/joshrotenberg/tower-mcp/pull/779))
+- **session:** Restore unknown sessions from SessionStore + auto-reinitialize ([#782](https://github.com/joshrotenberg/tower-mcp/pull/782))
+- **context:** Typed helpers for server-originated tasks/* (SEP-1686) ([#793](https://github.com/joshrotenberg/tower-mcp/pull/793))
+- **router:** Reversible tool/resource/prompt disable/enable ([#792](https://github.com/joshrotenberg/tower-mcp/pull/792))
+- **http:** Host header validation with :authority fallback and rejection logging ([#798](https://github.com/joshrotenberg/tower-mcp/pull/798))
+- **http:** Allow external NotificationSender via with_notifications ([#801](https://github.com/joshrotenberg/tower-mcp/pull/801))
+
+### Testing
+
+- Close critical test coverage gaps ([#757](https://github.com/joshrotenberg/tower-mcp/pull/757)) ([#766](https://github.com/joshrotenberg/tower-mcp/pull/766))
+
+
+
 ## [0.10.0] - 2026-03-26
 
 ### Documentation

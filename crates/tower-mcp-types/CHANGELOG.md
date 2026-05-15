@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.1] - 2026-05-15
+
+### Features
+
+- **context:** Typed helpers for server-originated tasks/* (SEP-1686) ([#793](https://github.com/joshrotenberg/tower-mcp/pull/793))
+
+### Miscellaneous Tasks
+
+- Verify tower-mcp-types compiles for wasm32-unknown-unknown ([#784](https://github.com/joshrotenberg/tower-mcp/pull/784))
+
+
+
 ## [0.10.0] - 2026-03-26
 
 ### Documentation
