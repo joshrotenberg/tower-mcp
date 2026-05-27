@@ -9,8 +9,12 @@
  * 2. Matches them against our existing spec-tracking issues by SEP number
  * 3. Creates tracking issues only for SEPs in tracked statuses (in-review, accepted, final)
  * 4. Updates title prefixes when upstream status changes
- * 5. Closes tracking issues when SEPs move to untracked statuses (draft, proposal, dormant, rejected)
- * 6. Reopens tracking issues when SEPs advance back to a tracked status
+ * 5. Closes open tracking issues when SEPs move to untracked statuses (draft, proposal, dormant, rejected)
+ *
+ * Closed issues stay closed -- they were triaged by a human (implemented,
+ * not-applicable, etc.) and the workflow does not re-open them. If a SEP
+ * regresses upstream and later advances again, the summary log surfaces it
+ * and the human can reopen by hand.
  *
  * @param {Object} params - GitHub Actions context
  * @param {Object} params.github - Octokit REST client
@@ -120,27 +124,13 @@ module.exports = async ({ github, context, core }) => {
     if (sepToIssue.has(sepNumber)) {
       const existing = sepToIssue.get(sepNumber);
 
-      // Reopen closed issues if the SEP has advanced to a tracked status
+      // Closed issues stay closed. A human closed them deliberately
+      // (implemented, not-applicable, etc.) and the workflow has no
+      // business resurrecting them. If upstream genuinely needs new
+      // attention, the human will see it in the weekly sync summary
+      // and reopen by hand.
       if (existing.state === 'closed') {
-        if (isTracked) {
-          core.info(`Reopening SEP-${sepNumber}: status advanced to ${prefix}`);
-          await github.rest.issues.update({
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            issue_number: existing.number,
-            title: newTitle,
-            state: 'open',
-          });
-          await github.rest.issues.createComment({
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            issue_number: existing.number,
-            body: `Reopening: SEP status advanced to ${prefix.replace(/[\[\]]/g, '')}.`,
-          });
-          updated++;
-        } else {
-          skipped++;
-        }
+        skipped++;
         continue;
       }
 
@@ -161,7 +151,7 @@ module.exports = async ({ github, context, core }) => {
           issue_number: existing.number,
           body: `Closing: SEP status is ${prefix.replace(/[\[\]]/g, '')}. ` +
             'Only in-review, accepted, and final SEPs are tracked here. ' +
-            'This issue will be reopened automatically if the SEP advances.',
+            'Reopen by hand if this SEP advances back to a tracked status.',
         });
         closed++;
         continue;
