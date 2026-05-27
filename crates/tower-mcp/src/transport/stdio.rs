@@ -50,6 +50,17 @@ fn clean_input_line(line: &str) -> &str {
     line.strip_prefix('\u{feff}').unwrap_or(line).trim()
 }
 
+/// Build a JSON-RPC parse-error response from a parser/dispatch error message.
+///
+/// Per JSON-RPC 2.0, a parse error sets `code` to `-32700` and `id` to
+/// `null` (the request id cannot be recovered from unparseable input).
+/// Returning a single shared constructor keeps every stdio parse-error
+/// path consistent and gives the wire-format tests in
+/// [`tower_mcp_types::testing`] one stable surface to assert against.
+pub(crate) fn parse_error_response(message: impl Into<String>) -> JsonRpcResponse {
+    JsonRpcResponse::error(None, crate::error::JsonRpcError::parse_error(message))
+}
+
 /// Process a single line of JSON-RPC input
 ///
 /// Returns `Ok(Some(response))` for requests, `Ok(None)` for notifications.
@@ -270,10 +281,7 @@ impl StdioTransport {
                         }
                         Err(e) => {
                             tracing::error!(error = %e, "Error processing message");
-                            let error_response = JsonRpcResponse::error(
-                                None,
-                                crate::error::JsonRpcError::parse_error(e.to_string()),
-                            );
+                            let error_response = parse_error_response(e.to_string());
                             let response_json = serde_json::to_string(&error_response).map_err(|e| {
                                 Error::Transport(format!("Failed to serialize error: {}", e))
                             })?;
@@ -498,8 +506,14 @@ where
         id: Option<crate::protocol::RequestId>,
         message: &str,
     ) -> Result<()> {
-        let error_response =
-            JsonRpcResponse::error(id, crate::error::JsonRpcError::parse_error(message));
+        // `id` is currently always `None` from every call site (parse-error
+        // path), so use the shared helper; preserve the parameter for callers
+        // that may want to surface a known-id error in future.
+        let error_response = if let Some(id) = id {
+            JsonRpcResponse::error(Some(id), crate::error::JsonRpcError::parse_error(message))
+        } else {
+            parse_error_response(message)
+        };
         let response_json = serde_json::to_string(&error_response)
             .map_err(|e| Error::Transport(format!("Failed to serialize error: {}", e)))?;
         write_line_to_stdout(stdout, &response_json).await
@@ -568,10 +582,7 @@ impl SyncStdioTransport {
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "Error processing message");
-                    let error_response = JsonRpcResponse::error(
-                        None,
-                        crate::error::JsonRpcError::parse_error(e.to_string()),
-                    );
+                    let error_response = parse_error_response(e.to_string());
                     let response_json = serde_json::to_string(&error_response).map_err(|e| {
                         Error::Transport(format!("Failed to serialize error: {}", e))
                     })?;
@@ -783,10 +794,7 @@ impl BidirectionalStdioTransport {
             }
             Err(e) => {
                 tracing::error!(error = %e, "Error processing message");
-                let error_response = JsonRpcResponse::error(
-                    None,
-                    crate::error::JsonRpcError::parse_error(e.to_string()),
-                );
+                let error_response = parse_error_response(e.to_string());
                 let response_json = serde_json::to_string(&error_response)
                     .map_err(|e| Error::Transport(format!("Failed to serialize error: {}", e)))?;
                 self.write_line(&response_json, stdout).await?;
@@ -801,8 +809,7 @@ impl BidirectionalStdioTransport {
         message: &str,
         stdout: Arc<Mutex<tokio::io::Stdout>>,
     ) -> Result<()> {
-        let error_response =
-            JsonRpcResponse::error(None, crate::error::JsonRpcError::parse_error(message));
+        let error_response = parse_error_response(message);
         let response_json = serde_json::to_string(&error_response)
             .map_err(|e| Error::Transport(format!("Failed to serialize error: {}", e)))?;
         self.write_line(&response_json, stdout).await
@@ -925,6 +932,43 @@ mod tests {
     use crate::protocol::{
         LogLevel, LoggingMessageParams, ProgressParams, ProgressToken, TaskStatus, TaskStatusParams,
     };
+    use tower_mcp_types::testing::assert_jsonrpc_error_response;
+
+    // =========================================================================
+    // parse_error_response tests -- wire-format invariants on the stdio
+    // parse-error path (regression coverage for #802 / #803).
+    // =========================================================================
+
+    #[test]
+    fn parse_error_response_has_null_id_and_code_neg_32700() {
+        let resp = parse_error_response("expected value at line 1");
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_jsonrpc_error_response(&json);
+        assert!(
+            json["id"].is_null(),
+            "id must be null on parse error, got: {json}"
+        );
+        assert_eq!(json["error"]["code"].as_i64().unwrap(), -32700);
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("expected value"),
+            "error.message should carry the parser detail, got: {json}"
+        );
+    }
+
+    #[test]
+    fn parse_error_response_serializes_to_single_line_json() {
+        // The stdio loop writes responses line-delimited; the body itself
+        // must not contain embedded newlines or it would split the frame.
+        let resp = parse_error_response("oops\nstill oops");
+        let s = serde_json::to_string(&resp).unwrap();
+        assert!(
+            !s.contains('\n'),
+            "serialized parse-error response must be single-line, got: {s:?}"
+        );
+    }
 
     // =========================================================================
     // serialize_notification tests
