@@ -79,6 +79,8 @@ fn validate_list_tools_result() {
             meta: None,
         }],
         next_cursor: None,
+        ttl_ms: None,
+        cache_scope: None,
         meta: None,
     };
     validate_against_def(&result, "ListToolsResult");
@@ -99,6 +101,8 @@ fn validate_list_resources_result() {
             meta: None,
         }],
         next_cursor: None,
+        ttl_ms: None,
+        cache_scope: None,
         meta: None,
     };
     validate_against_def(&result, "ListResourcesResult");
@@ -135,6 +139,8 @@ fn validate_list_prompts_result() {
             meta: None,
         }],
         next_cursor: None,
+        ttl_ms: None,
+        cache_scope: None,
         meta: None,
     };
     validate_against_def(&result, "ListPromptsResult");
@@ -215,6 +221,8 @@ fn validate_list_resource_templates_result() {
             meta: None,
         }],
         next_cursor: None,
+        ttl_ms: None,
+        cache_scope: None,
         meta: None,
     };
     validate_against_def(&result, "ListResourceTemplatesResult");
@@ -633,7 +641,7 @@ fn validate_create_message_result() {
 fn validate_server_capabilities() {
     let caps = ServerCapabilities {
         experimental: None,
-        logging: Some(LoggingCapability {}),
+        logging: Some(LoggingCapability::default()),
         completions: None,
         prompts: Some(PromptsCapability { list_changed: true }),
         resources: Some(ResourcesCapability {
@@ -651,10 +659,14 @@ fn validate_server_capabilities() {
 fn validate_client_capabilities() {
     let caps = ClientCapabilities {
         experimental: None,
-        roots: Some(RootsCapability { list_changed: true }),
+        roots: Some(RootsCapability {
+            list_changed: true,
+            deprecated: None,
+        }),
         sampling: Some(SamplingCapability {
             tools: None,
             context: None,
+            deprecated: None,
         }),
         elicitation: Some(ElicitationCapability {
             form: None,

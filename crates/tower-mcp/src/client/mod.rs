@@ -184,7 +184,10 @@ impl McpClientBuilder {
     /// respond to `roots/list` requests with these roots.
     pub fn with_roots(mut self, roots: Vec<Root>) -> Self {
         self.roots = roots;
-        self.capabilities.roots = Some(RootsCapability { list_changed: true });
+        self.capabilities.roots = Some(RootsCapability {
+            list_changed: true,
+            deprecated: None,
+        });
         self
     }
 
