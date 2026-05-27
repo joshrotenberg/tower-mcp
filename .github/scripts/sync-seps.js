@@ -7,9 +7,9 @@
  * The script:
  * 1. Fetches all issues with the "SEP" label from upstream
  * 2. Matches them against our existing spec-tracking issues by SEP number
- * 3. Creates tracking issues only for SEPs in tracked statuses (draft, in-review, accepted, final)
+ * 3. Creates tracking issues only for SEPs in tracked statuses (in-review, accepted, final)
  * 4. Updates title prefixes when upstream status changes
- * 5. Closes tracking issues when SEPs move to untracked statuses (proposal, dormant, rejected)
+ * 5. Closes tracking issues when SEPs move to untracked statuses (draft, proposal, dormant, rejected)
  * 6. Reopens tracking issues when SEPs advance back to a tracked status
  *
  * @param {Object} params - GitHub Actions context
@@ -34,13 +34,14 @@ module.exports = async ({ github, context, core }) => {
   };
 
   // Only create/keep tracking issues for SEPs in these statuses.
-  // Draft and above are worth tracking; dormant, proposal, and rejected are not
-  // actionable enough to warrant an issue.
+  // In-review and above are worth tracking; draft, proposal, dormant, and
+  // rejected churn too much or are not actionable enough to warrant an issue.
+  // Drafts are still visible in the upstream label view if you want to
+  // browse them; tracking them here just adds noise.
   const TRACKED_STATUSES = new Set([
     '[accepted]',
     '[final]',
     '[in-review]',
-    '[draft]',
   ]);
 
   // SEPs to skip entirely (not actionable for tower-mcp).
@@ -159,7 +160,7 @@ module.exports = async ({ github, context, core }) => {
           repo: context.repo.repo,
           issue_number: existing.number,
           body: `Closing: SEP status is ${prefix.replace(/[\[\]]/g, '')}. ` +
-            'Only draft, in-review, accepted, and final SEPs are tracked. ' +
+            'Only in-review, accepted, and final SEPs are tracked here. ' +
             'This issue will be reopened automatically if the SEP advances.',
         });
         closed++;
