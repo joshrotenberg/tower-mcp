@@ -358,6 +358,8 @@ impl From<i32> for RequestId {
 // =============================================================================
 
 /// High-level MCP request (parsed from JSON-RPC)
+// Variant sizes are dictated by the spec, not optimizable without API churn.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum McpRequest {
@@ -511,6 +513,8 @@ pub struct RequestMeta {
 }
 
 /// High-level MCP response
+// Variant sizes are dictated by the spec, not optimizable without API churn.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 #[non_exhaustive]
@@ -667,7 +671,7 @@ pub struct ClientTasksElicitationCreateCapability {}
 /// use tower_mcp_types::protocol::RootsCapability;
 ///
 /// // Client advertising roots with change notification support
-/// let cap = RootsCapability { list_changed: true };
+/// let cap = RootsCapability { list_changed: true, deprecated: None };
 /// assert!(cap.list_changed);
 ///
 /// // The notification method is defined as a constant:
@@ -682,6 +686,11 @@ pub struct RootsCapability {
     /// Whether the client supports roots list changed notifications
     #[serde(default)]
     pub list_changed: bool,
+    /// SEP-2577: roots is deprecated in the 2026-07-28 protocol with a
+    /// 12-month minimum support window. Servers that advertise roots
+    /// can attach a `DeprecationInfo` to signal to clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deprecated: Option<DeprecationInfo>,
 }
 
 /// Represents a root directory or file that the server can operate on.
@@ -766,6 +775,10 @@ pub struct SamplingCapability {
     /// Support for context inclusion within sampling
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<SamplingContextCapability>,
+    /// SEP-2577: sampling is deprecated in the 2026-07-28 protocol with
+    /// a 12-month minimum support window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deprecated: Option<DeprecationInfo>,
 }
 
 /// Marker capability for tool use within sampling
@@ -1566,7 +1579,12 @@ pub struct ServerCapabilities {
 
 /// Logging capability declaration
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct LoggingCapability {}
+pub struct LoggingCapability {
+    /// SEP-2577: logging is deprecated in the 2026-07-28 protocol with
+    /// a 12-month minimum support window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deprecated: Option<DeprecationInfo>,
+}
 
 /// Capability for async task management
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1637,6 +1655,56 @@ pub struct PromptsCapability {
 }
 
 // =============================================================================
+// Lifecycle and caching annotations (SEP-2549, SEP-2577, SEP-2596)
+// =============================================================================
+
+/// Scope of a cached list result.
+///
+/// Per SEP-2549, servers can hint to clients how widely they may share a
+/// cached `tools/list`, `resources/list`, etc. response. `Session` means
+/// the cache is valid for the current client only; `Global` means it
+/// applies to any client of this server. `None` on the parent field
+/// means the server expresses no opinion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum CacheScope {
+    /// Cache is valid for the current session only.
+    Session,
+    /// Cache is valid across sessions (per-server, not per-client).
+    Global,
+}
+
+/// Deprecation metadata for spec features and capabilities.
+///
+/// Per SEP-2577 + SEP-2596, the spec now has a formal Active/Deprecated/
+/// Removed lifecycle for features. Servers can attach this metadata to
+/// capability declarations so clients (and tooling like `manifest.rs`
+/// exporters or codegen) can surface deprecation warnings.
+///
+/// All fields are optional so the struct stays forward-compatible with
+/// future SEP-2596 extensions. Setting any field signals the parent
+/// feature is deprecated.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeprecationInfo {
+    /// Protocol version in which this feature became deprecated
+    /// (e.g. `"2026-07-28"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    /// Protocol version in which this feature is scheduled for removal.
+    /// Per SEP-2577, the minimum window after `since` is 12 months.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remove_in: Option<String>,
+    /// Human-readable explanation, e.g. why this feature was deprecated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// Pointer to the replacement feature or SEP, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<String>,
+}
+
+// =============================================================================
 // Tools
 // =============================================================================
 
@@ -1655,6 +1723,14 @@ pub struct ListToolsResult {
     pub tools: Vec<ToolDefinition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// SEP-2549: client-cache TTL in milliseconds for this list response.
+    /// `None` means "no opinion -- client policy decides".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_ms: Option<u64>,
+    /// SEP-2549: scope the cached result applies to. `None` means
+    /// scope is unspecified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_scope: Option<CacheScope>,
     /// Optional protocol-level metadata
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
@@ -2411,6 +2487,12 @@ pub struct ListResourcesResult {
     pub resources: Vec<ResourceDefinition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// SEP-2549: client-cache TTL in milliseconds for this list response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_ms: Option<u64>,
+    /// SEP-2549: scope the cached result applies to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_scope: Option<CacheScope>,
     /// Optional protocol-level metadata
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
@@ -2702,6 +2784,12 @@ pub struct ListResourceTemplatesResult {
     /// Cursor for next page (if more templates available)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// SEP-2549: client-cache TTL in milliseconds for this list response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_ms: Option<u64>,
+    /// SEP-2549: scope the cached result applies to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_scope: Option<CacheScope>,
     /// Optional protocol-level metadata
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
@@ -2771,6 +2859,12 @@ pub struct ListPromptsResult {
     pub prompts: Vec<PromptDefinition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// SEP-2549: client-cache TTL in milliseconds for this list response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_ms: Option<u64>,
+    /// SEP-2549: scope the cached result applies to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_scope: Option<CacheScope>,
     /// Optional protocol-level metadata
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
@@ -4119,6 +4213,107 @@ mod tests {
         );
     }
 
+    // =========================================================================
+    // SEP-2549 (TTL on list results) wire-format tests
+    // =========================================================================
+
+    #[test]
+    fn list_tools_result_omits_ttl_and_cache_scope_by_default() {
+        let r = ListToolsResult {
+            tools: vec![],
+            next_cursor: None,
+            ttl_ms: None,
+            cache_scope: None,
+            meta: None,
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert!(
+            json.get("ttlMs").is_none(),
+            "ttlMs must be omitted when None, got: {json}"
+        );
+        assert!(
+            json.get("cacheScope").is_none(),
+            "cacheScope must be omitted when None, got: {json}"
+        );
+    }
+
+    #[test]
+    fn list_tools_result_emits_ttl_and_cache_scope_when_set() {
+        let r = ListToolsResult {
+            tools: vec![],
+            next_cursor: None,
+            ttl_ms: Some(60_000),
+            cache_scope: Some(CacheScope::Global),
+            meta: None,
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["ttlMs"], 60_000);
+        assert_eq!(json["cacheScope"], "global");
+    }
+
+    #[test]
+    fn cache_scope_roundtrips_via_lowercase_strings() {
+        for (scope, wire) in [
+            (CacheScope::Session, "session"),
+            (CacheScope::Global, "global"),
+        ] {
+            let s = serde_json::to_value(scope).unwrap();
+            assert_eq!(s, serde_json::json!(wire));
+            let back: CacheScope = serde_json::from_value(s).unwrap();
+            assert_eq!(back, scope);
+        }
+    }
+
+    // =========================================================================
+    // SEP-2577 / SEP-2596 (deprecation metadata) wire-format tests
+    // =========================================================================
+
+    #[test]
+    fn roots_capability_omits_deprecated_by_default() {
+        let cap = RootsCapability {
+            list_changed: true,
+            deprecated: None,
+        };
+        let json = serde_json::to_value(&cap).unwrap();
+        assert!(
+            json.get("deprecated").is_none(),
+            "deprecated must be omitted when None to avoid changing wire output for existing servers, got: {json}"
+        );
+    }
+
+    #[test]
+    fn capability_emits_deprecation_info_when_flagged() {
+        let cap = LoggingCapability {
+            deprecated: Some(DeprecationInfo {
+                since: Some("2026-07-28".into()),
+                remove_in: Some("2027-07-28".into()),
+                message: Some("Logging moves to OpenTelemetry per SEP-2577".into()),
+                replacement: Some(
+                    "https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2577"
+                        .into(),
+                ),
+            }),
+        };
+        let json = serde_json::to_value(&cap).unwrap();
+        let dep = &json["deprecated"];
+        assert_eq!(dep["since"], "2026-07-28");
+        assert_eq!(dep["removeIn"], "2027-07-28");
+        assert!(dep["message"].as_str().unwrap().contains("OpenTelemetry"));
+        assert!(dep["replacement"].as_str().unwrap().contains("2577"));
+    }
+
+    #[test]
+    fn deprecation_info_round_trip_with_partial_fields() {
+        // Forward-compatible: a server that only sets `since` round-trips
+        // without losing or adding fields.
+        let wire = r#"{"since":"2026-07-28"}"#;
+        let info: DeprecationInfo = serde_json::from_str(wire).unwrap();
+        assert_eq!(info.since.as_deref(), Some("2026-07-28"));
+        assert!(info.remove_in.is_none());
+        let back = serde_json::to_string(&info).unwrap();
+        assert_eq!(back, wire);
+    }
+
     #[test]
     fn cancelled_params_serializes_request_id_when_present() {
         let p = CancelledParams {
@@ -4431,7 +4626,10 @@ mod tests {
 
     #[test]
     fn test_roots_capability_serialization() {
-        let cap = RootsCapability { list_changed: true };
+        let cap = RootsCapability {
+            list_changed: true,
+            deprecated: None,
+        };
         let json = serde_json::to_value(&cap).unwrap();
         assert_eq!(json["listChanged"], true);
     }
@@ -4439,7 +4637,10 @@ mod tests {
     #[test]
     fn test_client_capabilities_with_roots() {
         let caps = ClientCapabilities {
-            roots: Some(RootsCapability { list_changed: true }),
+            roots: Some(RootsCapability {
+                list_changed: true,
+                deprecated: None,
+            }),
             sampling: None,
             elicitation: None,
             tasks: None,
@@ -5293,6 +5494,8 @@ mod tests {
         let response = McpResponse::ListTools(ListToolsResult {
             tools: vec![],
             next_cursor: Some("cursor123".to_string()),
+            ttl_ms: None,
+            cache_scope: None,
             meta: None,
         });
         let json = serde_json::to_string(&response).unwrap();

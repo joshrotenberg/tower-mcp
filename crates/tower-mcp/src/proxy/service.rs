@@ -628,6 +628,8 @@ async fn handle_list_tools(infos: Vec<EntryInfo>) -> Result<McpResponse, JsonRpc
     Ok(McpResponse::ListTools(ListToolsResult {
         tools,
         next_cursor: None,
+        ttl_ms: None,
+        cache_scope: None,
         meta: None,
     }))
 }
@@ -670,6 +672,8 @@ async fn handle_list_resources(infos: Vec<EntryInfo>) -> Result<McpResponse, Jso
     Ok(McpResponse::ListResources(ListResourcesResult {
         resources,
         next_cursor: None,
+        ttl_ms: None,
+        cache_scope: None,
         meta: None,
     }))
 }
@@ -691,6 +695,8 @@ async fn handle_list_resource_templates(
         ListResourceTemplatesResult {
             resource_templates,
             next_cursor: None,
+            ttl_ms: None,
+            cache_scope: None,
             meta: None,
         },
     ))
@@ -731,6 +737,8 @@ async fn handle_list_prompts(infos: Vec<EntryInfo>) -> Result<McpResponse, JsonR
     Ok(McpResponse::ListPrompts(ListPromptsResult {
         prompts,
         next_cursor: None,
+        ttl_ms: None,
+        cache_scope: None,
         meta: None,
     }))
 }

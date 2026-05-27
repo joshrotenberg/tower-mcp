@@ -1762,6 +1762,8 @@ impl McpRouter {
                 Ok(McpResponse::ListTools(ListToolsResult {
                     tools,
                     next_cursor,
+                    ttl_ms: None,
+                    cache_scope: None,
                     meta: None,
                 }))
             }
@@ -1978,6 +1980,8 @@ impl McpRouter {
                 Ok(McpResponse::ListResources(ListResourcesResult {
                     resources,
                     next_cursor,
+                    ttl_ms: None,
+                    cache_scope: None,
                     meta: None,
                 }))
             }
@@ -2016,6 +2020,8 @@ impl McpRouter {
                     ListResourceTemplatesResult {
                         resource_templates,
                         next_cursor,
+                        ttl_ms: None,
+                        cache_scope: None,
                         meta: None,
                     },
                 ))
@@ -2169,6 +2175,8 @@ impl McpRouter {
                 Ok(McpResponse::ListPrompts(ListPromptsResult {
                     prompts,
                     next_cursor,
+                    ttl_ms: None,
+                    cache_scope: None,
                     meta: None,
                 }))
             }
