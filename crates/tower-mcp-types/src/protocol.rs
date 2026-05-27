@@ -91,8 +91,9 @@ pub struct JsonRpcResultResponse {
 pub struct JsonRpcErrorResponse {
     /// JSON-RPC version, always "2.0".
     pub jsonrpc: String,
-    /// Request identifier (may be null for parse errors).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Request identifier. MUST be present per JSON-RPC 2.0; serialized as
+    /// `null` when the id could not be determined (e.g. parse errors).
+    #[serde(default)]
     pub id: Option<RequestId>,
     /// The error details.
     pub error: JsonRpcError,
@@ -4005,6 +4006,40 @@ impl McpNotification {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::JsonRpcError;
+
+    #[test]
+    fn error_response_serializes_id_null_when_unknown() {
+        let resp = JsonRpcResponse::error(None, JsonRpcError::parse_error("bad json"));
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(
+            json.get("id").is_some(),
+            "id field must be present per JSON-RPC 2.0, got: {json}"
+        );
+        assert!(
+            json["id"].is_null(),
+            "id must serialize as null when unknown, got: {}",
+            json["id"]
+        );
+    }
+
+    #[test]
+    fn error_response_serializes_id_when_known() {
+        let resp =
+            JsonRpcResponse::error(Some(RequestId::Number(7)), JsonRpcError::parse_error("bad"));
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["id"], serde_json::json!(7));
+    }
+
+    #[test]
+    fn error_response_deserializes_null_id() {
+        let wire = r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"x"}}"#;
+        let resp: JsonRpcResponse = serde_json::from_str(wire).unwrap();
+        match resp {
+            JsonRpcResponse::Error(e) => assert!(e.id.is_none()),
+            _ => panic!("expected Error variant"),
+        }
+    }
 
     #[test]
     fn test_content_text_constructor() {
