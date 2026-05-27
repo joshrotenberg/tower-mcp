@@ -451,8 +451,16 @@ pub enum McpNotification {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CancelledParams {
-    /// The ID of the request to cancel (required for non-task cancellations)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The ID of the request to cancel.
+    ///
+    /// Per the MCP spec, `requestId` MUST be present on
+    /// `notifications/cancelled`. The field is `Option<RequestId>` for
+    /// backward compatibility on the receive side -- if a peer sends a
+    /// malformed notification without an id, deserialization still
+    /// succeeds and we log and drop it. When `None`, the field
+    /// serializes as `"requestId": null`, which a spec-strict receiver
+    /// will reject (the correct behavior for a malformed send).
+    #[serde(default)]
     pub request_id: Option<RequestId>,
     /// Optional reason for cancellation
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4007,6 +4015,57 @@ impl McpNotification {
 mod tests {
     use super::*;
     use crate::error::JsonRpcError;
+
+    #[test]
+    fn cancelled_params_serializes_request_id_when_present() {
+        let p = CancelledParams {
+            request_id: Some(RequestId::Number(42)),
+            reason: Some("user abort".into()),
+            meta: None,
+        };
+        let json = serde_json::to_value(&p).unwrap();
+        assert_eq!(json["requestId"], serde_json::json!(42));
+        assert_eq!(json["reason"], serde_json::json!("user abort"));
+    }
+
+    #[test]
+    fn cancelled_params_emits_null_request_id_when_absent() {
+        // Spec REQUIRES requestId on notifications/cancelled. We keep
+        // Option<RequestId> on the receive side for tolerance, but we
+        // must NOT silently omit it on the send side -- emit null so a
+        // strict receiver can detect and reject the malformed message.
+        let p = CancelledParams {
+            request_id: None,
+            reason: None,
+            meta: None,
+        };
+        let json = serde_json::to_value(&p).unwrap();
+        assert!(
+            json.get("requestId").is_some(),
+            "requestId field must be present per MCP spec, got: {json}"
+        );
+        assert!(
+            json["requestId"].is_null(),
+            "requestId must serialize as null when unset, got: {}",
+            json["requestId"]
+        );
+    }
+
+    #[test]
+    fn cancelled_params_deserializes_null_request_id() {
+        let wire = r#"{"requestId":null,"reason":"x"}"#;
+        let p: CancelledParams = serde_json::from_str(wire).unwrap();
+        assert!(p.request_id.is_none());
+        assert_eq!(p.reason.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn cancelled_params_deserializes_missing_request_id() {
+        // Tolerate peers that omit the field entirely.
+        let wire = r#"{"reason":"x"}"#;
+        let p: CancelledParams = serde_json::from_str(wire).unwrap();
+        assert!(p.request_id.is_none());
+    }
 
     #[test]
     fn error_response_serializes_id_null_when_unknown() {
