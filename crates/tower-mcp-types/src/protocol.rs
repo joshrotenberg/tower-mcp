@@ -395,6 +395,8 @@ pub enum McpRequest {
     SetLoggingLevel(SetLogLevelParams),
     /// Request completion suggestions
     Complete(CompleteParams),
+    /// SEP-2575: discover server capabilities without an initialize handshake
+    Discover(DiscoverParams),
     /// Unknown method
     Unknown {
         method: String,
@@ -423,6 +425,7 @@ impl McpRequest {
             McpRequest::Ping => "ping",
             McpRequest::SetLoggingLevel(_) => "logging/setLevel",
             McpRequest::Complete(_) => "completion/complete",
+            McpRequest::Discover(_) => "server/discover",
             McpRequest::Unknown { method, .. } => method,
         }
     }
@@ -530,6 +533,8 @@ pub enum McpResponse {
     SetLoggingLevel(EmptyResult),
     Complete(CompleteResult),
     Pong(EmptyResult),
+    /// SEP-2575 `server/discover` response.
+    Discover(DiscoverResult),
     Empty(EmptyResult),
     /// Raw JSON value for experimental/extension methods.
     Raw(Value),
@@ -1490,6 +1495,46 @@ pub struct InitializeResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
     /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
+}
+
+// =============================================================================
+// server/discover (SEP-2575)
+// =============================================================================
+
+/// Parameters for the `server/discover` RPC (SEP-2575).
+///
+/// `server/discover` lets clients fetch server capabilities, supported
+/// protocol versions, and implementation info **without** establishing a
+/// session or going through the initialize handshake. It is the stateless
+/// replacement for `initialize` in the 2026-07-28 protocol.
+///
+/// The request takes no parameters today; the empty struct is reserved
+/// so future SEPs can add optional fields without breaking callers.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DiscoverParams {}
+
+/// Result of the `server/discover` RPC (SEP-2575).
+///
+/// Shape mirrors `InitializeResult` with the singular `protocol_version`
+/// replaced by `supported_versions` -- a `server/discover` call is
+/// version-independent, so the server enumerates every version it can
+/// speak and the client picks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoverResult {
+    /// All protocol versions this server can speak. The client picks one
+    /// and signals it via `MCP-Protocol-Version` on subsequent requests.
+    pub supported_versions: Vec<String>,
+    /// Server capabilities (same shape as the `initialize` result).
+    pub capabilities: ServerCapabilities,
+    /// Server implementation info.
+    pub server_info: Implementation,
+    /// Optional instructions describing how to use this server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    /// Optional protocol-level metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
 }
@@ -3976,6 +4021,11 @@ impl McpRequest {
                 let p: CompleteParams = serde_json::from_value(params)?;
                 Ok(McpRequest::Complete(p))
             }
+            "server/discover" => {
+                // SEP-2575: empty-or-missing params is valid.
+                let p: DiscoverParams = serde_json::from_value(params).unwrap_or_default();
+                Ok(McpRequest::Discover(p))
+            }
             method => Ok(McpRequest::Unknown {
                 method: method.to_string(),
                 params: req.params.clone(),
@@ -4015,6 +4065,59 @@ impl McpNotification {
 mod tests {
     use super::*;
     use crate::error::JsonRpcError;
+
+    // =========================================================================
+    // SEP-2575 (server/discover) wire-format tests
+    // =========================================================================
+
+    #[test]
+    fn discover_request_round_trips_with_no_params() {
+        // Per SEP-2575 the params field is empty/optional. Both shapes
+        // round-trip into McpRequest::Discover.
+        let no_params = r#"{"jsonrpc":"2.0","id":1,"method":"server/discover"}"#;
+        let req: JsonRpcRequest = serde_json::from_str(no_params).unwrap();
+        let parsed = McpRequest::from_jsonrpc(&req).unwrap();
+        assert!(matches!(parsed, McpRequest::Discover(_)));
+        assert_eq!(parsed.method_name(), "server/discover");
+
+        let empty_params = r#"{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{}}"#;
+        let req: JsonRpcRequest = serde_json::from_str(empty_params).unwrap();
+        let parsed = McpRequest::from_jsonrpc(&req).unwrap();
+        assert!(matches!(parsed, McpRequest::Discover(_)));
+    }
+
+    #[test]
+    fn discover_result_serializes_supported_versions_array() {
+        let r = DiscoverResult {
+            supported_versions: vec!["2026-07-28".into(), "2025-11-25".into()],
+            capabilities: ServerCapabilities::default(),
+            server_info: Implementation {
+                name: "test-server".into(),
+                version: "1.0.0".into(),
+                title: None,
+                description: None,
+                icons: None,
+                website_url: None,
+                meta: None,
+            },
+            instructions: None,
+            meta: None,
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            json["supportedVersions"],
+            serde_json::json!(["2026-07-28", "2025-11-25"])
+        );
+        assert!(
+            json.get("protocolVersion").is_none(),
+            "server/discover must use supportedVersions, not protocolVersion, got: {json}"
+        );
+        assert_eq!(json["serverInfo"]["name"], "test-server");
+        assert!(
+            json.get("instructions").is_none(),
+            "instructions must be omitted when None, got: {json}"
+        );
+    }
 
     #[test]
     fn cancelled_params_serializes_request_id_when_present() {

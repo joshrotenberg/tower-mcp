@@ -1691,6 +1691,38 @@ impl McpRouter {
                 }))
             }
 
+            McpRequest::Discover(_) => {
+                // SEP-2575 server/discover -- stateless capability advertisement.
+                // Unlike initialize, this does NOT transition session state and
+                // does not require a session at all. Returns the same capability
+                // surface plus the full set of protocol versions we can speak,
+                // so clients can pick one and signal it via MCP-Protocol-Version
+                // on subsequent requests.
+                tracing::debug!("Stateless server/discover request");
+                Ok(McpResponse::Discover(DiscoverResult {
+                    supported_versions: crate::protocol::SUPPORTED_PROTOCOL_VERSIONS
+                        .iter()
+                        .map(|v| (*v).to_string())
+                        .collect(),
+                    capabilities: self.capabilities(),
+                    server_info: Implementation {
+                        name: self.inner.server_name.clone(),
+                        version: self.inner.server_version.clone(),
+                        title: self.inner.server_title.clone(),
+                        description: self.inner.server_description.clone(),
+                        icons: self.inner.server_icons.clone(),
+                        website_url: self.inner.server_website_url.clone(),
+                        meta: None,
+                    },
+                    instructions: if let Some(config) = &self.inner.auto_instructions {
+                        Some(self.inner.generate_instructions(config))
+                    } else {
+                        self.inner.instructions.clone()
+                    },
+                    meta: None,
+                }))
+            }
+
             McpRequest::ListTools(params) => {
                 let filter = self.inner.tool_filter.as_ref();
                 let disabled = self.inner.disabled_tools.read().unwrap().clone();
@@ -2309,35 +2341,6 @@ impl McpRouter {
                 } else {
                     // No completion handler registered, return empty completions
                     Ok(McpResponse::Complete(CompleteResult::new(vec![])))
-                }
-            }
-
-            McpRequest::Unknown { ref method, .. } if method == "server/discover" => {
-                #[cfg(feature = "stateless")]
-                {
-                    use crate::protocol::SUPPORTED_PROTOCOL_VERSIONS;
-                    let result = crate::stateless::DiscoverResult {
-                        supported_versions: SUPPORTED_PROTOCOL_VERSIONS
-                            .iter()
-                            .map(|v| v.to_string())
-                            .collect(),
-                        capabilities: self.capabilities(),
-                        server_info: Implementation {
-                            name: self.inner.server_name.clone(),
-                            version: self.inner.server_version.clone(),
-                            title: self.inner.server_title.clone(),
-                            description: self.inner.server_description.clone(),
-                            icons: self.inner.server_icons.clone(),
-                            website_url: None,
-                            meta: None,
-                        },
-                        instructions: self.inner.instructions.clone(),
-                    };
-                    Ok(McpResponse::Raw(serde_json::to_value(result).unwrap()))
-                }
-                #[cfg(not(feature = "stateless"))]
-                {
-                    Err(Error::JsonRpc(JsonRpcError::method_not_found(method)))
                 }
             }
 

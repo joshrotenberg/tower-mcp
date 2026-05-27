@@ -24,9 +24,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::{
-    ClientCapabilities, Implementation, ProgressToken, Root, ServerCapabilities,
-};
+use crate::protocol::{ClientCapabilities, ProgressToken, Root};
 
 // =============================================================================
 // Extended _meta fields for stateless mode
@@ -104,29 +102,12 @@ pub enum LogLevel {
 // server/discover RPC
 // =============================================================================
 
-/// Request parameters for the `server/discover` RPC (SEP-1442).
-///
-/// Allows clients to query server capabilities without establishing a session.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct DiscoverParams {}
+// SEP-1442's `server/discover` shape was promoted to the always-available
+// `protocol` module when SEP-2575 finalized. Re-export from here so existing
+// imports keep working; new code should import from `protocol` directly.
 
-/// Response for the `server/discover` RPC (SEP-1442).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DiscoverResult {
-    /// Protocol versions supported by this server.
-    pub supported_versions: Vec<String>,
-
-    /// Server capabilities.
-    pub capabilities: ServerCapabilities,
-
-    /// Server implementation info.
-    pub server_info: Implementation,
-
-    /// Optional instructions for using this server.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub instructions: Option<String>,
-}
+#[doc(inline)]
+pub use crate::protocol::{DiscoverParams, DiscoverResult};
 
 // =============================================================================
 // Error codes (SEP-1442)
@@ -300,6 +281,8 @@ mod tests {
 
     #[test]
     fn test_discover_result_serialization() {
+        use crate::protocol::{Implementation, ServerCapabilities};
+
         let result = DiscoverResult {
             supported_versions: vec!["2025-11-25".to_string(), "2025-03-26".to_string()],
             capabilities: ServerCapabilities::default(),
@@ -313,6 +296,7 @@ mod tests {
                 meta: None,
             },
             instructions: Some("Test instructions".to_string()),
+            meta: None,
         };
 
         let json = serde_json::to_value(&result).unwrap();
