@@ -3647,7 +3647,12 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"]["code"].as_i64().unwrap(), -32700); // Parse error
+        tower_mcp_types::testing::assert_jsonrpc_error_response(&json);
+        assert!(
+            json["id"].is_null(),
+            "id must be null on parse error: {json}"
+        );
+        assert_eq!(json["error"]["code"].as_i64().unwrap(), -32700);
     }
 
     #[tokio::test]

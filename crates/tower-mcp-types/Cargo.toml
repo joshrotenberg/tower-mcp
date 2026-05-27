@@ -13,6 +13,11 @@ readme = "../../README.md"
 keywords = ["mcp", "json-rpc", "ai", "llm", "protocol"]
 categories = ["network-programming"]
 
+[features]
+default = []
+# Wire-format assertion helpers for JSON-RPC test cases.
+testing = []
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true

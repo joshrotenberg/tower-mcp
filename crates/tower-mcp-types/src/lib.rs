@@ -23,6 +23,9 @@
 pub mod error;
 pub mod protocol;
 
+#[cfg(feature = "testing")]
+pub mod testing;
+
 // Convenience re-exports
 pub use error::{
     BoxError, Error, ErrorCode, JsonRpcError, McpErrorCode, Result, ResultExt, ToolError,
