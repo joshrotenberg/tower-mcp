@@ -37,18 +37,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --target wasm32-unknown-unknown -p tower-mcp-types
 
-  semver:
-    name: SemVer
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: obi1kenobi/cargo-semver-checks-action@v2
-        with:
-          package: tower-mcp,tower-mcp-types
+  # SemVer check is disabled pre-1.0 -- see the tracking issue for the
+  # re-enable plan. While the crate is in active 0.x development tracking
+  # rapid MCP spec change, essentially every PR is a `feat!:` breaking
+  # change by strict semver rules, so the check is pure noise. Convention
+  # is to mark breaking commits with `!` (per CLAUDE.md) and let
+  # release-plz drive 0.x -> 0.(x+1).0 bumps from the commit log.
+  #
+  # semver:
+  #   name: SemVer
+  #   if: github.event_name == 'pull_request'
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v6
+  #     - uses: dtolnay/rust-toolchain@stable
+  #     - uses: Swatinem/rust-cache@v2
+  #     - uses: obi1kenobi/cargo-semver-checks-action@v2
+  #       with:
+  #         package: tower-mcp,tower-mcp-types
 
   fmt:
     name: Format
