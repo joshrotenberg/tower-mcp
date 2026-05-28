@@ -38,7 +38,7 @@ If you've used [axum](https://docs.rs/axum), tower-mcp's API will feel familiar:
 | **Tower-native middleware** | Timeout, rate-limit, auth, tracing -- on the whole server or on individual tools. Any `tower::Layer` works. |
 | **All transports** | stdio, HTTP/SSE (with stream resumption), WebSocket, and child process. Same router, any transport. |
 | **In-process testing** | `TestClient` lets you test MCP servers without spawning a subprocess or opening a socket. |
-| **Conformance** | 39/39 server and 265/265 client conformance checks pass in CI on every PR. |
+| **Conformance** | 39/39 server checks (30 scenarios) and 265/265 client checks (24 scenarios) from the [official MCP conformance suite](https://github.com/modelcontextprotocol/conformance) pass in CI on every PR. The suite is upstream-maintained and grows with the spec, so this is a moving target -- not a one-time achievement. [SEP-2484](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2484) (accepted) makes conformance scenarios a prerequisite for standards-track SEPs reaching `final`. |
 | **Capability filtering** | Session-based tool/resource/prompt visibility for multi-tenant patterns. |
 | **No proc macros required** | Builder pattern API with optional trait-based tools. Nothing hidden behind `#[derive]`. Optional `#[tool_fn]` / `#[prompt_fn]` / `#[resource_fn]` macros available for convenience (feature: `macros`). |
 | **Async tasks** | Full task lifecycle -- background execution, cancellation, TTL cleanup, per-tool task support mode. Clients can poll or wait for long-running tool results. |
@@ -574,7 +574,14 @@ let router = McpRouter::new()
 
 ## Protocol Compliance
 
-tower-mcp targets the [MCP specification 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) with backward compatibility for `2025-03-26`. The [official MCP conformance test suite](https://github.com/joshrotenberg/tower-mcp/actions/workflows/conformance.yml) runs in CI on every PR, currently passing 39/39 server tests and 265/265 client checks (24/24 scenarios).
+tower-mcp targets the [MCP specification 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) with backward compatibility for `2025-03-26`. The [official MCP conformance test suite](https://github.com/modelcontextprotocol/conformance) runs in CI on every PR via [`conformance.yml`](https://github.com/joshrotenberg/tower-mcp/actions/workflows/conformance.yml), currently passing:
+
+- **Server:** 39/39 checks across 30 scenarios
+- **Client:** 265/265 checks across 24 scenarios (3 SHOULD-level warnings)
+
+Numbers above are from `@modelcontextprotocol/conformance@0.1.15`, run on every PR. Because the suite is upstream-maintained and grows with the spec, these counts shift as new scenarios are added -- treat the green CI badge as the source of truth, not any single snapshot.
+
+[SEP-2484](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2484) (accepted) makes merged conformance scenarios a prerequisite for standards-track SEPs reaching `final`, which elevates the conformance suite from a nice-to-have to spec-gating infrastructure. We run it on every PR to catch regressions early and to stay ahead of new scenarios as the spec evolves.
 
 - [x] [JSON-RPC 2.0 message format](https://modelcontextprotocol.io/specification/2025-11-25/basic#messages)
 - [x] [Protocol version negotiation](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle#version-negotiation) (supports `2025-11-25` and `2025-03-26`)
