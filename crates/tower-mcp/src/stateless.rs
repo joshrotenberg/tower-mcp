@@ -24,16 +24,36 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::{ClientCapabilities, ProgressToken, Root};
+use crate::protocol::{ClientCapabilities, Implementation, ProgressToken};
 
 // =============================================================================
-// Extended _meta fields for stateless mode
+// Per-request _meta (SEP-2575 RequestMetaObject)
 // =============================================================================
 
-/// Extended request metadata for stateless MCP (SEP-1442).
+/// Per-request metadata carried in JSON-RPC `_meta` per SEP-2575.
 ///
-/// In stateless mode, each request must be self-contained. This extended metadata
-/// allows passing protocol version, session ID, and client capabilities per-request.
+/// In the 2026-07-28 protocol every request is self-contained -- there is no
+/// initialize handshake and no session. The fields previously negotiated at
+/// init time (protocol version, client identity, client capabilities) ride on
+/// each request via the `_meta` object. The MCP-defined keys are reverse-DNS
+/// namespaced under `io.modelcontextprotocol/`.
+///
+/// Wire shape (per the FINAL spec):
+///
+/// ```json
+/// "_meta": {
+///   "progressToken": "...",
+///   "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+///   "io.modelcontextprotocol/clientInfo": { "name": "...", "version": "..." },
+///   "io.modelcontextprotocol/clientCapabilities": { ... },
+///   "io.modelcontextprotocol/logLevel": "info"
+/// }
+/// ```
+///
+/// Three of these are REQUIRED per the spec (`protocolVersion`, `clientInfo`,
+/// `clientCapabilities`). They are typed as `Option<_>` here so deserialization
+/// stays tolerant of partial/transitional clients; server-side validation
+/// should reject requests that lack the required fields.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatelessRequestMeta {
@@ -41,44 +61,36 @@ pub struct StatelessRequestMeta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress_token: Option<ProgressToken>,
 
-    /// The MCP protocol version for this request (SEP-1442).
+    /// The MCP protocol version this request targets.
     ///
-    /// For HTTP transport, this must match the `MCP-Protocol-Version` header.
+    /// For HTTP transport this MUST match the `MCP-Protocol-Version` header
+    /// (see SEP-2243). Spec key: `io.modelcontextprotocol/protocolVersion`.
     #[serde(
-        rename = "modelcontextprotocol.io/mcpProtocolVersion",
+        rename = "io.modelcontextprotocol/protocolVersion",
         skip_serializing_if = "Option::is_none"
     )]
     pub protocol_version: Option<String>,
 
-    /// Optional session ID for requests that need session affinity (SEP-1442).
-    ///
-    /// For HTTP transport, this must match the `MCP-Session-Id` header.
+    /// Identifies the client software making this request. REQUIRED per
+    /// SEP-2575 (the spec uses non-Option types; we keep `Option` for
+    /// deserialization tolerance).
     #[serde(
-        rename = "modelcontextprotocol.io/sessionId",
+        rename = "io.modelcontextprotocol/clientInfo",
         skip_serializing_if = "Option::is_none"
     )]
-    pub session_id: Option<String>,
+    pub client_info: Option<Implementation>,
 
-    /// Client capabilities for this specific request (SEP-1442).
-    ///
-    /// Allows the server to know what optional features the client can handle
-    /// for this specific transaction.
+    /// Capabilities the client advertises for this specific request.
+    /// REQUIRED per SEP-2575.
     #[serde(
-        rename = "modelcontextprotocol.io/clientCapabilities",
+        rename = "io.modelcontextprotocol/clientCapabilities",
         skip_serializing_if = "Option::is_none"
     )]
     pub client_capabilities: Option<ClientCapabilities>,
 
-    /// Client roots for this request (SEP-1442).
+    /// Optional per-request log-level override.
     #[serde(
-        rename = "modelcontextprotocol.io/roots",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub roots: Option<Vec<Root>>,
-
-    /// Log level for this request (SEP-1442).
-    #[serde(
-        rename = "modelcontextprotocol.io/logLevel",
+        rename = "io.modelcontextprotocol/logLevel",
         skip_serializing_if = "Option::is_none"
     )]
     pub log_level: Option<LogLevel>,
@@ -250,9 +262,9 @@ impl StatelessRequestMeta {
         self.client_capabilities.is_some()
     }
 
-    /// Check if this request includes roots.
-    pub fn has_roots(&self) -> bool {
-        self.roots.is_some()
+    /// Check if this request includes client identity.
+    pub fn has_client_info(&self) -> bool {
+        self.client_info.is_some()
     }
 }
 
@@ -261,34 +273,77 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_stateless_meta_serialization() {
+    fn meta_serializes_with_spec_keys() {
+        use crate::protocol::{ClientCapabilities, Implementation};
+
         let meta = StatelessRequestMeta {
             progress_token: None,
-            protocol_version: Some("2025-11-25".to_string()),
-            session_id: Some("abc123".to_string()),
-            client_capabilities: None,
-            roots: None,
+            protocol_version: Some("2026-07-28".to_string()),
+            client_info: Some(Implementation {
+                name: "test-client".into(),
+                version: "1.0.0".into(),
+                title: None,
+                description: None,
+                icons: None,
+                website_url: None,
+                meta: None,
+            }),
+            client_capabilities: Some(ClientCapabilities::default()),
             log_level: Some(LogLevel::Info),
         };
 
-        let json = serde_json::to_string(&meta).unwrap();
-        assert!(json.contains("modelcontextprotocol.io/mcpProtocolVersion"));
-        assert!(json.contains("modelcontextprotocol.io/sessionId"));
-        assert!(json.contains("modelcontextprotocol.io/logLevel"));
+        let json: serde_json::Value = serde_json::to_value(&meta).unwrap();
+        // SEP-2575 reverse-DNS namespace `io.modelcontextprotocol/`.
+        assert_eq!(
+            json["io.modelcontextprotocol/protocolVersion"],
+            "2026-07-28"
+        );
+        assert_eq!(
+            json["io.modelcontextprotocol/clientInfo"]["name"],
+            "test-client"
+        );
+        assert!(json["io.modelcontextprotocol/clientCapabilities"].is_object());
+        assert_eq!(json["io.modelcontextprotocol/logLevel"], "info");
+
+        // Confirm the dropped SEP-1442 draft keys are NOT emitted.
+        assert!(
+            json.get("modelcontextprotocol.io/mcpProtocolVersion")
+                .is_none()
+        );
+        assert!(json.get("modelcontextprotocol.io/sessionId").is_none());
+        assert!(json.get("io.modelcontextprotocol/sessionId").is_none());
+        assert!(json.get("io.modelcontextprotocol/roots").is_none());
     }
 
     #[test]
-    fn test_stateless_meta_deserialization() {
+    fn meta_deserializes_from_spec_keys() {
         let json = r#"{
-            "modelcontextprotocol.io/mcpProtocolVersion": "2025-11-25",
-            "modelcontextprotocol.io/sessionId": "test-session",
-            "modelcontextprotocol.io/logLevel": "debug"
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": {
+                "name": "test-client",
+                "version": "1.0.0"
+            },
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "io.modelcontextprotocol/logLevel": "debug"
         }"#;
-
         let meta: StatelessRequestMeta = serde_json::from_str(json).unwrap();
-        assert_eq!(meta.protocol_version, Some("2025-11-25".to_string()));
-        assert_eq!(meta.session_id, Some("test-session".to_string()));
+        assert_eq!(meta.protocol_version.as_deref(), Some("2026-07-28"));
+        assert_eq!(meta.client_info.as_ref().unwrap().name, "test-client");
+        assert!(meta.has_client_capabilities());
+        assert!(meta.has_client_info());
         assert_eq!(meta.log_level, Some(LogLevel::Debug));
+    }
+
+    #[test]
+    fn from_params_extracts_meta_object() {
+        let params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28"
+            },
+            "other": "ignored"
+        });
+        let meta = StatelessRequestMeta::from_params(&params).expect("meta present");
+        assert_eq!(meta.protocol_version.as_deref(), Some("2026-07-28"));
     }
 
     #[test]
@@ -350,23 +405,6 @@ mod tests {
     }
 
     #[test]
-    fn test_from_params() {
-        let params = serde_json::json!({
-            "name": "test-tool",
-            "_meta": {
-                "modelcontextprotocol.io/mcpProtocolVersion": "2025-11-25",
-                "modelcontextprotocol.io/sessionId": "session-123",
-                "modelcontextprotocol.io/logLevel": "debug"
-            }
-        });
-
-        let meta = StatelessRequestMeta::from_params(&params).unwrap();
-        assert_eq!(meta.protocol_version, Some("2025-11-25".to_string()));
-        assert_eq!(meta.session_id, Some("session-123".to_string()));
-        assert_eq!(meta.log_level, Some(LogLevel::Debug));
-    }
-
-    #[test]
     fn test_from_params_no_meta() {
         let params = serde_json::json!({
             "name": "test-tool"
@@ -381,14 +419,30 @@ mod tests {
         let meta = StatelessRequestMeta {
             progress_token: None,
             protocol_version: None,
-            session_id: None,
+            client_info: None,
             client_capabilities: Some(ClientCapabilities::default()),
-            roots: None,
             log_level: None,
         };
         assert!(meta.has_client_capabilities());
 
         let meta_without = StatelessRequestMeta::default();
         assert!(!meta_without.has_client_capabilities());
+    }
+
+    #[test]
+    fn legacy_sep1442_draft_keys_are_silently_ignored() {
+        // Old `modelcontextprotocol.io/...` namespace keys from the SEP-1442
+        // draft no longer match the spec. They deserialize as None (silently
+        // dropped) -- existing tower-mcp clients that emit them will not
+        // produce errors but the new fields will appear absent.
+        let json = r#"{
+            "modelcontextprotocol.io/mcpProtocolVersion": "2025-11-25",
+            "modelcontextprotocol.io/sessionId": "old",
+            "modelcontextprotocol.io/roots": []
+        }"#;
+        let meta: StatelessRequestMeta = serde_json::from_str(json).unwrap();
+        assert!(meta.protocol_version.is_none());
+        assert!(meta.client_info.is_none());
+        assert!(meta.client_capabilities.is_none());
     }
 }
