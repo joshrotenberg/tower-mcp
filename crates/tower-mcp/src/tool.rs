@@ -682,9 +682,11 @@ impl Tool {
         icons: Option<Vec<ToolIcon>>,
         annotations: Option<ToolAnnotations>,
         task_support: TaskSupportMode,
+        input_schema_override: Option<Value>,
         handler: H,
     ) -> Self {
-        let input_schema = ensure_object_schema(handler.input_schema());
+        let input_schema =
+            ensure_object_schema(input_schema_override.unwrap_or_else(|| handler.input_schema()));
         let handler_service = ToolHandlerService::new(handler);
         let catch_error = ToolCatchError::new(handler_service);
         let service = BoxCloneService::new(catch_error);
@@ -735,6 +737,7 @@ pub struct ToolBuilder {
     title: Option<String>,
     description: Option<String>,
     output_schema: Option<Value>,
+    input_schema_override: Option<Value>,
     icons: Option<Vec<ToolIcon>>,
     annotations: Option<ToolAnnotations>,
     task_support: TaskSupportMode,
@@ -763,6 +766,7 @@ impl ToolBuilder {
             title: None,
             description: None,
             output_schema: None,
+            input_schema_override: None,
             icons: None,
             annotations: None,
             task_support: TaskSupportMode::default(),
@@ -782,6 +786,7 @@ impl ToolBuilder {
             title: None,
             description: None,
             output_schema: None,
+            input_schema_override: None,
             icons: None,
             annotations: None,
             task_support: TaskSupportMode::default(),
@@ -811,6 +816,63 @@ impl ToolBuilder {
     /// Set the output schema (JSON Schema for structured output)
     pub fn output_schema(mut self, schema: Value) -> Self {
         self.output_schema = Some(schema);
+        self
+    }
+
+    /// Override the input schema (JSON Schema for tool arguments).
+    ///
+    /// By default, the input schema is auto-generated from the handler's input
+    /// type via [`schemars::JsonSchema`]. Calling this method overrides that
+    /// auto-generation with an explicit schema. This is particularly useful for
+    /// handlers that use [`RawArgs`](crate::extract::RawArgs) (which has no typed
+    /// input struct) but still need to declare a non-trivial schema, or to
+    /// supply richer JSON Schema 2020-12 constructs (`oneOf`, `anyOf`,
+    /// `if`/`then`, `$ref`, etc.) that schemars cannot express.
+    ///
+    /// The supplied schema is normalized via the same `type: "object"` check
+    /// the auto-generated schemas go through, so MCP-spec compliance is
+    /// preserved.
+    ///
+    /// When called alongside a typed handler (`.handler(|x: Foo| ...)` or a
+    /// [`Json<T>`](crate::extract::Json) extractor), the explicit schema wins
+    /// over the schemars-generated one.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use serde_json::json;
+    /// use tower_mcp::{CallToolResult, ToolBuilder};
+    /// use tower_mcp::extract::RawArgs;
+    ///
+    /// let tool = ToolBuilder::new("query")
+    ///     .description("Query with a conditional schema")
+    ///     .input_schema(json!({
+    ///         "type": "object",
+    ///         "properties": {
+    ///             "filter": {
+    ///                 "oneOf": [
+    ///                     { "type": "string" },
+    ///                     {
+    ///                         "type": "object",
+    ///                         "properties": { "field": { "type": "string" } },
+    ///                         "required": ["field"]
+    ///                     }
+    ///                 ]
+    ///             }
+    ///         },
+    ///         "required": ["filter"]
+    ///     }))
+    ///     .extractor_handler((), |RawArgs(args): RawArgs| async move {
+    ///         Ok(CallToolResult::json(args))
+    ///     })
+    ///     .build();
+    ///
+    /// let schema = tool.definition().input_schema;
+    /// assert_eq!(schema["type"], "object");
+    /// assert!(schema["properties"]["filter"]["oneOf"].is_array());
+    /// ```
+    pub fn input_schema(mut self, schema: Value) -> Self {
+        self.input_schema_override = Some(schema);
         self
     }
 
@@ -933,6 +995,7 @@ impl ToolBuilder {
             title: self.title,
             description: self.description,
             output_schema: self.output_schema,
+            input_schema_override: self.input_schema_override,
             icons: self.icons,
             annotations: self.annotations,
             task_support: self.task_support,
@@ -993,6 +1056,7 @@ impl ToolBuilder {
             title: self.title,
             description: self.description,
             output_schema: self.output_schema,
+            input_schema_override: self.input_schema_override,
             icons: self.icons,
             annotations: self.annotations,
             task_support: self.task_support,
@@ -1104,6 +1168,10 @@ impl ToolBuilder {
         F: crate::extract::ExtractorHandler<S, T> + Clone,
         T: Send + Sync + 'static,
     {
+        let input_schema = ensure_object_schema(
+            self.input_schema_override
+                .unwrap_or_else(|| F::input_schema()),
+        );
         crate::extract::ToolBuilderWithExtractor {
             name: self.name,
             title: self.title,
@@ -1114,7 +1182,7 @@ impl ToolBuilder {
             task_support: self.task_support,
             state,
             handler,
-            input_schema: F::input_schema(),
+            input_schema,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -1173,6 +1241,7 @@ impl ToolBuilder {
             title: self.title,
             description: self.description,
             output_schema: self.output_schema,
+            input_schema_override: self.input_schema_override,
             icons: self.icons,
             annotations: self.annotations,
             task_support: self.task_support,
@@ -1211,6 +1280,7 @@ pub struct ToolBuilderWithHandler<I, F> {
     title: Option<String>,
     description: Option<String>,
     output_schema: Option<Value>,
+    input_schema_override: Option<Value>,
     icons: Option<Vec<ToolIcon>>,
     annotations: Option<ToolAnnotations>,
     task_support: TaskSupportMode,
@@ -1227,6 +1297,7 @@ pub struct ToolBuilderWithNoParamsHandler<F> {
     title: Option<String>,
     description: Option<String>,
     output_schema: Option<Value>,
+    input_schema_override: Option<Value>,
     icons: Option<Vec<ToolIcon>>,
     annotations: Option<ToolAnnotations>,
     task_support: TaskSupportMode,
@@ -1248,6 +1319,7 @@ where
             self.icons,
             self.annotations,
             self.task_support,
+            self.input_schema_override,
             NoParamsTypedHandler {
                 handler: self.handler,
             },
@@ -1263,6 +1335,7 @@ where
             title: self.title,
             description: self.description,
             output_schema: self.output_schema,
+            input_schema_override: self.input_schema_override,
             icons: self.icons,
             annotations: self.annotations,
             task_support: self.task_support,
@@ -1289,6 +1362,7 @@ pub struct ToolBuilderWithNoParamsHandlerLayer<F, L> {
     title: Option<String>,
     description: Option<String>,
     output_schema: Option<Value>,
+    input_schema_override: Option<Value>,
     icons: Option<Vec<ToolIcon>>,
     annotations: Option<ToolAnnotations>,
     task_support: TaskSupportMode,
@@ -1308,7 +1382,10 @@ where
 {
     /// Build the tool with the applied layer(s).
     pub fn build(self) -> Tool {
-        let input_schema = serde_json::json!({ "type": "object" });
+        let input_schema = ensure_object_schema(
+            self.input_schema_override
+                .unwrap_or_else(|| serde_json::json!({ "type": "object" })),
+        );
 
         let handler_service = ToolHandlerService::new(NoParamsTypedHandler {
             handler: self.handler,
@@ -1340,6 +1417,7 @@ where
             title: self.title,
             description: self.description,
             output_schema: self.output_schema,
+            input_schema_override: self.input_schema_override,
             icons: self.icons,
             annotations: self.annotations,
             task_support: self.task_support,
@@ -1378,6 +1456,7 @@ where
             self.icons,
             self.annotations,
             self.task_support,
+            self.input_schema_override,
             TypedHandler {
                 handler: self.handler,
                 _phantom: std::marker::PhantomData,
@@ -1416,6 +1495,7 @@ where
             title: self.title,
             description: self.description,
             output_schema: self.output_schema,
+            input_schema_override: self.input_schema_override,
             icons: self.icons,
             annotations: self.annotations,
             task_support: self.task_support,
@@ -1448,6 +1528,7 @@ pub struct ToolBuilderWithLayer<I, F, L> {
     title: Option<String>,
     description: Option<String>,
     output_schema: Option<Value>,
+    input_schema_override: Option<Value>,
     icons: Option<Vec<ToolIcon>>,
     annotations: Option<ToolAnnotations>,
     task_support: TaskSupportMode,
@@ -1471,9 +1552,11 @@ where
 {
     /// Build the tool with the applied layer(s).
     pub fn build(self) -> Tool {
-        let input_schema = schemars::schema_for!(I);
-        let input_schema = serde_json::to_value(input_schema)
-            .unwrap_or_else(|_| serde_json::json!({ "type": "object" }));
+        let input_schema = self.input_schema_override.unwrap_or_else(|| {
+            let input_schema = schemars::schema_for!(I);
+            serde_json::to_value(input_schema)
+                .unwrap_or_else(|_| serde_json::json!({ "type": "object" }))
+        });
         let input_schema = ensure_object_schema(input_schema);
 
         let handler_service = ToolHandlerService::new(TypedHandler {
@@ -1510,6 +1593,7 @@ where
             title: self.title,
             description: self.description,
             output_schema: self.output_schema,
+            input_schema_override: self.input_schema_override,
             icons: self.icons,
             annotations: self.annotations,
             task_support: self.task_support,
@@ -1653,6 +1737,7 @@ pub trait McpTool: Send + Sync + 'static {
             None,
             annotations,
             TaskSupportMode::default(),
+            None,
             McpToolHandler { tool },
         )
     }
@@ -2890,5 +2975,129 @@ mod tests {
         assert!(result.is_error);
         let text = result.first_text().unwrap();
         assert!(text.contains("Invalid input"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn test_input_schema_override_with_raw_args() {
+        // With a RawArgs handler there is no typed input struct, so the
+        // builder normally falls back to `{ "type": "object" }`. The
+        // `input_schema` setter must let users declare a richer schema.
+        let custom = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "minLength": 1 }
+            },
+            "required": ["query"]
+        });
+
+        let tool = ToolBuilder::new("query")
+            .description("Query with a custom schema")
+            .input_schema(custom.clone())
+            .extractor_handler((), |RawArgs(args): RawArgs| async move {
+                Ok(CallToolResult::json(args))
+            })
+            .build();
+
+        let schema = tool.definition().input_schema;
+        assert_eq!(schema, custom);
+
+        // The handler still executes against the raw args.
+        let result = tool.call(serde_json::json!({"query": "hello"})).await;
+        assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn test_input_schema_override_wins_over_typed_handler() {
+        // When both `.input_schema(...)` and a typed `.handler(|x: Foo|)` are
+        // provided, the explicit schema must win over the schemars-generated
+        // one.
+        let custom = serde_json::json!({
+            "type": "object",
+            "title": "GreetOverride",
+            "properties": {
+                "name": { "type": "string", "minLength": 1, "maxLength": 64 }
+            },
+            "required": ["name"],
+            "additionalProperties": false
+        });
+
+        let tool = ToolBuilder::new("greet")
+            .description("Greet someone with a hand-tuned schema")
+            .input_schema(custom.clone())
+            .handler(|input: GreetInput| async move {
+                Ok(CallToolResult::text(format!("Hello, {}!", input.name)))
+            })
+            .build();
+
+        let schema = tool.definition().input_schema;
+        assert_eq!(schema, custom);
+        // Confirm the schemars-generated `GreetInput` schema did not leak in.
+        assert_eq!(schema["title"], "GreetOverride");
+
+        // Handler still dispatches via the typed deserialization.
+        let result = tool.call(serde_json::json!({"name": "World"})).await;
+        assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn test_input_schema_override_preserves_2020_12_constructs() {
+        // Schemars cannot express `oneOf` in property positions directly;
+        // overriding the schema must keep those advanced constructs intact.
+        let custom = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "filter": {
+                    "oneOf": [
+                        { "type": "string" },
+                        {
+                            "type": "object",
+                            "properties": { "field": { "type": "string" } },
+                            "required": ["field"]
+                        }
+                    ]
+                }
+            },
+            "required": ["filter"]
+        });
+
+        let tool = ToolBuilder::new("filter_tool")
+            .description("Demonstrates oneOf preservation")
+            .input_schema(custom.clone())
+            .extractor_handler((), |RawArgs(args): RawArgs| async move {
+                Ok(CallToolResult::json(args))
+            })
+            .build();
+
+        let schema = tool.definition().input_schema;
+        assert_eq!(schema, custom);
+        let one_of = schema["properties"]["filter"]["oneOf"]
+            .as_array()
+            .expect("oneOf must survive as an array");
+        assert_eq!(one_of.len(), 2);
+        assert_eq!(one_of[0]["type"], "string");
+        assert_eq!(one_of[1]["type"], "object");
+    }
+
+    #[tokio::test]
+    async fn test_input_schema_override_adds_type_object_if_missing() {
+        // `ensure_object_schema` must still run against the user-supplied
+        // schema, so MCP-spec `type: "object"` is added when omitted.
+        let custom_no_type = serde_json::json!({
+            "properties": {
+                "x": { "type": "number" }
+            }
+        });
+
+        let tool = ToolBuilder::new("typeless")
+            .description("Schema missing top-level type")
+            .input_schema(custom_no_type)
+            .extractor_handler((), |RawArgs(args): RawArgs| async move {
+                Ok(CallToolResult::json(args))
+            })
+            .build();
+
+        let schema = tool.definition().input_schema;
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"]["x"].is_object());
     }
 }

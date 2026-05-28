@@ -1219,6 +1219,7 @@ pub struct ToolBuilderWithTypedExtractor<S, F, T, I> {
     pub(crate) title: Option<String>,
     pub(crate) description: Option<String>,
     pub(crate) output_schema: Option<Value>,
+    pub(crate) input_schema_override: Option<Value>,
     pub(crate) icons: Option<Vec<crate::protocol::ToolIcon>>,
     pub(crate) annotations: Option<crate::protocol::ToolAnnotations>,
     pub(crate) task_support: crate::protocol::TaskSupportMode,
@@ -1238,10 +1239,12 @@ where
     /// Build the tool.
     pub fn build(self) -> Tool {
         let input_schema = {
-            let schema = schemars::schema_for!(I);
-            let schema = serde_json::to_value(schema).unwrap_or_else(|_| {
-                serde_json::json!({
-                    "type": "object"
+            let schema = self.input_schema_override.unwrap_or_else(|| {
+                let schema = schemars::schema_for!(I);
+                serde_json::to_value(schema).unwrap_or_else(|_| {
+                    serde_json::json!({
+                        "type": "object"
+                    })
                 })
             });
             crate::tool::ensure_object_schema(schema)
