@@ -23,7 +23,7 @@
 //! | Code   | Name                          | Source | Meaning                              |
 //! |--------|-------------------------------|--------|--------------------------------------|
 //! | -32000 | ConnectionClosed              | *impl* | Transport connection was closed      |
-//! | -32001 | RequestTimeout                | *impl* | Request exceeded timeout             |
+//! | -32001 | HeaderMismatch                | **spec** (SEP-2243) | HTTP headers do not match the request body, or required headers are missing/malformed |
 //! | -32002 | ResourceNotFound              | *deprecated* | **SEP-2164** reassigned to -32602; variant kept for backcompat |
 //! | -32003 | MissingRequiredClientCapability | **spec** (SEP-2575) | Client lacks a capability required by the request |
 //! | -32004 | UnsupportedProtocolVersion    | **spec** (SEP-2575) | Server does not support the request's protocol version |
@@ -32,6 +32,7 @@
 //! | -32007 | Forbidden                     | *impl* | Access forbidden (insufficient scope)|
 //! | -32008 | AlreadySubscribed             | *impl* | Resource already subscribed (moved from -32003 to avoid collision with SEP-2575) |
 //! | -32009 | NotSubscribed                 | *impl* | Resource not subscribed (moved from -32004 to avoid collision with SEP-2575) |
+//! | -32010 | RequestTimeout                | *impl* | Request exceeded timeout (moved from -32001 to avoid collision with SEP-2243) |
 //! | -32042 | UrlElicitationRequired        | TS SDK | URL elicitation required             |
 
 use serde::{Deserialize, Serialize};
@@ -73,14 +74,22 @@ pub enum ErrorCode {
 ///   -32004; they moved to -32008 and -32009 to make room. **This is a
 ///   breaking change on the wire** for any subscribe/unsubscribe responses
 ///   that relied on the old codes.
+/// - `HeaderMismatch` (-32001) is a spec assignment from SEP-2243 (HTTP
+///   header standardization). `RequestTimeout` previously occupied -32001
+///   and moved to -32010 to make room. **This is a breaking change on the
+///   wire** for any consumers matching on the old `RequestTimeout` code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 #[non_exhaustive]
 pub enum McpErrorCode {
     /// Transport connection was closed.
     ConnectionClosed = -32000,
-    /// Request exceeded timeout.
-    RequestTimeout = -32001,
+    /// SEP-2243: HTTP headers (e.g. `Mcp-Method`, `Mcp-Name`,
+    /// `Mcp-Param-*`) do not match the corresponding values in the request
+    /// body, or a required header is missing or malformed.
+    ///
+    /// Use [`JsonRpcError::header_mismatch`] to construct.
+    HeaderMismatch = -32001,
     /// Resource not found.
     ///
     /// **Deprecated**: SEP-2164 (FINAL) moves this to the standard JSON-RPC
@@ -119,6 +128,9 @@ pub enum McpErrorCode {
     /// Resource not subscribed (for unsubscribe). Moved from -32004 to
     /// avoid the SEP-2575 `UnsupportedProtocolVersion` collision.
     NotSubscribed = -32009,
+    /// Request exceeded timeout. Moved from -32001 to avoid the SEP-2243
+    /// `HeaderMismatch` collision.
+    RequestTimeout = -32010,
     /// URL elicitation is required before processing the request.
     UrlElicitationRequired = -32042,
 }
@@ -266,6 +278,21 @@ impl JsonRpcError {
     /// URL elicitation is required before processing the request
     pub fn url_elicitation_required(message: impl Into<String>) -> Self {
         Self::mcp_error(McpErrorCode::UrlElicitationRequired, message)
+    }
+
+    /// SEP-2243: HTTP headers do not match the request body, or a required
+    /// header is missing or malformed.
+    ///
+    /// Servers using the Streamable HTTP transport return this error code
+    /// (with HTTP status `400 Bad Request`) when any of the following hold:
+    ///
+    /// - A required standard header (`Mcp-Method`, `Mcp-Name`) is missing
+    ///   for the corresponding method.
+    /// - A header value does not match the request body value.
+    /// - A `Mcp-Param-{Name}` Base64-encoded value cannot be decoded.
+    /// - A header value contains invalid characters.
+    pub fn header_mismatch(message: impl Into<String>) -> Self {
+        Self::mcp_error(McpErrorCode::HeaderMismatch, message)
     }
 
     /// SEP-2575: server does not support the protocol version the client
@@ -618,11 +645,39 @@ mod tests {
         assert_eq!(McpErrorCode::UnsupportedProtocolVersion.code(), -32004);
     }
 
+    // =========================================================================
+    // SEP-2243 HeaderMismatch (-32001) wire-format tests
+    // =========================================================================
+
+    #[test]
+    fn header_mismatch_code_is_negative_32001() {
+        assert_eq!(McpErrorCode::HeaderMismatch.code(), -32001);
+    }
+
+    #[test]
+    fn header_mismatch_constructor_uses_spec_code() {
+        let err = JsonRpcError::header_mismatch(
+            "Mcp-Name header value 'foo' does not match body value 'bar'",
+        );
+        assert_eq!(err.code, -32001);
+        assert_eq!(err.code, McpErrorCode::HeaderMismatch.code());
+        assert!(err.message.contains("Mcp-Name"));
+    }
+
+    #[test]
+    fn request_timeout_moved_off_spec_assignment() {
+        // SEP-2243 took -32001 for HeaderMismatch; our RequestTimeout
+        // moved to -32010 to avoid collision.
+        assert_eq!(McpErrorCode::RequestTimeout.code(), -32010);
+        assert_eq!(McpErrorCode::HeaderMismatch.code(), -32001);
+    }
+
     #[test]
     #[allow(deprecated)] // ResourceNotFound stays in the enum for backcompat
     fn no_two_mcp_codes_share_a_value() {
         let all = [
             McpErrorCode::ConnectionClosed.code(),
+            McpErrorCode::HeaderMismatch.code(),
             McpErrorCode::RequestTimeout.code(),
             McpErrorCode::ResourceNotFound.code(),
             McpErrorCode::MissingRequiredClientCapability.code(),

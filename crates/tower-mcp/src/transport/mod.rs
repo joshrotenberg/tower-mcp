@@ -11,6 +11,9 @@ pub mod stdio;
 #[cfg(feature = "http")]
 pub mod http;
 
+#[cfg(feature = "http")]
+mod http_headers;
+
 #[cfg(feature = "websocket")]
 pub mod websocket;
 

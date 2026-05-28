@@ -370,6 +370,10 @@ where
 }
 
 /// Construct an HTTP 401 Unauthorized response with a JSON-RPC error body.
+///
+/// Uses the MCP `Forbidden` code (-32007). The previous code (-32001) was
+/// reclaimed by SEP-2243 for `HeaderMismatch`; emitting that here would
+/// confuse clients that route on the JSON-RPC error code.
 #[cfg(feature = "http")]
 fn unauthorized_response(message: &str) -> axum::response::Response {
     use axum::http::StatusCode;
@@ -378,7 +382,7 @@ fn unauthorized_response(message: &str) -> axum::response::Response {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "error": {
-            "code": -32001,
+            "code": tower_mcp_types::McpErrorCode::Forbidden.code(),
             "message": message
         },
         "id": null
