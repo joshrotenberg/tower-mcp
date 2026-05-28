@@ -129,8 +129,11 @@ pub(crate) fn serialize_notification(notification: &ServerNotification) -> Optio
     }
 }
 
-/// Write a line to an async stdout writer and flush.
-async fn write_line_to_stdout(stdout: &mut tokio::io::Stdout, line: &str) -> Result<()> {
+/// Write a line to an async writer and flush.
+async fn write_line_to_stdout<W>(stdout: &mut W, line: &str) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     stdout
         .write_all(line.as_bytes())
         .await
@@ -238,10 +241,29 @@ impl StdioTransport {
     }
 
     /// Run the transport, processing messages until EOF or error
+    ///
+    /// This is a thin wrapper around [`Self::run_with_streams`] that wires up
+    /// `tokio::io::stdin()` and `tokio::io::stdout()`. Most users want this
+    /// method; use [`Self::run_with_streams`] only for in-process testing.
     pub async fn run(&mut self) -> Result<()> {
-        let stdin = tokio::io::stdin();
-        let mut stdout = tokio::io::stdout();
-        let mut reader = BufReader::new(stdin);
+        self.run_with_streams(tokio::io::stdin(), tokio::io::stdout())
+            .await
+    }
+
+    /// Run the transport, reading from `reader` and writing to `writer`.
+    ///
+    /// This is the streams-generic counterpart of [`Self::run`]. The default
+    /// `run()` calls this with `tokio::io::stdin()` / `tokio::io::stdout()`.
+    ///
+    /// Exposing this lets tests drive the full read-eval-write loop with
+    /// `tokio::io::duplex()` and assert end-to-end behavior (parse-error
+    /// frames, loop continuation across bad input, EOF handling).
+    pub async fn run_with_streams<R, W>(&mut self, reader: R, mut writer: W) -> Result<()>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send,
+        W: tokio::io::AsyncWrite + Unpin + Send,
+    {
+        let mut reader = BufReader::new(reader);
 
         tracing::info!("Stdio transport started, waiting for input");
 
@@ -274,7 +296,7 @@ impl StdioTransport {
                                 Error::Transport(format!("Failed to serialize response: {}", e))
                             })?;
                             tracing::debug!(output = %response_json, "Sending response");
-                            write_line_to_stdout(&mut stdout, &response_json).await?;
+                            write_line_to_stdout(&mut writer, &response_json).await?;
                         }
                         Ok(None) => {
                             // Notification, no response needed
@@ -285,7 +307,7 @@ impl StdioTransport {
                             let response_json = serde_json::to_string(&error_response).map_err(|e| {
                                 Error::Transport(format!("Failed to serialize error: {}", e))
                             })?;
-                            write_line_to_stdout(&mut stdout, &response_json).await?;
+                            write_line_to_stdout(&mut writer, &response_json).await?;
                         }
                     }
                 }
@@ -294,7 +316,7 @@ impl StdioTransport {
                 Some(notification) = self.notification_rx.recv() => {
                     if let Some(json) = serialize_notification(&notification) {
                         tracing::debug!(output = %json, "Sending notification");
-                        write_line_to_stdout(&mut stdout, &json).await?;
+                        write_line_to_stdout(&mut writer, &json).await?;
                     }
                 }
             }
@@ -398,10 +420,24 @@ where
     }
 
     /// Run the transport, processing messages until EOF or error.
+    ///
+    /// Thin wrapper around [`Self::run_with_streams`] that wires up
+    /// `tokio::io::stdin()` / `tokio::io::stdout()`.
     pub async fn run(&mut self) -> Result<()> {
-        let stdin = tokio::io::stdin();
-        let mut stdout = tokio::io::stdout();
-        let mut reader = BufReader::new(stdin);
+        self.run_with_streams(tokio::io::stdin(), tokio::io::stdout())
+            .await
+    }
+
+    /// Run the transport, reading from `reader` and writing to `writer`.
+    ///
+    /// Streams-generic counterpart of [`Self::run`]. Lets tests drive the
+    /// read-eval-write loop with in-memory streams (e.g. `tokio::io::duplex()`).
+    pub async fn run_with_streams<R, W>(&mut self, reader: R, mut writer: W) -> Result<()>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send,
+        W: tokio::io::AsyncWrite + Unpin + Send,
+    {
+        let mut reader = BufReader::new(reader);
 
         tracing::info!("Generic stdio transport started, waiting for input");
 
@@ -421,13 +457,13 @@ where
                             break;
                         }
 
-                        self.process_input(&line, &mut stdout).await?;
+                        Self::process_input(&mut self.service, &line, &mut writer).await?;
                     }
 
                     Some(notification) = notif_rx.recv() => {
                         if let Some(json) = serialize_notification(&notification) {
                             tracing::debug!(output = %json, "Sending notification");
-                            write_line_to_stdout(&mut stdout, &json).await?;
+                            write_line_to_stdout(&mut writer, &json).await?;
                         }
                     }
                 }
@@ -442,14 +478,21 @@ where
                     break;
                 }
 
-                self.process_input(&line, &mut stdout).await?;
+                Self::process_input(&mut self.service, &line, &mut writer).await?;
             }
         }
 
         Ok(())
     }
 
-    async fn process_input(&mut self, line: &str, stdout: &mut tokio::io::Stdout) -> Result<()> {
+    async fn process_input<W>(
+        service: &mut JsonRpcService<S>,
+        line: &str,
+        writer: &mut W,
+    ) -> Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin + Send,
+    {
         let trimmed = clean_input_line(line);
         if trimmed.is_empty() {
             return Ok(());
@@ -461,7 +504,7 @@ where
         let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
             Err(e) => {
-                self.write_error(stdout, None, &e.to_string()).await?;
+                Self::write_error(writer, None, &e.to_string()).await?;
                 return Ok(());
             }
         };
@@ -479,33 +522,35 @@ where
         let message: JsonRpcMessage = match serde_json::from_str(trimmed) {
             Ok(m) => m,
             Err(e) => {
-                self.write_error(stdout, None, &e.to_string()).await?;
+                Self::write_error(writer, None, &e.to_string()).await?;
                 return Ok(());
             }
         };
 
-        match self.service.call_message(message).await {
+        match service.call_message(message).await {
             Ok(response) => {
                 let response_json = serde_json::to_string(&response).map_err(|e| {
                     Error::Transport(format!("Failed to serialize response: {}", e))
                 })?;
                 tracing::debug!(output = %response_json, "Sending response");
-                write_line_to_stdout(stdout, &response_json).await?;
+                write_line_to_stdout(writer, &response_json).await?;
             }
             Err(e) => {
                 tracing::error!(error = %e, "Error processing message");
-                self.write_error(stdout, None, &e.to_string()).await?;
+                Self::write_error(writer, None, &e.to_string()).await?;
             }
         }
         Ok(())
     }
 
-    async fn write_error(
-        &self,
-        stdout: &mut tokio::io::Stdout,
+    async fn write_error<W>(
+        writer: &mut W,
         id: Option<crate::protocol::RequestId>,
         message: &str,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin + Send,
+    {
         // `id` is currently always `None` from every call site (parse-error
         // path), so use the shared helper; preserve the parameter for callers
         // that may want to surface a known-id error in future.
@@ -516,7 +561,7 @@ where
         };
         let response_json = serde_json::to_string(&error_response)
             .map_err(|e| Error::Transport(format!("Failed to serialize error: {}", e)))?;
-        write_line_to_stdout(stdout, &response_json).await
+        write_line_to_stdout(writer, &response_json).await
     }
 }
 
@@ -693,10 +738,28 @@ impl BidirectionalStdioTransport {
     }
 
     /// Run the transport, processing messages until EOF or error
+    ///
+    /// Thin wrapper around [`Self::run_with_streams`] that wires up
+    /// `tokio::io::stdin()` / `tokio::io::stdout()`.
     pub async fn run(&mut self) -> Result<()> {
-        let stdin = tokio::io::stdin();
-        let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
-        let mut reader = BufReader::new(stdin);
+        self.run_with_streams(tokio::io::stdin(), tokio::io::stdout())
+            .await
+    }
+
+    /// Run the transport, reading from `reader` and writing to `writer`.
+    ///
+    /// Streams-generic counterpart of [`Self::run`]. The writer is held
+    /// behind an `Arc<Mutex<_>>` so the outgoing-request and notification
+    /// paths can share it with the incoming-message branch -- the same
+    /// concurrency model `run()` has always used, just with the streams
+    /// supplied by the caller.
+    pub async fn run_with_streams<R, W>(&mut self, reader: R, writer: W) -> Result<()>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send,
+        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let writer = Arc::new(Mutex::new(writer));
+        let mut reader = BufReader::new(reader);
 
         tracing::info!("Bidirectional stdio transport started, waiting for input");
 
@@ -720,19 +783,19 @@ impl BidirectionalStdioTransport {
                         continue;
                     }
 
-                    self.handle_incoming_message(trimmed, stdout.clone()).await?;
+                    self.handle_incoming_message(trimmed, writer.clone()).await?;
                 }
 
                 // Handle outgoing requests to send to the client
                 Some(outgoing) = self.request_rx.recv() => {
-                    self.send_outgoing_request(outgoing, stdout.clone()).await?;
+                    self.send_outgoing_request(outgoing, writer.clone()).await?;
                 }
 
                 // Forward server notifications to the client
                 Some(notification) = self.notification_rx.recv() => {
                     if let Some(json) = serialize_notification(&notification) {
                         tracing::debug!(output = %json, "Sending notification");
-                        self.write_line(&json, stdout.clone()).await?;
+                        self.write_line(&json, writer.clone()).await?;
                     }
                 }
             }
@@ -742,11 +805,10 @@ impl BidirectionalStdioTransport {
     }
 
     /// Handle an incoming message from stdin
-    async fn handle_incoming_message(
-        &mut self,
-        line: &str,
-        stdout: Arc<Mutex<tokio::io::Stdout>>,
-    ) -> Result<()> {
+    async fn handle_incoming_message<W>(&mut self, line: &str, writer: Arc<Mutex<W>>) -> Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin + Send,
+    {
         tracing::debug!(input = %line, "Received message");
 
         // Malformed JSON must produce a JSON-RPC parse error response, not
@@ -756,7 +818,7 @@ impl BidirectionalStdioTransport {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "Malformed JSON on stdin");
-                return self.write_parse_error(&e.to_string(), stdout).await;
+                return self.write_parse_error(&e.to_string(), writer).await;
             }
         };
 
@@ -781,7 +843,7 @@ impl BidirectionalStdioTransport {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(error = %e, "JSON did not match JSON-RPC request shape");
-                return self.write_parse_error(&e.to_string(), stdout).await;
+                return self.write_parse_error(&e.to_string(), writer).await;
             }
         };
         match self.service.call_message(message).await {
@@ -790,29 +852,28 @@ impl BidirectionalStdioTransport {
                     Error::Transport(format!("Failed to serialize response: {}", e))
                 })?;
                 tracing::debug!(output = %response_json, "Sending response");
-                self.write_line(&response_json, stdout).await?;
+                self.write_line(&response_json, writer).await?;
             }
             Err(e) => {
                 tracing::error!(error = %e, "Error processing message");
                 let error_response = parse_error_response(e.to_string());
                 let response_json = serde_json::to_string(&error_response)
                     .map_err(|e| Error::Transport(format!("Failed to serialize error: {}", e)))?;
-                self.write_line(&response_json, stdout).await?;
+                self.write_line(&response_json, writer).await?;
             }
         }
 
         Ok(())
     }
 
-    async fn write_parse_error(
-        &self,
-        message: &str,
-        stdout: Arc<Mutex<tokio::io::Stdout>>,
-    ) -> Result<()> {
+    async fn write_parse_error<W>(&self, message: &str, writer: Arc<Mutex<W>>) -> Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin + Send,
+    {
         let error_response = parse_error_response(message);
         let response_json = serde_json::to_string(&error_response)
             .map_err(|e| Error::Transport(format!("Failed to serialize error: {}", e)))?;
-        self.write_line(&response_json, stdout).await
+        self.write_line(&response_json, writer).await
     }
 
     /// Handle a response to one of our pending requests
@@ -871,11 +932,14 @@ impl BidirectionalStdioTransport {
     }
 
     /// Send an outgoing request to the client
-    async fn send_outgoing_request(
+    async fn send_outgoing_request<W>(
         &mut self,
         outgoing: OutgoingRequest,
-        stdout: Arc<Mutex<tokio::io::Stdout>>,
-    ) -> Result<()> {
+        writer: Arc<Mutex<W>>,
+    ) -> Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin + Send,
+    {
         // Build JSON-RPC request
         let request = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -901,23 +965,26 @@ impl BidirectionalStdioTransport {
         }
 
         // Send the request
-        self.write_line(&request_json, stdout).await?;
+        self.write_line(&request_json, writer).await?;
 
         Ok(())
     }
 
-    /// Write a line to stdout
-    async fn write_line(&self, line: &str, stdout: Arc<Mutex<tokio::io::Stdout>>) -> Result<()> {
-        let mut stdout = stdout.lock().await;
-        stdout
+    /// Write a line to the shared writer
+    async fn write_line<W>(&self, line: &str, writer: Arc<Mutex<W>>) -> Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin + Send,
+    {
+        let mut writer = writer.lock().await;
+        writer
             .write_all(line.as_bytes())
             .await
             .map_err(|e| Error::Transport(format!("Failed to write to stdout: {}", e)))?;
-        stdout
+        writer
             .write_all(b"\n")
             .await
             .map_err(|e| Error::Transport(format!("Failed to write newline: {}", e)))?;
-        stdout
+        writer
             .flush()
             .await
             .map_err(|e| Error::Transport(format!("Failed to flush stdout: {}", e)))?;
