@@ -378,6 +378,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn record_round_trips_client_info_and_capabilities() {
+        // Issue #786: SessionRecord must be able to carry client identity
+        // and capabilities through a save/load round trip so a session
+        // restored from another instance retains the original client's
+        // advertised metadata.
+        let store = MemorySessionStore::new();
+        let mut record = sample_record("client-meta");
+        record.client_info = Some(crate::protocol::Implementation {
+            name: "test-client".into(),
+            version: "9.9.9".into(),
+            title: Some("Test Client".into()),
+            description: None,
+            icons: None,
+            website_url: None,
+            meta: None,
+        });
+        record.client_capabilities = Some(crate::protocol::ClientCapabilities {
+            roots: Some(crate::protocol::RootsCapability {
+                list_changed: true,
+                deprecated: None,
+            }),
+            ..Default::default()
+        });
+
+        store.create(&mut record).await.unwrap();
+        let loaded = store
+            .load(&record.id)
+            .await
+            .unwrap()
+            .expect("record should survive create/load round trip");
+
+        let info = loaded
+            .client_info
+            .expect("client_info should survive round trip");
+        assert_eq!(info.name, "test-client");
+        assert_eq!(info.version, "9.9.9");
+        assert_eq!(info.title.as_deref(), Some("Test Client"));
+
+        let caps = loaded
+            .client_capabilities
+            .expect("client_capabilities should survive round trip");
+        assert_eq!(caps.roots.map(|r| r.list_changed), Some(true));
+    }
+
+    #[tokio::test]
     async fn record_touch_updates_timestamps() {
         let mut record = SessionRecord::new("t", "2025-11-25", Duration::from_secs(60));
         let original_expiry = record.expires_at;

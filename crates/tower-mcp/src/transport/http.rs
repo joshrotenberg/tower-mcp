@@ -185,8 +185,8 @@ use crate::context::{
 use crate::error::{Error, JsonRpcError, Result};
 use crate::jsonrpc::JsonRpcService;
 use crate::protocol::{
-    JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, LATEST_PROTOCOL_VERSION, McpNotification,
-    RequestId, SUPPORTED_PROTOCOL_VERSIONS,
+    ClientCapabilities, Implementation, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
+    LATEST_PROTOCOL_VERSION, McpNotification, RequestId, SUPPORTED_PROTOCOL_VERSIONS,
 };
 use crate::router::{McpRouter, RouterRequest, RouterResponse};
 use crate::transport::service::{
@@ -242,6 +242,20 @@ struct Session {
     request_rx: Mutex<Option<OutgoingRequestReceiver>>,
     /// Negotiated protocol version (set after initialize)
     protocol_version: RwLock<String>,
+    /// Client implementation info advertised in the `initialize` request.
+    ///
+    /// Populated by `handle_post` after a successful initialize response,
+    /// and restored from a [`SessionRecord`](crate::session_store::SessionRecord)
+    /// when a session is rebuilt from the persistent store. `None` until the
+    /// first initialize completes.
+    client_info: RwLock<Option<Implementation>>,
+    /// Client capabilities advertised in the `initialize` request.
+    ///
+    /// Populated by `handle_post` after a successful initialize response,
+    /// and restored from a [`SessionRecord`](crate::session_store::SessionRecord)
+    /// when a session is rebuilt from the persistent store. `None` until the
+    /// first initialize completes.
+    client_capabilities: RwLock<Option<ClientCapabilities>>,
     /// Counter for SSE event IDs (for stream resumption per SEP-1699)
     event_counter: AtomicU64,
     /// Pluggable store for SSE events (enables cross-instance replay)
@@ -298,6 +312,8 @@ impl Session {
             pending_requests: Mutex::new(HashMap::new()),
             request_rx: Mutex::new(request_rx),
             protocol_version: RwLock::new(LATEST_PROTOCOL_VERSION.to_string()),
+            client_info: RwLock::new(None),
+            client_capabilities: RwLock::new(None),
             event_counter: AtomicU64::new(0),
             event_store,
         }
@@ -324,6 +340,8 @@ impl Session {
             pending_requests: Mutex::new(HashMap::new()),
             request_rx: Mutex::new(None),
             protocol_version: RwLock::new(LATEST_PROTOCOL_VERSION.to_string()),
+            client_info: RwLock::new(None),
+            client_capabilities: RwLock::new(None),
             event_counter: AtomicU64::new(0),
             event_store,
         }
@@ -385,6 +403,8 @@ impl Session {
             pending_requests: Mutex::new(HashMap::new()),
             request_rx: Mutex::new(request_rx),
             protocol_version: RwLock::new(record.protocol_version.clone()),
+            client_info: RwLock::new(record.client_info.clone()),
+            client_capabilities: RwLock::new(record.client_capabilities.clone()),
             event_counter: AtomicU64::new(0),
             event_store,
         }
@@ -410,6 +430,8 @@ impl Session {
             pending_requests: Mutex::new(HashMap::new()),
             request_rx: Mutex::new(None),
             protocol_version: RwLock::new(record.protocol_version.clone()),
+            client_info: RwLock::new(record.client_info.clone()),
+            client_capabilities: RwLock::new(record.client_capabilities.clone()),
             event_counter: AtomicU64::new(0),
             event_store,
         }
@@ -622,9 +644,12 @@ impl SessionRegistry {
             protocol_version,
             self.config.ttl,
         );
-        // Convert from monotonic Instant to SystemTime approximation. We
-        // don't persist the client_info/capabilities here -- those can be
-        // populated by a future restore-aware refactor.
+        // Populate the client identity / capabilities advertised at
+        // initialize time so persisted records faithfully describe the
+        // session. These remain `None` until a successful initialize.
+        record.client_info = session.client_info.read().await.clone();
+        record.client_capabilities = session.client_capabilities.read().await.clone();
+        // Convert from monotonic Instant to SystemTime approximation.
         let now = std::time::SystemTime::now();
         let created_ago = session.created_at.elapsed();
         let last_accessed_ago = last_accessed.elapsed();
@@ -643,6 +668,20 @@ impl SessionRegistry {
         let record = self.record_for(session).await;
         if let Err(e) = self.persistent.create(&mut record.clone()).await {
             tracing::warn!(session_id = %session.id, error = %e, "Failed to persist session record");
+        }
+    }
+
+    /// Persist an update to an existing session's record (upsert).
+    ///
+    /// Called after the session's state changes in a way that should be
+    /// reflected in the persistent store -- notably after a successful
+    /// `initialize` so the stored record carries the client's advertised
+    /// `client_info` and `capabilities` (rather than the defaults captured
+    /// at create time). Failures are logged but non-fatal.
+    async fn save_record(&self, session: &Session) {
+        let record = self.record_for(session).await;
+        if let Err(e) = self.persistent.save(&record).await {
+            tracing::warn!(session_id = %session.id, error = %e, "Failed to save session record");
         }
     }
 
@@ -2190,6 +2229,26 @@ async fn handle_post(
         return StatusCode::ACCEPTED.into_response();
     }
 
+    // For initialize requests, capture the advertised client info /
+    // capabilities from the raw params before `parsed` is consumed by
+    // deserialization. These are stashed onto the live `Session` after a
+    // successful initialize so the persisted SessionRecord faithfully
+    // describes the client (rather than carrying the defaults set at
+    // session-create time).
+    let init_client_metadata: Option<(Option<Implementation>, Option<ClientCapabilities>)> =
+        if is_init {
+            let params = parsed.get("params");
+            let client_info = params
+                .and_then(|p| p.get("clientInfo"))
+                .and_then(|v| serde_json::from_value::<Implementation>(v.clone()).ok());
+            let client_capabilities = params
+                .and_then(|p| p.get("capabilities"))
+                .and_then(|v| serde_json::from_value::<ClientCapabilities>(v.clone()).ok());
+            Some((client_info, client_capabilities))
+        } else {
+            None
+        };
+
     // Handle as JSON-RPC request
     let request: JsonRpcRequest = match serde_json::from_value(parsed) {
         Ok(r) => r,
@@ -2220,15 +2279,24 @@ async fn handle_post(
         }
     };
 
-    // For initialize responses, extract and store the negotiated protocol version
-    if is_init
-        && let JsonRpcResponse::Result(ref result) = response
-        && let Some(version) = result
+    // For successful initialize responses, extract and store the negotiated
+    // protocol version, stash the client's advertised identity / capabilities
+    // on the live session, and persist the now-complete record to the session
+    // store so a restore from a peer instance sees the original client info
+    // instead of defaults.
+    if is_init && let JsonRpcResponse::Result(ref result) = response {
+        if let Some(version) = result
             .result
             .get("protocolVersion")
             .and_then(|v| v.as_str())
-    {
-        *session.protocol_version.write().await = version.to_string();
+        {
+            *session.protocol_version.write().await = version.to_string();
+        }
+        if let Some((client_info, client_capabilities)) = init_client_metadata {
+            *session.client_info.write().await = client_info;
+            *session.client_capabilities.write().await = client_capabilities;
+        }
+        state.sessions.save_record(&session).await;
     }
 
     // Build response with headers
@@ -2880,14 +2948,246 @@ mod tests {
 
         // Custom store should have the record.
         assert_eq!(store.len().await, 1);
-        let record = store.load(&session_id).await.unwrap();
-        assert!(record.is_some(), "expected session to be persisted");
-        assert_eq!(record.unwrap().id, session_id);
+        let record = store
+            .load(&session_id)
+            .await
+            .unwrap()
+            .expect("expected session to be persisted");
+        assert_eq!(record.id, session_id);
 
-        // Terminate session via the handle — store should be cleared.
+        // After initialize completes the record must carry the client's
+        // advertised identity / capabilities (issue #786). Previously these
+        // were left as `None` because the record was created before
+        // initialize ran.
+        let client_info = record
+            .client_info
+            .expect("client_info should be populated after initialize");
+        assert_eq!(client_info.name, "test-client");
+        assert_eq!(client_info.version, "1.0.0");
+        assert!(
+            record.client_capabilities.is_some(),
+            "client_capabilities should be populated after initialize"
+        );
+
+        // Terminate session via the handle -- store should be cleared.
         assert!(handle.terminate_session(&session_id).await);
         assert_eq!(store.len().await, 0);
         assert!(store.load(&session_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_session_store_record_carries_negotiated_protocol_version() {
+        // Issue #786: stored record should reflect the negotiated protocol
+        // version (taken from the initialize response), not the default the
+        // session was created with.
+        use crate::session_store::{MemorySessionStore, SessionStore as PublicSessionStore};
+
+        let store = Arc::new(MemorySessionStore::new());
+        let store_dyn: Arc<dyn PublicSessionStore> = store.clone();
+
+        let transport = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .session_store(store_dyn);
+        let app = transport.into_router();
+
+        // Initialize using an older supported protocol version so we can
+        // tell the persisted version apart from `LATEST_PROTOCOL_VERSION`.
+        let init_request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "clientInfo": { "name": "v-client", "version": "2.0.0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(init_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let session_id = response
+            .headers()
+            .get(MCP_SESSION_ID_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let record = store
+            .load(&session_id)
+            .await
+            .unwrap()
+            .expect("session should be persisted");
+        assert_eq!(record.protocol_version, "2025-03-26");
+        let client_info = record.client_info.expect("client_info should be populated");
+        assert_eq!(client_info.name, "v-client");
+    }
+
+    #[tokio::test]
+    async fn test_restored_session_exposes_original_client_info() {
+        // Issue #786: a session restored from the persistent store on a
+        // peer instance should retain the original client's identity and
+        // capabilities, not the synthetic defaults used for auto-reinit.
+        use crate::session_store::{MemorySessionStore, SessionStore as PublicSessionStore};
+
+        let store = Arc::new(MemorySessionStore::new());
+        let store_dyn: Arc<dyn PublicSessionStore> = store.clone();
+
+        // First "instance": initialize, then drop the transport so the
+        // local registry is gone but the persistent record survives.
+        let session_id = {
+            let transport = HttpTransport::new(create_test_router())
+                .disable_origin_validation()
+                .session_store(store_dyn.clone());
+            let app = transport.into_router();
+
+            let init_request = Request::builder()
+                .method("POST")
+                .uri("/")
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json, text/event-stream")
+                .body(Body::from(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2025-11-25",
+                            "capabilities": { "roots": {} },
+                            "clientInfo": {
+                                "name": "original-client",
+                                "version": "3.1.4"
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            let response = app.oneshot(init_request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            response
+                .headers()
+                .get(MCP_SESSION_ID_HEADER)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+
+        // Sanity check: the persisted record now carries the client info.
+        let stored = store
+            .load(&session_id)
+            .await
+            .unwrap()
+            .expect("record should survive transport drop");
+        assert_eq!(
+            stored.client_info.as_ref().map(|c| c.name.as_str()),
+            Some("original-client")
+        );
+
+        // Second "instance": brand new transport, same store. A request
+        // with the existing session id triggers restore_from_record.
+        let transport2 = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .session_store(store_dyn);
+        let app2 = transport2.into_router();
+
+        let list_request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header(MCP_SESSION_ID_HEADER, &session_id)
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app2.oneshot(list_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json.get("result").is_some(),
+            "expected tools/list result, got {json}"
+        );
+
+        // After the restore, the record in the store still carries the
+        // original client info (refreshed expiry, not a synthetic
+        // "auto-recovered" identity).
+        let after_restore = store
+            .load(&session_id)
+            .await
+            .unwrap()
+            .expect("record should still be present after restore");
+        let client_info = after_restore
+            .client_info
+            .expect("restored record should retain client_info");
+        assert_eq!(client_info.name, "original-client");
+        assert_eq!(client_info.version, "3.1.4");
+        assert!(
+            after_restore.client_capabilities.is_some(),
+            "restored record should retain client_capabilities"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auto_reinitialize_marks_synthetic_client_info() {
+        // Companion to the restored-client-info test: the auto-reinit
+        // path must continue to flag the client as `"auto-recovered"` so
+        // the two paths remain distinguishable on inspection of the
+        // persisted record.
+        use crate::session_store::{MemorySessionStore, SessionStore as PublicSessionStore};
+
+        let store = Arc::new(MemorySessionStore::new());
+        let store_dyn: Arc<dyn PublicSessionStore> = store.clone();
+
+        let transport = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .session_store(store_dyn)
+            .auto_reinitialize_sessions(true);
+        let app = transport.into_router();
+
+        let list_request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header(MCP_SESSION_ID_HEADER, "made-up-id")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(list_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let record = store
+            .load("made-up-id")
+            .await
+            .unwrap()
+            .expect("auto-reinitialize should persist a record");
+        assert_eq!(
+            record.client_info.as_ref().map(|c| c.name.as_str()),
+            Some("auto-recovered")
+        );
     }
 
     #[tokio::test]
