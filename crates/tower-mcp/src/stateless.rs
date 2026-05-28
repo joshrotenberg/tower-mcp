@@ -110,26 +110,41 @@ pub enum LogLevel {
 pub use crate::protocol::{DiscoverParams, DiscoverResult};
 
 // =============================================================================
-// Error codes (SEP-1442)
+// Error codes -- the SEP-1442 draft assignments were wrong; SEP-2575 FINAL
+// canonicalized them in the spec's draft schema. Re-export the corrected
+// values from the always-available error module.
 // =============================================================================
 
-/// SEP-1442 error codes.
+/// Re-exported for SEP-2575 compatibility. Prefer importing from
+/// [`crate::error::McpErrorCode::UnsupportedProtocolVersion`] directly.
+#[doc(inline)]
+pub use crate::error::UnsupportedProtocolVersionData;
+
+/// Legacy SEP-1442 error code constants.
+///
+/// These were wrong: SEP-1442 (draft) placed `UNSUPPORTED_VERSION` at -32000,
+/// which collides with the established `ConnectionClosed` assignment.
+/// SEP-2575 (FINAL) moved it to -32004. Use
+/// [`crate::error::McpErrorCode::UnsupportedProtocolVersion`] or
+/// [`crate::error::JsonRpcError::unsupported_protocol_version`] instead.
 pub mod error_codes {
-    /// Unsupported protocol version (-32000).
-    ///
-    /// The error data MUST include `supportedVersions` array.
+    /// Spec-correct unsupported protocol version code (SEP-2575).
+    pub const UNSUPPORTED_PROTOCOL_VERSION: i32 = -32004;
+
+    /// Wrong assignment from SEP-1442 draft. Kept temporarily for
+    /// back-compat; new code should use [`UNSUPPORTED_PROTOCOL_VERSION`].
+    #[deprecated(
+        since = "0.12.0",
+        note = "SEP-1442 draft assignment was wrong; SEP-2575 FINAL uses -32004. \
+                Use `UNSUPPORTED_PROTOCOL_VERSION` or \
+                `crate::error::McpErrorCode::UnsupportedProtocolVersion`."
+    )]
     pub const UNSUPPORTED_VERSION: i32 = -32000;
 
-    /// Invalid or missing required session ID (-32001).
+    /// Invalid or missing required session ID (-32001) per SEP-1442.
+    /// SEP-2567 (FINAL) removes sessions entirely; this constant is
+    /// retained only for the 2025-11-25 protocol path.
     pub const INVALID_SESSION: i32 = -32001;
-}
-
-/// Error data for unsupported protocol version errors.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UnsupportedVersionData {
-    /// Protocol versions supported by this server.
-    pub supported_versions: Vec<String>,
 }
 
 // =============================================================================
@@ -195,8 +210,12 @@ impl StatelessConfig {
 
 /// Validate a protocol version string against supported versions.
 ///
-/// Returns `Ok(())` if valid, or a JSON-RPC error with the SEP-1442 error code
-/// and `supportedVersions` data if the version is not supported.
+/// Returns `Ok(())` if valid, or a JSON-RPC `UnsupportedProtocolVersion`
+/// error (-32004 per SEP-2575) with the spec-shape data:
+///
+/// ```json
+/// { "supported": ["..."], "requested": "..." }
+/// ```
 pub fn validate_protocol_version(
     version: &str,
 ) -> std::result::Result<(), crate::error::JsonRpcError> {
@@ -205,17 +224,10 @@ pub fn validate_protocol_version(
     if SUPPORTED_PROTOCOL_VERSIONS.contains(&version) {
         Ok(())
     } else {
-        let data = UnsupportedVersionData {
-            supported_versions: SUPPORTED_PROTOCOL_VERSIONS
-                .iter()
-                .map(|v| v.to_string())
-                .collect(),
-        };
-        Err(crate::error::JsonRpcError {
-            code: error_codes::UNSUPPORTED_VERSION,
-            message: format!("Unsupported protocol version: {}", version),
-            data: Some(serde_json::to_value(data).unwrap()),
-        })
+        Err(crate::error::JsonRpcError::unsupported_protocol_version(
+            version,
+            SUPPORTED_PROTOCOL_VERSIONS.iter().copied(),
+        ))
     }
 }
 
@@ -305,13 +317,21 @@ mod tests {
     }
 
     #[test]
-    fn test_unsupported_version_data() {
-        let data = UnsupportedVersionData {
-            supported_versions: vec!["2025-11-25".to_string()],
+    fn test_unsupported_protocol_version_data_shape() {
+        // Per SEP-2575 the wire shape is `supported`, not `supportedVersions`,
+        // and the data also carries `requested`.
+        let data = UnsupportedProtocolVersionData {
+            supported: vec!["2026-07-28".to_string(), "2025-11-25".to_string()],
+            requested: "2027-01-01".to_string(),
         };
 
         let json = serde_json::to_value(&data).unwrap();
-        assert_eq!(json["supportedVersions"][0], "2025-11-25");
+        assert_eq!(json["supported"][0], "2026-07-28");
+        assert_eq!(json["requested"], "2027-01-01");
+        assert!(
+            json.get("supportedVersions").is_none(),
+            "spec field name is 'supported', not 'supportedVersions': {json}"
+        );
     }
 
     #[test]

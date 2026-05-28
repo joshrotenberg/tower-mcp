@@ -15,19 +15,24 @@
 //!
 //! ## MCP-Specific Error Codes
 //!
-//! MCP uses the server error range (-32000 to -32099) for protocol-specific errors:
+//! MCP uses the server error range (-32000 to -32099) for protocol-specific
+//! errors. Codes assigned by the spec are marked **spec**; codes used only by
+//! this implementation (in the JSON-RPC "implementation-defined" subrange) are
+//! marked *impl*.
 //!
-//! | Code   | Name            | Meaning                                  |
-//! |--------|-----------------|------------------------------------------|
-//! | -32000 | ConnectionClosed| Transport connection was closed          |
-//! | -32001 | RequestTimeout  | Request exceeded timeout                 |
-//! | -32002 | ResourceNotFound| Resource not found                       |
-//! | -32003 | AlreadySubscribed| Resource already subscribed             |
-//! | -32004 | NotSubscribed   | Resource not subscribed (for unsubscribe)|
-//! | -32005 | SessionNotFound | Session not found or expired             |
-//! | -32006 | SessionRequired | MCP-Session-Id header is required        |
-//! | -32007 | Forbidden       | Access forbidden (insufficient scope)    |
-//! | -32042 | UrlElicitationRequired | URL elicitation required          |
+//! | Code   | Name                          | Source | Meaning                              |
+//! |--------|-------------------------------|--------|--------------------------------------|
+//! | -32000 | ConnectionClosed              | *impl* | Transport connection was closed      |
+//! | -32001 | RequestTimeout                | *impl* | Request exceeded timeout             |
+//! | -32002 | ResourceNotFound              | *impl* | Resource not found (legacy; **SEP-2164** moves to -32602) |
+//! | -32003 | MissingRequiredClientCapability | **spec** (SEP-2575) | Client lacks a capability required by the request |
+//! | -32004 | UnsupportedProtocolVersion    | **spec** (SEP-2575) | Server does not support the request's protocol version |
+//! | -32005 | SessionNotFound               | *impl* | Session not found or expired (legacy; deprecated by SEP-2567) |
+//! | -32006 | SessionRequired               | *impl* | Mcp-Session-Id header required (legacy; deprecated by SEP-2567) |
+//! | -32007 | Forbidden                     | *impl* | Access forbidden (insufficient scope)|
+//! | -32008 | AlreadySubscribed             | *impl* | Resource already subscribed (moved from -32003 to avoid collision with SEP-2575) |
+//! | -32009 | NotSubscribed                 | *impl* | Resource not subscribed (moved from -32004 to avoid collision with SEP-2575) |
+//! | -32042 | UrlElicitationRequired        | TS SDK | URL elicitation required             |
 
 use serde::{Deserialize, Serialize};
 
@@ -55,28 +60,59 @@ pub enum ErrorCode {
     InternalError = -32603,
 }
 
-/// MCP-specific error codes (in the -32000 to -32099 range)
+/// MCP-specific error codes (in the -32000 to -32099 range).
+///
+/// Codes marked **spec** are assigned by an MCP SEP. Others are
+/// implementation-defined within the JSON-RPC server-error range; using them
+/// is permitted by JSON-RPC 2.0 but they are not part of the MCP wire spec.
+///
+/// Recently-changed assignments:
+/// - `MissingRequiredClientCapability` (-32003) and `UnsupportedProtocolVersion`
+///   (-32004) are spec assignments from SEP-2575.
+/// - `AlreadySubscribed` and `NotSubscribed` previously occupied -32003 and
+///   -32004; they moved to -32008 and -32009 to make room. **This is a
+///   breaking change on the wire** for any subscribe/unsubscribe responses
+///   that relied on the old codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 #[non_exhaustive]
 pub enum McpErrorCode {
-    /// Transport connection was closed
+    /// Transport connection was closed.
     ConnectionClosed = -32000,
-    /// Request exceeded timeout
+    /// Request exceeded timeout.
     RequestTimeout = -32001,
-    /// Resource not found
+    /// Resource not found.
+    ///
+    /// SEP-2164 (FINAL) moves this to the standard JSON-RPC `InvalidParams`
+    /// code (-32602). The migration is gated on protocol-version negotiation
+    /// landing (see #819); for now we keep emitting -32002 for back-compat
+    /// with 2025-11-25 clients.
     ResourceNotFound = -32002,
-    /// Resource already subscribed
-    AlreadySubscribed = -32003,
-    /// Resource not subscribed (for unsubscribe)
-    NotSubscribed = -32004,
-    /// Session not found or expired - client should re-initialize
+    /// SEP-2575: client capabilities advertised on the request do not
+    /// include a capability required by the called method.
+    MissingRequiredClientCapability = -32003,
+    /// SEP-2575: server does not support the protocol version the client
+    /// requested (via `MCP-Protocol-Version` header or per-request `_meta`).
+    /// Use [`JsonRpcError::unsupported_protocol_version`] to construct.
+    UnsupportedProtocolVersion = -32004,
+    /// Session not found or expired -- client should re-initialize.
+    ///
+    /// SEP-2567 deprecates sessions entirely. This code stays for the
+    /// 2025-11-25 protocol path; sessionless deployments will never emit it.
     SessionNotFound = -32005,
-    /// Session ID is required but was not provided
+    /// Session ID is required but was not provided.
+    ///
+    /// SEP-2567 deprecates sessions entirely. Same caveat as `SessionNotFound`.
     SessionRequired = -32006,
-    /// Access forbidden (insufficient scope or authorization)
+    /// Access forbidden (insufficient scope or authorization).
     Forbidden = -32007,
-    /// URL elicitation is required before processing the request
+    /// Resource already subscribed. Moved from -32003 to avoid the
+    /// SEP-2575 `MissingRequiredClientCapability` collision.
+    AlreadySubscribed = -32008,
+    /// Resource not subscribed (for unsubscribe). Moved from -32004 to
+    /// avoid the SEP-2575 `UnsupportedProtocolVersion` collision.
+    NotSubscribed = -32009,
+    /// URL elicitation is required before processing the request.
     UrlElicitationRequired = -32042,
 }
 
@@ -220,6 +256,53 @@ impl JsonRpcError {
     pub fn url_elicitation_required(message: impl Into<String>) -> Self {
         Self::mcp_error(McpErrorCode::UrlElicitationRequired, message)
     }
+
+    /// SEP-2575: server does not support the protocol version the client
+    /// requested. The error data carries both the AS-supported versions
+    /// and the version the client asked for, matching the spec shape:
+    ///
+    /// ```text
+    /// data: { supported: [...], requested: "..." }
+    /// ```
+    pub fn unsupported_protocol_version(
+        requested: impl Into<String>,
+        supported: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        let data = UnsupportedProtocolVersionData {
+            supported: supported.into_iter().map(Into::into).collect(),
+            requested: requested.into(),
+        };
+        Self {
+            code: McpErrorCode::UnsupportedProtocolVersion.code(),
+            message: format!(
+                "Unsupported protocol version: {} (supported: {})",
+                data.requested,
+                data.supported.join(", "),
+            ),
+            data: Some(
+                serde_json::to_value(&data)
+                    .expect("UnsupportedProtocolVersionData is serializable"),
+            ),
+        }
+    }
+}
+
+/// SEP-2575 error data for `UnsupportedProtocolVersion` (-32004).
+///
+/// Wire shape per the draft schema:
+/// ```json
+/// {
+///   "supported": ["2026-07-28", "2025-11-25"],
+///   "requested": "2027-01-01"
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnsupportedProtocolVersionData {
+    /// Protocol versions the server supports. The client should pick a
+    /// mutually-supported version from this list and retry.
+    pub supported: Vec<String>,
+    /// The protocol version that was requested by the client.
+    pub requested: String,
 }
 
 /// Tool execution error with context
@@ -452,6 +535,85 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =========================================================================
+    // SEP-2575 UnsupportedProtocolVersion (-32004) wire-format tests
+    // =========================================================================
+
+    #[test]
+    fn unsupported_protocol_version_code_is_negative_32004() {
+        assert_eq!(McpErrorCode::UnsupportedProtocolVersion.code(), -32004);
+    }
+
+    #[test]
+    fn unsupported_protocol_version_constructor_has_spec_shape() {
+        let err =
+            JsonRpcError::unsupported_protocol_version("2027-01-01", ["2026-07-28", "2025-11-25"]);
+        assert_eq!(err.code, -32004);
+        let data = err.data.expect("data must be present");
+        assert_eq!(
+            data["supported"],
+            serde_json::json!(["2026-07-28", "2025-11-25"])
+        );
+        assert_eq!(data["requested"], "2027-01-01");
+        assert!(
+            data.get("supportedVersions").is_none(),
+            "spec field name is 'supported', not 'supportedVersions'"
+        );
+    }
+
+    #[test]
+    fn unsupported_protocol_version_data_round_trip() {
+        let original = UnsupportedProtocolVersionData {
+            supported: vec!["2026-07-28".into(), "2025-11-25".into()],
+            requested: "2027-01-01".into(),
+        };
+        let json = serde_json::to_value(&original).unwrap();
+        let parsed: UnsupportedProtocolVersionData = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(parsed.supported, original.supported);
+        assert_eq!(parsed.requested, original.requested);
+    }
+
+    // =========================================================================
+    // Subscribe-code migration (avoid SEP-2575 collision)
+    // =========================================================================
+
+    #[test]
+    fn subscribe_codes_moved_off_spec_assignments() {
+        // -32003 and -32004 belong to SEP-2575 spec codes; our subscribe codes
+        // moved to -32008/-32009 to avoid collision.
+        assert_eq!(McpErrorCode::AlreadySubscribed.code(), -32008);
+        assert_eq!(McpErrorCode::NotSubscribed.code(), -32009);
+        assert_eq!(McpErrorCode::MissingRequiredClientCapability.code(), -32003);
+        assert_eq!(McpErrorCode::UnsupportedProtocolVersion.code(), -32004);
+    }
+
+    #[test]
+    fn no_two_mcp_codes_share_a_value() {
+        let all = [
+            McpErrorCode::ConnectionClosed.code(),
+            McpErrorCode::RequestTimeout.code(),
+            McpErrorCode::ResourceNotFound.code(),
+            McpErrorCode::MissingRequiredClientCapability.code(),
+            McpErrorCode::UnsupportedProtocolVersion.code(),
+            McpErrorCode::SessionNotFound.code(),
+            McpErrorCode::SessionRequired.code(),
+            McpErrorCode::Forbidden.code(),
+            McpErrorCode::AlreadySubscribed.code(),
+            McpErrorCode::NotSubscribed.code(),
+            McpErrorCode::UrlElicitationRequired.code(),
+        ];
+        let mut sorted = all.to_vec();
+        sorted.sort_unstable();
+        let original_len = sorted.len();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            original_len,
+            "collision in McpErrorCode values: {:?}",
+            all
+        );
+    }
 
     #[test]
     fn test_box_error_from_io_error() {
