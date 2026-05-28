@@ -156,6 +156,11 @@ name = "external_notifications"
 path = "../../examples/external_notifications.rs"
 required-features = ["http"]
 
+[[example]]
+name = "axum_embedding"
+path = "../../examples/axum_embedding.rs"
+required-features = ["http"]
+
 # --- Middleware ---
 [[example]]
 name = "middleware"

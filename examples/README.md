@@ -3,6 +3,11 @@
 Focused examples demonstrating tower-mcp features. Each file is self-contained
 and covers a specific topic.
 
+If you are dropping tower-mcp into an existing axum application,
+[`axum_embedding`](axum_embedding.rs) is the canonical pattern: it shows how
+`HttpTransport::into_router()` composes with your own routes, state, and
+tower middleware.
+
 ## Running Examples
 
 ```bash
@@ -13,6 +18,9 @@ cargo run --example rate_limiting
 
 # HTTP transport
 cargo run --example http_server --features http
+
+# Embed MCP inside an existing axum app
+cargo run --example axum_embedding --features http
 
 # WebSocket transport
 cargo run --example websocket_server --features websocket
@@ -45,6 +53,7 @@ cargo run --example tool_macro --features macros
 |---------|---------------|
 | [http_server](http_server.rs) | HTTP/SSE transport with sessions, progress, resources |
 | [websocket_server](websocket_server.rs) | WebSocket transport with sampling support |
+| [axum_embedding](axum_embedding.rs) | Canonical pattern for mounting MCP under `/mcp` inside an existing axum app, sharing middleware and state with non-MCP routes |
 
 ### Middleware
 

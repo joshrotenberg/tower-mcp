@@ -607,12 +607,12 @@ We track all MCP Specification Enhancement Proposals (SEPs) as [GitHub issues](h
 
 A full-featured MCP server for querying [crates.io](https://crates.io) is available as a standalone project: [cratesio-mcp](https://github.com/joshrotenberg/cratesio-mcp). A demo instance is deployed at **https://cratesio-mcp.fly.dev** -- connect with any MCP client that supports HTTP transport.
 
-The repo includes 23 focused examples organized by topic:
+The repo includes 24 focused examples organized by topic:
 
 | Category | Examples |
 |----------|----------|
 | **Getting started** | [`getting_started`](examples/getting_started.rs) -- tools, resources, prompts, stdio transport |
-| **Transports** | [`http_server`](examples/http_server.rs), [`websocket_server`](examples/websocket_server.rs) |
+| **Transports** | [`http_server`](examples/http_server.rs), [`websocket_server`](examples/websocket_server.rs), [`axum_embedding`](examples/axum_embedding.rs) -- mount MCP under `/mcp` inside an existing axum app |
 | **Middleware** | [`middleware`](examples/middleware.rs) (transport, per-tool, per-resource, per-prompt, guards), [`rate_limiting`](examples/rate_limiting.rs), [`capability_filtering`](examples/capability_filtering.rs), [`tool_selection`](examples/tool_selection.rs) |
 | **Authentication** | [`http_auth`](examples/http_auth.rs), [`oauth_client`](examples/oauth_client.rs), [`external_api_auth`](examples/external_api_auth.rs) |
 | **Clients** | [`client_cli`](examples/client_cli.rs), [`http_client`](examples/http_client.rs), [`http_sse_client`](examples/http_sse_client.rs) |
