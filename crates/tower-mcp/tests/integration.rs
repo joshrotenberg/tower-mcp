@@ -1946,13 +1946,26 @@ async fn test_task_capabilities_advertised() {
             let caps = r.result.get("capabilities").unwrap();
             let tasks = caps
                 .get("tasks")
-                .expect("capabilities should include 'tasks'");
+                .expect("capabilities should include 'tasks' (back-compat)");
             assert!(tasks.get("list").is_some(), "tasks should have 'list'");
             assert!(tasks.get("cancel").is_some(), "tasks should have 'cancel'");
             let requests = tasks.get("requests").expect("tasks should have 'requests'");
             assert!(
                 requests.get("tools").is_some(),
                 "requests should have 'tools'"
+            );
+
+            // SEP-2663: support is also declared in `capabilities.extensions`
+            // under the reverse-DNS identifier.
+            let extensions = caps
+                .get("extensions")
+                .expect("SEP-2663: capabilities should include 'extensions'");
+            let tasks_ext = extensions
+                .get("io.modelcontextprotocol/tasks")
+                .expect("SEP-2663: extensions should include tasks identifier");
+            assert!(
+                tasks_ext.is_object(),
+                "tasks extension value should be an object (no settings)"
             );
         }
         JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
@@ -2026,6 +2039,113 @@ async fn test_task_tool_definition_includes_execution() {
             }
         }
         JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+        _ => panic!("unexpected response variant"),
+    }
+}
+
+#[tokio::test]
+async fn test_task_create_includes_sep_2663_result_type_discriminator() {
+    // SEP-2663 mandates `resultType: "task"` on CreateTaskResult, with the
+    // Task fields inlined at the top of the result. tower-mcp also keeps the
+    // legacy nested `task` field for 2025-11-25 back-compat.
+    let router = create_router_with_tasks();
+    let mut service = JsonRpcService::new(router.clone());
+    init_service(&router, &mut service).await;
+
+    let call_req = JsonRpcRequest::new(2, "tools/call").with_params(serde_json::json!({
+        "name": "echo",
+        "arguments": { "message": "hello" },
+        "task": {}
+    }));
+    let resp = service.call_single(call_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Result(r) => {
+            assert_eq!(
+                r.result["resultType"], "task",
+                "SEP-2663: resultType MUST be \"task\" on CreateTaskResult"
+            );
+            // Inlined Task fields:
+            assert!(
+                r.result["taskId"].as_str().is_some(),
+                "SEP-2663: taskId MUST be present at the top of the result"
+            );
+            assert_eq!(r.result["status"], "working");
+            // Legacy nested mirror kept for 2025-11-25 clients:
+            assert_eq!(
+                r.result["task"]["taskId"], r.result["taskId"],
+                "back-compat: nested task.taskId should mirror the inlined taskId"
+            );
+        }
+        JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+        _ => panic!("unexpected response variant"),
+    }
+}
+
+#[tokio::test]
+async fn test_task_update_acks_with_empty_result() {
+    // SEP-2663 `tasks/update`: the server acknowledges with an empty result.
+    let router = create_router_with_tasks();
+    let mut service = JsonRpcService::new(router.clone());
+    init_service(&router, &mut service).await;
+
+    // Spin up a working task we can address.
+    let call_req = JsonRpcRequest::new(2, "tools/call").with_params(serde_json::json!({
+        "name": "slow",
+        "arguments": {},
+        "task": {}
+    }));
+    let resp = service.call_single(call_req).await.unwrap();
+    let task_id = match &resp {
+        JsonRpcResponse::Result(r) => r.result["taskId"].as_str().unwrap().to_string(),
+        JsonRpcResponse::Error(e) => panic!("create task failed: {:?}", e),
+        _ => panic!("unexpected response variant"),
+    };
+
+    let update_req = JsonRpcRequest::new(3, "tasks/update").with_params(serde_json::json!({
+        "taskId": task_id,
+        "inputResponses": {
+            "ignored-key": { "action": "accept", "content": { "input": "noop" } }
+        }
+    }));
+    let resp = service.call_single(update_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Result(r) => {
+            // Empty object ack -- no fields beyond the JSON-RPC envelope.
+            assert!(
+                r.result.as_object().is_some_and(|o| o.is_empty()),
+                "tasks/update should ack with empty result, got: {}",
+                r.result
+            );
+        }
+        JsonRpcResponse::Error(e) => panic!("tasks/update should ack; got error: {:?}", e),
+        _ => panic!("unexpected response variant"),
+    }
+}
+
+#[tokio::test]
+async fn test_task_update_returns_error_for_unknown_task() {
+    // SEP-2663 says servers SHOULD return a JSON-RPC error for unknown
+    // taskIds on tasks/update.
+    let router = create_router_with_tasks();
+    let mut service = JsonRpcService::new(router.clone());
+    init_service(&router, &mut service).await;
+
+    let update_req = JsonRpcRequest::new(3, "tasks/update").with_params(serde_json::json!({
+        "taskId": "task-does-not-exist",
+        "inputResponses": {}
+    }));
+    let resp = service.call_single(update_req).await.unwrap();
+    match resp {
+        JsonRpcResponse::Error(e) => {
+            assert!(
+                e.error.message.contains("not found"),
+                "expected 'not found' in error message, got: {}",
+                e.error.message
+            );
+        }
+        JsonRpcResponse::Result(r) => panic!("expected error, got result: {}", r.result),
         _ => panic!("unexpected response variant"),
     }
 }
