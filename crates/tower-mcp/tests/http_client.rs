@@ -2298,7 +2298,9 @@ mod stateless_tests {
         );
     }
 
-    /// Unsupported protocol version returns SEP-1442 error code -32000.
+    /// Unsupported protocol version returns SEP-2575 error code -32004
+    /// with the spec-shape data: `{ supported: [...], requested: "..." }`.
+    /// (SEP-1442 draft used -32000 / `supportedVersions`; both were wrong.)
     #[tokio::test]
     async fn test_stateless_unsupported_version() {
         let (url, _server) = start_stateless_server().await;
@@ -2324,8 +2326,12 @@ mod stateless_tests {
 
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["error"]["code"].as_i64().unwrap(), -32000);
-        assert!(body["error"]["data"]["supportedVersions"].is_array());
+        assert_eq!(body["error"]["code"].as_i64().unwrap(), -32004);
+        assert!(
+            body["error"]["data"]["supported"].is_array(),
+            "spec data field is 'supported': {body}"
+        );
+        assert_eq!(body["error"]["data"]["requested"], "1999-01-01");
     }
 
     /// Protocol version in _meta field (body) works as alternative to header.
