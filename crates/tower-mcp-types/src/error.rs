@@ -24,7 +24,7 @@
 //! |--------|-------------------------------|--------|--------------------------------------|
 //! | -32000 | ConnectionClosed              | *impl* | Transport connection was closed      |
 //! | -32001 | RequestTimeout                | *impl* | Request exceeded timeout             |
-//! | -32002 | ResourceNotFound              | *impl* | Resource not found (legacy; **SEP-2164** moves to -32602) |
+//! | -32002 | ResourceNotFound              | *deprecated* | **SEP-2164** reassigned to -32602; variant kept for backcompat |
 //! | -32003 | MissingRequiredClientCapability | **spec** (SEP-2575) | Client lacks a capability required by the request |
 //! | -32004 | UnsupportedProtocolVersion    | **spec** (SEP-2575) | Server does not support the request's protocol version |
 //! | -32005 | SessionNotFound               | *impl* | Session not found or expired (legacy; deprecated by SEP-2567) |
@@ -83,10 +83,17 @@ pub enum McpErrorCode {
     RequestTimeout = -32001,
     /// Resource not found.
     ///
-    /// SEP-2164 (FINAL) moves this to the standard JSON-RPC `InvalidParams`
-    /// code (-32602). The migration is gated on protocol-version negotiation
-    /// landing (see #819); for now we keep emitting -32002 for back-compat
-    /// with 2025-11-25 clients.
+    /// **Deprecated**: SEP-2164 (FINAL) moves this to the standard JSON-RPC
+    /// `InvalidParams` code (-32602). The
+    /// [`JsonRpcError::resource_not_found`] constructor now emits -32602.
+    /// The enum variant is retained so existing pattern matches on
+    /// `McpErrorCode::ResourceNotFound` keep compiling, but the variant's
+    /// numeric value is no longer what the constructor produces.
+    #[deprecated(
+        since = "0.12.0",
+        note = "SEP-2164 reassigned resource-not-found to InvalidParams (-32602). \
+                Use JsonRpcError::resource_not_found or ErrorCode::InvalidParams."
+    )]
     ResourceNotFound = -32002,
     /// SEP-2575: client capabilities advertised on the request do not
     /// include a capability required by the called method.
@@ -193,10 +200,14 @@ impl JsonRpcError {
         Self::mcp_error(McpErrorCode::RequestTimeout, message)
     }
 
-    /// Resource not found
+    /// Resource not found. Per SEP-2164 (FINAL) this now uses the
+    /// standard JSON-RPC `InvalidParams` code (-32602) rather than the
+    /// legacy MCP-specific [`McpErrorCode::ResourceNotFound`] (-32002).
+    /// The resource URI is a parameter, so missing-parameter and
+    /// unknown-resource-URI are the same error class.
     pub fn resource_not_found(uri: &str) -> Self {
-        Self::mcp_error(
-            McpErrorCode::ResourceNotFound,
+        Self::new(
+            ErrorCode::InvalidParams,
             format!("Resource not found: {}", uri),
         )
     }
@@ -575,6 +586,25 @@ mod tests {
     }
 
     // =========================================================================
+    // SEP-2164: ResourceNotFound -> InvalidParams (-32602)
+    // =========================================================================
+
+    #[test]
+    fn resource_not_found_constructor_uses_invalid_params() {
+        let err = JsonRpcError::resource_not_found("file:///gone.txt");
+        assert_eq!(err.code, ErrorCode::InvalidParams.code());
+        assert_eq!(err.code, -32602);
+        assert!(err.message.contains("file:///gone.txt"));
+    }
+
+    #[test]
+    fn resource_not_found_serializes_with_spec_code() {
+        let err = JsonRpcError::resource_not_found("urn:test:x");
+        let json = serde_json::to_value(&err).unwrap();
+        assert_eq!(json["code"], -32602);
+    }
+
+    // =========================================================================
     // Subscribe-code migration (avoid SEP-2575 collision)
     // =========================================================================
 
@@ -589,6 +619,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // ResourceNotFound stays in the enum for backcompat
     fn no_two_mcp_codes_share_a_value() {
         let all = [
             McpErrorCode::ConnectionClosed.code(),

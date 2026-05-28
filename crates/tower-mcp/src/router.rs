@@ -6457,7 +6457,7 @@ mod tests {
         };
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
         let err = resp.inner.expect_err("disabled resource should error");
-        assert_eq!(err.code, -32002);
+        assert_eq!(err.code, -32602); // SEP-2164: ResourceNotFound now uses InvalidParams
 
         // prompts/list excludes
         let req = RouterRequest {

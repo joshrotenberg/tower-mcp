@@ -691,7 +691,7 @@ async fn test_error_resources_not_found() {
 
     match resp {
         JsonRpcResponse::Error(e) => {
-            assert_eq!(e.error.code, -32002); // MCP ResourceNotFound
+            assert_eq!(e.error.code, -32602); // InvalidParams per SEP-2164 (was -32002 ResourceNotFound)
         }
         JsonRpcResponse::Result(_) => panic!("Expected error for resource not found"),
         _ => panic!("unexpected response variant"),
@@ -910,7 +910,7 @@ async fn test_resources_read_not_found() {
 
     match resp {
         JsonRpcResponse::Error(e) => {
-            assert_eq!(e.error.code, -32002); // MCP ResourceNotFound
+            assert_eq!(e.error.code, -32602); // InvalidParams per SEP-2164 (was -32002 ResourceNotFound)
             assert!(e.error.message.contains("not found"));
         }
         JsonRpcResponse::Result(_) => panic!("Expected error for non-existent resource"),
