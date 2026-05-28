@@ -31,6 +31,19 @@ pub const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 /// ```
 pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-03-26"];
 
+/// The next protocol version we are tracking toward but have not yet
+/// fully implemented. Documented as a constant so downstream tooling
+/// (codegen, conformance harnesses) can reference it explicitly.
+///
+/// Once the implementation is feature-complete (sessionless transport,
+/// `server/discover`, `messages/listen`, per-request `_meta` capabilities;
+/// see [tower-mcp#814]) this value will move into
+/// [`SUPPORTED_PROTOCOL_VERSIONS`] and become the new
+/// [`LATEST_PROTOCOL_VERSION`].
+///
+/// [tower-mcp#814]: https://github.com/joshrotenberg/tower-mcp/issues/814
+pub const UPCOMING_PROTOCOL_VERSION: &str = "2026-07-28";
+
 /// JSON-RPC 2.0 request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
@@ -4159,6 +4172,28 @@ impl McpNotification {
 mod tests {
     use super::*;
     use crate::error::JsonRpcError;
+
+    // =========================================================================
+    // Protocol version constants
+    // =========================================================================
+
+    #[test]
+    fn upcoming_version_is_documented_and_not_yet_supported() {
+        // UPCOMING_PROTOCOL_VERSION points at the next protocol we're tracking
+        // toward. Until #814 ships fully, the constant exists for downstream
+        // tooling but the version must NOT appear in SUPPORTED_PROTOCOL_VERSIONS
+        // (otherwise we'd be falsely advertising compatibility).
+        assert_eq!(UPCOMING_PROTOCOL_VERSION, "2026-07-28");
+        assert!(
+            !SUPPORTED_PROTOCOL_VERSIONS.contains(&UPCOMING_PROTOCOL_VERSION),
+            "do not promote UPCOMING_PROTOCOL_VERSION into SUPPORTED until the \
+             impl is complete; current: {:?}",
+            SUPPORTED_PROTOCOL_VERSIONS
+        );
+        // LATEST_PROTOCOL_VERSION is one of the SUPPORTED ones; it isn't
+        // UPCOMING until we ship 2026-07-28.
+        assert!(SUPPORTED_PROTOCOL_VERSIONS.contains(&LATEST_PROTOCOL_VERSION));
+    }
 
     // =========================================================================
     // SEP-2575 (server/discover) wire-format tests

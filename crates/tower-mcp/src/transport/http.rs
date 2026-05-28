@@ -2137,16 +2137,21 @@ async fn handle_post(
         return json_rpc_error_response(None, JsonRpcError::session_required());
     };
 
-    // Validate protocol version (if present and not init request)
+    // Validate protocol version (if present and not init request).
+    // Per SEP-2575, unsupported versions get a JSON-RPC error with code
+    // -32004 and `{ supported, requested }` data, not a plain-text 400.
     if !is_init
         && let Some(version) = get_protocol_version(&headers)
         && !SUPPORTED_PROTOCOL_VERSIONS.contains(&version.as_str())
     {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!("Unsupported protocol version: {}", version),
-        )
-            .into_response();
+        let id = extract_request_id(&parsed);
+        return json_rpc_error_response(
+            id,
+            JsonRpcError::unsupported_protocol_version(
+                version,
+                SUPPORTED_PROTOCOL_VERSIONS.iter().copied(),
+            ),
+        );
     }
 
     // Check if this is a response to one of our outgoing requests (sampling)
@@ -2720,6 +2725,75 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("2025-03-26")
         );
+    }
+
+    #[tokio::test]
+    async fn unsupported_protocol_version_returns_spec_shape_error() {
+        // SEP-2575: requests carrying an unrecognized MCP-Protocol-Version
+        // header (post-initialize) get a JSON-RPC error with code -32004 and
+        // data `{ supported: [...], requested: "..." }`.
+        let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
+        let app = transport.into_router();
+
+        // Initialize first so we're past the init exemption.
+        let init_request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": { "name": "t", "version": "0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let init_response = app.clone().oneshot(init_request).await.unwrap();
+        let session_id = init_response
+            .headers()
+            .get(MCP_SESSION_ID_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Now send a request with a bogus version header.
+        let bad = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header(MCP_SESSION_ID_HEADER, &session_id)
+            .header(MCP_PROTOCOL_VERSION_HEADER, "1999-01-01")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 99,
+                    "method": "tools/list"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(bad).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"].as_i64().unwrap(), -32004);
+        assert_eq!(json["error"]["data"]["requested"], "1999-01-01");
+        let supported = json["error"]["data"]["supported"]
+            .as_array()
+            .expect("supported must be an array");
+        assert!(supported.contains(&serde_json::json!("2025-11-25")));
+        // The request id must be echoed (we have one in the body).
+        assert_eq!(json["id"], 99);
     }
 
     #[tokio::test]
