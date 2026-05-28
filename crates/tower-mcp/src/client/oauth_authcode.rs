@@ -78,10 +78,20 @@ fn generate_state() -> String {
 /// OAuth authorization server metadata (subset of RFC 8414).
 #[derive(Debug, serde::Deserialize)]
 struct AuthorizationServerMetadata {
+    /// AS issuer identifier (RFC 8414 §2). Required by the spec but
+    /// modelled as `Option` so deserialization tolerates AS metadata
+    /// documents that omit it (we then can't enforce SEP-2468).
+    #[serde(default)]
+    issuer: Option<String>,
     authorization_endpoint: String,
     token_endpoint: String,
     #[allow(dead_code)]
     registration_endpoint: Option<String>,
+    /// RFC 9207 / SEP-2468: AS advertises that it includes `iss` in
+    /// authorization responses. Drives the "absent iss is suspicious"
+    /// branch of client-side validation.
+    #[serde(default)]
+    authorization_response_iss_parameter_supported: bool,
 }
 
 /// Discover the authorization server metadata from the MCP server's
@@ -199,6 +209,14 @@ struct OAuthAuthCodeInner {
     callback_rx: Mutex<Option<oneshot::Receiver<Result<CallbackResult, String>>>>,
     /// Handle to the callback server task.
     _callback_task: tokio::task::JoinHandle<()>,
+    /// SEP-2468 / RFC 9207: expected `iss` value, recorded at start time
+    /// from AS metadata. Used to validate the authorization response's
+    /// `iss` parameter against the originating server.
+    expected_issuer: Option<String>,
+    /// SEP-2468: whether the AS advertises iss-in-response support. When
+    /// `true`, a missing `iss` in the callback is grounds for rejection
+    /// per RFC 9207 §2.4. When `false`, missing `iss` is tolerated.
+    iss_required: bool,
 }
 
 #[derive(Debug)]
@@ -206,6 +224,9 @@ struct CallbackResult {
     code: String,
     #[allow(dead_code)]
     state: String,
+    /// SEP-2468: `iss` parameter from the authorization response, if the
+    /// AS included it. Validated against `expected_issuer`.
+    iss: Option<String>,
 }
 
 impl fmt::Debug for OAuthAuthorizationCode {
@@ -301,6 +322,8 @@ impl OAuthAuthorizationCode {
                 cache: RwLock::new(None),
                 callback_rx: Mutex::new(Some(callback_rx)),
                 _callback_task: callback_task,
+                expected_issuer: metadata.issuer,
+                iss_required: metadata.authorization_response_iss_parameter_supported,
             }),
         })
     }
@@ -342,6 +365,16 @@ impl OAuthAuthorizationCode {
                 "CSRF state mismatch".to_string(),
             ));
         }
+
+        // SEP-2468: validate `iss` against expected issuer recorded from AS
+        // metadata at flow start. Mismatch (or missing-when-required) aborts
+        // the flow per RFC 9207 §2.4 to defend against mix-up attacks.
+        validate_iss(
+            result.iss.as_deref(),
+            self.inner.expected_issuer.as_deref(),
+            self.inner.iss_required,
+        )
+        .map_err(OAuthClientError::InvalidResponse)?;
 
         // Exchange code for tokens
         let token = self.exchange_code(&result.code).await?;
@@ -621,6 +654,7 @@ fn parse_callback_query(path: &str, expected_state: &str) -> Result<CallbackResu
     let mut code = None;
     let mut state = None;
     let mut error = None;
+    let mut iss = None;
 
     for param in query.split('&') {
         let mut parts = param.splitn(2, '=');
@@ -633,6 +667,8 @@ fn parse_callback_query(path: &str, expected_state: &str) -> Result<CallbackResu
             "state" => state = Some(decoded),
             "error" => error = Some(decoded),
             "error_description" if error.is_none() => error = Some(decoded),
+            // SEP-2468 / RFC 9207
+            "iss" => iss = Some(decoded),
             _ => {}
         }
     }
@@ -648,7 +684,52 @@ fn parse_callback_query(path: &str, expected_state: &str) -> Result<CallbackResu
         return Err("CSRF state mismatch".to_string());
     }
 
-    Ok(CallbackResult { code, state })
+    Ok(CallbackResult { code, state, iss })
+}
+
+/// SEP-2468 / RFC 9207 §2.4: validate the authorization response's `iss`
+/// parameter against the expected issuer recorded at flow start.
+///
+/// Rules:
+/// - If the AS advertised support (`iss_required = true`) and the
+///   callback omits `iss`, REJECT -- the AS promised it would send one.
+/// - If `iss` is present, it MUST equal `expected` exactly (simple
+///   string compare per the SEP).
+/// - If `iss` is absent and the AS did not advertise support, accept.
+///   This is the SEP's "comparison instead of discard" rule for legacy
+///   AS that have not yet started emitting `iss`.
+///
+/// Returns Err with a description suitable for surfacing to the user.
+fn validate_iss(
+    iss: Option<&str>,
+    expected: Option<&str>,
+    iss_required: bool,
+) -> Result<(), String> {
+    match (iss, expected, iss_required) {
+        (Some(received), Some(want), _) => {
+            if received == want {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Issuer mismatch (SEP-2468): expected `{}`, got `{}`",
+                    want, received
+                ))
+            }
+        }
+        (Some(_received), None, _) => {
+            // Server sent iss but we never recorded an expected value
+            // (AS metadata lacked an `issuer` field). Don't have a baseline
+            // to compare against; accept rather than fail-open, but the
+            // AS metadata is malformed per RFC 8414.
+            Ok(())
+        }
+        (None, _, true) => Err(
+            "Authorization response missing `iss` (SEP-2468): the AS advertises \
+             authorization_response_iss_parameter_supported but did not include iss"
+                .to_string(),
+        ),
+        (None, _, false) => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -721,6 +802,68 @@ mod tests {
         let result = parse_callback_query("/callback?state=mystate", "mystate");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("code"));
+    }
+
+    // =========================================================================
+    // SEP-2468 / RFC 9207 -- iss parameter validation
+    // =========================================================================
+
+    #[test]
+    fn parse_callback_extracts_iss_when_present() {
+        let result = parse_callback_query(
+            "/callback?code=abc&state=s&iss=https%3A%2F%2Fauth.example.com",
+            "s",
+        )
+        .unwrap();
+        assert_eq!(result.iss.as_deref(), Some("https://auth.example.com"));
+    }
+
+    #[test]
+    fn parse_callback_iss_is_none_when_absent() {
+        let result = parse_callback_query("/callback?code=abc&state=s", "s").unwrap();
+        assert!(result.iss.is_none());
+    }
+
+    #[test]
+    fn validate_iss_accepts_exact_match() {
+        let expected = Some("https://auth.example.com");
+        assert!(validate_iss(Some("https://auth.example.com"), expected, true).is_ok());
+        assert!(validate_iss(Some("https://auth.example.com"), expected, false).is_ok());
+    }
+
+    #[test]
+    fn validate_iss_rejects_mismatch_regardless_of_required() {
+        let expected = Some("https://auth.example.com");
+        let bad = Some("https://evil.example.com");
+        for required in [true, false] {
+            let err = validate_iss(bad, expected, required).unwrap_err();
+            assert!(
+                err.contains("Issuer mismatch"),
+                "should reject mismatch (required={required}), got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_iss_rejects_missing_when_as_advertises_support() {
+        // SEP-2468 / RFC 9207 §2.4: AS advertised iss support but did not send.
+        let err = validate_iss(None, Some("https://auth.example.com"), true).unwrap_err();
+        assert!(err.contains("missing `iss`"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_iss_accepts_missing_when_as_does_not_advertise_support() {
+        // Tolerance window: AS predates the iss-emission convention. Accept
+        // rather than reject so we don't break legacy flows.
+        assert!(validate_iss(None, Some("https://auth.example.com"), false).is_ok());
+    }
+
+    #[test]
+    fn validate_iss_accepts_when_no_expected_recorded() {
+        // AS metadata omitted issuer; we have no baseline to compare against.
+        // Accept rather than fail-open, but the AS metadata is non-compliant.
+        assert!(validate_iss(Some("https://auth.example.com"), None, false).is_ok());
+        assert!(validate_iss(None, None, false).is_ok());
     }
 
     #[test]
