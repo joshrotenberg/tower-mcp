@@ -433,6 +433,22 @@ impl RequestContext {
         &self.extensions
     }
 
+    /// SEP-2575 per-request `_meta` (protocol version, client info, client
+    /// capabilities, log level) if the transport extracted it.
+    ///
+    /// Returns `None` when:
+    /// - The request had no `_meta` field, or
+    /// - The transport does not stash per-request metadata (only the HTTP
+    ///   transport currently does), or
+    /// - The `stateless` feature is not enabled.
+    ///
+    /// Equivalent to `self.extension::<StatelessRequestMeta>()` but typed
+    /// so handlers don't have to repeat the import.
+    #[cfg(feature = "stateless")]
+    pub fn per_request_meta(&self) -> Option<&crate::stateless::StatelessRequestMeta> {
+        self.extension::<crate::stateless::StatelessRequestMeta>()
+    }
+
     /// Get the request ID
     pub fn request_id(&self) -> &RequestId {
         &self.request_id

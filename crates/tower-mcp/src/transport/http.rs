@@ -194,6 +194,19 @@ use crate::transport::service::{
 };
 use tower::util::BoxCloneService;
 
+/// SEP-2575 per-request `_meta` extraction. Pulls `StatelessRequestMeta` from
+/// the parsed request params and inserts it into the per-request `Extensions`
+/// so handlers can read it via `ctx.per_request_meta()`. No-op if the request
+/// has no `_meta`, params aren't an object, or the meta can't deserialize.
+#[cfg(feature = "stateless")]
+fn stash_per_request_meta(req: &JsonRpcRequest, ext: &mut crate::router::Extensions) {
+    if let Some(params) = req.params.as_ref()
+        && let Some(meta) = crate::stateless::StatelessRequestMeta::from_params(params)
+    {
+        ext.insert(meta);
+    }
+}
+
 /// Header name for MCP session ID
 pub const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 
@@ -2074,13 +2087,15 @@ async fn handle_post(
                 ServiceSource::Service(mutex) => JsonRpcService::new(mutex.lock().unwrap().clone()),
             };
 
+            let mut ext = crate::router::Extensions::new();
             #[cfg(feature = "oauth")]
-            {
-                if let Some(claims) = http_extensions.get::<crate::oauth::token::TokenClaims>() {
-                    let mut ext = crate::router::Extensions::new();
-                    ext.insert(claims.clone());
-                    service = service.with_extensions(ext);
-                }
+            if let Some(claims) = http_extensions.get::<crate::oauth::token::TokenClaims>() {
+                ext.insert(claims.clone());
+            }
+            #[cfg(feature = "stateless")]
+            stash_per_request_meta(&request, &mut ext);
+            if !ext.is_empty() {
+                service = service.with_extensions(ext);
             }
 
             let response = match service.call_single(request).await {
@@ -2268,14 +2283,18 @@ async fn handle_post(
     // Process the request through the middleware-wrapped service
     let mut service = JsonRpcService::new(session.make_service());
 
-    // Bridge TokenClaims from HTTP request extensions to MCP extensions
+    // Bridge per-request data from HTTP into MCP Extensions: OAuth claims,
+    // SEP-2575 `_meta` (clientInfo, clientCapabilities, etc.). Empty ext is
+    // skipped to avoid pointless allocation.
+    let mut ext = crate::router::Extensions::new();
     #[cfg(feature = "oauth")]
-    {
-        if let Some(claims) = http_extensions.get::<crate::oauth::token::TokenClaims>() {
-            let mut ext = crate::router::Extensions::new();
-            ext.insert(claims.clone());
-            service = service.with_extensions(ext);
-        }
+    if let Some(claims) = http_extensions.get::<crate::oauth::token::TokenClaims>() {
+        ext.insert(claims.clone());
+    }
+    #[cfg(feature = "stateless")]
+    stash_per_request_meta(&request, &mut ext);
+    if !ext.is_empty() {
+        service = service.with_extensions(ext);
     }
     let response = match service.call_single(request).await {
         Ok(resp) => resp,

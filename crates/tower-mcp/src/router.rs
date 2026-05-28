@@ -625,6 +625,19 @@ impl McpRouter {
         request_id: RequestId,
         progress_token: Option<ProgressToken>,
     ) -> RequestContext {
+        self.create_context_with_extensions(request_id, progress_token, &Extensions::new())
+    }
+
+    /// Internal: build a `RequestContext` and additionally merge per-request
+    /// extensions on top of the router's extensions. Used by [`Service::call`]
+    /// to thread `RouterRequest.extensions` (e.g. SEP-2575 per-request
+    /// `_meta`) through to handlers.
+    pub(crate) fn create_context_with_extensions(
+        &self,
+        request_id: RequestId,
+        progress_token: Option<ProgressToken>,
+        per_request: &Extensions,
+    ) -> RequestContext {
         let ctx = RequestContext::new(request_id.clone());
 
         // Set up progress token if provided
@@ -648,8 +661,12 @@ impl McpRouter {
             ctx
         };
 
-        // Include router extensions (for with_state() and middleware data)
-        let ctx = ctx.with_extensions(self.inner.extensions.clone());
+        // Start with router-level extensions, then layer per-request extensions
+        // on top so they win on type collision. with_state() data stays
+        // visible; per-request meta (SEP-2575) is now reachable too.
+        let mut merged = (*self.inner.extensions).clone();
+        merged.merge(per_request);
+        let ctx = ctx.with_extensions(Arc::new(merged));
 
         // Set up log level filtering
         let ctx = ctx.with_min_log_level(self.inner.min_log_level.clone());
@@ -1634,7 +1651,12 @@ impl McpRouter {
     }
 
     /// Handle an MCP request
-    async fn handle(&self, request_id: RequestId, request: McpRequest) -> Result<McpResponse> {
+    async fn handle(
+        &self,
+        request_id: RequestId,
+        request: McpRequest,
+        extensions: Extensions,
+    ) -> Result<McpResponse> {
         // Enforce session state - reject requests before initialization
         let method = request.method_name();
         if !self.session.is_request_allowed(method) {
@@ -1842,7 +1864,11 @@ impl McpRouter {
 
                     // Create a context for the async task execution
                     let progress_token = params.meta.and_then(|m| m.progress_token);
-                    let ctx = self.create_context(request_id, progress_token);
+                    let ctx = self.create_context_with_extensions(
+                        request_id,
+                        progress_token,
+                        &extensions,
+                    );
 
                     // Spawn the task execution in the background
                     let task_store = self.inner.task_store.clone();
@@ -1912,7 +1938,11 @@ impl McpRouter {
 
                     // Extract progress token from request metadata
                     let progress_token = params.meta.and_then(|m| m.progress_token);
-                    let ctx = self.create_context(request_id, progress_token);
+                    let ctx = self.create_context_with_extensions(
+                        request_id,
+                        progress_token,
+                        &extensions,
+                    );
 
                     let start = std::time::Instant::now();
                     let result = tool.call_with_context(ctx, params.arguments).await;
@@ -2051,7 +2081,7 @@ impl McpRouter {
                     }
 
                     tracing::debug!(uri = %params.uri, "Reading static resource");
-                    let ctx = self.create_context(request_id, None);
+                    let ctx = self.create_context_with_extensions(request_id, None, &extensions);
                     let result = resource.read_with_context(ctx).await;
                     return Ok(McpResponse::ReadResource(result));
                 }
@@ -2067,7 +2097,8 @@ impl McpRouter {
                             return Err(filter.denial_error(&params.uri));
                         }
                         tracing::debug!(uri = %params.uri, "Reading dynamic resource");
-                        let ctx = self.create_context(request_id, None);
+                        let ctx =
+                            self.create_context_with_extensions(request_id, None, &extensions);
                         let result = resource.read_with_context(ctx).await;
                         return Ok(McpResponse::ReadResource(result));
                     }
@@ -2220,7 +2251,7 @@ impl McpRouter {
                 }
 
                 tracing::debug!(name = %params.name, "Getting prompt");
-                let ctx = self.create_context(request_id, None);
+                let ctx = self.create_context_with_extensions(request_id, None, &extensions);
                 let result = prompt.get_with_context(ctx, params.arguments).await?;
 
                 Ok(McpResponse::GetPrompt(result))
@@ -2646,7 +2677,7 @@ impl Service<RouterRequest> for McpRouter {
         let router = self.clone();
         let request_id = req.id.clone();
         Box::pin(async move {
-            let result = router.handle(req.id, req.inner).await;
+            let result = router.handle(req.id, req.inner, req.extensions).await;
             // Clean up tracking after request completes
             router.complete_request(&request_id);
             Ok(RouterResponse {
