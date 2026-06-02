@@ -121,4 +121,120 @@ async fn messages_listen_returns_method_not_found_for_old_protocol() {
         code, -32601,
         "expected Method Not Found (-32601), got code: {code}"
     );
+
+    // JSON-RPC spec: error response MUST echo the request id.
+    let id = body["id"].as_i64();
+    assert_eq!(
+        id,
+        Some(1),
+        "error response must echo the request id, got: {body}"
+    );
+}
+
+/// Initialize with 2025-11-25 (creates a session), then POST `messages/listen`
+/// with a per-request `Mcp-Protocol-Version: 2026-07-28` header.
+///
+/// This exercises the header-override branch in `handle_post`: the session was
+/// negotiated at 2025-11-25, but the per-request header promotes the effective
+/// version to 2026-07-28, which enables the SSE path.
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn messages_listen_via_session_with_header_override() {
+    let a = app();
+
+    // Step 1: initialize with 2025-11-25 to create a session.
+    let init_request = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(Body::from(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}"#,
+        ))
+        .unwrap();
+
+    let init_resp = a.clone().oneshot(init_request).await.unwrap();
+    assert_eq!(
+        init_resp.status(),
+        StatusCode::OK,
+        "initialize must succeed"
+    );
+
+    let session_id = init_resp
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .expect("initialize response must include mcp-session-id header");
+
+    // Step 2: POST messages/listen with session ID + Mcp-Protocol-Version: 2026-07-28.
+    // The session is at 2025-11-25 but the per-request header overrides the
+    // effective version to 2026-07-28, so the server should return SSE.
+    let listen_request = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("mcp-session-id", &session_id)
+        .header("Mcp-Protocol-Version", "2026-07-28")
+        .body(Body::from(
+            r#"{"jsonrpc":"2.0","id":2,"method":"messages/listen","params":{}}"#,
+        ))
+        .unwrap();
+
+    let listen_resp = a.oneshot(listen_request).await.unwrap();
+    assert_eq!(
+        listen_resp.status(),
+        StatusCode::OK,
+        "messages/listen with header override must return 200"
+    );
+
+    let content_type = listen_resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        content_type.contains("text/event-stream"),
+        "expected Content-Type: text/event-stream for session+header override, got: {content_type}"
+    );
+}
+
+/// Exercise the pure session-fallback branch (no header, session carries version).
+///
+/// With the `stateless` feature enabled, a 2026-07-28 initialize creates a
+/// stateless session (no persisted record). With `stateless` disabled the
+/// router negotiates the version down to `LATEST_PROTOCOL_VERSION` (2025-11-25)
+/// because 2026-07-28 is not yet in `SUPPORTED_PROTOCOL_VERSIONS`. In either
+/// case the session record does not carry 2026-07-28 after a standard
+/// `initialize` handshake, so the pure headerless fallback path cannot be
+/// exercised through the HTTP API without the per-request header override.
+///
+/// The header-override test (`messages_listen_via_session_with_header_override`)
+/// covers the adjacent code path; this placeholder documents the gap.
+///
+/// If 2026-07-28 is promoted to `SUPPORTED_PROTOCOL_VERSIONS`, this test can
+/// be filled in: initialize without the stateless feature, capture the session
+/// ID, and POST `messages/listen` with only the session ID header (no
+/// `Mcp-Protocol-Version`).
+#[cfg(not(feature = "stateless"))]
+#[tokio::test]
+async fn messages_listen_session_fallback_placeholder() {
+    // When 2026-07-28 is in SUPPORTED_PROTOCOL_VERSIONS, initialize with that
+    // version (no stateless feature), capture the session ID, then POST
+    // messages/listen with no Mcp-Protocol-Version header. The session record
+    // will carry 2026-07-28 and the server should return SSE.
+    //
+    // For now: just verify the existing 2025-11-25 path (no header = MethodNotFound)
+    // still works correctly, confirming the test runs in CI.
+    let response = post_messages_listen(None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        body.get("error").is_some(),
+        "headerless request on 2025-11-25 session must return Method Not Found"
+    );
 }
