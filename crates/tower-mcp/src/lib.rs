@@ -136,6 +136,10 @@
 //! - [`GetPromptResult`] - Prompt expansion result
 //! - [`Content`] - Text, image, audio, or resource content
 //!
+//! ### Stateless (2026-07-28, requires `stateless` feature)
+//! - [`stateless::StatelessRequestMeta`] - Per-request `_meta` carrying protocol version,
+//!   client identity, and client capabilities for sessionless 2026-07-28 requests
+//!
 //! ## Feature Flags
 //!
 //! - `full` - Enable all optional features
@@ -152,6 +156,9 @@
 //! - `http-client` - HTTP client transport for connecting to remote MCP servers
 //! - `oauth-client` - OAuth 2.0 client-side token acquisition via client credentials grant (requires `http-client`)
 //! - `macros` - Optional proc macros (`#[tool_fn]`, `#[prompt_fn]`, `#[resource_fn]`, `#[resource_template_fn]`)
+//! - `stateless` - Experimental 2026-07-28 stateless protocol mode (SEP-2575 + SEP-2567). Enables
+//!   version-gated sessionless dispatch, `server/discover` RPC, per-request `_meta` via
+//!   [`stateless::StatelessRequestMeta`], and `messages/listen` SSE endpoint. Requires `http`.
 //!
 //! ## Middleware Placement Guide
 //!
@@ -325,6 +332,40 @@
 //!     .build();
 //! ```
 //!
+//! ### Stateless Mode (2026-07-28, requires `stateless` + `http` features)
+//!
+//! The `stateless` feature enables experimental support for the 2026-07-28 MCP protocol
+//! (SEP-2575 final + SEP-2567 accepted). In this mode the initialize/initialized handshake
+//! is replaced by two new RPCs:
+//!
+//! - **`server/discover`** -- stateless capability discovery. Clients that send requests with
+//!   `MCP-Protocol-Version: 2026-07-28` (SEP-2243 header) can call `server/discover` instead
+//!   of `initialize` to learn what the server supports without establishing a session.
+//! - **`messages/listen`** -- client-initiated SSE subscription. A GET to `/mcp` with
+//!   `MCP-Protocol-Version: 2026-07-28` opens a server-push stream that is not tied to any
+//!   session, allowing stateless clients to receive notifications.
+//!
+//! Per-request client identity and capabilities ride in each request's `_meta` object via
+//! [`stateless::StatelessRequestMeta`] rather than being negotiated once at session open.
+//! The `MCP-Protocol-Version` header value is the version gate: requests carrying `2026-07-28`
+//! or later route through the stateless path; older requests continue through the
+//! session-based path unchanged.
+//!
+//! ```rust,ignore
+//! use tower_mcp::{McpRouter, HttpTransport};
+//! use tower_mcp::stateless::StatelessConfig;
+//!
+//! let router = McpRouter::new().server_info("my-server", "1.0.0");
+//!
+//! // Enable stateless mode alongside the session-based path.
+//! let transport = HttpTransport::new(router)
+//!     .stateless(StatelessConfig::new());
+//! ```
+//!
+//! The 2026-07-28 protocol is experimental. The `UPCOMING_PROTOCOL_VERSION` constant in
+//! `tower_mcp::protocol` tracks the target version string and will not appear in
+//! `SUPPORTED_PROTOCOL_VERSIONS` until the spec is stable.
+//!
 //! ### Router Composition
 //!
 //! Combine multiple routers using [`McpRouter::merge()`] or [`McpRouter::nest()`]:
@@ -388,6 +429,14 @@
 //!
 //! This crate implements the MCP specification (2025-11-25):
 //! <https://modelcontextprotocol.io/specification/2025-11-25>
+//!
+//! The `stateless` feature additionally tracks the upcoming 2026-07-28 protocol defined by:
+//! - [SEP-2567](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2567) (accepted) --
+//!   `messages/listen` SSE endpoint
+//! - [SEP-2575](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2575) (final) --
+//!   stateless session model, `server/discover`, per-request `_meta`
+//! - [SEP-2243](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2243) (final) --
+//!   strict HTTP headers (`Mcp-Method`, `Mcp-Name`, `MCP-Protocol-Version`)
 
 pub mod async_task;
 pub mod auth;
