@@ -82,17 +82,28 @@ jobs:
 
       - name: Check server/discover (SEP-2575, #865)
         run: |
-          response=$(curl -s -X POST http://127.0.0.1:3001/mcp \
+          # Use -D to dump response headers to a temp file, -o for the body.
+          curl -s -X POST http://127.0.0.1:3001/mcp \
             -H "Content-Type: application/json" \
             -H "MCP-Protocol-Version: 2026-07-28" \
             -H "Mcp-Method: server/discover" \
-            -d '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{}}')
+            -d '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{}}' \
+            -D /tmp/discover-headers.txt \
+            -o /tmp/discover-body.json
+          response=$(cat /tmp/discover-body.json)
           echo "server/discover response: $response"
           # DiscoverResult serializes as camelCase: supportedVersions, serverInfo, capabilities
           echo "$response" | grep -q '"supportedVersions"' || { echo "FAIL: supportedVersions missing"; exit 1; }
           echo "$response" | grep -q '"serverInfo"' || { echo "FAIL: serverInfo missing"; exit 1; }
           echo "$response" | grep -q '"capabilities"' || { echo "FAIL: capabilities missing"; exit 1; }
           echo "PASS: server/discover returned well-formed DiscoverResult"
+          # server/discover must NOT set mcp-session-id: stateless responses are sessionless (#865)
+          if grep -qi "mcp-session-id" /tmp/discover-headers.txt; then
+            echo "FAIL: server/discover response must not include mcp-session-id header"
+            cat /tmp/discover-headers.txt
+            exit 1
+          fi
+          echo "PASS: server/discover response does not include mcp-session-id header"
 
       - name: Check stateless tools/call without _meta (#862)
         run: |
@@ -144,36 +155,86 @@ jobs:
 
       - name: Check messages/listen opens SSE stream with 2026-07-28 (#868)
         run: |
-          # Capture just the headers + first bytes; the SSE stream stays open.
+          # Step 1: establish a 2025-11-25 session to get an mcp-session-id.
+          # (2026-07-28 initialize is stateless and returns no session ID.)
+          curl -s -X POST http://127.0.0.1:3001/mcp \
+            -H "Content-Type: application/json" \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"ci-test","version":"1.0"},"capabilities":{}}}' \
+            -D /tmp/init-headers.txt \
+            -o /tmp/init-body.json
+          session_id=$(grep -i "mcp-session-id" /tmp/init-headers.txt | awk '{print $2}' | tr -d '\r')
+          echo "Session ID: $session_id"
+          if [ -z "$session_id" ]; then
+            echo "FAIL: no mcp-session-id in initialize response"
+            cat /tmp/init-headers.txt
+            exit 1
+          fi
+
+          # Step 2: open messages/listen SSE stream in the background, capture output.
+          # Sending MCP-Protocol-Version: 2026-07-28 on the request overrides the
+          # session's negotiated version and enables the SSE stream.
+          curl -s --max-time 5 \
+            -X POST http://127.0.0.1:3001/mcp \
+            -H "Content-Type: application/json" \
+            -H "MCP-Protocol-Version: 2026-07-28" \
+            -H "Mcp-Method: messages/listen" \
+            -H "Accept: text/event-stream" \
+            -H "mcp-session-id: $session_id" \
+            -d '{"jsonrpc":"2.0","id":5,"method":"messages/listen","params":{}}' \
+            -o /tmp/sse-stream.txt &
+          SSE_PID=$!
+          sleep 1
+
+          # Step 3: confirm SSE stream content-type (via a parallel content-type probe).
           content_type=$(curl -s -o /dev/null -w "%{content_type}" \
             --max-time 3 \
             -X POST http://127.0.0.1:3001/mcp \
             -H "Content-Type: application/json" \
             -H "MCP-Protocol-Version: 2026-07-28" \
             -H "Mcp-Method: messages/listen" \
-            -d '{"jsonrpc":"2.0","id":5,"method":"messages/listen","params":{}}' || true)
+            -H "Accept: text/event-stream" \
+            -d '{"jsonrpc":"2.0","id":6,"method":"messages/listen","params":{}}' || true)
           echo "messages/listen Content-Type: $content_type"
-          echo "$content_type" | grep -q "text/event-stream" || { echo "FAIL: expected text/event-stream"; exit 1; }
+          echo "$content_type" | grep -q "text/event-stream" || { echo "FAIL: expected text/event-stream"; kill $SSE_PID 2>/dev/null; exit 1; }
           echo "PASS: messages/listen returns SSE stream for 2026-07-28"
+
+          # Step 4: trigger log notifications on the established session.
+          # test_tool_with_logging sends three log notifications via ctx.send_log().
+          curl -s -X POST http://127.0.0.1:3001/mcp \
+            -H "Content-Type: application/json" \
+            -H "Mcp-Method: tools/call" \
+            -H "Mcp-Name: test_tool_with_logging" \
+            -H "mcp-session-id: $session_id" \
+            -d '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"test_tool_with_logging","arguments":{}}}' \
+            -o /dev/null
+          sleep 1
+
+          # Step 5: verify at least one SSE data line arrived.
+          kill $SSE_PID 2>/dev/null || true
+          echo "SSE stream output:"
+          cat /tmp/sse-stream.txt
+          grep -q "^data:" /tmp/sse-stream.txt || { echo "FAIL: no data: lines in SSE stream"; exit 1; }
+          echo "PASS: notification event appeared in messages/listen SSE stream"
 
       - name: Check messages/listen returns JSON-RPC error without 2026-07-28 (#868)
         run: |
           # Without MCP-Protocol-Version: 2026-07-28, messages/listen must NOT
-          # return an SSE stream. A request with no session ID returns a JSON-RPC
-          # error (SessionRequired, -32006). We assert there is an "error" field and
-          # no "text/event-stream" content -- confirming the endpoint is gated.
+          # return an SSE stream. The 2025-11-25 server returns MethodNotFound
+          # (-32601) because messages/listen is a 2026-07-28-only method.
+          # We assert the error code is exactly -32601 and no SSE stream is returned.
           content_type=$(curl -s -o /tmp/messages-listen-legacy.json \
             -w "%{content_type}" \
             --max-time 3 \
             -X POST http://127.0.0.1:3001/mcp \
             -H "Content-Type: application/json" \
-            -d '{"jsonrpc":"2.0","id":6,"method":"messages/listen","params":{}}' || true)
+            -d '{"jsonrpc":"2.0","id":8,"method":"messages/listen","params":{}}' || true)
           response=$(cat /tmp/messages-listen-legacy.json)
           echo "Legacy messages/listen Content-Type: $content_type"
           echo "Legacy messages/listen body: $response"
           echo "$content_type" | grep -vq "text/event-stream" || { echo "FAIL: must not return SSE stream without 2026-07-28"; exit 1; }
           echo "$response" | grep -q '"error"' || { echo "FAIL: expected a JSON-RPC error field"; exit 1; }
-          echo "PASS: messages/listen returns JSON-RPC error without 2026-07-28 version"
+          echo "$response" | grep -q -- '-32601' || { echo "FAIL: expected MethodNotFound error code -32601"; exit 1; }
+          echo "PASS: messages/listen returns MethodNotFound (-32601) without 2026-07-28 version"
 
       - name: Show server logs on failure
         if: failure()
