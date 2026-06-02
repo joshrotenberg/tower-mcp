@@ -68,6 +68,50 @@
 //!     }
 //! }
 //! ```
+//!
+//! # Stateless mode: per-request metadata (`stateless` feature)
+//!
+//! With the 2026-07-28 protocol, clients do not run an initialize handshake.
+//! Instead, every request carries the client's protocol version, identity, and
+//! capabilities in a `_meta` object. The HTTP transport extracts these fields
+//! and stashes them as a [`StatelessRequestMeta`](crate::stateless::StatelessRequestMeta)
+//! extension on the [`RequestContext`], accessible via
+//! [`ctx.per_request_meta()`](RequestContext::per_request_meta).
+//!
+//! `per_request_meta()` returns `Some` when:
+//! - The `stateless` feature is compiled in, AND
+//! - The request was dispatched by the HTTP transport, AND
+//! - The request's `_meta` contained at least one recognized field.
+//!
+//! It returns `None` for stdio/WebSocket transports, for 2025-11-25 session-based
+//! requests, and when the request carried no `_meta`.
+//!
+//! The [`StatelessRequestMeta`](crate::stateless::StatelessRequestMeta) struct
+//! provides:
+//!
+//! - `protocol_version` -- the `io.modelcontextprotocol/protocolVersion` field
+//! - `client_info` -- the `io.modelcontextprotocol/clientInfo` field (name, version)
+//! - `client_capabilities` -- the `io.modelcontextprotocol/clientCapabilities` field
+//! - `log_level` -- optional per-request log level override
+//! - `progress_token` -- optional progress token for progress notifications
+//!
+//! ```rust,ignore
+//! // Requires feature = ["stateless"]
+//! use tower_mcp::context::RequestContext;
+//!
+//! async fn my_tool(ctx: RequestContext, input: MyInput) -> Result<CallToolResult> {
+//!     if let Some(meta) = ctx.per_request_meta() {
+//!         // Available for 2026-07-28+ clients on the HTTP transport
+//!         if let Some(ref info) = meta.client_info {
+//!             tracing::info!(client = %info.name, version = %info.version, "request from");
+//!         }
+//!         if let Some(ref version) = meta.protocol_version {
+//!             tracing::debug!(protocol_version = %version);
+//!         }
+//!     }
+//!     Ok(CallToolResult::text("ok"))
+//! }
+//! ```
 
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -436,14 +480,30 @@ impl RequestContext {
     /// SEP-2575 per-request `_meta` (protocol version, client info, client
     /// capabilities, log level) if the transport extracted it.
     ///
-    /// Returns `None` when:
+    /// Returns `Some` for 2026-07-28+ clients on the HTTP transport when the
+    /// request carried a `_meta` object with recognized fields. Returns `None`
+    /// when:
     /// - The request had no `_meta` field, or
     /// - The transport does not stash per-request metadata (only the HTTP
-    ///   transport currently does), or
-    /// - The `stateless` feature is not enabled.
+    ///   transport currently does this), or
+    /// - The `stateless` feature is not compiled in.
     ///
-    /// Equivalent to `self.extension::<StatelessRequestMeta>()` but typed
-    /// so handlers don't have to repeat the import.
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// async fn my_tool(ctx: RequestContext, input: MyInput) -> Result<CallToolResult> {
+    ///     if let Some(meta) = ctx.per_request_meta() {
+    ///         // protocol_version, client_info, client_capabilities are all Option<_>
+    ///         if let Some(ref version) = meta.protocol_version {
+    ///             tracing::debug!(protocol_version = %version);
+    ///         }
+    ///         if let Some(ref info) = meta.client_info {
+    ///             tracing::info!(client = %info.name, version = %info.version);
+    ///         }
+    ///     }
+    ///     Ok(CallToolResult::text("ok"))
+    /// }
+    /// ```
     #[cfg(feature = "stateless")]
     pub fn per_request_meta(&self) -> Option<&crate::stateless::StatelessRequestMeta> {
         self.extension::<crate::stateless::StatelessRequestMeta>()

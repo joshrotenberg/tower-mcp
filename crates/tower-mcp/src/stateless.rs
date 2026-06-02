@@ -1,26 +1,46 @@
-//! SEP-1442 Stateless MCP support (experimental)
+//! Stateless MCP support: SEP-1442 opt-in and automatic 2026-07-28 dispatch
 //!
-//! This module provides experimental support for stateless MCP as defined in
-//! [SEP-1442](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/1442).
+//! This module contains types and helpers for stateless MCP operation. There are
+//! two distinct paths; understanding which one applies to your deployment is
+//! important.
 //!
-//! ## Feature Flag
+//! ## Two stateless paths
+//!
+//! ### Automatic version-gated path (2026-07-28+)
+//!
+//! When the `stateless` feature is compiled in, the HTTP transport automatically
+//! dispatches any request carrying `MCP-Protocol-Version: 2026-07-28` (or later)
+//! statelessly -- no session is created or looked up, and no initialize handshake
+//! is required. Client identity and capabilities flow through per-request `_meta`
+//! (see [`StatelessRequestMeta`]).
+//!
+//! **This path is always active when the feature is compiled in, regardless of
+//! whether [`StatelessConfig`] was provided to the transport.** Adding
+//! `features = ["stateless"]` to your `Cargo.toml` is sufficient; you do not
+//! need to call `HttpTransport::stateless()`.
+//!
+//! ### Legacy SEP-1442 opt-in path
+//!
+//! [`StatelessConfig`] and `HttpTransport::stateless()` activate the older
+//! SEP-1442-style opt-in stateless behavior for clients that do not use the
+//! 2026-07-28 protocol. This path controls whether sessions are optional,
+//! whether the protocol version must be present in every request, and whether
+//! `server/discover` is enabled.
+//!
+//! ## Feature flag
 //!
 //! This module is gated behind the `stateless` feature flag:
 //!
 //! ```toml
-//! tower-mcp = { version = "0.9", features = ["stateless"] }
+//! tower-mcp = { version = "0.10", features = ["stateless"] }
 //! ```
 //!
-//! ## Key Changes from Standard MCP
+//! ## Key properties of stateless mode
 //!
-//! 1. **Per-request protocol version**: Every request includes the protocol version
-//! 2. **Optional discovery**: `server/discover` RPC for capability discovery
-//! 3. **Optional sessions**: Sessions are no longer mandatory
-//! 4. **Per-request client capabilities**: Clients can specify capabilities per-request
-//!
-//! ## Warning
-//!
-//! SEP-1442 is still in-review. The API may change as the specification evolves.
+//! 1. **Per-request protocol version**: Every request carries the protocol version
+//! 2. **Optional discovery**: `server/discover` RPC for capability discovery (SEP-2575)
+//! 3. **No sessions required**: Sessions are optional (2026-07-28) or configurable (SEP-1442)
+//! 4. **Per-request client capabilities**: Client info and capabilities ride on each request
 
 use serde::{Deserialize, Serialize};
 
@@ -179,9 +199,18 @@ pub mod error_codes {
 // Stateless mode configuration
 // =============================================================================
 
-/// Configuration for stateless MCP mode.
+/// Configuration for the legacy SEP-1442 stateless opt-in path.
 ///
-/// Controls which SEP-1442 features are enabled and their strictness.
+/// **This configuration applies only to the legacy SEP-1442 opt-in path.**
+/// It does NOT control the automatic version-gated path for 2026-07-28+
+/// clients: when the `stateless` feature is compiled in, any request with
+/// `MCP-Protocol-Version: 2026-07-28` and no `mcp-session-id` is dispatched
+/// statelessly regardless of whether this config is set on the transport.
+///
+/// Use [`HttpTransport::stateless()`](crate::transport::http::HttpTransport::stateless)
+/// to attach this configuration to a transport. Omitting it does not disable
+/// stateless support for 2026-07-28+ clients; it only disables the
+/// additional SEP-1442 opt-in behaviors below.
 #[derive(Debug, Clone)]
 pub struct StatelessConfig {
     /// Whether to require protocol version in every request.

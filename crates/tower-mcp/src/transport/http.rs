@@ -1,6 +1,8 @@
 //! Streamable HTTP transport for MCP
 //!
-//! Implements the Streamable HTTP transport from MCP specification 2025-11-25.
+//! Implements the Streamable HTTP transport from MCP specification 2025-11-25,
+//! with version-gated support for the 2026-07-28 stateless protocol (SEP-2575 /
+//! SEP-2567) when the `stateless` feature is compiled in.
 //!
 //! ## Features
 //!
@@ -10,6 +12,79 @@
 //! - SSE event IDs and stream resumption via `Last-Event-ID` header (SEP-1699)
 //! - Configurable session TTL and cleanup
 //! - **Sampling support**: Server-to-client LLM requests via SSE + POST
+//! - **Stateless mode** (`stateless` feature): version-gated dispatch for
+//!   2026-07-28+ clients with per-request `_meta` and no session handshake
+//!
+//! ## Stateless mode (2026-07-28 protocol)
+//!
+//! When the `stateless` feature is compiled in, the transport handles two
+//! distinct stateless paths:
+//!
+//! ### Automatic version-gated path (2026-07-28+)
+//!
+//! Any request that arrives with `MCP-Protocol-Version: 2026-07-28` (or
+//! later) and no `mcp-session-id` header is dispatched statelessly, regardless
+//! of whether [`HttpTransport::stateless()`] was called. The client is fully
+//! self-identifying: every request carries its protocol version, client info,
+//! and client capabilities in the `_meta` object; no initialize handshake is
+//! needed. Handlers access this data via
+//! [`RequestContext::per_request_meta()`](crate::context::RequestContext::per_request_meta).
+//!
+//! This path runs before the legacy SEP-1442 opt-in path, so 2026-07-28
+//! clients are always handled correctly even on transports that never call
+//! `HttpTransport::stateless()`.
+//!
+//! ### Legacy SEP-1442 opt-in path
+//!
+//! Calling [`HttpTransport::stateless()`] with a [`crate::stateless::StatelessConfig`]
+//! activates the older SEP-1442-style opt-in stateless behavior for clients that
+//! do not carry `MCP-Protocol-Version: 2026-07-28`. See
+//! [`crate::stateless::StatelessConfig`] for details on what this path controls.
+//!
+//! Stateful clients (those sending an `mcp-session-id`) continue to work
+//! normally on the same transport alongside both stateless paths.
+//!
+//! ## `messages/listen` SSE stream
+//!
+//! Clients using the 2026-07-28 protocol open a server-to-client notification
+//! stream by POSTing a `messages/listen` JSON-RPC request. The server responds
+//! with `Content-Type: text/event-stream` and streams zero or more
+//! `notifications/*` events until the client disconnects.
+//!
+//! This replaces the `GET /` SSE endpoint used by the 2025-11-25 protocol. The
+//! `GET /` endpoint is still supported for 2025-11-25 sessions; `messages/listen`
+//! is only available for 2026-07-28+ clients.
+//!
+//! ```text
+//! Client (2026-07-28)                          Server
+//!   |                                            |
+//!   |-- POST / {method: "messages/listen",       |
+//!   |           MCP-Protocol-Version: 2026-07-28} -->|
+//!   |<-- 200 Content-Type: text/event-stream ----|
+//!   |<-- event: message (notification) ----------|
+//!   |<-- event: message (notification) ----------|
+//!   |   (client disconnects)                     |
+//! ```
+//!
+//! ## SEP-2243 HTTP headers
+//!
+//! SEP-2243 defines HTTP headers that let load balancers, proxies, and
+//! observability tools inspect MCP traffic without parsing the JSON-RPC body:
+//!
+//! | Header | Required when | Description |
+//! |--------|---------------|-------------|
+//! | `Mcp-Method` | All POST requests (strict mode) | Mirrors the JSON-RPC `method` field |
+//! | `Mcp-Name` | `tools/call`, `prompts/get`, `resources/read` (strict mode) | Mirrors `params.name` or `params.uri` |
+//! | `MCP-Protocol-Version` | All requests (strict mode) | The protocol version in use |
+//!
+//! Validation is **lenient** for 2025-11-25 clients: headers present in the
+//! request are validated for consistency with the body, but missing headers are
+//! not an error. Validation is **strict** for 2026-07-28+ clients: `Mcp-Method`
+//! must be present on every POST and `Mcp-Name` must be present for the three
+//! named methods. Violations return `-32001` (HeaderMismatch).
+//!
+//! The public constants [`MCP_METHOD_HEADER`], [`MCP_NAME_HEADER`], and
+//! [`MCP_PARAM_HEADER_PREFIX`] hold the canonical lowercase header names.
 //!
 //! ## Sampling (Server-to-Client Requests)
 //!
@@ -73,10 +148,12 @@
 //!
 //! ## Error Codes
 //!
-//! | Code    | Name           | Description                              |
-//! |---------|----------------|------------------------------------------|
-//! | -32005  | SessionNotFound| Session expired or server restarted      |
-//! | -32006  | SessionRequired| MCP-Session-Id header missing            |
+//! | Code    | Name                      | Description                                        |
+//! |---------|---------------------------|----------------------------------------------------|
+//! | -32001  | HeaderMismatch            | Required HTTP header missing or inconsistent with body (SEP-2243, strict mode) |
+//! | -32004  | UnsupportedProtocolVersion| Server does not support the requested protocol version (SEP-2575) |
+//! | -32005  | SessionNotFound           | Session expired or server restarted                |
+//! | -32006  | SessionRequired           | MCP-Session-Id header missing                      |
 //!
 //! ## Session Handling
 //!
@@ -1417,18 +1494,29 @@ impl HttpTransport {
         self
     }
 
-    /// Enable SEP-1442 stateless mode (experimental).
+    /// Enable the legacy SEP-1442 stateless opt-in path.
     ///
-    /// When enabled, requests with an `MCP-Protocol-Version` header (or
-    /// `_meta.protocolVersion` in the body) are processed without requiring a
-    /// session. Each stateless request gets an ephemeral, pre-initialized
-    /// router that is discarded after the response is sent.
+    /// This activates the SEP-1442-style stateless behavior for clients that
+    /// do NOT send `MCP-Protocol-Version: 2026-07-28`. Specifically, when a
+    /// [`crate::stateless::StatelessConfig`] is set:
     ///
-    /// This enables horizontal scaling and serverless deployments where
-    /// sessions cannot be maintained across instances.
+    /// - Requests without a session ID can be served without an initialize
+    ///   handshake (if [`crate::stateless::StatelessConfig::optional_sessions`]
+    ///   is `true`).
+    /// - The `server/discover` RPC is enabled (if
+    ///   [`crate::stateless::StatelessConfig::enable_discover`] is `true`).
+    /// - Protocol version may be required in every request body (if
+    ///   [`crate::stateless::StatelessConfig::require_protocol_version`] is `true`).
+    ///
+    /// **Note:** this method does NOT control the automatic version-gated
+    /// stateless path for 2026-07-28+ clients. When the `stateless` feature
+    /// is compiled in, any request with `MCP-Protocol-Version: 2026-07-28`
+    /// and no `mcp-session-id` is dispatched statelessly regardless of
+    /// whether this method is called. See the [`crate::stateless`] module
+    /// documentation for the full two-path explanation.
     ///
     /// Stateful clients (those that send `mcp-session-id`) continue to work
-    /// normally alongside stateless clients.
+    /// normally on the same transport.
     ///
     /// # Example
     ///
@@ -1440,6 +1528,8 @@ impl HttpTransport {
     /// #[tokio::main]
     /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ///     let router = McpRouter::new().server_info("my-server", "1.0.0");
+    ///     // Enables the SEP-1442 opt-in path. 2026-07-28 clients are
+    ///     // handled statelessly regardless of this call.
     ///     let transport = HttpTransport::new(router)
     ///         .stateless(StatelessConfig::new());
     ///     transport.serve("127.0.0.1:3000").await?;

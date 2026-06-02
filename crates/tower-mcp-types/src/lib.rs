@@ -13,6 +13,27 @@
 //!   format without running a full server
 //! - Testing libraries that want MCP types without pulling in a server stack
 //!
+//! # Stateless protocol support (2026-07-28)
+//!
+//! This crate also tracks the next protocol version (`2026-07-28`) that adds
+//! stateless operation, per-request `_meta`, and the `server/discover` RPC.
+//! Key items:
+//!
+//! - [`protocol::UPCOMING_PROTOCOL_VERSION`] -- the `"2026-07-28"` version
+//!   string, not yet in `SUPPORTED_PROTOCOL_VERSIONS`. Useful for codegen
+//!   tools and conformance harnesses that need to reference it explicitly.
+//! - [`protocol::DiscoverResult`] / [`protocol::DiscoverParams`] -- types for
+//!   the `server/discover` RPC (SEP-2575), which returns the server's supported
+//!   protocol versions and capabilities without requiring an `initialize`
+//!   handshake.
+//! - [`error::UnsupportedProtocolVersionData`] -- the structured error data
+//!   attached to a `-32004` (UnsupportedProtocolVersion) response. Contains
+//!   the `supported` versions list and the `requested` version string.
+//! - [`error::McpErrorCode::HeaderMismatch`] (`-32001`) and
+//!   [`error::McpErrorCode::UnsupportedProtocolVersion`] (`-32004`) -- new
+//!   spec-assigned error codes (SEP-2243 and SEP-2575 respectively). See the
+//!   [`error`] module for the full error code table.
+//!
 //! # The only standalone Rust MCP types crate
 //!
 //! Most Rust MCP libraries bundle their protocol types with their runtime.
