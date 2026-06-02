@@ -547,7 +547,7 @@ async fn check_tools_list(
     results
 }
 
-/// Check 3: tools/call echo -- result.content array, content[0].type
+/// Check 3: tools/call echo -- result.content array, content\[0\].type
 async fn check_tools_call(
     client: &reqwest::Client,
     rmcp_sid: Option<&str>,
