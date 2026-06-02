@@ -213,6 +213,29 @@ pub const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 /// Header name for MCP protocol version
 pub const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 
+/// SEP-2243: header that mirrors the JSON-RPC `method` field for HTTP
+/// intermediaries (load balancers, observability) so they can route or
+/// classify MCP traffic without parsing the body. Required on all POST
+/// requests when the negotiated protocol version implements SEP-2243.
+pub const MCP_METHOD_HEADER: &str = "mcp-method";
+
+/// SEP-2243: header that mirrors `params.name` (for `tools/call` and
+/// `prompts/get`) or `params.uri` (for `resources/read`). Required for
+/// those three methods when the negotiated protocol version implements
+/// SEP-2243.
+pub const MCP_NAME_HEADER: &str = "mcp-name";
+
+/// SEP-2243: prefix for custom headers derived from tool parameters
+/// marked with the `x-mcp-header` JSON Schema extension. The full header
+/// name is `Mcp-Param-{Name}`.
+pub const MCP_PARAM_HEADER_PREFIX: &str = "mcp-param-";
+
+/// First MCP protocol version that mandates SEP-2243 HTTP header
+/// validation. Prior versions are treated leniently: present headers are
+/// still validated for body consistency, but missing headers are not an
+/// error.
+pub(super) const SEP_2243_MIN_PROTOCOL_VERSION: &str = "2026-07-28";
+
 /// SSE event type for JSON-RPC messages
 const SSE_MESSAGE_EVENT: &str = "message";
 
@@ -2208,6 +2231,44 @@ async fn handle_post(
         );
     }
 
+    // SEP-2243: validate the standardized HTTP headers (Mcp-Method,
+    // Mcp-Name, Mcp-Param-*) against the body. Mode is "strict" only
+    // when the negotiated protocol version is at or beyond the
+    // SEP-2243-inclusion version; otherwise present headers are still
+    // checked for body consistency but missing headers are allowed.
+    //
+    // For `initialize` requests the session's protocol version hasn't
+    // been negotiated yet, so we fall back to the version the client
+    // requested in the body. For all other requests we use the session's
+    // negotiated version (which is also reflected back in the response
+    // `Mcp-Protocol-Version` header).
+    let sep_2243_version = if is_init {
+        match parsed
+            .get("params")
+            .and_then(|p| p.get("protocolVersion"))
+            .and_then(|v| v.as_str())
+        {
+            Some(v) => v.to_string(),
+            None => session.protocol_version.read().await.clone(),
+        }
+    } else {
+        session.protocol_version.read().await.clone()
+    };
+    let sep_2243_mode = super::http_headers::mode_for_version(&sep_2243_version);
+    if let Err(err) = super::http_headers::validate(&headers, &parsed, sep_2243_mode) {
+        tracing::warn!(
+            mode = ?sep_2243_mode,
+            version = %sep_2243_version,
+            error = %err.message,
+            "Rejecting request: SEP-2243 header validation failed",
+        );
+        let id = extract_request_id(&parsed);
+        let mut resp = json_rpc_error_response(id, err);
+        // Per SEP-2243 §"Error Code" the HTTP status MUST be 400.
+        *resp.status_mut() = StatusCode::BAD_REQUEST;
+        return resp;
+    }
+
     // Check if this is a response to one of our outgoing requests (sampling)
     if is_response(&parsed) {
         if let Some(id) = extract_request_id(&parsed) {
@@ -2881,6 +2942,434 @@ mod tests {
         assert!(supported.contains(&serde_json::json!("2025-11-25")));
         // The request id must be echoed (we have one in the body).
         assert_eq!(json["id"], 99);
+    }
+
+    // =========================================================================
+    // SEP-2243: HTTP header standardization (Mcp-Method, Mcp-Name, Mcp-Param-*)
+    // =========================================================================
+
+    /// In lenient mode (negotiated protocol version < 2026-07-28) a
+    /// request without any SEP-2243 headers must still succeed — older
+    /// clients that haven't opted in must keep working.
+    #[tokio::test]
+    async fn sep_2243_lenient_mode_accepts_missing_headers() {
+        let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
+        let app = transport.into_router();
+
+        // Initialize (no SEP-2243 headers) negotiates 2025-11-25 — lenient.
+        let init = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": { "name": "t", "version": "0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let init_response = app.clone().oneshot(init).await.unwrap();
+        assert_eq!(init_response.status(), StatusCode::OK);
+        let session_id = init_response
+            .headers()
+            .get(MCP_SESSION_ID_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // tools/list with no Mcp-Method header — must succeed in lenient mode.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header(MCP_SESSION_ID_HEADER, &session_id)
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/list"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// In lenient mode, if the client opts in by sending Mcp-Method,
+    /// the server still validates against the body and rejects a
+    /// mismatch with -32001.
+    #[tokio::test]
+    async fn sep_2243_lenient_mode_validates_present_headers() {
+        let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
+        let app = transport.into_router();
+
+        let init = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header(MCP_METHOD_HEADER, "initialize")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": { "name": "t", "version": "0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let init_response = app.clone().oneshot(init).await.unwrap();
+        assert_eq!(init_response.status(), StatusCode::OK);
+        let session_id = init_response
+            .headers()
+            .get(MCP_SESSION_ID_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // tools/list with a deliberately-wrong Mcp-Method header.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header(MCP_SESSION_ID_HEADER, &session_id)
+            .header(MCP_METHOD_HEADER, "ping")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/list"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"].as_i64().unwrap(), -32001);
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Mcp-Method")
+        );
+        assert_eq!(json["id"], 2);
+    }
+
+    /// tools/call with matching Mcp-Method + Mcp-Name passes validation
+    /// even in strict mode. Driven via initialize with the upcoming
+    /// 2026-07-28 protocol version so we exercise the strict branch.
+    #[tokio::test]
+    async fn sep_2243_strict_mode_tools_call_with_matching_headers() {
+        use crate::{CallToolResult, ToolBuilder};
+
+        let router = McpRouter::new().server_info("t", "1.0.0").tool(
+            ToolBuilder::new("echo")
+                .description("echo")
+                .handler(|args: serde_json::Value| async move {
+                    Ok(CallToolResult::text(args.to_string()))
+                })
+                .build(),
+        );
+        let transport = HttpTransport::new(router).disable_origin_validation();
+        let app = transport.into_router();
+
+        // Initialize requesting 2026-07-28 so the session falls into
+        // strict mode. The server will negotiate the actual returned
+        // version against SUPPORTED_PROTOCOL_VERSIONS, but for SEP-2243
+        // gating on init the requested version is what counts.
+        let init = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header(MCP_METHOD_HEADER, "initialize")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2026-07-28",
+                        "capabilities": {},
+                        "clientInfo": { "name": "t", "version": "0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let init_response = app.clone().oneshot(init).await.unwrap();
+        assert_eq!(init_response.status(), StatusCode::OK);
+        let session_id = init_response
+            .headers()
+            .get(MCP_SESSION_ID_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let negotiated_version = init_response
+            .headers()
+            .get(MCP_PROTOCOL_VERSION_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // For subsequent requests, the session's negotiated protocol
+        // version is what the validator gates on. If the server did
+        // NOT honor 2026-07-28 (because it isn't in SUPPORTED yet) the
+        // session will be lenient — which is fine, we just want to
+        // confirm the happy path works. If it IS honored, the strict
+        // branch is exercised.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header(MCP_SESSION_ID_HEADER, &session_id)
+            .header(MCP_PROTOCOL_VERSION_HEADER, &negotiated_version)
+            .header(MCP_METHOD_HEADER, "tools/call")
+            .header(MCP_NAME_HEADER, "echo")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "echo",
+                        "arguments": {"message": "hi"}
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// tools/call with mismatched Mcp-Name vs body params.name MUST be
+    /// rejected with -32001 and HTTP 400 even in lenient mode.
+    #[tokio::test]
+    async fn sep_2243_tools_call_mcp_name_mismatch_rejected() {
+        use crate::{CallToolResult, ToolBuilder};
+
+        let router = McpRouter::new().server_info("t", "1.0.0").tool(
+            ToolBuilder::new("echo")
+                .description("echo")
+                .handler(|args: serde_json::Value| async move {
+                    Ok(CallToolResult::text(args.to_string()))
+                })
+                .build(),
+        );
+        let transport = HttpTransport::new(router).disable_origin_validation();
+        let app = transport.into_router();
+
+        let init = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": { "name": "t", "version": "0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let init_response = app.clone().oneshot(init).await.unwrap();
+        let session_id = init_response
+            .headers()
+            .get(MCP_SESSION_ID_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header(MCP_SESSION_ID_HEADER, &session_id)
+            .header(MCP_METHOD_HEADER, "tools/call")
+            .header(MCP_NAME_HEADER, "not-echo")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "echo",
+                        "arguments": {"message": "hi"}
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"].as_i64().unwrap(), -32001);
+        let msg = json["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("Mcp-Name"), "got: {msg}");
+        assert_eq!(json["id"], 7);
+    }
+
+    /// Mcp-Param-* with a Base64-encoded value that decodes to the
+    /// body argument must pass validation.
+    #[tokio::test]
+    async fn sep_2243_mcp_param_base64_decoded_and_matched() {
+        use crate::{CallToolResult, ToolBuilder};
+
+        let router = McpRouter::new().server_info("t", "1.0.0").tool(
+            ToolBuilder::new("echo")
+                .description("echo")
+                .handler(|args: serde_json::Value| async move {
+                    Ok(CallToolResult::text(args.to_string()))
+                })
+                .build(),
+        );
+        let transport = HttpTransport::new(router).disable_origin_validation();
+        let app = transport.into_router();
+
+        let init = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": { "name": "t", "version": "0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let init_response = app.clone().oneshot(init).await.unwrap();
+        let session_id = init_response
+            .headers()
+            .get(MCP_SESSION_ID_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Body argument is "Hello"; header is "=?base64?SGVsbG8=?=".
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header(MCP_SESSION_ID_HEADER, &session_id)
+            .header(MCP_METHOD_HEADER, "tools/call")
+            .header(MCP_NAME_HEADER, "echo")
+            .header("mcp-param-message", "=?base64?SGVsbG8=?=")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "echo",
+                        "arguments": {"message": "Hello"}
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// notifications/initialized still receives ACCEPTED when SEP-2243
+    /// headers match (regression for the notification fast path).
+    #[tokio::test]
+    async fn sep_2243_notification_with_matching_method_header_accepted() {
+        let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
+        let app = transport.into_router();
+
+        let init = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": { "name": "t", "version": "0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let init_response = app.clone().oneshot(init).await.unwrap();
+        let session_id = init_response
+            .headers()
+            .get(MCP_SESSION_ID_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header(MCP_SESSION_ID_HEADER, &session_id)
+            .header(MCP_METHOD_HEADER, "notifications/initialized")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
 
     #[tokio::test]

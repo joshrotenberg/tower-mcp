@@ -153,9 +153,25 @@ pub mod error_codes {
     )]
     pub const UNSUPPORTED_VERSION: i32 = -32000;
 
-    /// Invalid or missing required session ID (-32001) per SEP-1442.
-    /// SEP-2567 (FINAL) removes sessions entirely; this constant is
-    /// retained only for the 2025-11-25 protocol path.
+    /// Invalid or missing required session ID (-32001) per the SEP-1442
+    /// draft.
+    ///
+    /// **Deprecated**: SEP-2243 (FINAL 2026-04-15) reassigns -32001 to
+    /// `HeaderMismatch`. SEP-2567 (FINAL) also removes sessions
+    /// entirely. New code should use one of:
+    /// - [`crate::error::McpErrorCode::SessionRequired`] (-32006) for a
+    ///   missing session ID, or
+    /// - [`crate::error::McpErrorCode::SessionNotFound`] (-32005) for an
+    ///   unknown or expired session.
+    ///
+    /// The numeric value of this constant is unchanged so any existing
+    /// match arms keep compiling, but emitting -32001 from new code will
+    /// confuse SEP-2243-aware clients.
+    #[deprecated(
+        since = "0.11.0",
+        note = "SEP-2243 reclaims -32001 for HeaderMismatch. Use \
+                McpErrorCode::SessionRequired (-32006) or SessionNotFound (-32005)."
+    )]
     pub const INVALID_SESSION: i32 = -32001;
 }
 
