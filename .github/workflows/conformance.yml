@@ -3,8 +3,8 @@ name: MCP Conformance
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
+  schedule:
+    - cron: '0 10 * * 1'  # Mondays 10am UTC
 
 env:
   CARGO_TERM_COLOR: always
