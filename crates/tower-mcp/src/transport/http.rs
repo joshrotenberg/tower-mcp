@@ -2070,6 +2070,124 @@ async fn handle_post(
     // Check if this is an initialize request (creates new session)
     let is_init = is_initialize_request(&parsed);
 
+    // SEP-2575 / SEP-2567: version-gated stateless mode for 2026-07-28+ clients.
+    //
+    // When the requested (or carried) protocol version is >= 2026-07-28 and the
+    // request has no mcp-session-id, every request -- including `initialize` --
+    // is served without creating or looking up a session. Each request is fully
+    // self-contained; client identity and capabilities flow through per-request
+    // `_meta` rather than a session handshake.
+    //
+    // This block runs before the legacy SEP-1442 stateless path so that
+    // 2026-07-28 requests are handled here regardless of whether
+    // `stateless_config` is set on the transport.
+    #[cfg(feature = "stateless")]
+    {
+        let version_in_play: Option<String> = if is_init {
+            // For `initialize`, read the version the client is requesting from
+            // the params object.
+            parsed
+                .get("params")
+                .and_then(|p| p.get("protocolVersion"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        } else {
+            // For non-init requests, only the HTTP-level `MCP-Protocol-Version`
+            // header gates stateless mode. Body-level `_meta.protocolVersion` is
+            // plumbed to handlers via `stash_per_request_meta` in both paths.
+            get_protocol_version(&headers)
+        };
+
+        if let Some(ref version) = version_in_play
+            && is_stateless_protocol_version(version)
+            && get_session_id(&headers).is_none()
+            // `messages/listen` opens an SSE stream; let it fall through to the
+            // dedicated intercept below rather than handling it as a plain RPC call.
+            && parsed.get("method").and_then(|m| m.as_str()) != Some("messages/listen")
+        {
+            // Notifications and responses are fire-and-forget; no dispatch needed.
+            if !is_init && (parsed.get("id").is_none() || is_response(&parsed)) {
+                return StatusCode::ACCEPTED.into_response();
+            }
+
+            // SEP-2243 validation before `parsed` is consumed by deserialization.
+            // 2026-07-28 falls into strict mode, so missing Mcp-Method is an error.
+            let sep_2243_mode = super::http_headers::mode_for_version(version);
+            if let Err(err) = super::http_headers::validate(&headers, &parsed, sep_2243_mode) {
+                tracing::warn!(
+                    mode = ?sep_2243_mode,
+                    version = %version,
+                    error = %err.message,
+                    "Rejecting stateless request: SEP-2243 header validation failed",
+                );
+                let id = extract_request_id(&parsed);
+                let mut resp = json_rpc_error_response(id, err);
+                *resp.status_mut() = StatusCode::BAD_REQUEST;
+                return resp;
+            }
+
+            let request: JsonRpcRequest = match serde_json::from_value(parsed) {
+                Ok(r) => r,
+                Err(e) => {
+                    return json_rpc_error_response(
+                        None,
+                        JsonRpcError::parse_error(format!("Invalid request: {}", e)),
+                    );
+                }
+            };
+
+            // Ephemeral pre-initialized service -- no session is stored or created.
+            let mut service = match &state.service_source {
+                ServiceSource::Router { router, factory } => {
+                    let ephemeral = router.with_fresh_session();
+                    ephemeral.session().mark_initialized();
+                    JsonRpcService::new(factory(ephemeral))
+                }
+                ServiceSource::Service(mutex) => JsonRpcService::new(mutex.lock().unwrap().clone()),
+            };
+
+            let mut ext = crate::router::Extensions::new();
+            #[cfg(feature = "oauth")]
+            if let Some(claims) = http_extensions.get::<crate::oauth::token::TokenClaims>() {
+                ext.insert(claims.clone());
+            }
+            stash_per_request_meta(&request, &mut ext);
+            if !ext.is_empty() {
+                service = service.with_extensions(ext);
+            }
+
+            let mut response = match service.call_single(request).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    return json_rpc_error_response(
+                        None,
+                        JsonRpcError::internal_error(e.to_string()),
+                    );
+                }
+            };
+
+            // For `initialize`: the router's version negotiation falls back to
+            // `LATEST_PROTOCOL_VERSION` ("2025-11-25") because 2026-07-28 is not
+            // yet in `SUPPORTED_PROTOCOL_VERSIONS` at the types layer. Patch the
+            // response to reflect the version the transport is actually serving so
+            // the client sees the version it requested.
+            if is_init
+                && let JsonRpcResponse::Result(ref mut result) = response
+                && let Some(pv) = result.result.get_mut("protocolVersion")
+            {
+                *pv = serde_json::Value::String(version.clone());
+            }
+
+            let mut resp = axum::Json(response).into_response();
+            resp.headers_mut().insert(
+                MCP_PROTOCOL_VERSION_HEADER,
+                HeaderValue::from_str(version).unwrap(),
+            );
+            // Intentionally NO `mcp-session-id` header for 2026-07-28+ clients.
+            return resp;
+        }
+    }
+
     // SEP-1442: Handle stateless requests (no session needed).
     // Stateless requests have a protocol version but no session ID and are not
     // initialize requests. They are processed with an ephemeral service and
@@ -2441,6 +2559,17 @@ async fn handle_post(
 /// `messages/listen` is part of the 2026-07-28 spec (SEP-2575 / SEP-2567).
 /// Version strings are YYYY-MM-DD dates, so lexicographic comparison is correct.
 fn version_supports_messages_listen(version: &str) -> bool {
+    version >= UPCOMING_PROTOCOL_VERSION
+}
+
+/// Returns `true` when the given protocol version string enables stateless
+/// (sessionless) mode for the HTTP transport.
+///
+/// Stateless mode is introduced in the 2026-07-28 protocol (SEP-2575 /
+/// SEP-2567). Version strings are YYYY-MM-DD; lexicographic comparison is
+/// correct for date-ordered MCP versions.
+#[cfg(feature = "stateless")]
+fn is_stateless_protocol_version(version: &str) -> bool {
     version >= UPCOMING_PROTOCOL_VERSION
 }
 
@@ -3164,7 +3293,12 @@ mod tests {
     /// tools/call with matching Mcp-Method + Mcp-Name passes validation
     /// even in strict mode. Driven via initialize with the upcoming
     /// 2026-07-28 protocol version so we exercise the strict branch.
+    ///
+    /// Gated to `not(stateless)` because with the stateless feature enabled,
+    /// initialize requests for 2026-07-28 are handled without a session (chunk 5).
+    /// The stateless-mode equivalent is `stateless_v2026_tools_call_without_session_succeeds`.
     #[tokio::test]
+    #[cfg(not(feature = "stateless"))]
     async fn sep_2243_strict_mode_tools_call_with_matching_headers() {
         use crate::{CallToolResult, ToolBuilder};
 
@@ -5259,5 +5393,191 @@ mod tests {
         let transport = HttpTransport::new(create_test_router());
         let (app, _handle) = transport.into_router_with_handle();
         let _session_id = init_session(&app).await;
+    }
+
+    // =========================================================================
+    // Chunk 5: version-gated stateless mode for 2026-07-28+ clients
+    // =========================================================================
+
+    /// 2026-07-28 initialize must NOT return mcp-session-id.
+    #[tokio::test]
+    #[cfg(feature = "stateless")]
+    async fn stateless_v2026_initialize_omits_session_id() {
+        let transport = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .disable_host_validation();
+        let app = transport.into_router();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header(MCP_METHOD_HEADER, "initialize")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2026-07-28",
+                        "capabilities": {},
+                        "clientInfo": { "name": "sc", "version": "1.0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !response.headers().contains_key(MCP_SESSION_ID_HEADER),
+            "2026-07-28 initialize must not return mcp-session-id"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(MCP_PROTOCOL_VERSION_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("2026-07-28")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["result"]["protocolVersion"], "2026-07-28",
+            "initialize result must carry 2026-07-28 protocol version"
+        );
+    }
+
+    /// 2026-07-28 tools/call without session header succeeds.
+    #[tokio::test]
+    #[cfg(feature = "stateless")]
+    async fn stateless_v2026_tools_call_without_session_succeeds() {
+        use crate::{CallToolResult, ToolBuilder};
+        let router = McpRouter::new().server_info("t", "1.0.0").tool(
+            ToolBuilder::new("echo")
+                .description("echo")
+                .handler(|args: serde_json::Value| async move {
+                    Ok(CallToolResult::text(args.to_string()))
+                })
+                .build(),
+        );
+        let transport = HttpTransport::new(router).disable_origin_validation();
+        let app = transport.into_router();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header(MCP_PROTOCOL_VERSION_HEADER, "2026-07-28")
+            .header(MCP_METHOD_HEADER, "tools/call")
+            .header(MCP_NAME_HEADER, "echo")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "echo",
+                        "arguments": {"message": "hello"},
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientInfo": {
+                                "name": "sc", "version": "1.0"
+                            },
+                            "io.modelcontextprotocol/clientCapabilities": {}
+                        }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !response.headers().contains_key(MCP_SESSION_ID_HEADER),
+            "stateless tools/call must not set mcp-session-id"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(MCP_PROTOCOL_VERSION_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("2026-07-28")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json.get("result").is_some(),
+            "expected tools/call result, got: {json}"
+        );
+    }
+
+    /// 2025-11-25 initialize still returns mcp-session-id (unchanged).
+    #[tokio::test]
+    async fn stateless_v2025_initialize_still_gets_session_id() {
+        let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
+        let app = transport.into_router();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": { "name": "old-client", "version": "1.0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers().contains_key(MCP_SESSION_ID_HEADER),
+            "2025-11-25 initialize must return mcp-session-id"
+        );
+    }
+
+    /// With require_sessions(), 2025-11-25 tools/list without session
+    /// header fails with SessionRequired (-32006) -- behavior unchanged.
+    #[tokio::test]
+    async fn stateless_v2025_tools_list_without_session_rejected() {
+        let transport = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .require_sessions();
+        let app = transport.into_router();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header(MCP_PROTOCOL_VERSION_HEADER, "2025-11-25")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/list"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("error").is_some(), "expected error, got: {json}");
+        assert_eq!(
+            json["error"]["code"].as_i64().unwrap(),
+            -32006,
+            "expected SessionRequired (-32006)"
+        );
     }
 }
