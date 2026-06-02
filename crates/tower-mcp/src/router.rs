@@ -183,6 +183,13 @@ struct McpRouterInner {
     min_log_level: Arc<RwLock<LogLevel>>,
     /// Page size for list method pagination (None = return all results)
     page_size: Option<usize>,
+    /// TTL hint for list responses in milliseconds (SEP-2549).
+    /// When set, the value is returned as `ttlMs` in tools/list, resources/list,
+    /// and prompts/list responses so clients can cache the list.
+    list_ttl_ms: Option<u64>,
+    /// Deprecation info for the logging capability (SEP-2577).
+    /// When set, included in the `logging` capability in the initialize result.
+    logging_deprecated: Option<tower_mcp_types::protocol::DeprecationInfo>,
     /// Names of tools that are currently disabled (hidden from list/call).
     disabled_tools: Arc<RwLock<HashSet<String>>>,
     /// URIs of resources that are currently disabled (hidden from list/read).
@@ -315,6 +322,8 @@ impl McpRouter {
                 prompt_filter: None,
                 min_log_level: Arc::new(RwLock::new(LogLevel::Debug)),
                 page_size: None,
+                list_ttl_ms: None,
+                logging_deprecated: None,
                 disabled_tools: Arc::new(RwLock::new(HashSet::new())),
                 disabled_resources: Arc::new(RwLock::new(HashSet::new())),
                 disabled_prompts: Arc::new(RwLock::new(HashSet::new())),
@@ -715,6 +724,26 @@ impl McpRouter {
     /// single response.
     pub fn page_size(mut self, size: usize) -> Self {
         Arc::make_mut(&mut self.inner).page_size = Some(size);
+        self
+    }
+
+    /// Set a TTL hint on list responses (tools/list, resources/list, prompts/list).
+    ///
+    /// When set, the `ttlMs` field is included in list responses so clients can
+    /// cache the list for up to this many milliseconds before re-fetching.
+    /// Implements SEP-2549.
+    pub fn list_ttl(mut self, ms: u64) -> Self {
+        Arc::make_mut(&mut self.inner).list_ttl_ms = Some(ms);
+        self
+    }
+
+    /// Mark the logging capability as deprecated in the server's initialize result.
+    ///
+    /// When set, the `deprecated` object is included in the `logging` capability
+    /// in the `initialize` response, signalling to clients that logging notifications
+    /// are being phased out. Implements SEP-2577.
+    pub fn logging_deprecated(mut self, info: tower_mcp_types::protocol::DeprecationInfo) -> Self {
+        Arc::make_mut(&mut self.inner).logging_deprecated = Some(info);
         self
     }
 
@@ -1614,7 +1643,9 @@ impl McpRouter {
             },
             // Always advertise logging capability when notification channel is configured
             logging: if self.inner.notification_tx.is_some() {
-                Some(LoggingCapability::default())
+                Some(LoggingCapability {
+                    deprecated: self.inner.logging_deprecated.clone(),
+                })
             } else {
                 None
             },
@@ -1804,7 +1835,7 @@ impl McpRouter {
                 Ok(McpResponse::ListTools(ListToolsResult {
                     tools,
                     next_cursor,
-                    ttl_ms: None,
+                    ttl_ms: self.inner.list_ttl_ms,
                     cache_scope: None,
                     meta: None,
                 }))
@@ -2027,7 +2058,7 @@ impl McpRouter {
                 Ok(McpResponse::ListResources(ListResourcesResult {
                     resources,
                     next_cursor,
-                    ttl_ms: None,
+                    ttl_ms: self.inner.list_ttl_ms,
                     cache_scope: None,
                     meta: None,
                 }))
@@ -2067,7 +2098,7 @@ impl McpRouter {
                     ListResourceTemplatesResult {
                         resource_templates,
                         next_cursor,
-                        ttl_ms: None,
+                        ttl_ms: self.inner.list_ttl_ms,
                         cache_scope: None,
                         meta: None,
                     },
@@ -2223,7 +2254,7 @@ impl McpRouter {
                 Ok(McpResponse::ListPrompts(ListPromptsResult {
                     prompts,
                     next_cursor,
-                    ttl_ms: None,
+                    ttl_ms: self.inner.list_ttl_ms,
                     cache_scope: None,
                     meta: None,
                 }))
