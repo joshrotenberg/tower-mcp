@@ -491,7 +491,9 @@ pub use protocol::{
     TasksCancelCapability, TasksCapability, TasksListCapability, TasksRequestsCapability,
     TasksToolsCallCapability, TasksToolsRequestsCapability, ToolAnnotations, ToolChoice,
     ToolDefinition, ToolExecution, ToolIcon, ToolsCapability, UnsubscribeResourceParams,
+    UpdateTaskParams,
 };
+pub use protocol::{RESULT_TYPE_TASK, TASKS_EXTENSION_ID};
 #[cfg(feature = "dynamic-tools")]
 pub use registry::{
     DynamicPromptRegistry, DynamicResourceRegistry, DynamicResourceTemplateRegistry,

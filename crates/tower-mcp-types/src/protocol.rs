@@ -396,13 +396,27 @@ pub enum McpRequest {
     ListPrompts(ListPromptsParams),
     /// Get a prompt
     GetPrompt(GetPromptParams),
-    /// List tasks
+    /// List tasks.
+    ///
+    /// Removed from the core protocol by SEP-2663 (the tasks extension drops
+    /// `tasks/list` entirely). Kept here as a legacy parsing target so 2025-11-25
+    /// clients are not broken; new clients should not send this method.
     ListTasks(ListTasksParams),
-    /// Get task info
+    /// Get task info (`tasks/get`).
     GetTaskInfo(GetTaskInfoParams),
-    /// Get task result
+    /// Update an in-flight task with `inputResponses` (`tasks/update`).
+    ///
+    /// Introduced by SEP-2663 to replace the blocking `tasks/result` method
+    /// from the 2025-11-25 experimental spec. The response is an empty ack;
+    /// task state is observed via `tasks/get`.
+    UpdateTask(UpdateTaskParams),
+    /// Legacy `tasks/result` request from the 2025-11-25 experimental spec.
+    ///
+    /// SEP-2663 removes this method (clients are expected to receive
+    /// `MethodNotFound`), but we keep parsing it so 2025-11-25 servers built
+    /// on this crate continue to handle existing clients.
     GetTaskResult(GetTaskResultParams),
-    /// Cancel a task
+    /// Cancel a task (`tasks/cancel`).
     CancelTask(CancelTaskParams),
     /// Ping (keepalive)
     Ping,
@@ -435,6 +449,7 @@ impl McpRequest {
             McpRequest::GetPrompt(_) => "prompts/get",
             McpRequest::ListTasks(_) => "tasks/list",
             McpRequest::GetTaskInfo(_) => "tasks/get",
+            McpRequest::UpdateTask(_) => "tasks/update",
             McpRequest::GetTaskResult(_) => "tasks/result",
             McpRequest::CancelTask(_) => "tasks/cancel",
             McpRequest::Ping => "ping",
@@ -545,7 +560,14 @@ pub enum McpResponse {
     CreateTask(CreateTaskResult),
     ListTasks(ListTasksResult),
     GetTaskInfo(TaskObject),
+    /// Ack-only response for `tasks/update` (SEP-2663).
+    UpdateTask(EmptyResult),
     GetTaskResult(CallToolResult),
+    /// Response to `tasks/cancel`.
+    ///
+    /// Note: SEP-2663 redefines `tasks/cancel` to return an empty ack, but to
+    /// preserve back-compat for 2025-11-25 clients we still surface the task
+    /// state object here. A future release may migrate to the ack-only shape.
     CancelTask(TaskObject),
     SetLoggingLevel(EmptyResult),
     Complete(CompleteResult),
@@ -3230,6 +3252,21 @@ pub enum PromptRole {
 // Tasks (async operations)
 // =============================================================================
 
+/// Reverse-DNS identifier for the SEP-2663 tasks extension.
+///
+/// This string is the key under which task-extension capabilities are declared
+/// inside `ClientCapabilities.extensions` and `ServerCapabilities.extensions`.
+/// It is **not** a method prefix: per the spec, methods remain unprefixed
+/// (`tasks/get`, `tasks/update`, `tasks/cancel`).
+pub const TASKS_EXTENSION_ID: &str = "io.modelcontextprotocol/tasks";
+
+/// SEP-2322 / SEP-2663 `resultType` discriminator value for task results.
+///
+/// Per SEP-2663, servers **MUST** set `resultType` to `"task"` when returning
+/// a [`CreateTaskResult`], and **MUST NOT** set `resultType` to `"task"` on
+/// any other result shape.
+pub const RESULT_TYPE_TASK: &str = "task";
+
 /// Task support mode for tool execution
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -3330,15 +3367,103 @@ pub struct TaskObject {
 #[deprecated(note = "Use TaskObject instead")]
 pub type TaskInfo = TaskObject;
 
-/// Result of creating a task (returned when tools/call includes task params)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// Result of creating a task (returned when `tools/call` is task-augmented).
+///
+/// Per SEP-2663, `CreateTaskResult = Result & Task`: the task fields are
+/// inlined at the top of the result and `resultType` is set to `"task"` so
+/// clients can distinguish a task handle from a normal `CallToolResult` on
+/// the same RPC.
+///
+/// Serialization layout:
+/// ```jsonc
+/// {
+///   "resultType": "task",
+///   "taskId": "...",
+///   "status": "working",
+///   "createdAt": "...",
+///   "lastUpdatedAt": "...",
+///   "ttl": null,
+///   "pollInterval": 5000,
+///   // The nested `task` field is emitted purely for back-compat with the
+///   // 2025-11-25 experimental wire format. New clients should read the
+///   // top-level fields and ignore `task`. This nested mirror will be
+///   // removed in a future release.
+///   "task": { "taskId": ..., "status": ..., ... }
+/// }
+/// ```
+#[derive(Debug, Clone)]
 pub struct CreateTaskResult {
-    /// The created task object
+    /// The created task object. Serialized both inline (per SEP-2663) and
+    /// under the legacy `task` key for back-compat.
     pub task: TaskObject,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
+}
+
+impl CreateTaskResult {
+    /// Wire-spec discriminator value (always `"task"`).
+    pub const RESULT_TYPE: &'static str = RESULT_TYPE_TASK;
+
+    /// Build a result from a [`TaskObject`], with the SEP-2663 discriminator
+    /// pre-populated when serialized.
+    pub fn new(task: TaskObject) -> Self {
+        Self { task, meta: None }
+    }
+}
+
+impl Serialize for CreateTaskResult {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Serialize the TaskObject to a JSON object, then inject the
+        // SEP-2663 discriminator and the nested `task` mirror for back-compat.
+        let mut value = serde_json::to_value(&self.task)
+            .map_err(|e| serde::ser::Error::custom(format!("task serialize: {e}")))?;
+        let obj = value
+            .as_object_mut()
+            .ok_or_else(|| serde::ser::Error::custom("task did not serialize to a JSON object"))?;
+        obj.insert(
+            "resultType".to_string(),
+            Value::String(Self::RESULT_TYPE.to_string()),
+        );
+        obj.insert(
+            "task".to_string(),
+            serde_json::to_value(&self.task)
+                .map_err(|e| serde::ser::Error::custom(format!("task mirror: {e}")))?,
+        );
+        if let Some(meta) = &self.meta {
+            obj.insert("_meta".to_string(), meta.clone());
+        }
+        value.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CreateTaskResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Accept both the SEP-2663 flat layout and the 2025-11-25 nested
+        // layout (`{ "task": { ... } }`) by deserializing as a generic
+        // object and disambiguating.
+        let value = Value::deserialize(deserializer)?;
+        let meta = value.get("_meta").filter(|v| !v.is_null()).cloned();
+        if let Some(task_val) = value.get("task")
+            && task_val.is_object()
+            && task_val
+                .as_object()
+                .is_some_and(|o| o.contains_key("taskId"))
+        {
+            // Nested back-compat shape; trust the nested object.
+            let task: TaskObject =
+                serde_json::from_value(task_val.clone()).map_err(serde::de::Error::custom)?;
+            return Ok(CreateTaskResult { task, meta });
+        }
+        // Otherwise treat the flat top-level fields as the TaskObject.
+        let task: TaskObject = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(CreateTaskResult { task, meta })
+    }
 }
 
 /// Parameters for listing tasks
@@ -3399,6 +3524,30 @@ pub struct CancelTaskParams {
     #[serde(default)]
     pub reason: Option<String>,
     /// Optional protocol-level metadata
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<RequestMeta>,
+}
+
+/// Parameters for the SEP-2663 `tasks/update` request.
+///
+/// When a task is in the `input_required` state the server publishes one or
+/// more requests in the `inputRequests` field of a `tasks/get` response;
+/// clients fulfill those requests by posting responses keyed by the request
+/// identifier in `inputResponses`. The server acknowledges with an empty
+/// result; the post-update task state is observed via a subsequent
+/// `tasks/get`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateTaskParams {
+    /// Identifier of the task being updated.
+    pub task_id: String,
+    /// Responses to outstanding `inputRequests` previously surfaced by the
+    /// server, keyed by the request identifier. Opaque to this crate; clients
+    /// supply whatever shape the server expects per its `inputRequest`
+    /// envelope (e.g. an `ElicitResult` or `CreateMessageResult`).
+    #[serde(default)]
+    pub input_responses: HashMap<String, Value>,
+    /// Optional protocol-level metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<RequestMeta>,
 }
@@ -4103,6 +4252,14 @@ impl McpRequest {
                 let p: GetPromptParams = serde_json::from_value(params)?;
                 Ok(McpRequest::GetPrompt(p))
             }
+            // Tasks methods. The canonical method names defined by SEP-2663
+            // (`tasks/get`, `tasks/update`, `tasks/cancel`) are unprefixed; the
+            // `io.modelcontextprotocol/tasks` identifier is the *extension*
+            // label used for capability declarations, not a method prefix.
+            // `tasks/list` and `tasks/result` are 2025-11-25 experimental
+            // methods that SEP-2663 removes; we still parse them so legacy
+            // clients receive a structured response instead of a transport
+            // error, but server handlers may reject them at their own discretion.
             "tasks/list" => {
                 let p: ListTasksParams = serde_json::from_value(params).unwrap_or_default();
                 Ok(McpRequest::ListTasks(p))
@@ -4110,6 +4267,10 @@ impl McpRequest {
             "tasks/get" => {
                 let p: GetTaskInfoParams = serde_json::from_value(params)?;
                 Ok(McpRequest::GetTaskInfo(p))
+            }
+            "tasks/update" => {
+                let p: UpdateTaskParams = serde_json::from_value(params)?;
+                Ok(McpRequest::UpdateTask(p))
             }
             "tasks/result" => {
                 let p: GetTaskResultParams = serde_json::from_value(params)?;
@@ -5541,5 +5702,161 @@ mod tests {
             }
             _ => panic!("expected ListTools variant"),
         }
+    }
+
+    // =========================================================================
+    // SEP-2663 tasks extension wire-format tests
+    // =========================================================================
+
+    fn task_obj_for_tests() -> TaskObject {
+        TaskObject {
+            task_id: "task-786512e2".into(),
+            status: TaskStatus::Working,
+            status_message: None,
+            created_at: "2025-11-25T10:30:00Z".into(),
+            last_updated_at: "2025-11-25T10:30:00Z".into(),
+            ttl: Some(60_000),
+            poll_interval: Some(5_000),
+            meta: None,
+        }
+    }
+
+    #[test]
+    fn tasks_extension_id_matches_sep_2663() {
+        // The reverse-DNS identifier MUST match the value defined in the SEP
+        // (used as the key in ClientCapabilities.extensions / ServerCapabilities.extensions).
+        assert_eq!(TASKS_EXTENSION_ID, "io.modelcontextprotocol/tasks");
+    }
+
+    #[test]
+    fn create_task_result_serializes_with_sep_2663_discriminator() {
+        // Per SEP-2663:
+        //   - resultType MUST be "task"
+        //   - the Task fields are inlined at the top of the result object
+        let result = CreateTaskResult::new(task_obj_for_tests());
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["resultType"], serde_json::json!("task"));
+        // SEP-2663 inlined Task fields
+        assert_eq!(json["taskId"], serde_json::json!("task-786512e2"));
+        assert_eq!(json["status"], serde_json::json!("working"));
+        assert_eq!(json["pollInterval"], serde_json::json!(5_000));
+        assert_eq!(json["ttl"], serde_json::json!(60_000));
+        assert_eq!(json["createdAt"], serde_json::json!("2025-11-25T10:30:00Z"));
+        // Back-compat: the nested `task` mirror is still emitted for
+        // 2025-11-25 clients of this crate. New clients should ignore it.
+        assert_eq!(json["task"]["taskId"], serde_json::json!("task-786512e2"));
+    }
+
+    #[test]
+    fn create_task_result_round_trips_via_flat_layout() {
+        let original = CreateTaskResult::new(task_obj_for_tests());
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: CreateTaskResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.task.task_id, "task-786512e2");
+        assert_eq!(parsed.task.status, TaskStatus::Working);
+        assert_eq!(parsed.task.ttl, Some(60_000));
+    }
+
+    #[test]
+    fn create_task_result_accepts_legacy_nested_layout() {
+        // 2025-11-25 wire shape (no resultType, task is nested only).
+        let legacy = serde_json::json!({
+            "task": {
+                "taskId": "legacy-id",
+                "status": "working",
+                "createdAt": "2025-11-25T10:30:00Z",
+                "lastUpdatedAt": "2025-11-25T10:30:00Z",
+                "ttl": null
+            }
+        });
+        let parsed: CreateTaskResult = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.task.task_id, "legacy-id");
+        assert_eq!(parsed.task.status, TaskStatus::Working);
+    }
+
+    #[test]
+    fn tasks_update_method_parses_via_from_jsonrpc() {
+        // SEP-2663 introduces tasks/update with { taskId, inputResponses }.
+        let body = r#"{
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tasks/update",
+            "params": {
+                "taskId": "abc-123",
+                "inputResponses": {
+                    "name": {
+                        "action": "accept",
+                        "content": { "input": "Luca" }
+                    }
+                }
+            }
+        }"#;
+        let req: JsonRpcRequest = serde_json::from_str(body).unwrap();
+        let parsed = McpRequest::from_jsonrpc(&req).unwrap();
+        match parsed {
+            McpRequest::UpdateTask(p) => {
+                assert_eq!(p.task_id, "abc-123");
+                let name_resp = p.input_responses.get("name").expect("has 'name' key");
+                assert_eq!(name_resp["action"], "accept");
+            }
+            other => panic!("expected UpdateTask, got {:?}", other.method_name()),
+        }
+        // Verify reverse mapping for `method_name()`.
+        let parsed = McpRequest::from_jsonrpc(&req).unwrap();
+        assert_eq!(parsed.method_name(), "tasks/update");
+    }
+
+    #[test]
+    fn legacy_tasks_methods_still_parse_for_back_compat() {
+        // 2025-11-25 method strings remain parseable so servers built against
+        // this crate continue to receive structured requests from legacy clients.
+        for (method, params, expected_name) in [
+            (
+                "tasks/get",
+                serde_json::json!({ "taskId": "x" }),
+                "tasks/get",
+            ),
+            (
+                "tasks/cancel",
+                serde_json::json!({ "taskId": "x" }),
+                "tasks/cancel",
+            ),
+            (
+                "tasks/result",
+                serde_json::json!({ "taskId": "x" }),
+                "tasks/result",
+            ),
+            ("tasks/list", serde_json::json!({}), "tasks/list"),
+        ] {
+            let req = JsonRpcRequest::new(1, method).with_params(params);
+            let parsed = McpRequest::from_jsonrpc(&req)
+                .unwrap_or_else(|e| panic!("failed to parse legacy {method}: {e:?}"));
+            assert_eq!(parsed.method_name(), expected_name);
+        }
+    }
+
+    #[test]
+    fn result_type_task_discriminator_constant() {
+        // SEP-2322/SEP-2663 reserve the "task" discriminator value.
+        assert_eq!(RESULT_TYPE_TASK, "task");
+        assert_eq!(CreateTaskResult::RESULT_TYPE, RESULT_TYPE_TASK);
+    }
+
+    #[test]
+    fn server_capabilities_extensions_keys_match_tasks_extension_id() {
+        // Per SEP-2663, support for the tasks extension is declared by
+        // inserting the extension identifier into ServerCapabilities.extensions
+        // (an empty object value indicates "supported with no settings").
+        let mut extensions = HashMap::new();
+        extensions.insert(TASKS_EXTENSION_ID.to_string(), serde_json::json!({}));
+        let caps = ServerCapabilities {
+            extensions: Some(extensions),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&caps).unwrap();
+        assert_eq!(
+            json["extensions"]["io.modelcontextprotocol/tasks"],
+            serde_json::json!({})
+        );
     }
 }

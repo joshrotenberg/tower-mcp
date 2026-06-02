@@ -1618,7 +1618,11 @@ impl McpRouter {
             } else {
                 None
             },
-            // Tasks capability is advertised if any tool supports tasks
+            // Tasks capability is advertised if any tool supports tasks.
+            // SEP-2663 moves the declaration to `capabilities.extensions`
+            // under the reverse-DNS key `io.modelcontextprotocol/tasks`; we
+            // continue to set the legacy top-level `tasks` field for back-compat
+            // with 2025-11-25 clients that key off it.
             tasks: {
                 let has_task_support = self
                     .inner
@@ -1646,7 +1650,23 @@ impl McpRouter {
                 None
             },
             experimental: None,
-            extensions: None,
+            extensions: {
+                let has_task_support = self
+                    .inner
+                    .tools
+                    .values()
+                    .any(|t| !matches!(t.task_support, TaskSupportMode::Forbidden));
+                if has_task_support {
+                    let mut map = std::collections::HashMap::new();
+                    map.insert(
+                        tower_mcp_types::protocol::TASKS_EXTENSION_ID.to_string(),
+                        serde_json::json!({}),
+                    );
+                    Some(map)
+                } else {
+                    None
+                }
+            },
         }
     }
 
@@ -1923,10 +1943,7 @@ impl McpRouter {
                         ))
                     })?;
 
-                    Ok(McpResponse::CreateTask(CreateTaskResult {
-                        task,
-                        meta: None,
-                    }))
+                    Ok(McpResponse::CreateTask(CreateTaskResult::new(task)))
                 } else {
                     // Synchronous request: validate task_support != Required
                     if matches!(tool.task_support, TaskSupportMode::Required) {
@@ -2322,6 +2339,27 @@ impl McpRouter {
                         Ok(McpResponse::GetTaskResult(call_result))
                     }
                 }
+            }
+
+            McpRequest::UpdateTask(params) => {
+                // SEP-2663 `tasks/update`: validate the task exists and
+                // acknowledge with an empty result. tower-mcp does not yet
+                // model server-initiated `inputRequests` for tasks (that's a
+                // future MRTR-flavored feature), so we currently treat any
+                // submitted `inputResponses` as ignorable per spec ("A server
+                // SHOULD ignore any inputResponses mapped to a key that is
+                // not currently outstanding").
+                let _ = self
+                    .inner
+                    .task_store
+                    .get_task(&params.task_id)
+                    .ok_or_else(|| {
+                        Error::JsonRpc(JsonRpcError::invalid_params(format!(
+                            "Task not found: {}",
+                            params.task_id
+                        )))
+                    })?;
+                Ok(McpResponse::UpdateTask(EmptyResult {}))
             }
 
             McpRequest::CancelTask(params) => {
