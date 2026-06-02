@@ -187,6 +187,7 @@ use crate::jsonrpc::JsonRpcService;
 use crate::protocol::{
     ClientCapabilities, Implementation, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
     LATEST_PROTOCOL_VERSION, McpNotification, RequestId, SUPPORTED_PROTOCOL_VERSIONS,
+    UPCOMING_PROTOCOL_VERSION,
 };
 use crate::router::{McpRouter, RouterRequest, RouterResponse};
 use crate::transport::service::{
@@ -2214,6 +2215,37 @@ async fn handle_post(
         return json_rpc_error_response(None, JsonRpcError::session_required());
     };
 
+    // SEP-2575 / SEP-2567: intercept `messages/listen` before the standard
+    // version validation. `messages/listen` is only available when the
+    // effective protocol version is >= 2026-07-28; otherwise we return a
+    // proper JSON-RPC error rather than silently falling through to the
+    // router (which would return `MethodNotFound` anyway, but without the
+    // protocol-version context).
+    //
+    // We check the Mcp-Protocol-Version header first (per-request override),
+    // falling back to the session-negotiated version. Intercepting here
+    // also prevents the version-validation guard below from rejecting the
+    // 2026-07-28 header before we can inspect it.
+    {
+        let method_str = parsed.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        if method_str == "messages/listen" {
+            let req_id = extract_request_id(&parsed);
+            let effective_version = if let Some(v) = get_protocol_version(&headers) {
+                v
+            } else {
+                session.protocol_version.read().await.clone()
+            };
+            if version_supports_messages_listen(&effective_version) {
+                return handle_messages_listen_sse(session).await;
+            } else {
+                return json_rpc_error_response(
+                    req_id,
+                    JsonRpcError::method_not_found("messages/listen"),
+                );
+            }
+        }
+    }
+
     // Validate protocol version (if present and not init request).
     // Per SEP-2575, unsupported versions get a JSON-RPC error with code
     // -32004 and `{ supported, requested }` data, not a plain-text 400.
@@ -2402,6 +2434,58 @@ async fn handle_post(
     );
 
     resp
+}
+
+/// Returns `true` when the given protocol version string enables `messages/listen`.
+///
+/// `messages/listen` is part of the 2026-07-28 spec (SEP-2575 / SEP-2567).
+/// Version strings are YYYY-MM-DD dates, so lexicographic comparison is correct.
+fn version_supports_messages_listen(version: &str) -> bool {
+    version >= UPCOMING_PROTOCOL_VERSION
+}
+
+/// Serve a `messages/listen` request as an SSE stream.
+///
+/// Subscribes to the session's notification broadcast channel and returns a
+/// streaming `text/event-stream` response. The stream closes naturally when:
+/// - The client disconnects (axum drops the response body).
+/// - The broadcast channel closes (server shutdown / session expiry).
+///
+/// Each notification is assigned a monotonically increasing event ID for
+/// potential stream resumption (SEP-1699).
+async fn handle_messages_listen_sse(session: Arc<Session>) -> Response {
+    let rx = session.notifications_tx.subscribe();
+    let session_clone = session.clone();
+
+    let stream = BroadcastStream::new(rx)
+        .then(move |result: std::result::Result<String, _>| {
+            let session = session_clone.clone();
+            async move {
+                match result {
+                    Ok(msg) => {
+                        let event_id = session.next_event_id();
+                        // Buffer the event for potential replay (SEP-1699)
+                        session.buffer_event(event_id, msg.clone()).await;
+                        Some(Ok::<_, Infallible>(
+                            Event::default()
+                                .id(event_id.to_string())
+                                .event(SSE_MESSAGE_EVENT)
+                                .data(msg),
+                        ))
+                    }
+                    Err(_) => None,
+                }
+            }
+        })
+        .filter_map(|x| x);
+
+    Sse::new(stream)
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(Duration::from_secs(30))
+                .text("ping"),
+        )
+        .into_response()
 }
 
 /// Handle GET requests (SSE stream for server notifications and outgoing requests)

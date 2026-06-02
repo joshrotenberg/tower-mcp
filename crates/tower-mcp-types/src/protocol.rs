@@ -426,6 +426,13 @@ pub enum McpRequest {
     Complete(CompleteParams),
     /// SEP-2575: discover server capabilities without an initialize handshake
     Discover(DiscoverParams),
+    /// SEP-2575 / SEP-2567: open a server-to-client notification stream
+    /// (`messages/listen`).
+    ///
+    /// The HTTP transport intercepts this before it reaches the router and
+    /// returns an SSE stream. The variant is defined here for client-side
+    /// type-safe construction and for any future transport implementations.
+    MessagesListen(MessagesListenParams),
     /// Unknown method
     Unknown {
         method: String,
@@ -456,6 +463,7 @@ impl McpRequest {
             McpRequest::SetLoggingLevel(_) => "logging/setLevel",
             McpRequest::Complete(_) => "completion/complete",
             McpRequest::Discover(_) => "server/discover",
+            McpRequest::MessagesListen(_) => "messages/listen",
             McpRequest::Unknown { method, .. } => method,
         }
     }
@@ -574,6 +582,13 @@ pub enum McpResponse {
     Pong(EmptyResult),
     /// SEP-2575 `server/discover` response.
     Discover(DiscoverResult),
+    /// SEP-2575 / SEP-2567 `messages/listen` response.
+    ///
+    /// In practice the HTTP transport returns an SSE stream for this method
+    /// and never produces this variant. It is provided for completeness and
+    /// for potential future transport implementations that want a typed
+    /// result.
+    MessagesListen(MessagesListenResult),
     Empty(EmptyResult),
     /// Raw JSON value for experimental/extension methods.
     Raw(Value),
@@ -1582,6 +1597,42 @@ pub struct DiscoverResult {
     /// Optional instructions describing how to use this server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    /// Optional protocol-level metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
+}
+
+// =============================================================================
+// messages/listen (SEP-2575 / SEP-2567)
+// =============================================================================
+
+/// Parameters for the `messages/listen` RPC (SEP-2575 / SEP-2567).
+///
+/// `messages/listen` is sent by the client over HTTP POST to open a
+/// server-to-client notification stream (SSE). The server responds with
+/// `Content-Type: text/event-stream` and streams zero or more
+/// `notifications/*` events until the client disconnects.
+///
+/// Under SEP-2567 (sessionless), the stream lifetime is scoped to the single
+/// request. Only servers whose negotiated protocol version is >= 2026-07-28
+/// enable this path; older servers return a `Method Not Found` (-32601) error.
+///
+/// The struct takes no parameters today; the empty struct is reserved so
+/// future SEPs can add optional fields without breaking callers.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MessagesListenParams {
+    /// Optional protocol-level metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
+}
+
+/// Result of the `messages/listen` RPC.
+///
+/// In practice the HTTP transport opens an SSE stream and never serializes
+/// this type as a JSON-RPC result. It is provided for completeness and for
+/// transports that want a typed acknowledgement shape.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MessagesListenResult {
     /// Optional protocol-level metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
@@ -4294,6 +4345,12 @@ impl McpRequest {
                 let p: DiscoverParams = serde_json::from_value(params).unwrap_or_default();
                 Ok(McpRequest::Discover(p))
             }
+            "messages/listen" => {
+                // SEP-2575 / SEP-2567: client-initiated streaming.
+                // Empty-or-missing params is valid.
+                let p: MessagesListenParams = serde_json::from_value(params).unwrap_or_default();
+                Ok(McpRequest::MessagesListen(p))
+            }
             method => Ok(McpRequest::Unknown {
                 method: method.to_string(),
                 params: req.params.clone(),
@@ -4407,6 +4464,35 @@ mod tests {
             json.get("instructions").is_none(),
             "instructions must be omitted when None, got: {json}"
         );
+    }
+
+    // =========================================================================
+    // SEP-2575 / SEP-2567 (messages/listen) wire-format tests
+    // =========================================================================
+
+    #[test]
+    fn messages_listen_request_round_trips_with_no_params() {
+        // Per SEP-2575 / SEP-2567, params is empty/optional.
+        let no_params = r#"{"jsonrpc":"2.0","id":1,"method":"messages/listen"}"#;
+        let req: JsonRpcRequest = serde_json::from_str(no_params).unwrap();
+        let parsed = McpRequest::from_jsonrpc(&req).unwrap();
+        assert!(matches!(parsed, McpRequest::MessagesListen(_)));
+        assert_eq!(parsed.method_name(), "messages/listen");
+
+        let empty_params = r#"{"jsonrpc":"2.0","id":2,"method":"messages/listen","params":{}}"#;
+        let req: JsonRpcRequest = serde_json::from_str(empty_params).unwrap();
+        let parsed = McpRequest::from_jsonrpc(&req).unwrap();
+        assert!(matches!(parsed, McpRequest::MessagesListen(_)));
+    }
+
+    #[test]
+    fn messages_listen_request_serializes_with_correct_method() {
+        let req = JsonRpcRequest::new(42i64, "messages/listen");
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["method"], "messages/listen");
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["id"], 42);
     }
 
     // =========================================================================
