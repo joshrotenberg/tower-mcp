@@ -30,27 +30,31 @@
 //! # List tools (admin_ tools are hidden)
 //! curl -X POST http://localhost:3000/ \
 //!   -H "Content-Type: application/json" \
-//!   -H "Mcp-Session-Id: <session-id-from-init>" \
+//!   -H "MCP-Session-Id: <session-id-from-init>" \
 //!   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
 //!
 //! # Try to call hidden admin tool (returns "method not found")
 //! curl -X POST http://localhost:3000/ \
 //!   -H "Content-Type: application/json" \
-//!   -H "Mcp-Session-Id: <session-id-from-init>" \
+//!   -H "MCP-Session-Id: <session-id-from-init>" \
 //!   -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"admin_delete_user","arguments":{"user_id":"123"}}}'
 //!
 //! # List resources (admin config is hidden)
 //! curl -X POST http://localhost:3000/ \
 //!   -H "Content-Type: application/json" \
-//!   -H "Mcp-Session-Id: <session-id-from-init>" \
+//!   -H "MCP-Session-Id: <session-id-from-init>" \
 //!   -d '{"jsonrpc":"2.0","id":4,"method":"resources/list","params":{}}'
 //!
 //! # List prompts (admin/internal prompts are hidden)
 //! curl -X POST http://localhost:3000/ \
 //!   -H "Content-Type: application/json" \
-//!   -H "Mcp-Session-Id: <session-id-from-init>" \
+//!   -H "MCP-Session-Id: <session-id-from-init>" \
 //!   -d '{"jsonrpc":"2.0","id":5,"method":"prompts/list","params":{}}'
 //! ```
+//!
+//! The curl examples above use the 2025-11-25 session-based flow. The 2026-07-28
+//! stateless protocol is also supported: `DenialBehavior` filtering applies equally
+//! to stateless requests. See `http_server.rs` for the stateless curl walkthrough.
 
 use schemars::JsonSchema;
 use serde::Deserialize;

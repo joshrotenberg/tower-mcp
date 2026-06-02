@@ -40,6 +40,23 @@
 //! #   Payload: {"sub":"demo-user","scope":"mcp:read mcp:write"}
 //! #   Secret:  demo-secret-do-not-use-in-production
 //! ```
+//!
+//! The examples above use the 2025-11-25 session-based flow. Both auth strategies
+//! also work with the 2026-07-28 stateless protocol -- the `Authorization` header
+//! is validated on every request regardless of protocol version. No `initialize`
+//! call or `MCP-Session-Id` is required in stateless mode:
+//!
+//! ```bash
+//! # Stateless request with API key auth (2026-07-28)
+//! curl -X POST http://localhost:3000/ \
+//!   -H "Content-Type: application/json" \
+//!   -H "Authorization: Bearer sk-test-key-123" \
+//!   -H "MCP-Protocol-Version: 2026-07-28" \
+//!   -H "Mcp-Method: tools/list" \
+//!   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+//! ```
+//!
+//! See `http_server.rs` for the full 2026-07-28 stateless walkthrough.
 
 use axum::Router;
 use schemars::JsonSchema;

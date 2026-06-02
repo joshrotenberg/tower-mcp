@@ -27,6 +27,10 @@
 //!   -H "MCP-Session-Id: <session-id>" \
 //!   -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"add","arguments":{"a":10,"b":32}}}'
 //! ```
+//!
+//! The curl examples above use the 2025-11-25 session-based flow. The Unix socket
+//! transport also supports the 2026-07-28 stateless protocol when the server is
+//! configured for it. See `http_server.rs` for the stateless curl walkthrough.
 
 #[cfg(unix)]
 mod app {

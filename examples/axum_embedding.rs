@@ -28,6 +28,11 @@
 //!   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"curl","version":"1.0"}}}'
 //! ```
 //!
+//! The curl examples above use the 2025-11-25 session-based flow. The 2026-07-28
+//! stateless protocol is also supported when embedding -- `HttpTransport::into_router()`
+//! honours `MCP-Protocol-Version` on every request. See `http_server.rs` for the
+//! stateless curl walkthrough.
+//!
 //! # Why this example exists
 //!
 //! `HttpTransport::into_router()` returns a plain [`axum::Router`]. That means

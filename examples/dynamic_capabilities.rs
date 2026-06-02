@@ -7,6 +7,15 @@
 //! - Meta-tools (`create_tool`, `remove_tool`) that manage other tools
 //! - List-changed notifications when capabilities change
 //!
+//! This example drives the service in-process via `JsonRpcService::call_single`
+//! rather than starting a real transport. `JsonRpcService` is the JSON-RPC 2.0
+//! framing layer that sits directly below all transports (HTTP, stdio, WebSocket),
+//! making it useful for in-process testing, scripting, and protocol-level
+//! inspection without a network round-trip. In a production server you would
+//! attach the same `DynamicToolRegistry` to an `HttpTransport` or
+//! `StdioTransport` and external clients would connect normally -- see
+//! `http_server.rs` or `getting_started.rs` for that pattern.
+//!
 //! Run with: `cargo run --example dynamic_capabilities --features dynamic-tools`
 
 use schemars::JsonSchema;

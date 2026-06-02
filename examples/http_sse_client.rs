@@ -1,5 +1,14 @@
 //! HTTP SSE client example demonstrating stream resumption
 //!
+//! This example targets the **2025-11-25 session-based protocol** only. It
+//! initializes a session, receives an `MCP-Session-Id`, and opens a
+//! per-session SSE stream via `GET`. Under the 2026-07-28 stateless protocol
+//! there is no session ID; SSE notifications are instead delivered via
+//! `messages/listen` (a `POST` with `Accept: text/event-stream`,
+//! `MCP-Protocol-Version: 2026-07-28`, and `Mcp-Method: messages/listen`).
+//! If you are running a 2026-07-28 server, the `GET` stream used here will
+//! not work as expected.
+//!
 //! This example shows how to connect to an MCP server's SSE stream and use
 //! the Last-Event-ID header for stream resumption (SEP-1699).
 //!
