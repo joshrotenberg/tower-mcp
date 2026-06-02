@@ -77,6 +77,17 @@ async fn discover_returns_supported_versions_and_server_info() {
         result.get("protocolVersion").is_none(),
         "server/discover must NOT include singular protocolVersion -- that's the initialize shape: {result}"
     );
+    // LATEST_PROTOCOL_VERSION must be present in the advertised list so clients
+    // can always negotiate the current stable version. This assertion catches
+    // regressions where a version is accidentally removed from SUPPORTED_PROTOCOL_VERSIONS.
+    assert!(
+        versions
+            .iter()
+            .any(|v| v.as_str() == Some(tower_mcp::protocol::LATEST_PROTOCOL_VERSION)),
+        "supportedVersions must include LATEST_PROTOCOL_VERSION ({}) but got: {:?}",
+        tower_mcp::protocol::LATEST_PROTOCOL_VERSION,
+        versions
+    );
 }
 
 #[tokio::test]
@@ -97,4 +108,48 @@ async fn discover_is_idempotent() {
     let a = post_discover().await;
     let b = post_discover().await;
     assert_eq!(a["result"], b["result"]);
+}
+
+/// server/discover via the 2026-07-28 stateless dispatch path succeeds without
+/// a session and does not create one. The request carries `Mcp-Protocol-Version:
+/// 2026-07-28` and `Mcp-Method: server/discover` (required by strict SEP-2243 mode).
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn stateless_v2026_discover_returns_supported_versions_no_session() {
+    let (app, handle) = HttpTransport::new(router())
+        .disable_origin_validation()
+        .into_router_with_handle();
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header("Mcp-Protocol-Version", "2026-07-28")
+        .header("Mcp-Method", "server/discover")
+        .body(Body::from(
+            r#"{"jsonrpc":"2.0","id":1,"method":"server/discover"}"#,
+        ))
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    assert!(
+        response.status().is_success(),
+        "expected 2xx, got {}",
+        response.status()
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let resp: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(resp.get("error").is_none(), "expected no error: {resp}");
+    assert!(
+        resp["result"]["supportedVersions"].is_array(),
+        "supportedVersions must be an array: {resp}"
+    );
+    // No session must be created for a stateless discover call.
+    assert_eq!(
+        handle.session_count().await,
+        0,
+        "stateless discover must not create a session"
+    );
 }

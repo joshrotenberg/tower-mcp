@@ -147,3 +147,139 @@ async fn legacy_namespace_keys_are_silently_dropped() {
     assert!(meta.protocol_version.is_none(), "legacy key must not match");
     assert!(meta.client_info.is_none());
 }
+
+/// Verify that `stash_per_request_meta` fires in the session-based (2025-11-25)
+/// path. Initialize to get a session id, then POST tools/call with a session
+/// header AND `_meta` in the body -- assert the handler sees the meta.
+/// This guards against accidental removal of the `stash_per_request_meta` call
+/// at line ~2506 of http.rs.
+#[tokio::test]
+async fn session_path_stashes_per_request_meta() {
+    let captured = Captured::default();
+    let app = HttpTransport::new(router(captured.clone()))
+        .disable_origin_validation()
+        .into_router();
+
+    // Initialize to create a session.
+    let init_req = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(Body::from(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 0,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": { "name": "session-test", "version": "1.0" }
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let init_resp = app.clone().oneshot(init_req).await.unwrap();
+    let session_id = init_resp
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .expect("initialize must return session id");
+
+    // tools/call with session header AND _meta in the body.
+    let tool_req = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header("Mcp-Session-Id", &session_id)
+        .body(Body::from(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "inspect_meta",
+                    "arguments": {},
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2025-11-25",
+                        "io.modelcontextprotocol/clientInfo": {
+                            "name": "session-client",
+                            "version": "0.1"
+                        },
+                        "io.modelcontextprotocol/clientCapabilities": {}
+                    }
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let tool_resp = app.oneshot(tool_req).await.unwrap();
+    assert!(
+        tool_resp.status().is_success(),
+        "expected 2xx, got {}",
+        tool_resp.status()
+    );
+    let bytes = axum::body::to_bytes(tool_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(json.get("error").is_none(), "unexpected error: {json}");
+
+    // The handler must have seen the meta via the session-based path.
+    let meta = captured
+        .0
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("session-based path must stash per-request meta on the handler context");
+    assert_eq!(
+        meta.protocol_version.as_deref(),
+        Some("2025-11-25"),
+        "handler must see protocol_version from session-based _meta"
+    );
+    let info = meta
+        .client_info
+        .expect("clientInfo must be threaded through");
+    assert_eq!(info.name, "session-client");
+}
+
+/// Verify that the `log_level` field in `_meta` (`io.modelcontextprotocol/logLevel`)
+/// is deserialized and available on the `StatelessRequestMeta` seen by the handler.
+#[tokio::test]
+async fn handler_sees_log_level_from_meta() {
+    let (_, captured) = call_tool(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "inspect_meta",
+            "arguments": {},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": {
+                    "name": "log-test",
+                    "version": "1.0"
+                },
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "io.modelcontextprotocol/logLevel": "warning"
+            }
+        }
+    }))
+    .await;
+
+    let meta = captured
+        .0
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("meta must be present");
+    use tower_mcp::stateless::LogLevel;
+    assert_eq!(
+        meta.log_level,
+        Some(LogLevel::Warning),
+        "log_level must be threaded through to the handler context"
+    );
+}

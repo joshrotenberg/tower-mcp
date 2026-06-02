@@ -3155,6 +3155,84 @@ mod tests {
         assert!(supported.contains(&serde_json::json!("2025-11-25")));
         // The request id must be echoed (we have one in the body).
         assert_eq!(json["id"], 99);
+        // Field name must be `supported`, NOT `supportedVersions` (SEP-2575 shape).
+        assert!(
+            json["error"]["data"].get("supportedVersions").is_none(),
+            "error data must use 'supported', not 'supportedVersions': {:?}",
+            json["error"]["data"]
+        );
+        // The supported set must exactly match SUPPORTED_PROTOCOL_VERSIONS --
+        // no extras, none missing.
+        let expected: Vec<serde_json::Value> = SUPPORTED_PROTOCOL_VERSIONS
+            .iter()
+            .map(|v| serde_json::json!(v))
+            .collect();
+        assert_eq!(
+            supported, &expected,
+            "data.supported must exactly match SUPPORTED_PROTOCOL_VERSIONS"
+        );
+    }
+
+    /// When a request (no session) arrives with an invalid `Mcp-Protocol-Version`
+    /// header, the transport must return -32004 with the correct SEP-2575 wire
+    /// shape: `{ supported: [...], requested: "..." }`. This verifies the
+    /// version-validation path fires without requiring a session.
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn stateless_unsupported_protocol_version_returns_spec_shape_error() {
+        let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
+        let app = transport.into_router();
+
+        // "1999-01-01" is below UPCOMING_PROTOCOL_VERSION ("2026-07-28"), so it
+        // does not enter the version-gated stateless block. It is also not in
+        // SUPPORTED_PROTOCOL_VERSIONS, so it triggers the -32004 version check
+        // at lines ~2370-2382. No session header is sent, exercising the
+        // sessionless request path through version validation.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header(MCP_PROTOCOL_VERSION_HEADER, "1999-01-01")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 42,
+                    "method": "tools/list"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["error"]["code"].as_i64().unwrap(),
+            -32004,
+            "must return UnsupportedProtocolVersion (-32004): {json}"
+        );
+        assert_eq!(
+            json["error"]["data"]["requested"], "1999-01-01",
+            "data.requested must echo the version: {json}"
+        );
+        // Field name must be `supported`, not `supportedVersions`.
+        assert!(
+            json["error"]["data"].get("supportedVersions").is_none(),
+            "error data must use 'supported', not 'supportedVersions': {json}"
+        );
+        let supported = json["error"]["data"]["supported"]
+            .as_array()
+            .expect("data.supported must be an array");
+        let expected: Vec<serde_json::Value> = SUPPORTED_PROTOCOL_VERSIONS
+            .iter()
+            .map(|v| serde_json::json!(v))
+            .collect();
+        assert_eq!(
+            supported, &expected,
+            "data.supported must exactly match SUPPORTED_PROTOCOL_VERSIONS"
+        );
     }
 
     // =========================================================================

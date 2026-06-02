@@ -6659,4 +6659,71 @@ mod tests {
         assert_eq!(deserialized.id, RequestId::String("req-2".into()));
         assert!(deserialized.is_error());
     }
+
+    // =========================================================================
+    // Issue #872: McpRequest::Discover unit tests
+    // Unit tests that exercise the router dispatch directly via JsonRpcService,
+    // without going through the HTTP transport layer.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_discover_dispatch_via_jsonrpc_service() {
+        // server/discover must work without any prior initialize call.
+        // The router does NOT require session initialization for this RPC.
+        let router = McpRouter::new().server_info("unit-test-server", "4.2.0");
+        let mut service = JsonRpcService::new(router);
+
+        let req = JsonRpcRequest::new(1, "server/discover");
+        let resp = service.call_single(req).await.unwrap();
+
+        match resp {
+            JsonRpcResponse::Result(r) => {
+                // supportedVersions must be a non-empty array.
+                let versions = r
+                    .result
+                    .get("supportedVersions")
+                    .and_then(|v| v.as_array())
+                    .expect("result.supportedVersions must be an array");
+                assert!(!versions.is_empty(), "supportedVersions must not be empty");
+
+                // serverInfo.name must match what we configured.
+                assert_eq!(
+                    r.result["serverInfo"]["name"], "unit-test-server",
+                    "serverInfo.name must match configured value"
+                );
+                assert_eq!(
+                    r.result["serverInfo"]["version"], "4.2.0",
+                    "serverInfo.version must match configured value"
+                );
+
+                // server/discover must NOT include singular protocolVersion
+                // (that field belongs to the initialize response shape).
+                assert!(
+                    r.result.get("protocolVersion").is_none(),
+                    "server/discover must NOT include protocolVersion: {:?}",
+                    r.result
+                );
+            }
+            JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+            _ => panic!("unexpected response variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_discover_does_not_require_initialization() {
+        // server/discover works on a freshly created, un-initialized router.
+        // No prior initialize call is made -- the session state is empty.
+        let router = McpRouter::new().server_info("fresh-router", "1.0.0");
+        let mut service = JsonRpcService::new(router);
+
+        let req = JsonRpcRequest::new(2, "server/discover");
+        let resp = service.call_single(req).await.unwrap();
+
+        // Must succeed -- not return an error about missing session/initialization.
+        assert!(
+            !matches!(resp, JsonRpcResponse::Error(_)),
+            "server/discover must not require initialization: {:?}",
+            resp
+        );
+    }
 }
