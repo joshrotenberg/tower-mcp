@@ -53,6 +53,8 @@ cargo run --example tool_macro --features macros
 |---------|---------------|
 | [http_server](http_server.rs) | HTTP/SSE transport with sessions, progress, resources |
 | [websocket_server](websocket_server.rs) | WebSocket transport with sampling support |
+| [unix_socket_server](unix_socket_server.rs) | Unix domain socket transport (Linux/macOS) |
+| [horizontal_scaling](horizontal_scaling.rs) | Two HTTP instances sharing a session/event store behind a load balancer |
 | [axum_embedding](axum_embedding.rs) | Canonical pattern for mounting MCP under `/mcp` inside an existing axum app, sharing middleware and state with non-MCP routes |
 
 ### Middleware
@@ -86,6 +88,7 @@ cargo run --example tool_macro --features macros
 |---------|---------------|
 | [sampling_server](sampling_server.rs) | Server-to-client LLM requests and elicitation |
 | [client_handler](client_handler.rs) | Client-side sampling and notification handling |
+| [external_notifications](external_notifications.rs) | Pushing MCP notifications from background tasks via `HttpTransport::with_notifications` |
 
 ### Dynamic Capabilities
 
@@ -101,6 +104,8 @@ cargo run --example tool_macro --features macros
 | [resource_templates](resource_templates.rs) | URI template matching (RFC 6570) |
 | [structured_output](structured_output.rs) | Typed JSON output with schemas |
 | [error_handling](error_handling.rs) | Tool error patterns and propagation |
+| [event_store](event_store.rs) | Custom `EventStore` for persistent SSE event buffering and cross-instance resumption |
+| [session_store](session_store.rs) | Custom `SessionStore` for persistent session metadata |
 | [testing](testing.rs) | In-process testing with TestClient |
 | [weather_server](weather_server.rs) | External API integration (NWS) |
 
