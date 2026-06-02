@@ -5580,4 +5580,134 @@ mod tests {
             "expected SessionRequired (-32006)"
         );
     }
+
+    /// 2026-07-28 tools/list without session header succeeds (#856).
+    #[tokio::test]
+    #[cfg(feature = "stateless")]
+    async fn stateless_v2026_tools_list_without_session_succeeds() {
+        let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
+        let app = transport.into_router();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header(MCP_PROTOCOL_VERSION_HEADER, "2026-07-28")
+            .header(MCP_METHOD_HEADER, "tools/list")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !response.headers().contains_key(MCP_SESSION_ID_HEADER),
+            "stateless tools/list must not set mcp-session-id"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(MCP_PROTOCOL_VERSION_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("2026-07-28")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["result"]["tools"].is_array(),
+            "expected tools array in result, got: {json}"
+        );
+    }
+
+    /// 2026-07-28 stateless notification (no id) returns 202 and creates no session (#857).
+    #[tokio::test]
+    #[cfg(feature = "stateless")]
+    async fn stateless_v2026_notification_returns_202_no_session() {
+        let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
+        let (app, handle) = transport.into_router_with_handle();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header(MCP_PROTOCOL_VERSION_HEADER, "2026-07-28")
+            .header(MCP_METHOD_HEADER, "notifications/initialized")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::ACCEPTED,
+            "stateless notification must return 202 ACCEPTED"
+        );
+        assert!(
+            !response.headers().contains_key(MCP_SESSION_ID_HEADER),
+            "stateless notification must not set mcp-session-id"
+        );
+        assert_eq!(
+            handle.session_count().await,
+            0,
+            "stateless notification must not create a session"
+        );
+    }
+
+    /// 2026-07-28 stateless request missing Mcp-Method returns -32001 + HTTP 400 (#859).
+    #[tokio::test]
+    #[cfg(feature = "stateless")]
+    async fn stateless_v2026_missing_mcp_method_returns_400() {
+        let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
+        let app = transport.into_router();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header(MCP_PROTOCOL_VERSION_HEADER, "2026-07-28")
+            // Intentionally NO Mcp-Method header
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "missing Mcp-Method must return HTTP 400"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("error").is_some(), "expected error, got: {json}");
+        assert_eq!(
+            json["error"]["code"].as_i64().unwrap(),
+            -32001,
+            "expected InvalidRequest (-32001)"
+        );
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Mcp-Method"),
+            "error message must mention Mcp-Method, got: {json}"
+        );
+    }
 }
