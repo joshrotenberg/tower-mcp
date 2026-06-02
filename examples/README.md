@@ -25,9 +25,10 @@ cargo run --example axum_embedding --features http
 # WebSocket transport
 cargo run --example websocket_server --features websocket
 
-# Clients (start http_server first)
+# Clients (start http_server first, or run stateless_http_client standalone)
 cargo run --example http_client --features http-client
 cargo run --example http_sse_client --features http
+cargo run --example stateless_http_client --features "http,stateless"
 
 # Dynamic capabilities
 cargo run --example dynamic_capabilities --features dynamic-tools
@@ -81,6 +82,7 @@ cargo run --example tool_macro --features macros
 | [client_cli](client_cli.rs) | Stdio client connecting to subprocess servers |
 | [http_client](http_client.rs) | HTTP client with McpClient API |
 | [http_sse_client](http_sse_client.rs) | SSE stream resumption (Last-Event-ID) |
+| [stateless_http_client](stateless_http_client.rs) | 2026-07-28 stateless protocol: server/discover, tools/list, tools/call, messages/listen -- no session ID |
 
 ### Bidirectional Communication
 

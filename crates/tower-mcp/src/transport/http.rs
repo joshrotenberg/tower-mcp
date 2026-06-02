@@ -2587,6 +2587,7 @@ async fn handle_post(
     // Bridge per-request data from HTTP into MCP Extensions: OAuth claims,
     // SEP-2575 `_meta` (clientInfo, clientCapabilities, etc.). Empty ext is
     // skipped to avoid pointless allocation.
+    #[allow(unused_mut)]
     let mut ext = crate::router::Extensions::new();
     #[cfg(feature = "oauth")]
     if let Some(claims) = http_extensions.get::<crate::oauth::token::TokenClaims>() {

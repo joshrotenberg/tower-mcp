@@ -214,6 +214,11 @@ name = "server_discover"
 path = "../../examples/server_discover.rs"
 required-features = ["http", "stateless"]
 
+[[example]]
+name = "stateless_http_client"
+path = "../../examples/stateless_http_client.rs"
+required-features = ["http", "stateless"]
+
 # --- Sampling and bidirectional ---
 [[example]]
 name = "sampling_server"
