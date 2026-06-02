@@ -50,6 +50,135 @@ jobs:
         if: failure()
         run: cat /tmp/conformance-server.log
 
+  stateless-conformance:
+    name: Stateless 2026-07-28 Conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build conformance server (with stateless feature)
+        run: cargo build --manifest-path examples/conformance-server/Cargo.toml
+
+      - name: Start server
+        run: |
+          cargo run --manifest-path examples/conformance-server/Cargo.toml \
+            > /tmp/conformance-server-stateless.log 2>&1 &
+          echo $! > /tmp/conformance-server-stateless.pid
+
+      - name: Wait for server
+        run: |
+          for i in $(seq 1 30); do
+            if nc -z 127.0.0.1 3001 2>/dev/null; then
+              echo "Server is ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Server failed to start. Logs:"
+          cat /tmp/conformance-server-stateless.log
+          exit 1
+
+      - name: Check server/discover (SEP-2575, #865)
+        run: |
+          response=$(curl -s -X POST http://127.0.0.1:3001/mcp \
+            -H "Content-Type: application/json" \
+            -H "MCP-Protocol-Version: 2026-07-28" \
+            -H "Mcp-Method: server/discover" \
+            -d '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{}}')
+          echo "server/discover response: $response"
+          # DiscoverResult serializes as camelCase: supportedVersions, serverInfo, capabilities
+          echo "$response" | grep -q '"supportedVersions"' || { echo "FAIL: supportedVersions missing"; exit 1; }
+          echo "$response" | grep -q '"serverInfo"' || { echo "FAIL: serverInfo missing"; exit 1; }
+          echo "$response" | grep -q '"capabilities"' || { echo "FAIL: capabilities missing"; exit 1; }
+          echo "PASS: server/discover returned well-formed DiscoverResult"
+
+      - name: Check stateless tools/call without _meta (#862)
+        run: |
+          response=$(curl -s -X POST http://127.0.0.1:3001/mcp \
+            -H "Content-Type: application/json" \
+            -H "MCP-Protocol-Version: 2026-07-28" \
+            -H "Mcp-Method: tools/call" \
+            -H "Mcp-Name: test_simple_text" \
+            -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"test_simple_text","arguments":{}}}')
+          echo "stateless tools/call response: $response"
+          echo "$response" | grep -q '"result"' || { echo "FAIL: no result field"; exit 1; }
+          echo "PASS: stateless tools/call succeeded"
+
+      - name: Check test_per_request_meta with _meta block (#870)
+        run: |
+          response=$(curl -s -X POST http://127.0.0.1:3001/mcp \
+            -H "Content-Type: application/json" \
+            -H "MCP-Protocol-Version: 2026-07-28" \
+            -H "Mcp-Method: tools/call" \
+            -H "Mcp-Name: test_per_request_meta" \
+            -d '{
+              "jsonrpc":"2.0","id":3,"method":"tools/call",
+              "params":{
+                "_meta":{
+                  "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                  "io.modelcontextprotocol/clientInfo":{"name":"test-client","version":"1.0"},
+                  "io.modelcontextprotocol/clientCapabilities":{}
+                },
+                "name":"test_per_request_meta",
+                "arguments":{}
+              }
+            }')
+          echo "per_request_meta response: $response"
+          echo "$response" | grep -q '2026-07-28' || { echo "FAIL: protocol_version not reflected"; exit 1; }
+          echo "$response" | grep -q 'test-client' || { echo "FAIL: client_name not reflected"; exit 1; }
+          echo "PASS: per-request _meta threaded to handler"
+
+      - name: Check test_per_request_meta without _meta returns no meta (#870)
+        run: |
+          response=$(curl -s -X POST http://127.0.0.1:3001/mcp \
+            -H "Content-Type: application/json" \
+            -H "MCP-Protocol-Version: 2026-07-28" \
+            -H "Mcp-Method: tools/call" \
+            -H "Mcp-Name: test_per_request_meta" \
+            -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"test_per_request_meta","arguments":{}}}')
+          echo "no-meta response: $response"
+          echo "$response" | grep -q '"no meta"' || { echo "FAIL: expected 'no meta' text"; exit 1; }
+          echo "PASS: absent _meta returns 'no meta'"
+
+      - name: Check messages/listen opens SSE stream with 2026-07-28 (#868)
+        run: |
+          # Capture just the headers + first bytes; the SSE stream stays open.
+          content_type=$(curl -s -o /dev/null -w "%{content_type}" \
+            --max-time 3 \
+            -X POST http://127.0.0.1:3001/mcp \
+            -H "Content-Type: application/json" \
+            -H "MCP-Protocol-Version: 2026-07-28" \
+            -H "Mcp-Method: messages/listen" \
+            -d '{"jsonrpc":"2.0","id":5,"method":"messages/listen","params":{}}' || true)
+          echo "messages/listen Content-Type: $content_type"
+          echo "$content_type" | grep -q "text/event-stream" || { echo "FAIL: expected text/event-stream"; exit 1; }
+          echo "PASS: messages/listen returns SSE stream for 2026-07-28"
+
+      - name: Check messages/listen returns JSON-RPC error without 2026-07-28 (#868)
+        run: |
+          # Without MCP-Protocol-Version: 2026-07-28, messages/listen must NOT
+          # return an SSE stream. A request with no session ID returns a JSON-RPC
+          # error (SessionRequired, -32006). We assert there is an "error" field and
+          # no "text/event-stream" content -- confirming the endpoint is gated.
+          content_type=$(curl -s -o /tmp/messages-listen-legacy.json \
+            -w "%{content_type}" \
+            --max-time 3 \
+            -X POST http://127.0.0.1:3001/mcp \
+            -H "Content-Type: application/json" \
+            -d '{"jsonrpc":"2.0","id":6,"method":"messages/listen","params":{}}' || true)
+          response=$(cat /tmp/messages-listen-legacy.json)
+          echo "Legacy messages/listen Content-Type: $content_type"
+          echo "Legacy messages/listen body: $response"
+          echo "$content_type" | grep -vq "text/event-stream" || { echo "FAIL: must not return SSE stream without 2026-07-28"; exit 1; }
+          echo "$response" | grep -q '"error"' || { echo "FAIL: expected a JSON-RPC error field"; exit 1; }
+          echo "PASS: messages/listen returns JSON-RPC error without 2026-07-28 version"
+
+      - name: Show server logs on failure
+        if: failure()
+        run: cat /tmp/conformance-server-stateless.log
+
   client-conformance:
     name: Client Conformance Suite
     runs-on: ubuntu-latest

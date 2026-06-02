@@ -57,6 +57,7 @@ pub fn build_tools() -> Vec<Tool> {
         build_elicitation(),
         build_elicitation_sep1034_defaults(),
         build_elicitation_sep1330_enums(),
+        build_per_request_meta(),
     ]
 }
 
@@ -290,9 +291,41 @@ fn build_elicitation_sep1034_defaults() -> Tool {
         .build()
 }
 
+fn build_per_request_meta() -> Tool {
+    ToolBuilder::new("test_per_request_meta")
+        .description(
+            "Reflects per-request _meta from the request context. \
+             Returns protocol_version and client_info.name when a 2026-07-28 \
+             _meta block is present, or \"no meta\" when absent. \
+             Exercises SEP-2575 per-request metadata threading (#870).",
+        )
+        .extractor_handler((), |ctx: Context, RawArgs(_args): RawArgs| async move {
+            match ctx.per_request_meta() {
+                Some(meta) => {
+                    let version = meta
+                        .protocol_version
+                        .as_deref()
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let client_name = meta
+                        .client_info
+                        .as_ref()
+                        .map(|i| i.name.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    Ok(CallToolResult::text(format!(
+                        "protocol_version={version} client_name={client_name}"
+                    )))
+                }
+                None => Ok(CallToolResult::text("no meta")),
+            }
+        })
+        .build()
+}
+
 fn build_elicitation_sep1330_enums() -> Tool {
     ToolBuilder::new("test_elicitation_sep1330_enums")
-        .description("Requests elicitation with enum schemas")
+        .description("Requests elicitation with enum schemas -- all 5 SEP-1330 variants")
         .extractor_handler((), |ctx: Context, RawArgs(_args): RawArgs| async move {
             if !ctx.can_elicit() {
                 return Ok(CallToolResult::error("Elicitation not available"));
