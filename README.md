@@ -88,7 +88,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tower-mcp = "0.9"
+tower-mcp = "0.11"
 ```
 
 ### Feature Flags
@@ -114,7 +114,7 @@ Example with features:
 
 ```toml
 [dependencies]
-tower-mcp = { version = "0.9", features = ["full"] }
+tower-mcp = { version = "0.11", features = ["full"] }
 ```
 
 ### Types Only
@@ -126,7 +126,7 @@ any context where you want to serialize/deserialize MCP messages without a runti
 
 ```toml
 [dependencies]
-tower-mcp-types = "0.9"
+tower-mcp-types = "0.11"
 ```
 
 `tower-mcp-types` provides all types from `tower_mcp::protocol` and `tower_mcp::error`
