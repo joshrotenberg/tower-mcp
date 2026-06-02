@@ -2,7 +2,7 @@
 //!
 //! Demonstrates using McpClient to connect to an MCP server and interact with it.
 //!
-//! This example spawns the stdio_server example as a subprocess and:
+//! This example spawns the getting_started example as a subprocess and:
 //! 1. Initializes the connection
 //! 2. Lists available tools
 //! 3. Calls each tool with sample inputs
@@ -21,10 +21,10 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .with_env_filter("tower_mcp=info,client_cli=debug")
         .init();
 
-    // Get server command from args, or default to our stdio_server example
+    // Get server command from args, or default to our getting_started example
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (cmd, cmd_args): (&str, Vec<&str>) = if args.is_empty() {
-        ("cargo", vec!["run", "--example", "stdio_server"])
+        ("cargo", vec!["run", "--example", "getting_started"])
     } else {
         (
             args[0].as_str(),

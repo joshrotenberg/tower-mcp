@@ -8,7 +8,7 @@
 //! - Health checks (ping all backends)
 //!
 //! This example spawns two backend servers as subprocesses:
-//! - `basic` server (provides echo and add tools)
+//! - `getting_started` server (provides echo and add tools)
 //! - `sampling_server` (provides summarize, confirm_delete, slow_task tools)
 //!
 //! Run with: cargo run --example proxy --features proxy
@@ -34,7 +34,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
 
     // Spawn backend servers as subprocesses
     let basic_transport =
-        StdioClientTransport::spawn("cargo", &["run", "--example", "basic"]).await?;
+        StdioClientTransport::spawn("cargo", &["run", "--example", "getting_started"]).await?;
     let sampling_transport =
         StdioClientTransport::spawn("cargo", &["run", "--example", "sampling_server"]).await?;
 
