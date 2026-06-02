@@ -209,6 +209,11 @@ name = "http_sse_client"
 path = "../../examples/http_sse_client.rs"
 required-features = ["http"]
 
+[[example]]
+name = "server_discover"
+path = "../../examples/server_discover.rs"
+required-features = ["http", "stateless"]
+
 # --- Sampling and bidirectional ---
 [[example]]
 name = "sampling_server"
