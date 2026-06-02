@@ -3,7 +3,8 @@ use tower_mcp::protocol::{
     Content, CreateMessageParams, LogLevel, LoggingMessageParams, ResourceContent, SamplingMessage,
 };
 use tower_mcp::{
-    CallToolResult, ElicitFormParams, ElicitFormSchema, ElicitMode, Tool, ToolBuilder,
+    CallToolResult, ElicitFormParams, ElicitFormSchema, ElicitMode, TaskSupportMode, Tool,
+    ToolBuilder,
     extract::{Context, RawArgs},
 };
 
@@ -58,6 +59,8 @@ pub fn build_tools() -> Vec<Tool> {
         build_elicitation_sep1034_defaults(),
         build_elicitation_sep1330_enums(),
         build_per_request_meta(),
+        // SEP-2663: task-capable tool so the server advertises the tasks extension
+        build_create_task(),
     ]
 }
 
@@ -404,6 +407,26 @@ fn build_elicitation_sep1330_enums() -> Tool {
                 ))),
                 Err(e) => Ok(CallToolResult::error(format!("Elicitation failed: {}", e))),
             }
+        })
+        .build()
+}
+
+/// SEP-2663: A tool that opts in to async task support.
+///
+/// Registering at least one tool with `TaskSupportMode::Optional` (or `Required`)
+/// causes the router to advertise `io.modelcontextprotocol/tasks` in the server's
+/// `capabilities.extensions`, giving the conformance client a way to verify the
+/// tasks extension advertisement end-to-end.
+fn build_create_task() -> Tool {
+    ToolBuilder::new("test_create_task")
+        .description(
+            "A tool that supports async task execution (SEP-2663 tasks extension). \
+             Its presence in the tool list causes the server to advertise \
+             io.modelcontextprotocol/tasks in capabilities.extensions.",
+        )
+        .task_support(TaskSupportMode::Optional)
+        .extractor_handler((), |RawArgs(_args): RawArgs| async move {
+            Ok(CallToolResult::text("task support available"))
         })
         .build()
 }

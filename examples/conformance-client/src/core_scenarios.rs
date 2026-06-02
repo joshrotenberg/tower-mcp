@@ -107,6 +107,95 @@ pub async fn elicitation_defaults(server_url: &str) -> Result<()> {
     Ok(())
 }
 
+/// `ttl-list` -- Connect and verify tools/list returns a ttlMs hint.
+///
+/// Asserts that the server includes `ttlMs: 60000` in the `tools/list`
+/// response, exercising the SEP-2549 list TTL field end-to-end.
+pub async fn ttl_list(server_url: &str) -> Result<()> {
+    let transport = HttpClientTransport::new(server_url);
+    let client = McpClient::builder()
+        .connect(transport, handlers::BasicHandler)
+        .await?;
+
+    client.initialize("conformance-client", "0.1.0").await?;
+    let tools = client.list_tools().await?;
+
+    anyhow::ensure!(
+        tools.ttl_ms == Some(60_000),
+        "expected ttlMs=60000 in tools/list response, got {:?}",
+        tools.ttl_ms
+    );
+    tracing::info!("tools/list ttlMs verified: {:?}", tools.ttl_ms);
+
+    client.shutdown().await?;
+    Ok(())
+}
+
+/// `deprecated-capability` -- Connect and verify the logging capability carries
+/// SEP-2577 deprecation metadata in the initialize result.
+pub async fn deprecated_capability(server_url: &str) -> Result<()> {
+    let transport = HttpClientTransport::new(server_url);
+    let client = McpClient::builder()
+        .connect(transport, handlers::BasicHandler)
+        .await?;
+
+    let result = client.initialize("conformance-client", "0.1.0").await?;
+
+    let logging = result
+        .capabilities
+        .logging
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("server must advertise logging capability"))?;
+
+    let dep = logging
+        .deprecated
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("logging capability must carry deprecation info"))?;
+
+    anyhow::ensure!(
+        dep.since.as_deref() == Some("2026-07-28"),
+        "expected since=2026-07-28, got {:?}",
+        dep.since
+    );
+    tracing::info!("logging.deprecated.since verified: {:?}", dep.since);
+
+    client.shutdown().await?;
+    Ok(())
+}
+
+/// `tasks-extension` -- Connect and verify the server advertises the
+/// `io.modelcontextprotocol/tasks` extension (SEP-2663).
+pub async fn tasks_extension(server_url: &str) -> Result<()> {
+    let transport = HttpClientTransport::new(server_url);
+    let client = McpClient::builder()
+        .connect(transport, handlers::BasicHandler)
+        .await?;
+
+    let result = client.initialize("conformance-client", "0.1.0").await?;
+
+    let extensions = result
+        .capabilities
+        .extensions
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("server must advertise extensions in capabilities"))?;
+
+    anyhow::ensure!(
+        extensions.contains_key(tower_mcp::protocol::TASKS_EXTENSION_ID),
+        "expected io.modelcontextprotocol/tasks in capabilities.extensions, got keys: {:?}",
+        extensions.keys().collect::<Vec<_>>()
+    );
+    tracing::info!("tasks extension advertised in capabilities.extensions");
+
+    // Also verify the task-capable tool is callable
+    let _ = client
+        .call_tool("test_create_task", serde_json::json!({}))
+        .await?;
+    tracing::info!("test_create_task tool called successfully");
+
+    client.shutdown().await?;
+    Ok(())
+}
+
 /// Generate dummy arguments from a tool's input schema.
 pub fn build_tool_arguments(schema: &serde_json::Value) -> serde_json::Value {
     let mut args = serde_json::Map::new();
