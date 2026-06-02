@@ -2,6 +2,39 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.0] - 2026-06-02
+
+### Bug Fixes
+
+- **jsonrpc:** Serialize null id on error responses per spec ([#803](https://github.com/joshrotenberg/tower-mcp/pull/803))
+- **types:** Emit null requestId on cancelled notification when unset ([#811](https://github.com/joshrotenberg/tower-mcp/pull/811))
+- **types:** Reconcile McpErrorCode against SEP-2575 canonical assignments ([#838](https://github.com/joshrotenberg/tower-mcp/pull/838))
+- **types:** Use InvalidParams (-32602) for resource-not-found per SEP-2164 ([#841](https://github.com/joshrotenberg/tower-mcp/pull/841))
+
+### Documentation
+
+- Position conformance numbers prominently per SEP-2484 ([#840](https://github.com/joshrotenberg/tower-mcp/pull/840))
+- **examples:** Add axum embedding guide example ([#842](https://github.com/joshrotenberg/tower-mcp/pull/842))
+- **tower-mcp-types:** Add crate-level doc, update description ([#823](https://github.com/joshrotenberg/tower-mcp/pull/823)) ([#851](https://github.com/joshrotenberg/tower-mcp/pull/851))
+- Update lib.rs and README for 2026-07-28 stateless protocol (#858, #871) ([#886](https://github.com/joshrotenberg/tower-mcp/pull/886))
+- Module-level docs for stateless transport, context, and types (#860, #864, #867, #874) ([#889](https://github.com/joshrotenberg/tower-mcp/pull/889))
+- Update README version strings to 0.11 ([#897](https://github.com/joshrotenberg/tower-mcp/pull/897))
+
+### Features
+
+- **types,router:** Wire server/discover RPC end-to-end per SEP-2575 ([#829](https://github.com/joshrotenberg/tower-mcp/pull/829))
+- **types:** TTL on list results (SEP-2549) + deprecation metadata (SEP-2577/2596) ([#826](https://github.com/joshrotenberg/tower-mcp/pull/826))
+- **http:** Return spec-shape UnsupportedProtocolVersion per SEP-2575 ([#839](https://github.com/joshrotenberg/tower-mcp/pull/839))
+- **tasks:** Repackage as io.modelcontextprotocol/tasks extension per SEP-2663 ([#846](https://github.com/joshrotenberg/tower-mcp/pull/846))
+- **http:** SEP-2243 HTTP standardization headers ([#845](https://github.com/joshrotenberg/tower-mcp/pull/845))
+- **http:** Add messages/listen SSE streaming endpoint (#814 chunk 4) ([#852](https://github.com/joshrotenberg/tower-mcp/pull/852))
+
+### Testing
+
+- **types:** Add wire-format assertion helpers for JSON-RPC ([#808](https://github.com/joshrotenberg/tower-mcp/pull/808))
+
+
+
 ## [0.10.1] - 2026-05-15
 
 ### Features
