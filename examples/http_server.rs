@@ -1,8 +1,19 @@
 //! HTTP server example for tower-mcp
 //!
+//! This transport supports two MCP protocol versions:
+//!
+//! - **2025-11-25** (session-based): clients initialize once, receive a
+//!   `MCP-Session-Id`, and attach it to subsequent requests. SSE notifications
+//!   are delivered on a per-session stream opened via a GET request.
+//! - **2026-07-28** (stateless): no `initialize` handshake and no
+//!   `MCP-Session-Id`. Every request carries `MCP-Protocol-Version: 2026-07-28`
+//!   and the SEP-2243 `Mcp-Method` header. Use `server/discover` for capability
+//!   discovery and `messages/listen` for server-push notifications.
+//!
 //! Run with: cargo run --example http_server --features http
 //!
-//! Test with curl:
+//! ## 2025-11-25 session-based flow
+//!
 //! ```bash
 //! # Initialize session (client sends protocolVersion)
 //! curl -X POST http://localhost:3000/ \
@@ -47,6 +58,64 @@
 //!   -H "Accept: text/event-stream" \
 //!   -H "MCP-Session-Id: <session-id>" \
 //!   -H "Last-Event-ID: 5"
+//! ```
+//!
+//! ## 2026-07-28 stateless flow
+//!
+//! The 2026-07-28 protocol removes the `initialize` handshake and `MCP-Session-Id`.
+//! Every request is self-contained: include `MCP-Protocol-Version: 2026-07-28`
+//! and the SEP-2243 `Mcp-Method` header (required in strict mode for this
+//! protocol version). No session ID is sent or returned by the server.
+//!
+//! ```bash
+//! # (Optional) Discover server capabilities -- replaces initialize
+//! curl -X POST http://localhost:3000/ \
+//!   -H "Content-Type: application/json" \
+//!   -H "Accept: application/json" \
+//!   -H "MCP-Protocol-Version: 2026-07-28" \
+//!   -H "Mcp-Method: server/discover" \
+//!   -d '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{}}'
+//!
+//! # Server responds with its capabilities (no session created):
+//! # {
+//! #   "jsonrpc": "2.0",
+//! #   "id": 1,
+//! #   "result": {
+//! #     "protocolVersion": "2026-07-28",
+//! #     "serverInfo": { "name": "http-example", "version": "1.0.0" },
+//! #     "capabilities": { "tools": {}, "resources": {}, "prompts": {} }
+//! #   }
+//! # }
+//!
+//! # List tools -- no MCP-Session-Id, just the protocol version header
+//! curl -X POST http://localhost:3000/ \
+//!   -H "Content-Type: application/json" \
+//!   -H "MCP-Protocol-Version: 2026-07-28" \
+//!   -H "Mcp-Method: tools/list" \
+//!   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+//!
+//! # Call a tool -- Mcp-Name is required when calling tools (SEP-2243)
+//! curl -X POST http://localhost:3000/ \
+//!   -H "Content-Type: application/json" \
+//!   -H "MCP-Protocol-Version: 2026-07-28" \
+//!   -H "Mcp-Method: tools/call" \
+//!   -H "Mcp-Name: add" \
+//!   -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"add","arguments":{"a":10,"b":32}}}'
+//!
+//! # Open a server-push notification stream -- replaces per-session SSE.
+//! # The server delivers notifications (progress, logs, etc.) for requests
+//! # whose progressToken matches a subscription. Each SSE event carries an
+//! # ID for potential resumption (SEP-1699).
+//! #
+//! #   id: 0
+//! #   event: message
+//! #   data: {"jsonrpc":"2.0","method":"notifications/progress",...}
+//! curl -N -X POST http://localhost:3000/ \
+//!   -H "Content-Type: application/json" \
+//!   -H "Accept: text/event-stream" \
+//!   -H "MCP-Protocol-Version: 2026-07-28" \
+//!   -H "Mcp-Method: messages/listen" \
+//!   -d '{"jsonrpc":"2.0","id":4,"method":"messages/listen","params":{}}'
 //! ```
 
 use std::time::Duration;

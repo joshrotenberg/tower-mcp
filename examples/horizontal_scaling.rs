@@ -1,5 +1,7 @@
 //! Horizontal scaling example: two HTTP transports, one shared store.
 //!
+//! ## 2025-11-25 session-based path
+//!
 //! Spawns two independent [`HttpTransport`] instances on different ports
 //! that share the same [`SessionStore`] and [`EventStore`]. A small
 //! in-process client:
@@ -9,10 +11,22 @@
 //! 2. Drops the connection and reconnects to instance B (port 3001) with
 //!    the same `mcp-session-id`. Instance B has never seen the session
 //!    locally, but finds it in the shared store and restores it
-//!    transparently. The follow-up `tools/list` call succeeds.
+//!    transparently. The follow-up `tools/call` succeeds.
 //!
 //! This simulates what happens behind a load balancer without session
-//! affinity, or after an instance restarts.
+//! affinity, or after an instance restarts. In production the shared
+//! stores would be backed by Redis or a similar external store so that
+//! session state survives instance restarts.
+//!
+//! ## 2026-07-28 stateless path
+//!
+//! Under the 2026-07-28 protocol, requests carry no `MCP-Session-Id` and
+//! the server creates no session state. Every request is self-contained --
+//! any instance can handle any request without consulting a shared store.
+//! Session affinity at the load balancer is not required, and no shared
+//! [`SessionStore`] or [`EventStore`] is needed. The demo below uses the
+//! session-based flow only; for the stateless flow see
+//! `examples/http_server.rs`.
 //!
 //! Run with: `cargo run --example horizontal_scaling --features http`
 
