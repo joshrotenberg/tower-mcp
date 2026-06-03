@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.12.0] - 2026-06-03
+
+### Features
+
+- **http:** Add opt-in SSE response wrapping for rmcp compatibility (closes #900) ([#902](https://github.com/joshrotenberg/tower-mcp/pull/902))
+- **http:** Enforce notifications/initialized before tool dispatch per MCP spec ([#901](https://github.com/joshrotenberg/tower-mcp/pull/901)) ([#903](https://github.com/joshrotenberg/tower-mcp/pull/903))
+
+
+
 ## [0.11.0] - 2026-06-02
 
 ### Bug Fixes
