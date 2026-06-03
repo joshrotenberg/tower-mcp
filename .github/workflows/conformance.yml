@@ -170,6 +170,14 @@ jobs:
             exit 1
           fi
 
+          # Step 1b: send notifications/initialized to complete the handshake.
+          # The server enforces this before accepting tool/resource requests.
+          curl -s -X POST http://127.0.0.1:3001/mcp \
+            -H "Content-Type: application/json" \
+            -H "mcp-session-id: $session_id" \
+            -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+            -o /dev/null
+
           # Step 2: open messages/listen SSE stream in the background, capture output.
           # Sending MCP-Protocol-Version: 2026-07-28 on the request overrides the
           # session's negotiated version and enables the SSE stream.
