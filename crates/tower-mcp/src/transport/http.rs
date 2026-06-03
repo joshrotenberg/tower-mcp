@@ -6219,6 +6219,23 @@ mod tests {
             .map(|s| s.to_string())
             .expect("missing session ID from initialize");
 
+        // Send notifications/initialized to complete the MCP handshake.
+        let notif_request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header(MCP_SESSION_ID_HEADER, &session_id)
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        app.clone().oneshot(notif_request).await.unwrap();
+
         // Now call tools/list
         let list_request = Request::builder()
             .method("POST")
