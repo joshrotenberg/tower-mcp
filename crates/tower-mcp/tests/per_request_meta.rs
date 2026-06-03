@@ -188,6 +188,23 @@ async fn session_path_stashes_per_request_meta() {
         .map(|s| s.to_string())
         .expect("initialize must return session id");
 
+    // Send notifications/initialized before any other requests (spec requirement).
+    let notif_req = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("Mcp-Session-Id", &session_id)
+        .body(Body::from(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    app.clone().oneshot(notif_req).await.unwrap();
+
     // tools/call with session header AND _meta in the body.
     let tool_req = Request::builder()
         .method("POST")

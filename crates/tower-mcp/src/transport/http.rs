@@ -374,6 +374,14 @@ struct Session {
     event_counter: AtomicU64,
     /// Pluggable store for SSE events (enables cross-instance replay)
     event_store: Arc<dyn crate::event_store::EventStore>,
+    /// Whether `notifications/initialized` has been received from the client.
+    ///
+    /// Per the MCP 2025-11-25 spec, clients MUST send this notification after
+    /// receiving the `initialize` response and before sending any other requests.
+    /// Checked by `handle_post` when `strict_initialization` is enabled on
+    /// [`SessionConfig`]. Pre-initialized sessions (optional_sessions path) and
+    /// restored sessions start with this set to `true`.
+    initialized_notification_received: std::sync::atomic::AtomicBool,
 }
 
 impl Session {
@@ -430,6 +438,7 @@ impl Session {
             client_capabilities: RwLock::new(None),
             event_counter: AtomicU64::new(0),
             event_store,
+            initialized_notification_received: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -458,6 +467,7 @@ impl Session {
             client_capabilities: RwLock::new(None),
             event_counter: AtomicU64::new(0),
             event_store,
+            initialized_notification_received: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -521,6 +531,9 @@ impl Session {
             client_capabilities: RwLock::new(record.client_capabilities.clone()),
             event_counter: AtomicU64::new(0),
             event_store,
+            // Restored sessions already completed the handshake on a previous
+            // instance; treat `notifications/initialized` as already received.
+            initialized_notification_received: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -548,6 +561,9 @@ impl Session {
             client_capabilities: RwLock::new(record.client_capabilities.clone()),
             event_counter: AtomicU64::new(0),
             event_store,
+            // Restored sessions already completed the handshake on a previous
+            // instance; treat `notifications/initialized` as already received.
+            initialized_notification_received: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -671,6 +687,16 @@ pub struct SessionConfig {
     pub max_sessions: Option<usize>,
     /// How often to run the cleanup task
     pub cleanup_interval: Duration,
+    /// Whether to enforce that clients send `notifications/initialized` before
+    /// making any non-initialize requests, per the MCP 2025-11-25 spec.
+    ///
+    /// When `true` (the default), the transport returns a JSON-RPC
+    /// `InvalidRequest` error (-32600) to any request received before
+    /// `notifications/initialized` on a 2025-11-25 session-based connection.
+    ///
+    /// Set to `false` to restore the previous lenient behavior, e.g. in
+    /// dev/test scenarios where the full MCP handshake is inconvenient.
+    pub strict_initialization: bool,
 }
 
 impl Default for SessionConfig {
@@ -679,6 +705,7 @@ impl Default for SessionConfig {
             ttl: DEFAULT_SESSION_TTL,
             max_sessions: None,
             cleanup_interval: DEFAULT_CLEANUP_INTERVAL,
+            strict_initialization: true,
         }
     }
 }
@@ -701,6 +728,21 @@ impl SessionConfig {
     /// Set the cleanup interval
     pub fn cleanup_interval(mut self, interval: Duration) -> Self {
         self.cleanup_interval = interval;
+        self
+    }
+
+    /// Enable or disable strict initialization enforcement.
+    ///
+    /// When enabled (default), the transport enforces that clients send
+    /// `notifications/initialized` before any other requests on a
+    /// 2025-11-25 session-based connection, per the MCP spec. Requests
+    /// that arrive before this notification receive a JSON-RPC
+    /// `InvalidRequest` error (-32600).
+    ///
+    /// Disable this for dev/test scenarios where the full MCP handshake
+    /// is inconvenient.
+    pub fn strict_initialization(mut self, enabled: bool) -> Self {
+        self.strict_initialization = enabled;
         self
     }
 }
@@ -884,6 +926,13 @@ impl SessionRegistry {
                 service_factory,
                 self.events.clone(),
             ));
+            // Pre-initialized sessions bypass the full MCP handshake (they
+            // exist for clients that don't track session IDs). Mark the
+            // notification as already received so strict_initialization checks
+            // don't reject their requests.
+            session
+                .initialized_notification_received
+                .store(true, Ordering::Release);
             sessions.insert(session.id.clone(), session.clone());
             tracing::debug!(session_id = %session.id, "Created pre-initialized session (optional_sessions)");
             session
@@ -907,6 +956,11 @@ impl SessionRegistry {
             }
 
             let session = Arc::new(Session::from_service(service, self.events.clone()));
+            // Pre-initialized sessions bypass the full MCP handshake; mark the
+            // notification as already received.
+            session
+                .initialized_notification_received
+                .store(true, Ordering::Release);
             sessions.insert(session.id.clone(), session.clone());
             tracing::debug!(session_id = %session.id, "Created pre-initialized session from service (optional_sessions)");
             session
@@ -1226,6 +1280,9 @@ struct AppState {
     sampling_enabled: bool,
     /// Whether sessions are optional (for clients that don't track session IDs)
     optional_sessions: bool,
+    /// Whether to enforce `notifications/initialized` before tool dispatch
+    /// (see [`SessionConfig::strict_initialization`]).
+    strict_initialization: bool,
     /// SEP-1442 stateless mode configuration
     #[cfg(feature = "stateless")]
     stateless_config: Option<crate::stateless::StatelessConfig>,
@@ -1825,6 +1882,7 @@ impl HttpTransport {
             allowed_hosts: self.allowed_hosts.clone(),
             sampling_enabled: self.sampling_enabled,
             optional_sessions: self.optional_sessions,
+            strict_initialization: self.session_config.strict_initialization,
             #[cfg(feature = "stateless")]
             stateless_config: self.stateless_config.clone(),
             sse_responses: self.sse_responses,
@@ -2600,9 +2658,42 @@ async fn handle_post(
         if let Ok(notification) = serde_json::from_value::<JsonRpcNotification>(parsed)
             && let Ok(mcp_notification) = McpNotification::from_jsonrpc(&notification)
         {
+            // Per the MCP 2025-11-25 spec, clients MUST send
+            // `notifications/initialized` after receiving the `initialize`
+            // response and before sending any other requests. Record the
+            // receipt so the strict_initialization check below can allow
+            // subsequent tool/resource/prompt requests.
+            if matches!(&mcp_notification, McpNotification::Initialized) {
+                session
+                    .initialized_notification_received
+                    .store(true, Ordering::Release);
+                tracing::debug!(session_id = %session.id, "Received notifications/initialized");
+            }
             session.handle_notification(mcp_notification);
         }
         return StatusCode::ACCEPTED.into_response();
+    }
+
+    // Enforce `notifications/initialized` before any non-initialize request
+    // (MCP 2025-11-25 spec requirement). This only applies to the session-based
+    // path; stateless requests (2026-07-28) are handled above and never reach here.
+    if !is_init
+        && state.strict_initialization
+        && !session
+            .initialized_notification_received
+            .load(Ordering::Acquire)
+    {
+        let id = extract_request_id(&parsed);
+        tracing::warn!(
+            session_id = %session.id,
+            "Rejecting request: notifications/initialized not yet received"
+        );
+        return json_rpc_error_response(
+            id,
+            JsonRpcError::invalid_request(
+                "Client must send notifications/initialized before making requests",
+            ),
+        );
     }
 
     // For initialize requests, capture the advertised client info /
@@ -6177,6 +6268,222 @@ mod tests {
         assert!(
             val["result"]["tools"].is_array(),
             "tools/list result.tools should be an array: {val}"
+        );
+    }
+
+    // =========================================================================
+    // notifications/initialized enforcement (#901)
+    // =========================================================================
+
+    /// Helper: do the `initialize` handshake and return the session ID.
+    async fn do_initialize(app: &axum::Router) -> String {
+        let init_request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": { "name": "test-client", "version": "1.0.0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.clone().oneshot(init_request).await.unwrap();
+        response
+            .headers()
+            .get(MCP_SESSION_ID_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn tools_list_before_initialized_notification_returns_error() {
+        // Spec: clients MUST send notifications/initialized before any other
+        // request. Skipping it should yield -32600 InvalidRequest.
+        let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
+        let app = transport.into_router();
+
+        let session_id = do_initialize(&app).await;
+
+        // Send tools/list WITHOUT sending notifications/initialized first.
+        let list_request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header(MCP_SESSION_ID_HEADER, &session_id)
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/list"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(list_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json.get("error").is_some(),
+            "expected error when notifications/initialized not sent, got: {json}"
+        );
+        assert_eq!(
+            json["error"]["code"].as_i64().unwrap(),
+            -32600,
+            "expected InvalidRequest (-32600), got: {json}"
+        );
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("notifications/initialized"),
+            "error message should mention notifications/initialized, got: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tools_list_after_initialized_notification_succeeds() {
+        // After sending notifications/initialized, tool requests should succeed.
+        let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
+        let app = transport.into_router();
+
+        let session_id = do_initialize(&app).await;
+
+        // Send notifications/initialized.
+        let notif_request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header(MCP_SESSION_ID_HEADER, &session_id)
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        app.clone().oneshot(notif_request).await.unwrap();
+
+        // Now tools/list should succeed.
+        let list_request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header(MCP_SESSION_ID_HEADER, &session_id)
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/list"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(list_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json.get("result").is_some(),
+            "expected success after notifications/initialized, got: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn notifications_initialized_itself_always_accepted() {
+        // The notifications/initialized notification itself must always be
+        // accepted (202 ACCEPTED) regardless of the initialization flag.
+        let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
+        let app = transport.into_router();
+
+        let session_id = do_initialize(&app).await;
+
+        let notif_request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header(MCP_SESSION_ID_HEADER, &session_id)
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(notif_request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::ACCEPTED,
+            "notifications/initialized must return 202 ACCEPTED"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_initialization_false_allows_tools_list_without_notification() {
+        // When strict_initialization is disabled, tool requests must succeed
+        // even if the client skips notifications/initialized.
+        let config = SessionConfig {
+            strict_initialization: false,
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .session_config(config);
+        let app = transport.into_router();
+
+        let session_id = do_initialize(&app).await;
+
+        // No notifications/initialized -- should still succeed.
+        let list_request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header(MCP_SESSION_ID_HEADER, &session_id)
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/list"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(list_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json.get("result").is_some(),
+            "expected success with strict_initialization=false, got: {json}"
         );
     }
 }

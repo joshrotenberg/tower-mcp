@@ -1612,6 +1612,23 @@ async fn test_http_client_sse_event_replay_on_reconnect() {
         .unwrap()
         .to_string();
 
+    // 1b. Send notifications/initialized before any other requests (spec requirement)
+    client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("mcp-session-id", &session_id)
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+
     // 2. Open SSE stream and start consuming in a background task.
     //    This ensures the server's broadcast subscriber is active before we
     //    trigger notifications.
@@ -1798,6 +1815,23 @@ async fn test_http_client_session_expiry_error() {
         .unwrap()
         .to_string();
 
+    // Send notifications/initialized before any other requests (spec requirement)
+    client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("mcp-session-id", &session_id)
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+
     // Verify the session works before expiry
     let resp = client
         .post(&url)
@@ -1936,6 +1970,23 @@ async fn test_optional_sessions_codex_pattern() {
         .to_str()
         .unwrap()
         .to_string();
+
+    // Send notifications/initialized before any other requests (spec requirement)
+    client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("mcp-session-id", &session_id)
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
 
     // tools/list with session ID (setup phase)
     let resp = client
