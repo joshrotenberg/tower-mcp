@@ -1229,6 +1229,8 @@ struct AppState {
     /// SEP-1442 stateless mode configuration
     #[cfg(feature = "stateless")]
     stateless_config: Option<crate::stateless::StatelessConfig>,
+    /// Whether to wrap synchronous responses in SSE format (rmcp compat)
+    sse_responses: bool,
 }
 
 /// Configuration for OAuth 2.1 Protected Resource Metadata.
@@ -1279,6 +1281,10 @@ pub struct HttpTransport {
     stateless_config: Option<crate::stateless::StatelessConfig>,
     #[cfg(feature = "oauth")]
     oauth_config: Option<OAuthConfig>,
+    /// When true, synchronous JSON-RPC responses are wrapped in SSE format.
+    ///
+    /// See [`HttpTransport::sse_responses()`] for details.
+    sse_responses: bool,
 }
 
 impl HttpTransport {
@@ -1306,6 +1312,7 @@ impl HttpTransport {
             stateless_config: None,
             #[cfg(feature = "oauth")]
             oauth_config: None,
+            sse_responses: false,
         }
     }
 
@@ -1361,6 +1368,7 @@ impl HttpTransport {
             stateless_config: None,
             #[cfg(feature = "oauth")]
             oauth_config: None,
+            sse_responses: false,
         }
     }
 
@@ -1491,6 +1499,44 @@ impl HttpTransport {
     /// ```
     pub fn require_sessions(mut self) -> Self {
         self.optional_sessions = false;
+        self
+    }
+
+    /// Enable SSE-wrapping for synchronous JSON-RPC responses.
+    ///
+    /// When enabled, synchronous responses (initialize, tools/list, tools/call, etc.)
+    /// are returned with `Content-Type: text/event-stream` and formatted as an SSE
+    /// message event:
+    ///
+    /// ```text
+    /// event: message
+    /// data: {"jsonrpc":"2.0","id":1,"result":{...}}
+    ///
+    /// ```
+    ///
+    /// This matches the behavior of rmcp's `StreamableHttpService`, which always uses
+    /// SSE format for all responses. The MCP Streamable HTTP spec allows both bare
+    /// JSON and SSE for synchronous responses; this option is provided for
+    /// compatibility with clients that expect rmcp's SSE-always behavior.
+    ///
+    /// **Known divergence from rmcp:** rmcp's `StreamableHttpService` always uses SSE
+    /// for synchronous responses by default. tower-mcp defaults to bare JSON (the
+    /// spec-correct choice, matching the SHOULD in the 2025-11-25 spec). Use
+    /// `.sse_responses(true)` to match rmcp's behavior when targeting clients
+    /// written against rmcp.
+    ///
+    /// The existing SSE notification stream (GET `/`) and `messages/listen` stream
+    /// (2026-07-28+) are unaffected by this flag.
+    ///
+    /// Default: `false` (bare JSON, `Content-Type: application/json`).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let transport = HttpTransport::new(router).sse_responses(true);
+    /// ```
+    pub fn sse_responses(mut self, enabled: bool) -> Self {
+        self.sse_responses = enabled;
         self
     }
 
@@ -1781,6 +1827,7 @@ impl HttpTransport {
             optional_sessions: self.optional_sessions,
             #[cfg(feature = "stateless")]
             stateless_config: self.stateless_config.clone(),
+            sse_responses: self.sse_responses,
         })
     }
 
@@ -2268,7 +2315,11 @@ async fn handle_post(
                 *pv = serde_json::Value::String(version.clone());
             }
 
-            let mut resp = axum::Json(response).into_response();
+            let mut resp = if state.sse_responses {
+                sse_json_response(&response)
+            } else {
+                axum::Json(response).into_response()
+            };
             resp.headers_mut().insert(
                 MCP_PROTOCOL_VERSION_HEADER,
                 HeaderValue::from_str(version).unwrap(),
@@ -2340,7 +2391,11 @@ async fn handle_post(
                 }
             };
 
-            let mut resp = axum::Json(response).into_response();
+            let mut resp = if state.sse_responses {
+                sse_json_response(&response)
+            } else {
+                axum::Json(response).into_response()
+            };
             resp.headers_mut().insert(
                 MCP_PROTOCOL_VERSION_HEADER,
                 HeaderValue::from_str(&version).unwrap(),
@@ -2626,7 +2681,11 @@ async fn handle_post(
     }
 
     // Build response with headers
-    let mut resp = axum::Json(response).into_response();
+    let mut resp = if state.sse_responses {
+        sse_json_response(&response)
+    } else {
+        axum::Json(response).into_response()
+    };
 
     if is_init {
         resp.headers_mut().insert(
@@ -3020,6 +3079,36 @@ async fn handle_delete(
 /// Does not require authentication or session state.
 async fn handle_health() -> Response {
     StatusCode::OK.into_response()
+}
+
+/// Build a synchronous JSON-RPC response wrapped in SSE format.
+///
+/// Used when [`AppState::sse_responses`] is `true`. The body is a single SSE
+/// event followed by the required blank line:
+///
+/// ```text
+/// event: message
+/// data: <json>
+///
+/// ```
+fn sse_json_response(response: impl serde::Serialize) -> Response {
+    let json = match serde_json::to_string(&response) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to serialize response for SSE wrapping");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let sse_body = format!("event: message\ndata: {json}\n\n");
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        sse_body,
+    )
+        .into_response()
 }
 
 /// Create a JSON-RPC error response
@@ -5877,6 +5966,217 @@ mod tests {
                 .unwrap_or("")
                 .contains("Mcp-Method"),
             "error message must mention Mcp-Method, got: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_responses_false_returns_application_json() {
+        // Default behavior: synchronous responses use Content-Type: application/json
+        let transport = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .sse_responses(false);
+        let app = transport.into_router();
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": {"name": "test", "version": "0.1"}
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let ct = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.contains("application/json"),
+            "sse_responses(false) should return application/json, got: {ct}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_responses_true_returns_text_event_stream_with_valid_json() {
+        // When sse_responses is enabled, synchronous responses use SSE format
+        let transport = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .sse_responses(true);
+        let app = transport.into_router();
+
+        let init_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "0.1"}
+            }
+        })
+        .to_string();
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(init_body))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let ct = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.contains("text/event-stream"),
+            "sse_responses(true) should return text/event-stream, got: {ct}"
+        );
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_text = String::from_utf8_lossy(&bytes);
+
+        // SSE body must contain the event type line and data line
+        assert!(
+            body_text.contains("event: message"),
+            "SSE body missing 'event: message': {body_text}"
+        );
+        assert!(
+            body_text.contains("data: "),
+            "SSE body missing 'data: ' line: {body_text}"
+        );
+
+        // Extract and validate the JSON from the data: line
+        let data_line = body_text
+            .lines()
+            .find(|l| l.starts_with("data: "))
+            .expect("no data: line in SSE body");
+        let json_str = data_line.trim_start_matches("data: ");
+        let val: serde_json::Value =
+            serde_json::from_str(json_str).expect("data: line is not valid JSON");
+
+        // Verify it's a well-formed JSON-RPC response with the expected result
+        assert_eq!(val["jsonrpc"], "2.0", "jsonrpc version mismatch: {val}");
+        assert_eq!(val["id"], 1, "id mismatch: {val}");
+        assert!(
+            val["result"].is_object(),
+            "result should be an object: {val}"
+        );
+        // The initialize result must contain protocolVersion
+        assert_eq!(
+            val["result"]["protocolVersion"].as_str(),
+            Some("2025-11-25"),
+            "protocolVersion missing or wrong: {val}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_responses_true_tools_list_returns_valid_sse() {
+        // Verify tools/list (non-init request) also returns SSE when enabled
+        let transport = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .sse_responses(true);
+        let app = transport.into_router();
+
+        // Initialize first to get a session ID
+        let init_request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": {"name": "test", "version": "0.1"}
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let init_response = app.clone().oneshot(init_request).await.unwrap();
+        assert_eq!(init_response.status(), StatusCode::OK);
+        let session_id = init_response
+            .headers()
+            .get(MCP_SESSION_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .expect("missing session ID from initialize");
+
+        // Now call tools/list
+        let list_request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header(MCP_SESSION_ID_HEADER, &session_id)
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/list",
+                    "params": {}
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let list_response = app.oneshot(list_request).await.unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+
+        let ct = list_response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.contains("text/event-stream"),
+            "tools/list with sse_responses(true) should return text/event-stream, got: {ct}"
+        );
+
+        let bytes = axum::body::to_bytes(list_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_text = String::from_utf8_lossy(&bytes);
+        let data_line = body_text
+            .lines()
+            .find(|l| l.starts_with("data: "))
+            .expect("no data: line in SSE body for tools/list");
+        let json_str = data_line.trim_start_matches("data: ");
+        let val: serde_json::Value =
+            serde_json::from_str(json_str).expect("tools/list data: line is not valid JSON");
+
+        assert_eq!(val["jsonrpc"], "2.0");
+        assert_eq!(val["id"], 2);
+        // tools/list result has a "tools" array (may be empty for create_test_router())
+        assert!(
+            val["result"]["tools"].is_array(),
+            "tools/list result.tools should be an array: {val}"
         );
     }
 }
