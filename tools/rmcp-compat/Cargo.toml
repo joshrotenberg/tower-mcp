@@ -1,0 +1,28 @@
+[package]
+name = "rmcp-compat"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "rmcp wire-format compatibility harness for tower-mcp"
+
+[[bin]]
+name = "rmcp-compat"
+path = "src/main.rs"
+
+[dependencies]
+tower-mcp = { path = "../../crates/tower-mcp", features = ["http"] }
+rmcp = { version = "1.7.0", features = [
+    "server",
+    "macros",
+    "transport-streamable-http-server",
+    "transport-streamable-http-server-session",
+    "schemars",
+] }
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+schemars = "1.0"
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8" }
+tokio-util = "0.7"
+anyhow = "1"
