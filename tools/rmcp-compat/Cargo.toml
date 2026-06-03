@@ -3,7 +3,7 @@ name = "rmcp-compat"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "Spike: wire-format comparison between rmcp and tower-mcp HTTP servers"
+description = "rmcp wire-format compatibility harness for tower-mcp"
 
 [[bin]]
 name = "rmcp-compat"
