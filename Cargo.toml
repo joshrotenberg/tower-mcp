@@ -60,7 +60,7 @@ urlencoding = "2"
 # Tower ecosystem
 tower = { version = "0.5", features = ["util"] }
 tower-service = "0.3"
-tower-resilience = { version = "0.9.3", default-features = false, features = ["bulkhead", "ratelimiter", "coalesce", "circuitbreaker"] }
+tower-resilience = { version = "0.10.0", default-features = false, features = ["bulkhead", "ratelimiter", "coalesce", "circuitbreaker"] }
 
 # Async
 futures = "0.3"

@@ -76,7 +76,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -87,7 +87,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -701,7 +701,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -967,8 +967,6 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
- "allocator-api2",
- "equivalent",
  "foldhash 0.1.5",
 ]
 
@@ -988,6 +986,11 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "allocator-api2",
+ "equivalent",
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "heck"
@@ -1508,7 +1511,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2115,7 +2118,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2172,7 +2175,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2501,7 +2504,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2607,7 +2610,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2879,9 +2882,9 @@ dependencies = [
 
 [[package]]
 name = "tower-resilience"
-version = "0.9.3"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6d0d9b4835bc80b017391985f22e79a972482bb8c03f6dbecb695be58554eb1"
+checksum = "e66a165a0eb525c9c651c9ac614d3bb827183396a2e9ca7ae2ba4dba35dc3b96"
 dependencies = [
  "tower-resilience-bulkhead",
  "tower-resilience-circuitbreaker",
@@ -2892,9 +2895,9 @@ dependencies = [
 
 [[package]]
 name = "tower-resilience-bulkhead"
-version = "0.9.3"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9a593fc471fefa32e1bcc2adf280985241d92cdb2ac5ef83baf9733d9747b73"
+checksum = "321c1d703c62ee1545f5f304b592779948bebfe4c69ace74ae88b05c294f89d0"
 dependencies = [
  "futures",
  "thiserror",
@@ -2907,9 +2910,9 @@ dependencies = [
 
 [[package]]
 name = "tower-resilience-circuitbreaker"
-version = "0.9.3"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de17cd6e94d2f9d6c1c128cf218b211fd5637255dbdc9e5c9c343d85f1a89e20"
+checksum = "f1c89ebacecf47734e7a562f615997bd54e1867ca26fb596f309d63ca5f6f42a"
 dependencies = [
  "futures",
  "thiserror",
@@ -2920,11 +2923,11 @@ dependencies = [
 
 [[package]]
 name = "tower-resilience-coalesce"
-version = "0.9.3"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a0f64a2dadfe269457a8092044b3119e78137d7188e895b56691b835312ed46"
+checksum = "58b737e5c50f2934c407282db7c21b1e9ff93b47de002bed67fcf87c96315f47"
 dependencies = [
- "hashbrown 0.15.5",
+ "hashbrown 0.17.1",
  "parking_lot",
  "tokio",
  "tower",
@@ -2935,9 +2938,9 @@ dependencies = [
 
 [[package]]
 name = "tower-resilience-core"
-version = "0.9.3"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93d5dbead0dc80bac53e3cc245c3d85b3025ff677991c44da4e2d287ba01cab9"
+checksum = "13d51ef3353f58a987373162f9f68d6c9e555d1e09a215c224bf4e1f9e135138"
 dependencies = [
  "thiserror",
  "tokio",
@@ -2945,9 +2948,9 @@ dependencies = [
 
 [[package]]
 name = "tower-resilience-ratelimiter"
-version = "0.9.3"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "230aadac0fb91a238741a50342a82ca2d60294b2f2018b9767fc87d6776799cd"
+checksum = "dfdb9886c24218ef028174b88d30f87da404c75fd017789549f729736c44c1e4"
 dependencies = [
  "futures",
  "tokio",
@@ -3330,7 +3333,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
