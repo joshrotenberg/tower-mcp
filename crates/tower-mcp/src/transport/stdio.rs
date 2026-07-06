@@ -716,7 +716,9 @@ impl BidirectionalStdioTransport {
             Arc::new(ChannelClientRequester::new(request_tx));
 
         let (notif_tx, notification_rx) = notification_channel(256);
-        let router = router.with_notification_sender(notif_tx);
+        let router = router
+            .with_notification_sender(notif_tx)
+            .with_client_requester(client_requester.clone());
 
         let service = JsonRpcService::new(router.clone());
 
@@ -732,7 +734,10 @@ impl BidirectionalStdioTransport {
 
     /// Get the client requester handle
     ///
-    /// Use this to configure the router's request context to enable sampling.
+    /// The requester is already wired into the router's request context by
+    /// [`Self::new`], so handlers can elicit and sample without further setup.
+    /// This getter exposes the same handle for advanced callers that want to
+    /// issue server-to-client requests directly.
     pub fn client_requester(&self) -> ClientRequesterHandle {
         self.client_requester.clone()
     }
@@ -807,7 +812,7 @@ impl BidirectionalStdioTransport {
     /// Handle an incoming message from stdin
     async fn handle_incoming_message<W>(&mut self, line: &str, writer: Arc<Mutex<W>>) -> Result<()>
     where
-        W: tokio::io::AsyncWrite + Unpin + Send,
+        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         tracing::debug!(input = %line, "Received message");
 
@@ -846,22 +851,32 @@ impl BidirectionalStdioTransport {
                 return self.write_parse_error(&e.to_string(), writer).await;
             }
         };
-        match self.service.call_message(message).await {
-            Ok(response) => {
-                let response_json = serde_json::to_string(&response).map_err(|e| {
-                    Error::Transport(format!("Failed to serialize response: {}", e))
-                })?;
-                tracing::debug!(output = %response_json, "Sending response");
-                self.write_line(&response_json, writer).await?;
+        // Dispatch the request on a spawned task so the run loop stays free to
+        // service outgoing server-to-client requests (elicitation/create,
+        // sampling/createMessage) and the client's responses to them while the
+        // handler is in flight. Handling the request inline here would deadlock
+        // any handler that calls `ctx.elicit_form()` / `ctx.sample()`: the
+        // handler awaits the client's response, but that response can only be
+        // read by this same loop (#923).
+        let mut service = self.service.clone();
+        tokio::spawn(async move {
+            let response_json = match service.call_message(message).await {
+                Ok(response) => serde_json::to_string(&response),
+                Err(e) => {
+                    tracing::error!(error = %e, "Error processing message");
+                    serde_json::to_string(&parse_error_response(e.to_string()))
+                }
+            };
+            match response_json {
+                Ok(json) => {
+                    tracing::debug!(output = %json, "Sending response");
+                    if let Err(e) = write_line_locked(&writer, &json).await {
+                        tracing::error!(error = %e, "Failed to write response to stdout");
+                    }
+                }
+                Err(e) => tracing::error!(error = %e, "Failed to serialize response"),
             }
-            Err(e) => {
-                tracing::error!(error = %e, "Error processing message");
-                let error_response = parse_error_response(e.to_string());
-                let response_json = serde_json::to_string(&error_response)
-                    .map_err(|e| Error::Transport(format!("Failed to serialize error: {}", e)))?;
-                self.write_line(&response_json, writer).await?;
-            }
-        }
+        });
 
         Ok(())
     }
@@ -975,21 +990,33 @@ impl BidirectionalStdioTransport {
     where
         W: tokio::io::AsyncWrite + Unpin + Send,
     {
-        let mut writer = writer.lock().await;
-        writer
-            .write_all(line.as_bytes())
-            .await
-            .map_err(|e| Error::Transport(format!("Failed to write to stdout: {}", e)))?;
-        writer
-            .write_all(b"\n")
-            .await
-            .map_err(|e| Error::Transport(format!("Failed to write newline: {}", e)))?;
-        writer
-            .flush()
-            .await
-            .map_err(|e| Error::Transport(format!("Failed to flush stdout: {}", e)))?;
-        Ok(())
+        write_line_locked(&writer, line).await
     }
+}
+
+/// Write a single newline-terminated line to a shared writer and flush it.
+///
+/// Free-standing counterpart to [`BidirectionalStdioTransport::write_line`] so
+/// spawned request-dispatch tasks can write their responses without borrowing
+/// the transport.
+async fn write_line_locked<W>(writer: &Arc<Mutex<W>>, line: &str) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin + Send,
+{
+    let mut writer = writer.lock().await;
+    writer
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|e| Error::Transport(format!("Failed to write to stdout: {}", e)))?;
+    writer
+        .write_all(b"\n")
+        .await
+        .map_err(|e| Error::Transport(format!("Failed to write newline: {}", e)))?;
+    writer
+        .flush()
+        .await
+        .map_err(|e| Error::Transport(format!("Failed to flush stdout: {}", e)))?;
+    Ok(())
 }
 
 #[cfg(test)]
