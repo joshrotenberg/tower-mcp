@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.12.2] - 2026-07-06
+
+### Documentation
+
+- Bump README install version to 0.12 and redirect root CHANGELOG ([#930](https://github.com/joshrotenberg/tower-mcp/pull/930))
+
+
+
 ## [0.12.1] - 2026-06-12
 
 
