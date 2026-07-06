@@ -294,7 +294,7 @@
 //! avoids TCP overhead and removes the need to pick a port:
 //!
 //! ```rust,no_run
-//! # #[cfg(unix)]
+//! # #[cfg(all(unix, feature = "unix"))]
 //! # async fn run() -> Result<(), tower_mcp::BoxError> {
 //! # use tower_mcp::{McpRouter, UnixSocketTransport};
 //! let router = McpRouter::new().server_info("sidecar", "1.0.0");
