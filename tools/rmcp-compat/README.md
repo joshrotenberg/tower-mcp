@@ -24,7 +24,7 @@ It then runs a series of checks across all four operation groups:
 | `prompts/list` | `result.prompts` is array (may be empty) |
 | `resources/read` | Not-found URI returns an error; code is `-32602` per SEP-2164 |
 | `invalid-params` | Missing required tool argument returns error code `-32602` |
-| `initialized-enforcement` | Both reject requests before `notifications/initialized` with `-32600` |
+| `initialized-enforcement` | tower-mcp rejects requests before `notifications/initialized` with `-32600` (per #901); rmcp does not enforce this ordering, so the divergence is a KNOWN-DIFF |
 | `sse-response-mode` | With `.sse_responses(true)`, both return `text/event-stream` with valid JSON-RPC |
 
 ## How to run
@@ -61,7 +61,7 @@ Example output:
 [PASS] method-not-found: error.message is string on both
 [KNOWN-DIFF] method-not-found: error.message phrasing differs (both use -32601): ...
 
-Results: 18/20 checks passed (0 failed, 2 known-diffs, 0 errors)
+Results: 17/21 checks passed (0 failed, 4 known-diffs, 0 errors)
 ```
 
 ## Known diffs
@@ -69,12 +69,31 @@ Results: 18/20 checks passed (0 failed, 2 known-diffs, 0 errors)
 Known diffs are documented divergences that are intentional or explained. They
 appear as `[KNOWN-DIFF]` and do not cause a non-zero exit code.
 
-Current known diffs:
+Current known diffs (against rmcp 2.1.0):
 
 **`error.message` phrasing for method-not-found:**
 rmcp returns just the method name (e.g. `"nonexistent/method"`); tower-mcp
 returns `"Method not found: nonexistent/method"`. Both use error code `-32601`.
 This is an implementation detail, not a spec requirement.
+
+**`resources/read` not-found error code:**
+For a read of a non-existent resource URI, rmcp returns `-32601`
+(MethodNotFound, because it does not advertise the resources capability),
+while tower-mcp returns `-32602` (InvalidParams) per SEP-2164 (#841). Both
+return an error; the codes differ.
+
+**`invalid-params` reporting for a missing required argument:**
+Calling `echo` with no `message` argument is reported by both servers as a
+tool-level error (`result.isError == true`) rather than a JSON-RPC `-32602`
+error. Both agree on the shape.
+
+**`initialized-enforcement` ordering:**
+A `tools/list` sent before `notifications/initialized` is rejected by tower-mcp
+with `-32600` (InvalidRequest) per #901. rmcp does not enforce this ordering and
+returns the tools list. tower-mcp is the stricter, more spec-compliant side, so
+this is a documented divergence rather than a tower-mcp bug. (With rmcp 1.7.0
+this surfaced as a FAIL; rmcp 2.1.0 did not change the behavior, so it is now
+classified as a KNOWN-DIFF.)
 
 **SSE response wrapping (default mode):**
 rmcp always wraps synchronous JSON-RPC responses as SSE (`Content-Type:
@@ -106,7 +125,12 @@ validates that the opt-in SSE mode matches rmcp's behavior exactly.
 Change the version constraint in `tools/rmcp-compat/Cargo.toml`:
 
 ```toml
-rmcp = { version = "1.7.0", features = [...] }
+rmcp = { version = "2.1.0", features = [...] }
 ```
 
 Then run the harness and update any KNOWN-DIFF entries that have changed.
+
+Note the 1.x -> 2.x jump renamed `rmcp::model::Content` to
+`rmcp::model::ContentBlock` (constructed via `ContentBlock::text(...)`); the
+`StreamableHttpService`, `LocalSessionManager`, `ServerHandler`, and the
+`#[tool]`/`#[tool_router]`/`#[tool_handler]` macro surfaces were unchanged.

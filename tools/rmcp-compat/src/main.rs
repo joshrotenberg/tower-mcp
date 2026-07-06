@@ -104,7 +104,7 @@ mod rmcp_server {
             &self,
             Parameters(EchoParams { message }): Parameters<EchoParams>,
         ) -> Result<CallToolResult, ErrorData> {
-            Ok(CallToolResult::success(vec![Content::text(message)]))
+            Ok(CallToolResult::success(vec![ContentBlock::text(message)]))
         }
     }
 
@@ -450,8 +450,11 @@ async fn check_initialize(
         }
     }
 
-    // MCP spec requires client to send notifications/initialized before other requests.
-    // Both servers now enforce this: rmcp strictly, tower-mcp since #901.
+    // MCP spec requires the client to send notifications/initialized after
+    // initialize and before other requests. Send it to both so subsequent
+    // requests are well-formed. Enforcement of this ordering differs between the
+    // servers (tower-mcp rejects a premature request, rmcp does not); that
+    // divergence is exercised by the initialized-enforcement check below.
     if let Some(ref sid) = rmcp_sid {
         send_initialized(client, &RMCP, Some(sid.as_str())).await;
     }
@@ -1161,8 +1164,10 @@ async fn check_invalid_params(
 
 /// Check 9: notifications/initialized enforcement
 ///
-/// Send tools/list WITHOUT the notifications/initialized step. Both servers
-/// (since #901) should return an error (-32600 InvalidRequest).
+/// Send tools/list WITHOUT the notifications/initialized step. tower-mcp rejects
+/// this with -32600 (InvalidRequest) per #901. rmcp does not enforce the ordering
+/// and returns the tools list, so this is a KNOWN-DIFF (tower-mcp is the stricter,
+/// more spec-compliant side), verified current as of rmcp 2.1.0.
 async fn check_initialized_enforcement(client: &reqwest::Client) -> Vec<CheckResult> {
     // Start fresh sessions without sending notifications/initialized
     let init_body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"compat-enforcement-test","version":"0.1.0"}}}"#;
@@ -1248,13 +1253,28 @@ async fn check_initialized_enforcement(client: &reqwest::Client) -> Vec<CheckRes
             ));
         }
         (None, Some(t)) => {
-            results.push(fail(
-                "initialized-enforcement",
-                format!(
-                    "tower-mcp returned error {t}; rmcp returned result: {}",
-                    rmcp_resp.body
-                ),
-            ));
+            // rmcp does not enforce the notifications/initialized ordering: it
+            // returns the tools/list result instead of an error. tower-mcp
+            // rejects with -32600 (InvalidRequest) per #901, which is the
+            // stricter, more spec-compliant behavior. Documented KNOWN-DIFF,
+            // not a bug. Any other tower-mcp code here would be a regression,
+            // so keep that path a FAIL.
+            if t == -32600 {
+                results.push(known_diff(
+                    "initialized-enforcement",
+                    "tower-mcp rejects tools/list before notifications/initialized with -32600 \
+                     (InvalidRequest, per #901); rmcp does not enforce the ordering and returns \
+                     the tools list. tower-mcp is the stricter, more spec-compliant side.",
+                ));
+            } else {
+                results.push(fail(
+                    "initialized-enforcement",
+                    format!(
+                        "tower-mcp returned error {t} (expected -32600); rmcp returned result: {}",
+                        rmcp_resp.body
+                    ),
+                ));
+            }
         }
         (None, None) => {
             results.push(fail(
