@@ -70,7 +70,8 @@ proxy = []
 resilience = ["dep:tower-resilience"]
 # Proc macros for tool/resource/prompt definitions
 macros = ["dep:tower-mcp-macros"]
-# SEP-1442 stateless MCP mode (experimental)
+# Stateless MCP mode (experimental). SEP-1442 is the legacy opt-in path; the
+# finalized 2026-07-28 mechanism is SEP-2575/2567/2243.
 stateless = []
 
 [dependencies.axum]
