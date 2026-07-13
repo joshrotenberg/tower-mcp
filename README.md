@@ -91,6 +91,15 @@ Add to your `Cargo.toml`:
 tower-mcp = "0.12"
 ```
 
+Tool input types use `schemars::JsonSchema`, and the derive must come from the
+same `schemars` major version tower-mcp uses (currently `1.x`). To avoid a
+version skew (which surfaces as opaque `ExtractorHandler` trait-bound errors),
+either match the version or depend on `schemars` through the re-export:
+
+```rust
+use tower_mcp::schemars::JsonSchema;
+```
+
 ### Feature Flags
 
 | Feature | Description |

@@ -22,6 +22,14 @@
 //! - Use **`State<T>`** when state is passed directly to `extractor_handler()` (per-tool state)
 //! - Use **`Extension<T>`** when state is set via `McpRouter::with_state()` (router-level state)
 //!
+//! # schemars version alignment
+//!
+//! The `T` in [`Json<T>`] must implement [`schemars::JsonSchema`], and the
+//! derived impl must come from the same `schemars` major version tower-mcp uses
+//! (currently `1.x`). A version skew produces opaque `ExtractorHandler`
+//! trait-bound errors that do not name the real cause. Depend on `schemars`
+//! through the `tower_mcp::schemars` re-export to keep the versions aligned.
+//!
 //! # Example
 //!
 //! ```rust
@@ -588,6 +596,12 @@ where
 /// This trait is implemented for functions that take extractors as arguments.
 /// You don't need to implement this trait directly; it's automatically
 /// implemented for compatible async functions.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a valid extractor handler",
+    note = "each closure argument must be an extractor (`Json<T>`, `State<S>`, `Context`, `Extension<T>`, `RawArgs`) and the return type must be `Result<impl Into<CallToolResult>, ToolError>`",
+    note = "for a `Json<T>` argument, `T` must implement `serde::Deserialize` and `schemars::JsonSchema`",
+    note = "if `T` derives `JsonSchema` but this still fails, check for a `schemars` major-version mismatch: the derive must come from the same `schemars` version tower-mcp uses (>=1). Depend on it via the `tower_mcp::schemars` re-export to stay aligned"
+)]
 pub trait ExtractorHandler<S, T>: Clone + Send + Sync + 'static {
     /// The future returned by the handler.
     type Future: Future<Output = Result<CallToolResult>> + Send;
@@ -796,6 +810,12 @@ where
 // =============================================================================
 
 /// Helper trait to get schema from `Json<T>` extractor
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` does not implement `HasSchema`",
+    note = "for `Json<T>` this means `T: schemars::JsonSchema` is not satisfied",
+    note = "a common cause is a `schemars` major-version mismatch: the derive on `T` must come from the same `schemars` version tower-mcp uses (>=1)",
+    note = "depend on `schemars` via the `tower_mcp::schemars` re-export to keep the versions aligned"
+)]
 pub trait HasSchema {
     /// Returns the JSON Schema for this type, if available.
     fn schema() -> Option<Value>;
@@ -1327,6 +1347,31 @@ mod tests {
     struct TestInput {
         name: String,
         count: i32,
+    }
+
+    // Regression guard for the `tower_mcp::schemars` re-export (see #936).
+    // Deriving with `#[schemars(crate = "crate::schemars")]` forces the derive
+    // to resolve through the re-export, which is the path downstream users rely
+    // on to stay version-aligned. `HasSchema::schema()` must then succeed.
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[schemars(crate = "crate::schemars")]
+    struct ReexportInput {
+        field: String,
+    }
+
+    #[test]
+    fn reexported_schemars_derive_produces_schema() {
+        let schema = <Json<ReexportInput> as HasSchema>::schema()
+            .expect("re-exported schemars derive should yield a schema");
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"].get("field").is_some());
+
+        // Exercise the full extract path so the derived type is actually used.
+        let ctx = RequestContext::new(RequestId::Number(1));
+        let args = serde_json::json!({"field": "value"});
+        let Json(input) = Json::<ReexportInput>::from_tool_request(&ctx, &(), &args)
+            .expect("deserialization should succeed");
+        assert_eq!(input.field, "value");
     }
 
     #[test]

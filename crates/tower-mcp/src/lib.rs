@@ -482,6 +482,15 @@ pub use tower_mcp_macros::resource_template_fn;
 #[cfg(feature = "macros")]
 pub use tower_mcp_macros::tool_fn;
 
+/// Re-export of the [`schemars`] crate.
+///
+/// Tool input types passed via [`extract::Json`] derive `schemars::JsonSchema`,
+/// and the derived impl must come from the same `schemars` major version that
+/// tower-mcp uses. Depending on `schemars` through this re-export
+/// (`tower_mcp::schemars`) keeps the versions aligned and avoids the opaque
+/// `ExtractorHandler` trait-bound errors that a version skew produces.
+pub use schemars;
+
 // Re-exports
 pub use async_task::{Task, TaskStore};
 pub use client::{
