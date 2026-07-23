@@ -1,0 +1,59 @@
+# MCP Conformance Suite -- Expected Failures Baseline (2026-07-28 draft)
+#
+# Applies to the 0.2.0-alpha.x draft suite run with
+# `--spec-version 2026-07-28 --suite all`. Each entry is a scenario expected
+# to fail (or carry SHOULD-level warnings, which the baseline checker counts
+# the same) while the corresponding parity-roadmap issue (#929) is open.
+# Remove entries as the phases land; CI fails when a baselined scenario
+# starts passing (stale entry) or a non-baselined scenario fails.
+#
+# Status at 0.2.0-alpha.9 (2026-07-23): 58/101 checks pass;
+# 26/40 scenarios fully green.
+#
+# Format (0.2.x suite): plain scenario-name strings under `server:` /
+# `client:` keys; reasons live in these comments.
+
+server:
+  # SEP-2575/2567 stateless core gaps (4/28 checks pass): required
+  # per-request _meta validation (-32602 + HTTP 400), HTTP status mapping
+  # (400/404 for version/header/capability/method errors), per-request
+  # capability gating (-32021), subscriptions/listen
+  # acknowledgment/subscriptionId/filter semantics.
+  # Types work in #949; transport and listen semantics in #952.
+  - server-stateless
+
+  # Progress notifications are not delivered when the draft-path response is
+  # a plain JSON body; needs JSON-vs-SSE content negotiation (#952).
+  - tools-call-with-progress
+
+  # SHOULD-level warning: resource-not-found error data omits `uri`.
+  # Small fix, batched into #952.
+  - sep-2164-resource-not-found
+
+  # SEP-2549 (1/7 checks pass): list results emit ttlMs but cacheScope is
+  # always absent; the draft spec requires both on the six cacheable
+  # results (#949).
+  - caching
+
+  # SEP-2243 (7/9 checks pass): the two failures need schema-aware rejection
+  # when an x-mcp-header-annotated argument is present in the body but its
+  # Mcp-Param-* header is missing; the transport does not yet consult tool
+  # schemas during header validation (#952).
+  - http-custom-header-server-validation
+
+  # SEP-2322 MRTR is not implemented (#950). Scenarios that fully pass do so
+  # because correct non-MRTR behavior (rejecting unsupported methods)
+  # coincides with the spec; the two warning-only entries below also need
+  # the MRTR fixture tools.
+  - input-required-result-basic-elicitation
+  - input-required-result-basic-sampling
+  - input-required-result-basic-list-roots
+  - input-required-result-request-state
+  - input-required-result-multiple-input-requests
+  - input-required-result-multi-round
+  - input-required-result-missing-input-response
+  - input-required-result-non-tool-request
+  - input-required-result-result-type
+  - input-required-result-tampered-state
+  - input-required-result-capability-check
+  - input-required-result-ignore-extra-params

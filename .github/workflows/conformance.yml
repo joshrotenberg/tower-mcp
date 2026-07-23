@@ -44,7 +44,7 @@ jobs:
           exit 1
 
       - name: Run conformance suite
-        run: npx @modelcontextprotocol/conformance@0.1.15 server --url http://127.0.0.1:3001/mcp --expected-failures ./conformance-baseline.yml
+        run: npx @modelcontextprotocol/conformance@0.1.16 server --url http://127.0.0.1:3001/mcp --expected-failures ./conformance-baseline.yml
 
       - name: Show server logs on failure
         if: failure()
@@ -264,10 +264,63 @@ jobs:
 
       - name: Run client conformance suite
         run: |
-          npx @modelcontextprotocol/conformance@0.1.15 client \
+          # Known gaps (new 0.1.16 offline-access scenarios, SHOULD-level
+          # warnings) are inventoried in conformance-baseline-client.yml and
+          # tracked in #953. The baseline makes the tool's exit code
+          # reliable: it fails on unexpected failures or stale entries.
+          npx @modelcontextprotocol/conformance@0.1.16 client \
             --suite all \
             --command "cargo run --manifest-path examples/conformance-client/Cargo.toml --" \
-            2>&1 | tee /tmp/client-conformance.log
-          # The conformance tool exits non-zero on SHOULD-level warnings.
-          # Check for actual failures (0 failed) to determine pass/fail.
-          grep -q "0 failed" /tmp/client-conformance.log
+            --expected-failures ./conformance-baseline-client.yml
+
+  draft-conformance:
+    name: Official 2026-07-28 Draft Suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Build conformance server
+        run: cargo build --manifest-path examples/conformance-server/Cargo.toml
+
+      - name: Start server
+        run: |
+          cargo run --manifest-path examples/conformance-server/Cargo.toml \
+            > /tmp/conformance-server-draft.log 2>&1 &
+          echo $! > /tmp/conformance-server-draft.pid
+
+      - name: Wait for server
+        run: |
+          for i in $(seq 1 30); do
+            if nc -z 127.0.0.1 3001 2>/dev/null; then
+              echo "Server is ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Server failed to start. Logs:"
+          cat /tmp/conformance-server-draft.log
+          exit 1
+
+      - name: Run official 2026-07-28 draft suite
+        run: |
+          # The 0.2.0-alpha.x line carries the 2026-07-28 draft scenarios.
+          # --suite all includes draft/pending-status scenarios
+          # (server-stateless, caching, header validation, the 14 MRTR
+          # input-required-result scenarios). Known gaps are inventoried in
+          # conformance-baseline-draft.yml, one entry per parity-roadmap
+          # phase issue (#929); the job fails on unexpected failures OR on
+          # stale baseline entries that started passing.
+          npx @modelcontextprotocol/conformance@0.2.0-alpha.9 server \
+            --url http://127.0.0.1:3001/mcp \
+            --spec-version 2026-07-28 \
+            --suite all \
+            --expected-failures ./conformance-baseline-draft.yml
+
+      - name: Show server logs on failure
+        if: failure()
+        run: cat /tmp/conformance-server-draft.log

@@ -61,7 +61,79 @@ pub fn build_tools() -> Vec<Tool> {
         build_per_request_meta(),
         // SEP-2663: task-capable tool so the server advertises the tasks extension
         build_create_task(),
+        // Fixtures for the official 2026-07-28 conformance suite (#948)
+        build_json_schema_2020_12(),
+        build_custom_header(),
     ]
+}
+
+/// Fixture for the `json-schema-2020-12` conformance scenario: a tool whose
+/// input schema exercises the 2020-12 keyword families (`$defs`/`$anchor`,
+/// `allOf`/`anyOf`, `if`/`then`/`else`). The suite verifies the schema
+/// round-trips through the server unmodified.
+fn build_json_schema_2020_12() -> Tool {
+    ToolBuilder::new("json_schema_2020_12_tool")
+        .description("Tool with JSON Schema 2020-12 features")
+        .input_schema(serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "$defs": {
+                "address": {
+                    "$anchor": "address",
+                    "type": "object",
+                    "properties": {
+                        "street": { "type": "string" },
+                        "city": { "type": "string" }
+                    }
+                }
+            },
+            "properties": {
+                "name": { "type": "string" },
+                "address": { "$ref": "#/$defs/address" }
+            },
+            "allOf": [{
+                "anyOf": [
+                    { "required": ["name"] },
+                    { "required": ["address"] }
+                ]
+            }],
+            "if": { "required": ["address"] },
+            "then": {
+                "properties": {
+                    "address": { "required": ["street"] }
+                }
+            },
+            "else": { "required": ["name"] },
+            "additionalProperties": false
+        }))
+        .extractor_handler((), |RawArgs(args): RawArgs| async move {
+            let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("world");
+            Ok(CallToolResult::text(format!("Hello, {name}!")))
+        })
+        .build()
+}
+
+/// Fixture for the `http-custom-header-server-validation` conformance
+/// scenario (SEP-2243): the `x-mcp-header` annotation promotes the `value`
+/// argument to an `Mcp-Param-Value` HTTP header, which the transport
+/// validates against the body.
+fn build_custom_header() -> Tool {
+    ToolBuilder::new("test_custom_header")
+        .description("Validates SEP-2243 custom parameter headers")
+        .input_schema(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "value": { "type": "string", "x-mcp-header": "Value" }
+            },
+            "required": ["value"]
+        }))
+        .extractor_handler((), |RawArgs(args): RawArgs| async move {
+            match args.get("value").and_then(|v| v.as_str()) {
+                Some(value) => Ok(CallToolResult::text(value.to_string())),
+                None => Ok(CallToolResult::error("value must be a string")),
+            }
+        })
+        .build()
 }
 
 fn build_simple_text() -> Tool {

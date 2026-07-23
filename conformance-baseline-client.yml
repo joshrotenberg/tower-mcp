@@ -1,0 +1,22 @@
+# MCP Conformance Suite -- Expected Failures Baseline (client, 2025-11-25)
+#
+# Applies to `@modelcontextprotocol/conformance@0.1.16 client --suite all`.
+# The baseline checker counts SHOULD-level warnings the same as failures,
+# so warning-carrying scenarios are listed too. CI fails when a baselined
+# scenario starts passing cleanly (stale entry) or a non-baselined scenario
+# fails.
+#
+# Status at 0.1.16 (2026-07-23): 264/266 checks pass, 4 warnings.
+
+client:
+  # New scenarios in 0.1.16 that the conformance-client harness does not
+  # implement yet ("Unknown scenario"): offline_access scope handling.
+  # Client-side work tracked in #953 (phase 6).
+  - auth/offline-access-scope
+  - auth/offline-access-not-supported
+
+  # SHOULD-level warnings (passing checks, warning flags). Inventoried for
+  # #953; each needs a look at whether the SHOULD is worth implementing.
+  - auth/basic-cimd
+  - auth/scope-from-scopes-supported
+  - auth/scope-step-up
