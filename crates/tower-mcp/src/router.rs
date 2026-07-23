@@ -1662,7 +1662,10 @@ impl McpRouter {
                     .any(|t| !matches!(t.task_support, TaskSupportMode::Forbidden));
                 if has_task_support {
                     Some(TasksCapability {
-                        list: Some(TasksListCapability {}),
+                        // `list` is intentionally not advertised: final
+                        // SEP-2663 removes `tasks/list` and this router
+                        // answers MethodNotFound for it.
+                        list: None,
                         cancel: Some(TasksCancelCapability {}),
                         requests: Some(TasksRequestsCapability {
                             tools: Some(TasksToolsRequestsCapability {
@@ -2307,18 +2310,6 @@ impl McpRouter {
 
             McpRequest::Ping => Ok(McpResponse::Pong(EmptyResult {})),
 
-            McpRequest::ListTasks(params) => {
-                let tasks = self.inner.task_store.list_tasks(params.status);
-
-                let (tasks, next_cursor) =
-                    paginate(tasks, params.cursor.as_deref(), self.inner.page_size)?;
-
-                Ok(McpResponse::ListTasks(ListTasksResult {
-                    tasks,
-                    next_cursor,
-                }))
-            }
-
             McpRequest::GetTaskInfo(params) => {
                 let task = self
                     .inner
@@ -2332,44 +2323,6 @@ impl McpRouter {
                     })?;
 
                 Ok(McpResponse::GetTaskInfo(task))
-            }
-
-            McpRequest::GetTaskResult(params) => {
-                // Wait for task to reach terminal state (blocks if still running)
-                let (task_obj, result, error) = self
-                    .inner
-                    .task_store
-                    .wait_for_completion(&params.task_id)
-                    .await
-                    .ok_or_else(|| {
-                        Error::JsonRpc(JsonRpcError::invalid_params(format!(
-                            "Task not found: {}",
-                            params.task_id
-                        )))
-                    })?;
-
-                // Build _meta with related-task reference
-                let meta = serde_json::json!({
-                    "io.modelcontextprotocol/related-task": task_obj
-                });
-
-                match task_obj.status {
-                    TaskStatus::Cancelled => Err(Error::JsonRpc(JsonRpcError::invalid_params(
-                        format!("Task {} was cancelled", params.task_id),
-                    ))),
-                    TaskStatus::Failed => {
-                        let mut call_result = CallToolResult::error(
-                            error.unwrap_or_else(|| "Task failed".to_string()),
-                        );
-                        call_result.meta = Some(meta);
-                        Ok(McpResponse::GetTaskResult(call_result))
-                    }
-                    _ => {
-                        let mut call_result = result.unwrap_or_else(|| CallToolResult::text(""));
-                        call_result.meta = Some(meta);
-                        Ok(McpResponse::GetTaskResult(call_result))
-                    }
-                }
             }
 
             McpRequest::UpdateTask(params) => {
@@ -2413,8 +2366,7 @@ impl McpRouter {
                     ))));
                 }
 
-                let task_obj = self
-                    .inner
+                self.inner
                     .task_store
                     .cancel_task(&params.task_id, params.reason.as_deref())
                     .ok_or_else(|| {
@@ -2424,7 +2376,10 @@ impl McpRouter {
                         )))
                     })?;
 
-                Ok(McpResponse::CancelTask(task_obj))
+                // SEP-2663 (final): the cancel acknowledgment MUST be an empty
+                // result. The observable status is polled via `tasks/get` and
+                // may remain non-terminal after this ack.
+                Ok(McpResponse::CancelTask(EmptyResult {}))
             }
 
             McpRequest::SetLoggingLevel(params) => {
@@ -3624,23 +3579,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_tasks_empty() {
+    async fn test_removed_tasks_methods_get_method_not_found() {
+        // Final SEP-2663 removes tasks/list and tasks/result. They no longer
+        // parse into typed requests, so the router sees Unknown and must
+        // answer MethodNotFound (-32601).
         let mut router = McpRouter::new();
         init_router(&mut router).await;
 
-        let req = RouterRequest {
-            id: RequestId::Number(1),
-            inner: McpRequest::ListTasks(ListTasksParams::default()),
-            extensions: Extensions::new(),
-        };
+        for method in ["tasks/list", "tasks/result"] {
+            let req = RouterRequest {
+                id: RequestId::Number(1),
+                inner: McpRequest::Unknown {
+                    method: method.to_string(),
+                    params: None,
+                },
+                extensions: Extensions::new(),
+            };
 
-        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+            let resp = router.ready().await.unwrap().call(req).await.unwrap();
 
-        match resp.inner {
-            Ok(McpResponse::ListTasks(result)) => {
-                assert!(result.tasks.is_empty());
+            match resp.inner {
+                Err(err) => {
+                    assert_eq!(err.code, -32601, "{method} must be MethodNotFound");
+                }
+                other => panic!("Expected MethodNotFound error for {method}, got {other:?}"),
             }
-            _ => panic!("Expected ListTasks response"),
         }
     }
 
@@ -3678,10 +3641,12 @@ mod tests {
         // Wait for task to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        // Get task result
+        // Poll task state via tasks/get (final SEP-2663 removed the blocking
+        // tasks/result; the terminal result payload on tasks/get is the
+        // phase 4 DetailedTask work, #951).
         let req = RouterRequest {
             id: RequestId::Number(2),
-            inner: McpRequest::GetTaskResult(GetTaskResultParams {
+            inner: McpRequest::GetTaskInfo(GetTaskInfoParams {
                 task_id: task_id.clone(),
                 meta: None,
             }),
@@ -3691,16 +3656,11 @@ mod tests {
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
 
         match resp.inner {
-            Ok(McpResponse::GetTaskResult(result)) => {
-                // Result should have _meta with related-task
-                assert!(result.meta.is_some());
-                // Check the result content
-                match &result.content[0] {
-                    Content::Text { text, .. } => assert_eq!(text, "15"),
-                    _ => panic!("Expected text content"),
-                }
+            Ok(McpResponse::GetTaskInfo(info)) => {
+                assert_eq!(info.task_id, task_id);
+                assert_eq!(info.status, TaskStatus::Completed);
             }
-            _ => panic!("Expected GetTaskResult response"),
+            _ => panic!("Expected GetTaskInfo response"),
         }
     }
 
@@ -3750,11 +3710,27 @@ mod tests {
 
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
 
+        // SEP-2663 (final): cancel acknowledges with an empty result.
         match resp.inner {
-            Ok(McpResponse::CancelTask(task_obj)) => {
-                assert_eq!(task_obj.status, TaskStatus::Cancelled);
+            Ok(McpResponse::CancelTask(EmptyResult {})) => {}
+            other => panic!("Expected empty CancelTask ack, got {other:?}"),
+        }
+
+        // Observable status is polled via tasks/get.
+        let req = RouterRequest {
+            id: RequestId::Number(3),
+            inner: McpRequest::GetTaskInfo(GetTaskInfoParams {
+                task_id: task_id.clone(),
+                meta: None,
+            }),
+            extensions: Extensions::new(),
+        };
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+        match resp.inner {
+            Ok(McpResponse::GetTaskInfo(info)) => {
+                assert_eq!(info.status, TaskStatus::Cancelled);
             }
-            _ => panic!("Expected CancelTask response"),
+            _ => panic!("Expected GetTaskInfo response"),
         }
     }
 

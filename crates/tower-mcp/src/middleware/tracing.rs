@@ -205,9 +205,7 @@ pub(crate) fn extract_operation_details(
         McpRequest::ListPrompts(_) => (Some("list"), Some("prompts".to_string())),
         McpRequest::SubscribeResource(params) => (Some("subscribe"), Some(params.uri.clone())),
         McpRequest::UnsubscribeResource(params) => (Some("unsubscribe"), Some(params.uri.clone())),
-        McpRequest::ListTasks(_) => (Some("list"), Some("tasks".to_string())),
         McpRequest::GetTaskInfo(params) => (Some("task"), Some(params.task_id.clone())),
-        McpRequest::GetTaskResult(params) => (Some("task_result"), Some(params.task_id.clone())),
         McpRequest::CancelTask(params) => (Some("cancel"), Some(params.task_id.clone())),
         McpRequest::Complete(params) => {
             let ref_type = match &params.reference {

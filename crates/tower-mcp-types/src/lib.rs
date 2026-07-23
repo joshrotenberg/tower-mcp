@@ -27,12 +27,13 @@
 //!   protocol versions and capabilities without requiring an `initialize`
 //!   handshake.
 //! - [`error::UnsupportedProtocolVersionData`] -- the structured error data
-//!   attached to a `-32004` (UnsupportedProtocolVersion) response. Contains
+//!   attached to a `-32022` (UnsupportedProtocolVersion) response. Contains
 //!   the `supported` versions list and the `requested` version string.
-//! - [`error::McpErrorCode::HeaderMismatch`] (`-32001`) and
-//!   [`error::McpErrorCode::UnsupportedProtocolVersion`] (`-32004`) -- new
-//!   spec-assigned error codes (SEP-2243 and SEP-2575 respectively). See the
-//!   [`error`] module for the full error code table.
+//! - [`error::McpErrorCode::HeaderMismatch`] (`-32020`) and
+//!   [`error::McpErrorCode::UnsupportedProtocolVersion`] (`-32022`) --
+//!   spec-assigned error codes (SEP-2243 and SEP-2575, renumbered by the
+//!   upstream error-code allocation in spec PR modelcontextprotocol#2907).
+//!   See the [`error`] module for the full error code table.
 //!
 //! # The only standalone Rust MCP types crate
 //!

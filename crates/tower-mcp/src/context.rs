@@ -782,7 +782,7 @@ impl RequestContext {
         Ok(result.action == ElicitAction::Accept)
     }
 
-    /// List tasks tracked by the connected client (SEP-1686).
+    /// List tasks tracked by the connected client (legacy SEP-1686).
     ///
     /// Sends a `tasks/list` request to the client and returns the result.
     /// Pass `Some(status)` to filter to a single status, or `None` for all
@@ -791,6 +791,12 @@ impl RequestContext {
     ///
     /// Returns an error if no client requester is configured or the client
     /// does not advertise task support.
+    #[deprecated(
+        since = "0.13.0",
+        note = "final SEP-2663 removes tasks/list; a conforming peer answers \
+                MethodNotFound (-32601). Only useful against legacy SEP-1686 \
+                clients."
+    )]
     pub async fn list_tasks(&self, status: Option<TaskStatus>) -> Result<ListTasksResult> {
         let params = ListTasksParams {
             status,
@@ -820,13 +826,21 @@ impl RequestContext {
             .map_err(|e| Error::Internal(format!("Failed to deserialize tasks/get: {e}")))
     }
 
-    /// Fetch the terminal result for a task tracked by the client (SEP-1686).
+    /// Fetch the terminal result for a task tracked by the client (legacy
+    /// SEP-1686).
     ///
     /// Sends a `tasks/result` request. The client is expected to block until
     /// the task reaches a terminal state and then return the underlying
     /// `CallToolResult`. For long-running tasks, prefer polling with
     /// [`get_task_info`](Self::get_task_info) and only call this once the
     /// status is terminal.
+    #[deprecated(
+        since = "0.13.0",
+        note = "final SEP-2663 removes tasks/result (results are inlined in \
+                the tasks/get DetailedTask); a conforming peer answers \
+                MethodNotFound (-32601). Only useful against legacy SEP-1686 \
+                clients."
+    )]
     pub async fn get_task_result(&self, task_id: impl Into<String>) -> Result<CallToolResult> {
         let params = GetTaskResultParams {
             task_id: task_id.into(),
@@ -839,25 +853,25 @@ impl RequestContext {
             .map_err(|e| Error::Internal(format!("Failed to deserialize tasks/result: {e}")))
     }
 
-    /// Cancel a task tracked by the client (SEP-1686).
+    /// Cancel a task tracked by the client.
     ///
-    /// Sends a `tasks/cancel` request and returns the resulting task object,
-    /// which will reflect the cancelled status.
+    /// Sends a `tasks/cancel` request. Per final SEP-2663 the acknowledgment
+    /// is an empty result and the observable task status is polled via
+    /// [`get_task_info`](Self::get_task_info); the ack body is discarded, so
+    /// this also tolerates legacy SEP-1686 peers that return the task object.
     pub async fn cancel_task(
         &self,
         task_id: impl Into<String>,
         reason: Option<String>,
-    ) -> Result<TaskObject> {
+    ) -> Result<()> {
         let params = CancelTaskParams {
             task_id: task_id.into(),
             reason,
             meta: None,
         };
-        let value = self
-            .request_raw("tasks/cancel", serde_json::to_value(&params)?)
+        self.request_raw("tasks/cancel", serde_json::to_value(&params)?)
             .await?;
-        serde_json::from_value(value)
-            .map_err(|e| Error::Internal(format!("Failed to deserialize tasks/cancel: {e}")))
+        Ok(())
     }
 
     /// Send an arbitrary JSON-RPC request to the client.
@@ -1280,6 +1294,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)] // exercises the legacy SEP-1686 helper
     async fn test_list_tasks_round_trips() {
         let (tx, rx) = outgoing_request_channel(10);
         spawn_mock_client(rx, |method, params| {
@@ -1307,18 +1322,32 @@ mod tests {
         spawn_mock_client(rx, |method, params| {
             assert_eq!(method, "tasks/cancel");
             assert_eq!(params["reason"], serde_json::json!("user requested"));
-            let task_id = params["taskId"].as_str().unwrap().to_string();
-            make_task_object(&task_id, TaskStatus::Cancelled)
+            // SEP-2663 (final): the cancel acknowledgment is an empty result.
+            serde_json::json!({})
         });
         let requester: ClientRequesterHandle = Arc::new(ChannelClientRequester::new(tx));
         let ctx = RequestContext::new(RequestId::Number(1)).with_client_requester(requester);
 
-        let task = ctx
-            .cancel_task("task-99", Some("user requested".into()))
+        ctx.cancel_task("task-99", Some("user requested".into()))
             .await
-            .unwrap();
-        assert_eq!(task.task_id, "task-99");
-        assert!(matches!(task.status, TaskStatus::Cancelled));
+            .expect("empty ack should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_cancel_task_tolerates_legacy_task_object_ack() {
+        // Legacy SEP-1686 peers return the task object from tasks/cancel;
+        // the helper discards the body either way.
+        let (tx, rx) = outgoing_request_channel(10);
+        spawn_mock_client(rx, |method, _params| {
+            assert_eq!(method, "tasks/cancel");
+            make_task_object("task-99", TaskStatus::Cancelled)
+        });
+        let requester: ClientRequesterHandle = Arc::new(ChannelClientRequester::new(tx));
+        let ctx = RequestContext::new(RequestId::Number(1)).with_client_requester(requester);
+
+        ctx.cancel_task("task-99", None)
+            .await
+            .expect("legacy task-object ack should also succeed");
     }
 
     #[tokio::test]

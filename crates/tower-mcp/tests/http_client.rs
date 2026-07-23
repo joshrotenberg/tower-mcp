@@ -2349,7 +2349,7 @@ mod stateless_tests {
         );
     }
 
-    /// Unsupported protocol version returns SEP-2575 error code -32004
+    /// Unsupported protocol version returns SEP-2575 error code -32022
     /// with the spec-shape data: `{ supported: [...], requested: "..." }`.
     /// (SEP-1442 draft used -32000 / `supportedVersions`; both were wrong.)
     #[tokio::test]
@@ -2377,7 +2377,7 @@ mod stateless_tests {
 
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["error"]["code"].as_i64().unwrap(), -32004);
+        assert_eq!(body["error"]["code"].as_i64().unwrap(), -32022);
         assert!(
             body["error"]["data"]["supported"].is_array(),
             "spec data field is 'supported': {body}"

@@ -23,17 +23,24 @@
 //! | Code   | Name                          | Source | Meaning                              |
 //! |--------|-------------------------------|--------|--------------------------------------|
 //! | -32000 | ConnectionClosed              | *impl* | Transport connection was closed      |
-//! | -32001 | HeaderMismatch                | **spec** (SEP-2243) | HTTP headers do not match the request body, or required headers are missing/malformed |
 //! | -32002 | ResourceNotFound              | *deprecated* | **SEP-2164** reassigned to -32602; variant kept for backcompat |
-//! | -32003 | MissingRequiredClientCapability | **spec** (SEP-2575) | Client lacks a capability required by the request |
-//! | -32004 | UnsupportedProtocolVersion    | **spec** (SEP-2575) | Server does not support the request's protocol version |
 //! | -32005 | SessionNotFound               | *impl* | Session not found or expired (legacy; deprecated by SEP-2567) |
 //! | -32006 | SessionRequired               | *impl* | Mcp-Session-Id header required (legacy; deprecated by SEP-2567) |
 //! | -32007 | Forbidden                     | *impl* | Access forbidden (insufficient scope)|
-//! | -32008 | AlreadySubscribed             | *impl* | Resource already subscribed (moved from -32003 to avoid collision with SEP-2575) |
-//! | -32009 | NotSubscribed                 | *impl* | Resource not subscribed (moved from -32004 to avoid collision with SEP-2575) |
-//! | -32010 | RequestTimeout                | *impl* | Request exceeded timeout (moved from -32001 to avoid collision with SEP-2243) |
+//! | -32008 | AlreadySubscribed             | *impl* | Resource already subscribed          |
+//! | -32009 | NotSubscribed                 | *impl* | Resource not subscribed              |
+//! | -32010 | RequestTimeout                | *impl* | Request exceeded timeout             |
+//! | -32020 | HeaderMismatch                | **spec** (SEP-2243) | HTTP headers do not match the request body, or required headers are missing/malformed |
+//! | -32021 | MissingRequiredClientCapability | **spec** (SEP-2575) | Client lacks a capability required by the request |
+//! | -32022 | UnsupportedProtocolVersion    | **spec** (SEP-2575) | Server does not support the request's protocol version |
 //! | -32042 | UrlElicitationRequired        | TS SDK | URL elicitation required             |
+//!
+//! The three **spec** codes were renumbered upstream by the error-code
+//! allocation policy (spec PR modelcontextprotocol#2907, 2026-06): the SEP
+//! documents originally assigned -32001 (HeaderMismatch), -32003
+//! (MissingRequiredClientCapability), and -32004 (UnsupportedProtocolVersion);
+//! the draft schema now assigns -32020/-32021/-32022 and is canonical. Verify
+//! against the published `schema/2026-07-28` at finalization.
 
 use serde::{Deserialize, Serialize};
 
@@ -68,16 +75,18 @@ pub enum ErrorCode {
 /// is permitted by JSON-RPC 2.0 but they are not part of the MCP wire spec.
 ///
 /// Recently-changed assignments:
-/// - `MissingRequiredClientCapability` (-32003) and `UnsupportedProtocolVersion`
-///   (-32004) are spec assignments from SEP-2575.
+/// - `HeaderMismatch` (SEP-2243), `MissingRequiredClientCapability`, and
+///   `UnsupportedProtocolVersion` (both SEP-2575) were originally assigned
+///   -32001/-32003/-32004 by their SEP documents. The upstream error-code
+///   allocation policy (spec PR modelcontextprotocol#2907, 2026-06)
+///   renumbered them to -32020/-32021/-32022 in the draft schema, which is
+///   canonical. **This is a breaking change on the wire** within the
+///   experimental 2026-07-28 surface.
 /// - `AlreadySubscribed` and `NotSubscribed` previously occupied -32003 and
-///   -32004; they moved to -32008 and -32009 to make room. **This is a
-///   breaking change on the wire** for any subscribe/unsubscribe responses
-///   that relied on the old codes.
-/// - `HeaderMismatch` (-32001) is a spec assignment from SEP-2243 (HTTP
-///   header standardization). `RequestTimeout` previously occupied -32001
-///   and moved to -32010 to make room. **This is a breaking change on the
-///   wire** for any consumers matching on the old `RequestTimeout` code.
+///   -32004; they moved to -32008 and -32009 when those slots were believed
+///   to be spec-assigned. They stay at -32008/-32009.
+/// - `RequestTimeout` previously occupied -32001 and moved to -32010 for the
+///   same reason. It stays at -32010.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 #[non_exhaustive]
@@ -88,8 +97,11 @@ pub enum McpErrorCode {
     /// `Mcp-Param-*`) do not match the corresponding values in the request
     /// body, or a required header is missing or malformed.
     ///
+    /// Originally -32001 in the SEP text; renumbered to -32020 by the
+    /// upstream error-code allocation (spec PR modelcontextprotocol#2907).
+    ///
     /// Use [`JsonRpcError::header_mismatch`] to construct.
-    HeaderMismatch = -32001,
+    HeaderMismatch = -32020,
     /// Resource not found.
     ///
     /// **Deprecated**: SEP-2164 (FINAL) moves this to the standard JSON-RPC
@@ -106,11 +118,18 @@ pub enum McpErrorCode {
     ResourceNotFound = -32002,
     /// SEP-2575: client capabilities advertised on the request do not
     /// include a capability required by the called method.
-    MissingRequiredClientCapability = -32003,
+    ///
+    /// Originally -32003 in the SEP text; renumbered to -32021 by the
+    /// upstream error-code allocation (spec PR modelcontextprotocol#2907).
+    MissingRequiredClientCapability = -32021,
     /// SEP-2575: server does not support the protocol version the client
     /// requested (via `MCP-Protocol-Version` header or per-request `_meta`).
+    ///
+    /// Originally -32004 in the SEP text; renumbered to -32022 by the
+    /// upstream error-code allocation (spec PR modelcontextprotocol#2907).
+    ///
     /// Use [`JsonRpcError::unsupported_protocol_version`] to construct.
-    UnsupportedProtocolVersion = -32004,
+    UnsupportedProtocolVersion = -32022,
     /// Session not found or expired -- client should re-initialize.
     ///
     /// SEP-2567 deprecates sessions entirely. This code stays for the
@@ -122,14 +141,14 @@ pub enum McpErrorCode {
     SessionRequired = -32006,
     /// Access forbidden (insufficient scope or authorization).
     Forbidden = -32007,
-    /// Resource already subscribed. Moved from -32003 to avoid the
-    /// SEP-2575 `MissingRequiredClientCapability` collision.
+    /// Resource already subscribed. Moved from -32003 when that slot was
+    /// believed to be spec-assigned; stays at -32008.
     AlreadySubscribed = -32008,
-    /// Resource not subscribed (for unsubscribe). Moved from -32004 to
-    /// avoid the SEP-2575 `UnsupportedProtocolVersion` collision.
+    /// Resource not subscribed (for unsubscribe). Moved from -32004 when
+    /// that slot was believed to be spec-assigned; stays at -32009.
     NotSubscribed = -32009,
-    /// Request exceeded timeout. Moved from -32001 to avoid the SEP-2243
-    /// `HeaderMismatch` collision.
+    /// Request exceeded timeout. Moved from -32001 when that slot was
+    /// believed to be spec-assigned; stays at -32010.
     RequestTimeout = -32010,
     /// URL elicitation is required before processing the request.
     UrlElicitationRequired = -32042,
@@ -325,7 +344,7 @@ impl JsonRpcError {
     }
 }
 
-/// SEP-2575 error data for `UnsupportedProtocolVersion` (-32004).
+/// SEP-2575 error data for `UnsupportedProtocolVersion` (-32022).
 ///
 /// Wire shape per the draft schema:
 /// ```json
@@ -575,19 +594,21 @@ mod tests {
     use super::*;
 
     // =========================================================================
-    // SEP-2575 UnsupportedProtocolVersion (-32004) wire-format tests
+    // SEP-2575 UnsupportedProtocolVersion (-32022) wire-format tests
     // =========================================================================
 
     #[test]
-    fn unsupported_protocol_version_code_is_negative_32004() {
-        assert_eq!(McpErrorCode::UnsupportedProtocolVersion.code(), -32004);
+    fn unsupported_protocol_version_code_is_negative_32022() {
+        // Renumbered from -32004 by the upstream error-code allocation
+        // (spec PR modelcontextprotocol#2907).
+        assert_eq!(McpErrorCode::UnsupportedProtocolVersion.code(), -32022);
     }
 
     #[test]
     fn unsupported_protocol_version_constructor_has_spec_shape() {
         let err =
             JsonRpcError::unsupported_protocol_version("2027-01-01", ["2026-07-28", "2025-11-25"]);
-        assert_eq!(err.code, -32004);
+        assert_eq!(err.code, -32022);
         let data = err.data.expect("data must be present");
         assert_eq!(
             data["supported"],
@@ -637,21 +658,25 @@ mod tests {
 
     #[test]
     fn subscribe_codes_moved_off_spec_assignments() {
-        // -32003 and -32004 belong to SEP-2575 spec codes; our subscribe codes
-        // moved to -32008/-32009 to avoid collision.
+        // Our subscribe codes moved to -32008/-32009 when -32003/-32004 were
+        // believed spec-assigned. The SEP-2575 codes have since been
+        // renumbered to -32021/-32022 (spec PR modelcontextprotocol#2907);
+        // the subscribe codes stay put.
         assert_eq!(McpErrorCode::AlreadySubscribed.code(), -32008);
         assert_eq!(McpErrorCode::NotSubscribed.code(), -32009);
-        assert_eq!(McpErrorCode::MissingRequiredClientCapability.code(), -32003);
-        assert_eq!(McpErrorCode::UnsupportedProtocolVersion.code(), -32004);
+        assert_eq!(McpErrorCode::MissingRequiredClientCapability.code(), -32021);
+        assert_eq!(McpErrorCode::UnsupportedProtocolVersion.code(), -32022);
     }
 
     // =========================================================================
-    // SEP-2243 HeaderMismatch (-32001) wire-format tests
+    // SEP-2243 HeaderMismatch (-32020) wire-format tests
     // =========================================================================
 
     #[test]
-    fn header_mismatch_code_is_negative_32001() {
-        assert_eq!(McpErrorCode::HeaderMismatch.code(), -32001);
+    fn header_mismatch_code_is_negative_32020() {
+        // Renumbered from -32001 by the upstream error-code allocation
+        // (spec PR modelcontextprotocol#2907).
+        assert_eq!(McpErrorCode::HeaderMismatch.code(), -32020);
     }
 
     #[test]
@@ -659,17 +684,17 @@ mod tests {
         let err = JsonRpcError::header_mismatch(
             "Mcp-Name header value 'foo' does not match body value 'bar'",
         );
-        assert_eq!(err.code, -32001);
+        assert_eq!(err.code, -32020);
         assert_eq!(err.code, McpErrorCode::HeaderMismatch.code());
         assert!(err.message.contains("Mcp-Name"));
     }
 
     #[test]
     fn request_timeout_moved_off_spec_assignment() {
-        // SEP-2243 took -32001 for HeaderMismatch; our RequestTimeout
-        // moved to -32010 to avoid collision.
+        // RequestTimeout moved to -32010 when -32001 was believed
+        // spec-assigned; HeaderMismatch is now -32020.
         assert_eq!(McpErrorCode::RequestTimeout.code(), -32010);
-        assert_eq!(McpErrorCode::HeaderMismatch.code(), -32001);
+        assert_eq!(McpErrorCode::HeaderMismatch.code(), -32020);
     }
 
     #[test]

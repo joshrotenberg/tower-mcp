@@ -44,21 +44,21 @@
 //! Stateful clients (those sending an `mcp-session-id`) continue to work
 //! normally on the same transport alongside both stateless paths.
 //!
-//! ## `messages/listen` SSE stream
+//! ## `subscriptions/listen` SSE stream
 //!
 //! Clients using the 2026-07-28 protocol open a server-to-client notification
-//! stream by POSTing a `messages/listen` JSON-RPC request. The server responds
+//! stream by POSTing a `subscriptions/listen` JSON-RPC request. The server responds
 //! with `Content-Type: text/event-stream` and streams zero or more
 //! `notifications/*` events until the client disconnects.
 //!
 //! This replaces the `GET /` SSE endpoint used by the 2025-11-25 protocol. The
-//! `GET /` endpoint is still supported for 2025-11-25 sessions; `messages/listen`
+//! `GET /` endpoint is still supported for 2025-11-25 sessions; `subscriptions/listen`
 //! is only available for 2026-07-28+ clients.
 //!
 //! ```text
 //! Client (2026-07-28)                          Server
 //!   |                                            |
-//!   |-- POST / {method: "messages/listen",       |
+//!   |-- POST / {method: "subscriptions/listen",  |
 //!   |           MCP-Protocol-Version: 2026-07-28} -->|
 //!   |<-- 200 Content-Type: text/event-stream ----|
 //!   |<-- event: message (notification) ----------|
@@ -81,7 +81,7 @@
 //! request are validated for consistency with the body, but missing headers are
 //! not an error. Validation is **strict** for 2026-07-28+ clients: `Mcp-Method`
 //! must be present on every POST and `Mcp-Name` must be present for the three
-//! named methods. Violations return `-32001` (HeaderMismatch).
+//! named methods. Violations return `-32020` (HeaderMismatch).
 //!
 //! The public constants [`MCP_METHOD_HEADER`], [`MCP_NAME_HEADER`], and
 //! [`MCP_PARAM_HEADER_PREFIX`] hold the canonical lowercase header names.
@@ -150,8 +150,8 @@
 //!
 //! | Code    | Name                      | Description                                        |
 //! |---------|---------------------------|----------------------------------------------------|
-//! | -32001  | HeaderMismatch            | Required HTTP header missing or inconsistent with body (SEP-2243, strict mode) |
-//! | -32004  | UnsupportedProtocolVersion| Server does not support the requested protocol version (SEP-2575) |
+//! | -32020  | HeaderMismatch            | Required HTTP header missing or inconsistent with body (SEP-2243, strict mode) |
+//! | -32022  | UnsupportedProtocolVersion| Server does not support the requested protocol version (SEP-2575) |
 //! | -32005  | SessionNotFound           | Session expired or server restarted                |
 //! | -32006  | SessionRequired           | MCP-Session-Id header missing                      |
 //!
@@ -1582,7 +1582,7 @@ impl HttpTransport {
     /// `.sse_responses(true)` to match rmcp's behavior when targeting clients
     /// written against rmcp.
     ///
-    /// The existing SSE notification stream (GET `/`) and `messages/listen` stream
+    /// The existing SSE notification stream (GET `/`) and `subscriptions/listen` stream
     /// (2026-07-28+) are unaffected by this flag.
     ///
     /// Default: `false` (bare JSON, `Content-Type: application/json`).
@@ -2296,9 +2296,9 @@ async fn handle_post(
         if let Some(ref version) = version_in_play
             && is_stateless_protocol_version(version)
             && get_session_id(&headers).is_none()
-            // `messages/listen` opens an SSE stream; let it fall through to the
+            // `subscriptions/listen` opens an SSE stream; let it fall through to the
             // dedicated intercept below rather than handling it as a plain RPC call.
-            && parsed.get("method").and_then(|m| m.as_str()) != Some("messages/listen")
+            && parsed.get("method").and_then(|m| m.as_str()) != Some("subscriptions/listen")
         {
             // Notifications and responses are fire-and-forget; no dispatch needed.
             if !is_init && (parsed.get("id").is_none() || is_response(&parsed)) {
@@ -2536,8 +2536,8 @@ async fn handle_post(
         return json_rpc_error_response(None, JsonRpcError::session_required());
     };
 
-    // SEP-2575 / SEP-2567: intercept `messages/listen` before the standard
-    // version validation. `messages/listen` is only available when the
+    // SEP-2575 / SEP-2567: intercept `subscriptions/listen` before the standard
+    // version validation. `subscriptions/listen` is only available when the
     // effective protocol version is >= 2026-07-28; otherwise we return a
     // proper JSON-RPC error rather than silently falling through to the
     // router (which would return `MethodNotFound` anyway, but without the
@@ -2549,19 +2549,19 @@ async fn handle_post(
     // 2026-07-28 header before we can inspect it.
     {
         let method_str = parsed.get("method").and_then(|m| m.as_str()).unwrap_or("");
-        if method_str == "messages/listen" {
+        if method_str == "subscriptions/listen" {
             let req_id = extract_request_id(&parsed);
             let effective_version = if let Some(v) = get_protocol_version(&headers) {
                 v
             } else {
                 session.protocol_version.read().await.clone()
             };
-            if version_supports_messages_listen(&effective_version) {
-                return handle_messages_listen_sse(session).await;
+            if version_supports_subscriptions_listen(&effective_version) {
+                return handle_subscriptions_listen_sse(session).await;
             } else {
                 return json_rpc_error_response(
                     req_id,
-                    JsonRpcError::method_not_found("messages/listen"),
+                    JsonRpcError::method_not_found("subscriptions/listen"),
                 );
             }
         }
@@ -2569,7 +2569,7 @@ async fn handle_post(
 
     // Validate protocol version (if present and not init request).
     // Per SEP-2575, unsupported versions get a JSON-RPC error with code
-    // -32004 and `{ supported, requested }` data, not a plain-text 400.
+    // -32022 and `{ supported, requested }` data, not a plain-text 400.
     if !is_init
         && let Some(version) = get_protocol_version(&headers)
         && !SUPPORTED_PROTOCOL_VERSIONS.contains(&version.as_str())
@@ -2795,11 +2795,11 @@ async fn handle_post(
     resp
 }
 
-/// Returns `true` when the given protocol version string enables `messages/listen`.
+/// Returns `true` when the given protocol version string enables `subscriptions/listen`.
 ///
-/// `messages/listen` is part of the 2026-07-28 spec (SEP-2575 / SEP-2567).
+/// `subscriptions/listen` is part of the 2026-07-28 spec (SEP-2575 / SEP-2567).
 /// Version strings are YYYY-MM-DD dates, so lexicographic comparison is correct.
-fn version_supports_messages_listen(version: &str) -> bool {
+fn version_supports_subscriptions_listen(version: &str) -> bool {
     version >= UPCOMING_PROTOCOL_VERSION
 }
 
@@ -2814,7 +2814,7 @@ fn is_stateless_protocol_version(version: &str) -> bool {
     version >= UPCOMING_PROTOCOL_VERSION
 }
 
-/// Serve a `messages/listen` request as an SSE stream.
+/// Serve a `subscriptions/listen` request as an SSE stream.
 ///
 /// Subscribes to the session's notification broadcast channel and returns a
 /// streaming `text/event-stream` response. The stream closes naturally when:
@@ -2823,7 +2823,7 @@ fn is_stateless_protocol_version(version: &str) -> bool {
 ///
 /// Each notification is assigned a monotonically increasing event ID for
 /// potential stream resumption (SEP-1699).
-async fn handle_messages_listen_sse(session: Arc<Session>) -> Response {
+async fn handle_subscriptions_listen_sse(session: Arc<Session>) -> Response {
     let rx = session.notifications_tx.subscribe();
     let session_clone = session.clone();
 
@@ -3362,7 +3362,7 @@ mod tests {
     #[tokio::test]
     async fn unsupported_protocol_version_returns_spec_shape_error() {
         // SEP-2575: requests carrying an unrecognized MCP-Protocol-Version
-        // header (post-initialize) get a JSON-RPC error with code -32004 and
+        // header (post-initialize) get a JSON-RPC error with code -32022 and
         // data `{ supported: [...], requested: "..." }`.
         let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
         let app = transport.into_router();
@@ -3418,7 +3418,7 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"]["code"].as_i64().unwrap(), -32004);
+        assert_eq!(json["error"]["code"].as_i64().unwrap(), -32022);
         assert_eq!(json["error"]["data"]["requested"], "1999-01-01");
         let supported = json["error"]["data"]["supported"]
             .as_array()
@@ -3445,7 +3445,7 @@ mod tests {
     }
 
     /// When a request (no session) arrives with an invalid `Mcp-Protocol-Version`
-    /// header, the transport must return -32004 with the correct SEP-2575 wire
+    /// header, the transport must return -32022 with the correct SEP-2575 wire
     /// shape: `{ supported: [...], requested: "..." }`. This verifies the
     /// version-validation path fires without requiring a session.
     #[cfg(feature = "stateless")]
@@ -3456,7 +3456,7 @@ mod tests {
 
         // "1999-01-01" is below UPCOMING_PROTOCOL_VERSION ("2026-07-28"), so it
         // does not enter the version-gated stateless block. It is also not in
-        // SUPPORTED_PROTOCOL_VERSIONS, so it triggers the -32004 version check
+        // SUPPORTED_PROTOCOL_VERSIONS, so it triggers the -32022 version check
         // at lines ~2370-2382. No session header is sent, exercising the
         // sessionless request path through version validation.
         let req = Request::builder()
@@ -3481,8 +3481,8 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
             json["error"]["code"].as_i64().unwrap(),
-            -32004,
-            "must return UnsupportedProtocolVersion (-32004): {json}"
+            -32022,
+            "must return UnsupportedProtocolVersion (-32022): {json}"
         );
         assert_eq!(
             json["error"]["data"]["requested"], "1999-01-01",
@@ -3570,7 +3570,7 @@ mod tests {
 
     /// In lenient mode, if the client opts in by sending Mcp-Method,
     /// the server still validates against the body and rejects a
-    /// mismatch with -32001.
+    /// mismatch with -32020.
     #[tokio::test]
     async fn sep_2243_lenient_mode_validates_present_headers() {
         let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
@@ -3629,7 +3629,7 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"]["code"].as_i64().unwrap(), -32001);
+        assert_eq!(json["error"]["code"].as_i64().unwrap(), -32020);
         assert!(
             json["error"]["message"]
                 .as_str()
@@ -3736,7 +3736,7 @@ mod tests {
     }
 
     /// tools/call with mismatched Mcp-Name vs body params.name MUST be
-    /// rejected with -32001 and HTTP 400 even in lenient mode.
+    /// rejected with -32020 and HTTP 400 even in lenient mode.
     #[tokio::test]
     async fn sep_2243_tools_call_mcp_name_mismatch_rejected() {
         use crate::{CallToolResult, ToolBuilder};
@@ -3807,7 +3807,7 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"]["code"].as_i64().unwrap(), -32001);
+        assert_eq!(json["error"]["code"].as_i64().unwrap(), -32020);
         let msg = json["error"]["message"].as_str().unwrap();
         assert!(msg.contains("Mcp-Name"), "got: {msg}");
         assert_eq!(json["id"], 7);
@@ -6013,7 +6013,7 @@ mod tests {
         );
     }
 
-    /// 2026-07-28 stateless request missing Mcp-Method returns -32001 + HTTP 400 (#859).
+    /// 2026-07-28 stateless request missing Mcp-Method returns -32020 + HTTP 400 (#859).
     #[tokio::test]
     #[cfg(feature = "stateless")]
     async fn stateless_v2026_missing_mcp_method_returns_400() {
@@ -6048,8 +6048,8 @@ mod tests {
         assert!(json.get("error").is_some(), "expected error, got: {json}");
         assert_eq!(
             json["error"]["code"].as_i64().unwrap(),
-            -32001,
-            "expected InvalidRequest (-32001)"
+            -32020,
+            "expected HeaderMismatch (-32020)"
         );
         assert!(
             json["error"]["message"]

@@ -8,7 +8,7 @@
 //! - **2026-07-28** (stateless): no `initialize` handshake and no
 //!   `MCP-Session-Id`. Every request carries `MCP-Protocol-Version: 2026-07-28`
 //!   and the SEP-2243 `Mcp-Method` header. Use `server/discover` for capability
-//!   discovery and `messages/listen` for server-push notifications.
+//!   discovery and `subscriptions/listen` for server-push notifications.
 //!
 //! Run with: cargo run --example http_server --features http
 //!
@@ -114,8 +114,8 @@
 //!   -H "Content-Type: application/json" \
 //!   -H "Accept: text/event-stream" \
 //!   -H "MCP-Protocol-Version: 2026-07-28" \
-//!   -H "Mcp-Method: messages/listen" \
-//!   -d '{"jsonrpc":"2.0","id":4,"method":"messages/listen","params":{}}'
+//!   -H "Mcp-Method: subscriptions/listen" \
+//!   -d '{"jsonrpc":"2.0","id":4,"method":"subscriptions/listen","params":{}}'
 //! ```
 
 use std::time::Duration;

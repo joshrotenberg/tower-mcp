@@ -33,7 +33,7 @@
 //!
 //! All validation failures return a JSON-RPC error with code
 //! [`McpErrorCode::HeaderMismatch`](crate::error::McpErrorCode::HeaderMismatch)
-//! (-32001) and HTTP status `400 Bad Request`.
+//! (-32020) and HTTP status `400 Bad Request`.
 //!
 //! ## Version gating
 //!
@@ -386,7 +386,7 @@ mod tests {
     fn strict_missing_mcp_method_is_error() {
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": "ping"});
         let err = validate(&hm(&[]), &body, Sep2243Mode::Strict).unwrap_err();
-        assert_eq!(err.code, -32001);
+        assert_eq!(err.code, -32020);
         assert!(err.message.contains("Mcp-Method"));
     }
 
@@ -401,7 +401,7 @@ mod tests {
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
         for mode in [Sep2243Mode::Strict, Sep2243Mode::Lenient] {
             let err = validate(&hm(&[("mcp-method", "ping")]), &body, mode).unwrap_err();
-            assert_eq!(err.code, -32001, "mode={mode:?}");
+            assert_eq!(err.code, -32020, "mode={mode:?}");
             assert!(err.message.contains("Mcp-Method"));
         }
     }
@@ -419,7 +419,7 @@ mod tests {
             Sep2243Mode::Strict,
         )
         .unwrap_err();
-        assert_eq!(err.code, -32001);
+        assert_eq!(err.code, -32020);
     }
 
     #[test]
@@ -432,7 +432,7 @@ mod tests {
             Sep2243Mode::Strict,
         )
         .unwrap_err();
-        assert_eq!(err.code, -32001);
+        assert_eq!(err.code, -32020);
         assert!(err.message.contains("Mcp-Name"));
     }
 
@@ -470,7 +470,7 @@ mod tests {
             Sep2243Mode::Lenient,
         )
         .unwrap_err();
-        assert_eq!(err.code, -32001);
+        assert_eq!(err.code, -32020);
     }
 
     #[test]
@@ -569,7 +569,7 @@ mod tests {
             Sep2243Mode::Strict,
         )
         .unwrap_err();
-        assert_eq!(err.code, -32001);
+        assert_eq!(err.code, -32020);
         assert!(err.message.contains("Base64"));
     }
 
@@ -609,7 +609,7 @@ mod tests {
             Sep2243Mode::Strict,
         )
         .unwrap_err();
-        assert_eq!(err.code, -32001);
+        assert_eq!(err.code, -32020);
         assert!(err.message.contains("Mcp-Param-region"));
     }
 
@@ -689,7 +689,7 @@ mod tests {
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                           "params": {"name": "x", "arguments": {"region": "c"}}});
         let err = validate(&h, &body, Sep2243Mode::Strict).unwrap_err();
-        assert_eq!(err.code, -32001);
+        assert_eq!(err.code, -32020);
     }
 
     #[test]
@@ -707,7 +707,7 @@ mod tests {
             h.insert(name, axum::http::HeaderValue::from_static("x"));
             let body = json!({"jsonrpc": "2.0", "id": 1, "method": "ping"});
             let err = validate(&h, &body, Sep2243Mode::Strict).unwrap_err();
-            assert_eq!(err.code, -32001);
+            assert_eq!(err.code, -32020);
             assert!(err.message.contains("empty suffix"));
         }
     }

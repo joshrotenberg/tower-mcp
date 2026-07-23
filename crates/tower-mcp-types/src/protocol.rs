@@ -36,7 +36,7 @@ pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-03-26"];
 /// (codegen, conformance harnesses) can reference it explicitly.
 ///
 /// Once the implementation is feature-complete (sessionless transport,
-/// `server/discover`, `messages/listen`, per-request `_meta` capabilities;
+/// `server/discover`, `subscriptions/listen`, per-request `_meta` capabilities;
 /// see [tower-mcp#814]) this value will move into
 /// [`SUPPORTED_PROTOCOL_VERSIONS`] and become the new
 /// [`LATEST_PROTOCOL_VERSION`].
@@ -237,7 +237,7 @@ pub mod notifications {
     /// Log message notification
     pub const MESSAGE: &str = "notifications/message";
     /// Task status changed
-    pub const TASK_STATUS_CHANGED: &str = "notifications/tasks/status";
+    pub const TASK_STATUS_CHANGED: &str = "notifications/tasks";
     /// Elicitation completed (for URL-based elicitation)
     pub const ELICITATION_COMPLETE: &str = "notifications/elicitation/complete";
 }
@@ -396,12 +396,6 @@ pub enum McpRequest {
     ListPrompts(ListPromptsParams),
     /// Get a prompt
     GetPrompt(GetPromptParams),
-    /// List tasks.
-    ///
-    /// Removed from the core protocol by SEP-2663 (the tasks extension drops
-    /// `tasks/list` entirely). Kept here as a legacy parsing target so 2025-11-25
-    /// clients are not broken; new clients should not send this method.
-    ListTasks(ListTasksParams),
     /// Get task info (`tasks/get`).
     GetTaskInfo(GetTaskInfoParams),
     /// Update an in-flight task with `inputResponses` (`tasks/update`).
@@ -410,12 +404,6 @@ pub enum McpRequest {
     /// from the 2025-11-25 experimental spec. The response is an empty ack;
     /// task state is observed via `tasks/get`.
     UpdateTask(UpdateTaskParams),
-    /// Legacy `tasks/result` request from the 2025-11-25 experimental spec.
-    ///
-    /// SEP-2663 removes this method (clients are expected to receive
-    /// `MethodNotFound`), but we keep parsing it so 2025-11-25 servers built
-    /// on this crate continue to handle existing clients.
-    GetTaskResult(GetTaskResultParams),
     /// Cancel a task (`tasks/cancel`).
     CancelTask(CancelTaskParams),
     /// Ping (keepalive)
@@ -427,12 +415,12 @@ pub enum McpRequest {
     /// SEP-2575: discover server capabilities without an initialize handshake
     Discover(DiscoverParams),
     /// SEP-2575 / SEP-2567: open a server-to-client notification stream
-    /// (`messages/listen`).
+    /// (`subscriptions/listen`).
     ///
     /// The HTTP transport intercepts this before it reaches the router and
     /// returns an SSE stream. The variant is defined here for client-side
     /// type-safe construction and for any future transport implementations.
-    MessagesListen(MessagesListenParams),
+    SubscriptionsListen(SubscriptionsListenParams),
     /// Unknown method
     Unknown {
         method: String,
@@ -454,16 +442,14 @@ impl McpRequest {
             McpRequest::UnsubscribeResource(_) => "resources/unsubscribe",
             McpRequest::ListPrompts(_) => "prompts/list",
             McpRequest::GetPrompt(_) => "prompts/get",
-            McpRequest::ListTasks(_) => "tasks/list",
             McpRequest::GetTaskInfo(_) => "tasks/get",
             McpRequest::UpdateTask(_) => "tasks/update",
-            McpRequest::GetTaskResult(_) => "tasks/result",
             McpRequest::CancelTask(_) => "tasks/cancel",
             McpRequest::Ping => "ping",
             McpRequest::SetLoggingLevel(_) => "logging/setLevel",
             McpRequest::Complete(_) => "completion/complete",
             McpRequest::Discover(_) => "server/discover",
-            McpRequest::MessagesListen(_) => "messages/listen",
+            McpRequest::SubscriptionsListen(_) => "subscriptions/listen",
             McpRequest::Unknown { method, .. } => method,
         }
     }
@@ -566,29 +552,26 @@ pub enum McpResponse {
     ListPrompts(ListPromptsResult),
     GetPrompt(GetPromptResult),
     CreateTask(CreateTaskResult),
-    ListTasks(ListTasksResult),
     GetTaskInfo(TaskObject),
     /// Ack-only response for `tasks/update` (SEP-2663).
     UpdateTask(EmptyResult),
-    GetTaskResult(CallToolResult),
-    /// Response to `tasks/cancel`.
+    /// Ack-only response for `tasks/cancel` (SEP-2663).
     ///
-    /// Note: SEP-2663 redefines `tasks/cancel` to return an empty ack, but to
-    /// preserve back-compat for 2025-11-25 clients we still surface the task
-    /// state object here. A future release may migrate to the ack-only shape.
-    CancelTask(TaskObject),
+    /// SEP-2663 (final) requires an empty ack; the observable task status is
+    /// polled via `tasks/get` and may remain non-terminal after the ack.
+    CancelTask(EmptyResult),
     SetLoggingLevel(EmptyResult),
     Complete(CompleteResult),
     Pong(EmptyResult),
     /// SEP-2575 `server/discover` response.
     Discover(DiscoverResult),
-    /// SEP-2575 / SEP-2567 `messages/listen` response.
+    /// SEP-2575 / SEP-2567 `subscriptions/listen` response.
     ///
     /// In practice the HTTP transport returns an SSE stream for this method
     /// and never produces this variant. It is provided for completeness and
     /// for potential future transport implementations that want a typed
     /// result.
-    MessagesListen(MessagesListenResult),
+    SubscriptionsListen(SubscriptionsListenResult),
     Empty(EmptyResult),
     /// Raw JSON value for experimental/extension methods.
     Raw(Value),
@@ -1603,12 +1586,12 @@ pub struct DiscoverResult {
 }
 
 // =============================================================================
-// messages/listen (SEP-2575 / SEP-2567)
+// subscriptions/listen (SEP-2575 / SEP-2567)
 // =============================================================================
 
-/// Parameters for the `messages/listen` RPC (SEP-2575 / SEP-2567).
+/// Parameters for the `subscriptions/listen` RPC (SEP-2575 / SEP-2567).
 ///
-/// `messages/listen` is sent by the client over HTTP POST to open a
+/// `subscriptions/listen` is sent by the client over HTTP POST to open a
 /// server-to-client notification stream (SSE). The server responds with
 /// `Content-Type: text/event-stream` and streams zero or more
 /// `notifications/*` events until the client disconnects.
@@ -1620,19 +1603,19 @@ pub struct DiscoverResult {
 /// The struct takes no parameters today; the empty struct is reserved so
 /// future SEPs can add optional fields without breaking callers.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct MessagesListenParams {
+pub struct SubscriptionsListenParams {
     /// Optional protocol-level metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
 }
 
-/// Result of the `messages/listen` RPC.
+/// Result of the `subscriptions/listen` RPC.
 ///
 /// In practice the HTTP transport opens an SSE stream and never serializes
 /// this type as a JSON-RPC result. It is provided for completeness and for
 /// transports that want a typed acknowledgement shape.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct MessagesListenResult {
+pub struct SubscriptionsListenResult {
     /// Optional protocol-level metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
@@ -4308,13 +4291,8 @@ impl McpRequest {
             // `io.modelcontextprotocol/tasks` identifier is the *extension*
             // label used for capability declarations, not a method prefix.
             // `tasks/list` and `tasks/result` are 2025-11-25 experimental
-            // methods that SEP-2663 removes; we still parse them so legacy
-            // clients receive a structured response instead of a transport
-            // error, but server handlers may reject them at their own discretion.
-            "tasks/list" => {
-                let p: ListTasksParams = serde_json::from_value(params).unwrap_or_default();
-                Ok(McpRequest::ListTasks(p))
-            }
+            // methods that final SEP-2663 removes; they intentionally fall
+            // through to `Unknown` so the router answers `MethodNotFound`.
             "tasks/get" => {
                 let p: GetTaskInfoParams = serde_json::from_value(params)?;
                 Ok(McpRequest::GetTaskInfo(p))
@@ -4322,10 +4300,6 @@ impl McpRequest {
             "tasks/update" => {
                 let p: UpdateTaskParams = serde_json::from_value(params)?;
                 Ok(McpRequest::UpdateTask(p))
-            }
-            "tasks/result" => {
-                let p: GetTaskResultParams = serde_json::from_value(params)?;
-                Ok(McpRequest::GetTaskResult(p))
             }
             "tasks/cancel" => {
                 let p: CancelTaskParams = serde_json::from_value(params)?;
@@ -4345,11 +4319,12 @@ impl McpRequest {
                 let p: DiscoverParams = serde_json::from_value(params).unwrap_or_default();
                 Ok(McpRequest::Discover(p))
             }
-            "messages/listen" => {
+            "subscriptions/listen" => {
                 // SEP-2575 / SEP-2567: client-initiated streaming.
                 // Empty-or-missing params is valid.
-                let p: MessagesListenParams = serde_json::from_value(params).unwrap_or_default();
-                Ok(McpRequest::MessagesListen(p))
+                let p: SubscriptionsListenParams =
+                    serde_json::from_value(params).unwrap_or_default();
+                Ok(McpRequest::SubscriptionsListen(p))
             }
             method => Ok(McpRequest::Unknown {
                 method: method.to_string(),
@@ -4467,30 +4442,31 @@ mod tests {
     }
 
     // =========================================================================
-    // SEP-2575 / SEP-2567 (messages/listen) wire-format tests
+    // SEP-2575 / SEP-2567 (subscriptions/listen) wire-format tests
     // =========================================================================
 
     #[test]
-    fn messages_listen_request_round_trips_with_no_params() {
+    fn subscriptions_listen_request_round_trips_with_no_params() {
         // Per SEP-2575 / SEP-2567, params is empty/optional.
-        let no_params = r#"{"jsonrpc":"2.0","id":1,"method":"messages/listen"}"#;
+        let no_params = r#"{"jsonrpc":"2.0","id":1,"method":"subscriptions/listen"}"#;
         let req: JsonRpcRequest = serde_json::from_str(no_params).unwrap();
         let parsed = McpRequest::from_jsonrpc(&req).unwrap();
-        assert!(matches!(parsed, McpRequest::MessagesListen(_)));
-        assert_eq!(parsed.method_name(), "messages/listen");
+        assert!(matches!(parsed, McpRequest::SubscriptionsListen(_)));
+        assert_eq!(parsed.method_name(), "subscriptions/listen");
 
-        let empty_params = r#"{"jsonrpc":"2.0","id":2,"method":"messages/listen","params":{}}"#;
+        let empty_params =
+            r#"{"jsonrpc":"2.0","id":2,"method":"subscriptions/listen","params":{}}"#;
         let req: JsonRpcRequest = serde_json::from_str(empty_params).unwrap();
         let parsed = McpRequest::from_jsonrpc(&req).unwrap();
-        assert!(matches!(parsed, McpRequest::MessagesListen(_)));
+        assert!(matches!(parsed, McpRequest::SubscriptionsListen(_)));
     }
 
     #[test]
-    fn messages_listen_request_serializes_with_correct_method() {
-        let req = JsonRpcRequest::new(42i64, "messages/listen");
+    fn subscriptions_listen_request_serializes_with_correct_method() {
+        let req = JsonRpcRequest::new(42i64, "subscriptions/listen");
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["method"], "messages/listen");
+        assert_eq!(v["method"], "subscriptions/listen");
         assert_eq!(v["jsonrpc"], "2.0");
         assert_eq!(v["id"], 42);
     }
@@ -5893,9 +5869,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_tasks_methods_still_parse_for_back_compat() {
-        // 2025-11-25 method strings remain parseable so servers built against
-        // this crate continue to receive structured requests from legacy clients.
+    fn final_tasks_methods_parse() {
+        // The SEP-2663 (final) method set: tasks/get, tasks/update,
+        // tasks/cancel. tasks/list and tasks/result are removed.
         for (method, params, expected_name) in [
             (
                 "tasks/get",
@@ -5907,17 +5883,32 @@ mod tests {
                 serde_json::json!({ "taskId": "x" }),
                 "tasks/cancel",
             ),
-            (
-                "tasks/result",
-                serde_json::json!({ "taskId": "x" }),
-                "tasks/result",
-            ),
-            ("tasks/list", serde_json::json!({}), "tasks/list"),
         ] {
             let req = JsonRpcRequest::new(1, method).with_params(params);
             let parsed = McpRequest::from_jsonrpc(&req)
-                .unwrap_or_else(|e| panic!("failed to parse legacy {method}: {e:?}"));
+                .unwrap_or_else(|e| panic!("failed to parse {method}: {e:?}"));
             assert_eq!(parsed.method_name(), expected_name);
+        }
+    }
+
+    #[test]
+    fn removed_tasks_methods_fall_through_to_unknown() {
+        // Final SEP-2663 removes tasks/list and tasks/result; they must not
+        // parse into typed requests. Falling through to `Unknown` makes the
+        // router answer MethodNotFound (-32601), which is the spec-required
+        // behavior for removed methods.
+        for (method, params) in [
+            ("tasks/list", serde_json::json!({})),
+            ("tasks/result", serde_json::json!({ "taskId": "x" })),
+        ] {
+            let req = JsonRpcRequest::new(1, method).with_params(params);
+            let parsed = McpRequest::from_jsonrpc(&req)
+                .unwrap_or_else(|e| panic!("failed to parse {method}: {e:?}"));
+            assert!(
+                matches!(parsed, McpRequest::Unknown { .. }),
+                "{method} must fall through to Unknown, got {}",
+                parsed.method_name()
+            );
         }
     }
 
