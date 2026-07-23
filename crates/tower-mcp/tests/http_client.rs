@@ -2690,3 +2690,27 @@ async fn initialized_notification_ordering_under_strict_server() {
         .expect("tools/list must not be rejected: initialized must be acknowledged first");
     assert!(!tools.tools.is_empty());
 }
+
+/// #983 regression: a 404 on the very first request (no session yet) is a
+/// wrong endpoint path, not an expired session. It must surface as a
+/// transport error naming the status and URL, never as SessionExpired.
+#[tokio::test]
+async fn pre_session_404_reports_endpoint_not_found() {
+    let (url, _server) = start_server().await;
+    // The MCP endpoint of the test server is the root path; /nope is a 404.
+    let transport = HttpClientTransport::new(format!("{url}/nope"));
+    let client = McpClient::connect(transport).await.unwrap();
+    let err = client
+        .initialize("wrong-path", "1.0.0")
+        .await
+        .expect_err("initialize against a wrong path must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("404") && msg.contains("/nope") && msg.contains("endpoint"),
+        "expected an endpoint-not-found transport error, got: {msg}"
+    );
+    assert!(
+        !msg.to_lowercase().contains("session"),
+        "must not be reported as a session error, got: {msg}"
+    );
+}

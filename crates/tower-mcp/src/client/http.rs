@@ -711,8 +711,22 @@ impl ClientTransport for HttpClientTransport {
         }
 
         if !status.is_success() {
-            if status == reqwest::StatusCode::NOT_FOUND && self.config.session_recovery {
+            // 404 only signals an expired session once a session exists.
+            // Before that (the initial `initialize`), a 404 means the URL is
+            // wrong, and reporting it as "Session expired" sends users
+            // hunting session bugs instead of checking the endpoint path.
+            if status == reqwest::StatusCode::NOT_FOUND
+                && self.config.session_recovery
+                && self.session_id.is_some()
+            {
                 return Err(Error::SessionExpired);
+            }
+            if status == reqwest::StatusCode::NOT_FOUND && self.session_id.is_none() {
+                return Err(Error::Transport(format!(
+                    "HTTP 404 from {}: MCP endpoint not found (check the endpoint path; \
+                     some servers serve MCP at the root, others at /mcp)",
+                    self.url
+                )));
             }
             let body = response.text().await.unwrap_or_default();
             return Err(Error::Transport(format!(
