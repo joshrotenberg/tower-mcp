@@ -63,14 +63,15 @@ use tokio::task::JoinHandle;
 
 use crate::error::{Error, Result};
 use crate::protocol::{
-    CallToolParams, CallToolResult, ClientCapabilities, CompleteParams, CompleteResult,
-    CompletionArgument, CompletionReference, ElicitationCapability, GetPromptParams,
-    GetPromptResult, Implementation, InitializeParams, InitializeResult, JsonRpcNotification,
-    JsonRpcRequest, ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams,
-    ListResourceTemplatesResult, ListResourcesParams, ListResourcesResult, ListRootsResult,
-    ListToolsParams, ListToolsResult, PromptDefinition, ReadResourceParams, ReadResourceResult,
-    RequestId, ResourceDefinition, ResourceTemplateDefinition, Root, RootsCapability,
-    SamplingCapability, ToolDefinition, notifications,
+    CallToolParams, CallToolResult, CancelTaskParams, ClientCapabilities, CompleteParams,
+    CompleteResult, CompletionArgument, CompletionReference, CreateTaskResult,
+    ElicitationCapability, GetPromptParams, GetPromptResult, GetTaskInfoParams, Implementation,
+    InitializeParams, InitializeResult, JsonRpcNotification, JsonRpcRequest, ListPromptsParams,
+    ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
+    ListResourcesParams, ListResourcesResult, ListRootsResult, ListToolsParams, ListToolsResult,
+    PromptDefinition, ReadResourceParams, ReadResourceResult, RequestId, ResourceDefinition,
+    ResourceTemplateDefinition, Root, RootsCapability, SamplingCapability, TaskObject,
+    TaskRequestParams, ToolDefinition, notifications,
 };
 use tower_mcp_types::JsonRpcError;
 
@@ -390,6 +391,85 @@ impl McpClient {
             task: None,
         };
         self.send_request("tools/call", &params).await
+    }
+
+    /// Make a task-augmented tool call (SEP-2663).
+    ///
+    /// Instead of blocking until the tool finishes, the server creates a
+    /// task and immediately returns a [`CreateTaskResult`] carrying the task
+    /// id. Poll with [`task_get`](Self::task_get) or block with
+    /// [`task_wait`](Self::task_wait); a completed task's `result` field
+    /// carries the [`CallToolResult`] the synchronous call would have
+    /// returned.
+    ///
+    /// `ttl_ms` is the requested task time-to-live in milliseconds; `None`
+    /// lets the server choose. The tool must support task execution
+    /// (advertised via the server's tasks capability); servers reject
+    /// task-augmented calls to unsupported tools.
+    pub async fn call_tool_as_task(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+        ttl_ms: Option<u64>,
+    ) -> Result<CreateTaskResult> {
+        self.ensure_initialized()?;
+        let params = CallToolParams {
+            name: name.to_string(),
+            arguments,
+            meta: None,
+            task: Some(TaskRequestParams { ttl: ttl_ms }),
+        };
+        self.send_request("tools/call", &params).await
+    }
+
+    /// Fetch a task's current state via `tasks/get` (SEP-2663).
+    ///
+    /// For `completed` tasks the returned object carries the terminal
+    /// [`CallToolResult`] in its `result` field; for `failed` tasks the
+    /// JSON-RPC error is in `error`. Unknown or expired task ids surface as
+    /// an invalid-params error from the server.
+    pub async fn task_get(&self, task_id: &str) -> Result<TaskObject> {
+        self.ensure_initialized()?;
+        let params = GetTaskInfoParams {
+            task_id: task_id.to_string(),
+            meta: None,
+        };
+        self.send_request("tasks/get", &params).await
+    }
+
+    /// Cancel a task via `tasks/cancel` (SEP-2663).
+    ///
+    /// Cancellation is cooperative: the acknowledgment is an empty result
+    /// and the observable status may remain non-terminal for a while after
+    /// the ack; poll [`task_get`](Self::task_get) to observe the terminal
+    /// state. The ack body is discarded, so legacy peers that return the
+    /// task object are also tolerated.
+    pub async fn task_cancel(&self, task_id: &str, reason: Option<String>) -> Result<()> {
+        self.ensure_initialized()?;
+        let params = CancelTaskParams {
+            task_id: task_id.to_string(),
+            reason,
+            meta: None,
+        };
+        let _ack: serde_json::Value = self.send_request("tasks/cancel", &params).await?;
+        Ok(())
+    }
+
+    /// Poll `tasks/get` until the task reaches a terminal state.
+    ///
+    /// Honors the server's suggested `pollInterval` (default 1000 ms,
+    /// clamped to 50 ms..30 s). A task purged after its TTL surfaces as the
+    /// server's task-not-found error. Wrap in
+    /// [`tokio::time::timeout`] to bound the overall wait.
+    pub async fn task_wait(&self, task_id: &str) -> Result<TaskObject> {
+        loop {
+            let task = self.task_get(task_id).await?;
+            if task.status.is_terminal() {
+                return Ok(task);
+            }
+            let interval_ms = task.poll_interval.unwrap_or(1000).clamp(50, 30_000);
+            tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
+        }
     }
 
     /// List available resources.

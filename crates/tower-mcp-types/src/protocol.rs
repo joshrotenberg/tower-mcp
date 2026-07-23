@@ -3430,6 +3430,15 @@ pub struct TaskObject {
     /// Suggested polling interval in milliseconds
     #[serde(skip_serializing_if = "Option::is_none")]
     pub poll_interval: Option<u64>,
+    /// SEP-2663 DetailedTask payload for `completed` tasks: exactly the
+    /// result the synchronous request would have returned. Absent for
+    /// non-terminal and non-completed statuses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<CallToolResult>,
+    /// SEP-2663 DetailedTask payload for `failed` tasks: the JSON-RPC error
+    /// object describing the execution failure. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<crate::error::JsonRpcError>,
     /// Optional protocol-level metadata
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
@@ -5818,6 +5827,8 @@ mod tests {
             last_updated_at: "2025-11-25T10:30:00Z".into(),
             ttl: Some(60_000),
             poll_interval: Some(5_000),
+            result: None,
+            error: None,
             meta: None,
         }
     }
