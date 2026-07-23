@@ -23,6 +23,22 @@ cargo run -p mcp-repl -- cargo run --example getting_started
 cargo run -p mcp-repl -- --http http://127.0.0.1:3001/mcp
 ```
 
+### Try it against a live server
+
+[cratesio-mcp](https://github.com/joshrotenberg/cratesio-mcp) (an MCP server
+for the crates.io registry, also built on tower-mcp) runs a public instance:
+
+```bash
+cargo run -p mcp-repl -- --http https://cratesio-mcp.fly.dev/
+```
+
+```text
+cratesio-mcp> search_crates query=tower-mcp per_page=3
+cratesio-mcp> get_crate_health name=serde
+cratesio-mcp> read crates://tokio/info
+cratesio-mcp> prompt analyze_crate crate_name=axum
+```
+
 ## What to try
 
 ```text
@@ -97,6 +113,14 @@ and description are shown, empty input accepts the default, and EOF
 cancels. Try `test_elicitation` against the conformance server. If a
 background task elicits while the editor owns the terminal, the request is
 declined rather than fighting the editor for stdin.
+
+## Related tools
+
+- [mcp-probe](https://github.com/conikeec/mcp-probe): a Rust TUI debugging
+  toolkit for MCP servers (ratatui dashboard, protocol analysis, timing
+  metrics, compliance checks). Complementary rather than overlapping:
+  mcp-probe is a debugging platform you inspect a server with; mcp-repl is a
+  shell you drive one from.
 
 ## Notes
 
