@@ -7,7 +7,7 @@ license.workspace = true
 repository = "https://github.com/joshrotenberg/tower-mcp"
 readme = "README.md"
 description = "Interactive MCP client REPL: connects to any MCP server and turns its tools, prompts, and resources into the command set"
-keywords = ["mcp", "repl", "cli", "client", "model-context-protocol"]
+keywords = ["mcp", "repl", "cli", "client", "protocol"]
 categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
