@@ -1682,18 +1682,29 @@ async fn test_task_list_after_creation() {
         _ => panic!("unexpected response variant"),
     };
 
-    // List tasks
+    // tasks/list is removed by final SEP-2663: expect MethodNotFound. The
+    // created task remains observable via tasks/get.
     let list_req = JsonRpcRequest::new(3, "tasks/list");
     let resp = service.call_single(list_req).await.unwrap();
 
     match resp {
+        JsonRpcResponse::Error(e) => {
+            assert_eq!(e.error.code, -32601, "tasks/list must be MethodNotFound");
+        }
         JsonRpcResponse::Result(r) => {
-            let tasks = r.result.get("tasks").unwrap().as_array().unwrap();
-            assert!(!tasks.is_empty(), "tasks list should not be empty");
-            let found = tasks
-                .iter()
-                .any(|t| t.get("taskId").unwrap().as_str().unwrap() == task_id);
-            assert!(found, "created task should be in the list");
+            panic!("tasks/list is removed by SEP-2663, got result: {:?}", r)
+        }
+        _ => panic!("unexpected response variant"),
+    }
+
+    // The task itself is still tracked.
+    let get_req = JsonRpcRequest::new(4, "tasks/get").with_params(serde_json::json!({
+        "taskId": task_id
+    }));
+    let resp = service.call_single(get_req).await.unwrap();
+    match resp {
+        JsonRpcResponse::Result(r) => {
+            assert_eq!(r.result["taskId"].as_str().unwrap(), task_id);
         }
         JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
         _ => panic!("unexpected response variant"),
@@ -1772,24 +1783,32 @@ async fn test_task_lifecycle_get_result() {
     // Wait briefly for the spawned task to complete
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-    // Get task result
+    // tasks/result is removed by final SEP-2663: expect MethodNotFound.
     let result_req = JsonRpcRequest::new(3, "tasks/result").with_params(serde_json::json!({
         "taskId": task_id
     }));
     let resp = service.call_single(result_req).await.unwrap();
 
     match resp {
+        JsonRpcResponse::Error(e) => {
+            assert_eq!(e.error.code, -32601, "tasks/result must be MethodNotFound");
+        }
         JsonRpcResponse::Result(r) => {
-            let content = r.result.get("content").unwrap().as_array().unwrap();
-            let text = content[0].get("text").unwrap().as_str().unwrap();
-            assert_eq!(text, "task result");
+            panic!("tasks/result is removed by SEP-2663, got result: {:?}", r)
+        }
+        _ => panic!("unexpected response variant"),
+    }
 
-            // Check _meta contains related-task
-            let meta = r.result.get("_meta").expect("result should have '_meta'");
-            let related_task = meta
-                .get("io.modelcontextprotocol/related-task")
-                .expect("_meta should have related-task");
-            assert_eq!(related_task["taskId"].as_str().unwrap(), task_id);
+    // Completion is observed by polling tasks/get. (Returning the terminal
+    // result payload on tasks/get is the phase 4 DetailedTask work, #951.)
+    let get_req = JsonRpcRequest::new(4, "tasks/get").with_params(serde_json::json!({
+        "taskId": task_id
+    }));
+    let resp = service.call_single(get_req).await.unwrap();
+    match resp {
+        JsonRpcResponse::Result(r) => {
+            assert_eq!(r.result["taskId"].as_str().unwrap(), task_id);
+            assert_eq!(r.result["status"].as_str().unwrap(), "completed");
         }
         JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
         _ => panic!("unexpected response variant"),
@@ -1816,13 +1835,30 @@ async fn test_task_cancel() {
         _ => panic!("unexpected response variant"),
     };
 
-    // Cancel the task
+    // Cancel the task. SEP-2663 (final): the ack is an empty result; the
+    // observable status is polled via tasks/get.
     let cancel_req = JsonRpcRequest::new(3, "tasks/cancel").with_params(serde_json::json!({
         "taskId": task_id,
         "reason": "Testing cancellation"
     }));
     let resp = service.call_single(cancel_req).await.unwrap();
 
+    match resp {
+        JsonRpcResponse::Result(r) => {
+            assert!(
+                r.result.as_object().is_some_and(|o| o.is_empty()),
+                "cancel ack must be an empty result, got: {:?}",
+                r.result
+            );
+        }
+        JsonRpcResponse::Error(e) => panic!("Expected success, got error: {:?}", e),
+        _ => panic!("unexpected response variant"),
+    }
+
+    let get_req = JsonRpcRequest::new(4, "tasks/get").with_params(serde_json::json!({
+        "taskId": task_id
+    }));
+    let resp = service.call_single(get_req).await.unwrap();
     match resp {
         JsonRpcResponse::Result(r) => {
             assert_eq!(r.result["status"].as_str().unwrap(), "cancelled");
@@ -1947,7 +1983,10 @@ async fn test_task_capabilities_advertised() {
             let tasks = caps
                 .get("tasks")
                 .expect("capabilities should include 'tasks' (back-compat)");
-            assert!(tasks.get("list").is_some(), "tasks should have 'list'");
+            assert!(
+                tasks.get("list").is_none(),
+                "tasks must not advertise 'list': final SEP-2663 removes tasks/list"
+            );
             assert!(tasks.get("cancel").is_some(), "tasks should have 'cancel'");
             let requests = tasks.get("requests").expect("tasks should have 'requests'");
             assert!(

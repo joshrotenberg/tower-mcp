@@ -153,7 +153,7 @@ jobs:
           echo "$response" | grep -q '"no meta"' || { echo "FAIL: expected 'no meta' text"; exit 1; }
           echo "PASS: absent _meta returns 'no meta'"
 
-      - name: Check messages/listen opens SSE stream with 2026-07-28 (#868)
+      - name: Check subscriptions/listen opens SSE stream with 2026-07-28 (#868)
         run: |
           # Step 1: establish a 2025-11-25 session to get an mcp-session-id.
           # (2026-07-28 initialize is stateless and returns no session ID.)
@@ -178,17 +178,17 @@ jobs:
             -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
             -o /dev/null
 
-          # Step 2: open messages/listen SSE stream in the background, capture output.
+          # Step 2: open subscriptions/listen SSE stream in the background, capture output.
           # Sending MCP-Protocol-Version: 2026-07-28 on the request overrides the
           # session's negotiated version and enables the SSE stream.
           curl -s --max-time 5 \
             -X POST http://127.0.0.1:3001/mcp \
             -H "Content-Type: application/json" \
             -H "MCP-Protocol-Version: 2026-07-28" \
-            -H "Mcp-Method: messages/listen" \
+            -H "Mcp-Method: subscriptions/listen" \
             -H "Accept: text/event-stream" \
             -H "mcp-session-id: $session_id" \
-            -d '{"jsonrpc":"2.0","id":5,"method":"messages/listen","params":{}}' \
+            -d '{"jsonrpc":"2.0","id":5,"method":"subscriptions/listen","params":{}}' \
             -o /tmp/sse-stream.txt &
           SSE_PID=$!
           sleep 1
@@ -199,12 +199,12 @@ jobs:
             -X POST http://127.0.0.1:3001/mcp \
             -H "Content-Type: application/json" \
             -H "MCP-Protocol-Version: 2026-07-28" \
-            -H "Mcp-Method: messages/listen" \
+            -H "Mcp-Method: subscriptions/listen" \
             -H "Accept: text/event-stream" \
-            -d '{"jsonrpc":"2.0","id":6,"method":"messages/listen","params":{}}' || true)
-          echo "messages/listen Content-Type: $content_type"
+            -d '{"jsonrpc":"2.0","id":6,"method":"subscriptions/listen","params":{}}' || true)
+          echo "subscriptions/listen Content-Type: $content_type"
           echo "$content_type" | grep -q "text/event-stream" || { echo "FAIL: expected text/event-stream"; kill $SSE_PID 2>/dev/null; exit 1; }
-          echo "PASS: messages/listen returns SSE stream for 2026-07-28"
+          echo "PASS: subscriptions/listen returns SSE stream for 2026-07-28"
 
           # Step 4: trigger log notifications on the established session.
           # test_tool_with_logging sends three log notifications via ctx.send_log().
@@ -222,27 +222,27 @@ jobs:
           echo "SSE stream output:"
           cat /tmp/sse-stream.txt
           grep -q "^data:" /tmp/sse-stream.txt || { echo "FAIL: no data: lines in SSE stream"; exit 1; }
-          echo "PASS: notification event appeared in messages/listen SSE stream"
+          echo "PASS: notification event appeared in subscriptions/listen SSE stream"
 
-      - name: Check messages/listen returns JSON-RPC error without 2026-07-28 (#868)
+      - name: Check subscriptions/listen returns JSON-RPC error without 2026-07-28 (#868)
         run: |
-          # Without MCP-Protocol-Version: 2026-07-28, messages/listen must NOT
+          # Without MCP-Protocol-Version: 2026-07-28, subscriptions/listen must NOT
           # return an SSE stream. The 2025-11-25 server returns MethodNotFound
-          # (-32601) because messages/listen is a 2026-07-28-only method.
+          # (-32601) because subscriptions/listen is a 2026-07-28-only method.
           # We assert the error code is exactly -32601 and no SSE stream is returned.
-          content_type=$(curl -s -o /tmp/messages-listen-legacy.json \
+          content_type=$(curl -s -o /tmp/subscriptions-listen-legacy.json \
             -w "%{content_type}" \
             --max-time 3 \
             -X POST http://127.0.0.1:3001/mcp \
             -H "Content-Type: application/json" \
-            -d '{"jsonrpc":"2.0","id":8,"method":"messages/listen","params":{}}' || true)
-          response=$(cat /tmp/messages-listen-legacy.json)
-          echo "Legacy messages/listen Content-Type: $content_type"
-          echo "Legacy messages/listen body: $response"
+            -d '{"jsonrpc":"2.0","id":8,"method":"subscriptions/listen","params":{}}' || true)
+          response=$(cat /tmp/subscriptions-listen-legacy.json)
+          echo "Legacy subscriptions/listen Content-Type: $content_type"
+          echo "Legacy subscriptions/listen body: $response"
           echo "$content_type" | grep -vq "text/event-stream" || { echo "FAIL: must not return SSE stream without 2026-07-28"; exit 1; }
           echo "$response" | grep -q '"error"' || { echo "FAIL: expected a JSON-RPC error field"; exit 1; }
           echo "$response" | grep -q -- '-32601' || { echo "FAIL: expected MethodNotFound error code -32601"; exit 1; }
-          echo "PASS: messages/listen returns MethodNotFound (-32601) without 2026-07-28 version"
+          echo "PASS: subscriptions/listen returns MethodNotFound (-32601) without 2026-07-28 version"
 
       - name: Show server logs on failure
         if: failure()

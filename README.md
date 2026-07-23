@@ -117,7 +117,7 @@ use tower_mcp::schemars::JsonSchema;
 | `proxy` | Multi-server aggregation proxy (`McpProxy`) |
 | `macros` | Optional proc macros (`#[tool_fn]`, `#[prompt_fn]`, `#[resource_fn]`, `#[resource_template_fn]`) |
 | `resilience` | Re-export tower-resilience circuit breaker, rate limiter, and bulkhead layers |
-| `stateless` | Experimental 2026-07-28 stateless protocol mode (SEP-2575 final + SEP-2567 accepted) -- version-gated sessionless dispatch, `server/discover` RPC, `messages/listen` SSE endpoint, per-request `_meta` client capabilities. Requires `http`. |
+| `stateless` | Experimental 2026-07-28 stateless protocol mode (SEP-2575 final + SEP-2567 accepted) -- version-gated sessionless dispatch, `server/discover` RPC, `subscriptions/listen` SSE endpoint, per-request `_meta` client capabilities. Requires `http`. |
 
 Example with features:
 
@@ -591,7 +591,7 @@ tower-mcp targets the [MCP specification 2025-11-25](https://modelcontextprotoco
 Numbers above are from `@modelcontextprotocol/conformance@0.1.15`, run on every PR. Because the suite is upstream-maintained and grows with the spec, these counts shift as new scenarios are added -- treat the green CI badge as the source of truth, not any single snapshot.
 
 The `stateless` feature enables an experimental 2026-07-28 protocol path (version-gated, behind
-`MCP-Protocol-Version: 2026-07-28`) covering `server/discover`, `messages/listen`, and per-request
+`MCP-Protocol-Version: 2026-07-28`) covering `server/discover`, `subscriptions/listen`, and per-request
 `_meta` capabilities as defined by SEP-2575 (final) and SEP-2567 (accepted). The 2026-07-28
 version is not yet stable and is not included in `SUPPORTED_PROTOCOL_VERSIONS`.
 
@@ -623,7 +623,7 @@ version is not yet stable and is not included in `SUPPORTED_PROTOCOL_VERSIONS`.
 - [x] [`_meta` field on all protocol types](https://modelcontextprotocol.io/specification/2025-11-25)
 - [x] [Strict HTTP headers: `Mcp-Method`, `Mcp-Name`, `MCP-Protocol-Version` (SEP-2243)](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2243) (final)
 - [x] [`server/discover` RPC -- stateless capability discovery (SEP-2575)](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2575) (requires `stateless` feature, 2026-07-28+)
-- [x] [`messages/listen` SSE endpoint -- client-initiated server-push stream (SEP-2567)](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2567) (requires `stateless` feature, 2026-07-28+)
+- [x] [`subscriptions/listen` SSE endpoint -- client-initiated server-push stream (SEP-2567)](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2567) (requires `stateless` feature, 2026-07-28+)
 - [x] [Per-request `_meta` client capabilities -- `StatelessRequestMeta` (SEP-2575)](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2575) (requires `stateless` feature, 2026-07-28+)
 
 We track all MCP Specification Enhancement Proposals (SEPs) as [GitHub issues](https://github.com/joshrotenberg/tower-mcp/issues?q=label%3Asep). A weekly workflow syncs status from the upstream spec repository.

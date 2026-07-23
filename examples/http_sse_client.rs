@@ -4,8 +4,8 @@
 //! initializes a session, receives an `MCP-Session-Id`, and opens a
 //! per-session SSE stream via `GET`. Under the 2026-07-28 stateless protocol
 //! there is no session ID; SSE notifications are instead delivered via
-//! `messages/listen` (a `POST` with `Accept: text/event-stream`,
-//! `MCP-Protocol-Version: 2026-07-28`, and `Mcp-Method: messages/listen`).
+//! `subscriptions/listen` (a `POST` with `Accept: text/event-stream`,
+//! `MCP-Protocol-Version: 2026-07-28`, and `Mcp-Method: subscriptions/listen`).
 //! If you are running a 2026-07-28 server, the `GET` stream used here will
 //! not work as expected.
 //!

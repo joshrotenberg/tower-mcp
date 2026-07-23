@@ -1159,7 +1159,7 @@ mod tests {
         let json = serialize_notification(&notification).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed["method"], "notifications/tasks/status");
+        assert_eq!(parsed["method"], "notifications/tasks");
         assert_eq!(parsed["params"]["taskId"], "task-42");
         assert_eq!(parsed["params"]["status"], "working");
     }

@@ -158,7 +158,7 @@
 //! - `macros` - Optional proc macros (`#[tool_fn]`, `#[prompt_fn]`, `#[resource_fn]`, `#[resource_template_fn]`)
 //! - `stateless` - Experimental 2026-07-28 stateless protocol mode (SEP-2575 + SEP-2567). Enables
 //!   version-gated sessionless dispatch, `server/discover` RPC, per-request `_meta` via
-//!   [`stateless::StatelessRequestMeta`], and `messages/listen` SSE endpoint. Requires `http`.
+//!   [`stateless::StatelessRequestMeta`], and `subscriptions/listen` SSE endpoint. Requires `http`.
 //!
 //! ## Middleware Placement Guide
 //!
@@ -341,9 +341,10 @@
 //! - **`server/discover`** -- stateless capability discovery. Clients that send requests with
 //!   `MCP-Protocol-Version: 2026-07-28` (SEP-2243 header) can call `server/discover` instead
 //!   of `initialize` to learn what the server supports without establishing a session.
-//! - **`messages/listen`** -- client-initiated SSE subscription. A GET to `/mcp` with
-//!   `MCP-Protocol-Version: 2026-07-28` opens a server-push stream that is not tied to any
-//!   session, allowing stateless clients to receive notifications.
+//! - **`subscriptions/listen`** -- client-initiated SSE subscription. A POST of a
+//!   `subscriptions/listen` request with `MCP-Protocol-Version: 2026-07-28` opens a
+//!   server-push stream that is not tied to any session, allowing stateless clients to
+//!   receive notifications.
 //!
 //! Per-request client identity and capabilities ride in each request's `_meta` object via
 //! [`stateless::StatelessRequestMeta`] rather than being negotiated once at session open.
@@ -432,7 +433,7 @@
 //!
 //! The `stateless` feature additionally tracks the upcoming 2026-07-28 protocol defined by:
 //! - [SEP-2567](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2567) (accepted) --
-//!   `messages/listen` SSE endpoint
+//!   `subscriptions/listen` SSE endpoint
 //! - [SEP-2575](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2575) (final) --
 //!   stateless session model, `server/discover`, per-request `_meta`
 //! - [SEP-2243](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2243) (final) --

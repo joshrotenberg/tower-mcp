@@ -10,7 +10,7 @@
 //! - Every request includes `Mcp-Method: <method>` (SEP-2243).
 //! - `tools/call` requests include `Mcp-Name: <tool-name>` (SEP-2243).
 //! - `server/discover` replaces `initialize` for capability discovery.
-//! - `messages/listen` replaces per-session SSE for server-push notifications.
+//! - `subscriptions/listen` replaces per-session SSE for server-push notifications.
 //!
 //! This example spins up an in-process HTTP server on a random port, then makes
 //! the four stateless requests in sequence and prints the results.
@@ -206,25 +206,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     // -----------------------------------------------------------------------
-    // Step 4: messages/listen
+    // Step 4: subscriptions/listen
     //
     // Opens a server-push SSE stream. In the 2026-07-28 protocol this is a
     // POST (not a GET) with Accept: text/event-stream. The server delivers
     // notifications for any in-flight requests that carry a progressToken.
     // We read for a short window and then disconnect.
     // -----------------------------------------------------------------------
-    println!("=== Step 4: messages/listen (SSE stream, 1-second window) ===");
+    println!("=== Step 4: subscriptions/listen (SSE stream, 1-second window) ===");
 
     let listen_response = client
         .post(&base_url)
         .header("Content-Type", "application/json")
         .header("Accept", "text/event-stream")
         .header("MCP-Protocol-Version", PROTOCOL_VERSION)
-        .header("Mcp-Method", "messages/listen")
+        .header("Mcp-Method", "subscriptions/listen")
         .json(&serde_json::json!({
             "jsonrpc": "2.0",
             "id": 4,
-            "method": "messages/listen",
+            "method": "subscriptions/listen",
             "params": {}
         }))
         .send()

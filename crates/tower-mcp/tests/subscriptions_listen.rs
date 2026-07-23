@@ -1,6 +1,6 @@
-//! Integration tests for the `messages/listen` RPC (SEP-2575 / SEP-2567).
+//! Integration tests for the `subscriptions/listen` RPC (SEP-2575 / SEP-2567).
 //!
-//! `messages/listen` opens a server-to-client notification stream over HTTP
+//! `subscriptions/listen` opens a server-to-client notification stream over HTTP
 //! POST. The server responds with `Content-Type: text/event-stream` (SSE)
 //! when the negotiated or requested protocol version is >= 2026-07-28
 //! (the UPCOMING_PROTOCOL_VERSION). Requests that target an older-protocol
@@ -32,8 +32,8 @@ fn app() -> axum::Router {
         .into_router()
 }
 
-/// POST a `messages/listen` request with the given `Mcp-Protocol-Version` header.
-async fn post_messages_listen(protocol_version: Option<&str>) -> axum::response::Response {
+/// POST a `subscriptions/listen` request with the given `Mcp-Protocol-Version` header.
+async fn post_subscriptions_listen(protocol_version: Option<&str>) -> axum::response::Response {
     let mut builder = Request::builder()
         .method("POST")
         .uri("/")
@@ -46,7 +46,7 @@ async fn post_messages_listen(protocol_version: Option<&str>) -> axum::response:
 
     let request = builder
         .body(Body::from(
-            r#"{"jsonrpc":"2.0","id":1,"method":"messages/listen","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"subscriptions/listen","params":{}}"#,
         ))
         .unwrap();
 
@@ -54,14 +54,14 @@ async fn post_messages_listen(protocol_version: Option<&str>) -> axum::response:
 }
 
 #[tokio::test]
-async fn messages_listen_returns_sse_when_protocol_is_2026_07_28() {
+async fn subscriptions_listen_returns_sse_when_protocol_is_2026_07_28() {
     // Clients that request protocol 2026-07-28 get an SSE stream back.
-    let response = post_messages_listen(Some("2026-07-28")).await;
+    let response = post_subscriptions_listen(Some("2026-07-28")).await;
 
     assert_eq!(
         response.status(),
         StatusCode::OK,
-        "expected 200 OK for messages/listen with protocol 2026-07-28"
+        "expected 200 OK for subscriptions/listen with protocol 2026-07-28"
     );
 
     let content_type = response
@@ -77,11 +77,11 @@ async fn messages_listen_returns_sse_when_protocol_is_2026_07_28() {
 }
 
 #[tokio::test]
-async fn messages_listen_returns_method_not_found_for_old_protocol() {
+async fn subscriptions_listen_returns_method_not_found_for_old_protocol() {
     // Without a 2026-07-28 Mcp-Protocol-Version header, the session falls back
     // to the 2025-11-25 negotiated version, which does not support
-    // messages/listen. The server must return a JSON-RPC Method Not Found error.
-    let response = post_messages_listen(None).await;
+    // subscriptions/listen. The server must return a JSON-RPC Method Not Found error.
+    let response = post_subscriptions_listen(None).await;
 
     // JSON-RPC errors ride on 200 OK at the HTTP level.
     assert_eq!(
@@ -131,7 +131,7 @@ async fn messages_listen_returns_method_not_found_for_old_protocol() {
     );
 }
 
-/// Initialize with 2025-11-25 (creates a session), then POST `messages/listen`
+/// Initialize with 2025-11-25 (creates a session), then POST `subscriptions/listen`
 /// with a per-request `Mcp-Protocol-Version: 2026-07-28` header.
 ///
 /// This exercises the header-override branch in `handle_post`: the session was
@@ -139,7 +139,7 @@ async fn messages_listen_returns_method_not_found_for_old_protocol() {
 /// version to 2026-07-28, which enables the SSE path.
 #[cfg(feature = "stateless")]
 #[tokio::test]
-async fn messages_listen_via_session_with_header_override() {
+async fn subscriptions_listen_via_session_with_header_override() {
     let a = app();
 
     // Step 1: initialize with 2025-11-25 to create a session.
@@ -167,7 +167,7 @@ async fn messages_listen_via_session_with_header_override() {
         .map(|s| s.to_string())
         .expect("initialize response must include mcp-session-id header");
 
-    // Step 2: POST messages/listen with session ID + Mcp-Protocol-Version: 2026-07-28.
+    // Step 2: POST subscriptions/listen with session ID + Mcp-Protocol-Version: 2026-07-28.
     // The session is at 2025-11-25 but the per-request header overrides the
     // effective version to 2026-07-28, so the server should return SSE.
     let listen_request = Request::builder()
@@ -178,7 +178,7 @@ async fn messages_listen_via_session_with_header_override() {
         .header("mcp-session-id", &session_id)
         .header("Mcp-Protocol-Version", "2026-07-28")
         .body(Body::from(
-            r#"{"jsonrpc":"2.0","id":2,"method":"messages/listen","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"subscriptions/listen","params":{}}"#,
         ))
         .unwrap();
 
@@ -186,7 +186,7 @@ async fn messages_listen_via_session_with_header_override() {
     assert_eq!(
         listen_resp.status(),
         StatusCode::OK,
-        "messages/listen with header override must return 200"
+        "subscriptions/listen with header override must return 200"
     );
 
     let content_type = listen_resp
@@ -210,24 +210,24 @@ async fn messages_listen_via_session_with_header_override() {
 /// `initialize` handshake, so the pure headerless fallback path cannot be
 /// exercised through the HTTP API without the per-request header override.
 ///
-/// The header-override test (`messages_listen_via_session_with_header_override`)
+/// The header-override test (`subscriptions_listen_via_session_with_header_override`)
 /// covers the adjacent code path; this placeholder documents the gap.
 ///
 /// If 2026-07-28 is promoted to `SUPPORTED_PROTOCOL_VERSIONS`, this test can
 /// be filled in: initialize without the stateless feature, capture the session
-/// ID, and POST `messages/listen` with only the session ID header (no
+/// ID, and POST `subscriptions/listen` with only the session ID header (no
 /// `Mcp-Protocol-Version`).
 #[cfg(not(feature = "stateless"))]
 #[tokio::test]
-async fn messages_listen_session_fallback_placeholder() {
+async fn subscriptions_listen_session_fallback_placeholder() {
     // When 2026-07-28 is in SUPPORTED_PROTOCOL_VERSIONS, initialize with that
     // version (no stateless feature), capture the session ID, then POST
-    // messages/listen with no Mcp-Protocol-Version header. The session record
+    // subscriptions/listen with no Mcp-Protocol-Version header. The session record
     // will carry 2026-07-28 and the server should return SSE.
     //
     // For now: just verify the existing 2025-11-25 path (no header = MethodNotFound)
     // still works correctly, confirming the test runs in CI.
-    let response = post_messages_listen(None).await;
+    let response = post_subscriptions_listen(None).await;
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await

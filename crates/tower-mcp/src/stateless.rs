@@ -156,19 +156,21 @@ pub use crate::error::UnsupportedProtocolVersionData;
 ///
 /// These were wrong: SEP-1442 (draft) placed `UNSUPPORTED_VERSION` at -32000,
 /// which collides with the established `ConnectionClosed` assignment.
-/// SEP-2575 (FINAL) moved it to -32004. Use
+/// SEP-2575 assigned -32004, which the upstream error-code allocation
+/// (spec PR modelcontextprotocol#2907, 2026-06) renumbered to -32022. Use
 /// [`crate::error::McpErrorCode::UnsupportedProtocolVersion`] or
 /// [`crate::error::JsonRpcError::unsupported_protocol_version`] instead.
 pub mod error_codes {
-    /// Spec-correct unsupported protocol version code (SEP-2575).
-    pub const UNSUPPORTED_PROTOCOL_VERSION: i32 = -32004;
+    /// Spec-correct unsupported protocol version code (SEP-2575, renumbered
+    /// from -32004 to -32022 by spec PR modelcontextprotocol#2907).
+    pub const UNSUPPORTED_PROTOCOL_VERSION: i32 = -32022;
 
     /// Wrong assignment from SEP-1442 draft. Kept temporarily for
     /// back-compat; new code should use [`UNSUPPORTED_PROTOCOL_VERSION`].
     #[deprecated(
         since = "0.12.0",
-        note = "SEP-1442 draft assignment was wrong; SEP-2575 FINAL uses -32004. \
-                Use `UNSUPPORTED_PROTOCOL_VERSION` or \
+        note = "SEP-1442 draft assignment was wrong; the current draft schema \
+                uses -32022. Use `UNSUPPORTED_PROTOCOL_VERSION` or \
                 `crate::error::McpErrorCode::UnsupportedProtocolVersion`."
     )]
     pub const UNSUPPORTED_VERSION: i32 = -32000;
@@ -176,20 +178,17 @@ pub mod error_codes {
     /// Invalid or missing required session ID (-32001) per the SEP-1442
     /// draft.
     ///
-    /// **Deprecated**: SEP-2243 (FINAL 2026-04-15) reassigns -32001 to
-    /// `HeaderMismatch`. SEP-2567 (FINAL) also removes sessions
-    /// entirely. New code should use one of:
+    /// **Deprecated**: SEP-2567 (FINAL) removes sessions entirely, and
+    /// -32001 is no longer assigned by any current SEP (SEP-2243 briefly
+    /// claimed it for `HeaderMismatch` before the upstream renumbering moved
+    /// that code to -32020). New code should use one of:
     /// - [`crate::error::McpErrorCode::SessionRequired`] (-32006) for a
     ///   missing session ID, or
     /// - [`crate::error::McpErrorCode::SessionNotFound`] (-32005) for an
     ///   unknown or expired session.
-    ///
-    /// The numeric value of this constant is unchanged so any existing
-    /// match arms keep compiling, but emitting -32001 from new code will
-    /// confuse SEP-2243-aware clients.
     #[deprecated(
         since = "0.11.0",
-        note = "SEP-2243 reclaims -32001 for HeaderMismatch. Use \
+        note = "Sessions are removed by SEP-2567. Use \
                 McpErrorCode::SessionRequired (-32006) or SessionNotFound (-32005)."
     )]
     pub const INVALID_SESSION: i32 = -32001;
@@ -268,7 +267,8 @@ impl StatelessConfig {
 /// Validate a protocol version string against supported versions.
 ///
 /// Returns `Ok(())` if valid, or a JSON-RPC `UnsupportedProtocolVersion`
-/// error (-32004 per SEP-2575) with the spec-shape data:
+/// error (-32022 per SEP-2575 after the upstream renumbering) with the
+/// spec-shape data:
 ///
 /// ```json
 /// { "supported": ["..."], "requested": "..." }

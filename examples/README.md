@@ -82,7 +82,7 @@ cargo run --example tool_macro --features macros
 | [client_cli](client_cli.rs) | Stdio client connecting to subprocess servers |
 | [http_client](http_client.rs) | HTTP client with McpClient API |
 | [http_sse_client](http_sse_client.rs) | SSE stream resumption (Last-Event-ID) |
-| [stateless_http_client](stateless_http_client.rs) | 2026-07-28 stateless protocol: server/discover, tools/list, tools/call, messages/listen -- no session ID |
+| [stateless_http_client](stateless_http_client.rs) | 2026-07-28 stateless protocol: server/discover, tools/list, tools/call, subscriptions/listen -- no session ID |
 
 ### Bidirectional Communication
 
