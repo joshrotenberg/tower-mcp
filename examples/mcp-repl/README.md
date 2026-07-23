@@ -6,6 +6,10 @@ get built-ins, tab completion is powered by the server itself where the
 protocol allows, and the command table refreshes live when the server's
 surface changes.
 
+The editor is [reedline](https://crates.io/crates/reedline) (nushell's line
+editor): a columnar completion menu with per-candidate descriptions, live
+input highlighting, and fish-style history hints.
+
 ## Run
 
 ```bash
@@ -25,6 +29,7 @@ cargo run -p mcp-repl -- --http http://127.0.0.1:3001/mcp
 getting-started> help                      # built-ins plus the server's tools
 getting-started> add a=2 b=3               # tools are commands; args coerced by inputSchema
 getting-started> echo message="hi there"   # tab-completes argument names
+getting-started> describe add              # input/output schemas, colored
 getting-started> read source://getting_started.rs
 getting-started> prompt greet name=World   # prompt args tab-complete via completion/complete
 ```
@@ -46,12 +51,63 @@ Progress and log notifications print inline as they arrive, and
 dynamic servers (see the `dynamic_capabilities` example) grow and shrink the
 REPL's vocabulary live.
 
+## Completion
+
+Tab opens a columnar menu. What gets completed:
+
+- The command word: built-ins plus every tool, each with its description.
+- Tool argument names from the tool's `inputSchema` properties (with type,
+  required flag, and description), and enum values after `key=` when the
+  property declares an `enum`.
+- `read <uri>`: resource URIs and template URI templates. When the partial
+  reaches a template's `{variable}`, the server's `completion/complete` is
+  asked to complete the variable (2s timeout, best-effort). Try
+  `read note://<Tab>` in `--demo`.
+- `prompt <name> <arg>=`: argument values via `completion/complete`, and
+  argument names from the prompt definition.
+- `describe <name>`: everything on the surface, labeled by kind.
+
+## describe
+
+`describe <name>` looks up a tool, prompt, resource, or template by name:
+
+- Tools: behavior hints, task support, and the input/output schemas as
+  syntax-colored JSON.
+- Prompts: the argument table (name, required/optional, description).
+- Resources and templates: URI, name, MIME type, size, and description.
+
+## Output rendering
+
+- JSON output (schema dumps, `info` capabilities, non-text content) is
+  pretty-printed with a small built-in syntax colorizer.
+- Text content that looks like markdown gets a light terminal rendering:
+  bold headings, dimmed code fences, styled inline code and bold spans,
+  colored bullets.
+- Progress, log, and task lines are tagged with dim brackets; task statuses
+  are colored (working=yellow, completed=green, failed/cancelled=red).
+
+All styling degrades to plain text when `NO_COLOR` is set or stdout is not
+a terminal. `--color always|never|auto` overrides the detection.
+
+## Elicitation
+
+Tools that request user input via `elicitation/create` prompt for each
+field at the terminal during a foreground call: the field's type, default,
+and description are shown, empty input accepts the default, and EOF
+cancels. Try `test_elicitation` against the conformance server. If a
+background task elicits while the editor owns the terminal, the request is
+declined rather than fighting the editor for stdin.
+
 ## Notes
 
-- Tab completion for prompt argument values calls the server's
-  `completion/complete`, one of the least-exercised capabilities in the
-  protocol. Servers that do not implement it simply contribute nothing.
+- Tab completion for prompt argument values and resource template variables
+  calls the server's `completion/complete`, one of the least-exercised
+  capabilities in the protocol. Servers that do not implement it simply
+  contribute nothing.
 - A spawned stdio child's stderr passes through to the terminal, which keeps
   server-side tracing visible while you explore.
 - `call <tool> <json>` is the escape hatch when `key=value` coercion is not
   enough.
+- When stdin is not a tty, the REPL reads lines directly (no editor), so
+  piping a script of commands works:
+  `printf 'echo message=hi\nquit\n' | mcp-repl --demo`.

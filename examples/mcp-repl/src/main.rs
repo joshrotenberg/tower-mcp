@@ -22,25 +22,28 @@
 //! task id immediately; `jobs`, `task <id>`, `wait <id>`, and `cancel <id>`
 //! manage it.
 
+mod editor;
+mod elicit;
+mod style;
+
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use clap::Parser;
-use rustyline::completion::{Completer, Pair};
-use rustyline::error::ReadlineError;
-use rustyline::highlight::Highlighter;
-use rustyline::hint::Hinter;
-use rustyline::validate::Validator;
-use rustyline::{Editor, Helper, history::DefaultHistory};
+use nu_ansi_term::{Color, Style};
 
 use tower_mcp::client::{
     ChannelTransport, HttpClientTransport, McpClient, NotificationHandler, StdioClientTransport,
 };
 use tower_mcp::protocol::{
-    Content, PromptDefinition, ResourceDefinition, ResourceTemplateDefinition, TaskObject,
-    ToolDefinition,
+    Content, LogLevel, PromptDefinition, ResourceDefinition, ResourceTemplateDefinition,
+    TaskObject, ToolDefinition,
 };
+
+use elicit::ReplClientHandler;
+use style::{json_pretty, paint, tag, task_status_style};
 
 #[derive(Parser)]
 #[command(
@@ -58,6 +61,10 @@ struct Args {
     #[arg(long, conflicts_with_all = ["http", "command"])]
     demo: bool,
 
+    /// When to emit ANSI colors (auto detects tty and NO_COLOR).
+    #[arg(long, value_enum, default_value = "auto")]
+    color: style::ColorMode,
+
     /// Command (and arguments) of a stdio MCP server to spawn.
     command: Vec<String>,
 }
@@ -65,201 +72,34 @@ struct Args {
 /// The server surface the REPL turns into commands. Refreshed on connect
 /// and whenever a list_changed notification arrives.
 #[derive(Default)]
-struct Surface {
-    tools: Vec<ToolDefinition>,
-    prompts: Vec<PromptDefinition>,
-    resources: Vec<ResourceDefinition>,
-    templates: Vec<ResourceTemplateDefinition>,
+pub struct Surface {
+    pub tools: Vec<ToolDefinition>,
+    pub prompts: Vec<PromptDefinition>,
+    pub resources: Vec<ResourceDefinition>,
+    pub templates: Vec<ResourceTemplateDefinition>,
 }
 
-const BUILTINS: &[&str] = &[
-    "help",
-    "tools",
-    "prompts",
-    "resources",
-    "templates",
-    "read",
-    "prompt",
-    "call",
-    "jobs",
-    "task",
-    "wait",
-    "cancel",
-    "refresh",
-    "info",
-    "quit",
-    "exit",
+/// Built-in commands with the short descriptions shown in the completion
+/// menu and `help`.
+pub const BUILTINS: &[(&str, &str)] = &[
+    ("help", "list built-ins and the server's tools"),
+    ("tools", "list tools"),
+    ("prompts", "list prompts"),
+    ("resources", "list resources"),
+    ("templates", "list resource templates"),
+    ("describe", "show schemas and metadata for a name"),
+    ("read", "read a resource"),
+    ("prompt", "get a prompt"),
+    ("call", "call a tool with raw JSON"),
+    ("jobs", "list background tasks"),
+    ("task", "show a background task"),
+    ("wait", "wait for a background task"),
+    ("cancel", "cancel a background task"),
+    ("refresh", "re-fetch the server surface"),
+    ("info", "server info and capabilities"),
+    ("quit", "exit"),
+    ("exit", "exit"),
 ];
-
-struct ReplHelper {
-    surface: Arc<RwLock<Surface>>,
-    client: Arc<McpClient>,
-    runtime: tokio::runtime::Handle,
-}
-
-impl ReplHelper {
-    /// Server-powered completion for prompt argument values. Safe to block
-    /// here: the completer runs on the dedicated readline thread, outside
-    /// the async runtime.
-    fn complete_via_server(&self, prompt: &str, arg: &str, partial: &str) -> Vec<String> {
-        let client = self.client.clone();
-        let (prompt, arg, partial) = (prompt.to_string(), arg.to_string(), partial.to_string());
-        self.runtime
-            .block_on(async move {
-                tokio::time::timeout(
-                    Duration::from_secs(2),
-                    client.complete_prompt_arg(&prompt, &arg, &partial),
-                )
-                .await
-            })
-            .ok()
-            .and_then(|r| r.ok())
-            .map(|r| r.completion.values)
-            .unwrap_or_default()
-    }
-}
-
-fn pair(s: &str) -> Pair {
-    Pair {
-        display: s.to_string(),
-        replacement: s.to_string(),
-    }
-}
-
-impl Completer for ReplHelper {
-    type Candidate = Pair;
-
-    fn complete(
-        &self,
-        line: &str,
-        pos: usize,
-        _ctx: &rustyline::Context<'_>,
-    ) -> rustyline::Result<(usize, Vec<Pair>)> {
-        let head = &line[..pos];
-        let (word_start, word) = match head.rfind(char::is_whitespace) {
-            Some(i) => (i + 1, &head[i + 1..]),
-            None => (0, head),
-        };
-        let surface = self.surface.read().unwrap();
-        let mut out: Vec<Pair> = Vec::new();
-
-        let mut words = head.split_whitespace();
-        let first = words.next().unwrap_or("");
-        let completing_first = word_start == 0;
-
-        if completing_first {
-            // First word: built-ins plus every tool name.
-            out.extend(
-                BUILTINS
-                    .iter()
-                    .filter(|c| c.starts_with(word))
-                    .map(|c| pair(c)),
-            );
-            out.extend(
-                surface
-                    .tools
-                    .iter()
-                    .filter(|t| t.name.starts_with(word))
-                    .map(|t| pair(&t.name)),
-            );
-        } else {
-            match first {
-                "read" => {
-                    out.extend(
-                        surface
-                            .resources
-                            .iter()
-                            .filter(|r| r.uri.starts_with(word))
-                            .map(|r| pair(&r.uri)),
-                    );
-                    out.extend(
-                        surface
-                            .templates
-                            .iter()
-                            .filter(|t| t.uri_template.starts_with(word))
-                            .map(|t| pair(&t.uri_template)),
-                    );
-                }
-                "prompt" => {
-                    let second_word = head.split_whitespace().count() == 2 && !head.ends_with(' ');
-                    let naming_prompt = second_word || (head.split_whitespace().count() == 1);
-                    if naming_prompt {
-                        out.extend(
-                            surface
-                                .prompts
-                                .iter()
-                                .filter(|p| p.name.starts_with(word))
-                                .map(|p| pair(&p.name)),
-                        );
-                    } else if let Some(prompt_name) = head.split_whitespace().nth(1) {
-                        if let Some((arg_name, partial)) = word.split_once('=') {
-                            // Argument value: ask the server (completion/complete).
-                            for v in self.complete_via_server(prompt_name, arg_name, partial) {
-                                out.push(Pair {
-                                    display: v.clone(),
-                                    replacement: format!("{arg_name}={v}"),
-                                });
-                            }
-                        } else if let Some(p) =
-                            surface.prompts.iter().find(|p| p.name == prompt_name)
-                        {
-                            // Argument name: from the prompt definition.
-                            out.extend(
-                                p.arguments
-                                    .iter()
-                                    .filter(|a| a.name.starts_with(word))
-                                    .map(|a| Pair {
-                                        display: format!(
-                                            "{}{}",
-                                            a.name,
-                                            if a.required { " (required)" } else { "" }
-                                        ),
-                                        replacement: format!("{}=", a.name),
-                                    }),
-                            );
-                        }
-                    }
-                }
-                "call" | "task" | "wait" | "cancel" => {
-                    if first == "call" {
-                        out.extend(
-                            surface
-                                .tools
-                                .iter()
-                                .filter(|t| t.name.starts_with(word))
-                                .map(|t| pair(&t.name)),
-                        );
-                    }
-                }
-                tool_name => {
-                    // Dynamic tool command: complete argument names from the
-                    // tool's inputSchema properties.
-                    if let Some(tool) = surface.tools.iter().find(|t| t.name == tool_name)
-                        && !word.contains('=')
-                        && let Some(props) = tool
-                            .input_schema
-                            .get("properties")
-                            .and_then(|p| p.as_object())
-                    {
-                        out.extend(props.keys().filter(|k| k.starts_with(word)).map(|k| Pair {
-                            display: k.to_string(),
-                            replacement: format!("{k}="),
-                        }));
-                    }
-                }
-            }
-        }
-
-        Ok((word_start, out))
-    }
-}
-
-impl Hinter for ReplHelper {
-    type Hint = String;
-}
-impl Highlighter for ReplHelper {}
-impl Validator for ReplHelper {}
-impl Helper for ReplHelper {}
 
 /// Coerce a `key=value` string according to the tool's inputSchema.
 fn coerce_arg(schema: &serde_json::Value, key: &str, raw: &str) -> serde_json::Value {
@@ -312,7 +152,13 @@ fn parse_kv_args(schema: &serde_json::Value, tokens: &[&str]) -> serde_json::Val
 fn render_content(content: &[Content]) {
     for c in content {
         match c {
-            Content::Text { text, .. } => println!("{text}"),
+            Content::Text { text, .. } => {
+                if style::colors_enabled() && style::looks_like_markdown(text) {
+                    println!("{}", style::render_markdown(text));
+                } else {
+                    println!("{text}");
+                }
+            }
             other => {
                 let v = serde_json::to_value(other).unwrap_or_default();
                 let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("content");
@@ -320,9 +166,12 @@ fn render_content(content: &[Content]) {
                     "image" | "audio" => {
                         let mime = v.get("mimeType").and_then(|m| m.as_str()).unwrap_or("?");
                         let len = v.get("data").and_then(|d| d.as_str()).map_or(0, str::len);
-                        println!("[{ty} {mime}, {len} base64 chars]");
+                        println!(
+                            "{}",
+                            tag(Style::new(), &format!("{ty} {mime}, {len} base64 chars"))
+                        );
                     }
-                    _ => println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default()),
+                    _ => println!("{}", json_pretty(&v)),
                 }
             }
         }
@@ -332,15 +181,15 @@ fn render_content(content: &[Content]) {
 fn render_task(task: &TaskObject) {
     println!(
         "task {}  status={}  {}",
-        task.task_id,
-        task.status,
+        paint(Style::new().bold(), &task.task_id),
+        paint(task_status_style(task.status), &task.status.to_string()),
         task.status_message.as_deref().unwrap_or("")
     );
     if let Some(result) = &task.result {
         render_content(&result.content);
     }
     if let Some(err) = &task.error {
-        println!("error {}: {}", err.code, err.message);
+        println!("{} {}: {}", style::error_prefix(), err.code, err.message);
     }
 }
 
@@ -364,15 +213,88 @@ async fn fetch_surface(client: &McpClient) -> Surface {
 
 fn demo_router() -> tower_mcp::McpRouter {
     use tower_mcp::extract::RawArgs;
-    use tower_mcp::{CallToolResult, TaskSupportMode, ToolBuilder};
+    use tower_mcp::protocol::{CompleteResult, CompletionReference, ReadResourceResult};
+    use tower_mcp::resource::ResourceTemplateBuilder;
+    use tower_mcp::{CallToolResult, PromptBuilder, TaskSupportMode, ToolBuilder};
+
+    const NOTES: &[(&str, &str)] = &[
+        ("groceries", "- eggs\n- coffee"),
+        ("ideas", "# Ideas\n\n- a REPL for MCP servers"),
+        ("todo", "1. ship it"),
+    ];
+
     tower_mcp::McpRouter::new()
         .server_info("mcp-repl-demo", env!("CARGO_PKG_VERSION"))
+        .prompt(
+            PromptBuilder::new("greet")
+                .description("Generate a greeting (name tab-completes via the server)")
+                .required_arg("name", "The person to greet")
+                .handler(|args| async move {
+                    let name = args.get("name").map(|s| s.as_str()).unwrap_or("World");
+                    Ok(tower_mcp::GetPromptResult::user_message(format!(
+                        "Please greet {name} warmly."
+                    )))
+                })
+                .build(),
+        )
+        .resource_template(
+            ResourceTemplateBuilder::new("note://{name}")
+                .name("Notes")
+                .description("Tiny in-memory notes (name tab-completes via the server)")
+                .mime_type("text/markdown")
+                .handler(
+                    |uri: String, vars: std::collections::HashMap<String, String>| async move {
+                        let name = vars.get("name").cloned().unwrap_or_default();
+                        let text = NOTES
+                            .iter()
+                            .find(|(n, _)| *n == name)
+                            .map(|(_, t)| (*t).to_string())
+                            .unwrap_or_else(|| format!("no note named `{name}`"));
+                        Ok(ReadResourceResult::text(uri, text))
+                    },
+                ),
+        )
+        .completion_handler(|params| async move {
+            let partial = params.argument.value;
+            let candidates: Vec<String> = match &params.reference {
+                CompletionReference::Prompt { name } if name == "greet" => {
+                    ["Ada", "Alan", "Grace", "Linus"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect()
+                }
+                CompletionReference::Resource { uri } if uri == "note://{name}" => {
+                    NOTES.iter().map(|(n, _)| n.to_string()).collect()
+                }
+                _ => Vec::new(),
+            };
+            Ok(CompleteResult::new(
+                candidates
+                    .into_iter()
+                    .filter(|c| c.starts_with(&partial))
+                    .collect::<Vec<_>>(),
+            ))
+        })
         .tool(
             ToolBuilder::new("echo")
                 .description("Echo a message back")
                 .extractor_handler((), |RawArgs(args): RawArgs| async move {
                     let msg = args.get("message").and_then(|v| v.as_str()).unwrap_or("");
                     Ok(CallToolResult::text(msg.to_string()))
+                })
+                .build(),
+        )
+        .tool(
+            ToolBuilder::new("about")
+                .description("Markdown-formatted notes about this demo server")
+                .extractor_handler((), |RawArgs(_): RawArgs| async move {
+                    Ok(CallToolResult::text(
+                        "# mcp-repl demo\n\n\
+                         A tiny in-process router for exploring the REPL.\n\n\
+                         - `echo message=hi` echoes back\n\
+                         - `slow_add a=2 b=3 &` runs **task-augmented**\n\
+                         - `describe slow_add` shows the tool's schemas\n",
+                    ))
                 })
                 .build(),
         )
@@ -390,6 +312,17 @@ fn demo_router() -> tower_mcp::McpRouter {
         )
 }
 
+fn log_level_style(level: LogLevel) -> Style {
+    match level {
+        LogLevel::Emergency | LogLevel::Alert | LogLevel::Critical | LogLevel::Error => {
+            Style::new().fg(Color::Red)
+        }
+        LogLevel::Warning => Style::new().fg(Color::Yellow),
+        LogLevel::Notice | LogLevel::Info => Style::new().fg(Color::Green),
+        _ => Style::new().dimmed(),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), tower_mcp::BoxError> {
     tracing_subscriber::fmt()
@@ -398,10 +331,16 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         )
         .init();
     let args = Args::parse();
+    style::init(args.color);
+
+    // True while the reedline editor owns the terminal; the elicitation
+    // handler declines form requests during that window instead of
+    // fighting over raw-mode stdin.
+    let at_prompt = Arc::new(AtomicBool::new(false));
 
     // Notifications print inline and trigger surface refreshes.
     let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-    let handler = {
+    let notifications = {
         let t = refresh_tx.clone();
         let r = refresh_tx.clone();
         let p = refresh_tx;
@@ -418,25 +357,39 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
             .on_progress(|p| {
                 let pct = match (p.progress, p.total) {
                     (done, Some(total)) if total > 0.0 => {
-                        format!(" ({:.0}%)", 100.0 * done / total)
+                        format!(" {:.0}%", 100.0 * done / total)
                     }
                     _ => String::new(),
                 };
-                println!("[progress{pct}] {}", p.message.as_deref().unwrap_or(""));
+                println!(
+                    "{} {}",
+                    tag(Style::new().fg(Color::Cyan), &format!("progress{pct}")),
+                    p.message.as_deref().unwrap_or("")
+                );
             })
             .on_log_message(|m| {
-                println!("[log {:?}] {}", m.level, m.data);
+                println!(
+                    "{} {}",
+                    tag(log_level_style(m.level), &format!("log {}", m.level)),
+                    m.data
+                );
             })
     };
+    let handler = ReplClientHandler::new(notifications, at_prompt.clone());
 
+    let builder = McpClient::builder().with_elicitation();
     let client = if args.demo {
-        McpClient::connect_with_handler(ChannelTransport::new(demo_router()), handler).await?
+        builder
+            .connect(ChannelTransport::new(demo_router()), handler)
+            .await?
     } else if let Some(url) = &args.http {
-        McpClient::connect_with_handler(HttpClientTransport::new(url.clone()), handler).await?
+        builder
+            .connect(HttpClientTransport::new(url.clone()), handler)
+            .await?
     } else if !args.command.is_empty() {
         let cmd_args: Vec<&str> = args.command[1..].iter().map(|s| s.as_str()).collect();
         let transport = StdioClientTransport::spawn(&args.command[0], &cmd_args).await?;
-        McpClient::connect_with_handler(transport, handler).await?
+        builder.connect(transport, handler).await?
     } else {
         eprintln!("usage: mcp-repl <server command...> | --http <url> | --demo");
         std::process::exit(2);
@@ -448,11 +401,20 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .await?;
     let server_name = init.server_info.name.clone();
     println!(
-        "connected: {} v{} (protocol {})",
-        server_name, init.server_info.version, init.protocol_version
+        "connected: {} v{} {}",
+        paint(Style::new().bold(), &server_name),
+        init.server_info.version,
+        paint(
+            Style::new().dimmed(),
+            &format!("(protocol {})", init.protocol_version)
+        )
     );
     if let Some(instructions) = &init.instructions {
-        println!("{instructions}");
+        if style::colors_enabled() && style::looks_like_markdown(instructions) {
+            println!("{}", style::render_markdown(instructions));
+        } else {
+            println!("{instructions}");
+        }
     }
 
     let surface = Arc::new(RwLock::new(fetch_surface(&client).await));
@@ -470,39 +432,15 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     // Readline runs on its own thread; lines cross into async via channels.
     let (line_tx, mut line_rx) = tokio::sync::mpsc::channel::<String>(1);
     let (ack_tx, ack_rx) = std::sync::mpsc::channel::<()>();
-    {
-        let helper = ReplHelper {
-            surface: surface.clone(),
-            client: client.clone(),
-            runtime: tokio::runtime::Handle::current(),
-        };
-        let prompt = format!("{server_name}> ");
-        std::thread::spawn(move || {
-            let mut editor: Editor<ReplHelper, DefaultHistory> =
-                Editor::new().expect("failed to init line editor");
-            editor.set_helper(Some(helper));
-            loop {
-                match editor.readline(&prompt) {
-                    Ok(line) => {
-                        let _ = editor.add_history_entry(line.as_str());
-                        if line_tx.blocking_send(line).is_err() {
-                            break;
-                        }
-                        // Wait until the command finished printing before
-                        // showing the next prompt.
-                        if ack_rx.recv().is_err() {
-                            break;
-                        }
-                    }
-                    Err(ReadlineError::Interrupted) => continue,
-                    Err(_) => {
-                        let _ = line_tx.blocking_send("quit".to_string());
-                        break;
-                    }
-                }
-            }
-        });
-    }
+    editor::spawn_readline_thread(
+        server_name,
+        surface.clone(),
+        client.clone(),
+        tokio::runtime::Handle::current(),
+        line_tx,
+        ack_rx,
+        at_prompt,
+    );
 
     let mut jobs: Vec<(String, String)> = Vec::new();
 
@@ -510,7 +448,8 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         tokio::select! {
             Some(()) = refresh_rx.recv() => {
                 let fresh = fetch_surface(&client).await;
-                println!("[surface changed: {} tools, {} prompts, {} resources]",
+                println!("{} {} tools, {} prompts, {} resources",
+                    tag(Style::new().fg(Color::Cyan), "surface changed"),
                     fresh.tools.len(), fresh.prompts.len(), fresh.resources.len());
                 *surface.write().unwrap() = fresh;
             }
@@ -541,6 +480,9 @@ async fn handle_line(
     if background {
         tokens.pop();
     }
+    if tokens.is_empty() {
+        return false;
+    }
     let cmd = tokens[0];
     let rest = &tokens[1..];
 
@@ -549,6 +491,7 @@ async fn handle_line(
         "help" => {
             println!("built-ins:");
             println!("  tools | prompts | resources | templates   list the server surface");
+            println!("  describe <name>                           schemas and metadata");
             println!("  read <uri>                                read a resource");
             println!("  prompt <name> [k=v...]                    get a prompt");
             println!("  call <tool> <json>                        call a tool with raw JSON");
@@ -560,7 +503,11 @@ async fn handle_line(
             if !s.tools.is_empty() {
                 println!("tools:");
                 for t in &s.tools {
-                    println!("  {:24} {}", t.name, t.description.as_deref().unwrap_or(""));
+                    println!(
+                        "  {:24} {}",
+                        paint(Style::new().fg(Color::Green), &t.name),
+                        t.description.as_deref().unwrap_or("")
+                    );
                 }
             }
         }
@@ -569,7 +516,11 @@ async fn handle_line(
             match cmd {
                 "tools" => {
                     for t in &s.tools {
-                        println!("{:24} {}", t.name, t.description.as_deref().unwrap_or(""));
+                        println!(
+                            "{:24} {}",
+                            paint(Style::new().fg(Color::Green), &t.name),
+                            t.description.as_deref().unwrap_or("")
+                        );
                     }
                 }
                 "prompts" => {
@@ -587,23 +538,38 @@ async fn handle_line(
                             .collect();
                         println!(
                             "{:24} {} {}",
-                            p.name,
-                            args.join(" "),
+                            paint(Style::new().fg(Color::Green), &p.name),
+                            paint(Style::new().fg(Color::Cyan), &args.join(" ")),
                             p.description.as_deref().unwrap_or("")
                         );
                     }
                 }
                 "resources" => {
                     for r in &s.resources {
-                        println!("{:40} {}", r.uri, r.name);
+                        println!(
+                            "{:40} {}",
+                            paint(Style::new().fg(Color::Green), &r.uri),
+                            r.name
+                        );
                     }
                 }
                 _ => {
                     for t in &s.templates {
-                        println!("{:40} {}", t.uri_template, t.name);
+                        println!(
+                            "{:40} {}",
+                            paint(Style::new().fg(Color::Green), &t.uri_template),
+                            t.name
+                        );
                     }
                 }
             }
+        }
+        "describe" => {
+            let Some(name) = rest.first() else {
+                println!("usage: describe <tool|prompt|resource|template>");
+                return false;
+            };
+            describe(&surface.read().unwrap(), name);
         }
         "read" => {
             let Some(uri) = rest.first() else {
@@ -614,13 +580,25 @@ async fn handle_line(
                 Ok(result) => {
                     for c in result.contents {
                         if let Some(text) = c.text {
-                            println!("{text}");
+                            let is_md = c
+                                .mime_type
+                                .as_deref()
+                                .is_some_and(|m| m.contains("markdown"))
+                                || style::looks_like_markdown(&text);
+                            if style::colors_enabled() && is_md {
+                                println!("{}", style::render_markdown(&text));
+                            } else {
+                                println!("{text}");
+                            }
                         } else if let Some(blob) = c.blob {
-                            println!("[binary {} base64 chars]", blob.len());
+                            println!(
+                                "{}",
+                                tag(Style::new(), &format!("binary {} base64 chars", blob.len()))
+                            );
                         }
                     }
                 }
-                Err(e) => println!("error: {e}"),
+                Err(e) => println!("{}: {e}", style::error_prefix()),
             }
         }
         "prompt" => {
@@ -646,10 +624,10 @@ async fn handle_line(
                             .unwrap_or_else(|| {
                                 v.get("content").map(|c| c.to_string()).unwrap_or_default()
                             });
-                        println!("[{role}] {text}");
+                        println!("{} {}", tag(Style::new().fg(Color::Cyan), role), text);
                     }
                 }
-                Err(e) => println!("error: {e}"),
+                Err(e) => println!("{}: {e}", style::error_prefix()),
             }
         }
         "call" => {
@@ -673,7 +651,10 @@ async fn handle_line(
             }
             for (id, tool) in jobs.iter() {
                 match client.task_get(id).await {
-                    Ok(task) => println!("{id}  {tool}  {}", task.status),
+                    Ok(task) => println!(
+                        "{id}  {tool}  {}",
+                        paint(task_status_style(task.status), &task.status.to_string())
+                    ),
                     Err(_) => println!("{id}  {tool}  (gone)"),
                 }
             }
@@ -696,7 +677,7 @@ async fn handle_line(
             };
             match outcome {
                 Ok(task) => render_task(&task),
-                Err(e) => println!("error: {e}"),
+                Err(e) => println!("{}: {e}", style::error_prefix()),
             }
         }
         "refresh" => {
@@ -712,12 +693,14 @@ async fn handle_line(
         }
         "info" => match client.server_info().await {
             Some(info) => {
-                println!("{} v{}", info.server_info.name, info.server_info.version);
-                println!("protocol: {}", info.protocol_version);
                 println!(
-                    "capabilities: {}",
-                    serde_json::to_string_pretty(&info.capabilities).unwrap_or_default()
+                    "{} v{}",
+                    paint(Style::new().bold(), &info.server_info.name),
+                    info.server_info.version
                 );
+                println!("protocol: {}", info.protocol_version);
+                let caps = serde_json::to_value(&info.capabilities).unwrap_or_default();
+                println!("capabilities: {}", json_pretty(&caps));
             }
             None => println!("not initialized"),
         },
@@ -730,7 +713,10 @@ async fn handle_line(
                     .map(|t| t.input_schema.clone())
             };
             let Some(schema) = schema else {
-                println!("unknown command: {tool_name} (try `help`)");
+                println!(
+                    "unknown command: {} (try `help`)",
+                    paint(Style::new().fg(Color::Red), tool_name)
+                );
                 return false;
             };
             let arguments = parse_kv_args(&schema, rest);
@@ -738,6 +724,124 @@ async fn handle_line(
         }
     }
     false
+}
+
+/// The `describe` built-in: schemas for a tool, the argument table for a
+/// prompt, metadata for a resource or template.
+fn describe(surface: &Surface, name: &str) {
+    if let Some(t) = surface.tools.iter().find(|t| t.name == name) {
+        println!(
+            "tool {}  {}",
+            paint(Style::new().fg(Color::Green).bold(), &t.name),
+            t.description.as_deref().unwrap_or("")
+        );
+        if let Some(a) = &t.annotations {
+            let mut hints = Vec::new();
+            if a.read_only_hint {
+                hints.push("read-only");
+            }
+            if a.idempotent_hint {
+                hints.push("idempotent");
+            }
+            if a.destructive_hint && !a.read_only_hint {
+                hints.push("destructive");
+            }
+            if a.open_world_hint {
+                hints.push("open-world");
+            }
+            if !hints.is_empty() {
+                println!("  hints: {}", hints.join(", "));
+            }
+        }
+        if let Some(e) = &t.execution {
+            let v = serde_json::to_value(e).unwrap_or_default();
+            if let Some(mode) = v.get("taskSupport").and_then(|m| m.as_str()) {
+                println!("  task support: {mode}");
+            }
+        }
+        println!("input schema:");
+        println!("{}", json_pretty(&t.input_schema));
+        if let Some(out) = &t.output_schema {
+            println!("output schema:");
+            println!("{}", json_pretty(out));
+        }
+        return;
+    }
+    if let Some(p) = surface.prompts.iter().find(|p| p.name == name) {
+        println!(
+            "prompt {}  {}",
+            paint(Style::new().fg(Color::Green).bold(), &p.name),
+            p.description.as_deref().unwrap_or("")
+        );
+        if p.arguments.is_empty() {
+            println!("  (no arguments)");
+        } else {
+            println!("arguments:");
+            for a in &p.arguments {
+                println!(
+                    "  {:20} {:10} {}",
+                    paint(Style::new().fg(Color::Cyan), &a.name),
+                    if a.required { "required" } else { "optional" },
+                    a.description.as_deref().unwrap_or("")
+                );
+            }
+        }
+        return;
+    }
+    if let Some(r) = surface
+        .resources
+        .iter()
+        .find(|r| r.uri == name || r.name == name)
+    {
+        println!(
+            "resource {}",
+            paint(Style::new().fg(Color::Green).bold(), &r.uri)
+        );
+        println!("  name: {}", r.name);
+        if let Some(t) = &r.title {
+            println!("  title: {t}");
+        }
+        if let Some(d) = &r.description {
+            println!("  description: {d}");
+        }
+        if let Some(m) = &r.mime_type {
+            println!("  mimeType: {m}");
+        }
+        if let Some(s) = r.size {
+            println!("  size: {s} bytes");
+        }
+        return;
+    }
+    if let Some(t) = surface
+        .templates
+        .iter()
+        .find(|t| t.uri_template == name || t.name == name)
+    {
+        println!(
+            "template {}",
+            paint(Style::new().fg(Color::Green).bold(), &t.uri_template)
+        );
+        println!("  name: {}", t.name);
+        if let Some(d) = &t.description {
+            println!("  description: {d}");
+        }
+        if let Some(m) = &t.mime_type {
+            println!("  mimeType: {m}");
+        }
+        if !t.arguments.is_empty() {
+            println!("arguments:");
+            for a in &t.arguments {
+                println!(
+                    "  {:20} {:10} {}",
+                    paint(Style::new().fg(Color::Cyan), &a.name),
+                    if a.required { "required" } else { "optional" },
+                    a.description.as_deref().unwrap_or("")
+                );
+            }
+        }
+        return;
+    }
+    println!("nothing on the surface named `{name}` (try `tools`, `prompts`, `resources`)");
 }
 
 async fn run_tool(
@@ -750,20 +854,26 @@ async fn run_tool(
     if background {
         match client.call_tool_as_task(name, arguments, None).await {
             Ok(created) => {
-                println!("[task {}] started", created.task.task_id);
+                println!(
+                    "{} started",
+                    tag(
+                        Style::new().fg(Color::Yellow),
+                        &format!("task {}", created.task.task_id)
+                    )
+                );
                 jobs.push((created.task.task_id, name.to_string()));
             }
-            Err(e) => println!("error: {e}"),
+            Err(e) => println!("{}: {e}", style::error_prefix()),
         }
         return;
     }
     match client.call_tool(name, arguments).await {
         Ok(result) => {
             if result.is_error {
-                println!("(tool error)");
+                println!("{}", tag(Style::new().fg(Color::Red), "tool error"));
             }
             render_content(&result.content);
         }
-        Err(e) => println!("error: {e}"),
+        Err(e) => println!("{}: {e}", style::error_prefix()),
     }
 }
