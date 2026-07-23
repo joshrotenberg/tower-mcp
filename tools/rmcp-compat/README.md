@@ -69,7 +69,7 @@ Results: 17/21 checks passed (0 failed, 4 known-diffs, 0 errors)
 Known diffs are documented divergences that are intentional or explained. They
 appear as `[KNOWN-DIFF]` and do not cause a non-zero exit code.
 
-Current known diffs (against rmcp 2.1.0):
+Current known diffs (against rmcp 3.0.0-beta.1):
 
 **`error.message` phrasing for method-not-found:**
 rmcp returns just the method name (e.g. `"nonexistent/method"`); tower-mcp
@@ -92,8 +92,8 @@ A `tools/list` sent before `notifications/initialized` is rejected by tower-mcp
 with `-32600` (InvalidRequest) per #901. rmcp does not enforce this ordering and
 returns the tools list. tower-mcp is the stricter, more spec-compliant side, so
 this is a documented divergence rather than a tower-mcp bug. (With rmcp 1.7.0
-this surfaced as a FAIL; rmcp 2.1.0 did not change the behavior, so it is now
-classified as a KNOWN-DIFF.)
+this surfaced as a FAIL; rmcp 2.1.0 and 3.0.0-beta.1 did not change the
+behavior, so it is classified as a KNOWN-DIFF.)
 
 **SSE response wrapping (default mode):**
 rmcp always wraps synchronous JSON-RPC responses as SSE (`Content-Type:
@@ -125,7 +125,7 @@ validates that the opt-in SSE mode matches rmcp's behavior exactly.
 Change the version constraint in `tools/rmcp-compat/Cargo.toml`:
 
 ```toml
-rmcp = { version = "2.1.0", features = [...] }
+rmcp = { version = "3.0.0-beta.1", features = [...] }
 ```
 
 Then run the harness and update any KNOWN-DIFF entries that have changed.
@@ -134,3 +134,14 @@ Note the 1.x -> 2.x jump renamed `rmcp::model::Content` to
 `rmcp::model::ContentBlock` (constructed via `ContentBlock::text(...)`); the
 `StreamableHttpService`, `LocalSessionManager`, `ServerHandler`, and the
 `#[tool]`/`#[tool_router]`/`#[tool_handler]` macro surfaces were unchanged.
+
+The 2.x -> 3.x jump (3.0.0-beta.1 implements the 2026-07-28 SEP batch)
+required no harness code changes: the harness does not use the surfaces that
+broke (Meta type split, `CallToolResult.structured_content` widening,
+`Annotations.last_modified`, the removed experimental tasks API). The
+`StreamableHttpServerConfig.stateful_mode` field was renamed
+`legacy_session_mode`; the harness uses `StreamableHttpServerConfig::default()`
+and the default remains `legacy_session_mode: true`, so rmcp still serves the
+2025-11-25 session-based flow that the harness exercises. rmcp 3.x dispatches
+the 2026-07-28 stateless protocol per-request, so requests negotiating
+`2025-11-25` behave as before.

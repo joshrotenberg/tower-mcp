@@ -1167,7 +1167,7 @@ async fn check_invalid_params(
 /// Send tools/list WITHOUT the notifications/initialized step. tower-mcp rejects
 /// this with -32600 (InvalidRequest) per #901. rmcp does not enforce the ordering
 /// and returns the tools list, so this is a KNOWN-DIFF (tower-mcp is the stricter,
-/// more spec-compliant side), verified current as of rmcp 2.1.0.
+/// more spec-compliant side), verified current as of rmcp 3.0.0-beta.1.
 async fn check_initialized_enforcement(client: &reqwest::Client) -> Vec<CheckResult> {
     // Start fresh sessions without sending notifications/initialized
     let init_body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"compat-enforcement-test","version":"0.1.0"}}}"#;
