@@ -536,12 +536,23 @@ impl ClientTransport for HttpClientTransport {
 
         let request = request.body(message.to_string());
 
-        // After session is established, send in a background task so the
-        // message loop can continue processing incoming SSE messages.
+        // Notifications (frames without an `id`) are awaited inline even
+        // after session establishment: the server processes a notification
+        // before answering 202, and never issues a client round-trip while
+        // doing so, so awaiting cannot deadlock and preserves ordering with
+        // everything sent afterwards. Without this, the spawned send path
+        // let `notifications/initialized` race the next request on a pooled
+        // connection, and strict servers rejected that request (#967).
+        let is_notification = serde_json::from_str::<serde_json::Value>(message)
+            .map(|v| v.get("id").is_none())
+            .unwrap_or(false);
+
+        // After session is established, send requests in a background task
+        // so the message loop can continue processing incoming SSE messages.
         // This prevents a deadlock when the server blocks on a
         // bidirectional request (sampling/elicitation) that requires the
         // client to respond via the SSE channel.
-        if self.session_id.is_some() {
+        if self.session_id.is_some() && !is_notification {
             let tx = self.incoming_tx.clone();
             let connected = self.connected.clone();
             let last_event_id = self.last_event_id.clone();
@@ -665,8 +676,9 @@ impl ClientTransport for HttpClientTransport {
             return Ok(());
         }
 
-        // Pre-session (initialize): handle synchronously to extract
-        // session headers and start the SSE stream.
+        // Pre-session (initialize) and notifications: handle synchronously.
+        // For initialize this extracts session headers and starts the SSE
+        // stream; for notifications the expected response is a bare 202.
         let response = request
             .send()
             .await
