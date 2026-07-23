@@ -3768,6 +3768,9 @@ mod tests {
             &self,
             task_id: &str,
         ) -> crate::async_task::Result<Option<crate::async_task::TaskSnapshot>> {
+            // Counted as a read: `tasks/get` dispatch fetches the snapshot so
+            // it can inline the SEP-2663 DetailedTask terminal payload.
+            self.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.inner.get_task_result(task_id).await
         }
 
