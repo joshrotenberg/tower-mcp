@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.1] - 2026-07-23
+
+### Bug Fixes
+
+- **client:** Await notification POSTs inline to preserve ordering ([#969](https://github.com/joshrotenberg/tower-mcp/pull/969))
+- **client:** Report pre-session HTTP 404 as endpoint-not-found, not Session expired ([#984](https://github.com/joshrotenberg/tower-mcp/pull/984))
+
+### Features
+
+- **examples:** Mcp-repl, an interactive MCP client REPL ([#966](https://github.com/joshrotenberg/tower-mcp/pull/966))
+
+### Testing
+
+- **childproc:** Poll for exit instead of a fixed sleep ([#985](https://github.com/joshrotenberg/tower-mcp/pull/985))
+
+
+
 ## [0.13.0] - 2026-07-23
 
 ### Bug Fixes
