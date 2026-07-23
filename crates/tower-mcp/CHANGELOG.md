@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0] - 2026-07-23
+
+### Bug Fixes
+
+- **stateless:** Realign 2026-07-28 wire constants with the current draft schema ([#954](https://github.com/joshrotenberg/tower-mcp/pull/954))
+- Draft-conformance quick wins (caching hints, sep-2164 uri, progress delivery) ([#960](https://github.com/joshrotenberg/tower-mcp/pull/960))
+- **transport:** Size limits, stateless disconnect cancellation, response-id leniency ([#963](https://github.com/joshrotenberg/tower-mcp/pull/963))
+
+### Features
+
+- **transport:** ChannelTransport notification delivery and concurrent requests ([#964](https://github.com/joshrotenberg/tower-mcp/pull/964))
+- **client:** Task-augmented tool calls and a tasks API on McpClient ([#965](https://github.com/joshrotenberg/tower-mcp/pull/965))
+
+### Miscellaneous Tasks
+
+- **conformance:** Run the official 2026-07-28 draft conformance suite ([#958](https://github.com/joshrotenberg/tower-mcp/pull/958))
+
+### Refactor
+
+- **tasks:** Promote TaskStore to a pluggable trait ([#962](https://github.com/joshrotenberg/tower-mcp/pull/962))
+
+
+
 ## [0.12.3] - 2026-07-23
 
 ### Bug Fixes
