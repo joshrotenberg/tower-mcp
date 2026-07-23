@@ -594,6 +594,8 @@ fn validate_task_object() {
         last_updated_at: "2025-01-01T00:01:00Z".to_string(),
         ttl: Some(300_000),
         poll_interval: None,
+        result: None,
+        error: None,
         meta: None,
     };
     validate_against_def(&task, "Task");
@@ -609,6 +611,8 @@ fn validate_task_completed() {
         last_updated_at: "2025-01-01T00:05:00Z".to_string(),
         ttl: Some(600_000),
         poll_interval: Some(1000),
+        result: None,
+        error: None,
         meta: None,
     };
     validate_against_def(&task, "Task");

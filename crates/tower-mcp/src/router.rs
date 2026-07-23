@@ -2430,10 +2430,16 @@ impl McpRouter {
             McpRequest::Ping => Ok(McpResponse::Pong(EmptyResult {})),
 
             McpRequest::GetTaskInfo(params) => {
-                let task = self
+                // SEP-2663 DetailedTask: `tasks/get` carries the
+                // status-discriminated payload inline. `completed` includes
+                // the result the synchronous request would have returned;
+                // `failed` includes the JSON-RPC error. This replaced the
+                // removed blocking `tasks/result` method as the way clients
+                // retrieve a task's outcome.
+                let (mut task, result, error) = self
                     .inner
                     .task_store
-                    .get_task(&params.task_id)
+                    .get_task_result(&params.task_id)
                     .await
                     .map_err(task_store_error)?
                     .ok_or_else(|| {
@@ -2442,6 +2448,16 @@ impl McpRouter {
                             params.task_id
                         )))
                     })?;
+
+                match task.status {
+                    TaskStatus::Completed => task.result = result,
+                    TaskStatus::Failed => {
+                        task.error = Some(JsonRpcError::internal_error(
+                            error.unwrap_or_else(|| "Task failed".to_string()),
+                        ));
+                    }
+                    _ => {}
+                }
 
                 Ok(McpResponse::GetTaskInfo(task))
             }
