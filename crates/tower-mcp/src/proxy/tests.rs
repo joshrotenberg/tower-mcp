@@ -72,6 +72,7 @@ mod proxy_tests {
                         meta: None,
                     }],
                     meta: None,
+                    ..Default::default()
                 })
             });
 

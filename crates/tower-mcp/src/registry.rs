@@ -833,6 +833,7 @@ mod tests {
                             meta: None,
                         }],
                         meta: None,
+                        ..Default::default()
                     })
                 },
             );
@@ -861,6 +862,7 @@ mod tests {
                             meta: None,
                         }],
                         meta: None,
+                        ..Default::default()
                     })
                 },
             );
@@ -893,6 +895,7 @@ mod tests {
                             meta: None,
                         }],
                         meta: None,
+                        ..Default::default()
                     })
                 },
             );
@@ -925,6 +928,7 @@ mod tests {
                             meta: None,
                         }],
                         meta: None,
+                        ..Default::default()
                     })
                 },
             );

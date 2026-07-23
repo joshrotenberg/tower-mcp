@@ -45,6 +45,7 @@ fn build_static_binary() -> Resource {
                         meta: None,
                     }],
                     meta: None,
+                    ..Default::default()
                 })
             }
         })
@@ -83,6 +84,7 @@ fn build_template() -> ResourceTemplate {
                     meta: None,
                 }],
                 meta: None,
+                ..Default::default()
             })
         })
 }

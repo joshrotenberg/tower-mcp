@@ -7,8 +7,8 @@
 # Remove entries as the phases land; CI fails when a baselined scenario
 # starts passing (stale entry) or a non-baselined scenario fails.
 #
-# Status at 0.2.0-alpha.9 (2026-07-23): 58/101 checks pass;
-# 26/40 scenarios fully green.
+# Status at 0.2.0-alpha.9 (2026-07-23, after the quick-wins PR): 66/102 checks
+# pass; 28/40 scenarios fully green (12 baselined).
 #
 # Format (0.2.x suite): plain scenario-name strings under `server:` /
 # `client:` keys; reasons live in these comments.
@@ -21,19 +21,6 @@ server:
   # acknowledgment/subscriptionId/filter semantics.
   # Types work in #949; transport and listen semantics in #952.
   - server-stateless
-
-  # Progress notifications are not delivered when the draft-path response is
-  # a plain JSON body; needs JSON-vs-SSE content negotiation (#952).
-  - tools-call-with-progress
-
-  # SHOULD-level warning: resource-not-found error data omits `uri`.
-  # Small fix, batched into #952.
-  - sep-2164-resource-not-found
-
-  # SEP-2549 (1/7 checks pass): list results emit ttlMs but cacheScope is
-  # always absent; the draft spec requires both on the six cacheable
-  # results (#949).
-  - caching
 
   # SEP-2243 (7/9 checks pass): the two failures need schema-aware rejection
   # when an x-mcp-header-annotated argument is present in the body but its

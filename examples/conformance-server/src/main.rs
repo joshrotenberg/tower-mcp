@@ -70,6 +70,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         )
         // SEP-2549: advertise a 60-second TTL hint on all list responses
         .list_ttl(60_000)
+        .read_ttl(60_000)
         // SEP-2577: mark the logging capability as deprecated since the 2026-07-28 protocol
         .logging_deprecated(DeprecationInfo {
             since: Some("2026-07-28".to_string()),

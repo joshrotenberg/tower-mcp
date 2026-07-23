@@ -31,6 +31,7 @@
 //!                 meta: None,
 //!             }],
 //!             meta: None,
+//!             ..Default::default()
 //!         })
 //!     })
 //!     .layer(TimeoutLayer::new(Duration::from_secs(30)))
@@ -62,6 +63,7 @@
 //!                 meta: None,
 //!             }],
 //!             meta: None,
+//!             ..Default::default()
 //!         })
 //!     });
 //! ```
@@ -181,6 +183,7 @@ where
                         meta: None,
                     }],
                     meta: None,
+                    ..Default::default()
                 }))
             }
         }
@@ -463,6 +466,7 @@ impl Resource {
 ///                 meta: None,
 ///             }],
 ///             meta: None,
+///             ..Default::default()
 ///         })
 ///     })
 ///     .build();
@@ -592,6 +596,7 @@ impl ResourceBuilder {
     ///                     meta: None,
     ///                 }],
     ///                 meta: None,
+    ///                 ..Default::default()
     ///             })
     ///         }
     ///     })
@@ -662,6 +667,7 @@ impl ResourceBuilder {
                         meta: None,
                     }],
                     meta: None,
+                    ..Default::default()
                 })
             }
         })
@@ -687,6 +693,7 @@ impl ResourceBuilder {
                         meta: None,
                     }],
                     meta: None,
+                    ..Default::default()
                 })
             }
         })
@@ -760,6 +767,7 @@ where
     ///                 meta: None,
     ///             }],
     ///             meta: None,
+    ///             ..Default::default()
     ///         })
     ///     })
     ///     .layer(TimeoutLayer::new(Duration::from_secs(30)))
@@ -1063,6 +1071,7 @@ where
 ///                 meta: None,
 ///             }],
 ///             meta: None,
+///             ..Default::default()
 ///         })
 ///     }
 /// }
@@ -1158,6 +1167,7 @@ pub trait ResourceTemplateHandler: Send + Sync {
 ///                 meta: None,
 ///             }],
 ///             meta: None,
+///             ..Default::default()
 ///         })
 ///     });
 /// ```
@@ -1291,6 +1301,7 @@ impl ResourceTemplate {
 ///                 meta: None,
 ///             }],
 ///             meta: None,
+///             ..Default::default()
 ///         })
 ///     });
 /// ```
@@ -1562,6 +1573,7 @@ mod tests {
                         meta: None,
                     }],
                     meta: None,
+                    ..Default::default()
                 })
             })
             .build();
@@ -1584,6 +1596,7 @@ mod tests {
                         meta: None,
                     }],
                     meta: None,
+                    ..Default::default()
                 })
             })
             .layer(TimeoutLayer::new(Duration::from_secs(30)))
@@ -1609,6 +1622,7 @@ mod tests {
                         meta: None,
                     }],
                     meta: None,
+                    ..Default::default()
                 })
             })
             .layer(TimeoutLayer::new(Duration::from_millis(50)))
@@ -1639,6 +1653,7 @@ mod tests {
                         meta: None,
                     }],
                     meta: None,
+                    ..Default::default()
                 })
             })
             .build();
@@ -1661,6 +1676,7 @@ mod tests {
                         meta: None,
                     }],
                     meta: None,
+                    ..Default::default()
                 })
             })
             .layer(TimeoutLayer::new(Duration::from_secs(30)))
@@ -1693,6 +1709,7 @@ mod tests {
                         meta: None,
                     }],
                     meta: None,
+                    ..Default::default()
                 })
             }
         }
@@ -1734,6 +1751,7 @@ mod tests {
                 Ok::<_, Error>(ReadResourceResult {
                     contents: vec![],
                     meta: None,
+                    ..Default::default()
                 })
             },
         };
@@ -1749,6 +1767,7 @@ mod tests {
                 Ok::<_, Error>(ReadResourceResult {
                     contents: vec![],
                     meta: None,
+                    ..Default::default()
                 })
             },
         };
@@ -1808,6 +1827,7 @@ mod tests {
                         meta: None,
                     }],
                     meta: None,
+                    ..Default::default()
                 })
             });
 
@@ -1834,6 +1854,7 @@ mod tests {
                         meta: None,
                     }],
                     meta: None,
+                    ..Default::default()
                 })
             });
 
@@ -1859,6 +1880,7 @@ mod tests {
                         meta: None,
                     }],
                     meta: None,
+                    ..Default::default()
                 })
             });
 
@@ -1889,6 +1911,7 @@ mod tests {
                         meta: None,
                     }],
                     meta: None,
+                    ..Default::default()
                 })
             });
 
@@ -1916,6 +1939,7 @@ mod tests {
                         meta: None,
                     }],
                     meta: None,
+                    ..Default::default()
                 })
             });
 
@@ -1969,6 +1993,7 @@ mod tests {
                         meta: None,
                     }],
                     meta: None,
+                    ..Default::default()
                 })
             });
 
@@ -2003,6 +2028,7 @@ mod tests {
                         meta: None,
                     }],
                     meta: None,
+                    ..Default::default()
                 })
             });
 

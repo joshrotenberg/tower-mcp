@@ -361,6 +361,7 @@ fn extended_test_router() -> McpRouter {
                     meta: None,
                 }],
                 meta: None,
+                ..Default::default()
             })
         });
 

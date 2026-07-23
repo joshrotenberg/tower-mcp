@@ -47,6 +47,7 @@ fn build_cargo_toml_resource(state: Arc<CodegenState>) -> Resource {
                         meta: None,
                     }],
                     meta: None,
+                    ..Default::default()
                 })
             }
         })
@@ -81,6 +82,7 @@ fn build_main_rs_resource(state: Arc<CodegenState>) -> Resource {
                         meta: None,
                     }],
                     meta: None,
+                    ..Default::default()
                 })
             }
         })
@@ -115,6 +117,7 @@ fn build_readme_resource(state: Arc<CodegenState>) -> Resource {
                         meta: None,
                     }],
                     meta: None,
+                    ..Default::default()
                 })
             }
         })
@@ -143,6 +146,7 @@ fn build_state_resource(state: Arc<CodegenState>) -> Resource {
                         meta: None,
                     }],
                     meta: None,
+                    ..Default::default()
                 })
             }
         })

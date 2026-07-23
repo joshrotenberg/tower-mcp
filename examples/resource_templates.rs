@@ -45,6 +45,7 @@ async fn main() -> Result<(), BoxError> {
                         meta: None,
                     }],
                     meta: None,
+                    ..Default::default()
                 });
             }
 
@@ -64,6 +65,7 @@ async fn main() -> Result<(), BoxError> {
                     meta: None,
                 }],
                 meta: None,
+                ..Default::default()
             })
         });
 
@@ -95,6 +97,7 @@ async fn main() -> Result<(), BoxError> {
                     meta: None,
                 }],
                 meta: None,
+                ..Default::default()
             })
         });
 
@@ -134,6 +137,7 @@ async fn main() -> Result<(), BoxError> {
                     meta: None,
                 }],
                 meta: None,
+                ..Default::default()
             })
         });
 

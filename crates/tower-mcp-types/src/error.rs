@@ -237,10 +237,13 @@ impl JsonRpcError {
     /// The resource URI is a parameter, so missing-parameter and
     /// unknown-resource-URI are the same error class.
     pub fn resource_not_found(uri: &str) -> Self {
+        // SEP-2164: the error data SHOULD carry the requested URI so clients
+        // can programmatically identify which resource was missing.
         Self::new(
             ErrorCode::InvalidParams,
             format!("Resource not found: {}", uri),
         )
+        .with_data(serde_json::json!({ "uri": uri }))
     }
 
     /// Resource already subscribed
@@ -643,6 +646,9 @@ mod tests {
         assert_eq!(err.code, ErrorCode::InvalidParams.code());
         assert_eq!(err.code, -32602);
         assert!(err.message.contains("file:///gone.txt"));
+        // SEP-2164: data.uri carries the requested URI.
+        let data = err.data.expect("data must be present");
+        assert_eq!(data["uri"], "file:///gone.txt");
     }
 
     #[test]

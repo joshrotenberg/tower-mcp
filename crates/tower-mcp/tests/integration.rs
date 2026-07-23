@@ -93,6 +93,7 @@ fn create_router_with_resources_and_prompts() -> McpRouter {
                     meta: None,
                 }],
                 meta: None,
+                ..Default::default()
             })
         })
         .build();

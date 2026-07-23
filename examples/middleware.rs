@@ -109,6 +109,7 @@ async fn main() -> Result<(), BoxError> {
                     meta: None,
                 }],
                 meta: None,
+                ..Default::default()
             })
         })
         .layer(TimeoutLayer::new(Duration::from_secs(5)))

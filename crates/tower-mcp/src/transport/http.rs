@@ -2332,9 +2332,21 @@ async fn handle_post(
             };
 
             // Ephemeral pre-initialized service -- no session is stored or created.
+            //
+            // A per-request notification channel captures anything the handler
+            // emits during the call (progress, logging). With no session and no
+            // GET stream on this path, those messages can only reach the client
+            // on the POST response itself: per the draft Streamable HTTP rules,
+            // a plain JSON body is only correct when the first outbound message
+            // is the terminal response; otherwise the response falls back to
+            // SSE with the notifications delivered ahead of the terminal
+            // response.
+            let (notif_tx, mut notif_rx) = crate::context::notification_channel(64);
             let mut service = match &state.service_source {
                 ServiceSource::Router { router, factory } => {
-                    let ephemeral = router.with_fresh_session();
+                    let ephemeral = router
+                        .with_fresh_session()
+                        .with_request_notification_sender(notif_tx);
                     ephemeral.session().mark_initialized();
                     JsonRpcService::new(factory(ephemeral))
                 }
@@ -2351,39 +2363,82 @@ async fn handle_post(
                 service = service.with_extensions(ext);
             }
 
-            let mut response = match service.call_single(request).await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    return json_rpc_error_response(
-                        None,
-                        JsonRpcError::internal_error(e.to_string()),
-                    );
-                }
-            };
+            let mut call: std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<JsonRpcResponse>> + Send>,
+            > = Box::pin(async move {
+                let mut service = service;
+                service.call_single(request).await
+            });
 
-            // For `initialize`: the router's version negotiation falls back to
-            // `LATEST_PROTOCOL_VERSION` ("2025-11-25") because 2026-07-28 is not
-            // yet in `SUPPORTED_PROTOCOL_VERSIONS` at the types layer. Patch the
-            // response to reflect the version the transport is actually serving so
-            // the client sees the version it requested.
-            if is_init
-                && let JsonRpcResponse::Result(ref mut result) = response
-                && let Some(pv) = result.result.get_mut("protocolVersion")
-            {
-                *pv = serde_json::Value::String(version.clone());
+            enum FirstOutbound {
+                Response(crate::error::Result<JsonRpcResponse>),
+                Notification(crate::context::ServerNotification),
             }
 
-            let mut resp = if state.sse_responses {
-                sse_json_response(&response)
-            } else {
-                axum::Json(response).into_response()
+            // Race the handler against its first notification. A closed
+            // channel (no sender attached, or all senders dropped) simply
+            // awaits the handler.
+            let first = tokio::select! {
+                result = &mut call => FirstOutbound::Response(result),
+                maybe = notif_rx.recv() => match maybe {
+                    Some(n) => FirstOutbound::Notification(n),
+                    None => FirstOutbound::Response((&mut call).await),
+                },
             };
-            resp.headers_mut().insert(
-                MCP_PROTOCOL_VERSION_HEADER,
-                HeaderValue::from_str(version).unwrap(),
-            );
-            // Intentionally NO `mcp-session-id` header for 2026-07-28+ clients.
-            return resp;
+
+            match first {
+                FirstOutbound::Response(result) => {
+                    let mut response = match result {
+                        Ok(resp) => resp,
+                        Err(e) => {
+                            return json_rpc_error_response(
+                                None,
+                                JsonRpcError::internal_error(e.to_string()),
+                            );
+                        }
+                    };
+
+                    // For `initialize`: the router's version negotiation falls
+                    // back to `LATEST_PROTOCOL_VERSION` ("2025-11-25") because
+                    // 2026-07-28 is not yet in `SUPPORTED_PROTOCOL_VERSIONS` at
+                    // the types layer. Patch the response to reflect the version
+                    // the transport is actually serving so the client sees the
+                    // version it requested.
+                    if is_init
+                        && let JsonRpcResponse::Result(ref mut result) = response
+                        && let Some(pv) = result.result.get_mut("protocolVersion")
+                    {
+                        *pv = serde_json::Value::String(version.clone());
+                    }
+
+                    let mut resp = if state.sse_responses {
+                        sse_json_response(&response)
+                    } else {
+                        axum::Json(response).into_response()
+                    };
+                    resp.headers_mut().insert(
+                        MCP_PROTOCOL_VERSION_HEADER,
+                        HeaderValue::from_str(version).unwrap(),
+                    );
+                    // Intentionally NO `mcp-session-id` header for 2026-07-28+ clients.
+                    return resp;
+                }
+                FirstOutbound::Notification(first_notif) => {
+                    let mut resp = stateless_sse_with_notifications(
+                        first_notif,
+                        call,
+                        notif_rx,
+                        is_init,
+                        version.clone(),
+                    );
+                    resp.headers_mut().insert(
+                        MCP_PROTOCOL_VERSION_HEADER,
+                        HeaderValue::from_str(version).unwrap(),
+                    );
+                    // Intentionally NO `mcp-session-id` header for 2026-07-28+ clients.
+                    return resp;
+                }
+            }
         }
     }
 
@@ -2812,6 +2867,130 @@ fn version_supports_subscriptions_listen(version: &str) -> bool {
 #[cfg(feature = "stateless")]
 fn is_stateless_protocol_version(version: &str) -> bool {
     version >= UPCOMING_PROTOCOL_VERSION
+}
+
+/// Stream a sessionless POST response as SSE: the notifications the handler
+/// emitted, in order, followed by the terminal JSON-RPC response.
+///
+/// Invoked when a handler produced a notification before its terminal
+/// response on the 2026-07-28 sessionless path. A plain JSON body would drop
+/// those notifications (there is no session stream to carry them), so the
+/// response falls back to `text/event-stream`: the buffered first
+/// notification, any further notifications as they arrive, and finally the
+/// terminal response, after which the stream ends.
+#[cfg(feature = "stateless")]
+fn stateless_sse_with_notifications(
+    first: crate::context::ServerNotification,
+    call: std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::error::Result<JsonRpcResponse>> + Send>,
+    >,
+    rx: crate::context::NotificationReceiver,
+    is_init: bool,
+    version: String,
+) -> Response {
+    struct Ctx {
+        call: Option<
+            std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<JsonRpcResponse>> + Send>,
+            >,
+        >,
+        rx: crate::context::NotificationReceiver,
+        rx_open: bool,
+        queue: std::collections::VecDeque<String>,
+        terminal: Option<String>,
+        is_init: bool,
+        version: String,
+    }
+
+    let mut queue = std::collections::VecDeque::new();
+    if let Some(json) = crate::transport::stdio::serialize_notification(&first) {
+        queue.push_back(json);
+    }
+    let ctx = Ctx {
+        call: Some(call),
+        rx,
+        rx_open: true,
+        queue,
+        terminal: None,
+        is_init,
+        version,
+    };
+
+    let stream = futures::stream::unfold(ctx, |mut ctx| async move {
+        loop {
+            // Buffered notifications flush first to preserve emission order.
+            if let Some(json) = ctx.queue.pop_front() {
+                return Some((
+                    Ok::<_, Infallible>(Event::default().event(SSE_MESSAGE_EVENT).data(json)),
+                    ctx,
+                ));
+            }
+            // The terminal response is the last event on the stream.
+            if let Some(json) = ctx.terminal.take() {
+                return Some((
+                    Ok(Event::default().event(SSE_MESSAGE_EVENT).data(json)),
+                    ctx,
+                ));
+            }
+            let mut call = ctx.call.take()?;
+            tokio::select! {
+                result = &mut call => {
+                    // Drain notifications that were queued before the handler
+                    // finished so they precede the terminal response.
+                    while let Ok(n) = ctx.rx.try_recv() {
+                        if let Some(json) =
+                            crate::transport::stdio::serialize_notification(&n)
+                        {
+                            ctx.queue.push_back(json);
+                        }
+                    }
+                    let terminal_json = match result {
+                        Ok(mut response) => {
+                            // Same initialize version patch as the JSON path.
+                            if ctx.is_init
+                                && let JsonRpcResponse::Result(ref mut r) = response
+                                && let Some(pv) = r.result.get_mut("protocolVersion")
+                            {
+                                *pv = serde_json::Value::String(ctx.version.clone());
+                            }
+                            serde_json::to_string(&response).ok()
+                        }
+                        Err(e) => Some(
+                            serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": serde_json::Value::Null,
+                                "error": JsonRpcError::internal_error(e.to_string()),
+                            })
+                            .to_string(),
+                        ),
+                    };
+                    ctx.terminal = terminal_json;
+                    // `call` is complete and intentionally not restored.
+                }
+                maybe = ctx.rx.recv(), if ctx.rx_open => {
+                    match maybe {
+                        Some(n) => {
+                            if let Some(json) =
+                                crate::transport::stdio::serialize_notification(&n)
+                            {
+                                ctx.queue.push_back(json);
+                            }
+                        }
+                        None => ctx.rx_open = false,
+                    }
+                    ctx.call = Some(call);
+                }
+            }
+        }
+    });
+
+    Sse::new(stream)
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(Duration::from_secs(30))
+                .text("ping"),
+        )
+        .into_response()
 }
 
 /// Serve a `subscriptions/listen` request as an SSE stream.

@@ -1727,21 +1727,29 @@ pub struct PromptsCapability {
 // Lifecycle and caching annotations (SEP-2549, SEP-2577, SEP-2596)
 // =============================================================================
 
-/// Scope of a cached list result.
+/// Scope of a cached result (SEP-2549).
 ///
-/// Per SEP-2549, servers can hint to clients how widely they may share a
-/// cached `tools/list`, `resources/list`, etc. response. `Session` means
-/// the cache is valid for the current client only; `Global` means it
-/// applies to any client of this server. `None` on the parent field
-/// means the server expresses no opinion.
+/// Servers hint to clients how widely they may share a cached
+/// `tools/list`, `resources/read`, etc. response. The final SEP-2549 wire
+/// values are `"public"` and `"private"`: `Public` means any client,
+/// gateway, or proxy may cache and serve the result across authorization
+/// contexts; `Private` restricts reuse to the same authorization context
+/// (a different access token requires a different cache). `None` on the
+/// parent field means the server expresses no opinion.
+///
+/// Earlier drafts of this crate used `session`/`global` values that never
+/// matched the SEP text; they were replaced before any release advertised
+/// 2026-07-28 support.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum CacheScope {
-    /// Cache is valid for the current session only.
-    Session,
-    /// Cache is valid across sessions (per-server, not per-client).
-    Global,
+    /// Any client, gateway, or proxy may cache and serve this result across
+    /// authorization contexts.
+    Public,
+    /// The cached result may only be reused within the same authorization
+    /// context.
+    Private,
 }
 
 /// Deprecation metadata for spec features and capabilities.
@@ -2601,15 +2609,40 @@ pub struct ReadResourceParams {
     pub meta: Option<RequestMeta>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReadResourceResult {
     pub contents: Vec<ResourceContent>,
+    /// SEP-2549: client-cache TTL in milliseconds for this read response.
+    /// The 2026-07-28 draft requires caching hints on `resources/read`
+    /// results; on older protocol versions the field is simply extra data.
+    #[serde(rename = "ttlMs", default, skip_serializing_if = "Option::is_none")]
+    pub ttl_ms: Option<u64>,
+    /// SEP-2549: scope the cached result applies to. `None` means
+    /// unspecified (clients treat it conservatively).
+    #[serde(
+        rename = "cacheScope",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cache_scope: Option<CacheScope>,
     /// Optional protocol-level metadata
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
 }
 
 impl ReadResourceResult {
+    /// Set the SEP-2549 client-cache TTL (milliseconds) for this result.
+    pub fn with_ttl_ms(mut self, ttl_ms: u64) -> Self {
+        self.ttl_ms = Some(ttl_ms);
+        self
+    }
+
+    /// Set the SEP-2549 cache scope for this result.
+    pub fn with_cache_scope(mut self, scope: CacheScope) -> Self {
+        self.cache_scope = Some(scope);
+        self
+    }
+
     /// Create a result with text content.
     ///
     /// # Example
@@ -2629,6 +2662,7 @@ impl ReadResourceResult {
                 meta: None,
             }],
             meta: None,
+            ..Default::default()
         }
     }
 
@@ -2659,6 +2693,7 @@ impl ReadResourceResult {
                 meta: None,
             }],
             meta: None,
+            ..Default::default()
         }
     }
 
@@ -2687,6 +2722,7 @@ impl ReadResourceResult {
                 meta: None,
             }],
             meta: None,
+            ..Default::default()
         }
     }
 
@@ -2712,6 +2748,7 @@ impl ReadResourceResult {
                 meta: None,
             }],
             meta: None,
+            ..Default::default()
         }
     }
 
@@ -2741,6 +2778,7 @@ impl ReadResourceResult {
                 meta: None,
             }],
             meta: None,
+            ..Default::default()
         }
     }
 
@@ -4501,19 +4539,20 @@ mod tests {
             tools: vec![],
             next_cursor: None,
             ttl_ms: Some(60_000),
-            cache_scope: Some(CacheScope::Global),
+            cache_scope: Some(CacheScope::Public),
             meta: None,
         };
         let json = serde_json::to_value(&r).unwrap();
         assert_eq!(json["ttlMs"], 60_000);
-        assert_eq!(json["cacheScope"], "global");
+        assert_eq!(json["cacheScope"], "public");
     }
 
     #[test]
     fn cache_scope_roundtrips_via_lowercase_strings() {
+        // Final SEP-2549 wire values are "public" and "private".
         for (scope, wire) in [
-            (CacheScope::Session, "session"),
-            (CacheScope::Global, "global"),
+            (CacheScope::Public, "public"),
+            (CacheScope::Private, "private"),
         ] {
             let s = serde_json::to_value(scope).unwrap();
             assert_eq!(s, serde_json::json!(wire));

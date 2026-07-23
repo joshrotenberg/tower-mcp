@@ -119,6 +119,7 @@ fn validate_read_resource_result() {
             meta: None,
         }],
         meta: None,
+        ..Default::default()
     };
     validate_against_def(&result, "ReadResourceResult");
 }
