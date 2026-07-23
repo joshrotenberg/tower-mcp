@@ -138,27 +138,33 @@ impl ChannelTransport {
 
         tokio::spawn(async move {
             while let Some(raw_request) = request_rx.recv().await {
-                // Parse the incoming JSON
-                let req: JsonRpcRequest = match serde_json::from_str(&raw_request) {
+                // Notifications carry no `id`, so they cannot parse as
+                // JsonRpcRequest (whose id is required). Inspect the raw
+                // frame first and handle them by method.
+                let parsed: serde_json::Value = match serde_json::from_str(&raw_request) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!("ChannelTransport: failed to parse frame: {}", e);
+                        continue;
+                    }
+                };
+                if parsed.get("id").is_none() {
+                    if parsed.get("method").and_then(|m| m.as_str())
+                        == Some("notifications/initialized")
+                    {
+                        router.handle_notification(McpNotification::Initialized);
+                    }
+                    // No response for notifications
+                    continue;
+                }
+
+                let req: JsonRpcRequest = match serde_json::from_value(parsed) {
                     Ok(r) => r,
                     Err(e) => {
                         tracing::error!("ChannelTransport: failed to parse request: {}", e);
                         continue;
                     }
                 };
-
-                // Check for initialized notification embedded as a request
-                // (McpClient sends notifications as JSON-RPC messages)
-                if req.method == "notifications/initialized" {
-                    router.handle_notification(McpNotification::Initialized);
-                    // No response for notifications
-                    continue;
-                }
-
-                // Handle other notifications (no response expected)
-                if req.method.starts_with("notifications/") {
-                    continue;
-                }
 
                 // Process each request in its own task so a slow call does
                 // not block the transport. The client correlates responses
