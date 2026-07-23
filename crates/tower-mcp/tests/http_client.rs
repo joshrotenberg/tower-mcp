@@ -2630,3 +2630,63 @@ async fn test_session_recovery_disabled() {
     let result = client.list_tools().await;
     assert!(result.is_err(), "Should fail without session recovery");
 }
+
+/// #967 regression: `notifications/initialized` must not race the first
+/// request after `initialize()`.
+///
+/// Post-session request POSTs are spawned in background tasks; notification
+/// POSTs must be awaited inline so a strict server (`strict_initialization`
+/// defaults to true) processes them before the next request arrives. The
+/// race depends on network timing, so an in-process server never exhibits
+/// it; this test routes the client through a TCP proxy that delays any
+/// connection carrying `notifications/initialized` by 200 ms, forcing the
+/// reordering. Before the fix the subsequent `tools/list` deterministically
+/// failed with -32600; after it, `initialize()` does not return until the
+/// notification is acknowledged, so ordering holds.
+#[tokio::test]
+async fn initialized_notification_ordering_under_strict_server() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (url, _server) = start_server().await;
+    let upstream = url.strip_prefix("http://").unwrap().to_string();
+
+    // Delaying proxy: hold back the connection that carries the
+    // initialized notification; pass everything else straight through.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut client_conn, _)) = listener.accept().await else {
+                break;
+            };
+            let upstream = upstream.clone();
+            tokio::spawn(async move {
+                let mut first = vec![0u8; 16 * 1024];
+                let n = match client_conn.read(&mut first).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => n,
+                };
+                if String::from_utf8_lossy(&first[..n]).contains("notifications/initialized") {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                let Ok(mut up) = tokio::net::TcpStream::connect(&upstream).await else {
+                    return;
+                };
+                if up.write_all(&first[..n]).await.is_err() {
+                    return;
+                }
+                let _ = tokio::io::copy_bidirectional(&mut client_conn, &mut up).await;
+            });
+        }
+    });
+
+    let proxied_url = format!("http://{proxy_addr}");
+    let transport = HttpClientTransport::new(proxied_url);
+    let client = McpClient::connect(transport).await.unwrap();
+    client.initialize("race-test", "1.0.0").await.unwrap();
+    let tools = client
+        .list_tools()
+        .await
+        .expect("tools/list must not be rejected: initialized must be acknowledged first");
+    assert!(!tools.tools.is_empty());
+}
