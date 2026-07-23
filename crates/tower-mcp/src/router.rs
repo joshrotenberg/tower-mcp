@@ -724,6 +724,16 @@ impl McpRouter {
         // visible; per-request meta (SEP-2575) is now reachable too.
         let mut merged = (*self.inner.extensions).clone();
         merged.merge(per_request);
+
+        // Adopt a transport-provided cancellation token (e.g. HTTP stateless
+        // client disconnect) so `ctx.is_cancelled()` / `ctx.cancelled()` and
+        // in-flight tracking observe the transport's signal.
+        let ctx = if let Some(token) = merged.get::<CancellationToken>() {
+            ctx.with_cancellation_token(token.clone())
+        } else {
+            ctx
+        };
+
         let ctx = ctx.with_extensions(Arc::new(merged));
 
         // Set up log level filtering

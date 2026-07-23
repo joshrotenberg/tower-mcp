@@ -314,6 +314,11 @@ pub const MCP_PARAM_HEADER_PREFIX: &str = "mcp-param-";
 /// error.
 pub(super) const SEP_2243_MIN_PROTOCOL_VERSION: &str = "2026-07-28";
 
+/// Default maximum POST body size in bytes (4 MiB, matching rmcp).
+///
+/// See [`HttpTransport::max_body_size`].
+pub const DEFAULT_MAX_BODY_SIZE: usize = 4 * 1024 * 1024;
+
 /// SSE event type for JSON-RPC messages
 const SSE_MESSAGE_EVENT: &str = "message";
 
@@ -1288,6 +1293,8 @@ struct AppState {
     stateless_config: Option<crate::stateless::StatelessConfig>,
     /// Whether to wrap synchronous responses in SSE format (rmcp compat)
     sse_responses: bool,
+    /// Maximum accepted POST body size in bytes
+    max_body_size: usize,
 }
 
 /// Configuration for OAuth 2.1 Protected Resource Metadata.
@@ -1342,6 +1349,10 @@ pub struct HttpTransport {
     ///
     /// See [`HttpTransport::sse_responses()`] for details.
     sse_responses: bool,
+    /// Maximum accepted POST body size in bytes.
+    ///
+    /// See [`HttpTransport::max_body_size()`] for details.
+    max_body_size: usize,
 }
 
 impl HttpTransport {
@@ -1370,6 +1381,7 @@ impl HttpTransport {
             #[cfg(feature = "oauth")]
             oauth_config: None,
             sse_responses: false,
+            max_body_size: DEFAULT_MAX_BODY_SIZE,
         }
     }
 
@@ -1426,6 +1438,7 @@ impl HttpTransport {
             #[cfg(feature = "oauth")]
             oauth_config: None,
             sse_responses: false,
+            max_body_size: DEFAULT_MAX_BODY_SIZE,
         }
     }
 
@@ -1594,6 +1607,42 @@ impl HttpTransport {
     /// ```
     pub fn sse_responses(mut self, enabled: bool) -> Self {
         self.sse_responses = enabled;
+        self
+    }
+
+    /// Set the maximum accepted POST body size in bytes.
+    ///
+    /// Requests whose body exceeds the limit are rejected with HTTP 413
+    /// (Payload Too Large) before any JSON parsing or dispatch happens.
+    /// A `Content-Length` header above the limit short-circuits without
+    /// reading the body; chunked bodies are capped while streaming.
+    ///
+    /// Default: 4 MiB ([`DEFAULT_MAX_BODY_SIZE`]), matching rmcp.
+    ///
+    /// # Interplay with axum's `DefaultBodyLimit`
+    ///
+    /// axum's built-in [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit)
+    /// (2 MB by default) only applies to body-consuming extractors such as
+    /// `Bytes`, `String`, and `Json`. The MCP endpoint consumes the raw
+    /// [`Request`](axum::extract::Request) and reads the body itself, so
+    /// `DefaultBodyLimit` never applies to it; this transport-level limit
+    /// is the only bound on the MCP POST body. Layering
+    /// `DefaultBodyLimit` onto the router returned by
+    /// [`into_router`](Self::into_router) does not change the MCP
+    /// endpoint's behavior.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use tower_mcp::McpRouter;
+    /// use tower_mcp::transport::http::HttpTransport;
+    ///
+    /// let router = McpRouter::new().server_info("my-server", "1.0.0");
+    /// // Accept request bodies up to 1 MiB.
+    /// let transport = HttpTransport::new(router).max_body_size(1024 * 1024);
+    /// ```
+    pub fn max_body_size(mut self, bytes: usize) -> Self {
+        self.max_body_size = bytes;
         self
     }
 
@@ -1886,6 +1935,7 @@ impl HttpTransport {
             #[cfg(feature = "stateless")]
             stateless_config: self.stateless_config.clone(),
             sse_responses: self.sse_responses,
+            max_body_size: self.max_body_size,
         })
     }
 
@@ -2227,7 +2277,21 @@ async fn handle_post(
         return resp;
     }
 
-    let body = match axum::body::to_bytes(body_bytes, usize::MAX).await {
+    // Bound the body size (rmcp #970 analog). axum's `DefaultBodyLimit`
+    // doesn't apply here because this handler consumes the raw `Request`
+    // instead of a body-consuming extractor, so this is the only limit on
+    // the MCP POST body. A declared Content-Length above the limit is
+    // rejected without reading; chunked bodies are capped while streaming.
+    if let Some(declared) = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        && declared > state.max_body_size
+    {
+        return body_too_large_response(state.max_body_size);
+    }
+
+    let body = match axum::body::to_bytes(body_bytes, state.max_body_size).await {
         Ok(bytes) => match String::from_utf8(bytes.to_vec()) {
             Ok(s) => s,
             Err(e) => {
@@ -2237,6 +2301,9 @@ async fn handle_post(
                 );
             }
         },
+        Err(e) if is_length_limit_error(&e) => {
+            return body_too_large_response(state.max_body_size);
+        }
         Err(e) => {
             return json_rpc_error_response(
                 None,
@@ -2359,9 +2426,21 @@ async fn handle_post(
                 ext.insert(claims.clone());
             }
             stash_per_request_meta(&request, &mut ext);
-            if !ext.is_empty() {
-                service = service.with_extensions(ext);
-            }
+
+            // rmcp #967 analog: give the request a cancellation token that
+            // fires if the client disconnects before the response is
+            // delivered. The router adopts the token as the
+            // `RequestContext`'s cancellation source, so handlers observe
+            // the disconnect via `ctx.is_cancelled()` / `ctx.cancelled()`,
+            // and spawned work holding a token clone is signalled even
+            // after the request future itself is dropped. Session-based
+            // requests are exempt: with stream resumption, a disconnect is
+            // not a cancellation.
+            let cancel_token = crate::context::CancellationToken::new();
+            let mut cancel_guard = CancelOnDisconnect::arm(cancel_token.clone());
+            ext.insert(cancel_token);
+
+            service = service.with_extensions(ext);
 
             let mut call: std::pin::Pin<
                 Box<dyn std::future::Future<Output = crate::error::Result<JsonRpcResponse>> + Send>,
@@ -2388,6 +2467,10 @@ async fn handle_post(
 
             match first {
                 FirstOutbound::Response(result) => {
+                    // Handler finished; the response is about to be
+                    // produced, so dropping the connection from here on is
+                    // no longer a cancellation.
+                    cancel_guard.disarm();
                     let mut response = match result {
                         Ok(resp) => resp,
                         Err(e) => {
@@ -2430,6 +2513,7 @@ async fn handle_post(
                         notif_rx,
                         is_init,
                         version.clone(),
+                        cancel_guard,
                     );
                     resp.headers_mut().insert(
                         MCP_PROTOCOL_VERSION_HEADER,
@@ -2869,6 +2953,37 @@ fn is_stateless_protocol_version(version: &str) -> bool {
     version >= UPCOMING_PROTOCOL_VERSION
 }
 
+/// Drop guard that cancels a per-request [`CancellationToken`] when the
+/// request is abandoned before its response is produced.
+///
+/// On the sessionless POST path the response future (plain JSON) or the SSE
+/// response stream is dropped when the client disconnects; holding this
+/// guard in that future/stream turns the drop into a cancellation signal.
+/// [`disarm`](Self::disarm) once the handler's terminal response resolves
+/// so normal completion doesn't signal cancellation.
+#[cfg(feature = "stateless")]
+struct CancelOnDisconnect(Option<crate::context::CancellationToken>);
+
+#[cfg(feature = "stateless")]
+impl CancelOnDisconnect {
+    fn arm(token: crate::context::CancellationToken) -> Self {
+        Self(Some(token))
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+#[cfg(feature = "stateless")]
+impl Drop for CancelOnDisconnect {
+    fn drop(&mut self) {
+        if let Some(token) = self.0.take() {
+            token.cancel();
+        }
+    }
+}
+
 /// Stream a sessionless POST response as SSE: the notifications the handler
 /// emitted, in order, followed by the terminal JSON-RPC response.
 ///
@@ -2887,6 +3002,7 @@ fn stateless_sse_with_notifications(
     rx: crate::context::NotificationReceiver,
     is_init: bool,
     version: String,
+    cancel_guard: CancelOnDisconnect,
 ) -> Response {
     struct Ctx {
         call: Option<
@@ -2900,6 +3016,10 @@ fn stateless_sse_with_notifications(
         terminal: Option<String>,
         is_init: bool,
         version: String,
+        /// Cancels the per-request token if the client disconnects (the
+        /// stream, and with it this state, is dropped) while the handler
+        /// is still in flight. Disarmed once the handler resolves.
+        cancel_guard: CancelOnDisconnect,
     }
 
     let mut queue = std::collections::VecDeque::new();
@@ -2914,6 +3034,7 @@ fn stateless_sse_with_notifications(
         terminal: None,
         is_init,
         version,
+        cancel_guard,
     };
 
     let stream = futures::stream::unfold(ctx, |mut ctx| async move {
@@ -2935,6 +3056,9 @@ fn stateless_sse_with_notifications(
             let mut call = ctx.call.take()?;
             tokio::select! {
                 result = &mut call => {
+                    // Handler finished; a later disconnect is no longer a
+                    // cancellation.
+                    ctx.cancel_guard.disarm();
                     // Drain notifications that were queued before the handler
                     // finished so they precede the terminal response.
                     while let Ok(n) = ctx.rx.try_recv() {
@@ -3390,6 +3514,32 @@ fn json_rpc_error_response(
     axum::Json(response).into_response()
 }
 
+/// HTTP 413 response for a POST body exceeding [`HttpTransport::max_body_size`].
+fn body_too_large_response(limit: usize) -> Response {
+    let mut resp = json_rpc_error_response(
+        None,
+        JsonRpcError::invalid_request(format!(
+            "Request body exceeds the maximum size of {} bytes",
+            limit
+        )),
+    );
+    *resp.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
+    resp
+}
+
+/// Returns `true` when the body-read error was caused by exceeding the
+/// configured length limit (as opposed to a transport-level I/O failure).
+fn is_length_limit_error(err: &axum::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = source {
+        if e.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        source = e.source();
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3399,6 +3549,72 @@ mod tests {
 
     fn create_test_router() -> McpRouter {
         McpRouter::new().server_info("test-server", "1.0.0")
+    }
+
+    #[tokio::test]
+    async fn test_oversized_body_rejected_with_413() {
+        let transport = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .max_body_size(1024);
+        let app = transport.into_router();
+
+        // 2 KiB of body against a 1 KiB limit.
+        let padding = "x".repeat(2048);
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"ping","params":{{"pad":"{}"}}}}"#,
+            padding
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn test_oversized_content_length_rejected_without_reading() {
+        let transport = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .max_body_size(1024);
+        let app = transport.into_router();
+
+        // Declared Content-Length above the limit short-circuits even
+        // though the actual body is tiny.
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header("Content-Length", "10485760")
+            .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn test_body_within_limit_accepted() {
+        let transport = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .max_body_size(1024);
+        let app = transport.into_router();
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

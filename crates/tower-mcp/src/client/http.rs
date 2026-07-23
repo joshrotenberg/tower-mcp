@@ -97,7 +97,19 @@ pub struct HttpClientConfig {
     /// JSON-RPC -32005 errors trigger re-initialization.
     /// Default: `true`.
     pub session_recovery: bool,
+    /// Maximum size in bytes buffered for a single SSE event.
+    ///
+    /// A server that streams an event without ever terminating it would
+    /// otherwise grow the parse buffer without bound. When a single
+    /// event's buffered size exceeds this cap, the stream is terminated
+    /// with [`Error::SseEventTooLarge`].
+    /// Default: 16 MiB (matching rmcp).
+    pub max_sse_event_size: usize,
 }
+
+/// Default maximum buffered size for a single SSE event (16 MiB, matching
+/// rmcp). See [`HttpClientConfig::max_sse_event_size`].
+pub const DEFAULT_MAX_SSE_EVENT_SIZE: usize = 16 * 1024 * 1024;
 
 impl Default for HttpClientConfig {
     fn default() -> Self {
@@ -110,6 +122,7 @@ impl Default for HttpClientConfig {
             sse_reconnect_delay: Duration::from_secs(1),
             max_sse_reconnect_attempts: 5,
             session_recovery: true,
+            max_sse_event_size: DEFAULT_MAX_SSE_EVENT_SIZE,
         }
     }
 }
@@ -534,6 +547,7 @@ impl ClientTransport for HttpClientTransport {
             let last_event_id = self.last_event_id.clone();
             let sse_retry_delay = self.sse_retry_delay.clone();
             let sse_reconnect_signal = self.sse_reconnect_signal.clone();
+            let max_sse_event_size = self.config.max_sse_event_size;
             tokio::spawn(async move {
                 let response = match request.send().await {
                     Ok(r) => r,
@@ -581,7 +595,7 @@ impl ClientTransport for HttpClientTransport {
                 if is_sse {
                     // Stream SSE response to extract id/retry fields
                     let mut stream = response.bytes_stream();
-                    let mut parser = SseParser::new();
+                    let mut parser = SseParser::with_limit(max_sse_event_size);
                     let mut had_retry = false;
                     let mut had_data = false;
 
@@ -590,7 +604,20 @@ impl ClientTransport for HttpClientTransport {
                         match result {
                             Ok(bytes) => {
                                 let text = String::from_utf8_lossy(&bytes);
-                                for event in parser.feed(&text) {
+                                let events = match parser.feed(&text) {
+                                    Ok(events) => events,
+                                    Err(e) => {
+                                        // A single event exceeded the cap;
+                                        // terminate the stream instead of
+                                        // buffering without bound. The
+                                        // response for this request is lost,
+                                        // so the transport is unusable.
+                                        tracing::error!(error = %e, "POST SSE stream terminated");
+                                        connected.store(false, Ordering::Release);
+                                        return;
+                                    }
+                                };
+                                for event in events {
                                     if let Some(ref id) = event.id {
                                         *last_event_id.write().await = Some(id.clone());
                                     }
@@ -889,7 +916,7 @@ async fn sse_stream_loop(params: SseLoopParams) {
 
         // Parse SSE stream, also listening for reconnect signals from POST handlers
         let mut stream = response.bytes_stream();
-        let mut parser = SseParser::new();
+        let mut parser = SseParser::with_limit(config.max_sse_event_size);
 
         use futures::StreamExt;
         loop {
@@ -898,7 +925,19 @@ async fn sse_stream_loop(params: SseLoopParams) {
                     match chunk {
                         Some(Ok(bytes)) => {
                             let text = String::from_utf8_lossy(&bytes);
-                            for event in parser.feed(&text) {
+                            let events = match parser.feed(&text) {
+                                Ok(events) => events,
+                                Err(e) => {
+                                    // A single event exceeded the cap;
+                                    // terminate the stream (no reconnect,
+                                    // the server would just repeat it)
+                                    // instead of buffering without bound.
+                                    tracing::error!(error = %e, "SSE stream terminated");
+                                    connected.store(false, Ordering::Release);
+                                    return;
+                                }
+                            };
+                            for event in events {
                                 if let Some(ref id) = event.id {
                                     *last_event_id.write().await = Some(id.clone());
                                 }
@@ -970,8 +1009,10 @@ fn extract_json_messages(body: &str) -> Vec<String> {
         || trimmed.starts_with(':');
 
     if looks_like_sse {
+        // The body is already fully in memory here, so no event-size cap
+        // applies: an unlimited parser never returns an error.
         let mut parser = SseParser::new();
-        let events = parser.feed(body);
+        let events = parser.feed(body).unwrap_or_default();
         events.into_iter().map(|e| e.data).collect()
     } else {
         vec![trimmed.to_string()]
@@ -992,7 +1033,11 @@ struct SseEvent {
 /// Incremental SSE parser.
 ///
 /// Handles partial chunks from the byte stream, buffering incomplete
-/// lines across `feed()` calls.
+/// lines across `feed()` calls. When constructed with
+/// [`with_limit`](Self::with_limit), a single event whose buffered size
+/// exceeds the limit terminates parsing with
+/// [`Error::SseEventTooLarge`] instead of growing without bound
+/// (rmcp #970 analog).
 struct SseParser {
     /// Partial line buffer (when a chunk ends mid-line).
     buffer: String,
@@ -1000,20 +1045,37 @@ struct SseParser {
     current_id: Option<String>,
     current_data: Vec<String>,
     current_retry: Option<u64>,
+    /// Total bytes across `current_data` lines, tracked incrementally.
+    data_len: usize,
+    /// Maximum buffered size for a single event.
+    max_event_size: usize,
 }
 
 impl SseParser {
+    /// Create a parser with no event-size limit.
     fn new() -> Self {
+        Self::with_limit(usize::MAX)
+    }
+
+    /// Create a parser that rejects events buffering more than
+    /// `max_event_size` bytes.
+    fn with_limit(max_event_size: usize) -> Self {
         Self {
             buffer: String::new(),
             current_id: None,
             current_data: Vec::new(),
             current_retry: None,
+            data_len: 0,
+            max_event_size,
         }
     }
 
     /// Feed a chunk of text and return any complete events.
-    fn feed(&mut self, text: &str) -> Vec<SseEvent> {
+    ///
+    /// Returns [`Error::SseEventTooLarge`] when the bytes buffered for a
+    /// single in-progress event exceed the configured limit. The parser
+    /// should not be fed further after an error.
+    fn feed(&mut self, text: &str) -> Result<Vec<SseEvent>> {
         self.buffer.push_str(text);
         let mut events = Vec::new();
 
@@ -1033,6 +1095,7 @@ impl SseParser {
                         retry: self.current_retry.take(),
                     });
                     self.current_data.clear();
+                    self.data_len = 0;
                 }
                 self.current_id = None;
                 self.current_retry = None;
@@ -1042,7 +1105,9 @@ impl SseParser {
                     self.current_id = Some(trimmed.to_string());
                 }
             } else if let Some(value) = line.strip_prefix("data:") {
-                self.current_data.push(value.trim().to_string());
+                let data = value.trim().to_string();
+                self.data_len += data.len();
+                self.current_data.push(data);
             } else if let Some(value) = line.strip_prefix("retry:") {
                 self.current_retry = value.trim().parse().ok();
             }
@@ -1050,7 +1115,18 @@ impl SseParser {
             // Lines starting with 'event:' are event types -- ignored (we only care about data)
         }
 
-        events
+        // Everything still buffered belongs to a single unfinished event
+        // (or an unfinished line of one). Cap it so a server that never
+        // terminates an event can't grow the buffers without bound.
+        let buffered = self.buffer.len() + self.data_len;
+        if buffered > self.max_event_size {
+            return Err(Error::SseEventTooLarge {
+                size: buffered,
+                limit: self.max_event_size,
+            });
+        }
+
+        Ok(events)
     }
 }
 
@@ -1065,7 +1141,9 @@ mod tests {
     #[test]
     fn test_parse_complete_event() {
         let mut parser = SseParser::new();
-        let events = parser.feed("id: 1\nevent: message\ndata: {\"hello\":\"world\"}\n\n");
+        let events = parser
+            .feed("id: 1\nevent: message\ndata: {\"hello\":\"world\"}\n\n")
+            .unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, Some("1".to_string()));
@@ -1075,8 +1153,9 @@ mod tests {
     #[test]
     fn test_parse_multiple_events() {
         let mut parser = SseParser::new();
-        let events =
-            parser.feed("id: 1\ndata: first\n\nid: 2\ndata: second\n\nid: 3\ndata: third\n\n");
+        let events = parser
+            .feed("id: 1\ndata: first\n\nid: 2\ndata: second\n\nid: 3\ndata: third\n\n")
+            .unwrap();
 
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].data, "first");
@@ -1092,11 +1171,11 @@ mod tests {
         let mut parser = SseParser::new();
 
         // First chunk: partial event
-        let events = parser.feed("id: 1\nda");
+        let events = parser.feed("id: 1\nda").unwrap();
         assert!(events.is_empty());
 
         // Second chunk: completes the event
-        let events = parser.feed("ta: hello\n\n");
+        let events = parser.feed("ta: hello\n\n").unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, Some("1".to_string()));
         assert_eq!(events[0].data, "hello");
@@ -1105,7 +1184,9 @@ mod tests {
     #[test]
     fn test_parse_multiline_data() {
         let mut parser = SseParser::new();
-        let events = parser.feed("id: 1\ndata: line1\ndata: line2\ndata: line3\n\n");
+        let events = parser
+            .feed("id: 1\ndata: line1\ndata: line2\ndata: line3\n\n")
+            .unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "line1\nline2\nline3");
@@ -1114,7 +1195,7 @@ mod tests {
     #[test]
     fn test_parse_comment_lines() {
         let mut parser = SseParser::new();
-        let events = parser.feed(": keep-alive\nid: 1\ndata: hello\n\n");
+        let events = parser.feed(": keep-alive\nid: 1\ndata: hello\n\n").unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "hello");
@@ -1123,7 +1204,7 @@ mod tests {
     #[test]
     fn test_parse_event_without_id() {
         let mut parser = SseParser::new();
-        let events = parser.feed("data: no-id-event\n\n");
+        let events = parser.feed("data: no-id-event\n\n").unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, None);
@@ -1133,7 +1214,7 @@ mod tests {
     #[test]
     fn test_empty_data_no_event() {
         let mut parser = SseParser::new();
-        let events = parser.feed("id: 1\n\n");
+        let events = parser.feed("id: 1\n\n").unwrap();
 
         // No data lines = no event produced
         assert!(events.is_empty());
@@ -1142,7 +1223,7 @@ mod tests {
     #[test]
     fn test_parse_crlf_line_endings() {
         let mut parser = SseParser::new();
-        let events = parser.feed("id: 1\r\ndata: crlf\r\n\r\n");
+        let events = parser.feed("id: 1\r\ndata: crlf\r\n\r\n").unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "crlf");
@@ -1153,7 +1234,7 @@ mod tests {
         let mut parser = SseParser::new();
         let json = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"token":"t1","progress":50}}"#;
         let input = format!("id: 42\nevent: message\ndata: {}\n\n", json);
-        let events = parser.feed(&input);
+        let events = parser.feed(&input).unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, Some("42".to_string()));
@@ -1161,6 +1242,44 @@ mod tests {
         // Verify it's valid JSON
         let parsed: serde_json::Value = serde_json::from_str(&events[0].data).unwrap();
         assert_eq!(parsed["method"], "notifications/progress");
+    }
+
+    #[test]
+    fn test_event_exceeding_limit_is_rejected() {
+        let mut parser = SseParser::with_limit(64);
+
+        // An unterminated data line larger than the limit trips the cap.
+        let big = "data: ".to_string() + &"x".repeat(128);
+        let err = parser.feed(&big).unwrap_err();
+        match err {
+            Error::SseEventTooLarge { size, limit } => {
+                assert!(size > 64, "size {} should exceed limit", size);
+                assert_eq!(limit, 64);
+            }
+            other => panic!("expected SseEventTooLarge, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_accumulated_data_lines_count_toward_limit() {
+        let mut parser = SseParser::with_limit(64);
+
+        // Many complete data lines belonging to one unterminated event.
+        let mut result = Ok(Vec::new());
+        for _ in 0..10 {
+            result = parser.feed("data: 0123456789\n");
+            if result.is_err() {
+                break;
+            }
+        }
+        assert!(matches!(result, Err(Error::SseEventTooLarge { .. })));
+    }
+
+    #[test]
+    fn test_events_within_limit_pass() {
+        let mut parser = SseParser::with_limit(64);
+        let events = parser.feed("data: hello\n\ndata: world\n\n").unwrap();
+        assert_eq!(events.len(), 2);
     }
 
     // =========================================================================

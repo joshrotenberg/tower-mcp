@@ -1043,11 +1043,27 @@ fn handle_response(
         }
     };
 
+    // Exact match first; genuine string IDs always take precedence. As a
+    // fallback, accept a response whose id is the string form of a numeric
+    // request id ("42" matching 42) -- some servers stringify numeric ids
+    // when echoing them (rmcp #1021 analog).
     let pending = match pending_requests.remove(&id) {
         Some(p) => p,
         None => {
-            tracing::warn!(id = ?id, "Response for unknown request");
-            return;
+            let numeric_fallback = match &id {
+                RequestId::String(s) => s
+                    .parse::<i64>()
+                    .ok()
+                    .and_then(|n| pending_requests.remove(&RequestId::Number(n))),
+                _ => None,
+            };
+            match numeric_fallback {
+                Some(p) => p,
+                None => {
+                    tracing::warn!(id = ?id, "Response for unknown request");
+                    return;
+                }
+            }
         }
     };
 
@@ -1854,5 +1870,80 @@ mod tests {
             }
             _ => panic!("Expected Unknown"),
         }
+    }
+
+    // =========================================================================
+    // handle_response ID correlation
+    // =========================================================================
+
+    fn pending_with(
+        ids: &[RequestId],
+    ) -> (
+        HashMap<RequestId, PendingRequest>,
+        Vec<oneshot::Receiver<Result<serde_json::Value>>>,
+    ) {
+        let mut map = HashMap::new();
+        let mut rxs = Vec::new();
+        for id in ids {
+            let (tx, rx) = oneshot::channel();
+            map.insert(id.clone(), PendingRequest { response_tx: tx });
+            rxs.push(rx);
+        }
+        (map, rxs)
+    }
+
+    #[tokio::test]
+    async fn test_stringified_numeric_response_id_correlates() {
+        // rmcp #1021 analog: a numeric request id 42 answered with a
+        // stringified id "42" still correlates.
+        let (mut pending, mut rxs) = pending_with(&[RequestId::Number(42)]);
+
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "42",
+            "result": {"ok": true}
+        });
+        handle_response(&response, &mut pending);
+
+        assert!(pending.is_empty(), "pending request should be resolved");
+        let result = rxs.remove(0).await.unwrap().unwrap();
+        assert_eq!(result, serde_json::json!({"ok": true}));
+    }
+
+    #[tokio::test]
+    async fn test_exact_string_id_takes_precedence() {
+        // A genuine string id "42" must match exactly and win over the
+        // numeric interpretation when both are pending.
+        let (mut pending, mut rxs) =
+            pending_with(&[RequestId::String("42".to_string()), RequestId::Number(42)]);
+
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "42",
+            "result": {"which": "string"}
+        });
+        handle_response(&response, &mut pending);
+
+        // The string entry resolved; the numeric entry is still pending.
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains_key(&RequestId::Number(42)));
+        let result = rxs.remove(0).await.unwrap().unwrap();
+        assert_eq!(result, serde_json::json!({"which": "string"}));
+    }
+
+    #[tokio::test]
+    async fn test_non_numeric_string_id_does_not_correlate() {
+        // A string id that is not the string form of the pending numeric
+        // id must not resolve it.
+        let (mut pending, _rxs) = pending_with(&[RequestId::Number(42)]);
+
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "not-a-number",
+            "result": {}
+        });
+        handle_response(&response, &mut pending);
+
+        assert_eq!(pending.len(), 1, "numeric request should stay pending");
     }
 }

@@ -17,6 +17,7 @@ categories = ["network-programming", "asynchronous"]
 tower.workspace = true
 tower-service.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 futures.workspace = true
 pin-project-lite = "0.2"
 tower-mcp-types.workspace = true

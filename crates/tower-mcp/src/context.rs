@@ -113,7 +113,7 @@
 //! }
 //! ```
 
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
@@ -310,8 +310,8 @@ pub struct RequestContext {
     request_id: RequestId,
     /// Progress token (if provided by client)
     progress_token: Option<ProgressToken>,
-    /// Cancellation flag
-    cancelled: Arc<AtomicBool>,
+    /// Cancellation signal for this request
+    cancellation: tokio_util::sync::CancellationToken,
     /// Channel for sending notifications
     notification_tx: Option<NotificationSender>,
     /// Handle for sending requests to the client (for sampling, etc.)
@@ -391,7 +391,7 @@ impl std::fmt::Debug for RequestContext {
         f.debug_struct("RequestContext")
             .field("request_id", &self.request_id)
             .field("progress_token", &self.progress_token)
-            .field("cancelled", &self.cancelled.load(Ordering::Relaxed))
+            .field("cancelled", &self.cancellation.is_cancelled())
             .finish()
     }
 }
@@ -402,7 +402,7 @@ impl RequestContext {
         Self {
             request_id,
             progress_token: None,
-            cancelled: Arc::new(AtomicBool::new(false)),
+            cancellation: tokio_util::sync::CancellationToken::new(),
             notification_tx: None,
             client_requester: None,
             extensions: Arc::new(Extensions::new()),
@@ -521,19 +521,48 @@ impl RequestContext {
 
     /// Check if the request has been cancelled
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Relaxed)
+        self.cancellation.is_cancelled()
     }
 
     /// Mark the request as cancelled
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Relaxed);
+        self.cancellation.cancel();
+    }
+
+    /// Wait until the request is cancelled.
+    ///
+    /// Completes when [`cancel`](Self::cancel) is called -- by a
+    /// `notifications/cancelled` message, or by the transport when the
+    /// client disconnects before the response is delivered (HTTP
+    /// stateless mode). Useful in `tokio::select!` to abandon work early:
+    ///
+    /// ```rust,ignore
+    /// tokio::select! {
+    ///     result = do_work() => { /* ... */ }
+    ///     _ = ctx.cancelled() => return Err(Error::tool("cancelled")),
+    /// }
+    /// ```
+    pub async fn cancelled(&self) {
+        self.cancellation.cancelled().await
     }
 
     /// Get a cancellation token that can be shared
     pub fn cancellation_token(&self) -> CancellationToken {
         CancellationToken {
-            cancelled: self.cancelled.clone(),
+            inner: self.cancellation.clone(),
         }
+    }
+
+    /// Replace this context's cancellation source with an existing token.
+    ///
+    /// Used by transports to link a request's lifetime to an external
+    /// signal (e.g. client disconnect on the HTTP stateless path). After
+    /// this call, `is_cancelled()`, `cancelled()`, and tokens returned by
+    /// [`cancellation_token`](Self::cancellation_token) all observe the
+    /// given token.
+    pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.cancellation = token.inner;
+        self
     }
 
     /// Report progress to the client
@@ -893,21 +922,37 @@ impl RequestContext {
     }
 }
 
-/// A token that can be used to check for cancellation
-#[derive(Clone, Debug)]
+/// A token that can be used to check for, wait on, or request cancellation
+///
+/// Cloned tokens share the same underlying signal: cancelling any clone
+/// cancels them all. Backed by [`tokio_util::sync::CancellationToken`],
+/// so cancellation can also be awaited via [`cancelled`](Self::cancelled).
+#[derive(Clone, Debug, Default)]
 pub struct CancellationToken {
-    cancelled: Arc<AtomicBool>,
+    inner: tokio_util::sync::CancellationToken,
 }
 
 impl CancellationToken {
+    /// Create a new, un-cancelled token
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     /// Check if cancellation has been requested
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Relaxed)
+        self.inner.is_cancelled()
     }
 
     /// Request cancellation
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Relaxed);
+        self.inner.cancel();
+    }
+
+    /// Wait until cancellation is requested
+    ///
+    /// Completes immediately if the token is already cancelled.
+    pub async fn cancelled(&self) {
+        self.inner.cancelled().await
     }
 }
 

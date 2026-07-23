@@ -449,6 +449,20 @@ pub enum Error {
     #[error("Session expired")]
     SessionExpired,
 
+    /// A single SSE event exceeded the configured maximum size.
+    ///
+    /// Raised by SSE-consuming client transports when a server streams an
+    /// event larger than the configured cap. The stream is terminated
+    /// rather than buffering without bound. `size` is the buffered size at
+    /// the point the limit was detected; `limit` is the configured cap.
+    #[error("SSE event too large: {size} bytes buffered, limit is {limit} bytes")]
+    SseEventTooLarge {
+        /// Bytes buffered for the event when the limit was exceeded.
+        size: usize,
+        /// The configured maximum event size in bytes.
+        limit: usize,
+    },
+
     #[error("Internal error: {0}")]
     Internal(String),
 }
