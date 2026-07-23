@@ -377,11 +377,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_is_running_after_exit() {
-        // `true` exits immediately
+        // `true` exits immediately, but spawn plus exit plus reap is not
+        // instantaneous, especially on loaded Windows CI runners where a
+        // fixed 100 ms sleep flaked. Poll with a generous bound instead.
         let mut conn = ChildProcessTransport::new("true").spawn().await.unwrap();
-        // Give it a moment to exit
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert!(!conn.is_running());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while conn.is_running() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child process still reported running 10s after exit"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     #[tokio::test]
