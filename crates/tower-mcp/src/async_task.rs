@@ -4,29 +4,31 @@
 //! longer than a typical request/response cycle. Tasks can be created via
 //! task-augmented `tools/call` requests, tracked, polled for status, and cancelled.
 //!
+//! Task state lives behind the pluggable [`TaskStore`] trait, mirroring the
+//! shape of [`crate::session_store`] and [`crate::event_store`]: a trait, an
+//! error enum, and an in-memory default. By default routers use
+//! [`MemoryTaskStore`], which keeps tasks in an in-process map (behavior
+//! identical to earlier versions). External stores (Redis, Postgres, etc.) can
+//! be plugged in so `tasks/get` works on any instance behind a load balancer
+//! in the sessionless 2026-07-28 flows (SEP-2663).
+//!
 //! # Example
 //!
-//! ```rust,ignore
-//! use tower_mcp::async_task::{TaskStore, Task};
-//! use tower_mcp::protocol::TaskStatus;
+//! ```rust,no_run
+//! use std::sync::Arc;
+//! use tower_mcp::async_task::{MemoryTaskStore, TaskStore};
+//! use tower_mcp::McpRouter;
 //!
-//! // Create a task store
-//! let store = TaskStore::new();
-//!
-//! // Create a task
-//! let task = store.create_task("my-tool", serde_json::json!({"key": "value"}), None);
-//!
-//! // Get task status
-//! let info = store.get_task(&task.id);
-//!
-//! // Mark task as complete
-//! store.complete_task(&task.id, Ok(result));
+//! let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+//! let router = McpRouter::new().task_store(store);
 //! ```
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
 
 use crate::protocol::{CallToolResult, TaskObject, TaskStatus};
 
@@ -142,20 +144,122 @@ impl CancellationToken {
     }
 }
 
-/// Thread-safe task storage
+/// Errors returned by [`TaskStore`] implementations.
+///
+/// Mirrors the three-variant shape of
+/// [`SessionStoreError`](crate::session_store::SessionStoreError): encode and
+/// decode errors from (de)serializing task state, and catch-all backend errors
+/// from the storage layer. [`MemoryTaskStore`] never returns errors; the
+/// variants exist for external implementations.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum TaskStoreError {
+    /// Failed to encode task state (e.g. serde serialization error).
+    #[error("encode error: {0}")]
+    Encode(String),
+    /// Failed to decode task state (e.g. corrupt data in the backend).
+    #[error("decode error: {0}")]
+    Decode(String),
+    /// Backend error (e.g. connection failure, transient storage error).
+    #[error("backend error: {0}")]
+    Backend(String),
+}
+
+/// Result alias for task store operations.
+pub type Result<T> = std::result::Result<T, TaskStoreError>;
+
+/// A task's current snapshot: the task object plus any result or error
+/// captured so far.
+pub type TaskSnapshot = (TaskObject, Option<CallToolResult>, Option<String>);
+
+/// Storage backend for async task state.
+///
+/// Implementations persist task lifecycle state keyed by task ID. The default
+/// implementation is [`MemoryTaskStore`]; external stores (Redis, Postgres,
+/// etc.) typically live in separate crates.
+///
+/// # Semantics
+///
+/// - Terminal states ([`TaskStatus::is_terminal`]) are immutable: once a task
+///   is completed, failed, or cancelled, further transitions must be rejected
+///   (`Ok(false)` from the transition methods).
+/// - [`cancel_task`](Self::cancel_task) must signal the task's
+///   [`CancellationToken`] even if the task is already terminal.
+/// - [`wait_for_completion`](Self::wait_for_completion) blocks until the task
+///   reaches a terminal state; how an implementation waits (notification,
+///   polling, pub/sub) is an implementation detail and must not leak into the
+///   trait.
+#[async_trait]
+pub trait TaskStore: Send + Sync + 'static {
+    /// Create and store a new task.
+    ///
+    /// Returns the task ID and a cancellation token for the spawned work.
+    async fn create_task(
+        &self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        ttl: Option<u64>,
+    ) -> Result<(String, CancellationToken)>;
+
+    /// Get task object by ID. Returns `None` if unknown.
+    async fn get_task(&self, task_id: &str) -> Result<Option<TaskObject>>;
+
+    /// Get a task's full snapshot (task object, result, error) by ID.
+    async fn get_task_result(&self, task_id: &str) -> Result<Option<TaskSnapshot>>;
+
+    /// Wait for a task to reach a terminal state, then return its snapshot.
+    ///
+    /// If the task is already terminal, returns immediately. Otherwise blocks
+    /// until the task completes, fails, or is cancelled. Returns `None` if
+    /// the task is unknown.
+    async fn wait_for_completion(&self, task_id: &str) -> Result<Option<TaskSnapshot>>;
+
+    /// List all tasks, optionally filtered by status.
+    async fn list_tasks(&self, status_filter: Option<TaskStatus>) -> Result<Vec<TaskObject>>;
+
+    /// Mark a task as requiring input.
+    ///
+    /// Returns `Ok(false)` if the task is unknown or already terminal.
+    async fn require_input(&self, task_id: &str, message: &str) -> Result<bool>;
+
+    /// Mark a task as completed with a result.
+    ///
+    /// Returns `Ok(false)` if the task is unknown or already terminal.
+    async fn complete_task(&self, task_id: &str, result: CallToolResult) -> Result<bool>;
+
+    /// Mark a task as failed with an error.
+    ///
+    /// Returns `Ok(false)` if the task is unknown or already terminal.
+    async fn fail_task(&self, task_id: &str, error: &str) -> Result<bool>;
+
+    /// Cancel a task.
+    ///
+    /// Signals the task's [`CancellationToken`] and, if the task is not
+    /// already terminal, marks it cancelled. Returns the updated task object,
+    /// or `None` if the task is unknown.
+    async fn cancel_task(&self, task_id: &str, reason: Option<&str>) -> Result<Option<TaskObject>>;
+}
+
+/// In-memory [`TaskStore`] backed by a `HashMap`.
+///
+/// This is the default store. Suitable for single-instance deployments. For
+/// horizontal scaling, use an external store that shares state across
+/// instances. Completion wakeups for
+/// [`wait_for_completion`](TaskStore::wait_for_completion) use a per-task
+/// [`tokio::sync::Notify`], which is an implementation detail of this store.
 #[derive(Debug, Clone)]
-pub struct TaskStore {
+pub struct MemoryTaskStore {
     tasks: Arc<RwLock<HashMap<String, Task>>>,
     next_id: Arc<AtomicU64>,
 }
 
-impl Default for TaskStore {
+impl Default for MemoryTaskStore {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl TaskStore {
+impl MemoryTaskStore {
     /// Create a new task store
     pub fn new() -> Self {
         Self {
@@ -170,172 +274,10 @@ impl TaskStore {
         format!("task-{}", id)
     }
 
-    /// Create and store a new task
+    /// Remove expired tasks (call periodically for cleanup).
     ///
-    /// Returns the task ID and a cancellation token for the spawned work.
-    pub fn create_task(
-        &self,
-        tool_name: &str,
-        arguments: serde_json::Value,
-        ttl: Option<u64>,
-    ) -> (String, CancellationToken) {
-        let id = self.generate_id();
-        let task = Task::new(id.clone(), tool_name.to_string(), arguments, ttl);
-        let token = task.cancellation_token.clone();
-
-        if let Ok(mut tasks) = self.tasks.write() {
-            tasks.insert(id.clone(), task);
-        }
-
-        (id, token)
-    }
-
-    /// Get task object by ID
-    pub fn get_task(&self, task_id: &str) -> Option<TaskObject> {
-        if let Ok(tasks) = self.tasks.read() {
-            tasks.get(task_id).map(|t| t.to_task_object())
-        } else {
-            None
-        }
-    }
-
-    /// Get full task result by ID (task object, result, error)
-    pub fn get_task_result(
-        &self,
-        task_id: &str,
-    ) -> Option<(TaskObject, Option<CallToolResult>, Option<String>)> {
-        if let Ok(tasks) = self.tasks.read() {
-            tasks
-                .get(task_id)
-                .map(|t| (t.to_task_object(), t.result.clone(), t.error.clone()))
-        } else {
-            None
-        }
-    }
-
-    /// Wait for a task to reach a terminal state, then return its result.
-    ///
-    /// If the task is already terminal, returns immediately. Otherwise blocks
-    /// until the task completes, fails, or is cancelled.
-    pub async fn wait_for_completion(
-        &self,
-        task_id: &str,
-    ) -> Option<(TaskObject, Option<CallToolResult>, Option<String>)> {
-        // First check if already terminal and get the notify handle
-        let notify = {
-            let tasks = self.tasks.read().ok()?;
-            let task = tasks.get(task_id)?;
-            if task.status.is_terminal() {
-                return Some((
-                    task.to_task_object(),
-                    task.result.clone(),
-                    task.error.clone(),
-                ));
-            }
-            task.completion_notify.clone()
-        };
-
-        // Wait for completion notification
-        notify.notified().await;
-
-        // Read the result
-        self.get_task_result(task_id)
-    }
-
-    /// List all tasks, optionally filtered by status
-    pub fn list_tasks(&self, status_filter: Option<TaskStatus>) -> Vec<TaskObject> {
-        if let Ok(tasks) = self.tasks.read() {
-            tasks
-                .values()
-                .filter(|t| status_filter.is_none() || status_filter == Some(t.status))
-                .map(|t| t.to_task_object())
-                .collect()
-        } else {
-            vec![]
-        }
-    }
-
-    /// Mark a task as requiring input
-    pub fn require_input(&self, task_id: &str, message: &str) -> bool {
-        let Ok(mut tasks) = self.tasks.write() else {
-            return false;
-        };
-        let Some(task) = tasks.get_mut(task_id) else {
-            return false;
-        };
-        if task.status.is_terminal() {
-            return false;
-        }
-        task.status = TaskStatus::InputRequired;
-        task.status_message = Some(message.to_string());
-        task.last_updated_at_str = chrono_now_iso8601();
-        true
-    }
-
-    /// Mark a task as completed with a result
-    pub fn complete_task(&self, task_id: &str, result: CallToolResult) -> bool {
-        let Ok(mut tasks) = self.tasks.write() else {
-            return false;
-        };
-        let Some(task) = tasks.get_mut(task_id) else {
-            return false;
-        };
-        if task.status.is_terminal() {
-            return false;
-        }
-        task.status = TaskStatus::Completed;
-        task.status_message = Some("Task completed".to_string());
-        task.result = Some(result);
-        task.completed_at = Some(Instant::now());
-        task.last_updated_at_str = chrono_now_iso8601();
-        task.completion_notify.notify_waiters();
-        true
-    }
-
-    /// Mark a task as failed with an error
-    pub fn fail_task(&self, task_id: &str, error: &str) -> bool {
-        let Ok(mut tasks) = self.tasks.write() else {
-            return false;
-        };
-        let Some(task) = tasks.get_mut(task_id) else {
-            return false;
-        };
-        if task.status.is_terminal() {
-            return false;
-        }
-        task.status = TaskStatus::Failed;
-        task.status_message = Some(format!("Task failed: {}", error));
-        task.error = Some(error.to_string());
-        task.completed_at = Some(Instant::now());
-        task.last_updated_at_str = chrono_now_iso8601();
-        task.completion_notify.notify_waiters();
-        true
-    }
-
-    /// Cancel a task
-    pub fn cancel_task(&self, task_id: &str, reason: Option<&str>) -> Option<TaskObject> {
-        let mut tasks = self.tasks.write().ok()?;
-        let task = tasks.get_mut(task_id)?;
-
-        // Signal cancellation
-        task.cancellation_token.cancel();
-
-        // If not already terminal, mark as cancelled
-        if !task.status.is_terminal() {
-            task.status = TaskStatus::Cancelled;
-            task.status_message = Some(
-                reason
-                    .map(|r| format!("Cancelled: {}", r))
-                    .unwrap_or_else(|| "Task cancelled".to_string()),
-            );
-            task.completed_at = Some(Instant::now());
-            task.last_updated_at_str = chrono_now_iso8601();
-            task.completion_notify.notify_waiters();
-        }
-        Some(task.to_task_object())
-    }
-
-    /// Remove expired tasks (call periodically for cleanup)
+    /// Returns the number removed. Not part of the [`TaskStore`] trait;
+    /// external backends typically expire entries natively (e.g. Redis TTL).
     pub fn cleanup_expired(&self) -> usize {
         if let Ok(mut tasks) = self.tasks.write() {
             let before = tasks.len();
@@ -360,6 +302,162 @@ impl TaskStore {
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+#[async_trait]
+impl TaskStore for MemoryTaskStore {
+    async fn create_task(
+        &self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        ttl: Option<u64>,
+    ) -> Result<(String, CancellationToken)> {
+        let id = self.generate_id();
+        let task = Task::new(id.clone(), tool_name.to_string(), arguments, ttl);
+        let token = task.cancellation_token.clone();
+
+        if let Ok(mut tasks) = self.tasks.write() {
+            tasks.insert(id.clone(), task);
+        }
+
+        Ok((id, token))
+    }
+
+    async fn get_task(&self, task_id: &str) -> Result<Option<TaskObject>> {
+        Ok(if let Ok(tasks) = self.tasks.read() {
+            tasks.get(task_id).map(|t| t.to_task_object())
+        } else {
+            None
+        })
+    }
+
+    async fn get_task_result(&self, task_id: &str) -> Result<Option<TaskSnapshot>> {
+        Ok(if let Ok(tasks) = self.tasks.read() {
+            tasks
+                .get(task_id)
+                .map(|t| (t.to_task_object(), t.result.clone(), t.error.clone()))
+        } else {
+            None
+        })
+    }
+
+    async fn wait_for_completion(&self, task_id: &str) -> Result<Option<TaskSnapshot>> {
+        // First check if already terminal and get the notify handle
+        let notify = {
+            let Ok(tasks) = self.tasks.read() else {
+                return Ok(None);
+            };
+            let Some(task) = tasks.get(task_id) else {
+                return Ok(None);
+            };
+            if task.status.is_terminal() {
+                return Ok(Some((
+                    task.to_task_object(),
+                    task.result.clone(),
+                    task.error.clone(),
+                )));
+            }
+            task.completion_notify.clone()
+        };
+
+        // Wait for completion notification
+        notify.notified().await;
+
+        // Read the result
+        self.get_task_result(task_id).await
+    }
+
+    async fn list_tasks(&self, status_filter: Option<TaskStatus>) -> Result<Vec<TaskObject>> {
+        Ok(if let Ok(tasks) = self.tasks.read() {
+            tasks
+                .values()
+                .filter(|t| status_filter.is_none() || status_filter == Some(t.status))
+                .map(|t| t.to_task_object())
+                .collect()
+        } else {
+            vec![]
+        })
+    }
+
+    async fn require_input(&self, task_id: &str, message: &str) -> Result<bool> {
+        let Ok(mut tasks) = self.tasks.write() else {
+            return Ok(false);
+        };
+        let Some(task) = tasks.get_mut(task_id) else {
+            return Ok(false);
+        };
+        if task.status.is_terminal() {
+            return Ok(false);
+        }
+        task.status = TaskStatus::InputRequired;
+        task.status_message = Some(message.to_string());
+        task.last_updated_at_str = chrono_now_iso8601();
+        Ok(true)
+    }
+
+    async fn complete_task(&self, task_id: &str, result: CallToolResult) -> Result<bool> {
+        let Ok(mut tasks) = self.tasks.write() else {
+            return Ok(false);
+        };
+        let Some(task) = tasks.get_mut(task_id) else {
+            return Ok(false);
+        };
+        if task.status.is_terminal() {
+            return Ok(false);
+        }
+        task.status = TaskStatus::Completed;
+        task.status_message = Some("Task completed".to_string());
+        task.result = Some(result);
+        task.completed_at = Some(Instant::now());
+        task.last_updated_at_str = chrono_now_iso8601();
+        task.completion_notify.notify_waiters();
+        Ok(true)
+    }
+
+    async fn fail_task(&self, task_id: &str, error: &str) -> Result<bool> {
+        let Ok(mut tasks) = self.tasks.write() else {
+            return Ok(false);
+        };
+        let Some(task) = tasks.get_mut(task_id) else {
+            return Ok(false);
+        };
+        if task.status.is_terminal() {
+            return Ok(false);
+        }
+        task.status = TaskStatus::Failed;
+        task.status_message = Some(format!("Task failed: {}", error));
+        task.error = Some(error.to_string());
+        task.completed_at = Some(Instant::now());
+        task.last_updated_at_str = chrono_now_iso8601();
+        task.completion_notify.notify_waiters();
+        Ok(true)
+    }
+
+    async fn cancel_task(&self, task_id: &str, reason: Option<&str>) -> Result<Option<TaskObject>> {
+        let Ok(mut tasks) = self.tasks.write() else {
+            return Ok(None);
+        };
+        let Some(task) = tasks.get_mut(task_id) else {
+            return Ok(None);
+        };
+
+        // Signal cancellation
+        task.cancellation_token.cancel();
+
+        // If not already terminal, mark as cancelled
+        if !task.status.is_terminal() {
+            task.status = TaskStatus::Cancelled;
+            task.status_message = Some(
+                reason
+                    .map(|r| format!("Cancelled: {}", r))
+                    .unwrap_or_else(|| "Task cancelled".to_string()),
+            );
+            task.completed_at = Some(Instant::now());
+            task.last_updated_at_str = chrono_now_iso8601();
+            task.completion_notify.notify_waiters();
+        }
+        Ok(Some(task.to_task_object()))
     }
 }
 
@@ -429,123 +527,214 @@ fn is_leap_year(year: i32) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_create_task() {
-        let store = TaskStore::new();
-        let (id, token) = store.create_task("test-tool", serde_json::json!({"a": 1}), None);
+    #[tokio::test]
+    async fn test_create_task() {
+        let store = MemoryTaskStore::new();
+        let (id, token) = store
+            .create_task("test-tool", serde_json::json!({"a": 1}), None)
+            .await
+            .unwrap();
 
         assert!(id.starts_with("task-"));
         assert!(!token.is_cancelled());
 
-        let info = store.get_task(&id).expect("task should exist");
+        let info = store
+            .get_task(&id)
+            .await
+            .unwrap()
+            .expect("task should exist");
         assert_eq!(info.task_id, id);
         assert_eq!(info.status, TaskStatus::Working);
     }
 
-    #[test]
-    fn test_task_lifecycle() {
-        let store = TaskStore::new();
-        let (id, _) = store.create_task("test-tool", serde_json::json!({}), None);
+    #[tokio::test]
+    async fn test_task_lifecycle() {
+        let store = MemoryTaskStore::new();
+        let (id, _) = store
+            .create_task("test-tool", serde_json::json!({}), None)
+            .await
+            .unwrap();
 
         // Complete task
-        assert!(store.complete_task(&id, CallToolResult::text("Done")));
+        assert!(
+            store
+                .complete_task(&id, CallToolResult::text("Done"))
+                .await
+                .unwrap()
+        );
 
-        let info = store.get_task(&id).unwrap();
+        let info = store.get_task(&id).await.unwrap().unwrap();
         assert_eq!(info.status, TaskStatus::Completed);
     }
 
-    #[test]
-    fn test_task_cancellation() {
-        let store = TaskStore::new();
-        let (id, token) = store.create_task("test-tool", serde_json::json!({}), None);
+    #[tokio::test]
+    async fn test_task_cancellation() {
+        let store = MemoryTaskStore::new();
+        let (id, token) = store
+            .create_task("test-tool", serde_json::json!({}), None)
+            .await
+            .unwrap();
 
         assert!(!token.is_cancelled());
 
-        let task_obj = store.cancel_task(&id, Some("User requested"));
+        let task_obj = store
+            .cancel_task(&id, Some("User requested"))
+            .await
+            .unwrap();
         assert!(task_obj.is_some());
         assert_eq!(task_obj.unwrap().status, TaskStatus::Cancelled);
         assert!(token.is_cancelled());
 
-        let info = store.get_task(&id).unwrap();
+        let info = store.get_task(&id).await.unwrap().unwrap();
         assert_eq!(info.status, TaskStatus::Cancelled);
     }
 
-    #[test]
-    fn test_task_failure() {
-        let store = TaskStore::new();
-        let (id, _) = store.create_task("test-tool", serde_json::json!({}), None);
+    #[tokio::test]
+    async fn test_task_failure() {
+        let store = MemoryTaskStore::new();
+        let (id, _) = store
+            .create_task("test-tool", serde_json::json!({}), None)
+            .await
+            .unwrap();
 
-        assert!(store.fail_task(&id, "Something went wrong"));
+        assert!(store.fail_task(&id, "Something went wrong").await.unwrap());
 
-        let info = store.get_task(&id).unwrap();
+        let info = store.get_task(&id).await.unwrap().unwrap();
         assert_eq!(info.status, TaskStatus::Failed);
         assert!(info.status_message.as_ref().unwrap().contains("failed"));
     }
 
-    #[test]
-    fn test_list_tasks() {
-        let store = TaskStore::new();
-        store.create_task("tool1", serde_json::json!({}), None);
-        store.create_task("tool2", serde_json::json!({}), None);
-        let (id3, _) = store.create_task("tool3", serde_json::json!({}), None);
+    #[tokio::test]
+    async fn test_list_tasks() {
+        let store = MemoryTaskStore::new();
+        store
+            .create_task("tool1", serde_json::json!({}), None)
+            .await
+            .unwrap();
+        store
+            .create_task("tool2", serde_json::json!({}), None)
+            .await
+            .unwrap();
+        let (id3, _) = store
+            .create_task("tool3", serde_json::json!({}), None)
+            .await
+            .unwrap();
 
         // Complete one task
-        store.complete_task(&id3, CallToolResult::text("Done"));
+        store
+            .complete_task(&id3, CallToolResult::text("Done"))
+            .await
+            .unwrap();
 
         // List all tasks
-        let all = store.list_tasks(None);
+        let all = store.list_tasks(None).await.unwrap();
         assert_eq!(all.len(), 3);
 
         // List only working tasks
-        let working = store.list_tasks(Some(TaskStatus::Working));
+        let working = store.list_tasks(Some(TaskStatus::Working)).await.unwrap();
         assert_eq!(working.len(), 2);
 
         // List only completed tasks
-        let completed = store.list_tasks(Some(TaskStatus::Completed));
+        let completed = store.list_tasks(Some(TaskStatus::Completed)).await.unwrap();
         assert_eq!(completed.len(), 1);
     }
 
-    #[test]
-    fn test_terminal_state_immutable() {
-        let store = TaskStore::new();
-        let (id, _) = store.create_task("test-tool", serde_json::json!({}), None);
+    #[tokio::test]
+    async fn test_terminal_state_immutable() {
+        let store = MemoryTaskStore::new();
+        let (id, _) = store
+            .create_task("test-tool", serde_json::json!({}), None)
+            .await
+            .unwrap();
 
         // Complete the task
-        store.complete_task(&id, CallToolResult::text("Done"));
+        store
+            .complete_task(&id, CallToolResult::text("Done"))
+            .await
+            .unwrap();
 
         // Try to fail - should fail
-        assert!(!store.fail_task(&id, "Error"));
+        assert!(!store.fail_task(&id, "Error").await.unwrap());
 
         // Status should still be completed
-        let info = store.get_task(&id).unwrap();
+        let info = store.get_task(&id).await.unwrap().unwrap();
         assert_eq!(info.status, TaskStatus::Completed);
     }
 
-    #[test]
-    fn test_task_ids_unique() {
-        let store = TaskStore::new();
-        let (id1, _) = store.create_task("tool", serde_json::json!({}), None);
-        let (id2, _) = store.create_task("tool", serde_json::json!({}), None);
-        let (id3, _) = store.create_task("tool", serde_json::json!({}), None);
+    #[tokio::test]
+    async fn test_task_ids_unique() {
+        let store = MemoryTaskStore::new();
+        let (id1, _) = store
+            .create_task("tool", serde_json::json!({}), None)
+            .await
+            .unwrap();
+        let (id2, _) = store
+            .create_task("tool", serde_json::json!({}), None)
+            .await
+            .unwrap();
+        let (id3, _) = store
+            .create_task("tool", serde_json::json!({}), None)
+            .await
+            .unwrap();
 
         assert_ne!(id1, id2);
         assert_ne!(id2, id3);
         assert_ne!(id1, id3);
     }
 
-    #[test]
-    fn test_get_task_result() {
-        let store = TaskStore::new();
-        let (id, _) = store.create_task("test-tool", serde_json::json!({}), None);
+    #[tokio::test]
+    async fn test_get_task_result() {
+        let store = MemoryTaskStore::new();
+        let (id, _) = store
+            .create_task("test-tool", serde_json::json!({}), None)
+            .await
+            .unwrap();
 
         // Complete with result
         let result = CallToolResult::text("The result");
-        store.complete_task(&id, result);
+        store.complete_task(&id, result).await.unwrap();
 
-        let (task_obj, result, error) = store.get_task_result(&id).unwrap();
+        let (task_obj, result, error) = store.get_task_result(&id).await.unwrap().unwrap();
         assert_eq!(task_obj.status, TaskStatus::Completed);
         assert!(result.is_some());
         assert!(error.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_completion_returns_terminal_snapshot() {
+        let store = MemoryTaskStore::new();
+        let (id, _) = store
+            .create_task("test-tool", serde_json::json!({}), None)
+            .await
+            .unwrap();
+
+        // Complete the task from another task while a waiter is blocked.
+        let waiter_store = store.clone();
+        let waiter_id = id.clone();
+        let waiter =
+            tokio::spawn(async move { waiter_store.wait_for_completion(&waiter_id).await });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        store
+            .complete_task(&id, CallToolResult::text("Done"))
+            .await
+            .unwrap();
+
+        let (task_obj, result, error) = waiter.await.unwrap().unwrap().unwrap();
+        assert_eq!(task_obj.status, TaskStatus::Completed);
+        assert!(result.is_some());
+        assert!(error.is_none());
+    }
+
+    #[tokio::test]
+    async fn dyn_task_store_object_safe() {
+        // Compile-time check that TaskStore is object-safe.
+        let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+        let (id, _) = store
+            .create_task("tool", serde_json::json!({}), None)
+            .await
+            .unwrap();
+        assert!(store.get_task(&id).await.unwrap().is_some());
     }
 
     #[test]

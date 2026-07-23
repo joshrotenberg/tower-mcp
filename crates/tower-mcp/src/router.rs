@@ -13,7 +13,7 @@ use tower_service::Service;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
-use crate::async_task::TaskStore;
+use crate::async_task::{MemoryTaskStore, TaskStore, TaskStoreError};
 use crate::context::{
     CancellationToken, ClientRequesterHandle, NotificationSender, RequestContext,
     ServerNotification,
@@ -55,6 +55,14 @@ fn decode_cursor(cursor: &str) -> Result<usize> {
 /// Encode an offset into an opaque pagination cursor.
 fn encode_cursor(offset: usize) -> String {
     BASE64.encode(offset.to_string())
+}
+
+/// Map a [`TaskStoreError`] to a JSON-RPC internal error.
+fn task_store_error(e: TaskStoreError) -> Error {
+    Error::JsonRpc(JsonRpcError::internal_error(format!(
+        "Task store error: {}",
+        e
+    )))
 }
 
 /// Apply pagination to a collected list of items.
@@ -166,7 +174,7 @@ struct McpRouterInner {
     /// Handle for sending requests to the client (for sampling, etc.)
     client_requester: Option<ClientRequesterHandle>,
     /// Task store for async operations
-    task_store: TaskStore,
+    task_store: Arc<dyn TaskStore>,
     /// Subscribed resource URIs
     subscriptions: Arc<RwLock<HashSet<String>>>,
     /// Handler for completion requests
@@ -313,7 +321,7 @@ impl McpRouter {
                 in_flight: Arc::new(RwLock::new(HashMap::new())),
                 notification_tx: None,
                 client_requester: None,
-                task_store: TaskStore::new(),
+                task_store: Arc::new(MemoryTaskStore::new()),
                 subscriptions: Arc::new(RwLock::new(HashSet::new())),
                 extensions: Arc::new(crate::context::Extensions::new()),
                 completion_handler: None,
@@ -391,9 +399,26 @@ impl McpRouter {
         ToolAnnotationsMap { map: Arc::new(map) }
     }
 
-    /// Get access to the task store for async operations
-    pub fn task_store(&self) -> &TaskStore {
-        &self.inner.task_store
+    /// Configure a pluggable [`TaskStore`] for async task state.
+    ///
+    /// The default is an in-process [`MemoryTaskStore`]. Supply an external
+    /// store (Redis, Postgres, etc.) to share task state across server
+    /// instances behind a load balancer, so `tasks/get` works regardless of
+    /// which instance created the task (SEP-2663).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::sync::Arc;
+    /// use tower_mcp::McpRouter;
+    /// use tower_mcp::async_task::{MemoryTaskStore, TaskStore};
+    ///
+    /// let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    /// let router = McpRouter::new().task_store(store);
+    /// ```
+    pub fn task_store(mut self, store: Arc<dyn TaskStore>) -> Self {
+        Arc::make_mut(&mut self.inner).task_store = store;
+        self
     }
 
     /// Enable dynamic tool registration and return a registry handle.
@@ -1908,11 +1933,12 @@ impl McpRouter {
                     }
 
                     // Create the task
-                    let (task_id, cancellation_token) = self.inner.task_store.create_task(
-                        &params.name,
-                        params.arguments.clone(),
-                        task_params.ttl,
-                    );
+                    let (task_id, cancellation_token) = self
+                        .inner
+                        .task_store
+                        .create_task(&params.name, params.arguments.clone(), task_params.ttl)
+                        .await
+                        .map_err(task_store_error)?;
 
                     tracing::info!(task_id = %task_id, tool = %params.name, "Created async task");
 
@@ -1948,7 +1974,9 @@ impl McpRouter {
                         } else if result.is_error {
                             // Tool returned an error result
                             let error_msg = result.first_text().unwrap_or("Tool execution failed");
-                            task_store.fail_task(&task_id_clone, error_msg);
+                            if let Err(e) = task_store.fail_task(&task_id_clone, error_msg).await {
+                                tracing::warn!(task_id = %task_id_clone, error = %e, "failed to record task failure");
+                            }
                             tracing::info!(
                                 target: "mcp::tools",
                                 tool = %tool_name,
@@ -1959,7 +1987,9 @@ impl McpRouter {
                                 "tool call completed"
                             );
                         } else {
-                            task_store.complete_task(&task_id_clone, result);
+                            if let Err(e) = task_store.complete_task(&task_id_clone, result).await {
+                                tracing::warn!(task_id = %task_id_clone, error = %e, "failed to record task completion");
+                            }
                             tracing::info!(
                                 target: "mcp::tools",
                                 tool = %tool_name,
@@ -1971,11 +2001,17 @@ impl McpRouter {
                         }
                     });
 
-                    let task = self.inner.task_store.get_task(&task_id).ok_or_else(|| {
-                        Error::JsonRpc(JsonRpcError::internal_error(
-                            "Failed to retrieve created task",
-                        ))
-                    })?;
+                    let task = self
+                        .inner
+                        .task_store
+                        .get_task(&task_id)
+                        .await
+                        .map_err(task_store_error)?
+                        .ok_or_else(|| {
+                            Error::JsonRpc(JsonRpcError::internal_error(
+                                "Failed to retrieve created task",
+                            ))
+                        })?;
 
                     Ok(McpResponse::CreateTask(CreateTaskResult::new(task)))
                 } else {
@@ -2315,6 +2351,8 @@ impl McpRouter {
                     .inner
                     .task_store
                     .get_task(&params.task_id)
+                    .await
+                    .map_err(task_store_error)?
                     .ok_or_else(|| {
                         Error::JsonRpc(JsonRpcError::invalid_params(format!(
                             "Task not found: {}",
@@ -2337,6 +2375,8 @@ impl McpRouter {
                     .inner
                     .task_store
                     .get_task(&params.task_id)
+                    .await
+                    .map_err(task_store_error)?
                     .ok_or_else(|| {
                         Error::JsonRpc(JsonRpcError::invalid_params(format!(
                             "Task not found: {}",
@@ -2352,6 +2392,8 @@ impl McpRouter {
                     .inner
                     .task_store
                     .get_task(&params.task_id)
+                    .await
+                    .map_err(task_store_error)?
                     .ok_or_else(|| {
                         Error::JsonRpc(JsonRpcError::invalid_params(format!(
                             "Task not found: {}",
@@ -2369,6 +2411,8 @@ impl McpRouter {
                 self.inner
                     .task_store
                     .cancel_task(&params.task_id, params.reason.as_deref())
+                    .await
+                    .map_err(task_store_error)?
                     .ok_or_else(|| {
                         Error::JsonRpc(JsonRpcError::invalid_params(format!(
                             "Task not found: {}",
@@ -3576,6 +3620,168 @@ mod tests {
             }
             _ => panic!("Expected CreateTask response"),
         }
+    }
+
+    /// [`TaskStore`] wrapper that counts calls, for proving dispatch goes
+    /// through an injected store.
+    struct CountingTaskStore {
+        inner: MemoryTaskStore,
+        creates: std::sync::atomic::AtomicUsize,
+        gets: std::sync::atomic::AtomicUsize,
+        completes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingTaskStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryTaskStore::new(),
+                creates: std::sync::atomic::AtomicUsize::new(0),
+                gets: std::sync::atomic::AtomicUsize::new(0),
+                completes: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TaskStore for CountingTaskStore {
+        async fn create_task(
+            &self,
+            tool_name: &str,
+            arguments: serde_json::Value,
+            ttl: Option<u64>,
+        ) -> crate::async_task::Result<(String, crate::async_task::CancellationToken)> {
+            self.creates
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.create_task(tool_name, arguments, ttl).await
+        }
+
+        async fn get_task(&self, task_id: &str) -> crate::async_task::Result<Option<TaskObject>> {
+            self.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.get_task(task_id).await
+        }
+
+        async fn get_task_result(
+            &self,
+            task_id: &str,
+        ) -> crate::async_task::Result<Option<crate::async_task::TaskSnapshot>> {
+            self.inner.get_task_result(task_id).await
+        }
+
+        async fn wait_for_completion(
+            &self,
+            task_id: &str,
+        ) -> crate::async_task::Result<Option<crate::async_task::TaskSnapshot>> {
+            self.inner.wait_for_completion(task_id).await
+        }
+
+        async fn list_tasks(
+            &self,
+            status_filter: Option<TaskStatus>,
+        ) -> crate::async_task::Result<Vec<TaskObject>> {
+            self.inner.list_tasks(status_filter).await
+        }
+
+        async fn require_input(
+            &self,
+            task_id: &str,
+            message: &str,
+        ) -> crate::async_task::Result<bool> {
+            self.inner.require_input(task_id, message).await
+        }
+
+        async fn complete_task(
+            &self,
+            task_id: &str,
+            result: CallToolResult,
+        ) -> crate::async_task::Result<bool> {
+            self.completes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.complete_task(task_id, result).await
+        }
+
+        async fn fail_task(&self, task_id: &str, error: &str) -> crate::async_task::Result<bool> {
+            self.inner.fail_task(task_id, error).await
+        }
+
+        async fn cancel_task(
+            &self,
+            task_id: &str,
+            reason: Option<&str>,
+        ) -> crate::async_task::Result<Option<TaskObject>> {
+            self.inner.cancel_task(task_id, reason).await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_injected_task_store_used_by_dispatch() {
+        let store = Arc::new(CountingTaskStore::new());
+
+        let add_tool = ToolBuilder::new("add")
+            .description("Add two numbers")
+            .task_support(TaskSupportMode::Optional)
+            .handler(|input: AddInput| async move {
+                Ok(CallToolResult::text(format!("{}", input.a + input.b)))
+            })
+            .build();
+
+        let mut router = McpRouter::new()
+            .tool(add_tool)
+            .task_store(store.clone() as Arc<dyn TaskStore>);
+        init_router(&mut router).await;
+
+        // Task-augmented tools/call must create the task in the injected store.
+        let req = RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::CallTool(CallToolParams {
+                name: "add".to_string(),
+                arguments: serde_json::json!({"a": 2, "b": 3}),
+                meta: None,
+                task: Some(TaskRequestParams { ttl: None }),
+            }),
+            extensions: Extensions::new(),
+        };
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+        let task_id = match resp.inner {
+            Ok(McpResponse::CreateTask(result)) => result.task.task_id,
+            other => panic!("Expected CreateTask response, got {other:?}"),
+        };
+
+        assert_eq!(
+            store.creates.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "create_task must go through the injected store"
+        );
+
+        // Wait for the background execution to record completion.
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            store.completes.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "complete_task must go through the injected store"
+        );
+
+        // tasks/get must read from the injected store.
+        let gets_before = store.gets.load(std::sync::atomic::Ordering::Relaxed);
+        let req = RouterRequest {
+            id: RequestId::Number(2),
+            inner: McpRequest::GetTaskInfo(GetTaskInfoParams {
+                task_id: task_id.clone(),
+                meta: None,
+            }),
+            extensions: Extensions::new(),
+        };
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+        match resp.inner {
+            Ok(McpResponse::GetTaskInfo(info)) => {
+                assert_eq!(info.task_id, task_id);
+                assert_eq!(info.status, TaskStatus::Completed);
+            }
+            other => panic!("Expected GetTaskInfo response, got {other:?}"),
+        }
+        assert!(
+            store.gets.load(std::sync::atomic::Ordering::Relaxed) > gets_before,
+            "tasks/get must go through the injected store"
+        );
     }
 
     #[tokio::test]

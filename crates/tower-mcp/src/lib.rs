@@ -493,7 +493,7 @@ pub use tower_mcp_macros::tool_fn;
 pub use schemars;
 
 // Re-exports
-pub use async_task::{Task, TaskStore};
+pub use async_task::{MemoryTaskStore, Task, TaskStore};
 pub use client::{
     ChannelTransport, ClientHandler, ClientTransport, McpClient, McpClientBuilder,
     NotificationHandler, StdioClientTransport,
