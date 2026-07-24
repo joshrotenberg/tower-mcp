@@ -139,6 +139,27 @@ cancels. Try `test_elicitation` against the conformance server. If a
 background task elicits while the editor owns the terminal, the request is
 declined rather than fighting the editor for stdin.
 
+## One-shot / scripting
+
+`-e/--exec <COMMAND>` runs a command and exits instead of opening the prompt.
+Repeatable; commands run in order against the same session. The exit status is
+non-zero if any command errored, so it drops into scripts and CI.
+
+```bash
+# One call, pretty output:
+mcp-repl --http https://example/mcp -e "get_crate_info name=serde"
+
+# Raw JSON for piping to jq (--json also silences the banner and timings):
+mcp-repl --http https://example/mcp -e "search_crates query=serde" --json | jq '.content'
+
+# Several commands in one session:
+mcp-repl --demo -e "echo message=hi" -e "about"
+```
+
+The banner and surface listing are suppressed in `--exec` mode (pass
+`--verbose` to keep them). `--json` applies to tool calls, `read`, `prompt`,
+`tools`/`prompts`/`resources`/`templates`, and errors (`{"error": "..."}`).
+
 ## Related tools
 
 - [mcp-probe](https://github.com/conikeec/mcp-probe): a Rust TUI debugging
