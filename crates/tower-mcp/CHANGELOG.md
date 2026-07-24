@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.14.0] - 2026-07-24
+
+### Bug Fixes
+
+- **client:** Wake the caller when a background HTTP POST fails ([#991](https://github.com/joshrotenberg/tower-mcp/pull/991))
+- **client:** Bound the inline notification send so a stall cannot freeze the client ([#999](https://github.com/joshrotenberg/tower-mcp/pull/999))
+
+
+
 ## [0.13.1] - 2026-07-23
 
 ### Bug Fixes

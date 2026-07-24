@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.3] - 2026-07-24
+
+### Bug Fixes
+
+- **mcp-repl:** Don't blame multi-instance for every not-initialized startup ([#1004](https://github.com/joshrotenberg/tower-mcp/pull/1004))
+
+### Features
+
+- **mcp-repl:** Fetch the startup surface concurrently ([#992](https://github.com/joshrotenberg/tower-mcp/pull/992))
+- **mcp-repl:** Auth flags and per-call latency annotations ([#998](https://github.com/joshrotenberg/tower-mcp/pull/998))
+- **mcp-repl:** List the tools at startup ([#1000](https://github.com/joshrotenberg/tower-mcp/pull/1000))
+- **mcp-repl:** One-shot execution mode and persistent history ([#1003](https://github.com/joshrotenberg/tower-mcp/pull/1003))
+
+
+
 ## [0.1.2] - 2026-07-24
 
 ### Features
