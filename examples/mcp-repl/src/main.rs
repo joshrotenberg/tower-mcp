@@ -348,10 +348,14 @@ async fn fetch_surface_initial(client: &McpClient) -> Surface {
         if attempt == ATTEMPTS {
             eprintln!(
                 "warning: the server kept rejecting surface requests as not-initialized \
-                 after {ATTEMPTS} attempts. This usually means the server runs multiple \
-                 instances without a shared session store, so requests are routed to \
-                 instances that do not share the initialized session. Try `refresh`, or \
-                 connect to a single-instance or stateless server."
+                 after {ATTEMPTS} attempts. The session the handshake established is not \
+                 being recognized on follow-up requests. Two common causes: the server runs \
+                 multiple instances without a shared session store, so requests scatter \
+                 across instances; or a single instance restarted (crash, OOM, or redeploy) \
+                 between requests and lost its in-memory sessions. Try `refresh`. A \
+                 persistent session store or the stateless protocol avoids both; if it is a \
+                 single instance, check its logs and resources (an OOM-looping machine \
+                 flaps like this)."
             );
             return surface;
         }
