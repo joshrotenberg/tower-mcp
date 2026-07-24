@@ -193,22 +193,79 @@ fn render_task(task: &TaskObject) {
     }
 }
 
-async fn fetch_surface(client: &McpClient) -> Surface {
-    fn ok_or_warn<T: Default>(what: &str, r: Result<T, tower_mcp::Error>) -> T {
-        r.unwrap_or_else(|e| {
-            eprintln!("warning: fetching {what} failed: {e}");
-            T::default()
-        })
+/// True when the server rejected a request because the session is not yet
+/// initialized (JSON-RPC `-32600` naming `notifications/initialized`). This
+/// is retryable at startup: against a multi-instance server without a shared
+/// session store, the initialize handshake and a follow-up request can land
+/// on different instances, so a brief retry often lands on a consistent one.
+fn is_not_initialized(e: &tower_mcp::Error) -> bool {
+    matches!(
+        e,
+        tower_mcp::Error::JsonRpc(j)
+            if j.code == -32600 && j.message.contains("notifications/initialized")
+    )
+}
+
+/// Fetch the server surface once. Returns the surface plus whether any list
+/// call was rejected as not-initialized (the retryable startup condition).
+async fn fetch_surface_once(client: &McpClient) -> (Surface, bool) {
+    fn take<T>(
+        what: &str,
+        r: Result<Vec<T>, tower_mcp::Error>,
+        not_initialized: &mut bool,
+    ) -> Vec<T> {
+        match r {
+            Ok(v) => v,
+            Err(e) => {
+                if is_not_initialized(&e) {
+                    *not_initialized = true;
+                } else {
+                    eprintln!("warning: fetching {what} failed: {e}");
+                }
+                Vec::new()
+            }
+        }
     }
-    Surface {
-        tools: ok_or_warn("tools", client.list_all_tools().await),
-        prompts: ok_or_warn("prompts", client.list_all_prompts().await),
-        resources: ok_or_warn("resources", client.list_all_resources().await),
-        templates: ok_or_warn(
+    let mut ni = false;
+    let surface = Surface {
+        tools: take("tools", client.list_all_tools().await, &mut ni),
+        prompts: take("prompts", client.list_all_prompts().await, &mut ni),
+        resources: take("resources", client.list_all_resources().await, &mut ni),
+        templates: take(
             "resource templates",
             client.list_all_resource_templates().await,
+            &mut ni,
         ),
+    };
+    (surface, ni)
+}
+
+async fn fetch_surface(client: &McpClient) -> Surface {
+    fetch_surface_once(client).await.0
+}
+
+/// Startup surface fetch with a bounded retry on the not-initialized
+/// condition. Explains the likely cause if it never clears.
+async fn fetch_surface_initial(client: &McpClient) -> Surface {
+    const ATTEMPTS: usize = 4;
+    for attempt in 1..=ATTEMPTS {
+        let (surface, not_initialized) = fetch_surface_once(client).await;
+        if !not_initialized {
+            return surface;
+        }
+        if attempt == ATTEMPTS {
+            eprintln!(
+                "warning: the server kept rejecting surface requests as not-initialized \
+                 after {ATTEMPTS} attempts. This usually means the server runs multiple \
+                 instances without a shared session store, so requests are routed to \
+                 instances that do not share the initialized session. Try `refresh`, or \
+                 connect to a single-instance or stateless server."
+            );
+            return surface;
+        }
+        tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
     }
+    unreachable!()
 }
 
 fn demo_router() -> tower_mcp::McpRouter {
@@ -417,7 +474,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         }
     }
 
-    let surface = Arc::new(RwLock::new(fetch_surface(&client).await));
+    let surface = Arc::new(RwLock::new(fetch_surface_initial(&client).await));
     {
         let s = surface.read().unwrap();
         println!(
@@ -875,5 +932,44 @@ async fn run_tool(
             render_content(&result.content);
         }
         Err(e) => println!("{}: {e}", style::error_prefix()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn jsonrpc(code: i32, message: &str) -> tower_mcp::Error {
+        tower_mcp::Error::JsonRpc(tower_mcp::error::JsonRpcError {
+            code,
+            message: message.to_string(),
+            data: None,
+        })
+    }
+
+    #[test]
+    fn detects_not_initialized_startup_error() {
+        assert!(is_not_initialized(&jsonrpc(
+            -32600,
+            "Client must send notifications/initialized before making requests"
+        )));
+    }
+
+    #[test]
+    fn does_not_match_unrelated_errors() {
+        // Same code, different message.
+        assert!(!is_not_initialized(&jsonrpc(
+            -32600,
+            "some other invalid request"
+        )));
+        // Right message text, different code.
+        assert!(!is_not_initialized(&jsonrpc(
+            -32602,
+            "notifications/initialized"
+        )));
+        // A transport error is never the not-initialized case.
+        assert!(!is_not_initialized(&tower_mcp::Error::Transport(
+            "boom".into()
+        )));
     }
 }
