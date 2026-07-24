@@ -83,6 +83,16 @@ pub struct HttpClientConfig {
     /// Timeout for HTTP requests.
     /// Default: 30 seconds.
     pub request_timeout: Duration,
+    /// Timeout for notification POSTs (frames without an `id`), capped at
+    /// `request_timeout`.
+    ///
+    /// Notifications are awaited inline so `notifications/initialized` is
+    /// ordered ahead of the first request, which blocks the client's message
+    /// loop for the duration. This bounds that block independently of
+    /// `request_timeout` so a server that stalls a notification's `202` cannot
+    /// freeze the client for the full request timeout.
+    /// Default: 5 seconds.
+    pub notification_timeout: Duration,
     /// Whether to attempt SSE reconnection on disconnect.
     /// Default: `true`.
     pub sse_reconnect: bool,
@@ -118,6 +128,7 @@ impl Default for HttpClientConfig {
             auto_sse: true,
             channel_capacity: 256,
             request_timeout: Duration::from_secs(30),
+            notification_timeout: Duration::from_secs(5),
             sse_reconnect: true,
             sse_reconnect_delay: Duration::from_secs(1),
             max_sse_reconnect_attempts: 5,
@@ -504,13 +515,32 @@ impl ClientTransport for HttpClientTransport {
             return Err(Error::Transport("Transport closed".to_string()));
         }
 
+        // Notifications (frames without an `id`) are awaited inline (below) to
+        // keep `notifications/initialized` ordered before the first request
+        // (#967). That inline await blocks the whole message loop, so it must
+        // be bounded independently: a server that stalls the notification's
+        // 202 (observed: a multi-instance server holding the POST for the full
+        // request timeout) would otherwise freeze the client with no output.
+        let parsed_message = serde_json::from_str::<serde_json::Value>(message).ok();
+        let is_notification = parsed_message
+            .as_ref()
+            .map(|v| v.get("id").is_none())
+            .unwrap_or(false);
+        let timeout = if is_notification {
+            self.config
+                .notification_timeout
+                .min(self.config.request_timeout)
+        } else {
+            self.config.request_timeout
+        };
+
         // Build request with headers
         let mut request = self
             .client
             .post(&self.url)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream")
-            .timeout(self.config.request_timeout);
+            .timeout(timeout);
 
         if let Some(ref session_id) = self.session_id {
             request = request.header("mcp-session-id", session_id);
@@ -536,19 +566,11 @@ impl ClientTransport for HttpClientTransport {
 
         let request = request.body(message.to_string());
 
-        // Notifications (frames without an `id`) are awaited inline even
-        // after session establishment: the server processes a notification
-        // before answering 202, and never issues a client round-trip while
-        // doing so, so awaiting cannot deadlock and preserves ordering with
-        // everything sent afterwards. Without this, the spawned send path
-        // let `notifications/initialized` race the next request on a pooled
-        // connection, and strict servers rejected that request (#967).
-        let parsed_message = serde_json::from_str::<serde_json::Value>(message).ok();
-        let is_notification = parsed_message
-            .as_ref()
-            .map(|v| v.get("id").is_none())
-            .unwrap_or(false);
-
+        // Notifications are awaited inline (bounded above) even after session
+        // establishment, so `notifications/initialized` reaches the server
+        // ahead of the first request rather than racing it on a pooled
+        // connection, which strict servers rejected (#967).
+        //
         // After session is established, send requests in a background task
         // so the message loop can continue processing incoming SSE messages.
         // This prevents a deadlock when the server blocks on a

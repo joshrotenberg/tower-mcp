@@ -2836,3 +2836,94 @@ async fn post_session_request_failure_wakes_caller() {
         "an empty-body response must surface as an error, got: {result:?}"
     );
 }
+
+/// Regression: a server that stalls the `notifications/initialized` POST must
+/// not freeze the client for the full `request_timeout`.
+///
+/// The notification is awaited inline to keep it ordered ahead of the first
+/// request (#967), which blocks the single message loop for the duration.
+/// `notification_timeout` bounds that block independently. Here the raw server
+/// reads the notification POST and never answers it; with a short
+/// `notification_timeout` the client abandons it quickly and `tools/list` still
+/// completes well under the 20s `request_timeout`. Before the fix, `tools/list`
+/// waited behind the notification for the full request timeout.
+#[tokio::test]
+async fn stalled_initialized_notification_does_not_freeze_client() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let Some(req) = read_http_request(&mut stream).await else {
+                    return;
+                };
+                if req.contains("\"method\":\"initialize\"") {
+                    let body = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "protocolVersion": "2025-11-25",
+                            "capabilities": {},
+                            "serverInfo": {"name": "raw", "version": "0"}
+                        }
+                    })
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         mcp-session-id: raw-session\r\nmcp-protocol-version: 2025-11-25\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                } else if req.contains("notifications/initialized") {
+                    // Stall: read the POST but never answer it. The client must
+                    // give up after notification_timeout, not request_timeout.
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                } else {
+                    // tools/list: respond normally.
+                    let body = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "result": {"tools": [{"name": "echo", "inputSchema": {"type": "object"}}]}
+                    })
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                }
+                let _ = stream.flush().await;
+            });
+        }
+    });
+
+    let url = format!("http://{addr}");
+    let config = HttpClientConfig {
+        auto_sse: false,
+        request_timeout: Duration::from_secs(20),
+        notification_timeout: Duration::from_millis(300),
+        ..Default::default()
+    };
+    let transport = HttpClientTransport::with_config(url, config);
+    let client = McpClient::connect(transport).await.unwrap();
+    client.initialize("raw-client", "1.0.0").await.unwrap();
+
+    // The stalled notification is abandoned after ~300ms, so this resolves
+    // quickly. Before the fix it waited behind the notification for the full
+    // 20s request_timeout; bound it at 8s so a regression fails as a timeout.
+    let tools = tokio::time::timeout(Duration::from_secs(8), client.list_tools())
+        .await
+        .expect("tools/list blocked behind the stalled notification (the bug this guards)")
+        .expect("tools/list should succeed once the stalled notification is abandoned");
+    assert_eq!(tools.tools.len(), 1);
+}
