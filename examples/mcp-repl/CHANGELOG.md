@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.2] - 2026-07-24
+
+### Features
+
+- **mcp-repl:** Info replays the full startup banner; resources/templates cross-hint ([#989](https://github.com/joshrotenberg/tower-mcp/pull/989))
+
+
+
 ## [0.1.1] - 2026-07-24
 
 ### Bug Fixes
