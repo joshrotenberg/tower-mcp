@@ -95,6 +95,10 @@ struct Args {
     #[arg(long)]
     verbose: bool,
 
+    /// Do not persist command history to ~/.mcp-repl_history.
+    #[arg(long)]
+    no_history: bool,
+
     /// Command (and arguments) of a stdio MCP server to spawn.
     command: Vec<String>,
 }
@@ -665,6 +669,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         line_tx,
         ack_rx,
         at_prompt,
+        !args.no_history,
     );
 
     let mut jobs: Vec<(String, String)> = Vec::new();
@@ -1282,6 +1287,29 @@ mod tests {
     fn error_json_is_a_valid_object() {
         let v: serde_json::Value = serde_json::from_str(&error_json("boom: it broke")).unwrap();
         assert_eq!(v["error"], "boom: it broke");
+    }
+
+    // The persistent-history path relies on FileBackedHistory buffering saves
+    // in memory and only writing on sync() (which sync_history() calls). The
+    // REPL exits abruptly without dropping the editor, so it syncs after each
+    // accepted line; this pins the assumption that save + sync reaches disk.
+    #[test]
+    fn file_backed_history_writes_on_sync() {
+        use reedline::{FileBackedHistory, History, HistoryItem};
+        let path = std::env::temp_dir().join(format!("mcp-repl-hist-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut h = FileBackedHistory::with_file(10, path.clone()).unwrap();
+            h.save(HistoryItem::from_command_line("echo persisted"))
+                .unwrap();
+            h.sync().unwrap();
+        }
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            contents.contains("echo persisted"),
+            "history was not written to disk: {contents:?}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
