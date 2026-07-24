@@ -181,3 +181,6 @@ The banner and surface listing are suppressed in `--exec` mode (pass
 - When stdin is not a tty, the REPL reads lines directly (no editor), so
   piping a script of commands works:
   `printf 'echo message=hi\nquit\n' | mcp-repl --demo`.
+- Command history persists to `~/.mcp-repl_history` (up to 1000 entries), so
+  up-arrow recalls commands from previous sessions. Pass `--no-history` to
+  keep it in-memory only.

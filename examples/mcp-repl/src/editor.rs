@@ -15,9 +15,10 @@ use std::time::Duration;
 
 use nu_ansi_term::{Color, Style};
 use reedline::{
-    ColumnarMenu, Completer, DefaultHinter, Emacs, Highlighter, KeyCode, KeyModifiers, MenuBuilder,
-    Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline,
-    ReedlineEvent, ReedlineMenu, Signal, Span, StyledText, Suggestion, default_emacs_keybindings,
+    ColumnarMenu, Completer, DefaultHinter, Emacs, FileBackedHistory, Highlighter, KeyCode,
+    KeyModifiers, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch,
+    PromptHistorySearchStatus, Reedline, ReedlineEvent, ReedlineMenu, Signal, Span, StyledText,
+    Suggestion, default_emacs_keybindings,
 };
 
 use tower_mcp::client::McpClient;
@@ -485,6 +486,7 @@ impl Highlighter for ReplHighlighter {
 ///
 /// When stdin is not a tty (piped input), falls back to a plain
 /// line-reader so non-interactive use keeps working.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_readline_thread(
     server_name: String,
     surface: Arc<RwLock<Surface>>,
@@ -493,6 +495,7 @@ pub fn spawn_readline_thread(
     line_tx: tokio::sync::mpsc::Sender<String>,
     ack_rx: std::sync::mpsc::Receiver<()>,
     at_prompt: Arc<AtomicBool>,
+    persist_history: bool,
 ) {
     std::thread::spawn(move || {
         if !std::io::stdin().is_terminal() {
@@ -507,8 +510,17 @@ pub fn spawn_readline_thread(
             &line_tx,
             &ack_rx,
             at_prompt,
+            persist_history,
         );
     });
+}
+
+/// The command-history file: `~/.mcp-repl_history`, shared across sessions.
+/// `None` when `$HOME` is unset (history stays in-memory).
+fn history_path() -> Option<std::path::PathBuf> {
+    let mut p = std::path::PathBuf::from(std::env::var_os("HOME")?);
+    p.push(".mcp-repl_history");
+    Some(p)
 }
 
 fn run_piped(line_tx: &tokio::sync::mpsc::Sender<String>, ack_rx: &std::sync::mpsc::Receiver<()>) {
@@ -541,6 +553,7 @@ fn run_piped(line_tx: &tokio::sync::mpsc::Sender<String>, ack_rx: &std::sync::mp
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_interactive(
     server_name: String,
     surface: Arc<RwLock<Surface>>,
@@ -549,6 +562,7 @@ fn run_interactive(
     line_tx: &tokio::sync::mpsc::Sender<String>,
     ack_rx: &std::sync::mpsc::Receiver<()>,
     at_prompt: Arc<AtomicBool>,
+    persist_history: bool,
 ) {
     let completer = ReplCompleter::new(surface.clone(), client, runtime);
     let highlighter = ReplHighlighter::new(surface);
@@ -574,6 +588,16 @@ fn run_interactive(
         ))
         .with_ansi_colors(style::colors_enabled());
 
+    // Persist history across sessions (up to 1000 entries) so up-arrow recalls
+    // commands from previous runs. Best-effort: a read-only HOME just keeps
+    // history in-memory for this session.
+    if persist_history && let Some(path) = history_path() {
+        match FileBackedHistory::with_file(1000, path) {
+            Ok(history) => editor = editor.with_history(Box::new(history)),
+            Err(e) => eprintln!("warning: command history disabled: {e}"),
+        }
+    }
+
     let prompt = ReplPrompt { server_name };
     loop {
         at_prompt.store(true, Ordering::SeqCst);
@@ -581,6 +605,10 @@ fn run_interactive(
         at_prompt.store(false, Ordering::SeqCst);
         match sig {
             Ok(Signal::Success(line)) => {
+                // Flush history now: a typed `quit` exits the process from the
+                // main loop, so this thread's editor is never dropped and
+                // FileBackedHistory would otherwise not persist on exit.
+                let _ = editor.sync_history();
                 if line_tx.blocking_send(line).is_err() {
                     break;
                 }
