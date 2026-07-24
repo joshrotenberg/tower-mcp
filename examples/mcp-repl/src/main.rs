@@ -35,7 +35,8 @@ use clap::Parser;
 use nu_ansi_term::{Color, Style};
 
 use tower_mcp::client::{
-    ChannelTransport, HttpClientTransport, McpClient, NotificationHandler, StdioClientTransport,
+    ChannelTransport, HttpClientConfig, HttpClientTransport, McpClient, NotificationHandler,
+    StdioClientTransport,
 };
 use tower_mcp::protocol::{
     Content, LogLevel, PromptDefinition, ResourceDefinition, ResourceTemplateDefinition,
@@ -64,6 +65,18 @@ struct Args {
     /// When to emit ANSI colors (auto detects tty and NO_COLOR).
     #[arg(long, value_enum, default_value = "auto")]
     color: style::ColorMode,
+
+    /// Bearer token for an authenticated `--http` server (sets
+    /// `Authorization: Bearer <token>`). Falls back to the `MCP_BEARER`
+    /// environment variable, which is preferred since a command-line token is
+    /// visible in `ps` and shell history.
+    #[arg(long)]
+    bearer: Option<String>,
+
+    /// Extra header for an authenticated `--http` server, as `Name: Value`
+    /// (repeatable). Split on the first colon.
+    #[arg(long = "header", value_name = "NAME: VALUE")]
+    headers: Vec<String>,
 
     /// Command (and arguments) of a stdio MCP server to spawn.
     command: Vec<String>,
@@ -215,6 +228,18 @@ fn print_banner(info: &tower_mcp::protocol::InitializeResult) {
     }
 }
 
+/// A dimmed `[142ms]` / `[1.23s]` annotation for how long a call took.
+/// Printed on its own trailing line after a request-issuing command, so a slow
+/// (or timing-out) call is visible without interleaving with streamed output.
+fn timing(elapsed: Duration) -> String {
+    let body = if elapsed.as_millis() < 1000 {
+        format!("[{}ms]", elapsed.as_millis())
+    } else {
+        format!("[{:.2}s]", elapsed.as_secs_f64())
+    };
+    paint(Style::new().dimmed(), &body)
+}
+
 /// The one-line surface summary.
 fn print_counts(surface: &Surface) {
     println!(
@@ -307,6 +332,27 @@ async fn fetch_surface_initial(client: &McpClient) -> Surface {
         tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
     }
     unreachable!()
+}
+
+/// Build the HTTP client config from the auth flags. `--bearer` wins over the
+/// `MCP_BEARER` environment variable; each `--header "Name: Value"` is split on
+/// the first colon (surrounding whitespace trimmed). A header with no colon is
+/// a usage error.
+fn build_http_config(
+    bearer: Option<String>,
+    headers: &[String],
+) -> Result<HttpClientConfig, String> {
+    let mut config = HttpClientConfig::default();
+    if let Some(token) = bearer.or_else(|| std::env::var("MCP_BEARER").ok()) {
+        config = config.bearer_token(token);
+    }
+    for raw in headers {
+        let (name, value) = raw
+            .split_once(':')
+            .ok_or_else(|| format!("invalid --header {raw:?}: expected `Name: Value`"))?;
+        config = config.header(name.trim(), value.trim());
+    }
+    Ok(config)
 }
 
 fn demo_router() -> tower_mcp::McpRouter {
@@ -475,14 +521,22 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     };
     let handler = ReplClientHandler::new(notifications, at_prompt.clone());
 
+    if args.http.is_none() && (args.bearer.is_some() || !args.headers.is_empty()) {
+        eprintln!("warning: --bearer/--header apply only to --http; ignoring them here");
+    }
+
     let builder = McpClient::builder().with_elicitation();
     let client = if args.demo {
         builder
             .connect(ChannelTransport::new(demo_router()), handler)
             .await?
     } else if let Some(url) = &args.http {
+        let config = build_http_config(args.bearer.clone(), &args.headers)?;
         builder
-            .connect(HttpClientTransport::new(url.clone()), handler)
+            .connect(
+                HttpClientTransport::with_config(url.clone(), config),
+                handler,
+            )
             .await?
     } else if !args.command.is_empty() {
         let cmd_args: Vec<&str> = args.command[1..].iter().map(|s| s.as_str()).collect();
@@ -676,6 +730,7 @@ async fn handle_line(
                 println!("usage: read <uri>");
                 return false;
             };
+            let started = std::time::Instant::now();
             match client.read_resource(uri).await {
                 Ok(result) => {
                     for c in result.contents {
@@ -700,6 +755,7 @@ async fn handle_line(
                 }
                 Err(e) => println!("{}: {e}", style::error_prefix()),
             }
+            println!("{}", timing(started.elapsed()));
         }
         "prompt" => {
             let Some(name) = rest.first() else {
@@ -712,6 +768,7 @@ async fn handle_line(
                     prompt_args.insert(k.to_string(), v.to_string());
                 }
             }
+            let started = std::time::Instant::now();
             match client.get_prompt(name, Some(prompt_args)).await {
                 Ok(result) => {
                     for m in result.messages {
@@ -729,6 +786,7 @@ async fn handle_line(
                 }
                 Err(e) => println!("{}: {e}", style::error_prefix()),
             }
+            println!("{}", timing(started.elapsed()));
         }
         "call" => {
             let Some(name) = rest.first() else {
@@ -964,6 +1022,7 @@ async fn run_tool(
         }
         return;
     }
+    let started = std::time::Instant::now();
     match client.call_tool(name, arguments).await {
         Ok(result) => {
             if result.is_error {
@@ -973,6 +1032,7 @@ async fn run_tool(
         }
         Err(e) => println!("{}: {e}", style::error_prefix()),
     }
+    println!("{}", timing(started.elapsed()));
 }
 
 #[cfg(test)]
@@ -985,6 +1045,43 @@ mod tests {
             message: message.to_string(),
             data: None,
         })
+    }
+
+    #[test]
+    fn build_http_config_sets_bearer_and_trims_headers() {
+        let cfg = build_http_config(
+            Some("tok".into()),
+            &["X-Api-Key: abc".into(), "X-Trim :  v ".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.headers.get("Authorization").map(String::as_str),
+            Some("Bearer tok")
+        );
+        assert_eq!(
+            cfg.headers.get("X-Api-Key").map(String::as_str),
+            Some("abc")
+        );
+        assert_eq!(cfg.headers.get("X-Trim").map(String::as_str), Some("v"));
+    }
+
+    #[test]
+    fn build_http_config_rejects_header_without_colon() {
+        let err = build_http_config(Some("tok".into()), &["nope".into()]).unwrap_err();
+        assert!(
+            err.contains("nope"),
+            "error should name the bad header: {err}"
+        );
+        assert!(
+            err.contains("Name: Value"),
+            "error should show the format: {err}"
+        );
+    }
+
+    #[test]
+    fn timing_formats_sub_second_and_seconds() {
+        assert!(timing(Duration::from_millis(142)).contains("[142ms]"));
+        assert!(timing(Duration::from_millis(2500)).contains("[2.50s]"));
     }
 
     #[test]

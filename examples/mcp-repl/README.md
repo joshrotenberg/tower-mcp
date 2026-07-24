@@ -39,6 +39,23 @@ cratesio-mcp> read crates://tokio/info
 cratesio-mcp> prompt analyze_crate crate_name=axum
 ```
 
+### Authenticated servers
+
+Attach credentials to an `--http` connection:
+
+```bash
+# Bearer token. Prefer MCP_BEARER: a --bearer on the command line is visible
+# in `ps` and shell history.
+MCP_BEARER="$TOKEN" mcp-repl --http https://internal.example/mcp
+mcp-repl --http https://internal.example/mcp --bearer "$TOKEN"
+
+# Arbitrary headers, repeatable (split on the first colon):
+mcp-repl --http https://internal.example/mcp --header "X-Api-Key: abc"
+```
+
+`--bearer` and `--header` apply only to `--http`; they are ignored (with a
+warning) for the demo and stdio-child transports.
+
 ## What to try
 
 ```text
@@ -106,6 +123,9 @@ Tab opens a columnar menu. What gets completed:
   colored bullets.
 - Progress, log, and task lines are tagged with dim brackets; task statuses
   are colored (working=yellow, completed=green, failed/cancelled=red).
+- Every tool call, `read`, and `prompt` prints a dimmed `[142ms]` / `[1.23s]`
+  annotation with the round-trip time, so a slow (or timing-out) call is
+  visible at a glance.
 
 All styling degrades to plain text when `NO_COLOR` is set or stdout is not
 a terminal. `--color always|never|auto` overrides the detection.
