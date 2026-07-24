@@ -240,6 +240,32 @@ fn timing(elapsed: Duration) -> String {
     paint(Style::new().dimmed(), &body)
 }
 
+/// A compact tool listing for the startup banner: name and description, capped
+/// so a large surface does not flood the screen. The full list is always
+/// available via `tools`.
+fn print_tool_overview(surface: &Surface) {
+    const CAP: usize = 30;
+    if surface.tools.is_empty() {
+        return;
+    }
+    for t in surface.tools.iter().take(CAP) {
+        println!(
+            "{:24} {}",
+            paint(Style::new().fg(Color::Green), &t.name),
+            t.description.as_deref().unwrap_or("")
+        );
+    }
+    if surface.tools.len() > CAP {
+        println!(
+            "{}",
+            paint(
+                Style::new().dimmed(),
+                &format!("... +{} more, type `tools`", surface.tools.len() - CAP)
+            )
+        );
+    }
+}
+
 /// The one-line surface summary.
 fn print_counts(surface: &Surface) {
     println!(
@@ -555,7 +581,20 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     print_banner(&init);
 
     let surface = Arc::new(RwLock::new(fetch_surface_initial(&client).await));
-    print_counts(&surface.read().unwrap());
+    {
+        let s = surface.read().unwrap();
+        print_counts(&s);
+        // List the tools at startup so the surface is browsable immediately,
+        // unless the server already enumerated them in its instructions (some
+        // servers dump the whole surface there); then it would just repeat.
+        let instructions_list_tools = init
+            .instructions
+            .as_deref()
+            .is_some_and(|instr| s.tools.first().is_some_and(|t| instr.contains(&t.name)));
+        if !instructions_list_tools {
+            print_tool_overview(&s);
+        }
+    }
 
     // Readline runs on its own thread; lines cross into async via channels.
     let (line_tx, mut line_rx) = tokio::sync::mpsc::channel::<String>(1);
