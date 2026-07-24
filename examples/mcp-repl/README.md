@@ -48,7 +48,12 @@ getting-started> echo message="hi there"   # tab-completes argument names
 getting-started> describe add              # input/output schemas, colored
 getting-started> read source://getting_started.rs
 getting-started> prompt greet name=World   # prompt args tab-complete via completion/complete
+getting-started> info                      # replay the startup banner (identity, instructions, counts) + capabilities
 ```
+
+`resources` lists concrete resources and `templates` lists parameterized
+(`{variable}`) ones; each points at the other so a server that splits its
+resources across the two MCP lists is not confusing.
 
 Task-capable tools support shell-style backgrounding (SEP-2663):
 

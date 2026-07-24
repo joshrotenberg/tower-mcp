@@ -96,7 +96,7 @@ pub const BUILTINS: &[(&str, &str)] = &[
     ("wait", "wait for a background task"),
     ("cancel", "cancel a background task"),
     ("refresh", "re-fetch the server surface"),
-    ("info", "server info and capabilities"),
+    ("info", "replay the connection banner plus capabilities"),
     ("quit", "exit"),
     ("exit", "exit"),
 ];
@@ -191,6 +191,39 @@ fn render_task(task: &TaskObject) {
     if let Some(err) = &task.error {
         println!("{} {}: {}", style::error_prefix(), err.code, err.message);
     }
+}
+
+/// The connection banner: server identity, negotiated protocol, and any
+/// server instructions (markdown-rendered when it looks like markdown).
+/// Printed at startup and replayed by the `info` command.
+fn print_banner(info: &tower_mcp::protocol::InitializeResult) {
+    println!(
+        "connected: {} v{} {}",
+        paint(Style::new().bold(), &info.server_info.name),
+        info.server_info.version,
+        paint(
+            Style::new().dimmed(),
+            &format!("(protocol {})", info.protocol_version)
+        )
+    );
+    if let Some(instructions) = &info.instructions {
+        if style::colors_enabled() && style::looks_like_markdown(instructions) {
+            println!("{}", style::render_markdown(instructions));
+        } else {
+            println!("{instructions}");
+        }
+    }
+}
+
+/// The one-line surface summary.
+fn print_counts(surface: &Surface) {
+    println!(
+        "{} tools, {} prompts, {} resources, {} templates. Type `help`.",
+        surface.tools.len(),
+        surface.prompts.len(),
+        surface.resources.len(),
+        surface.templates.len()
+    );
 }
 
 /// True when the server rejected a request because the session is not yet
@@ -457,34 +490,10 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .initialize("mcp-repl", env!("CARGO_PKG_VERSION"))
         .await?;
     let server_name = init.server_info.name.clone();
-    println!(
-        "connected: {} v{} {}",
-        paint(Style::new().bold(), &server_name),
-        init.server_info.version,
-        paint(
-            Style::new().dimmed(),
-            &format!("(protocol {})", init.protocol_version)
-        )
-    );
-    if let Some(instructions) = &init.instructions {
-        if style::colors_enabled() && style::looks_like_markdown(instructions) {
-            println!("{}", style::render_markdown(instructions));
-        } else {
-            println!("{instructions}");
-        }
-    }
+    print_banner(&init);
 
     let surface = Arc::new(RwLock::new(fetch_surface_initial(&client).await));
-    {
-        let s = surface.read().unwrap();
-        println!(
-            "{} tools, {} prompts, {} resources, {} templates. Type `help`.",
-            s.tools.len(),
-            s.prompts.len(),
-            s.resources.len(),
-            s.templates.len()
-        );
-    }
+    print_counts(&surface.read().unwrap());
 
     // Readline runs on its own thread; lines cross into async via channels.
     let (line_tx, mut line_rx) = tokio::sync::mpsc::channel::<String>(1);
@@ -609,6 +618,20 @@ async fn handle_line(
                             r.name
                         );
                     }
+                    // Templates (parameterized URIs) are a separate MCP list
+                    // and easy to miss; point at them.
+                    if !s.templates.is_empty() {
+                        println!(
+                            "{}",
+                            paint(
+                                Style::new().dimmed(),
+                                &format!(
+                                    "(+ {} resource template(s) with variables, see `templates`)",
+                                    s.templates.len()
+                                )
+                            )
+                        );
+                    }
                 }
                 _ => {
                     for t in &s.templates {
@@ -616,6 +639,18 @@ async fn handle_line(
                             "{:40} {}",
                             paint(Style::new().fg(Color::Green), &t.uri_template),
                             t.name
+                        );
+                    }
+                    if !s.resources.is_empty() {
+                        println!(
+                            "{}",
+                            paint(
+                                Style::new().dimmed(),
+                                &format!(
+                                    "(+ {} concrete resource(s), see `resources`)",
+                                    s.resources.len()
+                                )
+                            )
                         );
                     }
                 }
@@ -750,12 +785,9 @@ async fn handle_line(
         }
         "info" => match client.server_info().await {
             Some(info) => {
-                println!(
-                    "{} v{}",
-                    paint(Style::new().bold(), &info.server_info.name),
-                    info.server_info.version
-                );
-                println!("protocol: {}", info.protocol_version);
+                // Replay the full startup banner, then add capabilities.
+                print_banner(&info);
+                print_counts(&surface.read().unwrap());
                 let caps = serde_json::to_value(&info.capabilities).unwrap_or_default();
                 println!("capabilities: {}", json_pretty(&caps));
             }
