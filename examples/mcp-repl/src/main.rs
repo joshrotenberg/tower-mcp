@@ -27,7 +27,7 @@ mod elicit;
 mod style;
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -78,8 +78,43 @@ struct Args {
     #[arg(long = "header", value_name = "NAME: VALUE")]
     headers: Vec<String>,
 
+    /// Run a command and exit instead of starting the interactive prompt.
+    /// Repeatable; commands run in order against the same session. Exit status
+    /// is non-zero if any command errors. Combine with --http/--demo or a
+    /// stdio child.
+    #[arg(short = 'e', long = "exec", value_name = "COMMAND")]
+    exec: Vec<String>,
+
+    /// In --exec mode, emit raw JSON results instead of the pretty renderer,
+    /// for piping to tools like jq.
+    #[arg(long)]
+    json: bool,
+
+    /// In --exec mode, still print the startup banner and surface listing
+    /// (suppressed by default so only command output is emitted).
+    #[arg(long)]
+    verbose: bool,
+
     /// Command (and arguments) of a stdio MCP server to spawn.
     command: Vec<String>,
+}
+
+/// Set in `--exec` mode by `--json`: render raw JSON instead of pretty output.
+static JSON_OUTPUT: AtomicBool = AtomicBool::new(false);
+/// Set whenever a command errors, so `--exec` can exit non-zero.
+static HAD_ERROR: AtomicBool = AtomicBool::new(false);
+
+fn json_output() -> bool {
+    JSON_OUTPUT.load(Ordering::Relaxed)
+}
+
+fn note_error() {
+    HAD_ERROR.store(true, Ordering::Relaxed);
+}
+
+/// A one-line JSON error object for `--json` mode.
+fn error_json(message: &str) -> String {
+    serde_json::json!({ "error": message }).to_string()
 }
 
 /// The server surface the REPL turns into commands. Refreshed on connect
@@ -502,6 +537,11 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .init();
     let args = Args::parse();
     style::init(args.color);
+    JSON_OUTPUT.store(args.json, Ordering::Relaxed);
+    // --exec runs commands and exits; suppress the banner and surface listing
+    // unless --verbose, so scripted output is only the command results.
+    let one_shot = !args.exec.is_empty();
+    let quiet = one_shot && !args.verbose;
 
     // True while the reedline editor owns the terminal; the elicitation
     // handler declines form requests during that window instead of
@@ -578,10 +618,12 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .initialize("mcp-repl", env!("CARGO_PKG_VERSION"))
         .await?;
     let server_name = init.server_info.name.clone();
-    print_banner(&init);
+    if !quiet {
+        print_banner(&init);
+    }
 
     let surface = Arc::new(RwLock::new(fetch_surface_initial(&client).await));
-    {
+    if !quiet {
         let s = surface.read().unwrap();
         print_counts(&s);
         // List the tools at startup so the surface is browsable immediately,
@@ -594,6 +636,22 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         if !instructions_list_tools {
             print_tool_overview(&s);
         }
+    }
+
+    // One-shot: run each --exec command in order, then exit non-zero if any
+    // errored. No editor, no event loop.
+    if one_shot {
+        let mut jobs: Vec<(String, String)> = Vec::new();
+        for cmd in &args.exec {
+            if handle_line(&client, &surface, &mut jobs, cmd.trim()).await {
+                break;
+            }
+        }
+        std::process::exit(if HAD_ERROR.load(Ordering::Relaxed) {
+            1
+        } else {
+            0
+        });
     }
 
     // Readline runs on its own thread; lines cross into async via channels.
@@ -680,6 +738,17 @@ async fn handle_line(
         }
         "tools" | "prompts" | "resources" | "templates" => {
             let s = surface.read().unwrap();
+            if json_output() {
+                let v = match cmd {
+                    "tools" => serde_json::to_value(&s.tools),
+                    "prompts" => serde_json::to_value(&s.prompts),
+                    "resources" => serde_json::to_value(&s.resources),
+                    _ => serde_json::to_value(&s.templates),
+                }
+                .unwrap_or_default();
+                println!("{}", json_pretty(&v));
+                return false;
+            }
             match cmd {
                 "tools" => {
                     for t in &s.tools {
@@ -771,6 +840,12 @@ async fn handle_line(
             };
             let started = std::time::Instant::now();
             match client.read_resource(uri).await {
+                Ok(result) if json_output() => {
+                    println!(
+                        "{}",
+                        json_pretty(&serde_json::to_value(&result).unwrap_or_default())
+                    );
+                }
                 Ok(result) => {
                     for c in result.contents {
                         if let Some(text) = c.text {
@@ -792,9 +867,18 @@ async fn handle_line(
                         }
                     }
                 }
-                Err(e) => println!("{}: {e}", style::error_prefix()),
+                Err(e) => {
+                    note_error();
+                    if json_output() {
+                        println!("{}", error_json(&e.to_string()));
+                    } else {
+                        println!("{}: {e}", style::error_prefix());
+                    }
+                }
             }
-            println!("{}", timing(started.elapsed()));
+            if !json_output() {
+                println!("{}", timing(started.elapsed()));
+            }
         }
         "prompt" => {
             let Some(name) = rest.first() else {
@@ -809,6 +893,12 @@ async fn handle_line(
             }
             let started = std::time::Instant::now();
             match client.get_prompt(name, Some(prompt_args)).await {
+                Ok(result) if json_output() => {
+                    println!(
+                        "{}",
+                        json_pretty(&serde_json::to_value(&result).unwrap_or_default())
+                    );
+                }
                 Ok(result) => {
                     for m in result.messages {
                         let v = serde_json::to_value(&m).unwrap_or_default();
@@ -823,9 +913,18 @@ async fn handle_line(
                         println!("{} {}", tag(Style::new().fg(Color::Cyan), role), text);
                     }
                 }
-                Err(e) => println!("{}: {e}", style::error_prefix()),
+                Err(e) => {
+                    note_error();
+                    if json_output() {
+                        println!("{}", error_json(&e.to_string()));
+                    } else {
+                        println!("{}: {e}", style::error_prefix());
+                    }
+                }
             }
-            println!("{}", timing(started.elapsed()));
+            if !json_output() {
+                println!("{}", timing(started.elapsed()));
+            }
         }
         "call" => {
             let Some(name) = rest.first() else {
@@ -836,7 +935,12 @@ async fn handle_line(
             let arguments: serde_json::Value = match serde_json::from_str(&json) {
                 Ok(v) => v,
                 Err(e) => {
-                    println!("invalid JSON: {e}");
+                    note_error();
+                    if json_output() {
+                        println!("{}", error_json(&format!("invalid JSON: {e}")));
+                    } else {
+                        println!("invalid JSON: {e}");
+                    }
                     return false;
                 }
             };
@@ -873,8 +977,21 @@ async fn handle_line(
                 },
             };
             match outcome {
+                Ok(task) if json_output() => {
+                    println!(
+                        "{}",
+                        json_pretty(&serde_json::to_value(&task).unwrap_or_default())
+                    );
+                }
                 Ok(task) => render_task(&task),
-                Err(e) => println!("{}: {e}", style::error_prefix()),
+                Err(e) => {
+                    note_error();
+                    if json_output() {
+                        println!("{}", error_json(&e.to_string()));
+                    } else {
+                        println!("{}: {e}", style::error_prefix());
+                    }
+                }
             }
         }
         "refresh" => {
@@ -907,10 +1024,15 @@ async fn handle_line(
                     .map(|t| t.input_schema.clone())
             };
             let Some(schema) = schema else {
-                println!(
-                    "unknown command: {} (try `help`)",
-                    paint(Style::new().fg(Color::Red), tool_name)
-                );
+                note_error();
+                if json_output() {
+                    println!("{}", error_json(&format!("unknown command: {tool_name}")));
+                } else {
+                    println!(
+                        "unknown command: {} (try `help`)",
+                        paint(Style::new().fg(Color::Red), tool_name)
+                    );
+                }
                 return false;
             };
             let arguments = parse_kv_args(&schema, rest);
@@ -1048,16 +1170,30 @@ async fn run_tool(
     if background {
         match client.call_tool_as_task(name, arguments, None).await {
             Ok(created) => {
-                println!(
-                    "{} started",
-                    tag(
-                        Style::new().fg(Color::Yellow),
-                        &format!("task {}", created.task.task_id)
-                    )
-                );
+                if json_output() {
+                    println!(
+                        "{}",
+                        json_pretty(&serde_json::to_value(&created).unwrap_or_default())
+                    );
+                } else {
+                    println!(
+                        "{} started",
+                        tag(
+                            Style::new().fg(Color::Yellow),
+                            &format!("task {}", created.task.task_id)
+                        )
+                    );
+                }
                 jobs.push((created.task.task_id, name.to_string()));
             }
-            Err(e) => println!("{}: {e}", style::error_prefix()),
+            Err(e) => {
+                note_error();
+                if json_output() {
+                    println!("{}", error_json(&e.to_string()));
+                } else {
+                    println!("{}: {e}", style::error_prefix());
+                }
+            }
         }
         return;
     }
@@ -1065,13 +1201,32 @@ async fn run_tool(
     match client.call_tool(name, arguments).await {
         Ok(result) => {
             if result.is_error {
-                println!("{}", tag(Style::new().fg(Color::Red), "tool error"));
+                note_error();
             }
-            render_content(&result.content);
+            if json_output() {
+                println!(
+                    "{}",
+                    json_pretty(&serde_json::to_value(&result).unwrap_or_default())
+                );
+            } else {
+                if result.is_error {
+                    println!("{}", tag(Style::new().fg(Color::Red), "tool error"));
+                }
+                render_content(&result.content);
+            }
         }
-        Err(e) => println!("{}: {e}", style::error_prefix()),
+        Err(e) => {
+            note_error();
+            if json_output() {
+                println!("{}", error_json(&e.to_string()));
+            } else {
+                println!("{}: {e}", style::error_prefix());
+            }
+        }
     }
-    println!("{}", timing(started.elapsed()));
+    if !json_output() {
+        println!("{}", timing(started.elapsed()));
+    }
 }
 
 #[cfg(test)]
@@ -1121,6 +1276,12 @@ mod tests {
     fn timing_formats_sub_second_and_seconds() {
         assert!(timing(Duration::from_millis(142)).contains("[142ms]"));
         assert!(timing(Duration::from_millis(2500)).contains("[2.50s]"));
+    }
+
+    #[test]
+    fn error_json_is_a_valid_object() {
+        let v: serde_json::Value = serde_json::from_str(&error_json("boom: it broke")).unwrap();
+        assert_eq!(v["error"], "boom: it broke");
     }
 
     #[test]
