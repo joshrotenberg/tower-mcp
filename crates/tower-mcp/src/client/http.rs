@@ -543,7 +543,9 @@ impl ClientTransport for HttpClientTransport {
         // everything sent afterwards. Without this, the spawned send path
         // let `notifications/initialized` race the next request on a pooled
         // connection, and strict servers rejected that request (#967).
-        let is_notification = serde_json::from_str::<serde_json::Value>(message)
+        let parsed_message = serde_json::from_str::<serde_json::Value>(message).ok();
+        let is_notification = parsed_message
+            .as_ref()
             .map(|v| v.get("id").is_none())
             .unwrap_or(false);
 
@@ -554,6 +556,12 @@ impl ClientTransport for HttpClientTransport {
         // client to respond via the SSE channel.
         if self.session_id.is_some() && !is_notification {
             let tx = self.incoming_tx.clone();
+            // The caller is parked on this request id in the message loop's
+            // correlation map. Every failure branch below delivers a frame
+            // carrying it, so a background POST that dies (network error,
+            // timeout, HTTP error, empty body, response stream closed early)
+            // wakes the caller with an error instead of hanging it forever.
+            let req_id = parsed_message.and_then(|v| v.get("id").cloned());
             let connected = self.connected.clone();
             let last_event_id = self.last_event_id.clone();
             let sse_retry_delay = self.sse_retry_delay.clone();
@@ -564,6 +572,14 @@ impl ClientTransport for HttpClientTransport {
                     Ok(r) => r,
                     Err(e) => {
                         tracing::error!(error = %e, "Background HTTP request failed");
+                        if let Some(id) = &req_id {
+                            let _ = tx
+                                .send(transport_error_frame(
+                                    id,
+                                    &format!("HTTP request failed: {e}"),
+                                ))
+                                .await;
+                        }
                         connected.store(false, Ordering::Release);
                         return;
                     }
@@ -579,19 +595,37 @@ impl ClientTransport for HttpClientTransport {
                 if !status.is_success() {
                     let body = response.text().await.unwrap_or_default();
 
-                    // Try to parse the error body as JSON-RPC and forward it
-                    // so the message loop can detect -32005 (SessionNotFound)
-                    // and trigger session recovery.
+                    // Forward a JSON-RPC error body so the message loop can
+                    // detect -32005 (SessionNotFound) and trigger session
+                    // recovery. If the server did not echo our request id (a
+                    // null/absent id that is not the session-level -32005
+                    // signal), inject it so the awaiting caller is woken by
+                    // this error instead of hanging.
                     if !body.is_empty()
-                        && serde_json::from_str::<serde_json::Value>(&body)
-                            .ok()
-                            .is_some_and(|v| v.get("error").is_some())
+                        && let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&body)
+                        && v.get("error").is_some()
                     {
-                        let _ = tx.send(body).await;
+                        let is_session_signal =
+                            v.pointer("/error/code").and_then(|c| c.as_i64()) == Some(-32005);
+                        if !is_session_signal
+                            && v.get("id").is_none_or(|id| id.is_null())
+                            && let Some(id) = &req_id
+                        {
+                            v["id"] = id.clone();
+                        }
+                        let _ = tx.send(v.to_string()).await;
                         return;
                     }
 
                     tracing::error!(status = %status, body = %body, "HTTP error from server");
+                    if let Some(id) = &req_id {
+                        let _ = tx
+                            .send(transport_error_frame(
+                                id,
+                                &format!("server returned HTTP {status}"),
+                            ))
+                            .await;
+                    }
                     connected.store(false, Ordering::Release);
                     return;
                 }
@@ -656,20 +690,65 @@ impl ClientTransport for HttpClientTransport {
                     // with the updated last_event_id and sse_retry_delay.
                     if had_retry && !had_data {
                         sse_reconnect_signal.notify_one();
+                    } else if !had_data {
+                        // The response stream closed without ever delivering a
+                        // data frame, so nothing correlated the request. Wake
+                        // the caller rather than leave it hanging.
+                        if let Some(id) = &req_id {
+                            let _ = tx
+                                .send(transport_error_frame(
+                                    id,
+                                    "server closed the response stream without a reply",
+                                ))
+                                .await;
+                        }
                     }
                 } else {
-                    // Non-SSE response: read body and queue for recv()
+                    // Non-SSE response: read body and queue for recv().
                     match response.text().await {
                         Ok(body) if !body.is_empty() => {
-                            for msg in extract_json_messages(&body) {
-                                let _ = tx.send(msg).await;
+                            let msgs = extract_json_messages(&body);
+                            if msgs.is_empty() {
+                                // A non-empty body that yields no JSON-RPC
+                                // frames leaves the request uncorrelated.
+                                if let Some(id) = &req_id {
+                                    let _ = tx
+                                        .send(transport_error_frame(
+                                            id,
+                                            "server returned an unparseable response body",
+                                        ))
+                                        .await;
+                                }
+                            } else {
+                                for msg in msgs {
+                                    let _ = tx.send(msg).await;
+                                }
+                            }
+                        }
+                        Ok(_) => {
+                            // 2xx with an empty body: no frame to correlate the
+                            // request, so wake the caller rather than hang.
+                            if let Some(id) = &req_id {
+                                let _ = tx
+                                    .send(transport_error_frame(
+                                        id,
+                                        "server returned an empty response body",
+                                    ))
+                                    .await;
                             }
                         }
                         Err(e) => {
                             tracing::error!(error = %e, "Failed to read response body");
+                            if let Some(id) = &req_id {
+                                let _ = tx
+                                    .send(transport_error_frame(
+                                        id,
+                                        &format!("failed to read response body: {e}"),
+                                    ))
+                                    .await;
+                            }
                             connected.store(false, Ordering::Release);
                         }
-                        _ => {}
                     }
                 }
             });
@@ -1022,6 +1101,24 @@ async fn sse_stream_loop(params: SseLoopParams) {
 ///
 /// If the body is SSE-formatted (`event: message\ndata: ...\n\n`), extracts the
 /// `data:` content from each event. Otherwise returns the body as-is.
+/// Build a JSON-RPC error frame carrying `id`.
+///
+/// A post-session request POST is spawned in the background (so the message
+/// loop can keep servicing the SSE stream), which means its failures happen
+/// out of band from the caller. The caller is parked on the request id in the
+/// message loop's correlation map; if the background POST fails before a real
+/// response reaches the incoming channel, we must still deliver a frame with
+/// this id or the caller hangs until the process exits. `-32000` is the
+/// generic server-error code; the message names the transport-level cause.
+fn transport_error_frame(id: &serde_json::Value, message: &str) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": -32000, "message": message },
+    })
+    .to_string()
+}
+
 fn extract_json_messages(body: &str) -> Vec<String> {
     let trimmed = body.trim();
     if trimmed.is_empty() {

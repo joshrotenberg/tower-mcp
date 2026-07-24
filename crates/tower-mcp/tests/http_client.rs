@@ -18,7 +18,7 @@ use tower_mcp::{
     McpRouter, NoParams, NotificationHandler, PromptBuilder, PromptMessage, PromptRole,
     ReadResourceResult, ResourceBuilder, ResourceContent, ResourceTemplateBuilder, Root,
     SamplingContent, SamplingContentOrArray, SamplingMessage, ToolBuilder,
-    client::{HttpClientTransport, McpClient},
+    client::{HttpClientConfig, HttpClientTransport, McpClient},
     extract::{Context, RawArgs},
     transport::http::SessionConfig,
 };
@@ -2712,5 +2712,127 @@ async fn pre_session_404_reports_endpoint_not_found() {
     assert!(
         !msg.to_lowercase().contains("session"),
         "must not be reported as a session error, got: {msg}"
+    );
+}
+
+/// Read one full HTTP/1.1 request (headers + Content-Length body) from a raw
+/// connection. Returns the whole request as a string, or `None` on EOF.
+#[cfg(test)]
+async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Option<String> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    loop {
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let headers = String::from_utf8_lossy(&buf[..pos]).to_string();
+            let content_length = headers
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.trim()
+                        .eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            let need = pos + 4 + content_length;
+            while buf.len() < need {
+                let n = stream.read(&mut tmp).await.ok()?;
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            return Some(String::from_utf8_lossy(&buf).to_string());
+        }
+        let n = stream.read(&mut tmp).await.ok()?;
+        if n == 0 {
+            return (!buf.is_empty()).then(|| String::from_utf8_lossy(&buf).to_string());
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+}
+
+/// Regression: a post-session request whose background POST fails before
+/// delivering a response must wake the awaiting caller with an error, never
+/// hang it.
+///
+/// After the session is established, request POSTs are spawned in a background
+/// task so the message loop can keep servicing the SSE stream. That task used
+/// to drop a handful of failure modes on the floor (network error, timeout,
+/// HTTP error with a non-JSON body, empty body, response stream closed with no
+/// data), leaving the caller parked on the request id forever. This exercises
+/// the empty-body dead-end: the raw server answers `tools/list` with a `200`
+/// and no body. `Connection: close` forces a fresh connection per request so
+/// each is intercepted deterministically.
+#[tokio::test]
+async fn post_session_request_failure_wakes_caller() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let Some(req) = read_http_request(&mut stream).await else {
+                    return;
+                };
+                let response = if req.contains("\"method\":\"initialize\"") {
+                    let body = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "protocolVersion": "2025-11-25",
+                            "capabilities": {},
+                            "serverInfo": {"name": "raw", "version": "0"}
+                        }
+                    })
+                    .to_string();
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         mcp-session-id: raw-session\r\nmcp-protocol-version: 2025-11-25\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else if req.contains("notifications/initialized") {
+                    "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                } else {
+                    // tools/list and anything else: a 2xx with an empty body,
+                    // the dead-end that used to hang the caller.
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                };
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+
+    let url = format!("http://{addr}");
+    let config = HttpClientConfig {
+        auto_sse: false,
+        request_timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
+    let transport = HttpClientTransport::with_config(url, config);
+    let client = McpClient::connect(transport).await.unwrap();
+    client.initialize("raw-client", "1.0.0").await.unwrap();
+
+    // The bug made this future never resolve; bound it so the test fails as a
+    // timeout instead of hanging the whole suite.
+    let result = tokio::time::timeout(Duration::from_secs(3), client.list_tools()).await;
+    let result = result.expect(
+        "list_tools hung: the failed background POST never woke the caller (the bug this guards)",
+    );
+    assert!(
+        result.is_err(),
+        "an empty-body response must surface as an error, got: {result:?}"
     );
 }
