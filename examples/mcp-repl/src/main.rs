@@ -259,16 +259,24 @@ async fn fetch_surface_once(client: &McpClient) -> (Surface, bool) {
             }
         }
     }
+    // The four list calls are independent reads, so run them concurrently.
+    // The McpClient message loop multiplexes requests by id, so this is safe
+    // on a single connection, and it means startup costs one round-trip's
+    // latency instead of four in series. It also bounds the cost of a slow or
+    // unresponsive server: against a server that makes each list time out, the
+    // surface fetch now waits one `request_timeout`, not four.
+    let (tools, prompts, resources, templates) = tokio::join!(
+        client.list_all_tools(),
+        client.list_all_prompts(),
+        client.list_all_resources(),
+        client.list_all_resource_templates(),
+    );
     let mut ni = false;
     let surface = Surface {
-        tools: take("tools", client.list_all_tools().await, &mut ni),
-        prompts: take("prompts", client.list_all_prompts().await, &mut ni),
-        resources: take("resources", client.list_all_resources().await, &mut ni),
-        templates: take(
-            "resource templates",
-            client.list_all_resource_templates().await,
-            &mut ni,
-        ),
+        tools: take("tools", tools, &mut ni),
+        prompts: take("prompts", prompts, &mut ni),
+        resources: take("resources", resources, &mut ni),
+        templates: take("resource templates", templates, &mut ni),
     };
     (surface, ni)
 }
