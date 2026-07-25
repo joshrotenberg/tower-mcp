@@ -203,6 +203,8 @@ mod proxy_tests {
         let resp = call_proxy(
             &mut proxy,
             McpRequest::CallTool(crate::protocol::CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "math_add".to_string(),
                 arguments: json!({"a": 10, "b": 32}),
                 meta: None,
@@ -223,6 +225,8 @@ mod proxy_tests {
         let resp = call_proxy(
             &mut proxy,
             McpRequest::CallTool(crate::protocol::CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "text_echo".to_string(),
                 arguments: json!({"message": "hello"}),
                 meta: None,
@@ -251,6 +255,8 @@ mod proxy_tests {
         let result = call_proxy(
             &mut proxy,
             McpRequest::CallTool(crate::protocol::CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "nonexistent_tool".to_string(),
                 arguments: json!({}),
                 meta: None,
@@ -275,6 +281,8 @@ mod proxy_tests {
         let result = call_proxy(
             &mut proxy,
             McpRequest::ReadResource(crate::protocol::ReadResourceParams {
+                input_responses: None,
+                request_state: None,
                 uri: "unknown://resource".to_string(),
                 meta: None,
             }),
@@ -297,6 +305,8 @@ mod proxy_tests {
         let result = call_proxy(
             &mut proxy,
             McpRequest::GetPrompt(crate::protocol::GetPromptParams {
+                input_responses: None,
+                request_state: None,
                 name: "nonexistent_prompt".to_string(),
                 arguments: Default::default(),
                 meta: None,
@@ -346,6 +356,8 @@ mod proxy_tests {
         let resp = call_proxy(
             &mut proxy,
             McpRequest::ReadResource(crate::protocol::ReadResourceParams {
+                input_responses: None,
+                request_state: None,
                 uri: "text_file:///README.md".to_string(),
                 meta: None,
             }),
@@ -429,6 +441,8 @@ mod proxy_tests {
         let resp = call_proxy(
             &mut proxy,
             McpRequest::GetPrompt(crate::protocol::GetPromptParams {
+                input_responses: None,
+                request_state: None,
                 name: "text_greet".to_string(),
                 arguments: HashMap::from([("name".to_string(), "Alice".to_string())]),
                 meta: None,
@@ -497,6 +511,8 @@ mod proxy_tests {
         let resp = call_proxy(
             &mut proxy,
             McpRequest::CallTool(crate::protocol::CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "math.add".to_string(),
                 arguments: json!({"a": 1, "b": 2}),
                 meta: None,
@@ -633,6 +649,8 @@ mod proxy_tests {
         let resp = call_proxy(
             &mut proxy,
             McpRequest::CallTool(crate::protocol::CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "math_add".to_string(),
                 arguments: json!({"a": 5, "b": 7}),
                 meta: None,
@@ -832,6 +850,8 @@ mod proxy_tests {
         let result = call_proxy(
             &mut proxy,
             McpRequest::CallTool(crate::protocol::CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "slow_slow_op".to_string(),
                 arguments: json!({"delay_ms": 500}),
                 meta: None,
@@ -867,6 +887,8 @@ mod proxy_tests {
         let resp = call_proxy(
             &mut proxy,
             McpRequest::CallTool(crate::protocol::CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "slow_slow_op".to_string(),
                 arguments: json!({"delay_ms": 0}),
                 meta: None,
@@ -905,6 +927,8 @@ mod proxy_tests {
         let resp = call_proxy(
             &mut proxy,
             McpRequest::CallTool(crate::protocol::CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "math_add".to_string(),
                 arguments: json!({"a": 1, "b": 2}),
                 meta: None,
@@ -923,6 +947,8 @@ mod proxy_tests {
         let result = call_proxy(
             &mut proxy,
             McpRequest::CallTool(crate::protocol::CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "slow_slow_op".to_string(),
                 arguments: json!({"delay_ms": 500}),
                 meta: None,
@@ -1160,6 +1186,8 @@ mod proxy_tests {
         let req1 = RouterRequest {
             id: RequestId::Number(1),
             inner: McpRequest::CallTool(crate::protocol::CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "slow_slow_op".to_string(),
                 arguments: json!({"delay_ms": 10}),
                 meta: None,
@@ -1170,6 +1198,8 @@ mod proxy_tests {
         let req2 = RouterRequest {
             id: RequestId::Number(2),
             inner: McpRequest::CallTool(crate::protocol::CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "slow_slow_op".to_string(),
                 arguments: json!({"delay_ms": 10}),
                 meta: None,
@@ -1299,6 +1329,8 @@ mod proxy_tests {
         let resp = call_proxy(
             &mut proxy,
             McpRequest::CallTool(crate::protocol::CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "text_echo".to_string(),
                 arguments: json!({"message": "dynamic!"}),
                 meta: None,
@@ -1416,6 +1448,8 @@ mod proxy_tests {
         let result = call_proxy(
             &mut proxy,
             McpRequest::CallTool(crate::protocol::CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "slow_slow_op".to_string(),
                 arguments: json!({"delay_ms": 500}),
                 meta: None,
@@ -1430,6 +1464,8 @@ mod proxy_tests {
         let resp = call_proxy(
             &mut proxy,
             McpRequest::CallTool(crate::protocol::CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "math_add".to_string(),
                 arguments: json!({"a": 3, "b": 4}),
                 meta: None,
@@ -1501,6 +1537,8 @@ mod proxy_tests {
             let req = RouterRequest {
                 id: RequestId::Number(2),
                 inner: McpRequest::CallTool(crate::protocol::CallToolParams {
+                    input_responses: None,
+                    request_state: None,
                     name: "math_add".to_string(),
                     arguments: json!({"a": 10, "b": 20}),
                     meta: None,
@@ -1616,6 +1654,8 @@ mod proxy_tests {
         let resp = call_proxy(
             &mut proxy,
             McpRequest::CallTool(crate::protocol::CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "math_add".to_string(),
                 arguments: json!({"a": 1, "b": 2}),
                 meta: None,
@@ -1644,6 +1684,8 @@ mod proxy_tests {
         let resp = call_proxy(
             &mut proxy,
             McpRequest::CallTool(crate::protocol::CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "math_add".to_string(),
                 arguments: json!({"a": 10, "b": 20}),
                 meta: None,

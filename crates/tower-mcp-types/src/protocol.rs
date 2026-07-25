@@ -525,13 +525,69 @@ pub enum ProgressToken {
     Number(i64),
 }
 
-/// Request metadata that can include progress token
+/// Request metadata (`_meta`).
+///
+/// Carries the progress token (all versions) and, under 2026-07-28 (SEP-2575),
+/// the per-request protocol version, client identity, client capabilities, and
+/// log level that replaced the `initialize` handshake. Every 2026-07-28 key is
+/// optional here so a single type serves both protocol versions: a 2025-11-25
+/// request carries none of them and serializes byte-identically. Use
+/// [`RequestMeta::validate_for_version`] to enforce the keys a version requires.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestMeta {
-    /// Progress token for receiving progress notifications
+    /// Progress token for receiving progress notifications.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress_token: Option<ProgressToken>,
+    /// SEP-2575: the MCP protocol version for this request. Required on
+    /// 2026-07-28; on the HTTP transport it MUST match the
+    /// `MCP-Protocol-Version` header.
+    #[serde(
+        rename = "io.modelcontextprotocol/protocolVersion",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub protocol_version: Option<String>,
+    /// SEP-2575: self-reported client software identity. Optional.
+    #[serde(
+        rename = "io.modelcontextprotocol/clientInfo",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub client_info: Option<Implementation>,
+    /// SEP-2575: the client's capabilities for this specific request. Required
+    /// on 2026-07-28; declared per-request rather than once at initialization.
+    #[serde(
+        rename = "io.modelcontextprotocol/clientCapabilities",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub client_capabilities: Option<ClientCapabilities>,
+    /// SEP-2575: desired log level for this request. Optional.
+    ///
+    /// Deprecated as of 2026-07-28 (SEP-2577); it replaced the `logging/setLevel`
+    /// RPC. If absent, the server MUST NOT emit `notifications/message` for the
+    /// request.
+    #[serde(
+        rename = "io.modelcontextprotocol/logLevel",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub log_level: Option<LogLevel>,
+}
+
+impl RequestMeta {
+    /// Validate that the `_meta` keys the given protocol version requires are
+    /// present. Under 2026-07-28 (SEP-2575), `protocolVersion` and
+    /// `clientCapabilities` are required; earlier versions carry neither and
+    /// always pass.
+    pub fn validate_for_version(&self, protocol_version: &str) -> Result<(), MissingMetaKey> {
+        if protocol_version == UPCOMING_PROTOCOL_VERSION {
+            if self.protocol_version.is_none() {
+                return Err(MissingMetaKey("io.modelcontextprotocol/protocolVersion"));
+            }
+            if self.client_capabilities.is_none() {
+                return Err(MissingMetaKey("io.modelcontextprotocol/clientCapabilities"));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// High-level MCP response
@@ -1604,6 +1660,12 @@ pub struct DiscoverResult {
 /// future SEPs can add optional fields without breaking callers.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SubscriptionsListenParams {
+    /// SEP-2575: the notification types the client opts in to on this stream.
+    /// The draft schema requires this field; it is optional here so existing
+    /// callers keep compiling, and the transport enforces presence on the
+    /// 2026-07-28 path (#952).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notifications: Option<SubscriptionFilter>,
     /// Optional protocol-level metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
@@ -1971,6 +2033,22 @@ pub struct CallToolParams {
     pub name: String,
     #[serde(default)]
     pub arguments: Value,
+    /// SEP-2322: responses to the server's [`InputRequests`] from a prior
+    /// `input_required` result, sent on retry of the original request.
+    #[serde(
+        rename = "inputResponses",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub input_responses: Option<InputResponses>,
+    /// SEP-2322: opaque request state echoed back from a prior `input_required`
+    /// result.
+    #[serde(
+        rename = "requestState",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub request_state: Option<String>,
     /// Request metadata including progress token
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<RequestMeta>,
@@ -2604,6 +2682,22 @@ pub struct ResourceDefinition {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadResourceParams {
     pub uri: String,
+    /// SEP-2322: responses to the server's [`InputRequests`] from a prior
+    /// `input_required` result, sent on retry of the original request.
+    #[serde(
+        rename = "inputResponses",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub input_responses: Option<InputResponses>,
+    /// SEP-2322: opaque request state echoed back from a prior `input_required`
+    /// result.
+    #[serde(
+        rename = "requestState",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub request_state: Option<String>,
     /// Optional protocol-level metadata
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<RequestMeta>,
@@ -3009,6 +3103,22 @@ pub struct GetPromptParams {
     pub name: String,
     #[serde(default)]
     pub arguments: std::collections::HashMap<String, String>,
+    /// SEP-2322: responses to the server's [`InputRequests`] from a prior
+    /// `input_required` result, sent on retry of the original request.
+    #[serde(
+        rename = "inputResponses",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub input_responses: Option<InputResponses>,
+    /// SEP-2322: opaque request state echoed back from a prior `input_required`
+    /// result.
+    #[serde(
+        rename = "requestState",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub request_state: Option<String>,
     /// Optional protocol-level metadata
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<RequestMeta>,
@@ -4406,6 +4516,278 @@ impl McpNotification {
             }),
         }
     }
+}
+
+// =============================================================================
+// 2026-07-28 draft surface: result discrimination, Multi Round-Trip Requests
+// (SEP-2322), subscription streams (SEP-2575), and the meta model split.
+//
+// Everything here is additive and version-gated by omission: every new field
+// uses `skip_serializing_if`, so a value carrying none of it serializes
+// byte-identically to 2025-11-25 output. These shapes track the current
+// `2026-07-28` draft schema; a re-verify-against-final checkpoint is in #929.
+// =============================================================================
+
+/// The type discriminator carried by a 2026-07-28 result (SEP-2322).
+///
+/// The draft schema requires `resultType` on every result. For backward
+/// compatibility a client MUST treat an absent field as [`ResultType::Complete`];
+/// use [`ResultType::from_result_value`] to read it with that rule applied.
+/// `Complete` is the [`Default`].
+///
+/// The wire form is an open string. `"complete"` and `"input_required"` are
+/// defined by SEP-2322; extensions (for example the Tasks extension's
+/// `"task"`) may define further values, captured by [`ResultType::Other`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ResultType {
+    /// The request completed; the result carries the final content.
+    #[default]
+    Complete,
+    /// The server needs more input before it can complete the request; the
+    /// result is an [`InputRequiredResult`].
+    InputRequired,
+    /// A value not defined by SEP-2322, for example an extension discriminator.
+    Other(String),
+}
+
+impl ResultType {
+    /// The wire string for this discriminator.
+    pub fn as_str(&self) -> &str {
+        match self {
+            ResultType::Complete => "complete",
+            ResultType::InputRequired => "input_required",
+            ResultType::Other(s) => s.as_str(),
+        }
+    }
+
+    /// Whether this is the default `"complete"` discriminator.
+    pub fn is_complete(&self) -> bool {
+        matches!(self, ResultType::Complete)
+    }
+
+    /// Read the discriminator from a raw result object, applying the SEP-2322
+    /// backward-compatibility rule: a missing (or non-string) `resultType`
+    /// reads as [`ResultType::Complete`].
+    pub fn from_result_value(value: &Value) -> ResultType {
+        match value.get("resultType").and_then(Value::as_str) {
+            None => ResultType::Complete,
+            Some(s) => ResultType::from(s.to_string()),
+        }
+    }
+}
+
+impl From<String> for ResultType {
+    fn from(s: String) -> ResultType {
+        match s.as_str() {
+            "complete" => ResultType::Complete,
+            "input_required" => ResultType::InputRequired,
+            _ => ResultType::Other(s),
+        }
+    }
+}
+
+impl From<ResultType> for String {
+    fn from(r: ResultType) -> String {
+        match r {
+            ResultType::Complete => "complete".to_string(),
+            ResultType::InputRequired => "input_required".to_string(),
+            ResultType::Other(s) => s,
+        }
+    }
+}
+
+impl serde::Serialize for ResultType {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ResultType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<ResultType, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(ResultType::from(s))
+    }
+}
+
+/// A single server-initiated request the client must fulfil during a Multi
+/// Round-Trip Request (SEP-2322). Serialized adjacently as `{method, params}`,
+/// mirroring the JSON-RPC request embedded in an [`InputRequests`] map.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "method", content = "params")]
+#[non_exhaustive]
+pub enum InputRequest {
+    /// `sampling/createMessage`
+    #[serde(rename = "sampling/createMessage")]
+    CreateMessage(CreateMessageParams),
+    /// `roots/list`
+    #[serde(rename = "roots/list")]
+    ListRoots(ListRootsParams),
+    /// `elicitation/create`
+    #[serde(rename = "elicitation/create")]
+    Elicit(ElicitRequestParams),
+}
+
+impl InputRequest {
+    /// The MCP method name for this input request.
+    pub fn method_name(&self) -> &str {
+        match self {
+            InputRequest::CreateMessage(_) => "sampling/createMessage",
+            InputRequest::ListRoots(_) => "roots/list",
+            InputRequest::Elicit(_) => "elicitation/create",
+        }
+    }
+}
+
+/// A single client response to a server-initiated [`InputRequest`] (SEP-2322).
+/// Untagged: the wire value is the bare result object, correlated to its
+/// request by its key in the [`InputResponses`] map.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+#[non_exhaustive]
+pub enum InputResponse {
+    /// Result of a `sampling/createMessage` request.
+    CreateMessage(CreateMessageResult),
+    /// Result of a `roots/list` request.
+    ListRoots(ListRootsResult),
+    /// Result of an `elicitation/create` request.
+    Elicit(ElicitResult),
+}
+
+/// Map of server-initiated requests the client must fulfil, keyed by
+/// server-assigned identifiers (SEP-2322).
+pub type InputRequests = std::collections::BTreeMap<String, InputRequest>;
+
+/// Map of client responses to [`InputRequests`], keyed by the same
+/// identifiers (SEP-2322).
+pub type InputResponses = std::collections::BTreeMap<String, InputResponse>;
+
+/// A 2026-07-28 result signalling the server needs more input before it can
+/// complete the original request (SEP-2322).
+///
+/// At least one of `input_requests` or `request_state` is present. The client
+/// fulfils the requests, then retries the original request carrying the
+/// matching `inputResponses` (and echoing `requestState`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputRequiredResult {
+    /// Always [`ResultType::InputRequired`].
+    #[serde(rename = "resultType", default = "result_type_input_required")]
+    pub result_type: ResultType,
+    /// Requests the server needs fulfilled before the client retries.
+    #[serde(
+        rename = "inputRequests",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub input_requests: Option<InputRequests>,
+    /// Opaque blob the client echoes back on retry. The client MUST NOT
+    /// interpret it.
+    #[serde(
+        rename = "requestState",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub request_state: Option<String>,
+    /// Result-level metadata (`_meta`).
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
+}
+
+fn result_type_input_required() -> ResultType {
+    ResultType::InputRequired
+}
+
+impl InputRequiredResult {
+    /// An empty `input_required` result. Set `input_requests` and/or
+    /// `request_state` before returning it.
+    pub fn new() -> Self {
+        InputRequiredResult {
+            result_type: ResultType::InputRequired,
+            input_requests: None,
+            request_state: None,
+            meta: None,
+        }
+    }
+}
+
+impl Default for InputRequiredResult {
+    fn default() -> Self {
+        InputRequiredResult::new()
+    }
+}
+
+/// Notification meta (`_meta`) carried by notifications delivered on a
+/// `subscriptions/listen` stream (SEP-2575).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NotificationMeta {
+    /// Identifies the subscription stream a notification was delivered on: the
+    /// JSON-RPC id of the `subscriptions/listen` request that opened it.
+    /// Absent on notifications not delivered via a subscription stream.
+    #[serde(
+        rename = "io.modelcontextprotocol/subscriptionId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub subscription_id: Option<RequestId>,
+}
+
+/// Result meta (`_meta`) fields the server may attach to a response (SEP-2575).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResultMeta {
+    /// Identifies the server software producing the response. Self-reported and
+    /// unverified; intended for display, logging, and debugging.
+    #[serde(
+        rename = "io.modelcontextprotocol/serverInfo",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub server_info: Option<Implementation>,
+}
+
+/// A required `_meta` key was missing for the negotiated protocol version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingMetaKey(pub &'static str);
+
+impl std::fmt::Display for MissingMetaKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "missing required _meta key for the negotiated protocol version: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for MissingMetaKey {}
+
+/// Notification types a client opts in to on a `subscriptions/listen` stream
+/// (SEP-2575). Replaces the 2025-11-25 `resources/subscribe` RPC. The server
+/// MUST NOT send a notification type the client did not request.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionFilter {
+    /// Receive `notifications/tools/list_changed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools_list_changed: Option<bool>,
+    /// Receive `notifications/prompts/list_changed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompts_list_changed: Option<bool>,
+    /// Receive `notifications/resources/list_changed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources_list_changed: Option<bool>,
+    /// Resource URIs to receive `notifications/resources/updated` for.
+    /// Replaces the former `resources/subscribe` RPC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_subscriptions: Option<Vec<String>>,
+}
+
+/// Parameters for a `notifications/subscriptions/acknowledged` notification
+/// (SEP-2575): the subset of requested notification types the server will honor.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SubscriptionsAcknowledgedParams {
+    /// The notification types the server agreed to honor. Types the server does
+    /// not support are omitted.
+    pub notifications: SubscriptionFilter,
 }
 
 #[cfg(test)]
@@ -5984,6 +6366,157 @@ mod tests {
         assert_eq!(
             json["extensions"]["io.modelcontextprotocol/tasks"],
             serde_json::json!({})
+        );
+    }
+}
+
+#[cfg(test)]
+mod draft_2026_07_28_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn result_type_wire_forms_and_backcompat() {
+        assert_eq!(
+            serde_json::to_value(ResultType::Complete).unwrap(),
+            json!("complete")
+        );
+        assert_eq!(
+            serde_json::to_value(ResultType::InputRequired).unwrap(),
+            json!("input_required")
+        );
+        assert_eq!(
+            serde_json::to_value(ResultType::Other("task".into())).unwrap(),
+            json!("task")
+        );
+        assert_eq!(
+            serde_json::from_value::<ResultType>(json!("input_required")).unwrap(),
+            ResultType::InputRequired
+        );
+        assert_eq!(
+            serde_json::from_value::<ResultType>(json!("task")).unwrap(),
+            ResultType::Other("task".into())
+        );
+        // SEP-2322 backward-compat rule: an absent resultType reads as complete.
+        assert_eq!(
+            ResultType::from_result_value(&json!({"content": []})),
+            ResultType::Complete
+        );
+        assert_eq!(
+            ResultType::from_result_value(&json!({"resultType": "input_required"})),
+            ResultType::InputRequired
+        );
+        assert!(ResultType::default().is_complete());
+    }
+
+    #[test]
+    fn input_required_result_round_trips() {
+        let requests: InputRequests =
+            serde_json::from_value(json!({ "r1": {"method": "roots/list", "params": {}} }))
+                .unwrap();
+        let result = InputRequiredResult {
+            input_requests: Some(requests),
+            request_state: Some("opaque-blob".to_string()),
+            ..InputRequiredResult::new()
+        };
+        let v = serde_json::to_value(&result).unwrap();
+        assert_eq!(v["resultType"], json!("input_required"));
+        assert_eq!(v["inputRequests"]["r1"]["method"], json!("roots/list"));
+        assert_eq!(v["requestState"], json!("opaque-blob"));
+        let back: InputRequiredResult = serde_json::from_value(v).unwrap();
+        assert_eq!(back.result_type, ResultType::InputRequired);
+        assert_eq!(back.request_state.as_deref(), Some("opaque-blob"));
+    }
+
+    #[test]
+    fn input_request_is_adjacently_tagged_and_response_untagged() {
+        let ir: InputRequest =
+            serde_json::from_value(json!({"method": "roots/list", "params": {}})).unwrap();
+        assert_eq!(ir.method_name(), "roots/list");
+        assert!(matches!(ir, InputRequest::ListRoots(_)));
+        assert_eq!(
+            serde_json::to_value(&ir).unwrap(),
+            json!({"method": "roots/list", "params": {}})
+        );
+        // Untagged response value, correlated to its request by map key.
+        let resp: InputResponse = serde_json::from_value(json!({"roots": []})).unwrap();
+        assert!(matches!(resp, InputResponse::ListRoots(_)));
+    }
+
+    #[test]
+    fn request_meta_carries_sep2575_keys_and_validates_by_version() {
+        let meta = RequestMeta {
+            protocol_version: Some(UPCOMING_PROTOCOL_VERSION.to_string()),
+            client_capabilities: Some(ClientCapabilities::default()),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&meta).unwrap();
+        assert_eq!(
+            v["io.modelcontextprotocol/protocolVersion"],
+            json!(UPCOMING_PROTOCOL_VERSION)
+        );
+        assert!(
+            v.get("io.modelcontextprotocol/clientCapabilities")
+                .is_some()
+        );
+        // Version-aware required-key validation (SEP-2575).
+        assert!(meta.validate_for_version(UPCOMING_PROTOCOL_VERSION).is_ok());
+        assert!(
+            RequestMeta::default()
+                .validate_for_version(UPCOMING_PROTOCOL_VERSION)
+                .is_err()
+        );
+        assert!(
+            RequestMeta::default()
+                .validate_for_version("2025-11-25")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn subscription_types_round_trip() {
+        let filter = SubscriptionFilter {
+            tools_list_changed: Some(true),
+            resource_subscriptions: Some(vec!["file:///a".to_string()]),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&filter).unwrap();
+        assert_eq!(v["toolsListChanged"], json!(true));
+        assert_eq!(v["resourceSubscriptions"], json!(["file:///a"]));
+        assert!(v.get("promptsListChanged").is_none()); // None is omitted
+
+        let ack = SubscriptionsAcknowledgedParams {
+            notifications: filter,
+        };
+        let back: SubscriptionsAcknowledgedParams =
+            serde_json::from_value(serde_json::to_value(&ack).unwrap()).unwrap();
+        assert_eq!(back.notifications.tools_list_changed, Some(true));
+    }
+
+    #[test]
+    fn additions_keep_2025_11_25_output_byte_identical() {
+        // A tools/call with no MRTR/task/meta serializes exactly as before:
+        // only name + arguments, no new keys.
+        let params = CallToolParams {
+            name: "echo".to_string(),
+            arguments: json!({"message": "hi"}),
+            input_responses: None,
+            request_state: None,
+            meta: None,
+            task: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&params).unwrap(),
+            json!({"name": "echo", "arguments": {"message": "hi"}})
+        );
+        // RequestMeta with only a progress token adds no SEP-2575 keys.
+        let meta = RequestMeta {
+            progress_token: Some(ProgressToken::String("p".into())),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&meta).unwrap(),
+            json!({"progressToken": "p"})
         );
     }
 }
