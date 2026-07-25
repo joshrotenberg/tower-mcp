@@ -4575,6 +4575,45 @@ impl ResultType {
             Some(s) => ResultType::from(s.to_string()),
         }
     }
+
+    /// Stamp this discriminator onto a serialized result object, gated on the
+    /// negotiated protocol version. Returns `true` when the field was written.
+    ///
+    /// This is how `resultType` reaches the result base: the field is required
+    /// on 2026-07-28 results but must not appear on 2025-11-25 ones, and serde
+    /// cannot see the negotiated version, so the gate lives here rather than in
+    /// each result struct. Serialize the result, then stamp the value on its way
+    /// out. Nothing is written when
+    /// [`version_carries_result_type`] is false, when `result` is not a JSON
+    /// object, or when the result already carries a `resultType` (results that
+    /// own their discriminator, such as [`InputRequiredResult`] and
+    /// [`CreateTaskResult`], keep it on every version).
+    pub fn stamp_into(&self, result: &mut Value, protocol_version: &str) -> bool {
+        if !version_carries_result_type(protocol_version) {
+            return false;
+        }
+        let Some(obj) = result.as_object_mut() else {
+            return false;
+        };
+        if obj.contains_key("resultType") {
+            return false;
+        }
+        obj.insert(
+            "resultType".to_string(),
+            Value::String(self.as_str().to_string()),
+        );
+        true
+    }
+}
+
+/// Whether results on the given negotiated protocol version carry the SEP-2322
+/// `resultType` discriminator.
+///
+/// `resultType` is part of the 2026-07-28 spec (SEP-2322); on 2025-11-25 it is
+/// absent and readers apply the "absent means `complete`" rule. Version strings
+/// are YYYY-MM-DD dates, so lexicographic comparison is correct.
+pub fn version_carries_result_type(protocol_version: &str) -> bool {
+    protocol_version >= UPCOMING_PROTOCOL_VERSION
 }
 
 impl From<String> for ResultType {
@@ -6541,5 +6580,85 @@ mod draft_2026_07_28_tests {
             back.meta.unwrap().protocol_version.as_deref(),
             Some(UPCOMING_PROTOCOL_VERSION)
         );
+    }
+
+    #[test]
+    fn result_type_stamp_is_gated_on_the_negotiated_version() {
+        let result = CallToolResult::text("hi");
+        let baseline = serde_json::to_value(&result).unwrap();
+
+        // 2025-11-25 output is untouched: no resultType, byte-identical.
+        let mut v = baseline.clone();
+        assert!(!ResultType::Complete.stamp_into(&mut v, "2025-11-25"));
+        assert_eq!(v, baseline);
+
+        // 2026-07-28 carries the discriminator.
+        let mut v = baseline.clone();
+        assert!(ResultType::Complete.stamp_into(&mut v, UPCOMING_PROTOCOL_VERSION));
+        assert_eq!(v["resultType"], json!("complete"));
+        assert_eq!(v["content"], baseline["content"]);
+
+        // Versions after 2026-07-28 keep carrying it (dates compare in order).
+        let mut v = baseline.clone();
+        assert!(ResultType::Complete.stamp_into(&mut v, "2027-01-01"));
+        assert_eq!(v["resultType"], json!("complete"));
+
+        assert!(!version_carries_result_type("2025-11-25"));
+        assert!(version_carries_result_type(UPCOMING_PROTOCOL_VERSION));
+    }
+
+    #[test]
+    fn result_type_stamp_leaves_owned_discriminators_alone() {
+        // InputRequiredResult and CreateTaskResult write their own resultType;
+        // stamping must not overwrite it with "complete".
+        let mut v = serde_json::to_value(InputRequiredResult::new()).unwrap();
+        assert!(!ResultType::Complete.stamp_into(&mut v, UPCOMING_PROTOCOL_VERSION));
+        assert_eq!(v["resultType"], json!("input_required"));
+
+        let mut v = json!({"resultType": RESULT_TYPE_TASK, "taskId": "t1"});
+        assert!(!ResultType::Complete.stamp_into(&mut v, UPCOMING_PROTOCOL_VERSION));
+        assert_eq!(v["resultType"], json!("task"));
+
+        // A non-object result (the empty result some methods return) is a no-op.
+        let mut v = json!(null);
+        assert!(!ResultType::Complete.stamp_into(&mut v, UPCOMING_PROTOCOL_VERSION));
+        assert_eq!(v, json!(null));
+    }
+
+    #[test]
+    fn stamped_result_round_trips_and_reads_back_as_complete() {
+        // Draft-schema shape of a complete tools/call result: the discriminator
+        // rides alongside the 2025-11-25 body and is ignored by readers that
+        // deserialize into the concrete result type.
+        let example = json!({
+            "resultType": "complete",
+            "content": [{"type": "text", "text": "42"}],
+            "isError": false
+        });
+        assert_eq!(
+            ResultType::from_result_value(&example),
+            ResultType::Complete
+        );
+        let parsed: CallToolResult = serde_json::from_value(example).unwrap();
+        let mut round_tripped = serde_json::to_value(&parsed).unwrap();
+        assert!(ResultType::Complete.stamp_into(&mut round_tripped, UPCOMING_PROTOCOL_VERSION));
+        assert_eq!(round_tripped["resultType"], json!("complete"));
+        assert_eq!(round_tripped["content"][0]["text"], json!("42"));
+
+        // An input_required result reads back through the same entry point.
+        let example = json!({
+            "resultType": "input_required",
+            "inputRequests": {"r1": {"method": "elicitation/create", "params": {
+                "message": "which file?",
+                "requestedSchema": {"type": "object", "properties": {}}
+            }}}
+        });
+        assert_eq!(
+            ResultType::from_result_value(&example),
+            ResultType::InputRequired
+        );
+        let parsed: InputRequiredResult = serde_json::from_value(example).unwrap();
+        assert_eq!(parsed.result_type, ResultType::InputRequired);
+        assert!(parsed.input_requests.is_some_and(|r| r.contains_key("r1")));
     }
 }
