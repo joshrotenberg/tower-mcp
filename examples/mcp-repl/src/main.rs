@@ -15,6 +15,9 @@
 //!
 //! # Connect to a streamable HTTP server:
 //! cargo run -p mcp-repl -- --http http://127.0.0.1:3001/mcp
+//!
+//! # Connect to a named profile from ~/.config/mcp-repl/config.toml:
+//! cargo run -p mcp-repl -- --server cratesio
 //! ```
 //!
 //! Inside the REPL, `help` lists the built-ins and the server's tools.
@@ -22,6 +25,7 @@
 //! task id immediately; `jobs`, `task <id>`, `wait <id>`, and `cancel <id>`
 //! manage it.
 
+mod config;
 mod editor;
 mod elicit;
 mod style;
@@ -59,8 +63,22 @@ struct Args {
     http: Option<String>,
 
     /// Serve the bundled demo router in-process (no external server needed).
-    #[arg(long, conflicts_with_all = ["http", "command"])]
+    #[arg(long, conflicts_with_all = ["http", "command", "server"])]
     demo: bool,
+
+    /// Connect using the named `[servers.<name>]` profile from the config
+    /// file. A bare positional that matches a profile name works too.
+    #[arg(long, value_name = "NAME")]
+    server: Option<String>,
+
+    /// Read server profiles from this file instead of
+    /// `$XDG_CONFIG_HOME/mcp-repl/config.toml` (or `~/.config/mcp-repl/config.toml`).
+    #[arg(long, value_name = "PATH")]
+    config: Option<String>,
+
+    /// Print the configured server profiles and exit.
+    #[arg(long)]
+    list_servers: bool,
 
     /// When to emit ANSI colors (auto detects tty and NO_COLOR).
     #[arg(long, value_enum, default_value = "auto")]
@@ -403,16 +421,26 @@ async fn fetch_surface_initial(client: &McpClient) -> Surface {
     unreachable!()
 }
 
-/// Build the HTTP client config from the auth flags. `--bearer` wins over the
-/// `MCP_BEARER` environment variable; each `--header "Name: Value"` is split on
-/// the first colon (surrounding whitespace trimmed). A header with no colon is
-/// a usage error.
+/// Build the HTTP client config from the auth flags and the resolved profile.
+/// `--bearer` wins over the profile's token, which wins over the `MCP_BEARER`
+/// environment variable; `--header` flags are applied after the profile's
+/// headers so a repeated name overrides it. Each `--header "Name: Value"` is
+/// split on the first colon (surrounding whitespace trimmed); a header with no
+/// colon is a usage error.
 fn build_http_config(
     bearer: Option<String>,
     headers: &[String],
+    profile_bearer: Option<String>,
+    profile_headers: &[(String, String)],
 ) -> Result<HttpClientConfig, String> {
     let mut config = HttpClientConfig::default();
-    if let Some(token) = bearer.or_else(|| std::env::var("MCP_BEARER").ok()) {
+    for (name, value) in profile_headers {
+        config = config.header(name.as_str(), value.as_str());
+    }
+    if let Some(token) = bearer
+        .or(profile_bearer)
+        .or_else(|| std::env::var("MCP_BEARER").ok())
+    {
         config = config.bearer_token(token);
     }
     for raw in headers {
@@ -525,6 +553,71 @@ fn demo_router() -> tower_mcp::McpRouter {
         )
 }
 
+/// Load the profile config, exiting with a usage status on a bad file. A
+/// missing file at the default location is not an error: profiles are opt-in.
+fn load_config(explicit: Option<&str>) -> config::Config {
+    let Some((path, explicit)) = config::config_path(explicit) else {
+        return config::Config::default();
+    };
+    match config::Config::load(&path, explicit) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// `--list-servers`: the configured profiles, one per line.
+fn print_servers(config: &config::Config) {
+    if config.servers.is_empty() {
+        println!("no server profiles configured");
+        return;
+    }
+    let width = config.names().iter().map(|n| n.len()).max().unwrap_or(0);
+    for (name, profile) in &config.servers {
+        println!(
+            "{:width$}  {}",
+            paint(Style::new().fg(Color::Cyan), name),
+            paint(Style::new().dimmed(), &profile.summary()),
+        );
+    }
+}
+
+/// Resolve the profile the invocation names, if any: `--server <name>`, or a
+/// bare single positional that matches a configured profile. A positional that
+/// matches nothing stays a stdio command, so spawning a server by bare name
+/// still works when no profile shadows it.
+fn resolve_profile(args: &Args, config: &config::Config) -> Option<(String, config::Connection)> {
+    let name = args
+        .server
+        .clone()
+        .or_else(|| match args.command.as_slice() {
+            [only] if config.servers.contains_key(only) => Some(only.clone()),
+            _ => None,
+        })?;
+    let profile = match config.profile(&name) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    };
+    if profile.bearer.is_some() {
+        eprintln!(
+            "warning: profile {name:?} stores a literal `bearer` token; prefer \
+             `bearer_env = \"VAR\"` so the token is not kept in the config file"
+        );
+    }
+    match profile.resolve_with(|var| std::env::var(var).ok()) {
+        Ok(connection) => Some((name, connection)),
+        Err(e) => {
+            eprintln!("error: server profile {name:?}: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
 fn log_level_style(level: LogLevel) -> Style {
     match level {
         LogLevel::Emergency | LogLevel::Alert | LogLevel::Critical | LogLevel::Error => {
@@ -546,6 +639,15 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     let args = Args::parse();
     style::init(args.color);
     JSON_OUTPUT.store(args.json, Ordering::Relaxed);
+
+    // Server profiles are read up front: both --list-servers and profile
+    // resolution need them before anything connects.
+    let profiles = load_config(args.config.as_deref());
+    if args.list_servers {
+        print_servers(&profiles);
+        return Ok(());
+    }
+    let profile = resolve_profile(&args, &profiles);
     // --exec runs commands and exits; suppress the banner and surface listing
     // unless --verbose, so scripted output is only the command results.
     let one_shot = !args.exec.is_empty();
@@ -595,8 +697,47 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     };
     let handler = ReplClientHandler::new(notifications, at_prompt.clone());
 
-    if args.http.is_none() && (args.bearer.is_some() || !args.headers.is_empty()) {
-        eprintln!("warning: --bearer/--header apply only to --http; ignoring them here");
+    // Explicit flags override profile fields: --http retargets a profile's URL
+    // while keeping its auth, and --bearer/--header are layered on in
+    // build_http_config.
+    let (profile_name, connection) = match profile {
+        Some((name, c)) => (Some(name), Some(c)),
+        None => (None, None),
+    };
+    let connection = match (args.http.clone(), connection) {
+        (
+            Some(url),
+            Some(config::Connection::Http {
+                bearer, headers, ..
+            }),
+        ) => Some(config::Connection::Http {
+            url,
+            bearer,
+            headers,
+        }),
+        (Some(url), _) => Some(config::Connection::Http {
+            url,
+            bearer: None,
+            headers: Vec::new(),
+        }),
+        (None, Some(c)) => Some(c),
+        (None, None) if !args.command.is_empty() => Some(config::Connection::Stdio {
+            command: args.command.clone(),
+        }),
+        (None, None) => None,
+    };
+
+    let over_http = matches!(connection, Some(config::Connection::Http { .. }));
+    if !over_http && (args.bearer.is_some() || !args.headers.is_empty()) {
+        eprintln!("warning: --bearer/--header apply only to HTTP servers; ignoring them here");
+    }
+    if let Some(name) = &profile_name
+        && !quiet
+    {
+        println!(
+            "{}",
+            tag(Style::new().fg(Color::Cyan), &format!("profile {name}"))
+        );
     }
 
     let builder = McpClient::builder().with_elicitation();
@@ -604,21 +745,31 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         builder
             .connect(ChannelTransport::new(demo_router()), handler)
             .await?
-    } else if let Some(url) = &args.http {
-        let config = build_http_config(args.bearer.clone(), &args.headers)?;
-        builder
-            .connect(
-                HttpClientTransport::with_config(url.clone(), config),
-                handler,
-            )
-            .await?
-    } else if !args.command.is_empty() {
-        let cmd_args: Vec<&str> = args.command[1..].iter().map(|s| s.as_str()).collect();
-        let transport = StdioClientTransport::spawn(&args.command[0], &cmd_args).await?;
-        builder.connect(transport, handler).await?
     } else {
-        eprintln!("usage: mcp-repl <server command...> | --http <url> | --demo");
-        std::process::exit(2);
+        match connection {
+            Some(config::Connection::Http {
+                url,
+                bearer,
+                headers,
+            }) => {
+                let config =
+                    build_http_config(args.bearer.clone(), &args.headers, bearer, &headers)?;
+                builder
+                    .connect(HttpClientTransport::with_config(url, config), handler)
+                    .await?
+            }
+            Some(config::Connection::Stdio { command }) => {
+                let cmd_args: Vec<&str> = command[1..].iter().map(|s| s.as_str()).collect();
+                let transport = StdioClientTransport::spawn(&command[0], &cmd_args).await?;
+                builder.connect(transport, handler).await?
+            }
+            None => {
+                eprintln!(
+                    "usage: mcp-repl <server command...> | --http <url> | --server <name> | --demo"
+                );
+                std::process::exit(2);
+            }
+        }
     };
     let client = Arc::new(client);
 
@@ -1255,6 +1406,8 @@ mod tests {
         let cfg = build_http_config(
             Some("tok".into()),
             &["X-Api-Key: abc".into(), "X-Trim :  v ".into()],
+            None,
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -1269,8 +1422,48 @@ mod tests {
     }
 
     #[test]
+    fn profile_auth_applies_and_flags_override_it() {
+        let profile_headers = [
+            ("X-Api-Key".to_string(), "from-profile".to_string()),
+            ("X-Kept".to_string(), "profile".to_string()),
+        ];
+        // No flags: the profile's token and headers are used as-is.
+        let cfg =
+            build_http_config(None, &[], Some("profile-tok".into()), &profile_headers).unwrap();
+        assert_eq!(
+            cfg.headers.get("Authorization").map(String::as_str),
+            Some("Bearer profile-tok")
+        );
+        assert_eq!(
+            cfg.headers.get("X-Api-Key").map(String::as_str),
+            Some("from-profile")
+        );
+
+        // Flags win over the profile, header by header.
+        let cfg = build_http_config(
+            Some("flag-tok".into()),
+            &["X-Api-Key: from-flag".into()],
+            Some("profile-tok".into()),
+            &profile_headers,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.headers.get("Authorization").map(String::as_str),
+            Some("Bearer flag-tok")
+        );
+        assert_eq!(
+            cfg.headers.get("X-Api-Key").map(String::as_str),
+            Some("from-flag")
+        );
+        assert_eq!(
+            cfg.headers.get("X-Kept").map(String::as_str),
+            Some("profile")
+        );
+    }
+
+    #[test]
     fn build_http_config_rejects_header_without_colon() {
-        let err = build_http_config(Some("tok".into()), &["nope".into()]).unwrap_err();
+        let err = build_http_config(Some("tok".into()), &["nope".into()], None, &[]).unwrap_err();
         assert!(
             err.contains("nope"),
             "error should name the bad header: {err}"

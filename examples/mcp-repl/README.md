@@ -53,8 +53,50 @@ mcp-repl --http https://internal.example/mcp --bearer "$TOKEN"
 mcp-repl --http https://internal.example/mcp --header "X-Api-Key: abc"
 ```
 
-`--bearer` and `--header` apply only to `--http`; they are ignored (with a
-warning) for the demo and stdio-child transports.
+`--bearer` and `--header` apply only to HTTP connections; they are ignored
+(with a warning) for the demo and stdio-child transports.
+
+## Profiles
+
+A config file names servers so a connection is `mcp-repl <name>` instead of a
+URL plus repeated auth flags, and tokens stay out of shell history. The file
+lives at `$XDG_CONFIG_HOME/mcp-repl/config.toml`, falling back to
+`~/.config/mcp-repl/config.toml`; `--config <path>` reads a different one.
+
+```toml
+[servers.cratesio]
+transport = "http"                 # http | stdio
+url = "https://cratesio-mcp.fly.dev/"
+bearer_env = "CRATESIO_TOKEN"      # read the token from the environment
+headers = { "X-Api-Key" = "abc" }
+
+[servers.local]
+transport = "stdio"
+command = ["cargo", "run", "--example", "getting_started"]
+```
+
+```bash
+mcp-repl --list-servers            # the configured profiles
+mcp-repl --server cratesio         # connect by name
+mcp-repl cratesio                  # a bare name works too
+```
+
+- `transport` is optional: a profile with a `url` is HTTP, one with a
+  `command` is stdio. A profile with both must say which.
+- Explicit flags override profile fields. `--http <url>` retargets the URL
+  while keeping the profile's auth; `--bearer` replaces the profile's token;
+  each `--header` overrides the profile header of the same name.
+- The bare-name form only resolves when the single positional matches a
+  configured profile, so spawning a stdio server by bare name still works.
+  Because everything after the first positional belongs to the spawned
+  command, use `--server <name>` when other flags follow.
+- Secrets: `bearer_env` names an environment variable holding the token. An
+  unset variable is an error rather than a silent anonymous connection. An
+  inline `bearer = "..."` works but warns, since it puts the token in the
+  file.
+- An unknown profile name errors with the list of known names, and a missing
+  `--config` file is an error. A missing file at the default location is not:
+  profiles are opt-in.
 
 ## What to try
 
