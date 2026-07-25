@@ -21,7 +21,7 @@ use reedline::{
     Suggestion, default_emacs_keybindings,
 };
 
-use tower_mcp::client::McpClient;
+use crate::session::Session;
 
 use crate::style;
 use crate::{BUILTINS, Surface};
@@ -74,7 +74,9 @@ impl Prompt for ReplPrompt {
 
 pub struct ReplCompleter {
     surface: Arc<RwLock<Surface>>,
-    client: Arc<McpClient>,
+    /// The session rather than the client: a reconnect swaps the client out,
+    /// and completions issued afterwards must go to the live one.
+    session: Arc<Session>,
     runtime: tokio::runtime::Handle,
 }
 
@@ -105,12 +107,12 @@ fn word_suggestion(
 impl ReplCompleter {
     pub fn new(
         surface: Arc<RwLock<Surface>>,
-        client: Arc<McpClient>,
+        session: Arc<Session>,
         runtime: tokio::runtime::Handle,
     ) -> Self {
         Self {
             surface,
-            client,
+            session,
             runtime,
         }
     }
@@ -125,7 +127,7 @@ impl ReplCompleter {
         arg: &str,
         partial: &str,
     ) -> Vec<String> {
-        let client = self.client.clone();
+        let client = self.session.client();
         let (prompt, arg, partial) = (prompt.to_string(), arg.to_string(), partial.to_string());
         self.runtime
             .block_on(async move {
@@ -150,7 +152,7 @@ impl ReplCompleter {
         var: &str,
         partial: &str,
     ) -> Vec<String> {
-        let client = self.client.clone();
+        let client = self.session.client();
         let (template, var, partial) = (
             uri_template.to_string(),
             var.to_string(),
@@ -490,7 +492,7 @@ impl Highlighter for ReplHighlighter {
 pub fn spawn_readline_thread(
     server_name: String,
     surface: Arc<RwLock<Surface>>,
-    client: Arc<McpClient>,
+    session: Arc<Session>,
     runtime: tokio::runtime::Handle,
     line_tx: tokio::sync::mpsc::Sender<String>,
     ack_rx: std::sync::mpsc::Receiver<()>,
@@ -505,7 +507,7 @@ pub fn spawn_readline_thread(
         run_interactive(
             server_name,
             surface,
-            client,
+            session,
             runtime,
             &line_tx,
             &ack_rx,
@@ -557,14 +559,14 @@ fn run_piped(line_tx: &tokio::sync::mpsc::Sender<String>, ack_rx: &std::sync::mp
 fn run_interactive(
     server_name: String,
     surface: Arc<RwLock<Surface>>,
-    client: Arc<McpClient>,
+    session: Arc<Session>,
     runtime: tokio::runtime::Handle,
     line_tx: &tokio::sync::mpsc::Sender<String>,
     ack_rx: &std::sync::mpsc::Receiver<()>,
     at_prompt: Arc<AtomicBool>,
     persist_history: bool,
 ) {
-    let completer = ReplCompleter::new(surface.clone(), client, runtime);
+    let completer = ReplCompleter::new(surface.clone(), session, runtime);
     let highlighter = ReplHighlighter::new(surface);
 
     let menu = ColumnarMenu::default().with_name(MENU_NAME);
