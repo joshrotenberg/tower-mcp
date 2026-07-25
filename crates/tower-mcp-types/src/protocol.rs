@@ -6519,4 +6519,27 @@ mod draft_2026_07_28_tests {
             json!({"progressToken": "p"})
         );
     }
+
+    #[test]
+    fn meta_survives_on_a_request_with_no_other_params() {
+        // Guard against the rmcp _meta-drop bug (rust-sdk#993): a params struct
+        // whose only populated field is `_meta` must round-trip `_meta` intact.
+        let params = ListToolsParams {
+            cursor: None,
+            meta: Some(RequestMeta {
+                protocol_version: Some(UPCOMING_PROTOCOL_VERSION.to_string()),
+                ..Default::default()
+            }),
+        };
+        let v = serde_json::to_value(&params).unwrap();
+        assert_eq!(
+            v["_meta"]["io.modelcontextprotocol/protocolVersion"],
+            json!(UPCOMING_PROTOCOL_VERSION)
+        );
+        let back: ListToolsParams = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            back.meta.unwrap().protocol_version.as_deref(),
+            Some(UPCOMING_PROTOCOL_VERSION)
+        );
+    }
 }
