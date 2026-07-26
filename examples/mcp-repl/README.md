@@ -131,6 +131,48 @@ Progress and log notifications print inline as they arrive, and
 dynamic servers (see the `dynamic_capabilities` example) grow and shrink the
 REPL's vocabulary live.
 
+## Wire tracing
+
+Half of any "is it the client, the server, or the network?" question is
+answered by the raw JSON-RPC frames. `--trace` prints every frame from the
+start; `wire on` / `wire off` toggles it mid-session.
+
+```text
+demo> wire on
+wire tracing on (frames print to stderr)
+demo> echo message=hi
+[wire ->] +4.512s
+{
+  "id": 6,
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "params": { "arguments": { "message": "hi" }, "name": "echo" }
+}
+[wire <-] +4.524s [12ms]
+{
+  "id": 6,
+  "jsonrpc": "2.0",
+  "result": { "content": [ { "text": "hi", "type": "text" } ] }
+}
+```
+
+Each frame carries its direction, a session-relative timestamp, and, on a
+response, the time its request was outstanding.
+
+`last` reprints the previous request and its response whether or not tracing
+was on: frames are always recorded, so the exchange you did not think to
+trace is still there. Under `--json` it prints a
+`{"request": ..., "response": ...}` object instead.
+
+Frames print to stderr, so `--json` output on stdout stays pipeable with
+tracing on.
+
+Secrets are masked before a frame is stored, so nothing unmasked reaches the
+trace or `last`: values under `authorization`, `token`, `apiKey`, `secret`,
+`password` and similar keys (separators and case ignored), and anything
+following `Bearer ` inside a string. The HTTP `Authorization` header itself
+never appears here, since it is not part of a JSON-RPC frame.
+
 ## Completion
 
 Tab opens a columnar menu. What gets completed:

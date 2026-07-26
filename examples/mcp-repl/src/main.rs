@@ -29,6 +29,7 @@ mod config;
 mod editor;
 mod elicit;
 mod style;
+mod wire;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,6 +50,7 @@ use tower_mcp::protocol::{
 
 use elicit::ReplClientHandler;
 use style::{json_pretty, paint, tag, task_status_style};
+use wire::{TracingTransport, wire};
 
 #[derive(Parser)]
 #[command(
@@ -117,6 +119,11 @@ struct Args {
     #[arg(long)]
     no_history: bool,
 
+    /// Print every JSON-RPC frame sent and received, to stderr. Equivalent to
+    /// starting with `wire on`; toggle it mid-session with `wire on|off`.
+    #[arg(long)]
+    trace: bool,
+
     /// Command (and arguments) of a stdio MCP server to spawn.
     command: Vec<String>,
 }
@@ -167,6 +174,8 @@ pub const BUILTINS: &[(&str, &str)] = &[
     ("cancel", "cancel a background task"),
     ("refresh", "re-fetch the server surface"),
     ("info", "replay the connection banner plus capabilities"),
+    ("wire", "toggle raw JSON-RPC frame tracing (on|off)"),
+    ("last", "reprint the previous request and response"),
     ("quit", "exit"),
     ("exit", "exit"),
 ];
@@ -288,7 +297,7 @@ fn print_banner(info: &tower_mcp::protocol::InitializeResult) {
 /// A dimmed `[142ms]` / `[1.23s]` annotation for how long a call took.
 /// Printed on its own trailing line after a request-issuing command, so a slow
 /// (or timing-out) call is visible without interleaving with streamed output.
-fn timing(elapsed: Duration) -> String {
+pub fn timing(elapsed: Duration) -> String {
     let body = if elapsed.as_millis() < 1000 {
         format!("[{}ms]", elapsed.as_millis())
     } else {
@@ -638,6 +647,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .init();
     let args = Args::parse();
     style::init(args.color);
+    wire::init(args.trace);
     JSON_OUTPUT.store(args.json, Ordering::Relaxed);
 
     // Server profiles are read up front: both --list-servers and profile
@@ -740,10 +750,16 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         );
     }
 
+    // Every transport is wrapped, whatever `--trace` says: the wrapper is what
+    // records the exchange `last` reprints, and tracing can be switched on
+    // mid-session with `wire on`.
     let builder = McpClient::builder().with_elicitation();
     let client = if args.demo {
         builder
-            .connect(ChannelTransport::new(demo_router()), handler)
+            .connect(
+                TracingTransport::new(ChannelTransport::new(demo_router())),
+                handler,
+            )
             .await?
     } else {
         match connection {
@@ -755,13 +771,18 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
                 let config =
                     build_http_config(args.bearer.clone(), &args.headers, bearer, &headers)?;
                 builder
-                    .connect(HttpClientTransport::with_config(url, config), handler)
+                    .connect(
+                        TracingTransport::new(HttpClientTransport::with_config(url, config)),
+                        handler,
+                    )
                     .await?
             }
             Some(config::Connection::Stdio { command }) => {
                 let cmd_args: Vec<&str> = command[1..].iter().map(|s| s.as_str()).collect();
                 let transport = StdioClientTransport::spawn(&command[0], &cmd_args).await?;
-                builder.connect(transport, handler).await?
+                builder
+                    .connect(TracingTransport::new(transport), handler)
+                    .await?
             }
             None => {
                 eprintln!(
@@ -883,6 +904,8 @@ async fn handle_line(
             println!("  <tool> [k=v...]                           call a tool (schema-coerced)");
             println!("  <tool> [k=v...] &                         run task-augmented (SEP-2663)");
             println!("  jobs | task <id> | wait <id> | cancel <id>  manage tasks");
+            println!("  wire [on|off]                             trace raw JSON-RPC frames");
+            println!("  last                                      reprint the previous exchange");
             println!("  refresh | info | quit");
             let s = surface.read().unwrap();
             if !s.tools.is_empty() {
@@ -1154,6 +1177,51 @@ async fn handle_line(
                 }
             }
         }
+        "wire" => match rest.first().copied() {
+            Some("on") => {
+                wire().set_trace(true);
+                println!("wire tracing on (frames print to stderr)");
+            }
+            Some("off") => {
+                wire().set_trace(false);
+                println!("wire tracing off");
+            }
+            None => println!(
+                "wire tracing is {}",
+                if wire().trace_enabled() { "on" } else { "off" }
+            ),
+            Some(other) => println!("usage: wire [on|off] (got `{other}`)"),
+        },
+        // Deliberately independent of the trace toggle: frames are recorded
+        // either way, so the exchange you did not think to trace is still there.
+        "last" => match wire().last_exchange() {
+            None => {
+                if json_output() {
+                    println!("{}", error_json("no exchange yet"));
+                } else {
+                    println!("no request has been sent yet");
+                }
+            }
+            Some((request, response)) => {
+                if json_output() {
+                    println!(
+                        "{}",
+                        json_pretty(&serde_json::json!({
+                            "request": request.json,
+                            "response": response.map(|r| r.json),
+                        }))
+                    );
+                } else {
+                    println!("{}", wire::render(wire::Direction::Sent, &request));
+                    match response {
+                        Some(response) => {
+                            println!("{}", wire::render(wire::Direction::Received, &response));
+                        }
+                        None => println!("(no response recorded for it)"),
+                    }
+                }
+            }
+        },
         "refresh" => {
             let fresh = fetch_surface(client).await;
             println!(

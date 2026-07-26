@@ -275,6 +275,13 @@ impl Completer for ReplCompleter {
             "read" => {
                 out.extend(self.complete_resource_word(&surface, word, span));
             }
+            "wire" => {
+                for state in ["on", "off"] {
+                    if state.starts_with(word) {
+                        out.push(word_suggestion(state, None, span));
+                    }
+                }
+            }
             "describe" => {
                 out.extend(Self::complete_describe_word(&surface, word, span));
             }
