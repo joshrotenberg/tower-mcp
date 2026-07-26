@@ -295,6 +295,8 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(1),
             inner: McpRequest::CallTool(CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "test_tool".to_string(),
                 arguments: serde_json::json!({}),
                 meta: None,
@@ -320,6 +322,8 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(1),
             inner: McpRequest::CallTool(CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "nonexistent".to_string(),
                 arguments: serde_json::json!({}),
                 meta: None,
@@ -396,6 +400,8 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(1),
             inner: McpRequest::CallTool(CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "add".to_string(),
                 arguments: serde_json::json!({}),
                 meta: None,
@@ -422,6 +428,8 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(1),
             inner: McpRequest::ReadResource(ReadResourceParams {
+                input_responses: None,
+                request_state: None,
                 uri: "file:///test".to_string(),
                 meta: None,
             }),

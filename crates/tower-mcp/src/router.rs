@@ -2966,6 +2966,8 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(1),
             inner: McpRequest::CallTool(CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "add".to_string(),
                 arguments: serde_json::json!({"a": 2, "b": 3}),
                 meta: None,
@@ -3365,6 +3367,8 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(1),
             inner: McpRequest::ReadResource(ReadResourceParams {
+                input_responses: None,
+                request_state: None,
                 uri: "db://users/123".to_string(),
                 meta: None,
             }),
@@ -3421,6 +3425,8 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(1),
             inner: McpRequest::ReadResource(ReadResourceParams {
+                input_responses: None,
+                request_state: None,
                 uri: "file:///README.md".to_string(),
                 meta: None,
             }),
@@ -3471,6 +3477,8 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(1),
             inner: McpRequest::ReadResource(ReadResourceParams {
+                input_responses: None,
+                request_state: None,
                 uri: "db://posts/123".to_string(),
                 meta: None,
             }),
@@ -3717,6 +3725,8 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(1),
             inner: McpRequest::CallTool(CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "add".to_string(),
                 arguments: serde_json::json!({"a": 5, "b": 10}),
                 meta: None,
@@ -3850,6 +3860,8 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(1),
             inner: McpRequest::CallTool(CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "add".to_string(),
                 arguments: serde_json::json!({"a": 2, "b": 3}),
                 meta: None,
@@ -3947,6 +3959,8 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(1),
             inner: McpRequest::CallTool(CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "add".to_string(),
                 arguments: serde_json::json!({"a": 7, "b": 8}),
                 meta: None,
@@ -4006,6 +4020,8 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(1),
             inner: McpRequest::CallTool(CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "slow".to_string(),
                 arguments: serde_json::json!({}),
                 meta: None,
@@ -4074,6 +4090,8 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(1),
             inner: McpRequest::CallTool(CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "add".to_string(),
                 arguments: serde_json::json!({"a": 1, "b": 2}),
                 meta: None,
@@ -4124,6 +4142,8 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(1),
             inner: McpRequest::CallTool(CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "sync_only".to_string(),
                 arguments: serde_json::json!({}),
                 meta: None,
@@ -4612,6 +4632,8 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(1),
             inner: McpRequest::CallTool(CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "admin".to_string(),
                 arguments: serde_json::json!({"a": 1, "b": 2}),
                 meta: None,
@@ -4653,6 +4675,8 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(1),
             inner: McpRequest::CallTool(CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "public".to_string(),
                 arguments: serde_json::json!({"a": 1, "b": 2}),
                 meta: None,
@@ -4692,6 +4716,8 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(1),
             inner: McpRequest::CallTool(CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "admin".to_string(),
                 arguments: serde_json::json!({"a": 1, "b": 2}),
                 meta: None,
@@ -4772,6 +4798,8 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(1),
             inner: McpRequest::ReadResource(ReadResourceParams {
+                input_responses: None,
+                request_state: None,
                 uri: "file:///secret.txt".to_string(),
                 meta: None,
             }),
@@ -4808,6 +4836,8 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(1),
             inner: McpRequest::ReadResource(ReadResourceParams {
+                input_responses: None,
+                request_state: None,
                 uri: "file:///public.txt".to_string(),
                 meta: None,
             }),
@@ -4845,6 +4875,8 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(1),
             inner: McpRequest::ReadResource(ReadResourceParams {
+                input_responses: None,
+                request_state: None,
                 uri: "file:///secret.txt".to_string(),
                 meta: None,
             }),
@@ -4924,6 +4956,8 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(1),
             inner: McpRequest::GetPrompt(GetPromptParams {
+                input_responses: None,
+                request_state: None,
                 name: "system_debug".to_string(),
                 arguments: HashMap::new(),
                 meta: None,
@@ -4962,6 +4996,8 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(1),
             inner: McpRequest::GetPrompt(GetPromptParams {
+                input_responses: None,
+                request_state: None,
                 name: "greeting".to_string(),
                 arguments: HashMap::new(),
                 meta: None,
@@ -5000,6 +5036,8 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(1),
             inner: McpRequest::GetPrompt(GetPromptParams {
+                input_responses: None,
+                request_state: None,
                 name: "system_debug".to_string(),
                 arguments: HashMap::new(),
                 meta: None,
@@ -5250,6 +5288,8 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(1),
             inner: McpRequest::CallTool(CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "api.echo".to_string(),
                 arguments: serde_json::json!({"value": "hello world"}),
                 meta: None,
@@ -6279,6 +6319,8 @@ mod tests {
             let req = RouterRequest {
                 id: RequestId::Number(2),
                 inner: McpRequest::CallTool(CallToolParams {
+                    input_responses: None,
+                    request_state: None,
                     name: "shared".to_string(),
                     arguments: serde_json::json!({"a": 1, "b": 2}),
                     meta: None,
@@ -6321,6 +6363,8 @@ mod tests {
             let req = RouterRequest {
                 id: RequestId::Number(1),
                 inner: McpRequest::CallTool(CallToolParams {
+                    input_responses: None,
+                    request_state: None,
                     name: "add".to_string(),
                     arguments: serde_json::json!({"a": 3, "b": 4}),
                     meta: None,
@@ -6445,6 +6489,8 @@ mod tests {
             let req = RouterRequest {
                 id: RequestId::Number(2),
                 inner: McpRequest::CallTool(CallToolParams {
+                    input_responses: None,
+                    request_state: None,
                     name: "hidden".to_string(),
                     arguments: serde_json::json!({"a": 1, "b": 2}),
                     meta: None,
@@ -6532,6 +6578,8 @@ mod tests {
             let req = RouterRequest {
                 id: RequestId::Number(1),
                 inner: McpRequest::CallTool(CallToolParams {
+                    input_responses: None,
+                    request_state: None,
                     name: "nonexistent".to_string(),
                     arguments: serde_json::json!({}),
                     meta: None,
@@ -6742,6 +6790,8 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(2),
             inner: McpRequest::CallTool(CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "dangerous".to_string(),
                 arguments: serde_json::json!({"a": 1, "b": 2}),
                 meta: None,
@@ -6770,6 +6820,8 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(3),
             inner: McpRequest::CallTool(CallToolParams {
+                input_responses: None,
+                request_state: None,
                 name: "flippy".to_string(),
                 arguments: serde_json::json!({"a": 1, "b": 2}),
                 meta: None,
@@ -6849,6 +6901,8 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(6),
             inner: McpRequest::ReadResource(ReadResourceParams {
+                input_responses: None,
+                request_state: None,
                 uri: "file:///hidden.txt".to_string(),
                 meta: None,
             }),
@@ -6876,6 +6930,8 @@ mod tests {
         let req = RouterRequest {
             id: RequestId::Number(8),
             inner: McpRequest::GetPrompt(GetPromptParams {
+                input_responses: None,
+                request_state: None,
                 name: "hidden_prompt".to_string(),
                 arguments: Default::default(),
                 meta: None,

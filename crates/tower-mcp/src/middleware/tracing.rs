@@ -318,6 +318,8 @@ mod tests {
 
         // Test tool call
         let req = McpRequest::CallTool(CallToolParams {
+            input_responses: None,
+            request_state: None,
             name: "my_tool".to_string(),
             arguments: Value::Null,
             meta: None,
@@ -329,6 +331,8 @@ mod tests {
 
         // Test resource read
         let req = McpRequest::ReadResource(ReadResourceParams {
+            input_responses: None,
+            request_state: None,
             uri: "file:///test.txt".to_string(),
             meta: None,
         });
@@ -338,6 +342,8 @@ mod tests {
 
         // Test prompt get
         let req = McpRequest::GetPrompt(GetPromptParams {
+            input_responses: None,
+            request_state: None,
             name: "my_prompt".to_string(),
             arguments: HashMap::new(),
             meta: None,

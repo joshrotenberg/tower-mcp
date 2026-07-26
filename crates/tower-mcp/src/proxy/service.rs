@@ -644,6 +644,8 @@ async fn handle_call_tool(
     let inner_request = McpRequest::CallTool(CallToolParams {
         name: stripped_name,
         arguments: params.arguments,
+        input_responses: params.input_responses,
+        request_state: params.request_state,
         meta: params.meta,
         task: params.task,
     });
@@ -711,6 +713,8 @@ async fn handle_read_resource(
 ) -> Result<McpResponse, JsonRpcError> {
     let inner_request = McpRequest::ReadResource(ReadResourceParams {
         uri: stripped_uri,
+        input_responses: params.input_responses,
+        request_state: params.request_state,
         meta: params.meta,
     });
 
@@ -753,6 +757,8 @@ async fn handle_get_prompt(
     let inner_request = McpRequest::GetPrompt(GetPromptParams {
         name: stripped_name,
         arguments: params.arguments,
+        input_responses: params.input_responses,
+        request_state: params.request_state,
         meta: params.meta,
     });
 

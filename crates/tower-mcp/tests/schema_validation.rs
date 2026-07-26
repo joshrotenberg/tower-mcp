@@ -236,6 +236,8 @@ fn validate_list_resource_templates_result() {
 #[test]
 fn validate_call_tool_request_params() {
     let params = CallToolParams {
+        input_responses: None,
+        request_state: None,
         name: "test-tool".to_string(),
         arguments: json!({"key": "value"}),
         meta: None,
@@ -273,6 +275,8 @@ fn validate_initialize_request_params() {
 #[test]
 fn validate_get_prompt_request_params() {
     let params = GetPromptParams {
+        input_responses: None,
+        request_state: None,
         name: "greeting".to_string(),
         arguments: std::collections::HashMap::from([("name".to_string(), "world".to_string())]),
         meta: None,
@@ -283,6 +287,8 @@ fn validate_get_prompt_request_params() {
 #[test]
 fn validate_read_resource_request_params() {
     let params = ReadResourceParams {
+        input_responses: None,
+        request_state: None,
         uri: "file:///test.txt".to_string(),
         meta: None,
     };

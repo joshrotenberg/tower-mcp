@@ -53,8 +53,50 @@ mcp-repl --http https://internal.example/mcp --bearer "$TOKEN"
 mcp-repl --http https://internal.example/mcp --header "X-Api-Key: abc"
 ```
 
-`--bearer` and `--header` apply only to `--http`; they are ignored (with a
-warning) for the demo and stdio-child transports.
+`--bearer` and `--header` apply only to HTTP connections; they are ignored
+(with a warning) for the demo and stdio-child transports.
+
+## Profiles
+
+A config file names servers so a connection is `mcp-repl <name>` instead of a
+URL plus repeated auth flags, and tokens stay out of shell history. The file
+lives at `$XDG_CONFIG_HOME/mcp-repl/config.toml`, falling back to
+`~/.config/mcp-repl/config.toml`; `--config <path>` reads a different one.
+
+```toml
+[servers.cratesio]
+transport = "http"                 # http | stdio
+url = "https://cratesio-mcp.fly.dev/"
+bearer_env = "CRATESIO_TOKEN"      # read the token from the environment
+headers = { "X-Api-Key" = "abc" }
+
+[servers.local]
+transport = "stdio"
+command = ["cargo", "run", "--example", "getting_started"]
+```
+
+```bash
+mcp-repl --list-servers            # the configured profiles
+mcp-repl --server cratesio         # connect by name
+mcp-repl cratesio                  # a bare name works too
+```
+
+- `transport` is optional: a profile with a `url` is HTTP, one with a
+  `command` is stdio. A profile with both must say which.
+- Explicit flags override profile fields. `--http <url>` retargets the URL
+  while keeping the profile's auth; `--bearer` replaces the profile's token;
+  each `--header` overrides the profile header of the same name.
+- The bare-name form only resolves when the single positional matches a
+  configured profile, so spawning a stdio server by bare name still works.
+  Because everything after the first positional belongs to the spawned
+  command, use `--server <name>` when other flags follow.
+- Secrets: `bearer_env` names an environment variable holding the token. An
+  unset variable is an error rather than a silent anonymous connection. An
+  inline `bearer = "..."` works but warns, since it puts the token in the
+  file.
+- An unknown profile name errors with the list of known names, and a missing
+  `--config` file is an error. A missing file at the default location is not:
+  profiles are opt-in.
 
 ### Reconnecting
 
@@ -111,6 +153,48 @@ Progress and log notifications print inline as they arrive, and
 `list_changed` notifications refresh the command table mid-session, so
 dynamic servers (see the `dynamic_capabilities` example) grow and shrink the
 REPL's vocabulary live.
+
+## Wire tracing
+
+Half of any "is it the client, the server, or the network?" question is
+answered by the raw JSON-RPC frames. `--trace` prints every frame from the
+start; `wire on` / `wire off` toggles it mid-session.
+
+```text
+demo> wire on
+wire tracing on (frames print to stderr)
+demo> echo message=hi
+[wire ->] +4.512s
+{
+  "id": 6,
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "params": { "arguments": { "message": "hi" }, "name": "echo" }
+}
+[wire <-] +4.524s [12ms]
+{
+  "id": 6,
+  "jsonrpc": "2.0",
+  "result": { "content": [ { "text": "hi", "type": "text" } ] }
+}
+```
+
+Each frame carries its direction, a session-relative timestamp, and, on a
+response, the time its request was outstanding.
+
+`last` reprints the previous request and its response whether or not tracing
+was on: frames are always recorded, so the exchange you did not think to
+trace is still there. Under `--json` it prints a
+`{"request": ..., "response": ...}` object instead.
+
+Frames print to stderr, so `--json` output on stdout stays pipeable with
+tracing on.
+
+Secrets are masked before a frame is stored, so nothing unmasked reaches the
+trace or `last`: values under `authorization`, `token`, `apiKey`, `secret`,
+`password` and similar keys (separators and case ignored), and anything
+following `Bearer ` inside a string. The HTTP `Authorization` header itself
+never appears here, since it is not part of a JSON-RPC frame.
 
 ## Completion
 

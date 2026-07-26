@@ -387,6 +387,8 @@ impl McpClient {
         let params = CallToolParams {
             name: name.to_string(),
             arguments,
+            input_responses: None,
+            request_state: None,
             meta: None,
             task: None,
         };
@@ -416,6 +418,8 @@ impl McpClient {
         let params = CallToolParams {
             name: name.to_string(),
             arguments,
+            input_responses: None,
+            request_state: None,
             meta: None,
             task: Some(TaskRequestParams { ttl: ttl_ms }),
         };
@@ -490,6 +494,8 @@ impl McpClient {
         self.ensure_initialized()?;
         let params = ReadResourceParams {
             uri: uri.to_string(),
+            input_responses: None,
+            request_state: None,
             meta: None,
         };
         self.send_request("resources/read", &params).await
@@ -649,6 +655,8 @@ impl McpClient {
         let params = GetPromptParams {
             name: name.to_string(),
             arguments: arguments.unwrap_or_default(),
+            input_responses: None,
+            request_state: None,
             meta: None,
         };
         self.send_request("prompts/get", &params).await
