@@ -28,6 +28,7 @@
 mod config;
 mod editor;
 mod elicit;
+mod find;
 mod style;
 mod wire;
 
@@ -164,6 +165,7 @@ pub const BUILTINS: &[(&str, &str)] = &[
     ("prompts", "list prompts"),
     ("resources", "list resources"),
     ("templates", "list resource templates"),
+    ("find", "search the surface by keyword"),
     ("describe", "show schemas and metadata for a name"),
     ("read", "read a resource"),
     ("prompt", "get a prompt"),
@@ -330,6 +332,53 @@ fn print_tool_overview(surface: &Surface) {
             )
         );
     }
+}
+
+/// The `find` built-in's output: matches grouped by kind under the heading
+/// of the list command that shows the same entries, best match first within
+/// each group.
+fn print_find(surface: &Surface, query: &str) {
+    let hits = find::search(surface, query);
+    if json_output() {
+        let v: Vec<serde_json::Value> = hits
+            .iter()
+            .map(|h| {
+                serde_json::json!({
+                    "kind": h.kind.heading(),
+                    "name": h.name,
+                    "description": h.description,
+                    "score": h.score,
+                })
+            })
+            .collect();
+        println!("{}", json_pretty(&serde_json::Value::Array(v)));
+        return;
+    }
+    if hits.is_empty() {
+        // grep's convention: a search that matched nothing exits non-zero, so
+        // `mcp-repl -e "find x"` can be tested in a script.
+        note_error();
+        println!("no match for {}", paint(Style::new().fg(Color::Red), query));
+        return;
+    }
+    let total = hits.len();
+    for (kind, group) in find::grouped(hits) {
+        println!("{}:", paint(Style::new().bold(), kind.heading()));
+        for hit in group {
+            println!(
+                "  {:24} {}",
+                paint(Style::new().fg(Color::Green), &hit.name),
+                hit.description
+            );
+        }
+    }
+    println!(
+        "{}",
+        paint(
+            Style::new().dimmed(),
+            &format!("{total} match{}", if total == 1 { "" } else { "es" })
+        )
+    );
 }
 
 /// The one-line surface summary.
@@ -897,6 +946,7 @@ async fn handle_line(
         "help" => {
             println!("built-ins:");
             println!("  tools | prompts | resources | templates   list the server surface");
+            println!("  find <keyword>                            search the surface");
             println!("  describe <name>                           schemas and metadata");
             println!("  read <uri>                                read a resource");
             println!("  prompt <name> [k=v...]                    get a prompt");
@@ -1008,6 +1058,16 @@ async fn handle_line(
                     }
                 }
             }
+        }
+        "find" => {
+            // Everything after the command word is the query, so a phrase
+            // (`find crate info`) is not silently truncated to its first word.
+            let query = rest.join(" ");
+            if query.is_empty() {
+                println!("usage: find <keyword>");
+                return false;
+            }
+            print_find(&surface.read().unwrap(), &query);
         }
         "describe" => {
             let Some(name) = rest.first() else {
@@ -1253,13 +1313,29 @@ async fn handle_line(
             };
             let Some(schema) = schema else {
                 note_error();
+                let suggestion = find::did_you_mean(&surface.read().unwrap(), tool_name);
                 if json_output() {
-                    println!("{}", error_json(&format!("unknown command: {tool_name}")));
+                    match &suggestion {
+                        Some(near) => println!(
+                            "{}",
+                            serde_json::json!({
+                                "error": format!("unknown command: {tool_name}"),
+                                "didYouMean": near,
+                            })
+                        ),
+                        None => {
+                            println!("{}", error_json(&format!("unknown command: {tool_name}")))
+                        }
+                    }
                 } else {
-                    println!(
-                        "unknown command: {} (try `help`)",
-                        paint(Style::new().fg(Color::Red), tool_name)
-                    );
+                    let name = paint(Style::new().fg(Color::Red), tool_name);
+                    match suggestion {
+                        Some(near) => println!(
+                            "unknown command: {name}; did you mean `{}`?",
+                            paint(Style::new().fg(Color::Green), &near)
+                        ),
+                        None => println!("unknown command: {name} (try `help`)"),
+                    }
                 }
                 return false;
             };
@@ -1546,6 +1622,13 @@ mod tests {
     fn timing_formats_sub_second_and_seconds() {
         assert!(timing(Duration::from_millis(142)).contains("[142ms]"));
         assert!(timing(Duration::from_millis(2500)).contains("[2.50s]"));
+    }
+
+    // Completion and highlighting both read BUILTINS, so membership is what
+    // makes `find` completable rather than any code in the editor.
+    #[test]
+    fn find_is_a_completable_builtin() {
+        assert!(BUILTINS.iter().any(|(name, _)| *name == "find"));
     }
 
     #[test]

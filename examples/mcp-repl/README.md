@@ -104,6 +104,7 @@ mcp-repl cratesio                  # a bare name works too
 getting-started> help                      # built-ins plus the server's tools
 getting-started> add a=2 b=3               # tools are commands; args coerced by inputSchema
 getting-started> echo message="hi there"   # tab-completes argument names
+getting-started> find note                 # keyword search across the surface
 getting-started> describe add              # input/output schemas, colored
 getting-started> read source://getting_started.rs
 getting-started> prompt greet name=World   # prompt args tab-complete via completion/complete
@@ -188,6 +189,41 @@ Tab opens a columnar menu. What gets completed:
 - `prompt <name> <arg>=`: argument values via `completion/complete`, and
   argument names from the prompt definition.
 - `describe <name>`: everything on the surface, labeled by kind.
+
+## find
+
+A server with dozens of tools is not navigable by listing it. `find
+<keyword>` searches names and descriptions across tools, prompts, resources,
+and templates, grouped by kind:
+
+```text
+cratesio> find download
+tools:
+  get_downloads            Get download statistics
+  get_version_downloads    Daily download stats for a specific version
+2 matches
+```
+
+Matching is case-insensitive. Results rank an exact name match first, then a
+name prefix, then a name substring, then a description match, and last a
+subsequence (`gvd` reaches `get_version_downloads`) so a loose match never
+buries a literal one. The search runs against the cached surface, so it
+issues no request.
+
+Under `--json` it prints an array of `{kind, name, description, score}`
+objects. A search that matched nothing exits non-zero, following grep.
+
+A mistyped command word gets the nearest built-in, tool, or prompt name by
+edit distance:
+
+```text
+cratesio> serch_crates query=serde
+unknown command: serch_crates; did you mean `search_crates`?
+```
+
+The tolerance scales with the length of what you typed, so a short word does
+not collect a suggestion from across the surface. When nothing is close
+enough, the message points at `help` as before.
 
 ## describe
 
