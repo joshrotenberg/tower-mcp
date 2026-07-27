@@ -17,14 +17,15 @@ use nu_ansi_term::{Color, Style};
 use tower_mcp::client::{ClientHandler, NotificationHandler, ServerNotification};
 use tower_mcp::error::JsonRpcError;
 use tower_mcp::protocol::{
-    ElicitAction, ElicitFieldValue, ElicitFormParams, ElicitRequestParams, ElicitResult,
-    PrimitiveSchemaDefinition,
+    CreateMessageParams, CreateMessageResult, ElicitAction, ElicitFieldValue, ElicitFormParams,
+    ElicitRequestParams, ElicitResult, PrimitiveSchemaDefinition,
 };
 
+use crate::sampling::{self, SamplingMode};
 use crate::style::{paint, tag};
 
-/// Client handler that layers terminal elicitation on top of the
-/// notification callbacks.
+/// Client handler that layers terminal elicitation and sampling on top of
+/// the notification callbacks.
 pub struct ReplClientHandler {
     notifications: NotificationHandler,
     at_prompt: Arc<AtomicBool>,
@@ -41,6 +42,41 @@ impl ReplClientHandler {
 
 #[async_trait]
 impl ClientHandler for ReplClientHandler {
+    async fn handle_create_message(
+        &self,
+        params: CreateMessageParams,
+    ) -> Result<CreateMessageResult, JsonRpcError> {
+        match sampling::mode() {
+            SamplingMode::Decline => Err(sampling::declined("--sampling decline")),
+            SamplingMode::Canned => {
+                println!(
+                    "{} answered with the canned reply",
+                    tag(Style::new().fg(Color::Purple), "sampling")
+                );
+                Ok(sampling::canned(&params))
+            }
+            SamplingMode::Prompt => {
+                if self.at_prompt.load(Ordering::SeqCst) {
+                    // Same constraint as a form elicitation: the editor holds
+                    // the terminal in raw mode and a second stdin reader
+                    // would corrupt it.
+                    println!(
+                        "\n{} declined a completion request from the server (arrived while at \
+                         the prompt; run the tool in the foreground to answer it)",
+                        tag(Style::new().fg(Color::Purple), "sampling"),
+                    );
+                    return Err(sampling::declined(
+                        "arrived while the editor held the terminal",
+                    ));
+                }
+                // Blocking stdin reads must leave the async runtime.
+                tokio::task::spawn_blocking(move || sampling::prompt(&params))
+                    .await
+                    .map_err(|e| JsonRpcError::internal_error(e.to_string()))?
+            }
+        }
+    }
+
     async fn handle_elicit(
         &self,
         params: ElicitRequestParams,

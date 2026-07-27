@@ -15,7 +15,14 @@
 //! [servers.local]
 //! transport = "stdio"
 //! command = ["cargo", "run", "--example", "getting_started"]
+//!
+//! [aliases]
+//! t = "tools"
 //! ```
+//!
+//! Command aliases live in the same file: `[aliases]` for every server, and
+//! `[servers.<name>.aliases]` for one profile. See [`crate::alias`], which
+//! also writes them back.
 //!
 //! Tokens are read from the environment via `bearer_env` rather than stored in
 //! the file; an inline `bearer` literal works but warns.
@@ -25,12 +32,16 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-/// The whole config file: named profiles under `[servers.<name>]`.
+/// The whole config file: named profiles under `[servers.<name>]`, plus the
+/// command aliases every server sees under `[aliases]`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub servers: BTreeMap<String, Profile>,
+    /// Command aliases in effect against every server. See [`crate::alias`].
+    #[serde(default)]
+    pub aliases: BTreeMap<String, String>,
 }
 
 /// One `[servers.<name>]` table.
@@ -51,6 +62,10 @@ pub struct Profile {
     /// The command (and arguments) of a `stdio` profile's child process.
     #[serde(default)]
     pub command: Vec<String>,
+    /// Command aliases in effect only through this profile. They shadow the
+    /// file-level `[aliases]` of the same name.
+    #[serde(default)]
+    pub aliases: BTreeMap<String, String>,
 }
 
 /// The transports a profile can name. `ws` and stateless HTTP are not
@@ -361,6 +376,34 @@ command = ["cargo", "run", "--example", "getting_started"]
         let err =
             Config::parse("[servers.x]\ntransport = \"ws\"\nurl = \"wss://example\"").unwrap_err();
         assert!(err.contains("ws"), "{err}");
+    }
+
+    #[test]
+    fn aliases_parse_at_both_scopes() {
+        let config = Config::parse(
+            r#"
+[aliases]
+t = "tools"
+
+[servers.cratesio]
+url = "https://cratesio-mcp.fly.dev/"
+aliases = { dl = "get_downloads crate" }
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.aliases.get("t").map(String::as_str), Some("tools"));
+        assert_eq!(
+            config.servers["cratesio"]
+                .aliases
+                .get("dl")
+                .map(String::as_str),
+            Some("get_downloads crate")
+        );
+    }
+
+    #[test]
+    fn a_config_without_aliases_parses_to_none_of_them() {
+        assert!(Config::parse(SAMPLE).unwrap().aliases.is_empty());
     }
 
     #[test]

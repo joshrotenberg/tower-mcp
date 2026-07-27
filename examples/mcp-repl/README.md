@@ -121,6 +121,54 @@ Pass `--no-reconnect` to turn this off and see session-loss errors as they
 arrive. stdio children and `--demo` are never reconnected: there, a lost
 session means the server process itself is gone.
 
+## Aliases
+
+Frequent commands get short names, kept in the same config file as the
+profiles:
+
+```text
+cratesio> alias dl=get_downloads
+dl = get_downloads  (profile cratesio)
+cratesio> dl crate=serde
+...
+cratesio> alias
+dl  get_downloads  (profile cratesio)
+t   tools          (global)
+cratesio> unalias dl
+removed dl (profile cratesio)
+```
+
+- `alias` lists what is in effect, `alias <name>` shows one, `alias
+  <name>=<expansion>` defines, and `unalias <name>` removes.
+- Expansion is a literal substitution of the first word with whatever
+  followed the alias appended: with `dl = "get_downloads"`, `dl crate=serde`
+  runs `get_downloads crate=serde`. An expansion that itself starts with an
+  alias expands again; a cycle is reported rather than looped.
+- An expansion can end in `&`, so an alias can run its tool task-augmented.
+- Scope: an alias defined while connected through a profile belongs to that
+  profile; otherwise it is global. `alias --global <name>=<expansion>` forces
+  the file-level table. A profile alias shadows a global one of the same
+  name, and `unalias` removes the definition that is actually in effect
+  (`--global` reaches past a profile alias to the global one).
+- Aliases cannot be named after a built-in, since expansion happens before
+  dispatch and the built-in would become unreachable. An alias that shadows a
+  *tool* is allowed, and says so when defined.
+- Every change is written back to the config file through `toml_edit`, so
+  comments, key order, and formatting elsewhere in the file survive. Removing
+  the last alias leaves the (now empty) table, because a comment above
+  `[aliases]` belongs to that table and would go with it.
+
+```toml
+[aliases]                       # every server
+t = "tools"
+
+[servers.cratesio.aliases]      # only through this profile
+dl = "get_downloads"
+```
+
+With no config file location at all (no `$HOME`, no `--config`), aliases
+still work for the session and the REPL says they were not saved.
+
 ## What to try
 
 ```text
@@ -200,7 +248,8 @@ never appears here, since it is not part of a JSON-RPC frame.
 
 Tab opens a columnar menu. What gets completed:
 
-- The command word: built-ins plus every tool, each with its description.
+- The command word: built-ins, aliases (shown with what they expand to), and
+  every tool, each with its description.
 - Tool argument names from the tool's `inputSchema` properties (with type,
   required flag, and description), and enum values after `key=` when the
   property declares an `enum`.
@@ -211,6 +260,7 @@ Tab opens a columnar menu. What gets completed:
 - `prompt <name> <arg>=`: argument values via `completion/complete`, and
   argument names from the prompt definition.
 - `describe <name>`: everything on the surface, labeled by kind.
+- `unalias <name>`: the aliases in effect, with their scope.
 
 ## describe
 
