@@ -285,8 +285,16 @@ impl Completer for ReplCompleter {
         }
 
         match first {
-            "read" => {
+            "read" | "subscribe" => {
                 out.extend(self.complete_resource_word(&surface, word, span));
+            }
+            // Only what is actually subscribed can be unsubscribed.
+            "unsubscribe" => {
+                for uri in crate::subscribe::list() {
+                    if uri.starts_with(word) {
+                        out.push(word_suggestion(uri, None, span));
+                    }
+                }
             }
             "wire" => {
                 for state in ["on", "off"] {
