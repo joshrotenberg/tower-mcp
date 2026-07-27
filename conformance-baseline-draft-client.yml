@@ -1,0 +1,79 @@
+# MCP Conformance Suite -- Expected Failures Baseline (client, 2026-07-28 draft)
+#
+# Applies to the 0.2.0-alpha.x draft suite run with
+# `client --spec-version 2026-07-28 --suite all`. Each entry is a scenario
+# expected to fail (or carry SHOULD-level warnings, which the baseline checker
+# counts the same) while the client parity work in #953 is open. Remove entries
+# as the gaps close; CI fails when a baselined scenario starts passing (stale
+# entry) or a non-baselined scenario fails.
+#
+# Status at 0.2.0-alpha.9 (2026-07-27): 171/213 checks pass; 3/32 scenarios
+# fully green (auth/pre-registration, auth/resource-mismatch,
+# json-schema-ref-no-deref), 29 baselined.
+#
+# Format (0.2.x suite): plain scenario-name strings under the `client:` key;
+# reasons live in these comments.
+
+client:
+  # SEP-2575: the client does not send `MCP-Protocol-Version` on the
+  # initialize POST (it only sets the header once initialize has returned a
+  # version), and does not populate the required per-request `_meta` fields.
+  # The draft harness answers a header-less POST with HTTP 400 / -32020, so
+  # every scenario that gets past auth and then makes an MCP call stops there.
+  # This one gap accounts for most of the entries below. Client work in #953.
+  - request-metadata
+  - tools_call
+
+  # SEP-2322 MRTR is not implemented client-side (#950 for the protocol work,
+  # #953 for the client surface): no request-state echo, no input-required
+  # result handling.
+  - sep-2322-client-request-state
+
+  # SEP-2243 custom/standard HTTP headers, client half (#952 server side,
+  # #953 client side): no `Mcp-Method` header on outgoing POSTs, no mirroring
+  # of x-mcp-header-annotated tool arguments into `Mcp-Param-*` headers, and no
+  # schema-aware exclusion of tools carrying invalid header annotations.
+  - http-standard-headers
+  - http-custom-headers
+  - http-invalid-tool-headers
+
+  # SEP-837: Dynamic Client Registration omits `application_type`. One missing
+  # field, but it is a MUST, so it fails every scenario that registers.
+  - auth/metadata-default
+  - auth/metadata-var1
+  - auth/metadata-var2
+  - auth/metadata-var3
+  - auth/basic-cimd
+  - auth/scope-from-www-authenticate
+  - auth/scope-from-scopes-supported
+  - auth/scope-omitted-when-undefined
+  - auth/scope-retry-limit
+  - auth/token-endpoint-auth-basic
+  - auth/token-endpoint-auth-post
+  - auth/token-endpoint-auth-none
+
+  # SEP-2468 `iss` handling in the authorization response is not implemented:
+  # no comparison against the recorded issuer, no rejection on mismatch or on
+  # a missing iss when the server advertised support, and no validation of the
+  # metadata document's issuer against the well-known URL.
+  - auth/iss-supported
+  - auth/iss-supported-missing
+  - auth/iss-not-advertised
+  - auth/iss-unexpected
+  - auth/iss-wrong-issuer
+  - auth/iss-normalized
+  - auth/metadata-issuer-mismatch
+
+  # SEP-2350 scope escalation: the client does not re-authorize with the
+  # union of old and new scopes after a step-up challenge. Also carries the
+  # SEP-837 failure above and a SHOULD-level warning about using the
+  # WWW-Authenticate scope on the initial request.
+  - auth/scope-step-up
+
+  # SEP-2352: no re-registration when PRM `authorization_servers` changes.
+  - auth/authorization-server-migration
+
+  # SEP-2207 offline_access: the harness cannot observe the scope decision
+  # because the client does not complete these flows.
+  - auth/offline-access-scope
+  - auth/offline-access-not-supported

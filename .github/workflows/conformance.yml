@@ -324,3 +324,68 @@ jobs:
       - name: Show server logs on failure
         if: failure()
         run: cat /tmp/conformance-server-draft.log
+
+  draft-client-conformance:
+    name: Official 2026-07-28 Draft Client Suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Build conformance client
+        run: cargo build --manifest-path examples/conformance-client/Cargo.toml
+
+      - name: Run official 2026-07-28 draft client suite
+        run: |
+          # The client half of the draft suite (#1027): the other three jobs
+          # cover stable client, stable server and draft server, so this was
+          # the least-visible coverage gap. Known gaps are inventoried in
+          # conformance-baseline-draft-client.yml, grouped by SEP and tracked
+          # in #953; the job fails on unexpected failures OR on stale baseline
+          # entries that started passing.
+          #
+          # pipefail so the tee below cannot mask the tool's exit code (the
+          # Actions default bash already sets it; stated here because the
+          # gating depends on it).
+          set -o pipefail
+          npx @modelcontextprotocol/conformance@0.2.0-alpha.9 client \
+            --suite all \
+            --spec-version 2026-07-28 \
+            --command "cargo run --manifest-path examples/conformance-client/Cargo.toml --" \
+            --expected-failures ./conformance-baseline-draft-client.yml \
+            | tee /tmp/conformance-draft-client.log
+
+      - name: Publish suite summary
+        if: always()
+        run: |
+          # The baselined exit code answers "did anything regress"; the
+          # absolute counts answer "how far along is the client". Both come
+          # from the single run above, so this step only reformats its output.
+          log=/tmp/conformance-draft-client.log
+          if [ ! -s "$log" ]; then
+            echo "No suite output to summarize." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          sed 's/\x1b\[[0-9;]*m//g' "$log" > /tmp/conformance-draft-client-clean.log
+          clean=/tmp/conformance-draft-client-clean.log
+          {
+            echo '## Official 2026-07-28 draft client suite'
+            echo
+            if grep -q '^Total:' "$clean"; then
+              echo "Unbaselined: $(grep -m1 '^Total:' "$clean" | sed 's/^Total: //')"
+            else
+              echo 'Suite did not reach a summary; see the job log.'
+            fi
+            echo
+            echo '<details><summary>Per-scenario results and baseline verdict</summary>'
+            echo
+            echo '```text'
+            sed -n '/=== SUITE SUMMARY ===/,$p' "$clean"
+            echo '```'
+            echo
+            echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"
