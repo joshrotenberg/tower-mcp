@@ -4,3 +4,8 @@
 *.swo
 .tmp/
 CLAUDE.md
+
+# cargo-llvm-cov report output (see the Coverage job in ci.yml)
+/lcov.info
+/coverage-summary.json
+/coverage.txt

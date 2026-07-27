@@ -129,6 +129,58 @@ jobs:
         env:
           RUSTDOCFLAGS: -Dwarnings
 
+  # Line, region and function coverage. Branch coverage is deliberately
+  # absent: `cargo llvm-cov --branch` needs nightly, and on this workspace
+  # the nightly llvm-cov crashes (SIGSEGV) generating any report format
+  # from branch-instrumented data. Revisit when that stabilises.
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Run tests with coverage instrumentation
+        run: cargo llvm-cov --workspace --all-features --no-report
+      - name: Generate reports
+        run: |
+          cargo llvm-cov report --lcov --output-path lcov.info
+          cargo llvm-cov report --json --summary-only --output-path coverage-summary.json
+          cargo llvm-cov report > coverage.txt
+      - name: Write job summary
+        run: |
+          jq -r '
+            .data[0].totals
+            | "| Metric | Covered | Total | Percent |",
+              "| --- | ---: | ---: | ---: |",
+              "| Lines | \(.lines.covered) | \(.lines.count) | \(.lines.percent * 100 | round / 100)% |",
+              "| Regions | \(.regions.covered) | \(.regions.count) | \(.regions.percent * 100 | round / 100)% |",
+              "| Functions | \(.functions.covered) | \(.functions.count) | \(.functions.percent * 100 | round / 100)% |"
+          ' coverage-summary.json >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo ""
+            echo "No threshold is enforced. \`lcov.info\` is attached to the run"
+            echo "as the \`coverage\` artifact."
+            echo ""
+            echo "<details><summary>Per-file coverage</summary>"
+            echo ""
+            echo '```'
+            cat coverage.txt
+            echo '```'
+            echo ""
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: |
+            lcov.info
+            coverage-summary.json
+            coverage.txt
+
   examples:
     name: Examples
     runs-on: ubuntu-latest
