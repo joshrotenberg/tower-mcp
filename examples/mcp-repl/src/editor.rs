@@ -23,6 +23,7 @@ use reedline::{
 
 use tower_mcp::client::McpClient;
 
+use crate::alias::Aliases;
 use crate::style;
 use crate::{BUILTINS, Surface};
 
@@ -74,6 +75,7 @@ impl Prompt for ReplPrompt {
 
 pub struct ReplCompleter {
     surface: Arc<RwLock<Surface>>,
+    aliases: Arc<RwLock<Aliases>>,
     client: Arc<McpClient>,
     runtime: tokio::runtime::Handle,
 }
@@ -105,11 +107,13 @@ fn word_suggestion(
 impl ReplCompleter {
     pub fn new(
         surface: Arc<RwLock<Surface>>,
+        aliases: Arc<RwLock<Aliases>>,
         client: Arc<McpClient>,
         runtime: tokio::runtime::Handle,
     ) -> Self {
         Self {
             surface,
+            aliases,
             client,
             runtime,
         }
@@ -257,10 +261,19 @@ impl Completer for ReplCompleter {
         let completing_first = word_start == 0;
 
         if completing_first {
-            // First word: built-ins plus every tool name.
+            // First word: built-ins, every alias, and every tool name.
             for (name, desc) in BUILTINS {
                 if name.starts_with(word) {
                     out.push(word_suggestion(*name, Some(desc.to_string()), span));
+                }
+            }
+            for entry in self.aliases.read().unwrap().entries() {
+                if entry.name.starts_with(word) {
+                    out.push(word_suggestion(
+                        entry.name,
+                        Some(format!("alias for `{}`", entry.expansion)),
+                        span,
+                    ));
                 }
             }
             for t in &surface.tools {
@@ -284,6 +297,17 @@ impl Completer for ReplCompleter {
             }
             "describe" => {
                 out.extend(Self::complete_describe_word(&surface, word, span));
+            }
+            "unalias" => {
+                for entry in self.aliases.read().unwrap().entries() {
+                    if entry.name.starts_with(word) {
+                        out.push(word_suggestion(
+                            entry.name,
+                            Some(format!("{} ({})", entry.expansion, entry.scope.label())),
+                            span,
+                        ));
+                    }
+                }
             }
             "prompt" => {
                 let words = head.split_whitespace().count();
@@ -396,15 +420,22 @@ impl Completer for ReplCompleter {
 /// and JSON-literal values get the same palette as output rendering.
 pub struct ReplHighlighter {
     surface: Arc<RwLock<Surface>>,
+    aliases: Arc<RwLock<Aliases>>,
 }
 
 impl ReplHighlighter {
-    pub fn new(surface: Arc<RwLock<Surface>>) -> Self {
-        Self { surface }
+    pub fn new(surface: Arc<RwLock<Surface>>, aliases: Arc<RwLock<Aliases>>) -> Self {
+        Self { surface, aliases }
     }
 
     fn command_style(&self, word: &str) -> Style {
         if BUILTINS.iter().any(|(name, _)| *name == word) {
+            return Style::new().fg(Color::Cyan).bold();
+        }
+        // An alias resolves to a command, so it reads as one: same style as a
+        // built-in, since that is what it behaves like at the prompt.
+        let aliases = self.aliases.read().unwrap();
+        if aliases.lookup(word).is_some() {
             return Style::new().fg(Color::Cyan).bold();
         }
         let surface = self.surface.read().unwrap();
@@ -413,6 +444,7 @@ impl ReplHighlighter {
         }
         // Prefix of something completable: neutral while typing.
         let is_prefix = BUILTINS.iter().any(|(name, _)| name.starts_with(word))
+            || aliases.entries().iter().any(|e| e.name.starts_with(word))
             || surface.tools.iter().any(|t| t.name.starts_with(word));
         if is_prefix {
             Style::new()
@@ -497,6 +529,7 @@ impl Highlighter for ReplHighlighter {
 pub fn spawn_readline_thread(
     server_name: String,
     surface: Arc<RwLock<Surface>>,
+    aliases: Arc<RwLock<Aliases>>,
     client: Arc<McpClient>,
     runtime: tokio::runtime::Handle,
     line_tx: tokio::sync::mpsc::Sender<String>,
@@ -512,6 +545,7 @@ pub fn spawn_readline_thread(
         run_interactive(
             server_name,
             surface,
+            aliases,
             client,
             runtime,
             &line_tx,
@@ -564,6 +598,7 @@ fn run_piped(line_tx: &tokio::sync::mpsc::Sender<String>, ack_rx: &std::sync::mp
 fn run_interactive(
     server_name: String,
     surface: Arc<RwLock<Surface>>,
+    aliases: Arc<RwLock<Aliases>>,
     client: Arc<McpClient>,
     runtime: tokio::runtime::Handle,
     line_tx: &tokio::sync::mpsc::Sender<String>,
@@ -571,8 +606,8 @@ fn run_interactive(
     at_prompt: Arc<AtomicBool>,
     persist_history: bool,
 ) {
-    let completer = ReplCompleter::new(surface.clone(), client, runtime);
-    let highlighter = ReplHighlighter::new(surface);
+    let completer = ReplCompleter::new(surface.clone(), aliases.clone(), client, runtime);
+    let highlighter = ReplHighlighter::new(surface, aliases);
 
     let menu = ColumnarMenu::default().with_name(MENU_NAME);
     let mut keybindings = default_emacs_keybindings();

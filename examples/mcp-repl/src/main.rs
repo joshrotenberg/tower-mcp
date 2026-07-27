@@ -20,15 +20,19 @@
 //! cargo run -p mcp-repl -- --server cratesio
 //! ```
 //!
-//! Inside the REPL, `help` lists the built-ins and the server's tools.
+//! Inside the REPL, `help` lists the built-ins and the server's tools, and
+//! `alias <name>=<expansion>` gives a frequent command a short name, kept in
+//! the same config file as the server profiles.
 //! A trailing `&` runs a tool task-augmented (SEP-2663): the call returns a
 //! task id immediately; `jobs`, `task <id>`, `wait <id>`, and `cancel <id>`
 //! manage it.
 
+mod alias;
 mod config;
 mod editor;
 mod elicit;
 mod find;
+mod sampling;
 mod style;
 mod wire;
 
@@ -49,6 +53,7 @@ use tower_mcp::protocol::{
     TaskObject, ToolDefinition,
 };
 
+use alias::Aliases;
 use elicit::ReplClientHandler;
 use style::{json_pretty, paint, tag, task_status_style};
 use wire::{TracingTransport, wire};
@@ -116,6 +121,13 @@ struct Args {
     #[arg(long)]
     verbose: bool,
 
+    /// How to answer a server's `sampling/createMessage` request: `prompt`
+    /// shows it and reads the assistant message on stdin, `canned` answers
+    /// with a fixed placeholder, `decline` refuses. Defaults to `prompt`
+    /// interactively and `decline` under --exec.
+    #[arg(long, value_enum, value_name = "STRATEGY")]
+    sampling: Option<sampling::SamplingMode>,
+
     /// Do not persist command history to ~/.mcp-repl_history.
     #[arg(long)]
     no_history: bool,
@@ -174,6 +186,8 @@ pub const BUILTINS: &[(&str, &str)] = &[
     ("task", "show a background task"),
     ("wait", "wait for a background task"),
     ("cancel", "cancel a background task"),
+    ("alias", "define, list, or show a command alias"),
+    ("unalias", "remove a command alias"),
     ("refresh", "re-fetch the server surface"),
     ("info", "replay the connection banner plus capabilities"),
     ("wire", "toggle raw JSON-RPC frame tracing (on|off)"),
@@ -701,6 +715,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
 
     // Server profiles are read up front: both --list-servers and profile
     // resolution need them before anything connects.
+    let config_file = config::config_path(args.config.as_deref()).map(|(path, _)| path);
     let profiles = load_config(args.config.as_deref());
     if args.list_servers {
         print_servers(&profiles);
@@ -754,6 +769,10 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
                 );
             })
     };
+    // Sampling has no model behind it, so the operator answers. Under --exec
+    // there is nobody to ask, so requests are refused unless --sampling says
+    // otherwise.
+    sampling::init(sampling::resolve(args.sampling, one_shot));
     let handler = ReplClientHandler::new(notifications, at_prompt.clone());
 
     // Explicit flags override profile fields: --http retargets a profile's URL
@@ -763,6 +782,20 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         Some((name, c)) => (Some(name), Some(c)),
         None => (None, None),
     };
+
+    // Aliases come from the same file as the profiles: the global table plus
+    // the connected profile's own, which shadows it.
+    let aliases = Arc::new(RwLock::new(Aliases::new(
+        profiles.aliases.clone(),
+        profile_name
+            .as_ref()
+            .and_then(|name| profiles.servers.get(name))
+            .map(|p| p.aliases.clone())
+            .unwrap_or_default(),
+        profile_name.clone(),
+        config_file,
+    )));
+
     let connection = match (args.http.clone(), connection) {
         (
             Some(url),
@@ -802,7 +835,11 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     // Every transport is wrapped, whatever `--trace` says: the wrapper is what
     // records the exchange `last` reprints, and tracing can be switched on
     // mid-session with `wire on`.
-    let builder = McpClient::builder().with_elicitation();
+    // Sampling is advertised whatever the strategy: a client is allowed to
+    // refuse an individual request, and a server can only ask when the
+    // capability is declared, so `--sampling decline` still exercises the
+    // server's rejection path.
+    let builder = McpClient::builder().with_elicitation().with_sampling();
     let client = if args.demo {
         builder
             .connect(
@@ -872,7 +909,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     if one_shot {
         let mut jobs: Vec<(String, String)> = Vec::new();
         for cmd in &args.exec {
-            if handle_line(&client, &surface, &mut jobs, cmd.trim()).await {
+            if handle_line(&client, &surface, &aliases, &mut jobs, cmd.trim()).await {
                 break;
             }
         }
@@ -889,6 +926,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     editor::spawn_readline_thread(
         server_name,
         surface.clone(),
+        aliases.clone(),
         client.clone(),
         tokio::runtime::Handle::current(),
         line_tx,
@@ -910,7 +948,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
             }
             maybe_line = line_rx.recv() => {
                 let Some(line) = maybe_line else { break };
-                let quit = handle_line(&client, &surface, &mut jobs, line.trim()).await;
+                let quit = handle_line(&client, &surface, &aliases, &mut jobs, line.trim()).await;
                 let _ = ack_tx.send(());
                 if quit {
                     break;
@@ -924,12 +962,33 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
 async fn handle_line(
     client: &Arc<McpClient>,
     surface: &Arc<RwLock<Surface>>,
+    aliases: &Arc<RwLock<Aliases>>,
     jobs: &mut Vec<(String, String)>,
     line: &str,
 ) -> bool {
     if line.is_empty() {
         return false;
     }
+    // Aliases expand before anything else looks at the line, so an expansion
+    // can carry arguments, a trailing `&`, or another alias. An alias can
+    // never be named after a built-in, so `alias`/`unalias` stay reachable.
+    let expanded;
+    let line = match aliases.read().unwrap().expand(line) {
+        Ok(None) => line,
+        Ok(Some(text)) => {
+            expanded = text;
+            expanded.trim()
+        }
+        Err(e) => {
+            note_error();
+            if json_output() {
+                println!("{}", error_json(&e));
+            } else {
+                println!("{}: {e}", style::error_prefix());
+            }
+            return false;
+        }
+    };
     let mut tokens: Vec<&str> = line.split_whitespace().collect();
     let background = tokens.last() == Some(&"&");
     if background {
@@ -954,6 +1013,7 @@ async fn handle_line(
             println!("  <tool> [k=v...]                           call a tool (schema-coerced)");
             println!("  <tool> [k=v...] &                         run task-augmented (SEP-2663)");
             println!("  jobs | task <id> | wait <id> | cancel <id>  manage tasks");
+            println!("  alias [<name>=<expansion>] | unalias <name>  command aliases");
             println!("  wire [on|off]                             trace raw JSON-RPC frames");
             println!("  last                                      reprint the previous exchange");
             println!("  refresh | info | quit");
@@ -1237,6 +1297,12 @@ async fn handle_line(
                 }
             }
         }
+        "alias" | "unalias" => {
+            // Everything after the command word is taken raw: an expansion is
+            // a command line, so its spacing and any `=` belong to it.
+            let raw = line.strip_prefix(cmd).unwrap_or("").trim();
+            handle_alias(aliases, surface, cmd, raw);
+        }
         "wire" => match rest.first().copied() {
             Some("on") => {
                 wire().set_trace(true);
@@ -1300,6 +1366,14 @@ async fn handle_line(
                 print_counts(&surface.read().unwrap());
                 let caps = serde_json::to_value(&info.capabilities).unwrap_or_default();
                 println!("capabilities: {}", json_pretty(&caps));
+                // What this client does with a request the server sends back.
+                println!(
+                    "{}",
+                    paint(
+                        Style::new().dimmed(),
+                        &format!("sampling: {}", sampling::mode().as_str())
+                    )
+                );
             }
             None => println!("not initialized"),
         },
@@ -1344,6 +1418,178 @@ async fn handle_line(
         }
     }
     false
+}
+
+/// The `alias` and `unalias` built-ins: define, list, show, and remove
+/// command aliases, persisting each change to the config file.
+///
+/// `raw` is everything after the command word, unsplit: an expansion is a
+/// command line of its own, so its spacing is part of it.
+fn handle_alias(
+    aliases: &Arc<RwLock<Aliases>>,
+    surface: &Arc<RwLock<Surface>>,
+    cmd: &str,
+    raw: &str,
+) {
+    // A leading `--global` targets the file-level table. Only leading: a
+    // trailing one would be ambiguous with an expansion that ends in a flag.
+    let (global, rest) = match raw.strip_prefix("--global") {
+        Some(r) if r.is_empty() || r.starts_with(char::is_whitespace) => (true, r.trim_start()),
+        _ => (false, raw),
+    };
+    let rest = rest.trim();
+
+    if cmd == "unalias" {
+        if rest.is_empty() || rest.contains(char::is_whitespace) {
+            println!("usage: unalias [--global] <name>");
+            return;
+        }
+        match aliases.write().unwrap().remove(rest, global) {
+            Ok(applied) => {
+                report_alias_warning(applied.warning.as_deref());
+                if json_output() {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "removed": rest,
+                            "expansion": applied.previous,
+                            "scope": applied.scope.label(),
+                        })
+                    );
+                } else {
+                    println!(
+                        "removed {} {}",
+                        paint(Style::new().fg(Color::Cyan), rest),
+                        paint(
+                            Style::new().dimmed(),
+                            &format!("({})", applied.scope.label())
+                        )
+                    );
+                }
+            }
+            Err(e) => alias_error(&e),
+        }
+        return;
+    }
+
+    // `alias` with nothing after it lists what is in effect.
+    if rest.is_empty() {
+        let aliases = aliases.read().unwrap();
+        let entries = aliases.entries();
+        if json_output() {
+            let rendered: Vec<serde_json::Value> = entries
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "name": e.name,
+                        "expansion": e.expansion,
+                        "scope": e.scope.label(),
+                    })
+                })
+                .collect();
+            println!("{}", json_pretty(&serde_json::Value::Array(rendered)));
+            return;
+        }
+        if entries.is_empty() {
+            println!("no aliases defined (try `alias t=tools`)");
+            return;
+        }
+        let width = entries.iter().map(|e| e.name.len()).max().unwrap_or(0);
+        for e in &entries {
+            println!(
+                "{:width$}  {}  {}",
+                paint(Style::new().fg(Color::Cyan), &e.name),
+                e.expansion,
+                paint(Style::new().dimmed(), &format!("({})", e.scope.label()))
+            );
+        }
+        return;
+    }
+
+    // `alias <name>` shows one definition; `alias <name>=<expansion>` defines.
+    let Some((name, expansion)) = rest.split_once('=') else {
+        let aliases = aliases.read().unwrap();
+        match aliases.lookup(rest) {
+            Some((expansion, scope)) if json_output() => println!(
+                "{}",
+                serde_json::json!({
+                    "name": rest,
+                    "expansion": expansion,
+                    "scope": scope.label(),
+                })
+            ),
+            Some((expansion, scope)) => println!(
+                "{} = {}  {}",
+                paint(Style::new().fg(Color::Cyan), rest),
+                expansion,
+                paint(Style::new().dimmed(), &format!("({})", scope.label()))
+            ),
+            None => alias_error(&format!(
+                "no alias named `{rest}` (define one with `alias {rest}=<expansion>`)"
+            )),
+        }
+        return;
+    };
+    let name = name.trim();
+    match aliases
+        .write()
+        .unwrap()
+        .define(name, expansion.trim(), global)
+    {
+        Ok(applied) => {
+            report_alias_warning(applied.warning.as_deref());
+            if json_output() {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "name": name,
+                        "expansion": expansion.trim(),
+                        "scope": applied.scope.label(),
+                        "replaced": applied.previous,
+                    })
+                );
+                return;
+            }
+            println!(
+                "{} = {}  {}",
+                paint(Style::new().fg(Color::Cyan), name),
+                expansion.trim(),
+                paint(
+                    Style::new().dimmed(),
+                    &format!("({})", applied.scope.label())
+                )
+            );
+            // An alias wins over a tool of the same name, since expansion
+            // happens before dispatch. Worth saying once, at definition.
+            if surface.read().unwrap().tools.iter().any(|t| t.name == name) {
+                println!(
+                    "{}",
+                    paint(
+                        Style::new().dimmed(),
+                        &format!("note: this shadows the tool `{name}` on this server")
+                    )
+                );
+            }
+        }
+        Err(e) => alias_error(&e),
+    }
+}
+
+/// A failed write is reported without discarding the alias: it applies to
+/// this session, it just did not reach the config file.
+fn report_alias_warning(warning: Option<&str>) {
+    if let Some(w) = warning {
+        eprintln!("warning: {w}");
+    }
+}
+
+fn alias_error(message: &str) {
+    note_error();
+    if json_output() {
+        println!("{}", error_json(message));
+    } else {
+        println!("{}: {message}", style::error_prefix());
+    }
 }
 
 /// The `describe` built-in: schemas for a tool, the argument table for a

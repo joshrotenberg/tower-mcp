@@ -16,12 +16,13 @@ use std::time::Duration;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tower_mcp::{
-    CallToolResult, McpRouter, StdioTransport, ToolBuilder,
+    CallToolResult, McpRouter, ToolBuilder,
     extract::{Context, Json},
     protocol::{
         ContentRole, CreateMessageParams, ElicitAction, ElicitFormParams, ElicitFormSchema,
         SamplingContent, SamplingContentOrArray, SamplingMessage,
     },
+    transport::stdio::BidirectionalStdioTransport,
 };
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -192,7 +193,11 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .tool(confirm_delete)
         .tool(slow_task);
 
-    let mut transport = StdioTransport::new(router);
+    // Bidirectional: sampling and elicitation are server-to-client requests,
+    // so the transport needs the client requester that plain `StdioTransport`
+    // does not wire up. Without it every tool here fails with
+    // "Sampling not available: no client requester configured".
+    let mut transport = BidirectionalStdioTransport::new(router);
     tracing::info!("Sampling server started");
     transport.run().await?;
 
