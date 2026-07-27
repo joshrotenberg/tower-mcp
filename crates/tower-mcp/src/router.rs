@@ -7113,3 +7113,23 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod cursor_property_tests {
+    use super::{decode_cursor, encode_cursor};
+    use proptest::prelude::*;
+
+    proptest! {
+        /// A cursor round-trips: decode(encode(n)) == n.
+        #[test]
+        fn cursor_round_trips(offset in any::<usize>()) {
+            prop_assert_eq!(decode_cursor(&encode_cursor(offset)).unwrap(), offset);
+        }
+
+        /// Decoding arbitrary client input never panics; it is Ok or a clean Err.
+        #[test]
+        fn decode_cursor_never_panics(s in ".*") {
+            let _ = decode_cursor(&s);
+        }
+    }
+}

@@ -491,3 +491,31 @@ mod tests {
         assert!(meta.client_capabilities.is_none());
     }
 }
+
+#[cfg(test)]
+mod version_property_tests {
+    use super::validate_protocol_version;
+    use crate::protocol::SUPPORTED_PROTOCOL_VERSIONS;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Validating an arbitrary version string never panics.
+        #[test]
+        fn validate_never_panics(v in ".*") {
+            let _ = validate_protocol_version(&v);
+        }
+
+        /// Every supported version validates.
+        #[test]
+        fn supported_versions_accept(i in 0usize..SUPPORTED_PROTOCOL_VERSIONS.len()) {
+            prop_assert!(validate_protocol_version(SUPPORTED_PROTOCOL_VERSIONS[i]).is_ok());
+        }
+
+        /// Anything not in the supported set is rejected.
+        #[test]
+        fn unsupported_versions_reject(v in ".*") {
+            prop_assume!(!SUPPORTED_PROTOCOL_VERSIONS.contains(&v.as_str()));
+            prop_assert!(validate_protocol_version(&v).is_err());
+        }
+    }
+}

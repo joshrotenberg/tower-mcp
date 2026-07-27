@@ -36,6 +36,7 @@ tower-resilience = { workspace = true, optional = true, default-features = false
 
 [dev-dependencies]
 async-trait.workspace = true
+proptest = "1"
 tokio-test = "0.4"
 tower = { workspace = true, features = ["timeout", "limit"] }
 tower-mcp-types = { path = "../tower-mcp-types", features = ["testing"] }
