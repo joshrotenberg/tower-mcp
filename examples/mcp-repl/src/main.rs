@@ -31,12 +31,15 @@ mod alias;
 mod config;
 mod editor;
 mod elicit;
+mod find;
 mod sampling;
+mod session;
 mod style;
 mod subscribe;
 mod wire;
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -55,6 +58,7 @@ use tower_mcp::protocol::{
 
 use alias::Aliases;
 use elicit::ReplClientHandler;
+use session::{Connector, Session, is_not_initialized, is_session_lost};
 use style::{json_pretty, paint, tag, task_status_style};
 use wire::{TracingTransport, wire};
 
@@ -132,6 +136,12 @@ struct Args {
     #[arg(long)]
     no_history: bool,
 
+    /// Do not transparently re-establish an HTTP session that the server has
+    /// lost (restart, OOM, or a 502/503 from the edge in front of it).
+    /// Session-loss errors surface as-is instead.
+    #[arg(long)]
+    no_reconnect: bool,
+
     /// Print every JSON-RPC frame sent and received, to stderr. Equivalent to
     /// starting with `wire on`; toggle it mid-session with `wire on|off`.
     #[arg(long)]
@@ -177,6 +187,7 @@ pub const BUILTINS: &[(&str, &str)] = &[
     ("prompts", "list prompts"),
     ("resources", "list resources"),
     ("templates", "list resource templates"),
+    ("find", "search the surface by keyword"),
     ("describe", "show schemas and metadata for a name"),
     ("read", "read a resource"),
     ("subscribe", "watch a resource for updates"),
@@ -350,6 +361,53 @@ fn print_tool_overview(surface: &Surface) {
     }
 }
 
+/// The `find` built-in's output: matches grouped by kind under the heading
+/// of the list command that shows the same entries, best match first within
+/// each group.
+fn print_find(surface: &Surface, query: &str) {
+    let hits = find::search(surface, query);
+    if json_output() {
+        let v: Vec<serde_json::Value> = hits
+            .iter()
+            .map(|h| {
+                serde_json::json!({
+                    "kind": h.kind.heading(),
+                    "name": h.name,
+                    "description": h.description,
+                    "score": h.score,
+                })
+            })
+            .collect();
+        println!("{}", json_pretty(&serde_json::Value::Array(v)));
+        return;
+    }
+    if hits.is_empty() {
+        // grep's convention: a search that matched nothing exits non-zero, so
+        // `mcp-repl -e "find x"` can be tested in a script.
+        note_error();
+        println!("no match for {}", paint(Style::new().fg(Color::Red), query));
+        return;
+    }
+    let total = hits.len();
+    for (kind, group) in find::grouped(hits) {
+        println!("{}:", paint(Style::new().bold(), kind.heading()));
+        for hit in group {
+            println!(
+                "  {:24} {}",
+                paint(Style::new().fg(Color::Green), &hit.name),
+                hit.description
+            );
+        }
+    }
+    println!(
+        "{}",
+        paint(
+            Style::new().dimmed(),
+            &format!("{total} match{}", if total == 1 { "" } else { "es" })
+        )
+    );
+}
+
 /// The one-line surface summary.
 fn print_counts(surface: &Surface) {
     println!(
@@ -361,17 +419,58 @@ fn print_counts(surface: &Surface) {
     );
 }
 
-/// True when the server rejected a request because the session is not yet
-/// initialized (JSON-RPC `-32600` naming `notifications/initialized`). This
-/// is retryable at startup: against a multi-instance server without a shared
-/// session store, the initialize handshake and a follow-up request can land
-/// on different instances, so a brief retry often lands on a consistent one.
-fn is_not_initialized(e: &tower_mcp::Error) -> bool {
-    matches!(
-        e,
-        tower_mcp::Error::JsonRpc(j)
-            if j.code == -32600 && j.message.contains("notifications/initialized")
-    )
+/// Run one request, and if it fails because the server lost the session,
+/// rebuild the connection and run it exactly once more.
+///
+/// The retry is deliberately bounded to a single attempt: a server that is
+/// down stays down, and a loop here would turn one dead command into a long
+/// unresponsive prompt. On the second failure the original error surfaces
+/// with a hint, which is what the user would have seen without reconnection.
+///
+/// `op` runs against whichever client is current, so it takes the client as
+/// an argument rather than closing over one: the second call must use the
+/// client the reconnect installed, not the dead one.
+async fn with_reconnect<T, F, Fut>(
+    session: &Session,
+    surface: &Arc<RwLock<Surface>>,
+    op: F,
+) -> Result<T, tower_mcp::Error>
+where
+    F: Fn(Arc<McpClient>) -> Fut,
+    Fut: Future<Output = Result<T, tower_mcp::Error>>,
+{
+    let seen = session.generation();
+    let err = match op(session.client()).await {
+        Ok(value) => return Ok(value),
+        Err(e) => e,
+    };
+    if !session.can_reconnect() || !is_session_lost(&err) {
+        return Err(err);
+    }
+    if let Err(reconnect_err) = session.reconnect(seen).await {
+        eprintln!("reconnect failed: {reconnect_err}");
+        return Err(err);
+    }
+    // The surface belongs to the old session: a restarted server may expose a
+    // different set of tools, and the completer and command dispatch both read
+    // this. Refresh before the retry so the retried command and the next
+    // prompt agree on what exists.
+    *surface.write().unwrap() = fetch_surface(&session.client()).await;
+    // stderr, so the note does not land in the middle of `--json` output
+    // being piped somewhere.
+    eprintln!("{}", paint(Style::new().dimmed(), "[reconnected]"));
+
+    let retried = op(session.client()).await;
+    if let Err(e) = &retried
+        && is_session_lost(e)
+    {
+        eprintln!(
+            "still no session after reconnecting. The server is likely down or \
+             restart-looping; check its logs, or pass --no-reconnect to see the \
+             raw errors."
+        );
+    }
+    retried
 }
 
 /// Fetch the server surface once. Returns the surface plus whether any list
@@ -418,6 +517,28 @@ async fn fetch_surface_once(client: &McpClient) -> (Surface, bool) {
 
 async fn fetch_surface(client: &McpClient) -> Surface {
     fetch_surface_once(client).await.0
+}
+
+/// Re-fetch the surface, reconnecting first if the fetch shows the session is
+/// gone. The four list calls swallow their own errors, so not-initialized is
+/// the one session-loss signal that survives to here; the typed session
+/// errors would have shown up as empty lists with a warning.
+async fn refresh_surface(session: &Session) -> Surface {
+    let (fresh, not_initialized) = fetch_surface_once(&session.client()).await;
+    if !not_initialized || !session.can_reconnect() {
+        return fresh;
+    }
+    let seen = session.generation();
+    match session.reconnect(seen).await {
+        Ok(()) => {
+            eprintln!("{}", paint(Style::new().dimmed(), "[reconnected]"));
+            fetch_surface(&session.client()).await
+        }
+        Err(e) => {
+            eprintln!("reconnect failed: {e}");
+            fresh
+        }
+    }
 }
 
 /// Startup surface fetch with a bounded retry on the not-initialized
@@ -597,6 +718,90 @@ fn demo_router() -> tower_mcp::McpRouter {
         )
 }
 
+/// The notification callbacks: log and progress messages print inline,
+/// `list_changed` notifications nudge the event loop to refresh the surface.
+/// Built per client, since a reconnect installs a new one.
+fn notification_handler(refresh_tx: tokio::sync::mpsc::UnboundedSender<()>) -> NotificationHandler {
+    let t = refresh_tx.clone();
+    let r = refresh_tx.clone();
+    let p = refresh_tx;
+    NotificationHandler::new()
+        .on_tools_changed(move || {
+            let _ = t.send(());
+        })
+        .on_resources_changed(move || {
+            let _ = r.send(());
+        })
+        .on_prompts_changed(move || {
+            let _ = p.send(());
+        })
+        .on_progress(|p| {
+            let pct = match (p.progress, p.total) {
+                (done, Some(total)) if total > 0.0 => {
+                    format!(" {:.0}%", 100.0 * done / total)
+                }
+                _ => String::new(),
+            };
+            println!(
+                "{} {}",
+                tag(Style::new().fg(Color::Cyan), &format!("progress{pct}")),
+                p.message.as_deref().unwrap_or("")
+            );
+        })
+        // A subscribed resource changed. Printed inline like progress and log
+        // lines; the content is not re-read, since a `read` may be expensive and
+        // the point is to know it moved.
+        .on_resource_updated(|uri| {
+            let known = if subscribe::contains(&uri) {
+                String::new()
+            } else {
+                format!(" {}", paint(Style::new().dimmed(), "(not subscribed here)"))
+            };
+            println!(
+                "{} {uri}{known}",
+                tag(Style::new().fg(Color::Cyan), "resource updated")
+            );
+        })
+        .on_log_message(|m| {
+            println!(
+                "{} {}",
+                tag(log_level_style(m.level), &format!("log {}", m.level)),
+                m.data
+            );
+        })
+}
+
+/// The recipe for rebuilding an `--http` connection: a brand new transport
+/// (so no dead `Mcp-Session-Id` is carried over), a fresh handler, and the
+/// initialize handshake, exactly as at startup. The rebuilt transport is
+/// wrapped in `TracingTransport` like the startup one, so `wire` and `last`
+/// keep reporting frames after a reconnect, and it declares the same
+/// capabilities as the startup client: a reconnect must not quietly leave the
+/// session less capable than it began.
+fn http_connector(
+    url: String,
+    config: HttpClientConfig,
+    make_handler: Arc<dyn Fn() -> ReplClientHandler + Send + Sync>,
+) -> Connector {
+    Box::new(move || {
+        let (url, config, handler) = (url.clone(), config.clone(), make_handler());
+        Box::pin(async move {
+            let client = McpClient::builder()
+                .with_elicitation()
+                .with_sampling()
+                .connect(
+                    TracingTransport::new(HttpClientTransport::with_config(url, config)),
+                    handler,
+                )
+                .await?;
+            client
+                .initialize("mcp-repl", env!("CARGO_PKG_VERSION"))
+                .await?;
+            Ok(client)
+        })
+    })
+}
+
 /// Load the profile config, exiting with a usage status on a bad file. A
 /// missing file at the default location is not an error: profiles are opt-in.
 fn load_config(explicit: Option<&str>) -> config::Config {
@@ -706,60 +911,21 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
 
     // Notifications print inline and trigger surface refreshes.
     let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-    let notifications = {
-        let t = refresh_tx.clone();
-        let r = refresh_tx.clone();
-        let p = refresh_tx;
-        NotificationHandler::new()
-            .on_tools_changed(move || {
-                let _ = t.send(());
-            })
-            .on_resources_changed(move || {
-                let _ = r.send(());
-            })
-            .on_prompts_changed(move || {
-                let _ = p.send(());
-            })
-            .on_progress(|p| {
-                let pct = match (p.progress, p.total) {
-                    (done, Some(total)) if total > 0.0 => {
-                        format!(" {:.0}%", 100.0 * done / total)
-                    }
-                    _ => String::new(),
-                };
-                println!(
-                    "{} {}",
-                    tag(Style::new().fg(Color::Cyan), &format!("progress{pct}")),
-                    p.message.as_deref().unwrap_or("")
-                );
-            })
-            // A subscribed resource changed. Printed inline like progress and
-            // log lines; the content is not re-read, since a `read` may be
-            // expensive and the point is to know it moved.
-            .on_resource_updated(|uri| {
-                let known = if subscribe::contains(&uri) {
-                    String::new()
-                } else {
-                    format!(" {}", paint(Style::new().dimmed(), "(not subscribed here)"))
-                };
-                println!(
-                    "{} {uri}{known}",
-                    tag(Style::new().fg(Color::Cyan), "resource updated")
-                );
-            })
-            .on_log_message(|m| {
-                println!(
-                    "{} {}",
-                    tag(log_level_style(m.level), &format!("log {}", m.level)),
-                    m.data
-                );
-            })
+
+    // A reconnect needs a fresh handler for the new client, so build handlers
+    // through a factory rather than once.
+    let make_handler: Arc<dyn Fn() -> ReplClientHandler + Send + Sync> = {
+        let refresh_tx = refresh_tx.clone();
+        let at_prompt = at_prompt.clone();
+        Arc::new(move || {
+            ReplClientHandler::new(notification_handler(refresh_tx.clone()), at_prompt.clone())
+        })
     };
+    drop(refresh_tx);
     // Sampling has no model behind it, so the operator answers. Under --exec
     // there is nobody to ask, so requests are refused unless --sampling says
     // otherwise.
     sampling::init(sampling::resolve(args.sampling, one_shot));
-    let handler = ReplClientHandler::new(notifications, at_prompt.clone());
 
     // Explicit flags override profile fields: --http retargets a profile's URL
     // while keeping its auth, and --bearer/--header are layered on in
@@ -826,11 +992,15 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     // capability is declared, so `--sampling decline` still exercises the
     // server's rejection path.
     let builder = McpClient::builder().with_elicitation().with_sampling();
+    // Only `--http` can be resurrected. A stdio child that dies takes its
+    // stdin and stdout with it (respawning it is a separate concern), and the
+    // in-process demo router cannot lose a session at all.
+    let mut connector: Option<Connector> = None;
     let client = if args.demo {
         builder
             .connect(
                 TracingTransport::new(ChannelTransport::new(demo_router())),
-                handler,
+                make_handler(),
             )
             .await?
     } else {
@@ -842,10 +1012,17 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
             }) => {
                 let config =
                     build_http_config(args.bearer.clone(), &args.headers, bearer, &headers)?;
+                if !args.no_reconnect {
+                    connector = Some(http_connector(
+                        url.clone(),
+                        config.clone(),
+                        make_handler.clone(),
+                    ));
+                }
                 builder
                     .connect(
                         TracingTransport::new(HttpClientTransport::with_config(url, config)),
-                        handler,
+                        make_handler(),
                     )
                     .await?
             }
@@ -853,7 +1030,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
                 let cmd_args: Vec<&str> = command[1..].iter().map(|s| s.as_str()).collect();
                 let transport = StdioClientTransport::spawn(&command[0], &cmd_args).await?;
                 builder
-                    .connect(TracingTransport::new(transport), handler)
+                    .connect(TracingTransport::new(transport), make_handler())
                     .await?
             }
             None => {
@@ -864,7 +1041,6 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
             }
         }
     };
-    let client = Arc::new(client);
 
     let init = client
         .initialize("mcp-repl", env!("CARGO_PKG_VERSION"))
@@ -873,6 +1049,8 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     if !quiet {
         print_banner(&init);
     }
+    let session = Arc::new(Session::new(client, connector));
+    let client = session.client();
 
     let surface = Arc::new(RwLock::new(fetch_surface_initial(&client).await));
     if !quiet {
@@ -895,7 +1073,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     if one_shot {
         let mut jobs: Vec<(String, String)> = Vec::new();
         for cmd in &args.exec {
-            if handle_line(&client, &surface, &aliases, &mut jobs, cmd.trim()).await {
+            if handle_line(&session, &surface, &aliases, &mut jobs, cmd.trim()).await {
                 break;
             }
         }
@@ -912,8 +1090,8 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     editor::spawn_readline_thread(
         server_name,
         surface.clone(),
+        session.clone(),
         aliases.clone(),
-        client.clone(),
         tokio::runtime::Handle::current(),
         line_tx,
         ack_rx,
@@ -926,7 +1104,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     loop {
         tokio::select! {
             Some(()) = refresh_rx.recv() => {
-                let fresh = fetch_surface(&client).await;
+                let fresh = fetch_surface(&session.client()).await;
                 println!("{} {} tools, {} prompts, {} resources",
                     tag(Style::new().fg(Color::Cyan), "surface changed"),
                     fresh.tools.len(), fresh.prompts.len(), fresh.resources.len());
@@ -934,7 +1112,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
             }
             maybe_line = line_rx.recv() => {
                 let Some(line) = maybe_line else { break };
-                let quit = handle_line(&client, &surface, &aliases, &mut jobs, line.trim()).await;
+                let quit = handle_line(&session, &surface, &aliases, &mut jobs, line.trim()).await;
                 let _ = ack_tx.send(());
                 if quit {
                     break;
@@ -946,7 +1124,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
 }
 
 async fn handle_line(
-    client: &Arc<McpClient>,
+    session: &Arc<Session>,
     surface: &Arc<RwLock<Surface>>,
     aliases: &Arc<RwLock<Aliases>>,
     jobs: &mut Vec<(String, String)>,
@@ -975,6 +1153,7 @@ async fn handle_line(
             return false;
         }
     };
+    let client = session.client();
     let mut tokens: Vec<&str> = line.split_whitespace().collect();
     let background = tokens.last() == Some(&"&");
     if background {
@@ -991,6 +1170,7 @@ async fn handle_line(
         "help" => {
             println!("built-ins:");
             println!("  tools | prompts | resources | templates   list the server surface");
+            println!("  find <keyword>                            search the surface");
             println!("  describe <name>                           schemas and metadata");
             println!("  read <uri>                                read a resource");
             println!("  subscribe <uri> | unsubscribe <uri>       watch a resource for updates");
@@ -1106,6 +1286,16 @@ async fn handle_line(
                 }
             }
         }
+        "find" => {
+            // Everything after the command word is the query, so a phrase
+            // (`find crate info`) is not silently truncated to its first word.
+            let query = rest.join(" ");
+            if query.is_empty() {
+                println!("usage: find <keyword>");
+                return false;
+            }
+            print_find(&surface.read().unwrap(), &query);
+        }
         "describe" => {
             let Some(name) = rest.first() else {
                 println!("usage: describe <tool|prompt|resource|template>");
@@ -1119,7 +1309,13 @@ async fn handle_line(
                 return false;
             };
             let started = std::time::Instant::now();
-            match client.read_resource(uri).await {
+            match with_reconnect(
+                session,
+                surface,
+                |c| async move { c.read_resource(uri).await },
+            )
+            .await
+            {
                 Ok(result) if json_output() => {
                     println!(
                         "{}",
@@ -1165,7 +1361,7 @@ async fn handle_line(
                 println!("usage: {cmd} <uri>");
                 return false;
             };
-            handle_subscription(client, cmd, uri).await;
+            handle_subscription(&client, cmd, uri).await;
         }
         "subscriptions" => {
             let active = subscribe::list();
@@ -1193,7 +1389,12 @@ async fn handle_line(
                 }
             }
             let started = std::time::Instant::now();
-            match client.get_prompt(name, Some(prompt_args)).await {
+            match with_reconnect(session, surface, |c| {
+                let prompt_args = prompt_args.clone();
+                async move { c.get_prompt(name, Some(prompt_args)).await }
+            })
+            .await
+            {
                 Ok(result) if json_output() => {
                     println!(
                         "{}",
@@ -1245,7 +1446,7 @@ async fn handle_line(
                     return false;
                 }
             };
-            run_tool(client, jobs, name, arguments, background).await;
+            run_tool(session, surface, jobs, name, arguments, background).await;
         }
         "jobs" => {
             if jobs.is_empty() {
@@ -1261,6 +1462,9 @@ async fn handle_line(
                 }
             }
         }
+        // Task commands do not reconnect: a task id belongs to the session
+        // that created it, so a fresh session would only report it missing.
+        // "(gone)" from `jobs` is the honest answer there.
         "task" | "wait" | "cancel" => {
             let Some(id) = rest.first() else {
                 println!("usage: {cmd} <task-id>");
@@ -1347,7 +1551,7 @@ async fn handle_line(
             }
         },
         "refresh" => {
-            let fresh = fetch_surface(client).await;
+            let fresh = refresh_surface(session).await;
             println!(
                 "{} tools, {} prompts, {} resources, {} templates",
                 fresh.tools.len(),
@@ -1385,18 +1589,34 @@ async fn handle_line(
             };
             let Some(schema) = schema else {
                 note_error();
+                let suggestion = find::did_you_mean(&surface.read().unwrap(), tool_name);
                 if json_output() {
-                    println!("{}", error_json(&format!("unknown command: {tool_name}")));
+                    match &suggestion {
+                        Some(near) => println!(
+                            "{}",
+                            serde_json::json!({
+                                "error": format!("unknown command: {tool_name}"),
+                                "didYouMean": near,
+                            })
+                        ),
+                        None => {
+                            println!("{}", error_json(&format!("unknown command: {tool_name}")))
+                        }
+                    }
                 } else {
-                    println!(
-                        "unknown command: {} (try `help`)",
-                        paint(Style::new().fg(Color::Red), tool_name)
-                    );
+                    let name = paint(Style::new().fg(Color::Red), tool_name);
+                    match suggestion {
+                        Some(near) => println!(
+                            "unknown command: {name}; did you mean `{}`?",
+                            paint(Style::new().fg(Color::Green), &near)
+                        ),
+                        None => println!("unknown command: {name} (try `help`)"),
+                    }
                 }
                 return false;
             };
             let arguments = parse_kv_args(&schema, rest);
-            run_tool(client, jobs, tool_name, arguments, background).await;
+            run_tool(session, surface, jobs, tool_name, arguments, background).await;
         }
     }
     false
@@ -1752,14 +1972,20 @@ fn describe(surface: &Surface, name: &str) {
 }
 
 async fn run_tool(
-    client: &Arc<McpClient>,
+    session: &Arc<Session>,
+    surface: &Arc<RwLock<Surface>>,
     jobs: &mut Vec<(String, String)>,
     name: &str,
     arguments: serde_json::Value,
     background: bool,
 ) {
     if background {
-        match client.call_tool_as_task(name, arguments, None).await {
+        match with_reconnect(session, surface, |c| {
+            let arguments = arguments.clone();
+            async move { c.call_tool_as_task(name, arguments, None).await }
+        })
+        .await
+        {
             Ok(created) => {
                 if json_output() {
                     println!(
@@ -1789,7 +2015,12 @@ async fn run_tool(
         return;
     }
     let started = std::time::Instant::now();
-    match client.call_tool(name, arguments).await {
+    match with_reconnect(session, surface, |c| {
+        let arguments = arguments.clone();
+        async move { c.call_tool(name, arguments).await }
+    })
+    .await
+    {
         Ok(result) => {
             if result.is_error {
                 note_error();
@@ -1911,6 +2142,13 @@ mod tests {
         assert!(timing(Duration::from_millis(2500)).contains("[2.50s]"));
     }
 
+    // Completion and highlighting both read BUILTINS, so membership is what
+    // makes `find` completable rather than any code in the editor.
+    #[test]
+    fn find_is_a_completable_builtin() {
+        assert!(BUILTINS.iter().any(|(name, _)| *name == "find"));
+    }
+
     #[test]
     fn error_json_is_a_valid_object() {
         let v: serde_json::Value = serde_json::from_str(&error_json("boom: it broke")).unwrap();
@@ -1940,29 +2178,154 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[test]
-    fn detects_not_initialized_startup_error() {
-        assert!(is_not_initialized(&jsonrpc(
-            -32600,
-            "Client must send notifications/initialized before making requests"
-        )));
+    /// A connected, initialized client over the in-process demo router, so
+    /// the reconnect path can be exercised without a socket.
+    async fn demo_client() -> McpClient {
+        let client = McpClient::builder()
+            .connect_simple(ChannelTransport::new(demo_router()))
+            .await
+            .unwrap();
+        client.initialize("mcp-repl-test", "0").await.unwrap();
+        client
     }
 
-    #[test]
-    fn does_not_match_unrelated_errors() {
-        // Same code, different message.
-        assert!(!is_not_initialized(&jsonrpc(
-            -32600,
-            "some other invalid request"
-        )));
-        // Right message text, different code.
-        assert!(!is_not_initialized(&jsonrpc(
-            -32602,
-            "notifications/initialized"
-        )));
-        // A transport error is never the not-initialized case.
-        assert!(!is_not_initialized(&tower_mcp::Error::Transport(
-            "boom".into()
-        )));
+    /// A session whose connector builds a fresh demo client, counting how
+    /// many times it is asked to.
+    async fn demo_session() -> (Arc<Session>, Arc<std::sync::atomic::AtomicUsize>) {
+        let connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = connects.clone();
+        let connector: Connector = Box::new(move || {
+            let counter = counter.clone();
+            Box::pin(async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(demo_client().await)
+            })
+        });
+        (
+            Arc::new(Session::new(demo_client().await, Some(connector))),
+            connects,
+        )
+    }
+
+    /// The regression this fixes: the server drops the session mid-command,
+    /// so the call fails with not-initialized. The next attempt must succeed
+    /// on a rebuilt session rather than leaving a dead prompt.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropped_session_is_rebuilt_and_the_command_retried() {
+        let (session, connects) = demo_session().await;
+        let surface = Arc::new(RwLock::new(Surface::default()));
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dead = Arc::as_ptr(&session.client()) as usize;
+        let seen: Arc<RwLock<Vec<usize>>> = Arc::new(RwLock::new(Vec::new()));
+
+        let (calls, saw) = (attempts.clone(), seen.clone());
+        let result = with_reconnect(&session, &surface, |c| {
+            let (calls, saw) = (calls.clone(), saw.clone());
+            async move {
+                saw.write().unwrap().push(Arc::as_ptr(&c) as usize);
+                // First attempt sees the session the server has forgotten.
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(jsonrpc(
+                        -32600,
+                        "Client must send notifications/initialized before making requests",
+                    ));
+                }
+                c.call_tool("echo", serde_json::json!({ "message": "alive" }))
+                    .await
+            }
+        })
+        .await
+        .expect("the retried call should succeed on the rebuilt session");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2, "one retry, not a loop");
+        // The retry has to run against the rebuilt client, not the dead one.
+        let seen = seen.read().unwrap();
+        assert_eq!(seen[0], dead);
+        assert_ne!(seen[1], dead, "the retry reused the dead client");
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            1,
+            "reconnected exactly once"
+        );
+        assert_eq!(session.generation(), 1);
+        match result.content.first() {
+            Some(Content::Text { text, .. }) => assert_eq!(text, "alive"),
+            other => panic!("unexpected content: {other:?}"),
+        }
+        // The surface is re-fetched from the new session, not left stale.
+        assert!(
+            !surface.read().unwrap().tools.is_empty(),
+            "surface should be refreshed after reconnect"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_still_dead_server_surfaces_the_error_after_one_retry() {
+        let (session, connects) = demo_session().await;
+        let surface = Arc::new(RwLock::new(Surface::default()));
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let calls = attempts.clone();
+        let err = with_reconnect(&session, &surface, |_c| {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(tower_mcp::Error::Transport(
+                    "HTTP 503 Service Unavailable from server: ".into(),
+                ))
+            }
+        })
+        .await
+        .unwrap_err();
+
+        assert!(is_session_lost(&err));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2, "bounded to one retry");
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ordinary_errors_do_not_reconnect() {
+        let (session, connects) = demo_session().await;
+        let surface = Arc::new(RwLock::new(Surface::default()));
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let calls = attempts.clone();
+        let err = with_reconnect(&session, &surface, |_c| {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(jsonrpc(-32602, "Invalid params"))
+            }
+        })
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, tower_mcp::Error::JsonRpc(j) if j.code == -32602));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "no retry");
+        assert_eq!(connects.load(Ordering::SeqCst), 0, "no reconnect");
+    }
+
+    /// `--no-reconnect`, and the stdio/demo transports, produce a session with
+    /// no connector: session-loss errors must pass straight through.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_without_a_connector_never_retries() {
+        let session = Arc::new(Session::new(demo_client().await, None));
+        let surface = Arc::new(RwLock::new(Surface::default()));
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        assert!(!session.can_reconnect());
+        let calls = attempts.clone();
+        let err = with_reconnect(&session, &surface, |_c| {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(tower_mcp::Error::SessionExpired)
+            }
+        })
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, tower_mcp::Error::SessionExpired));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 }

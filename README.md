@@ -88,7 +88,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tower-mcp = "0.12"
+tower-mcp = "0.14"
 ```
 
 Tool input types use `schemars::JsonSchema`, and the derive must come from the
@@ -123,7 +123,7 @@ Example with features:
 
 ```toml
 [dependencies]
-tower-mcp = { version = "0.12", features = ["full"] }
+tower-mcp = { version = "0.14", features = ["full"] }
 ```
 
 ### Types Only
@@ -135,7 +135,7 @@ any context where you want to serialize/deserialize MCP messages without a runti
 
 ```toml
 [dependencies]
-tower-mcp-types = "0.12"
+tower-mcp-types = "0.14"
 ```
 
 `tower-mcp-types` provides all types from `tower_mcp::protocol` and `tower_mcp::error`
@@ -633,7 +633,7 @@ We track all MCP Specification Enhancement Proposals (SEPs) as [GitHub issues](h
 
 A full-featured MCP server for querying [crates.io](https://crates.io) is available as a standalone project: [cratesio-mcp](https://github.com/joshrotenberg/cratesio-mcp). A demo instance is deployed at **https://cratesio-mcp.fly.dev** -- connect with any MCP client that supports HTTP transport.
 
-The repo includes 24 focused examples organized by topic:
+The repo includes 31 examples; a selection organized by topic (the full set lives in [`examples/`](examples/)):
 
 | Category | Examples |
 |----------|----------|
