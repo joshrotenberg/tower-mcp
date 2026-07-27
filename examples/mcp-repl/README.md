@@ -98,6 +98,29 @@ mcp-repl cratesio                  # a bare name works too
   `--config` file is an error. A missing file at the default location is not:
   profiles are opt-in.
 
+### Reconnecting
+
+A remote server that restarts, OOMs, or sits behind an edge returning 502/503
+loses the session, and every later request fails with a not-initialized or
+session-expired error. On an `--http` connection the REPL notices this,
+re-runs the handshake against a fresh transport, re-fetches the surface, and
+retries the command once:
+
+```text
+> search query=tower
+[reconnected]
+... results ...
+```
+
+The retry is bounded to a single attempt, so a server that is really down
+fails fast with its original error rather than hanging the prompt. Task ids
+do not survive a reconnect (they belong to the session that created them), so
+`task`, `wait`, and `cancel` never trigger one.
+
+Pass `--no-reconnect` to turn this off and see session-loss errors as they
+arrive. stdio children and `--demo` are never reconnected: there, a lost
+session means the server process itself is gone.
+
 ## Aliases
 
 Frequent commands get short names, kept in the same config file as the
@@ -152,6 +175,7 @@ still work for the session and the REPL says they were not saved.
 getting-started> help                      # built-ins plus the server's tools
 getting-started> add a=2 b=3               # tools are commands; args coerced by inputSchema
 getting-started> echo message="hi there"   # tab-completes argument names
+getting-started> find note                 # keyword search across the surface
 getting-started> describe add              # input/output schemas, colored
 getting-started> read source://getting_started.rs
 getting-started> prompt greet name=World   # prompt args tab-complete via completion/complete
@@ -275,6 +299,41 @@ Tab opens a columnar menu. What gets completed:
 - `bench <tool> ...`: tool names in the first position, then that tool's
   argument names, and `--n` / `--concurrency` after a leading `-`.
 - `unalias <name>`: the aliases in effect, with their scope.
+
+## find
+
+A server with dozens of tools is not navigable by listing it. `find
+<keyword>` searches names and descriptions across tools, prompts, resources,
+and templates, grouped by kind:
+
+```text
+cratesio> find download
+tools:
+  get_downloads            Get download statistics
+  get_version_downloads    Daily download stats for a specific version
+2 matches
+```
+
+Matching is case-insensitive. Results rank an exact name match first, then a
+name prefix, then a name substring, then a description match, and last a
+subsequence (`gvd` reaches `get_version_downloads`) so a loose match never
+buries a literal one. The search runs against the cached surface, so it
+issues no request.
+
+Under `--json` it prints an array of `{kind, name, description, score}`
+objects. A search that matched nothing exits non-zero, following grep.
+
+A mistyped command word gets the nearest built-in, tool, or prompt name by
+edit distance:
+
+```text
+cratesio> serch_crates query=serde
+unknown command: serch_crates; did you mean `search_crates`?
+```
+
+The tolerance scales with the length of what you typed, so a short word does
+not collect a suggestion from across the surface. When nothing is close
+enough, the message points at `help` as before.
 
 ## describe
 

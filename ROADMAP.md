@@ -2,10 +2,11 @@
 
 ## Current Status
 
-- **Version**: 0.9.x
-- **Spec version**: 2025-11-25
-- **Server conformance**: 39/39 (100%)
-- **Client conformance**: 265/265 checks, 24/24 scenarios (100%)
+- **Version**: 0.14.x
+- **Spec version**: 2025-11-25 (plus the 2026-07-28 draft behind the `stateless` feature)
+- **Server conformance (2025-11-25)**: 39/39
+- **Client conformance (2025-11-25)**: 264/266 (two offline-access gaps, tracked in #953)
+- **Server conformance (2026-07-28 draft)**: 66/102 (gaps baselined, tracked in #929)
 - **MSRV**: 1.90 (Rust 2024 edition)
 
 ## SDK Tier Assessment
@@ -15,10 +16,10 @@ tower-mcp targets Tier 2 per the [MCP SDK Tiering System](https://modelcontextpr
 | # | Requirement | Status |
 |---|-------------|--------|
 | 1 | Server conformance >= 80% | 100% (39/39) |
-| 2 | Client conformance >= 80% | 100% (265/265) |
+| 2 | Client conformance >= 80% | 264/266 |
 | 3 | Issue triage within 1 month | Active |
 | 4 | P0 resolution within 2 weeks | 0 open |
-| 5 | Stable release >= 1.0.0 | 0.9.x -- pre-1.0 |
+| 5 | Stable release >= 1.0.0 | 0.14.x -- pre-1.0 |
 | 6 | Spec tracking within 6 months | Current (2025-11-25) |
 | 7 | Documentation coverage | In progress |
 | 8 | Dependency update policy | dependabot.yml |
