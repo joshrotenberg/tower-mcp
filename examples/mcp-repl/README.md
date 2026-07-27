@@ -418,6 +418,39 @@ The banner and surface listing are suppressed in `--exec` mode (pass
 `--verbose` to keep them). `--json` applies to tool calls, `read`, `prompt`,
 `tools`/`prompts`/`resources`/`templates`, and errors (`{"error": "..."}`).
 
+## Capture and filtering
+
+The REPL is a small shell. A command's result can be captured into a variable,
+referenced in later arguments, or filtered inline.
+
+```text
+demo> x = search_crates query=serde
+$x = {2 fields}
+demo> get_crate_info name=$x.crates[0].name
+...
+demo> get_crate_info name=serde | crates[0].downloads
+11897234
+```
+
+- **Capture:** `name = <command>` binds the command's result to `$name`. The
+  spaces around `=` distinguish it from a `k=v` argument and from `alias name=...`.
+- **Reference:** `$name` and `$name.path[i].field` expand in later command
+  arguments before the command runs.
+- **Filter:** `<command> | <path>` prints just the selected value. A scalar
+  prints bare; an object or array prints as JSON.
+- **Paths** are a small selector: `.field`, `[index]`, chained (`crates[0].name`).
+  An undefined variable or a missing path is an error, so a typo fails an `-e`
+  chain rather than passing silently. JMESPath is a possible future addition.
+- **`vars`** lists what is bound; **`unset <name>`** clears one. Variables live
+  for the session, so they persist across an `-e` chain:
+
+```sh
+mcp-repl -e "x = search_crates query=serde" \
+         -e "get_crate_info name=\$x.crates[0].name" <server>
+```
+
+Capture and filtering currently act on tool-call results.
+
 ## Related tools
 
 - [mcp-probe](https://github.com/conikeec/mcp-probe): a Rust TUI debugging

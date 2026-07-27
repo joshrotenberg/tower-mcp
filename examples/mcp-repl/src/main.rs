@@ -38,6 +38,7 @@ mod sampling;
 mod session;
 mod style;
 mod subscribe;
+mod vars;
 mod wire;
 
 use std::collections::HashMap;
@@ -208,6 +209,8 @@ pub const BUILTINS: &[(&str, &str)] = &[
     ("info", "replay the connection banner plus capabilities"),
     ("wire", "toggle raw JSON-RPC frame tracing (on|off)"),
     ("last", "reprint the previous request and response"),
+    ("vars", "list captured variables"),
+    ("unset", "clear a captured variable"),
     ("quit", "exit"),
     ("exit", "exit"),
 ];
@@ -1156,6 +1159,24 @@ async fn handle_line(
             return false;
         }
     };
+    // Capture (`name = cmd`), pipe (`cmd | path`), and `$var` references make
+    // the REPL a small shell: routing and substitution run before dispatch so
+    // every command sees resolved arguments. Capture and pipe act on tool
+    // results.
+    let (output, routed) = vars::route(line);
+    let command = match vars::substitute(routed) {
+        Ok(c) => c,
+        Err(e) => {
+            note_error();
+            if json_output() {
+                println!("{}", error_json(&e));
+            } else {
+                println!("{}: {e}", style::error_prefix());
+            }
+            return false;
+        }
+    };
+    let line = command.as_str();
     let client = session.client();
     let mut tokens: Vec<&str> = line.split_whitespace().collect();
     let background = tokens.last() == Some(&"&");
@@ -1187,6 +1208,13 @@ async fn handle_line(
             println!("  alias [<name>=<expansion>] | unalias <name>  command aliases");
             println!("  wire [on|off]                             trace raw JSON-RPC frames");
             println!("  last                                      reprint the previous exchange");
+            println!(
+                "  vars | unset <name>                       list or clear captured variables"
+            );
+            println!(
+                "  name = <cmd> [| <path>]                   capture a result (filter with | path)"
+            );
+            println!("  $name.path in args                        reference a captured value");
             println!("  refresh | info | quit");
             let s = surface.read().unwrap();
             if !s.tools.is_empty() {
@@ -1450,7 +1478,7 @@ async fn handle_line(
                     return false;
                 }
             };
-            run_tool(session, surface, jobs, name, arguments, background).await;
+            run_tool(session, surface, jobs, name, arguments, background, &output).await;
         }
         "bench" => {
             handle_bench(&client, surface, rest, background).await;
@@ -1586,6 +1614,36 @@ async fn handle_line(
             }
             None => println!("not initialized"),
         },
+        "vars" => {
+            let all = vars::list();
+            if json_output() {
+                let map: serde_json::Map<String, serde_json::Value> = all.into_iter().collect();
+                println!("{}", json_pretty(&serde_json::Value::Object(map)));
+            } else if all.is_empty() {
+                println!("{}", paint(Style::new().dimmed(), "no variables"));
+            } else {
+                for (name, value) in all {
+                    println!(
+                        "{} {}",
+                        paint(Style::new().fg(Color::Cyan), &format!("${name} =")),
+                        value_summary(&value)
+                    );
+                }
+            }
+        }
+        "unset" => match rest.first() {
+            Some(name) => {
+                if vars::unset(name) {
+                    if !json_output() {
+                        println!("unset ${name}");
+                    }
+                } else {
+                    note_error();
+                    command_error(&format!("no such variable `${name}`"));
+                }
+            }
+            None => command_error("usage: unset <name>"),
+        },
         tool_name => {
             let schema = {
                 let s = surface.read().unwrap();
@@ -1623,7 +1681,10 @@ async fn handle_line(
                 return false;
             };
             let arguments = parse_kv_args(&schema, rest);
-            run_tool(session, surface, jobs, tool_name, arguments, background).await;
+            run_tool(
+                session, surface, jobs, tool_name, arguments, background, &output,
+            )
+            .await;
         }
     }
     false
@@ -2043,6 +2104,7 @@ async fn run_tool(
     name: &str,
     arguments: serde_json::Value,
     background: bool,
+    output: &vars::Output,
 ) {
     if background {
         match with_reconnect(session, surface, |c| {
@@ -2090,16 +2152,20 @@ async fn run_tool(
             if result.is_error {
                 note_error();
             }
-            if json_output() {
-                println!(
-                    "{}",
-                    json_pretty(&serde_json::to_value(&result).unwrap_or_default())
-                );
-            } else {
-                if result.is_error {
-                    println!("{}", tag(Style::new().fg(Color::Red), "tool error"));
+            if output.is_plain() {
+                if json_output() {
+                    println!(
+                        "{}",
+                        json_pretty(&serde_json::to_value(&result).unwrap_or_default())
+                    );
+                } else {
+                    if result.is_error {
+                        println!("{}", tag(Style::new().fg(Color::Red), "tool error"));
+                    }
+                    render_content(&result.content);
                 }
-                render_content(&result.content);
+            } else {
+                emit_result(result_value(&result), output);
             }
         }
         Err(e) => {
@@ -2113,6 +2179,69 @@ async fn run_tool(
     }
     if !json_output() {
         println!("{}", timing(started.elapsed()));
+    }
+}
+
+/// Extract a tool result's data value for capture or filtering: the structured
+/// content if present, else a lone JSON text block parsed, else the content.
+fn result_value(result: &tower_mcp::CallToolResult) -> serde_json::Value {
+    if let Some(structured) = &result.structured_content {
+        return structured.clone();
+    }
+    if let [Content::Text { text, .. }] = result.content.as_slice() {
+        return serde_json::from_str(text)
+            .unwrap_or_else(|_| serde_json::Value::String(text.clone()));
+    }
+    serde_json::to_value(&result.content).unwrap_or_default()
+}
+
+/// Apply a capture/filter [`vars::Output`] to a result value: select a path,
+/// bind it to a variable, or print it (bare scalar or pretty JSON).
+fn emit_result(mut value: serde_json::Value, output: &vars::Output) {
+    if let Some(path) = &output.filter {
+        match vars::get_path(&value, path) {
+            Some(selected) => value = selected,
+            None => {
+                note_error();
+                command_error(&format!("path `{path}` not found in result"));
+                return;
+            }
+        }
+    }
+    if let Some(name) = &output.capture {
+        vars::set(name, value.clone());
+        if json_output() {
+            println!("{}", json_pretty(&value));
+        } else {
+            println!(
+                "{} {}",
+                paint(Style::new().fg(Color::Cyan), &format!("${name} =")),
+                value_summary(&value)
+            );
+        }
+    } else if json_output() {
+        println!("{}", json_pretty(&value));
+    } else {
+        render_value(&value);
+    }
+}
+
+fn value_summary(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => format!("{s:?}"),
+        serde_json::Value::Array(a) => format!("[{} items]", a.len()),
+        serde_json::Value::Object(o) => format!("{{{} fields}}", o.len()),
+        other => other.to_string(),
+    }
+}
+
+fn render_value(value: &serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) => println!("{s}"),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            println!("{}", json_pretty(value))
+        }
+        other => println!("{other}"),
     }
 }
 
