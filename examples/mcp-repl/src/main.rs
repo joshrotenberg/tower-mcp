@@ -20,14 +20,16 @@
 //! cargo run -p mcp-repl -- --server cratesio
 //! ```
 //!
-//! Inside the REPL, `help` lists the built-ins and the server's tools, and
+//! Inside the REPL, `help` lists the built-ins and the server's tools,
 //! `alias <name>=<expansion>` gives a frequent command a short name, kept in
-//! the same config file as the server profiles.
+//! the same config file as the server profiles, and `bench <tool>` reports the
+//! latency distribution over repeated calls.
 //! A trailing `&` runs a tool task-augmented (SEP-2663): the call returns a
 //! task id immediately; `jobs`, `task <id>`, `wait <id>`, and `cancel <id>`
 //! manage it.
 
 mod alias;
+mod bench;
 mod config;
 mod editor;
 mod elicit;
@@ -180,6 +182,7 @@ pub const BUILTINS: &[(&str, &str)] = &[
     ("read", "read a resource"),
     ("prompt", "get a prompt"),
     ("call", "call a tool with raw JSON"),
+    ("bench", "time repeated calls to a tool"),
     ("jobs", "list background tasks"),
     ("task", "show a background task"),
     ("wait", "wait for a background task"),
@@ -960,6 +963,7 @@ async fn handle_line(
             println!("  read <uri>                                read a resource");
             println!("  prompt <name> [k=v...]                    get a prompt");
             println!("  call <tool> <json>                        call a tool with raw JSON");
+            println!("  bench <tool> [k=v...] [--n N] [--concurrency C]  time repeated calls");
             println!("  <tool> [k=v...]                           call a tool (schema-coerced)");
             println!("  <tool> [k=v...] &                         run task-augmented (SEP-2663)");
             println!("  jobs | task <id> | wait <id> | cancel <id>  manage tasks");
@@ -1189,6 +1193,9 @@ async fn handle_line(
             };
             run_tool(client, jobs, name, arguments, background).await;
         }
+        "bench" => {
+            handle_bench(client, surface, rest, background).await;
+        }
         "jobs" => {
             if jobs.is_empty() {
                 println!("no background tasks");
@@ -1344,6 +1351,64 @@ async fn handle_line(
     false
 }
 
+/// The `bench` built-in: issue one tool call repeatedly and report how long
+/// the calls took. Arguments are coerced against the tool's `inputSchema`,
+/// exactly as a direct call is, so `bench <tool> a=1` benchmarks the same
+/// request `<tool> a=1` would send.
+async fn handle_bench(
+    client: &Arc<McpClient>,
+    surface: &Arc<RwLock<Surface>>,
+    rest: &[&str],
+    background: bool,
+) {
+    // A trailing `&` is stripped before dispatch, so say why it did nothing
+    // rather than silently benchmarking the non-task path.
+    if background {
+        command_error("bench cannot run task-augmented; drop the trailing `&`");
+        return;
+    }
+    let plan = match bench::parse(rest) {
+        Ok(plan) => plan,
+        Err(e) => {
+            command_error(&e);
+            return;
+        }
+    };
+    let schema = {
+        let s = surface.read().unwrap();
+        s.tools
+            .iter()
+            .find(|t| t.name == plan.tool)
+            .map(|t| t.input_schema.clone())
+    };
+    let Some(schema) = schema else {
+        command_error(&format!("no tool named `{}` (try `tools`)", plan.tool));
+        return;
+    };
+    let arg_tokens: Vec<&str> = plan.args.iter().map(String::as_str).collect();
+    let arguments = parse_kv_args(&schema, &arg_tokens);
+
+    let outcome = bench::run(client, &plan.tool, arguments, plan.n, plan.concurrency).await;
+    // A run with failures in it exits non-zero, like any other failing
+    // command, so `-e "bench ..."` works as a health check.
+    if outcome.errors > 0 {
+        note_error();
+    }
+    if json_output() {
+        println!("{}", json_pretty(&bench::render_json(&plan, &outcome)));
+        return;
+    }
+    println!("{}", bench::render(&plan, &outcome));
+    if let Some(message) = &outcome.first_error {
+        println!(
+            "{} {}",
+            tag(Style::new().fg(Color::Red), "first error"),
+            message
+        );
+    }
+    println!("{}", timing(outcome.total));
+}
+
 /// The `alias` and `unalias` built-ins: define, list, show, and remove
 /// command aliases, persisting each change to the config file.
 ///
@@ -1391,7 +1456,7 @@ fn handle_alias(
                     );
                 }
             }
-            Err(e) => alias_error(&e),
+            Err(e) => command_error(&e),
         }
         return;
     }
@@ -1448,7 +1513,7 @@ fn handle_alias(
                 expansion,
                 paint(Style::new().dimmed(), &format!("({})", scope.label()))
             ),
-            None => alias_error(&format!(
+            None => command_error(&format!(
                 "no alias named `{rest}` (define one with `alias {rest}=<expansion>`)"
             )),
         }
@@ -1495,7 +1560,7 @@ fn handle_alias(
                 );
             }
         }
-        Err(e) => alias_error(&e),
+        Err(e) => command_error(&e),
     }
 }
 
@@ -1507,7 +1572,7 @@ fn report_alias_warning(warning: Option<&str>) {
     }
 }
 
-fn alias_error(message: &str) {
+fn command_error(message: &str) {
     note_error();
     if json_output() {
         println!("{}", error_json(message));
@@ -1792,6 +1857,14 @@ mod tests {
     fn timing_formats_sub_second_and_seconds() {
         assert!(timing(Duration::from_millis(142)).contains("[142ms]"));
         assert!(timing(Duration::from_millis(2500)).contains("[2.50s]"));
+    }
+
+    // Completion and input highlighting both read BUILTINS, and an alias may
+    // not shadow a name in it, so listing a command there is what makes it a
+    // first-class built-in rather than a hidden one.
+    #[test]
+    fn bench_is_a_listed_builtin() {
+        assert!(BUILTINS.iter().any(|(name, _)| *name == "bench"));
     }
 
     #[test]

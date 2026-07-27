@@ -179,6 +179,41 @@ Progress and log notifications print inline as they arrive, and
 dynamic servers (see the `dynamic_capabilities` example) grow and shrink the
 REPL's vocabulary live.
 
+## bench
+
+The `[142ms]` annotation answers "how slow was that call". `bench` answers
+"how slow is this tool", which is the question behind a server sitting on a
+network, a cold cache, or a rate limiter.
+
+```text
+cratesio> bench get_downloads crate=serde --n 50
+50 calls  ok=50 err=0  min=88ms p50=104ms p95=190ms max=311ms
+[5.42s]
+cratesio> bench get_downloads crate=serde --n 50 --concurrency 8
+50 calls  ok=50 err=0 concurrency=8  min=91ms p50=127ms p95=402ms max=655ms
+[892ms]
+```
+
+- `bench <tool> [k=v...] [--n N] [--concurrency C]`. Arguments are coerced
+  against the tool's `inputSchema` exactly as a direct call is, so
+  `bench <tool> a=1` benchmarks the request `<tool> a=1` would send. Flags may
+  appear anywhere after the tool name, in either spelling (`--n 50`,
+  `--n=50`).
+- `--n` defaults to 20 and is capped at 100000; `--concurrency` defaults to 1
+  (serial) and never exceeds `--n`. Workers pull from a shared counter, so one
+  slow call does not leave a worker's remaining share queued behind it.
+- Percentiles are nearest-rank over the calls that succeeded, so every number
+  reported is a latency that actually happened. Failures are counted
+  separately, with the first message shown, rather than folded into the
+  distribution: a fast rejection is not a fast call.
+- A tool result with `isError` counts as a failure, and any failure makes the
+  command exit non-zero, so `mcp-repl -e "bench <tool> --n 20" <server>` works
+  as a scripted health check.
+- Under `--json`, an object with `calls`, `ok`, `errors`, `concurrency`,
+  `firstError`, and `minMs` / `p50Ms` / `p95Ms` / `maxMs` / `totalMs`. The
+  latency fields are `null` when nothing succeeded, so a failed run cannot be
+  read as an instant one.
+
 ## Wire tracing
 
 Half of any "is it the client, the server, or the network?" question is
@@ -237,6 +272,8 @@ Tab opens a columnar menu. What gets completed:
 - `prompt <name> <arg>=`: argument values via `completion/complete`, and
   argument names from the prompt definition.
 - `describe <name>`: everything on the surface, labeled by kind.
+- `bench <tool> ...`: tool names in the first position, then that tool's
+  argument names, and `--n` / `--concurrency` after a leading `-`.
 - `unalias <name>`: the aliases in effect, with their scope.
 
 ## describe

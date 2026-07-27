@@ -215,6 +215,70 @@ impl ReplCompleter {
         out
     }
 
+    /// Completions for a word in a tool's argument list: argument names from
+    /// the tool's `inputSchema` properties, and enum values after `=`.
+    fn complete_tool_arg_word(
+        surface: &Surface,
+        tool_name: &str,
+        word: &str,
+        span: Span,
+    ) -> Vec<Suggestion> {
+        let mut out = Vec::new();
+        let Some(tool) = surface.tools.iter().find(|t| t.name == tool_name) else {
+            return out;
+        };
+        let Some(props) = tool
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+        else {
+            return out;
+        };
+        if let Some((arg_name, partial)) = word.split_once('=') {
+            // Enum values from the property schema, when declared.
+            if let Some(values) = props
+                .get(arg_name)
+                .and_then(|s| s.get("enum"))
+                .and_then(|e| e.as_array())
+            {
+                for v in values {
+                    if let Some(v) = v.as_str()
+                        && v.starts_with(partial)
+                    {
+                        out.push(word_suggestion(format!("{arg_name}={v}"), None, span));
+                    }
+                }
+            }
+            return out;
+        }
+        let required: Vec<&str> = tool
+            .input_schema
+            .get("required")
+            .and_then(|r| r.as_array())
+            .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        for (key, prop) in props {
+            if !key.starts_with(word) {
+                continue;
+            }
+            let ty = prop.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            let desc = prop
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("");
+            let req = if required.contains(&key.as_str()) {
+                "required "
+            } else {
+                ""
+            };
+            let full = format!("{req}{ty} {desc}");
+            let full = full.trim();
+            let desc = (!full.is_empty()).then(|| full.to_string());
+            out.push(suggestion(format!("{key}="), desc, span));
+        }
+        out
+    }
+
     /// Completions for `describe <name>`: every named thing on the surface.
     fn complete_describe_word(surface: &Surface, word: &str, span: Span) -> Vec<Suggestion> {
         let mut out = Vec::new();
@@ -349,61 +413,34 @@ impl Completer for ReplCompleter {
                     }
                 }
             }
-            tool_name => {
-                // Dynamic tool command: complete argument names from the
-                // tool's inputSchema properties, and enum values after `=`.
-                let Some(tool) = surface.tools.iter().find(|t| t.name == tool_name) else {
-                    return out;
-                };
-                let Some(props) = tool
-                    .input_schema
-                    .get("properties")
-                    .and_then(|p| p.as_object())
-                else {
-                    return out;
-                };
-                if let Some((arg_name, partial)) = word.split_once('=') {
-                    // Enum values from the property schema, when declared.
-                    if let Some(values) = props
-                        .get(arg_name)
-                        .and_then(|s| s.get("enum"))
-                        .and_then(|e| e.as_array())
-                    {
-                        for v in values {
-                            if let Some(v) = v.as_str()
-                                && v.starts_with(partial)
-                            {
-                                out.push(word_suggestion(format!("{arg_name}={v}"), None, span));
-                            }
+            "bench" => {
+                // `bench <tool> [k=v...] [--n N] [--concurrency C]`: the tool
+                // name first, then that tool's arguments, so it completes the
+                // same way calling the tool directly does.
+                let words = head.split_whitespace().count();
+                let naming_tool = words == 1 || (words == 2 && !head.ends_with(' '));
+                if word.starts_with('-') {
+                    for flag in ["--n", "--concurrency"] {
+                        if flag.starts_with(word) {
+                            out.push(word_suggestion(flag, None, span));
                         }
                     }
-                } else {
-                    let required: Vec<&str> = tool
-                        .input_schema
-                        .get("required")
-                        .and_then(|r| r.as_array())
-                        .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
-                        .unwrap_or_default();
-                    for (key, prop) in props {
-                        if !key.starts_with(word) {
-                            continue;
+                } else if naming_tool {
+                    for t in &surface.tools {
+                        if t.name.starts_with(word) {
+                            out.push(word_suggestion(&t.name, t.description.clone(), span));
                         }
-                        let ty = prop.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                        let desc = prop
-                            .get("description")
-                            .and_then(|d| d.as_str())
-                            .unwrap_or("");
-                        let req = if required.contains(&key.as_str()) {
-                            "required "
-                        } else {
-                            ""
-                        };
-                        let full = format!("{req}{ty} {desc}");
-                        let full = full.trim();
-                        let desc = (!full.is_empty()).then(|| full.to_string());
-                        out.push(suggestion(format!("{key}="), desc, span));
                     }
+                } else if let Some(tool_name) = head.split_whitespace().nth(1) {
+                    out.extend(Self::complete_tool_arg_word(
+                        &surface, tool_name, word, span,
+                    ));
                 }
+            }
+            tool_name => {
+                out.extend(Self::complete_tool_arg_word(
+                    &surface, tool_name, word, span,
+                ));
             }
         }
 
