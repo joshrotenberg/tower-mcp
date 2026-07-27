@@ -501,6 +501,31 @@ impl McpClient {
         self.send_request("resources/read", &params).await
     }
 
+    /// Subscribe to `notifications/resources/updated` for one resource
+    /// (`resources/subscribe`).
+    ///
+    /// The updates themselves arrive through the notification handler, so a
+    /// client that subscribes without registering
+    /// [`NotificationHandler::on_resource_updated`] will not see them. Servers
+    /// that support this advertise `resources.subscribe` in their
+    /// capabilities; one that does not will reject the request.
+    pub async fn subscribe_resource(&self, uri: &str) -> Result<()> {
+        self.ensure_initialized()?;
+        let _: serde_json::Value = self
+            .send_request("resources/subscribe", &serde_json::json!({ "uri": uri }))
+            .await?;
+        Ok(())
+    }
+
+    /// Stop receiving updates for a resource (`resources/unsubscribe`).
+    pub async fn unsubscribe_resource(&self, uri: &str) -> Result<()> {
+        self.ensure_initialized()?;
+        let _: serde_json::Value = self
+            .send_request("resources/unsubscribe", &serde_json::json!({ "uri": uri }))
+            .await?;
+        Ok(())
+    }
+
     /// List available prompts.
     pub async fn list_prompts(&self) -> Result<ListPromptsResult> {
         self.ensure_initialized()?;

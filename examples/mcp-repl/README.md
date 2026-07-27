@@ -238,6 +238,34 @@ cratesio> bench get_downloads crate=serde --n 50 --concurrency 8
   latency fields are `null` when nothing succeeded, so a failed run cannot be
   read as an instant one.
 
+## Resource subscriptions
+
+A server that supports `resources.subscribe` will push
+`notifications/resources/updated` for the resources you ask about. The REPL
+prints those inline, the way progress and log lines arrive:
+
+```text
+demo> subscribe note://status
+subscribed note://status
+demo> subscriptions
+note://status
+[resource updated] note://status
+demo> unsubscribe note://status
+unsubscribed note://status
+```
+
+- `subscribe <uri>` and `unsubscribe <uri>` complete from the surface and
+  from what is actually subscribed, respectively.
+- The local set is only updated once the server agrees, so `subscriptions`
+  lists what the server is sending updates for, not what was asked for.
+  Re-subscribing to something already held says so rather than double-counting.
+- A server that does not advertise `resources.subscribe` gets a warning before
+  the request goes out, so the rejection is explained rather than bare.
+- An update for something this session did not subscribe to is still printed,
+  tagged `(not subscribed here)`.
+- The resource is not re-read on an update: reading may be expensive, and the
+  point is to know it moved. Follow with `read <uri>` when you want the content.
+
 ## Wire tracing
 
 Half of any "is it the client, the server, or the network?" question is

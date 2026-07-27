@@ -37,6 +37,7 @@ mod find;
 mod sampling;
 mod session;
 mod style;
+mod subscribe;
 mod wire;
 
 use std::collections::HashMap;
@@ -191,6 +192,9 @@ pub const BUILTINS: &[(&str, &str)] = &[
     ("find", "search the surface by keyword"),
     ("describe", "show schemas and metadata for a name"),
     ("read", "read a resource"),
+    ("subscribe", "watch a resource for updates"),
+    ("unsubscribe", "stop watching a resource"),
+    ("subscriptions", "list active resource subscriptions"),
     ("prompt", "get a prompt"),
     ("call", "call a tool with raw JSON"),
     ("bench", "time repeated calls to a tool"),
@@ -625,6 +629,23 @@ fn demo_router() -> tower_mcp::McpRouter {
                 })
                 .build(),
         )
+        // A concrete resource, so `read`, `subscribe`, and `unsubscribe` all
+        // have something to point at without an external server. Subscribing
+        // needs a registered URI: the router rejects a subscription to
+        // anything it does not serve.
+        .resource(
+            tower_mcp::resource::ResourceBuilder::new("note://status")
+                .name("Status")
+                .description("A one-line status note (subscribe to it)")
+                .mime_type("text/plain")
+                .handler(|| async {
+                    Ok(ReadResourceResult::text(
+                        "note://status",
+                        "all quiet on the demo server",
+                    ))
+                })
+                .build(),
+        )
         .resource_template(
             ResourceTemplateBuilder::new("note://{name}")
                 .name("Notes")
@@ -728,6 +749,20 @@ fn notification_handler(refresh_tx: tokio::sync::mpsc::UnboundedSender<()>) -> N
                 "{} {}",
                 tag(Style::new().fg(Color::Cyan), &format!("progress{pct}")),
                 p.message.as_deref().unwrap_or("")
+            );
+        })
+        // A subscribed resource changed. Printed inline like progress and log
+        // lines; the content is not re-read, since a `read` may be expensive and
+        // the point is to know it moved.
+        .on_resource_updated(|uri| {
+            let known = if subscribe::contains(&uri) {
+                String::new()
+            } else {
+                format!(" {}", paint(Style::new().dimmed(), "(not subscribed here)"))
+            };
+            println!(
+                "{} {uri}{known}",
+                tag(Style::new().fg(Color::Cyan), "resource updated")
             );
         })
         .on_log_message(|m| {
@@ -1141,6 +1176,8 @@ async fn handle_line(
             println!("  find <keyword>                            search the surface");
             println!("  describe <name>                           schemas and metadata");
             println!("  read <uri>                                read a resource");
+            println!("  subscribe <uri> | unsubscribe <uri>       watch a resource for updates");
+            println!("  subscriptions                             list active subscriptions");
             println!("  prompt <name> [k=v...]                    get a prompt");
             println!("  call <tool> <json>                        call a tool with raw JSON");
             println!("  bench <tool> [k=v...] [--n N] [--concurrency C]  time repeated calls");
@@ -1321,6 +1358,27 @@ async fn handle_line(
             }
             if !json_output() {
                 println!("{}", timing(started.elapsed()));
+            }
+        }
+        "subscribe" | "unsubscribe" => {
+            let Some(uri) = rest.first() else {
+                println!("usage: {cmd} <uri>");
+                return false;
+            };
+            handle_subscription(&client, cmd, uri).await;
+        }
+        "subscriptions" => {
+            let active = subscribe::list();
+            if json_output() {
+                println!("{}", json_pretty(&serde_json::json!(active)));
+                return false;
+            }
+            if active.is_empty() {
+                println!("no active subscriptions (try `subscribe <uri>`)");
+                return false;
+            }
+            for uri in &active {
+                println!("{}", paint(Style::new().fg(Color::Green), uri));
             }
         }
         "prompt" => {
@@ -1627,6 +1685,65 @@ async fn handle_bench(
         );
     }
     println!("{}", timing(outcome.total));
+}
+
+/// The `subscribe` and `unsubscribe` built-ins. The local set is only updated
+/// once the server has agreed, so `subscriptions` lists what the server is
+/// actually sending updates for, not what was asked for.
+async fn handle_subscription(client: &Arc<McpClient>, cmd: &str, uri: &str) {
+    // A server that does not advertise the capability will reject the call.
+    // Saying so first turns a bare protocol error into an explanation.
+    if cmd == "subscribe"
+        && let Some(info) = client.server_info().await
+        && !subscribe::server_supports(
+            &serde_json::to_value(&info.capabilities).unwrap_or_default(),
+        )
+    {
+        eprintln!(
+            "warning: {} does not advertise resources.subscribe; the request will \
+             probably be rejected",
+            info.server_info.name
+        );
+    }
+    let started = std::time::Instant::now();
+    let outcome = if cmd == "subscribe" {
+        client.subscribe_resource(uri).await
+    } else {
+        client.unsubscribe_resource(uri).await
+    };
+    match outcome {
+        Ok(()) => {
+            let changed = if cmd == "subscribe" {
+                subscribe::add(uri)
+            } else {
+                subscribe::remove(uri)
+            };
+            if json_output() {
+                println!(
+                    "{}",
+                    serde_json::json!({ cmd: uri, "alreadyInEffect": !changed })
+                );
+            } else {
+                let note = if changed {
+                    String::new()
+                } else {
+                    format!(" {}", paint(Style::new().dimmed(), "(already in effect)"))
+                };
+                println!("{cmd}d {}{note}", paint(Style::new().fg(Color::Green), uri));
+            }
+        }
+        Err(e) => {
+            note_error();
+            if json_output() {
+                println!("{}", error_json(&e.to_string()));
+            } else {
+                println!("{}: {e}", style::error_prefix());
+            }
+        }
+    }
+    if !json_output() {
+        println!("{}", timing(started.elapsed()));
+    }
 }
 
 /// The `alias` and `unalias` built-ins: define, list, show, and remove
