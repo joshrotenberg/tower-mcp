@@ -28,6 +28,7 @@
 mod config;
 mod editor;
 mod elicit;
+mod sampling;
 mod style;
 mod wire;
 
@@ -114,6 +115,13 @@ struct Args {
     /// (suppressed by default so only command output is emitted).
     #[arg(long)]
     verbose: bool,
+
+    /// How to answer a server's `sampling/createMessage` request: `prompt`
+    /// shows it and reads the assistant message on stdin, `canned` answers
+    /// with a fixed placeholder, `decline` refuses. Defaults to `prompt`
+    /// interactively and `decline` under --exec.
+    #[arg(long, value_enum, value_name = "STRATEGY")]
+    sampling: Option<sampling::SamplingMode>,
 
     /// Do not persist command history to ~/.mcp-repl_history.
     #[arg(long)]
@@ -705,6 +713,10 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
                 );
             })
     };
+    // Sampling has no model behind it, so the operator answers. Under --exec
+    // there is nobody to ask, so requests are refused unless --sampling says
+    // otherwise.
+    sampling::init(sampling::resolve(args.sampling, one_shot));
     let handler = ReplClientHandler::new(notifications, at_prompt.clone());
 
     // Explicit flags override profile fields: --http retargets a profile's URL
@@ -753,7 +765,11 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     // Every transport is wrapped, whatever `--trace` says: the wrapper is what
     // records the exchange `last` reprints, and tracing can be switched on
     // mid-session with `wire on`.
-    let builder = McpClient::builder().with_elicitation();
+    // Sampling is advertised whatever the strategy: a client is allowed to
+    // refuse an individual request, and a server can only ask when the
+    // capability is declared, so `--sampling decline` still exercises the
+    // server's rejection path.
+    let builder = McpClient::builder().with_elicitation().with_sampling();
     let client = if args.demo {
         builder
             .connect(
@@ -1240,6 +1256,14 @@ async fn handle_line(
                 print_counts(&surface.read().unwrap());
                 let caps = serde_json::to_value(&info.capabilities).unwrap_or_default();
                 println!("capabilities: {}", json_pretty(&caps));
+                // What this client does with a request the server sends back.
+                println!(
+                    "{}",
+                    paint(
+                        Style::new().dimmed(),
+                        &format!("sampling: {}", sampling::mode().as_str())
+                    )
+                );
             }
             None => println!("not initialized"),
         },
