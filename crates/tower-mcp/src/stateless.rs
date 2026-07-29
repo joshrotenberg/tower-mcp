@@ -70,10 +70,13 @@ use crate::protocol::{ClientCapabilities, Implementation, ProgressToken};
 /// }
 /// ```
 ///
-/// Three of these are REQUIRED per the spec (`protocolVersion`, `clientInfo`,
-/// `clientCapabilities`). They are typed as `Option<_>` here so deserialization
-/// stays tolerant of partial/transitional clients; server-side validation
-/// should reject requests that lack the required fields.
+/// `protocolVersion` and `clientCapabilities` are REQUIRED per the spec.
+/// `clientInfo` is a SHOULD -- clients are expected to send it on every
+/// request unless specifically configured not to, but a server MUST NOT
+/// reject a request for lacking it. All three are typed as `Option<_>` here
+/// so deserialization stays tolerant of partial/transitional clients;
+/// server-side validation should reject requests that lack the two required
+/// fields.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatelessRequestMeta {
@@ -91,9 +94,12 @@ pub struct StatelessRequestMeta {
     )]
     pub protocol_version: Option<String>,
 
-    /// Identifies the client software making this request. REQUIRED per
-    /// SEP-2575 (the spec uses non-Option types; we keep `Option` for
-    /// deserialization tolerance).
+    /// Identifies the client software making this request. Clients SHOULD
+    /// include this on every request unless specifically configured not to
+    /// (SEP-2575, final -- earlier SEP-2575 drafts had this as REQUIRED; the
+    /// upstream schema demoted it before finalization). Self-reported and
+    /// unverified: servers SHOULD NOT use it for behavior or security
+    /// decisions, only display/logging/debugging.
     #[serde(
         rename = "io.modelcontextprotocol/clientInfo",
         skip_serializing_if = "Option::is_none"

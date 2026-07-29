@@ -2622,7 +2622,13 @@ impl McpRouter {
                     total = ?params.total,
                     "Progress notification"
                 );
-                // Progress notifications from client are unusual but valid
+                // Client-to-server progress notifications are unusual but
+                // valid through 2025-11-25. The final 2026-07-28 schema
+                // removes ProgressNotification from ClientNotification
+                // entirely -- clients no longer send this. Notifications are
+                // fire-and-forget with no response to reject with, so an
+                // off-spec one arriving here is simply logged and ignored
+                // rather than rejected, regardless of negotiated version.
             }
             McpNotification::RootsListChanged => {
                 tracing::info!("Client roots list changed");

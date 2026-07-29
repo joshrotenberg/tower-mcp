@@ -474,7 +474,18 @@ pub enum McpNotification {
     },
 }
 
-/// Parameters for cancellation notification
+/// Parameters for cancellation notification.
+///
+/// **Directionality changed in the final 2026-07-28 schema.** Through
+/// 2025-11-25, either side could send this notification to cancel a
+/// previously-issued request. The final 2026-07-28 schema restricts it to
+/// client-to-server only (`requestId` MUST reference a request the client
+/// issued); on stdio, the server may still send it, but solely to terminate
+/// a `subscriptions/listen` stream by referencing that request's id -- it
+/// MUST NOT use it to cancel any other request. This crate does not
+/// currently send `notifications/cancelled` from the server for any
+/// purpose, so no code changes; the `subscriptions/listen` termination case
+/// is part of #952.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CancelledParams {
@@ -661,7 +672,12 @@ pub struct ClientCapabilities {
     /// Experimental, non-standard capabilities
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub experimental: Option<HashMap<String, serde_json::Value>>,
-    /// Declared extension support (SEP-1724/SEP-2133)
+    /// Declared extension support (SEP-1724/SEP-2133).
+    ///
+    /// Keys MUST follow the `_meta` key naming rules (reverse-DNS prefix
+    /// mandatory, e.g. `io.modelcontextprotocol/tasks`) per the final
+    /// 2026-07-28 schema. Not currently validated on receipt -- this crate
+    /// has no `_meta`-key-naming validation anywhere yet, not just here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extensions: Option<HashMap<String, serde_json::Value>>,
 }
@@ -1720,7 +1736,12 @@ pub struct ServerCapabilities {
     /// Experimental, non-standard capabilities
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub experimental: Option<HashMap<String, serde_json::Value>>,
-    /// Declared extension support (SEP-1724/SEP-2133)
+    /// Declared extension support (SEP-1724/SEP-2133).
+    ///
+    /// Keys MUST follow the `_meta` key naming rules (reverse-DNS prefix
+    /// mandatory, e.g. `io.modelcontextprotocol/tasks`) per the final
+    /// 2026-07-28 schema. Not currently validated on receipt -- this crate
+    /// has no `_meta`-key-naming validation anywhere yet, not just here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extensions: Option<HashMap<String, serde_json::Value>>,
 }
