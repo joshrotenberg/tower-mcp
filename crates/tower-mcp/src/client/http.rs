@@ -742,6 +742,12 @@ fn encode_header_value(value: &str) -> String {
     }
 }
 
+fn is_jsonrpc_error_response(value: &serde_json::Value) -> bool {
+    value.get("error").is_some_and(serde_json::Value::is_object)
+        && value.pointer("/error/code").is_some()
+        && value.pointer("/error/message").is_some()
+}
+
 #[async_trait]
 impl ClientTransport for HttpClientTransport {
     async fn send(&mut self, message: &str) -> Result<()> {
@@ -1099,7 +1105,7 @@ impl ClientTransport for HttpClientTransport {
             let body = response.text().await.unwrap_or_default();
             if is_modern_request
                 && let Ok(mut error) = serde_json::from_str::<serde_json::Value>(&body)
-                && error.get("error").is_some()
+                && is_jsonrpc_error_response(&error)
             {
                 if error.get("id").is_none_or(serde_json::Value::is_null)
                     && let Some(id) = parsed_message.as_ref().and_then(|value| value.get("id"))
@@ -1891,6 +1897,22 @@ mod tests {
             encode_header_value("Hello, 世界"),
             "=?base64?SGVsbG8sIOS4lueVjA==?="
         );
+    }
+
+    #[test]
+    fn oauth_error_body_is_not_misclassified_as_jsonrpc() {
+        assert!(!is_jsonrpc_error_response(&serde_json::json!({
+            "error": "insufficient_scope",
+            "error_description": "Token has insufficient scope"
+        })));
+        assert!(is_jsonrpc_error_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": -32022,
+                "message": "Unsupported protocol version"
+            }
+        })));
     }
 
     #[test]

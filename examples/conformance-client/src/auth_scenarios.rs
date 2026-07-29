@@ -5,30 +5,51 @@
 //! with the authorization code, enabling headless OAuth flows.
 
 use anyhow::{Context, Result};
-use tower_mcp::client::McpClient;
 use tower_mcp::{HttpClientConfig, HttpClientTransport};
 
 use crate::handlers;
+
+struct OAuthFlowResult {
+    access_token: String,
+    requested_scope: Option<String>,
+}
 
 /// Standard OAuth authorization-code flow.
 ///
 /// Used by most auth scenarios: metadata discovery variants, CIMD, scope handling,
 /// token endpoint auth methods, and backcompat scenarios.
 pub async fn standard_auth(server_url: &str, context: &Option<serde_json::Value>) -> Result<()> {
-    let access_token = perform_oauth_flow(server_url, context, None).await?;
-    run_authed_client(server_url, &access_token).await
+    let flow = perform_oauth_flow(server_url, context, None).await?;
+    run_authed_client(server_url, &flow.access_token).await
+}
+
+/// Re-discover and re-register when protected-resource metadata changes issuer.
+pub async fn authorization_server_migration(
+    server_url: &str,
+    context: &Option<serde_json::Value>,
+) -> Result<()> {
+    let first = perform_oauth_flow(server_url, context, None).await?;
+    let first_result = run_authed_client(server_url, &first.access_token).await;
+    anyhow::ensure!(
+        first_result.is_err(),
+        "authorization-server migration scenario did not reject the first issuer's token"
+    );
+
+    let second = perform_oauth_flow(server_url, context, None).await?;
+    run_authed_client(server_url, &second.access_token).await
 }
 
 /// Scope step-up: connect, try tools, re-auth on failure, retry.
 pub async fn scope_step_up(server_url: &str, context: &Option<serde_json::Value>) -> Result<()> {
-    let access_token = perform_oauth_flow(server_url, context, None).await?;
+    let initial_flow = perform_oauth_flow(server_url, context, None).await?;
+    let access_token = &initial_flow.access_token;
 
-    let transport = HttpClientTransport::new(server_url).bearer_token(&access_token);
-    let client = McpClient::builder()
+    let transport = HttpClientTransport::new(server_url).bearer_token(access_token);
+    let client = crate::core_scenarios::client_builder()?
         .connect(transport, handlers::BasicHandler)
         .await?;
 
-    client.initialize("conformance-client", "0.1.0").await?;
+    crate::core_scenarios::activate(&client).await?;
 
     // Try listing/calling tools -- may fail with 403 at any point
     let mut needs_reauth = false;
@@ -73,17 +94,21 @@ pub async fn scope_step_up(server_url: &str, context: &Option<serde_json::Value>
 
     if needs_reauth {
         // Probe the server with the old token to get the required scope from 403 WWW-Authenticate
-        let escalated_scope = probe_for_scope(server_url, &access_token).await;
+        let escalated_scope = probe_for_scope(server_url, access_token).await;
         tracing::info!(scope = ?escalated_scope, "Escalated scope from 403 probe");
 
         // Re-authenticate with escalated scope
-        let new_token = perform_oauth_flow(server_url, context, escalated_scope.as_deref()).await?;
-        let transport = HttpClientTransport::new(server_url).bearer_token(&new_token);
-        let client = McpClient::builder()
+        let union_scope = union_scopes(
+            initial_flow.requested_scope.as_deref(),
+            escalated_scope.as_deref(),
+        );
+        let new_flow = perform_oauth_flow(server_url, context, union_scope.as_deref()).await?;
+        let transport = HttpClientTransport::new(server_url).bearer_token(&new_flow.access_token);
+        let client = crate::core_scenarios::client_builder()?
             .connect(transport, handlers::BasicHandler)
             .await?;
 
-        client.initialize("conformance-client", "0.1.0").await?;
+        crate::core_scenarios::activate(&client).await?;
 
         // Second attempt -- may still fail with 403 if server requires further escalation
         match client.list_tools().await {
@@ -115,13 +140,13 @@ pub async fn scope_retry_limit(
 ) -> Result<()> {
     for attempt in 0..3 {
         tracing::info!(attempt, "Auth attempt");
-        let access_token = perform_oauth_flow(server_url, context, None).await?;
-        let transport = HttpClientTransport::new(server_url).bearer_token(&access_token);
-        let client = McpClient::builder()
+        let flow = perform_oauth_flow(server_url, context, None).await?;
+        let transport = HttpClientTransport::new(server_url).bearer_token(&flow.access_token);
+        let client = crate::core_scenarios::client_builder()?
             .connect(transport, handlers::BasicHandler)
             .await?;
 
-        client.initialize("conformance-client", "0.1.0").await?;
+        crate::core_scenarios::activate(&client).await?;
         let tools = client.list_tools().await?;
 
         let mut success = true;
@@ -158,9 +183,9 @@ pub async fn resource_mismatch(
 ) -> Result<()> {
     // Try the standard flow -- expect it to fail due to resource mismatch
     match perform_oauth_flow(server_url, context, None).await {
-        Ok(token) => {
+        Ok(flow) => {
             // If we got a token, try using it -- should fail
-            let result = run_authed_client(server_url, &token).await;
+            let result = run_authed_client(server_url, &flow.access_token).await;
             if result.is_err() {
                 return Ok(());
             }
@@ -432,6 +457,67 @@ pub async fn cross_app_access(server_url: &str, context: &Option<serde_json::Val
 // Internal helpers
 // ============================================================================
 
+async fn send_initial_mcp_probe(
+    http: &reqwest::Client,
+    server_url: &str,
+) -> Result<reqwest::Response> {
+    let mut request = http
+        .post(server_url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream");
+
+    if crate::core_scenarios::uses_final_protocol() {
+        request = request
+            .header("MCP-Protocol-Version", "2026-07-28")
+            .header("Mcp-Method", "server/discover")
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "server/discover",
+                "params": {
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                        "io.modelcontextprotocol/clientInfo": {
+                            "name": "conformance-client",
+                            "version": "0.1.0"
+                        }
+                    }
+                }
+            }));
+    } else {
+        request = request.json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "conformance-client",
+                    "version": "0.1.0"
+                }
+            }
+        }));
+    }
+
+    Ok(request.send().await?)
+}
+
+fn union_scopes(left: Option<&str>, right: Option<&str>) -> Option<String> {
+    let mut scopes = Vec::new();
+    for scope in left
+        .into_iter()
+        .chain(right)
+        .flat_map(str::split_whitespace)
+    {
+        if !scopes.contains(&scope) {
+            scopes.push(scope);
+        }
+    }
+    (!scopes.is_empty()).then(|| scopes.join(" "))
+}
+
 /// Result of probing the server for auth requirements.
 struct ProbeResult {
     #[allow(dead_code)]
@@ -445,13 +531,7 @@ async fn probe_server(server_url: &str) -> Result<ProbeResult> {
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
 
-    let initial_resp = http
-        .post(server_url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json, text/event-stream")
-        .body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"conformance-client","version":"0.1.0"}}}"#)
-        .send()
-        .await?;
+    let initial_resp = send_initial_mcp_probe(&http, server_url).await?;
 
     let status = initial_resp.status();
     tracing::info!(status = %status, "Initial MCP request status");
@@ -519,13 +599,7 @@ async fn discover_metadata_via_probe(server_url: &str) -> Result<serde_json::Val
         .build()?;
 
     // Step 1: Try MCP endpoint for 401 with resource_metadata
-    let initial_resp = http
-        .post(server_url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json, text/event-stream")
-        .body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"conformance-client","version":"0.1.0"}}}"#)
-        .send()
-        .await?;
+    let initial_resp = send_initial_mcp_probe(&http, server_url).await?;
 
     let www_auth = initial_resp
         .headers()
@@ -593,19 +667,13 @@ async fn perform_oauth_flow(
     server_url: &str,
     _context: &Option<serde_json::Value>,
     scope_override: Option<&str>,
-) -> Result<String> {
+) -> Result<OAuthFlowResult> {
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
 
     // Step 1: Try MCP endpoint, expect 401 with resource metadata URL
-    let initial_resp = http
-        .post(server_url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json, text/event-stream")
-        .body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"conformance-client","version":"0.1.0"}}}"#)
-        .send()
-        .await?;
+    let initial_resp = send_initial_mcp_probe(&http, server_url).await?;
 
     let status = initial_resp.status();
     tracing::info!(status = %status, "Initial MCP request status");
@@ -682,50 +750,69 @@ async fn perform_oauth_flow(
     let registration_endpoint = metadata
         .get("registration_endpoint")
         .and_then(|v| v.as_str());
+    let expected_issuer = metadata.get("issuer").and_then(|v| v.as_str());
+    let iss_required = metadata
+        .get("authorization_response_iss_parameter_supported")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let refresh_supported = metadata
+        .get("grant_types_supported")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|values| values.iter().any(|value| value == "refresh_token"));
+    let offline_access_supported = metadata
+        .get("scopes_supported")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|values| values.iter().any(|value| value == "offline_access"));
 
     // Determine token endpoint auth method from metadata
     let auth_method = get_token_auth_method(&metadata);
 
-    // Determine scope for authorization request.
-    // If re-authing after 403 (scope_override), combine escalated scope with all supported scopes.
-    // Otherwise, use scope from WWW-Authenticate or scopes_supported (for initial auth).
-    let scope: Option<String> = if let Some(s) = scope_override {
-        // Combine escalated scope with all supported scopes from PRM/metadata
-        let mut all_scopes: Vec<String> = Vec::new();
-        for part in s.split_whitespace() {
-            if !all_scopes.contains(&part.to_string()) {
-                all_scopes.push(part.to_string());
-            }
-        }
-        let supported = metadata
-            .get("scopes_supported")
-            .or_else(|| prm.as_ref().and_then(|p| p.get("scopes_supported")))
-            .and_then(|v| v.as_array());
-        if let Some(arr) = supported {
-            for v in arr {
-                if let Some(s) = v.as_str()
-                    && !all_scopes.contains(&s.to_string())
-                {
-                    all_scopes.push(s.to_string());
-                }
-            }
-        }
-        Some(all_scopes.join(" "))
-    } else {
-        // Initial auth: only use scope from WWW-Authenticate header.
-        // Don't use scopes_supported from metadata/PRM here to avoid requesting
-        // more scope than needed (which would prevent step-up auth from working).
-        scope
-    };
+    // Scope precedence is: an explicit re-authorization union, then the
+    // challenge, then the protected-resource/authorization-server metadata.
+    let supported_scope = prm
+        .as_ref()
+        .and_then(|value| value.get("scopes_supported"))
+        .or_else(|| metadata.get("scopes_supported"))
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|value| !value.is_empty());
+    let mut selected_scope = scope_override
+        .map(str::to_string)
+        .or(scope)
+        .or(supported_scope);
+    if refresh_supported && offline_access_supported {
+        selected_scope = union_scopes(selected_scope.as_deref(), Some("offline_access"));
+    }
 
     // Step 4: Dynamic client registration (if available)
-    let (client_id, client_secret) = if let Some(reg_endpoint) = registration_endpoint {
+    let use_cimd = metadata
+        .get("client_id_metadata_document_supported")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let (client_id, client_secret) = if use_cimd {
+        (
+            "https://conformance-test.local/client-metadata.json".to_string(),
+            None,
+        )
+    } else if let Some(reg_endpoint) = registration_endpoint {
+        let grant_types = if refresh_supported {
+            serde_json::json!(["authorization_code", "refresh_token"])
+        } else {
+            serde_json::json!(["authorization_code"])
+        };
         let reg_resp = http_plain
             .post(reg_endpoint)
             .json(&serde_json::json!({
                 "client_name": "conformance-client",
+                "application_type": "native",
                 "redirect_uris": ["http://localhost:23456/callback"],
-                "grant_types": ["authorization_code"],
+                "grant_types": grant_types,
                 "response_types": ["code"],
                 "token_endpoint_auth_method": auth_method
             }))
@@ -765,7 +852,7 @@ async fn perform_oauth_flow(
         urlencoded(&code_challenge),
     );
 
-    if let Some(ref s) = scope {
+    if let Some(ref s) = selected_scope {
         auth_url.push_str(&format!("&scope={}", urlencoded(s)));
     }
 
@@ -786,6 +873,26 @@ async fn perform_oauth_flow(
     // Extract code from redirect URL
     let redirect_url = url::Url::parse(&location)
         .or_else(|_| url::Url::parse(&format!("http://localhost:23456{}", location)))?;
+    let response_issuer = redirect_url
+        .query_pairs()
+        .find(|(key, _)| key == "iss")
+        .map(|(_, value)| value.to_string());
+    match (response_issuer.as_deref(), expected_issuer) {
+        (Some(actual), Some(expected)) if actual != expected => {
+            anyhow::bail!(
+                "authorization response issuer mismatch: expected {expected:?}, got {actual:?}"
+            );
+        }
+        (Some(_), None) => {
+            anyhow::bail!("authorization response included iss but metadata omitted issuer");
+        }
+        (None, _) if iss_required => {
+            anyhow::bail!(
+                "authorization server advertised iss response support but omitted the parameter"
+            );
+        }
+        _ => {}
+    }
     let code = redirect_url
         .query_pairs()
         .find(|(k, _)| k == "code")
@@ -826,7 +933,10 @@ async fn perform_oauth_flow(
         .context("No access_token in token response")?;
 
     tracing::info!("OAuth flow completed successfully");
-    Ok(access_token.to_string())
+    Ok(OAuthFlowResult {
+        access_token: access_token.to_string(),
+        requested_scope: selected_scope,
+    })
 }
 
 /// OAuth flow with pre-registered credentials (no DCR).
@@ -841,13 +951,7 @@ async fn perform_oauth_flow_with_credentials(
         .build()?;
 
     // Try MCP endpoint first to get metadata hints
-    let initial_resp = http
-        .post(server_url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json, text/event-stream")
-        .body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"conformance-client","version":"0.1.0"}}}"#)
-        .send()
-        .await?;
+    let initial_resp = send_initial_mcp_probe(&http, server_url).await?;
 
     let www_auth = initial_resp
         .headers()
@@ -975,11 +1079,11 @@ async fn run_authed_client(server_url: &str, access_token: &str) -> Result<()> {
         ..Default::default()
     };
     let transport = HttpClientTransport::with_config(server_url, config).bearer_token(access_token);
-    let client = McpClient::builder()
+    let client = crate::core_scenarios::client_builder()?
         .connect(transport, handlers::BasicHandler)
         .await?;
 
-    client.initialize("conformance-client", "0.1.0").await?;
+    crate::core_scenarios::activate(&client).await?;
     let tools = client.list_tools().await?;
     tracing::info!("Listed {} tools with auth", tools.tools.len());
 
@@ -1081,6 +1185,14 @@ async fn discover_oauth_metadata_from_issuer(issuer_url: &str) -> Result<serde_j
         match http.get(url).send().await {
             Ok(resp) if resp.status().is_success() => {
                 let metadata: serde_json::Value = resp.json().await?;
+                let metadata_issuer = metadata
+                    .get("issuer")
+                    .and_then(serde_json::Value::as_str)
+                    .context("Authorization server metadata omitted issuer")?;
+                anyhow::ensure!(
+                    metadata_issuer == issuer_url,
+                    "Authorization server metadata issuer mismatch: expected {issuer_url:?}, got {metadata_issuer:?}"
+                );
                 tracing::info!(url = %url, "Discovered OAuth metadata from issuer");
                 return Ok(metadata);
             }
@@ -1243,12 +1355,35 @@ async fn probe_for_scope(server_url: &str, token: &str) -> Option<String> {
         .build()
         .ok()?;
 
-    let resp = http
+    let mut request = http
         .post(server_url)
         .header("Content-Type", "application/json")
         .header("Accept", "application/json, text/event-stream")
         .header("Authorization", format!("Bearer {}", token))
-        .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#)
+        .header("Mcp-Method", "tools/call")
+        .header("Mcp-Name", "test-tool");
+    let mut params = serde_json::json!({
+        "name": "test-tool",
+        "arguments": {}
+    });
+    if crate::core_scenarios::uses_final_protocol() {
+        request = request.header("MCP-Protocol-Version", "2026-07-28");
+        params["_meta"] = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "io.modelcontextprotocol/clientInfo": {
+                "name": "conformance-client",
+                "version": "0.1.0"
+            }
+        });
+    }
+    let resp = request
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": params
+        }))
         .send()
         .await
         .ok()?;
@@ -1265,15 +1400,10 @@ async fn probe_for_scope(server_url: &str, token: &str) -> Option<String> {
 /// Extract a parameter value from a WWW-Authenticate header.
 /// Handles: `param="value"` in comma-or-space-separated list.
 fn extract_www_auth_param(header: &str, param: &str) -> Option<String> {
-    let prefix = format!("{}=\"", param);
-    // Try splitting by comma first, then by space
-    for part in header.split(',').chain(header.split_whitespace()) {
-        let trimmed = part.trim().trim_end_matches(',');
-        if let Some(rest) = trimmed.strip_prefix(&prefix) {
-            return rest.strip_suffix('"').map(|s| s.to_string());
-        }
-    }
-    None
+    let prefix = format!("{param}=\"");
+    let start = header.find(&prefix)? + prefix.len();
+    let end = header[start..].find('"')? + start;
+    Some(header[start..end].to_string())
 }
 
 // ============================================================================

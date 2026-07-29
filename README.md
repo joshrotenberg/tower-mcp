@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/crates/l/tower-mcp.svg)](https://github.com/joshrotenberg/tower-mcp#license)
 [![MSRV](https://img.shields.io/crates/msrv/tower-mcp.svg)](https://github.com/joshrotenberg/tower-mcp)
 [![MCP](https://img.shields.io/badge/MCP-2025--11--25-blue)](https://modelcontextprotocol.io/specification/2025-11-25)
-[![Conformance](https://img.shields.io/badge/conformance-39%2F39_server_%7C_264%2F266_client-brightgreen)](https://github.com/joshrotenberg/tower-mcp/actions/workflows/conformance.yml)
+[![Conformance](https://img.shields.io/badge/conformance-39%2F39_server_%7C_295_client_checks-brightgreen)](https://github.com/joshrotenberg/tower-mcp/actions/workflows/conformance.yml)
 
 Tower-native [Model Context Protocol](https://modelcontextprotocol.io) (MCP) implementation for Rust.
 
@@ -38,7 +38,7 @@ If you've used [axum](https://docs.rs/axum), tower-mcp's API will feel familiar:
 | **Tower-native middleware** | Timeout, rate-limit, auth, tracing -- on the whole server or on individual tools. Any `tower::Layer` works. |
 | **All transports** | stdio, HTTP/SSE (with stream resumption), WebSocket, and child process. Same router, any transport. |
 | **In-process testing** | `TestClient` lets you test MCP servers without spawning a subprocess or opening a socket. |
-| **Conformance** | 39/39 server checks and 264/266 client checks (2025-11-25 suites, conformance@0.1.16) plus the official 2026-07-28 suites (114/114 server; 210 passing client checks with the remaining auth scenarios baselined at 0.2.0-alpha.10) run in CI on every PR via the [official MCP conformance suite](https://github.com/modelcontextprotocol/conformance). The suite is upstream-maintained and grows with the spec, so this is a moving target -- not a one-time achievement. [SEP-2484](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2484) (accepted) makes conformance scenarios a prerequisite for standards-track SEPs reaching `final`. |
+| **Conformance** | 39/39 server checks and all 26 client scenarios (295 checks) for 2025-11-25 (`conformance@0.1.16`), plus 114/114 server checks and all 32 client scenarios (382 checks) for 2026-07-28 (`conformance@0.2.0-alpha.10`), run with empty baselines in CI on every PR via the [official MCP conformance suite](https://github.com/modelcontextprotocol/conformance). The suite is upstream-maintained and grows with the spec, so this is a moving target -- not a one-time achievement. [SEP-2484](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2484) (accepted) makes conformance scenarios a prerequisite for standards-track SEPs reaching `final`. |
 | **Capability filtering** | Session-based tool/resource/prompt visibility for multi-tenant patterns. |
 | **No proc macros required** | Builder pattern API with optional trait-based tools. Nothing hidden behind `#[derive]`. Optional `#[tool_fn]` / `#[prompt_fn]` / `#[resource_fn]` macros available for convenience (feature: `macros`). |
 | **Async tasks** | Full task lifecycle -- background execution, cancellation, TTL cleanup, per-tool task support mode. Clients can poll or wait for long-running tool results. |
@@ -587,11 +587,11 @@ let router = McpRouter::new()
 tower-mcp targets the [MCP specification 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) with backward compatibility for `2025-03-26`. The [official MCP conformance test suite](https://github.com/modelcontextprotocol/conformance) runs in CI on every PR via [`conformance.yml`](https://github.com/joshrotenberg/tower-mcp/actions/workflows/conformance.yml), currently passing:
 
 - **Server (2025-11-25):** 39/39 checks (`conformance@0.1.16`)
-- **Client (2025-11-25):** 264/266 checks (`conformance@0.1.16`; the two gaps are new offline-access scenarios, baselined in `conformance-baseline-client.yml` and tracked in [#953](https://github.com/joshrotenberg/tower-mcp/issues/953))
+- **Client (2025-11-25):** all 26 scenarios green, 295 checks (`conformance@0.1.16`); the client baseline is empty
 - **Server (2026-07-28):** 114/114 checks (`conformance@0.2.0-alpha.10`, `--suite all`); the server baseline is empty
-- **Client (2026-07-28):** 210 passing checks and 9/32 scenarios fully green (`conformance@0.2.0-alpha.10`, `--suite all`); the 23 remaining auth scenarios are baselined in `conformance-baseline-draft-client.yml` and tracked in [#953](https://github.com/joshrotenberg/tower-mcp/issues/953)
+- **Client (2026-07-28):** all 32 scenarios green, 382 checks (`conformance@0.2.0-alpha.10`, `--suite all`); the client baseline is empty
 
-Because the suite is upstream-maintained and grows with the spec, these counts shift as new scenarios are added -- treat the green CI badge as the source of truth, not any single snapshot. CI fails when a baselined scenario regresses further or starts passing (stale baseline), so the baselines cannot silently rot.
+Because the suite is upstream-maintained and grows with the spec, these counts shift as new scenarios are added -- treat the green CI badge as the source of truth, not any single snapshot. The empty baselines make any new failure immediately visible.
 
 The `protocol-2026-07-28` feature enables the experimental implementation of the released
 2026-07-28 protocol (version-gated, behind

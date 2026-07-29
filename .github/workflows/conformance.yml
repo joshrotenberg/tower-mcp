@@ -225,10 +225,7 @@ jobs:
 
       - name: Run client conformance suite
         run: |
-          # Known gaps (new 0.1.16 offline-access scenarios, SHOULD-level
-          # warnings) are inventoried in conformance-baseline-client.yml and
-          # tracked in #953. The baseline makes the tool's exit code
-          # reliable: it fails on unexpected failures or stale entries.
+          # The empty baseline makes any regression fail immediately.
           npx @modelcontextprotocol/conformance@0.1.16 client \
             --suite all \
             --command "cargo run --manifest-path examples/conformance-client/Cargo.toml --" \
@@ -303,9 +300,7 @@ jobs:
           # The client half of the final-version suite (#1027): the other three jobs
           # cover stable client, stable server and final-version server, so this was
           # the least-visible coverage gap. Known gaps are inventoried in
-          # conformance-baseline-draft-client.yml, grouped by SEP and tracked
-          # in #953; the job fails on unexpected failures OR on stale baseline
-          # entries that started passing.
+          # The empty baseline makes any regression fail immediately.
           #
           # pipefail so the tee below cannot mask the tool's exit code (the
           # Actions default bash already sets it; stated here because the
@@ -321,8 +316,8 @@ jobs:
       - name: Publish suite summary
         if: always()
         run: |
-          # The baselined exit code answers "did anything regress"; the
-          # absolute counts answer "how far along is the client". Both come
+          # The exit code answers "did anything regress"; the absolute counts
+          # record the current suite size. Both come
           # from the single run above, so this step only reformats its output.
           log=/tmp/conformance-draft-client.log
           if [ ! -s "$log" ]; then

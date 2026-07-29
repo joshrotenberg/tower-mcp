@@ -7,52 +7,10 @@
 # as the gaps close; CI fails when a baselined scenario starts passing (stale
 # entry) or a non-baselined scenario fails.
 #
-# Status at 0.2.0-alpha.10 after the final client lifecycle/header/MRTR work:
-# 210 checks pass; 9/32 scenarios are fully green and 23 auth scenarios remain
-# baselined. The exact total includes scenario-specific header assertions that
-# were previously skipped because those methods were never exercised.
+# Status at 0.2.0-alpha.10 after the final client lifecycle and authorization
+# work: all 32 scenarios are green (382 checks, zero failures or warnings).
 #
 # Format (0.2.x suite): plain scenario-name strings under the `client:` key;
 # reasons live in these comments.
 
-client:
-  # SEP-837: Dynamic Client Registration omits `application_type`. One missing
-  # field, but it is a MUST, so it fails every scenario that registers.
-  - auth/metadata-default
-  - auth/metadata-var1
-  - auth/metadata-var2
-  - auth/metadata-var3
-  - auth/basic-cimd
-  - auth/scope-from-www-authenticate
-  - auth/scope-from-scopes-supported
-  - auth/scope-omitted-when-undefined
-  - auth/scope-retry-limit
-  - auth/token-endpoint-auth-basic
-  - auth/token-endpoint-auth-post
-  - auth/token-endpoint-auth-none
-
-  # SEP-2468 `iss` handling in the authorization response is not implemented:
-  # no comparison against the recorded issuer, no rejection on mismatch or on
-  # a missing iss when the server advertised support, and no validation of the
-  # metadata document's issuer against the well-known URL.
-  - auth/iss-supported
-  - auth/iss-supported-missing
-  - auth/iss-not-advertised
-  - auth/iss-unexpected
-  - auth/iss-wrong-issuer
-  - auth/iss-normalized
-  - auth/metadata-issuer-mismatch
-
-  # SEP-2350 scope escalation: the client does not re-authorize with the
-  # union of old and new scopes after a step-up challenge. Also carries the
-  # SEP-837 failure above and a SHOULD-level warning about using the
-  # WWW-Authenticate scope on the initial request.
-  - auth/scope-step-up
-
-  # SEP-2352: no re-registration when PRM `authorization_servers` changes.
-  - auth/authorization-server-migration
-
-  # SEP-2207 offline_access: the harness cannot observe the scope decision
-  # because the client does not complete these flows.
-  - auth/offline-access-scope
-  - auth/offline-access-not-supported
+client: []

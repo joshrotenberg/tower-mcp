@@ -78,11 +78,8 @@ fn generate_state() -> String {
 /// OAuth authorization server metadata (subset of RFC 8414).
 #[derive(Debug, serde::Deserialize)]
 struct AuthorizationServerMetadata {
-    /// AS issuer identifier (RFC 8414 §2). Required by the spec but
-    /// modelled as `Option` so deserialization tolerates AS metadata
-    /// documents that omit it (we then can't enforce SEP-2468).
-    #[serde(default)]
-    issuer: Option<String>,
+    /// AS issuer identifier (RFC 8414 §2).
+    issuer: String,
     authorization_endpoint: String,
     token_endpoint: String,
     #[allow(dead_code)]
@@ -103,34 +100,48 @@ async fn discover_auth_server(
     let base = server_url.trim_end_matches('/');
 
     // Try Protected Resource Metadata first (RFC 9728)
-    if let Some(metadata) = try_discover_via_prm(base, client).await {
+    if let Some(metadata) = try_discover_via_prm(base, client).await? {
         return Ok(metadata);
     }
 
     // Fallback: try well-known directly on the server URL
     let meta_url = format!("{}/.well-known/oauth-authorization-server", base);
-    client
+    let metadata = client
         .get(&meta_url)
         .send()
         .await
         .map_err(|e| OAuthClientError::Discovery(e.to_string()))?
+        .error_for_status()
+        .map_err(|e| OAuthClientError::Discovery(e.to_string()))?
         .json()
         .await
-        .map_err(|e| OAuthClientError::Discovery(e.to_string()))
+        .map_err(|e| OAuthClientError::Discovery(e.to_string()))?;
+    validate_metadata_issuer(&metadata, base)?;
+    Ok(metadata)
 }
 
 /// Try to discover auth server via Protected Resource Metadata (RFC 9728).
 async fn try_discover_via_prm(
     base: &str,
     client: &reqwest::Client,
-) -> Option<AuthorizationServerMetadata> {
+) -> Result<Option<AuthorizationServerMetadata>, OAuthClientError> {
     let prm_url = format!("{}/.well-known/oauth-protected-resource", base);
-    let resp = client.get(&prm_url).send().await.ok()?;
+    let Ok(resp) = client.get(&prm_url).send().await else {
+        return Ok(None);
+    };
     if !resp.status().is_success() {
-        return None;
+        return Ok(None);
     }
-    let prm: serde_json::Value = resp.json().await.ok()?;
-    let auth_server = prm["authorization_servers"].as_array()?.first()?.as_str()?;
+    let Ok(prm) = resp.json::<serde_json::Value>().await else {
+        return Ok(None);
+    };
+    let Some(auth_server) = prm["authorization_servers"]
+        .as_array()
+        .and_then(|servers| servers.first())
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(None);
+    };
     let meta_url = format!(
         "{}/.well-known/oauth-authorization-server",
         auth_server.trim_end_matches('/')
@@ -139,10 +150,34 @@ async fn try_discover_via_prm(
         .get(&meta_url)
         .send()
         .await
-        .ok()?
+        .map_err(|e| OAuthClientError::Discovery(e.to_string()))?
         .error_for_status()
-        .ok()?;
-    meta.json().await.ok()
+        .map_err(|e| OAuthClientError::Discovery(e.to_string()))?;
+    let metadata = meta
+        .json()
+        .await
+        .map_err(|e| OAuthClientError::Discovery(e.to_string()))?;
+    validate_metadata_issuer(&metadata, auth_server)?;
+    Ok(Some(metadata))
+}
+
+/// Validate the metadata issuer against the authorization-server identifier
+/// used to construct its well-known URL.
+///
+/// MCP requires exact string equality here. In particular, trailing slashes
+/// are significant and must not be normalized before comparison.
+fn validate_metadata_issuer(
+    metadata: &AuthorizationServerMetadata,
+    expected: &str,
+) -> Result<(), OAuthClientError> {
+    if metadata.issuer == expected {
+        Ok(())
+    } else {
+        Err(OAuthClientError::Discovery(format!(
+            "authorization server metadata issuer mismatch: expected `{expected}`, got `{}`",
+            metadata.issuer
+        )))
+    }
 }
 
 // =============================================================================
@@ -322,7 +357,7 @@ impl OAuthAuthorizationCode {
                 cache: RwLock::new(None),
                 callback_rx: Mutex::new(Some(callback_rx)),
                 _callback_task: callback_task,
-                expected_issuer: metadata.issuer,
+                expected_issuer: Some(metadata.issuer),
                 iss_required: metadata.authorization_response_iss_parameter_supported,
             }),
         })
@@ -864,6 +899,29 @@ mod tests {
         // Accept rather than fail-open, but the AS metadata is non-compliant.
         assert!(validate_iss(Some("https://auth.example.com"), None, false).is_ok());
         assert!(validate_iss(None, None, false).is_ok());
+    }
+
+    #[test]
+    fn validate_metadata_issuer_accepts_exact_match() {
+        let metadata = authorization_server_metadata("https://auth.example.com");
+        assert!(validate_metadata_issuer(&metadata, "https://auth.example.com").is_ok());
+    }
+
+    #[test]
+    fn validate_metadata_issuer_rejects_trailing_slash_mismatch() {
+        let metadata = authorization_server_metadata("https://auth.example.com/");
+        let err = validate_metadata_issuer(&metadata, "https://auth.example.com").unwrap_err();
+        assert!(err.to_string().contains("issuer mismatch"), "got: {err}");
+    }
+
+    fn authorization_server_metadata(issuer: &str) -> AuthorizationServerMetadata {
+        AuthorizationServerMetadata {
+            issuer: issuer.to_string(),
+            authorization_endpoint: "https://auth.example.com/authorize".to_string(),
+            token_endpoint: "https://auth.example.com/token".to_string(),
+            registration_endpoint: None,
+            authorization_response_iss_parameter_supported: false,
+        }
     }
 
     #[test]

@@ -11,17 +11,21 @@ fn requested_protocol_version() -> String {
         .unwrap_or_else(|_| tower_mcp::protocol::LATEST_PROTOCOL_VERSION.to_string())
 }
 
-fn client_builder() -> Result<McpClientBuilder> {
+pub(crate) fn uses_final_protocol() -> bool {
+    requested_protocol_version() == tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION
+}
+
+pub(crate) fn client_builder() -> Result<McpClientBuilder> {
     let version = requested_protocol_version();
     let mut builder = McpClient::builder();
-    if version == tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION {
+    if uses_final_protocol() {
         builder = builder.protocol_support(ProtocolSupport::try_new([version])?);
     }
     Ok(builder)
 }
 
-async fn activate(client: &McpClient) -> Result<()> {
-    if requested_protocol_version() == tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION {
+pub(crate) async fn activate(client: &McpClient) -> Result<()> {
+    if uses_final_protocol() {
         client.discover("conformance-client", "0.1.0").await?;
     } else {
         client.initialize("conformance-client", "0.1.0").await?;

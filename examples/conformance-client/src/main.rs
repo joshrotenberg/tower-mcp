@@ -84,6 +84,22 @@ async fn main() {
             auth_scenarios::standard_auth(&server_url, &context).await
         }
 
+        // Final authorization additions
+        "auth/offline-access-scope"
+        | "auth/offline-access-not-supported"
+        | "auth/iss-supported"
+        | "auth/iss-supported-missing"
+        | "auth/iss-not-advertised"
+        | "auth/iss-unexpected"
+        | "auth/iss-wrong-issuer"
+        | "auth/iss-normalized"
+        | "auth/metadata-issuer-mismatch" => {
+            auth_scenarios::standard_auth(&server_url, &context).await
+        }
+        "auth/authorization-server-migration" => {
+            auth_scenarios::authorization_server_migration(&server_url, &context).await
+        }
+
         // Auth scenarios - resource mismatch
         "auth/resource-mismatch" => auth_scenarios::resource_mismatch(&server_url, &context).await,
 
