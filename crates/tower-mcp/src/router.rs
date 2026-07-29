@@ -86,9 +86,120 @@ fn json_value_contains(actual: &serde_json::Value, required: &serde_json::Value)
 #[cfg(feature = "stateless")]
 fn client_capabilities_satisfy(actual: &ClientCapabilities, required: &ClientCapabilities) -> bool {
     let actual = serde_json::to_value(actual).expect("ClientCapabilities is always serializable");
-    let required =
+    let mut required =
         serde_json::to_value(required).expect("ClientCapabilities is always serializable");
+    // `roots.listChanged: false` means the optional notification capability
+    // was not declared; it is not a requirement that the caller also set the
+    // flag to false. Normalize it away before doing the structural subset
+    // comparison so `{roots:{listChanged:true}}` satisfies plain `{roots:{}}`.
+    if required.pointer("/roots/listChanged") == Some(&serde_json::Value::Bool(false))
+        && let Some(roots) = required
+            .get_mut("roots")
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        roots.remove("listChanged");
+    }
     json_value_contains(&actual, &required)
+}
+
+#[cfg(feature = "stateless")]
+fn validate_input_required_result(
+    extensions: &crate::context::Extensions,
+    result: &InputRequiredResult,
+) -> Result<()> {
+    result.validate().map_err(|message| {
+        Error::invalid_params(format!("invalid InputRequiredResult: {message}"))
+    })?;
+
+    let meta = extensions
+        .get::<crate::stateless::StatelessRequestMeta>()
+        .filter(|meta| {
+            meta.protocol_version.as_deref() == Some(crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION)
+        })
+        .ok_or_else(|| {
+            Error::invalid_params(
+                "InputRequiredResult is only supported by the 2026-07-28 request lifecycle",
+            )
+        })?;
+    let actual = meta.client_capabilities.as_ref().ok_or_else(|| {
+        Error::invalid_params("clientCapabilities is required for InputRequiredResult")
+    })?;
+
+    if let Some(requests) = &result.input_requests {
+        for request in requests.values() {
+            let (supported, required) = match request {
+                InputRequest::CreateMessage(params) => {
+                    let requires_tools = params.tools.is_some();
+                    let requires_context = params
+                        .include_context
+                        .is_some_and(|mode| mode != IncludeContext::None);
+                    let required_sampling = SamplingCapability {
+                        tools: requires_tools.then(SamplingToolsCapability::default),
+                        context: requires_context.then(SamplingContextCapability::default),
+                        ..SamplingCapability::default()
+                    };
+                    let supported = actual.sampling.as_ref().is_some_and(|sampling| {
+                        (!requires_tools || sampling.tools.is_some())
+                            && (!requires_context || sampling.context.is_some())
+                    });
+                    (
+                        supported,
+                        ClientCapabilities {
+                            sampling: Some(required_sampling),
+                            ..ClientCapabilities::default()
+                        },
+                    )
+                }
+                InputRequest::ListRoots(_) => (
+                    actual.roots.is_some(),
+                    ClientCapabilities {
+                        roots: Some(RootsCapability::default()),
+                        ..ClientCapabilities::default()
+                    },
+                ),
+                InputRequest::Elicit(ElicitRequestParams::Form(_)) => {
+                    let supported = actual.elicitation.as_ref().is_some_and(|elicitation| {
+                        elicitation.form.is_some()
+                            || (elicitation.form.is_none() && elicitation.url.is_none())
+                    });
+                    (
+                        supported,
+                        ClientCapabilities {
+                            elicitation: Some(ElicitationCapability {
+                                form: Some(ElicitationFormCapability::default()),
+                                ..ElicitationCapability::default()
+                            }),
+                            ..ClientCapabilities::default()
+                        },
+                    )
+                }
+                InputRequest::Elicit(ElicitRequestParams::Url(_)) => (
+                    actual
+                        .elicitation
+                        .as_ref()
+                        .is_some_and(|elicitation| elicitation.url.is_some()),
+                    ClientCapabilities {
+                        elicitation: Some(ElicitationCapability {
+                            url: Some(ElicitationUrlCapability::default()),
+                            ..ElicitationCapability::default()
+                        }),
+                        ..ClientCapabilities::default()
+                    },
+                ),
+                _ => {
+                    return Err(Error::invalid_params(
+                        "unsupported input request method in InputRequiredResult",
+                    ));
+                }
+            };
+            if !supported {
+                return Err(Error::JsonRpc(
+                    JsonRpcError::missing_required_client_capability(required),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Apply pagination to a collected list of items.
@@ -588,6 +699,7 @@ impl McpRouter {
     /// router clones, so registering one sender per request would
     /// accumulate senders without bound.
     #[cfg(feature = "stateless")]
+    #[cfg(feature = "http")]
     pub(crate) fn with_request_notification_sender(mut self, tx: NotificationSender) -> Self {
         Arc::make_mut(&mut self.inner).notification_tx = Some(tx);
         self
@@ -2205,30 +2317,56 @@ impl McpRouter {
                         progress_token,
                         &extensions,
                     );
+                    #[cfg(feature = "stateless")]
+                    let ctx = {
+                        let mut ctx = ctx;
+                        ctx.extensions_mut().insert(crate::mrtr::MrtrRequest::new(
+                            params.input_responses,
+                            params.request_state,
+                        ));
+                        ctx
+                    };
 
                     let start = std::time::Instant::now();
-                    let result = tool.call_with_context(ctx, params.arguments).await;
+                    let outcome = tool
+                        .call_outcome_with_context(ctx, params.arguments)
+                        .await?;
                     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-                    if result.is_error {
-                        tracing::info!(
-                            target: "mcp::tools",
-                            tool = %params.name,
-                            duration_ms,
-                            status = "error",
-                            "tool call completed"
-                        );
-                    } else {
-                        tracing::info!(
-                            target: "mcp::tools",
-                            tool = %params.name,
-                            duration_ms,
-                            status = "success",
-                            "tool call completed"
-                        );
+                    match outcome {
+                        RequestOutcome::Complete(result) => {
+                            let status = if result.is_error { "error" } else { "success" };
+                            tracing::info!(
+                                target: "mcp::tools",
+                                tool = %params.name,
+                                duration_ms,
+                                status,
+                                "tool call completed"
+                            );
+                            Ok(McpResponse::CallTool(result))
+                        }
+                        RequestOutcome::InputRequired(result) => {
+                            #[cfg(feature = "stateless")]
+                            {
+                                validate_input_required_result(&extensions, &result)?;
+                                tracing::info!(
+                                    target: "mcp::tools",
+                                    tool = %params.name,
+                                    duration_ms,
+                                    status = "input_required",
+                                    "tool call requires client input"
+                                );
+                                Ok(McpResponse::InputRequired(result))
+                            }
+                            #[cfg(not(feature = "stateless"))]
+                            {
+                                let _ = result;
+                                Err(Error::invalid_params(
+                                    "InputRequiredResult support was not compiled",
+                                ))
+                            }
+                        }
                     }
-
-                    Ok(McpResponse::CallTool(result))
                 }
             }
 
@@ -2344,10 +2482,34 @@ impl McpRouter {
 
                     tracing::debug!(uri = %params.uri, "Reading static resource");
                     let ctx = self.create_context_with_extensions(request_id, None, &extensions);
-                    let result = resource.read_with_context(ctx).await;
-                    return Ok(McpResponse::ReadResource(
-                        self.apply_read_cache_hints(result),
-                    ));
+                    #[cfg(feature = "stateless")]
+                    let ctx = {
+                        let mut ctx = ctx;
+                        ctx.extensions_mut().insert(crate::mrtr::MrtrRequest::new(
+                            params.input_responses.clone(),
+                            params.request_state.clone(),
+                        ));
+                        ctx
+                    };
+                    return match resource.read_outcome_with_context(ctx).await? {
+                        RequestOutcome::Complete(result) => Ok(McpResponse::ReadResource(
+                            self.apply_read_cache_hints(result),
+                        )),
+                        RequestOutcome::InputRequired(result) => {
+                            #[cfg(feature = "stateless")]
+                            {
+                                validate_input_required_result(&extensions, &result)?;
+                                Ok(McpResponse::InputRequired(result))
+                            }
+                            #[cfg(not(feature = "stateless"))]
+                            {
+                                let _ = result;
+                                Err(Error::invalid_params(
+                                    "InputRequiredResult support was not compiled",
+                                ))
+                            }
+                        }
+                    };
                 }
 
                 // Try dynamic resources
@@ -2363,10 +2525,34 @@ impl McpRouter {
                         tracing::debug!(uri = %params.uri, "Reading dynamic resource");
                         let ctx =
                             self.create_context_with_extensions(request_id, None, &extensions);
-                        let result = resource.read_with_context(ctx).await;
-                        return Ok(McpResponse::ReadResource(
-                            self.apply_read_cache_hints(result),
-                        ));
+                        #[cfg(feature = "stateless")]
+                        let ctx = {
+                            let mut ctx = ctx;
+                            ctx.extensions_mut().insert(crate::mrtr::MrtrRequest::new(
+                                params.input_responses.clone(),
+                                params.request_state.clone(),
+                            ));
+                            ctx
+                        };
+                        return match resource.read_outcome_with_context(ctx).await? {
+                            RequestOutcome::Complete(result) => Ok(McpResponse::ReadResource(
+                                self.apply_read_cache_hints(result),
+                            )),
+                            RequestOutcome::InputRequired(result) => {
+                                #[cfg(feature = "stateless")]
+                                {
+                                    validate_input_required_result(&extensions, &result)?;
+                                    Ok(McpResponse::InputRequired(result))
+                                }
+                                #[cfg(not(feature = "stateless"))]
+                                {
+                                    let _ = result;
+                                    Err(Error::invalid_params(
+                                        "InputRequiredResult support was not compiled",
+                                    ))
+                                }
+                            }
+                        };
                     }
                 }
 
@@ -2378,10 +2564,39 @@ impl McpRouter {
                             template = %template.uri_template,
                             "Reading resource via template"
                         );
-                        let result = template.read(&params.uri, variables).await?;
-                        return Ok(McpResponse::ReadResource(
-                            self.apply_read_cache_hints(result),
-                        ));
+                        let ctx =
+                            self.create_context_with_extensions(request_id, None, &extensions);
+                        #[cfg(feature = "stateless")]
+                        let ctx = {
+                            let mut ctx = ctx;
+                            ctx.extensions_mut().insert(crate::mrtr::MrtrRequest::new(
+                                params.input_responses.clone(),
+                                params.request_state.clone(),
+                            ));
+                            ctx
+                        };
+                        return match template
+                            .read_outcome_with_context(ctx, &params.uri, variables)
+                            .await?
+                        {
+                            RequestOutcome::Complete(result) => Ok(McpResponse::ReadResource(
+                                self.apply_read_cache_hints(result),
+                            )),
+                            RequestOutcome::InputRequired(result) => {
+                                #[cfg(feature = "stateless")]
+                                {
+                                    validate_input_required_result(&extensions, &result)?;
+                                    Ok(McpResponse::InputRequired(result))
+                                }
+                                #[cfg(not(feature = "stateless"))]
+                                {
+                                    let _ = result;
+                                    Err(Error::invalid_params(
+                                        "InputRequiredResult support was not compiled",
+                                    ))
+                                }
+                            }
+                        };
                     }
                 }
 
@@ -2395,10 +2610,39 @@ impl McpRouter {
                             template = %template.uri_template,
                             "Reading resource via dynamic template"
                         );
-                        let result = template.read(&params.uri, variables).await?;
-                        return Ok(McpResponse::ReadResource(
-                            self.apply_read_cache_hints(result),
-                        ));
+                        let ctx =
+                            self.create_context_with_extensions(request_id, None, &extensions);
+                        #[cfg(feature = "stateless")]
+                        let ctx = {
+                            let mut ctx = ctx;
+                            ctx.extensions_mut().insert(crate::mrtr::MrtrRequest::new(
+                                params.input_responses.clone(),
+                                params.request_state.clone(),
+                            ));
+                            ctx
+                        };
+                        return match template
+                            .read_outcome_with_context(ctx, &params.uri, variables)
+                            .await?
+                        {
+                            RequestOutcome::Complete(result) => Ok(McpResponse::ReadResource(
+                                self.apply_read_cache_hints(result),
+                            )),
+                            RequestOutcome::InputRequired(result) => {
+                                #[cfg(feature = "stateless")]
+                                {
+                                    validate_input_required_result(&extensions, &result)?;
+                                    Ok(McpResponse::InputRequired(result))
+                                }
+                                #[cfg(not(feature = "stateless"))]
+                                {
+                                    let _ = result;
+                                    Err(Error::invalid_params(
+                                        "InputRequiredResult support was not compiled",
+                                    ))
+                                }
+                            }
+                        };
                     }
                 }
 
@@ -2522,9 +2766,36 @@ impl McpRouter {
 
                 tracing::debug!(name = %params.name, "Getting prompt");
                 let ctx = self.create_context_with_extensions(request_id, None, &extensions);
-                let result = prompt.get_with_context(ctx, params.arguments).await?;
+                #[cfg(feature = "stateless")]
+                let ctx = {
+                    let mut ctx = ctx;
+                    ctx.extensions_mut().insert(crate::mrtr::MrtrRequest::new(
+                        params.input_responses,
+                        params.request_state,
+                    ));
+                    ctx
+                };
+                let outcome = prompt
+                    .get_outcome_with_context(ctx, params.arguments)
+                    .await?;
 
-                Ok(McpResponse::GetPrompt(result))
+                match outcome {
+                    RequestOutcome::Complete(result) => Ok(McpResponse::GetPrompt(result)),
+                    RequestOutcome::InputRequired(result) => {
+                        #[cfg(feature = "stateless")]
+                        {
+                            validate_input_required_result(&extensions, &result)?;
+                            Ok(McpResponse::InputRequired(result))
+                        }
+                        #[cfg(not(feature = "stateless"))]
+                        {
+                            let _ = result;
+                            Err(Error::invalid_params(
+                                "InputRequiredResult support was not compiled",
+                            ))
+                        }
+                    }
+                }
             }
 
             McpRequest::Ping => Ok(McpResponse::Pong(EmptyResult {})),
@@ -2983,6 +3254,84 @@ mod tests {
     struct AddInput {
         a: i64,
         b: i64,
+    }
+
+    #[cfg(feature = "stateless")]
+    fn final_extensions(client_capabilities: ClientCapabilities) -> Extensions {
+        let mut extensions = Extensions::new();
+        extensions.insert(crate::stateless::StatelessRequestMeta {
+            protocol_version: Some(EXPERIMENTAL_PROTOCOL_VERSION.to_string()),
+            client_capabilities: Some(client_capabilities),
+            ..Default::default()
+        });
+        extensions
+    }
+
+    #[cfg(feature = "stateless")]
+    #[test]
+    fn input_required_capability_validation_uses_capability_semantics() {
+        let roots = InputRequiredResult::with_requests(
+            [(
+                "roots".to_string(),
+                InputRequest::ListRoots(ListRootsParams::default()),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let extensions = final_extensions(ClientCapabilities {
+            roots: Some(RootsCapability {
+                list_changed: true,
+                deprecated: None,
+            }),
+            ..Default::default()
+        });
+        validate_input_required_result(&extensions, &roots).unwrap();
+        assert!(client_capabilities_satisfy(
+            extensions
+                .get::<crate::stateless::StatelessRequestMeta>()
+                .and_then(|meta| meta.client_capabilities.as_ref())
+                .unwrap(),
+            &ClientCapabilities {
+                roots: Some(RootsCapability::default()),
+                ..Default::default()
+            }
+        ));
+
+        let sampling_with_tools = InputRequiredResult::with_requests(
+            [(
+                "sample".to_string(),
+                InputRequest::CreateMessage(CreateMessageParams {
+                    tools: Some(Vec::new()),
+                    ..CreateMessageParams::new(vec![SamplingMessage::user("hello")], 10)
+                }),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let extensions = final_extensions(ClientCapabilities {
+            sampling: Some(SamplingCapability::default()),
+            ..Default::default()
+        });
+        assert!(validate_input_required_result(&extensions, &sampling_with_tools).is_err());
+
+        let form = InputRequiredResult::with_requests(
+            [(
+                "form".to_string(),
+                InputRequest::Elicit(ElicitRequestParams::Form(ElicitFormParams {
+                    mode: Some(ElicitMode::Form),
+                    message: "name".into(),
+                    requested_schema: ElicitFormSchema::new(),
+                    meta: None,
+                })),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let extensions = final_extensions(ClientCapabilities {
+            elicitation: Some(ElicitationCapability::default()),
+            ..Default::default()
+        });
+        validate_input_required_result(&extensions, &form).unwrap();
     }
 
     /// Helper to initialize a router for testing

@@ -1,40 +1,16 @@
-# MCP Conformance Suite -- Expected Failures Baseline (2026-07-28 draft)
+# MCP Conformance Suite -- Expected Failures Baseline (2026-07-28)
 #
-# Applies to the 0.2.0-alpha.x draft suite run with
+# Applies to the 0.2.0-alpha.x suite run with
 # `--spec-version 2026-07-28 --suite all`. Each entry is a scenario expected
 # to fail (or carry SHOULD-level warnings, which the baseline checker counts
 # the same) while the corresponding parity-roadmap issue (#929) is open.
 # Remove entries as the phases land; CI fails when a baselined scenario
 # starts passing (stale entry) or a non-baselined scenario fails.
 #
-# Status at 0.2.0-alpha.10 after the final HTTP lifecycle/listen and
-# schema-aware custom-header work in #952: 94/104 checks pass;
-# server-stateless passes 30/30 and http-custom-header-server-validation
-# passes 9/9. Note that
-# input-required-result-missing-input-response and
-# input-required-result-ignore-extra-params report "0 passed, 0 failed" in
-# the summary (they run no checks pending MRTR fixture tools) but the
-# harness's expected-failures gate still counts a zero-check scenario as an
-# unexpected failure unless baselined -- keep both entries even though the
-# summary line renders them with a checkmark.
+# Status at 0.2.0-alpha.10 after the final HTTP lifecycle, schema-aware
+# custom headers, and SEP-2322 MRTR work: all 114 server checks pass.
 #
 # Format (0.2.x suite): plain scenario-name strings under `server:` /
 # `client:` keys; reasons live in these comments.
 
-server:
-  # SEP-2322 MRTR is not implemented (#950). Scenarios that fully pass do so
-  # because correct non-MRTR behavior (rejecting unsupported methods)
-  # coincides with the spec; the two zero-check entries below also need the
-  # MRTR fixture tools to run any checks at all.
-  - input-required-result-basic-elicitation
-  - input-required-result-basic-sampling
-  - input-required-result-basic-list-roots
-  - input-required-result-request-state
-  - input-required-result-multiple-input-requests
-  - input-required-result-multi-round
-  - input-required-result-missing-input-response
-  - input-required-result-non-tool-request
-  - input-required-result-result-type
-  - input-required-result-tampered-state
-  - input-required-result-capability-check
-  - input-required-result-ignore-extra-params
+server: []

@@ -84,7 +84,7 @@ use tower_service::Service;
 use crate::context::RequestContext;
 use crate::error::{Error, Result};
 use crate::protocol::{
-    ContentAnnotations, ReadResourceResult, ResourceContent, ResourceDefinition,
+    ContentAnnotations, ReadResourceResult, RequestOutcome, ResourceContent, ResourceDefinition,
     ResourceTemplateDefinition, ToolIcon,
 };
 
@@ -242,6 +242,16 @@ pub trait ResourceHandler: Send + Sync {
     }
 }
 
+/// Resource handler that may return an SEP-2322 input-required continuation.
+#[cfg(feature = "stateless")]
+pub trait MrtrResourceHandler: Send + Sync {
+    /// Read a resource attempt with continuation values in the context.
+    fn read(
+        &self,
+        ctx: RequestContext,
+    ) -> BoxFuture<'_, Result<RequestOutcome<ReadResourceResult>>>;
+}
+
 /// Adapts a `ResourceHandler` to a Tower `Service<ResourceRequest>`.
 ///
 /// This is an internal adapter that bridges the handler abstraction to the
@@ -316,7 +326,9 @@ pub struct Resource {
     /// Optional annotations (audience, priority hints)
     pub annotations: Option<ContentAnnotations>,
     /// The boxed service that reads the resource
-    service: BoxResourceService,
+    service: Option<BoxResourceService>,
+    #[cfg(feature = "stateless")]
+    mrtr_handler: Option<Arc<dyn MrtrResourceHandler>>,
 }
 
 impl Clone for Resource {
@@ -331,6 +343,8 @@ impl Clone for Resource {
             size: self.size,
             annotations: self.annotations.clone(),
             service: self.service.clone(),
+            #[cfg(feature = "stateless")]
+            mrtr_handler: self.mrtr_handler.clone(),
         }
     }
 }
@@ -396,16 +410,59 @@ impl Resource {
     /// Any errors from the handler or middleware are converted to error responses
     /// in the result contents.
     pub fn read_with_context(&self, ctx: RequestContext) -> BoxFuture<'static, ReadResourceResult> {
-        use tower::ServiceExt;
-        let service = self.service.clone();
+        let resource = self.clone();
         let uri = self.uri.clone();
         Box::pin(async move {
-            // ServiceExt::oneshot properly handles poll_ready before call
-            // Service is Infallible, so unwrap is safe
-            service
+            match resource.read_outcome_with_context(ctx).await {
+                Ok(RequestOutcome::Complete(result)) => result,
+                Ok(RequestOutcome::InputRequired(_)) => ReadResourceResult {
+                    contents: vec![ResourceContent {
+                        uri,
+                        mime_type: Some("text/plain".into()),
+                        text: Some(
+                            "resource requires additional client input; use read_outcome_with_context"
+                                .into(),
+                        ),
+                        blob: None,
+                        meta: None,
+                    }],
+                    ..ReadResourceResult::default()
+                },
+                Err(error) => ReadResourceResult {
+                    contents: vec![ResourceContent {
+                        uri,
+                        mime_type: Some("text/plain".into()),
+                        text: Some(error.to_string()),
+                        blob: None,
+                        meta: None,
+                    }],
+                    ..ReadResourceResult::default()
+                },
+            }
+        })
+    }
+
+    /// Read the resource while preserving an SEP-2322 continuation.
+    pub fn read_outcome_with_context(
+        &self,
+        ctx: RequestContext,
+    ) -> BoxFuture<'static, Result<RequestOutcome<ReadResourceResult>>> {
+        use tower::ServiceExt;
+        #[cfg(feature = "stateless")]
+        if let Some(handler) = self.mrtr_handler.clone() {
+            return Box::pin(async move { handler.read(ctx).await });
+        }
+        let service = self
+            .service
+            .clone()
+            .expect("resource must have a complete or MRTR handler");
+        let uri = self.uri.clone();
+        Box::pin(async move {
+            let result = service
                 .oneshot(ResourceRequest::new(ctx, uri))
                 .await
-                .unwrap()
+                .unwrap();
+            Ok(RequestOutcome::Complete(result))
         })
     }
 
@@ -435,7 +492,36 @@ impl Resource {
             icons,
             size,
             annotations,
-            service,
+            service: Some(service),
+            #[cfg(feature = "stateless")]
+            mrtr_handler: None,
+        }
+    }
+
+    #[cfg(feature = "stateless")]
+    #[allow(clippy::too_many_arguments)]
+    fn from_mrtr_handler<H: MrtrResourceHandler + 'static>(
+        uri: String,
+        name: String,
+        title: Option<String>,
+        description: Option<String>,
+        mime_type: Option<String>,
+        icons: Option<Vec<ToolIcon>>,
+        size: Option<u64>,
+        annotations: Option<ContentAnnotations>,
+        handler: H,
+    ) -> Self {
+        Self {
+            uri,
+            name,
+            title,
+            description,
+            mime_type,
+            icons,
+            size,
+            annotations,
+            service: None,
+            mrtr_handler: Some(Arc::new(handler)),
         }
     }
 }
@@ -647,6 +733,26 @@ impl ResourceBuilder {
         }
     }
 
+    /// Set an SEP-2322 resource handler that may return input-required.
+    #[cfg(feature = "stateless")]
+    pub fn mrtr_handler<F, Fut>(self, handler: F) -> ResourceBuilderWithMrtrHandler<F>
+    where
+        F: Fn(RequestContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<RequestOutcome<ReadResourceResult>>> + Send + 'static,
+    {
+        ResourceBuilderWithMrtrHandler {
+            uri: self.uri,
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            mime_type: self.mime_type,
+            icons: self.icons,
+            size: self.size,
+            annotations: self.annotations,
+            handler,
+        }
+    }
+
     /// Create a static text resource (convenience method)
     pub fn text(self, content: impl Into<String>) -> Resource {
         let uri = self.uri.clone();
@@ -716,6 +822,46 @@ pub struct ResourceBuilderWithHandler<F> {
     size: Option<u64>,
     annotations: Option<ContentAnnotations>,
     handler: F,
+}
+
+#[cfg(feature = "stateless")]
+#[doc(hidden)]
+pub struct ResourceBuilderWithMrtrHandler<F> {
+    uri: String,
+    name: Option<String>,
+    title: Option<String>,
+    description: Option<String>,
+    mime_type: Option<String>,
+    icons: Option<Vec<ToolIcon>>,
+    size: Option<u64>,
+    annotations: Option<ContentAnnotations>,
+    handler: F,
+}
+
+#[cfg(feature = "stateless")]
+impl<F, Fut> ResourceBuilderWithMrtrHandler<F>
+where
+    F: Fn(RequestContext) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<RequestOutcome<ReadResourceResult>>> + Send + 'static,
+{
+    /// Build the resource with an SEP-2322-aware handler.
+    pub fn build(self) -> Resource {
+        let name = self.name.unwrap_or_else(|| self.uri.clone());
+
+        Resource::from_mrtr_handler(
+            self.uri,
+            name,
+            self.title,
+            self.description,
+            self.mime_type,
+            self.icons,
+            self.size,
+            self.annotations,
+            MrtrContextHandler {
+                handler: self.handler,
+            },
+        )
+    }
 }
 
 impl<F, Fut> ResourceBuilderWithHandler<F>
@@ -838,7 +984,9 @@ where
             icons: self.icons,
             size: self.size,
             annotations: self.annotations,
-            service,
+            service: Some(service),
+            #[cfg(feature = "stateless")]
+            mrtr_handler: None,
         }
     }
 
@@ -968,7 +1116,9 @@ where
             icons: self.icons,
             size: self.size,
             annotations: self.annotations,
-            service,
+            service: Some(service),
+            #[cfg(feature = "stateless")]
+            mrtr_handler: None,
         }
     }
 
@@ -1032,6 +1182,25 @@ where
 
     fn uses_context(&self) -> bool {
         true
+    }
+}
+
+#[cfg(feature = "stateless")]
+struct MrtrContextHandler<F> {
+    handler: F,
+}
+
+#[cfg(feature = "stateless")]
+impl<F, Fut> MrtrResourceHandler for MrtrContextHandler<F>
+where
+    F: Fn(RequestContext) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<RequestOutcome<ReadResourceResult>>> + Send + 'static,
+{
+    fn read(
+        &self,
+        ctx: RequestContext,
+    ) -> BoxFuture<'_, Result<RequestOutcome<ReadResourceResult>>> {
+        Box::pin((self.handler)(ctx))
     }
 }
 
@@ -1141,6 +1310,18 @@ pub trait ResourceTemplateHandler: Send + Sync {
     ) -> BoxFuture<'_, Result<ReadResourceResult>>;
 }
 
+/// Resource-template handler that may return an SEP-2322 continuation.
+#[cfg(feature = "stateless")]
+pub trait MrtrResourceTemplateHandler: Send + Sync {
+    /// Read a matched template resource with retry values in the context.
+    fn read(
+        &self,
+        ctx: RequestContext,
+        uri: &str,
+        variables: HashMap<String, String>,
+    ) -> BoxFuture<'_, Result<RequestOutcome<ReadResourceResult>>>;
+}
+
 /// A parameterized resource template
 ///
 /// Resource templates use URI template syntax (RFC 6570) to match multiple URIs
@@ -1191,7 +1372,9 @@ pub struct ResourceTemplate {
     /// Variable names in order of appearance
     variables: Vec<String>,
     /// Handler for reading matched resources
-    handler: Arc<dyn ResourceTemplateHandler>,
+    handler: Option<Arc<dyn ResourceTemplateHandler>>,
+    #[cfg(feature = "stateless")]
+    mrtr_handler: Option<Arc<dyn MrtrResourceTemplateHandler>>,
 }
 
 impl Clone for ResourceTemplate {
@@ -1207,6 +1390,8 @@ impl Clone for ResourceTemplate {
             pattern: self.pattern.clone(),
             variables: self.variables.clone(),
             handler: self.handler.clone(),
+            #[cfg(feature = "stateless")]
+            mrtr_handler: self.mrtr_handler.clone(),
         }
     }
 }
@@ -1274,7 +1459,45 @@ impl ResourceTemplate {
         uri: &str,
         variables: HashMap<String, String>,
     ) -> BoxFuture<'_, Result<ReadResourceResult>> {
-        self.handler.read(uri, variables)
+        match &self.handler {
+            Some(handler) => handler.read(uri, variables),
+            None => Box::pin(async {
+                Err(Error::invalid_params(
+                    "MRTR resource template requires read_outcome_with_context",
+                ))
+            }),
+        }
+    }
+
+    /// Read a matched resource while preserving an SEP-2322 continuation.
+    pub fn read_outcome_with_context(
+        &self,
+        ctx: RequestContext,
+        uri: &str,
+        variables: HashMap<String, String>,
+    ) -> BoxFuture<'_, Result<RequestOutcome<ReadResourceResult>>> {
+        let _ = &ctx;
+        #[cfg(feature = "stateless")]
+        if let Some(handler) = &self.mrtr_handler {
+            return handler.read(ctx, uri, variables);
+        }
+        match &self.handler {
+            Some(handler) => {
+                let handler = handler.clone();
+                let uri = uri.to_string();
+                Box::pin(async move {
+                    handler
+                        .read(&uri, variables)
+                        .await
+                        .map(RequestOutcome::Complete)
+                })
+            }
+            None => Box::pin(async {
+                Err(Error::invalid_params(
+                    "resource template has neither a complete nor MRTR handler",
+                ))
+            }),
+        }
     }
 }
 
@@ -1446,7 +1669,53 @@ impl ResourceTemplateBuilder {
             annotations: self.annotations,
             pattern,
             variables,
-            handler: Arc::new(FnTemplateHandler { handler }),
+            handler: Some(Arc::new(FnTemplateHandler { handler })),
+            #[cfg(feature = "stateless")]
+            mrtr_handler: None,
+        })
+    }
+
+    /// Set an SEP-2322-aware template handler that may require client input.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the URI template produces an invalid regex pattern. Use
+    /// [`try_mrtr_handler`](Self::try_mrtr_handler) for a fallible variant.
+    #[cfg(feature = "stateless")]
+    pub fn mrtr_handler<F, Fut>(self, handler: F) -> ResourceTemplate
+    where
+        F: Fn(RequestContext, String, HashMap<String, String>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<RequestOutcome<ReadResourceResult>>> + Send + 'static,
+    {
+        self.try_mrtr_handler(handler)
+            .unwrap_or_else(|error| panic!("Invalid URI template: {error}"))
+    }
+
+    /// Fallible variant of [`mrtr_handler`](Self::mrtr_handler).
+    #[cfg(feature = "stateless")]
+    pub fn try_mrtr_handler<F, Fut>(
+        self,
+        handler: F,
+    ) -> std::result::Result<ResourceTemplate, Error>
+    where
+        F: Fn(RequestContext, String, HashMap<String, String>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<RequestOutcome<ReadResourceResult>>> + Send + 'static,
+    {
+        let (pattern, variables) = compile_uri_template(&self.uri_template)?;
+        let name = self.name.unwrap_or_else(|| self.uri_template.clone());
+
+        Ok(ResourceTemplate {
+            uri_template: self.uri_template,
+            name,
+            title: self.title,
+            description: self.description,
+            mime_type: self.mime_type,
+            icons: self.icons,
+            annotations: self.annotations,
+            pattern,
+            variables,
+            handler: None,
+            mrtr_handler: Some(Arc::new(MrtrFnTemplateHandler { handler })),
         })
     }
 }
@@ -1468,6 +1737,27 @@ where
     ) -> BoxFuture<'_, Result<ReadResourceResult>> {
         let uri = uri.to_string();
         Box::pin((self.handler)(uri, variables))
+    }
+}
+
+#[cfg(feature = "stateless")]
+struct MrtrFnTemplateHandler<F> {
+    handler: F,
+}
+
+#[cfg(feature = "stateless")]
+impl<F, Fut> MrtrResourceTemplateHandler for MrtrFnTemplateHandler<F>
+where
+    F: Fn(RequestContext, String, HashMap<String, String>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<RequestOutcome<ReadResourceResult>>> + Send + 'static,
+{
+    fn read(
+        &self,
+        ctx: RequestContext,
+        uri: &str,
+        variables: HashMap<String, String>,
+    ) -> BoxFuture<'_, Result<RequestOutcome<ReadResourceResult>>> {
+        Box::pin((self.handler)(ctx, uri.to_string(), variables))
     }
 }
 
@@ -1545,6 +1835,61 @@ mod tests {
         let result = resource.read().await;
         assert_eq!(result.contents.len(), 1);
         assert_eq!(result.contents[0].text.as_deref(), Some("Hello, World!"));
+    }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn test_mrtr_builder_preserves_input_required_outcome() {
+        let resource = ResourceBuilder::new("test://continue")
+            .mrtr_handler(|_ctx| async move {
+                Ok(RequestOutcome::input_required(
+                    crate::protocol::InputRequiredResult::new().with_request_state("signed-state"),
+                ))
+            })
+            .build();
+
+        let outcome = resource
+            .read_outcome_with_context(RequestContext::new(crate::protocol::RequestId::Number(1)))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome
+                .as_input_required()
+                .and_then(|result| result.request_state.as_deref()),
+            Some("signed-state")
+        );
+    }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn test_mrtr_template_preserves_context_and_input_required_outcome() {
+        let template = ResourceTemplateBuilder::new("test://items/{id}").mrtr_handler(
+            |ctx, uri, variables| async move {
+                assert_eq!(ctx.request_state(), Some("prior-state"));
+                assert_eq!(uri, "test://items/42");
+                assert_eq!(variables.get("id").map(String::as_str), Some("42"));
+                Ok(RequestOutcome::input_required(
+                    crate::protocol::InputRequiredResult::new().with_request_state("next-state"),
+                ))
+            },
+        );
+        let variables = template.match_uri("test://items/42").unwrap();
+        let mut ctx = RequestContext::new(crate::protocol::RequestId::Number(1));
+        ctx.extensions_mut().insert(crate::mrtr::MrtrRequest::new(
+            None,
+            Some("prior-state".into()),
+        ));
+
+        let outcome = template
+            .read_outcome_with_context(ctx, "test://items/42", variables)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome
+                .as_input_required()
+                .and_then(|result| result.request_state.as_deref()),
+            Some("next-state")
+        );
     }
 
     #[tokio::test]

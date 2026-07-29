@@ -1,5 +1,10 @@
-use tower_mcp::protocol::{Content, ResourceContent};
-use tower_mcp::{GetPromptResult, Prompt, PromptBuilder, PromptMessage, PromptRole};
+use tower_mcp::protocol::{
+    Content, ElicitRequestParams, InputRequest, InputRequiredResult, ResourceContent,
+};
+use tower_mcp::{
+    ElicitFormParams, ElicitFormSchema, ElicitMode, GetPromptResult, Prompt, PromptBuilder,
+    PromptMessage, PromptRole, RequestOutcome,
+};
 
 use crate::tools::red_pixel_base64;
 
@@ -10,8 +15,53 @@ pub fn build_prompts() -> Vec<Prompt> {
         build_prompt_with_arguments(),
         build_prompt_with_embedded_resource(),
         build_prompt_with_image(),
+        build_input_required_prompt(),
         build_exercise_conformance_prompt(),
     ]
+}
+
+fn build_input_required_prompt() -> Prompt {
+    PromptBuilder::new("test_input_required_result_prompt")
+        .description("SEP-2322 non-tool continuation fixture")
+        .mrtr_handler(|ctx, _args| async move {
+            if ctx
+                .input_responses()
+                .is_some_and(|responses| responses.contains_key("user_context"))
+            {
+                return Ok(RequestOutcome::Complete(GetPromptResult {
+                    description: Some("Prompt using client-provided context".into()),
+                    messages: vec![PromptMessage {
+                        role: PromptRole::User,
+                        content: Content::Text {
+                            text: "Use the supplied test context".into(),
+                            annotations: None,
+                            meta: None,
+                        },
+                        meta: None,
+                    }],
+                    meta: None,
+                }));
+            }
+
+            let request = InputRequest::Elicit(ElicitRequestParams::Form(ElicitFormParams {
+                mode: Some(ElicitMode::Form),
+                message: "What context should the prompt use?".into(),
+                requested_schema: ElicitFormSchema::new().string_field(
+                    "context",
+                    Some("Context for the prompt"),
+                    true,
+                ),
+                meta: None,
+            }));
+            Ok(RequestOutcome::input_required(
+                InputRequiredResult::with_requests(
+                    [("user_context".to_string(), request)]
+                        .into_iter()
+                        .collect(),
+                ),
+            ))
+        })
+        .build()
 }
 
 /// A prompt that guides an agent to exercise all conformance server features.

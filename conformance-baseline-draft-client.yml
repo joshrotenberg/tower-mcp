@@ -1,6 +1,6 @@
-# MCP Conformance Suite -- Expected Failures Baseline (client, 2026-07-28 draft)
+# MCP Conformance Suite -- Expected Failures Baseline (client, 2026-07-28)
 #
-# Applies to the 0.2.0-alpha.x draft suite run with
+# Applies to the 0.2.0-alpha.x suite run with
 # `client --spec-version 2026-07-28 --suite all`. Each entry is a scenario
 # expected to fail (or carry SHOULD-level warnings, which the baseline checker
 # counts the same) while the client parity work in #953 is open. Remove entries
@@ -20,7 +20,7 @@ client:
   # SEP-2575: the client does not send `MCP-Protocol-Version` on the
   # initialize POST (it only sets the header once initialize has returned a
   # version), and does not populate the required per-request `_meta` fields.
-  # The draft harness answers a header-less POST with HTTP 400 / -32020, so
+  # The harness answers a header-less POST with HTTP 400 / -32020, so
   # every scenario that gets past auth and then makes an MCP call stops there.
   # This one gap accounts for most of the entries below. Client work in #953.
   - request-metadata

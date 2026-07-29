@@ -61,7 +61,7 @@ use crate::context::RequestContext;
 use crate::error::{Error, Result};
 use crate::protocol::{
     Content, GetPromptResult, PromptArgument, PromptDefinition, PromptMessage, PromptRole,
-    RequestId, ToolIcon,
+    RequestId, RequestOutcome, ToolIcon,
 };
 
 /// A boxed future for prompt handlers
@@ -298,6 +298,18 @@ pub trait PromptHandler: Send + Sync {
     }
 }
 
+/// Prompt handler that may return an SEP-2322 input-required continuation.
+#[cfg(feature = "stateless")]
+pub trait MrtrPromptHandler: Send + Sync {
+    /// Resolve a prompt attempt with continuation values available through
+    /// the request context.
+    fn get(
+        &self,
+        ctx: RequestContext,
+        arguments: HashMap<String, String>,
+    ) -> BoxFuture<'_, Result<RequestOutcome<GetPromptResult>>>;
+}
+
 /// A complete prompt definition with handler
 pub struct Prompt {
     /// The prompt name (must be unique within the router).
@@ -310,7 +322,9 @@ pub struct Prompt {
     pub icons: Option<Vec<ToolIcon>>,
     /// The arguments this prompt accepts.
     pub arguments: Vec<PromptArgument>,
-    handler: Arc<dyn PromptHandler>,
+    handler: Option<Arc<dyn PromptHandler>>,
+    #[cfg(feature = "stateless")]
+    mrtr_handler: Option<Arc<dyn MrtrPromptHandler>>,
 }
 
 impl Clone for Prompt {
@@ -322,6 +336,8 @@ impl Clone for Prompt {
             icons: self.icons.clone(),
             arguments: self.arguments.clone(),
             handler: self.handler.clone(),
+            #[cfg(feature = "stateless")]
+            mrtr_handler: self.mrtr_handler.clone(),
         }
     }
 }
@@ -361,7 +377,14 @@ impl Prompt {
         &self,
         arguments: HashMap<String, String>,
     ) -> BoxFuture<'_, Result<GetPromptResult>> {
-        self.handler.get(arguments)
+        match &self.handler {
+            Some(handler) => handler.get(arguments),
+            None => Box::pin(async {
+                Err(Error::invalid_params(
+                    "MRTR prompt requires get_outcome_with_context",
+                ))
+            }),
+        }
     }
 
     /// Get the prompt with request context
@@ -372,12 +395,46 @@ impl Prompt {
         ctx: RequestContext,
         arguments: HashMap<String, String>,
     ) -> BoxFuture<'_, Result<GetPromptResult>> {
-        self.handler.get_with_context(ctx, arguments)
+        match &self.handler {
+            Some(handler) => handler.get_with_context(ctx, arguments),
+            None => Box::pin(async {
+                Err(Error::invalid_params(
+                    "MRTR prompt requires get_outcome_with_context",
+                ))
+            }),
+        }
+    }
+
+    /// Get the prompt while preserving an SEP-2322 input-required outcome.
+    pub fn get_outcome_with_context(
+        &self,
+        ctx: RequestContext,
+        arguments: HashMap<String, String>,
+    ) -> BoxFuture<'_, Result<RequestOutcome<GetPromptResult>>> {
+        #[cfg(feature = "stateless")]
+        if let Some(handler) = &self.mrtr_handler {
+            return handler.get(ctx, arguments);
+        }
+        match &self.handler {
+            Some(handler) => Box::pin(async move {
+                handler
+                    .get_with_context(ctx, arguments)
+                    .await
+                    .map(RequestOutcome::Complete)
+            }),
+            None => Box::pin(async {
+                Err(Error::invalid_params(
+                    "prompt has neither a complete nor MRTR handler",
+                ))
+            }),
+        }
     }
 
     /// Returns true if this prompt uses context
     pub fn uses_context(&self) -> bool {
-        self.handler.uses_context()
+        self.handler
+            .as_ref()
+            .is_none_or(|handler| handler.uses_context())
     }
 }
 
@@ -582,6 +639,23 @@ impl PromptBuilder {
         }
     }
 
+    /// Set an SEP-2322 prompt handler that may return input-required.
+    #[cfg(feature = "stateless")]
+    pub fn mrtr_handler<F, Fut>(self, handler: F) -> PromptBuilderWithMrtrHandler<F>
+    where
+        F: Fn(RequestContext, HashMap<String, String>) -> Fut + Send + Sync + Clone + 'static,
+        Fut: Future<Output = Result<RequestOutcome<GetPromptResult>>> + Send + 'static,
+    {
+        PromptBuilderWithMrtrHandler {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            icons: self.icons,
+            arguments: self.arguments,
+            handler,
+        }
+    }
+
     /// Create a static prompt (no arguments needed)
     pub fn static_prompt(self, messages: Vec<PromptMessage>) -> Prompt {
         let description = self.description.clone();
@@ -640,6 +714,17 @@ pub struct PromptBuilderWithHandler<F> {
     handler: F,
 }
 
+#[cfg(feature = "stateless")]
+#[doc(hidden)]
+pub struct PromptBuilderWithMrtrHandler<F> {
+    name: String,
+    title: Option<String>,
+    description: Option<String>,
+    icons: Option<Vec<ToolIcon>>,
+    arguments: Vec<PromptArgument>,
+    handler: F,
+}
+
 impl<F, Fut> PromptBuilderWithHandler<F>
 where
     F: Fn(HashMap<String, String>) -> Fut + Send + Sync + Clone + 'static,
@@ -653,9 +738,11 @@ where
             description: self.description,
             icons: self.icons,
             arguments: self.arguments,
-            handler: Arc::new(FnHandler {
+            handler: Some(Arc::new(FnHandler {
                 handler: self.handler,
-            }),
+            })),
+            #[cfg(feature = "stateless")]
+            mrtr_handler: None,
         }
     }
 
@@ -711,9 +798,33 @@ where
             description: self.description,
             icons: self.icons,
             arguments: self.arguments,
-            handler: Arc::new(ServiceHandler {
+            handler: Some(Arc::new(ServiceHandler {
                 service: Mutex::new(boxed),
-            }),
+            })),
+            #[cfg(feature = "stateless")]
+            mrtr_handler: None,
+        }
+    }
+}
+
+#[cfg(feature = "stateless")]
+impl<F, Fut> PromptBuilderWithMrtrHandler<F>
+where
+    F: Fn(RequestContext, HashMap<String, String>) -> Fut + Send + Sync + Clone + 'static,
+    Fut: Future<Output = Result<RequestOutcome<GetPromptResult>>> + Send + 'static,
+{
+    /// Build the MRTR-capable prompt.
+    pub fn build(self) -> Prompt {
+        Prompt {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            icons: self.icons,
+            arguments: self.arguments,
+            handler: None,
+            mrtr_handler: Some(Arc::new(MrtrContextHandler {
+                handler: self.handler,
+            })),
         }
     }
 }
@@ -742,9 +853,11 @@ where
             description: self.description,
             icons: self.icons,
             arguments: self.arguments,
-            handler: Arc::new(ContextAwareHandler {
+            handler: Some(Arc::new(ContextAwareHandler {
                 handler: self.handler,
-            }),
+            })),
+            #[cfg(feature = "stateless")]
+            mrtr_handler: None,
         }
     }
 
@@ -768,9 +881,11 @@ where
             description: self.description,
             icons: self.icons,
             arguments: self.arguments,
-            handler: Arc::new(ServiceContextHandler {
+            handler: Some(Arc::new(ServiceContextHandler {
                 service: Mutex::new(boxed),
-            }),
+            })),
+            #[cfg(feature = "stateless")]
+            mrtr_handler: None,
         }
     }
 }
@@ -797,6 +912,26 @@ where
 /// Handler that receives request context
 struct ContextAwareHandler<F> {
     handler: F,
+}
+
+#[cfg(feature = "stateless")]
+struct MrtrContextHandler<F> {
+    handler: F,
+}
+
+#[cfg(feature = "stateless")]
+impl<F, Fut> MrtrPromptHandler for MrtrContextHandler<F>
+where
+    F: Fn(RequestContext, HashMap<String, String>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<RequestOutcome<GetPromptResult>>> + Send + 'static,
+{
+    fn get(
+        &self,
+        ctx: RequestContext,
+        arguments: HashMap<String, String>,
+    ) -> BoxFuture<'_, Result<RequestOutcome<GetPromptResult>>> {
+        Box::pin((self.handler)(ctx, arguments))
+    }
 }
 
 impl<F, Fut> PromptHandler for ContextAwareHandler<F>
@@ -982,7 +1117,9 @@ pub trait McpPrompt: Send + Sync + 'static {
             description: Some(Self::DESCRIPTION.to_string()),
             icons: None,
             arguments,
-            handler: Arc::new(McpPromptHandler { prompt }),
+            handler: Some(Arc::new(McpPromptHandler { prompt })),
+            #[cfg(feature = "stateless")]
+            mrtr_handler: None,
         }
     }
 }
@@ -1335,6 +1472,29 @@ mod tests {
         args.insert("name".to_string(), "Bob".to_string());
         let result = prompt.get(args).await.unwrap();
         assert_eq!(result.messages.len(), 1);
+    }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn test_mrtr_builder_preserves_input_required_outcome() {
+        let prompt = PromptBuilder::new("continue")
+            .mrtr_handler(|_ctx, _args| async move {
+                Ok(RequestOutcome::input_required(
+                    crate::protocol::InputRequiredResult::new().with_request_state("signed-state"),
+                ))
+            })
+            .build();
+
+        let outcome = prompt
+            .get_outcome_with_context(RequestContext::new(RequestId::Number(1)), HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome
+                .as_input_required()
+                .and_then(|result| result.request_state.as_deref()),
+            Some("signed-state")
+        );
     }
 
     #[tokio::test]

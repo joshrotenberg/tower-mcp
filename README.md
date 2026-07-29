@@ -38,7 +38,7 @@ If you've used [axum](https://docs.rs/axum), tower-mcp's API will feel familiar:
 | **Tower-native middleware** | Timeout, rate-limit, auth, tracing -- on the whole server or on individual tools. Any `tower::Layer` works. |
 | **All transports** | stdio, HTTP/SSE (with stream resumption), WebSocket, and child process. Same router, any transport. |
 | **In-process testing** | `TestClient` lets you test MCP servers without spawning a subprocess or opening a socket. |
-| **Conformance** | 39/39 server checks and 264/266 client checks (2025-11-25 suites, conformance@0.1.16) plus the official 2026-07-28 suites (67/101 server and 171/213 client checks at 0.2.0-alpha.10, gaps baselined per [#929](https://github.com/joshrotenberg/tower-mcp/issues/929) and [#953](https://github.com/joshrotenberg/tower-mcp/issues/953)) run in CI on every PR via the [official MCP conformance suite](https://github.com/modelcontextprotocol/conformance). The suite is upstream-maintained and grows with the spec, so this is a moving target -- not a one-time achievement. [SEP-2484](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2484) (accepted) makes conformance scenarios a prerequisite for standards-track SEPs reaching `final`. |
+| **Conformance** | 39/39 server checks and 264/266 client checks (2025-11-25 suites, conformance@0.1.16) plus the official 2026-07-28 suites (114/114 server and 171/213 client checks at 0.2.0-alpha.10, client gaps baselined in [#953](https://github.com/joshrotenberg/tower-mcp/issues/953)) run in CI on every PR via the [official MCP conformance suite](https://github.com/modelcontextprotocol/conformance). The suite is upstream-maintained and grows with the spec, so this is a moving target -- not a one-time achievement. [SEP-2484](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2484) (accepted) makes conformance scenarios a prerequisite for standards-track SEPs reaching `final`. |
 | **Capability filtering** | Session-based tool/resource/prompt visibility for multi-tenant patterns. |
 | **No proc macros required** | Builder pattern API with optional trait-based tools. Nothing hidden behind `#[derive]`. Optional `#[tool_fn]` / `#[prompt_fn]` / `#[resource_fn]` macros available for convenience (feature: `macros`). |
 | **Async tasks** | Full task lifecycle -- background execution, cancellation, TTL cleanup, per-tool task support mode. Clients can poll or wait for long-running tool results. |
@@ -588,17 +588,46 @@ tower-mcp targets the [MCP specification 2025-11-25](https://modelcontextprotoco
 
 - **Server (2025-11-25):** 39/39 checks (`conformance@0.1.16`)
 - **Client (2025-11-25):** 264/266 checks (`conformance@0.1.16`; the two gaps are new offline-access scenarios, baselined in `conformance-baseline-client.yml` and tracked in [#953](https://github.com/joshrotenberg/tower-mcp/issues/953))
-- **Server (2026-07-28):** 67/101 checks (`conformance@0.2.0-alpha.10`, `--suite all`); remaining gaps are baselined in `conformance-baseline-draft.yml`, one entry per phase of the parity roadmap in [#929](https://github.com/joshrotenberg/tower-mcp/issues/929)
+- **Server (2026-07-28):** 114/114 checks (`conformance@0.2.0-alpha.10`, `--suite all`); the server baseline is empty
 - **Client (2026-07-28):** 171/213 checks (`conformance@0.2.0-alpha.10`, `--suite all`); gaps are baselined in `conformance-baseline-draft-client.yml`, grouped by SEP and tracked in [#953](https://github.com/joshrotenberg/tower-mcp/issues/953)
 
 Because the suite is upstream-maintained and grows with the spec, these counts shift as new scenarios are added -- treat the green CI badge as the source of truth, not any single snapshot. CI fails when a baselined scenario regresses further or starts passing (stale baseline), so the baselines cannot silently rot.
 
 The `protocol-2026-07-28` feature enables the experimental implementation of the released
 2026-07-28 protocol (version-gated, behind
-`MCP-Protocol-Version: 2026-07-28`) covering `server/discover`, `subscriptions/listen`, and per-request
-`_meta` capabilities as defined by SEP-2575 and SEP-2567. It is not enabled by default and is
+`MCP-Protocol-Version: 2026-07-28`) covering `server/discover`, `subscriptions/listen`, per-request
+`_meta` capabilities, and SEP-2322 Multi Round-Trip Requests. It is not enabled by default and is
 not yet included in `SUPPORTED_PROTOCOL_VERSIONS`; compile-time availability and per-transport
 runtime enablement are reported separately.
+
+MRTR-aware tool, prompt, resource, and resource-template handlers return
+`RequestOutcome<T>`. Retry values are exposed on `RequestContext`, while
+`RequestStateCodec` provides versioned, expiring, HMAC-SHA256 state tokens:
+
+```rust
+use tower_mcp::{
+    CallToolResult, InputRequest, InputRequiredResult, InputRequests, ListRootsParams,
+    NoParams, RequestOutcome, ToolBuilder,
+};
+
+let tool = ToolBuilder::new("workspace_summary")
+    .mrtr_handler::<NoParams, _, _>(|ctx, _| async move {
+        if ctx.input_responses().is_some_and(|r| r.contains_key("roots")) {
+            return Ok(RequestOutcome::Complete(CallToolResult::text("ready")));
+        }
+
+        let requests: InputRequests = [(
+            "roots".into(),
+            InputRequest::ListRoots(ListRootsParams::default()),
+        )]
+        .into_iter()
+        .collect();
+        Ok(RequestOutcome::input_required(
+            InputRequiredResult::with_requests(requests),
+        ))
+    })
+    .build();
+```
 
 [SEP-2484](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2484) (accepted) makes merged conformance scenarios a prerequisite for standards-track SEPs reaching `final`, which elevates the conformance suite from a nice-to-have to spec-gating infrastructure. We run it on every PR to catch regressions early and to stay ahead of new scenarios as the spec evolves.
 
@@ -627,9 +656,10 @@ runtime enablement are reported separately.
 - [x] [SSE event IDs and stream resumption](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#resumability-and-redelivery) (SEP-1699)
 - [x] [`_meta` field on all protocol types](https://modelcontextprotocol.io/specification/2025-11-25)
 - [x] [Strict HTTP headers: `Mcp-Method`, `Mcp-Name`, `MCP-Protocol-Version` (SEP-2243)](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2243) (final)
-- [x] [`server/discover` RPC -- stateless capability discovery (SEP-2575)](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2575) (requires `stateless` feature, 2026-07-28+)
-- [x] [`subscriptions/listen` SSE endpoint -- client-initiated server-push stream (SEP-2567)](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2567) (requires `stateless` feature, 2026-07-28+)
-- [x] [Per-request `_meta` client capabilities -- `StatelessRequestMeta` (SEP-2575)](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2575) (requires `stateless` feature, 2026-07-28+)
+- [x] [`server/discover` RPC -- stateless capability discovery (SEP-2575)](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2575) (requires `protocol-2026-07-28`)
+- [x] [`subscriptions/listen` SSE endpoint -- client-initiated server-push stream (SEP-2567)](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2567) (requires `protocol-2026-07-28`)
+- [x] [Per-request `_meta` client capabilities -- `StatelessRequestMeta` (SEP-2575)](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2575) (requires `protocol-2026-07-28`)
+- [x] [Multi Round-Trip Requests for tools, prompts, and resources (SEP-2322)](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr) (requires `protocol-2026-07-28`)
 
 We track all MCP Specification Enhancement Proposals (SEPs) as [GitHub issues](https://github.com/joshrotenberg/tower-mcp/issues?q=label%3Asep). A weekly workflow syncs status from the upstream spec repository.
 

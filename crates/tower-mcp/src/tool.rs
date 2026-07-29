@@ -50,8 +50,8 @@ use tower_service::Service;
 use crate::context::RequestContext;
 use crate::error::{Error, Result, ResultExt};
 use crate::protocol::{
-    CallToolResult, ClientCapabilities, TaskSupportMode, ToolAnnotations, ToolDefinition,
-    ToolExecution, ToolIcon,
+    CallToolResult, ClientCapabilities, RequestOutcome, TaskSupportMode, ToolAnnotations,
+    ToolDefinition, ToolExecution, ToolIcon,
 };
 
 // =============================================================================
@@ -426,6 +426,21 @@ pub trait ToolHandler: Send + Sync {
     fn input_schema(&self) -> Value;
 }
 
+/// Handler for a tool that can complete or return an SEP-2322
+/// [`RequestOutcome::InputRequired`] continuation.
+#[cfg(feature = "stateless")]
+pub trait MrtrToolHandler: Send + Sync {
+    /// Execute an MRTR-capable tool with request context and raw arguments.
+    fn call(
+        &self,
+        ctx: RequestContext,
+        args: Value,
+    ) -> BoxFuture<'_, Result<RequestOutcome<CallToolResult>>>;
+
+    /// Get the tool's input schema.
+    fn input_schema(&self) -> Value;
+}
+
 /// Adapts a `ToolHandler` to a Tower `Service<ToolRequest>`.
 ///
 /// This is an internal adapter that bridges the handler abstraction to the
@@ -493,7 +508,9 @@ pub struct Tool {
     /// per-request protocol.
     pub(crate) required_client_capabilities: Option<ClientCapabilities>,
     /// The boxed service that executes the tool
-    pub(crate) service: BoxToolService,
+    pub(crate) service: Option<BoxToolService>,
+    #[cfg(feature = "stateless")]
+    pub(crate) mrtr_handler: Option<Arc<dyn MrtrToolHandler>>,
     /// JSON Schema for the tool's input
     pub(crate) input_schema: Value,
 }
@@ -533,6 +550,8 @@ impl Clone for Tool {
             task_support: self.task_support,
             required_client_capabilities: self.required_client_capabilities.clone(),
             service: self.service.clone(),
+            #[cfg(feature = "stateless")]
+            mrtr_handler: self.mrtr_handler.clone(),
             input_schema: self.input_schema.clone(),
         }
     }
@@ -589,12 +608,46 @@ impl Tool {
         ctx: RequestContext,
         args: Value,
     ) -> BoxFuture<'static, CallToolResult> {
-        use tower::ServiceExt;
-        let service = self.service.clone();
+        let tool = self.clone();
         Box::pin(async move {
-            // ServiceExt::oneshot properly handles poll_ready before call
-            // Service is Infallible, so unwrap is safe
-            service.oneshot(ToolRequest::new(ctx, args)).await.unwrap()
+            match tool.call_outcome_with_context(ctx, args).await {
+                Ok(RequestOutcome::Complete(result)) => result,
+                Ok(RequestOutcome::InputRequired(_)) => CallToolResult::error(
+                    "tool requires additional client input; use call_outcome_with_context",
+                ),
+                Err(error) => CallToolResult::error(error.to_string()),
+            }
+        })
+    }
+
+    /// Call the tool and preserve an SEP-2322 input-required outcome.
+    pub fn call_outcome(
+        &self,
+        args: Value,
+    ) -> BoxFuture<'static, Result<RequestOutcome<CallToolResult>>> {
+        let ctx = RequestContext::new(crate::protocol::RequestId::Number(0));
+        self.call_outcome_with_context(ctx, args)
+    }
+
+    /// Call the tool with context and preserve an SEP-2322 input-required
+    /// outcome or protocol-level handler error.
+    pub fn call_outcome_with_context(
+        &self,
+        ctx: RequestContext,
+        args: Value,
+    ) -> BoxFuture<'static, Result<RequestOutcome<CallToolResult>>> {
+        use tower::ServiceExt;
+        #[cfg(feature = "stateless")]
+        if let Some(handler) = self.mrtr_handler.clone() {
+            return Box::pin(async move { handler.call(ctx, args).await });
+        }
+        let service = self
+            .service
+            .clone()
+            .expect("tool must have a complete or MRTR handler");
+        Box::pin(async move {
+            let result = service.oneshot(ToolRequest::new(ctx, args)).await.unwrap();
+            Ok(RequestOutcome::Complete(result))
         })
     }
 
@@ -649,11 +702,13 @@ impl Tool {
     {
         let guarded = GuardService {
             guard,
-            inner: self.service,
+            inner: self
+                .service
+                .expect("with_guard is not supported on an MRTR tool"),
         };
         let caught = ToolCatchError::new(guarded);
         Tool {
-            service: BoxCloneService::new(caught),
+            service: Some(BoxCloneService::new(caught)),
             ..self
         }
     }
@@ -695,6 +750,8 @@ impl Tool {
             task_support: self.task_support,
             required_client_capabilities: self.required_client_capabilities.clone(),
             service: self.service.clone(),
+            #[cfg(feature = "stateless")]
+            mrtr_handler: self.mrtr_handler.clone(),
             input_schema: self.input_schema.clone(),
         }
     }
@@ -727,7 +784,39 @@ impl Tool {
             annotations,
             task_support,
             required_client_capabilities: None,
-            service,
+            service: Some(service),
+            #[cfg(feature = "stateless")]
+            mrtr_handler: None,
+            input_schema,
+        }
+    }
+
+    #[cfg(feature = "stateless")]
+    #[allow(clippy::too_many_arguments)]
+    fn from_mrtr_handler<H: MrtrToolHandler + 'static>(
+        name: String,
+        title: Option<String>,
+        description: Option<String>,
+        output_schema: Option<Value>,
+        icons: Option<Vec<ToolIcon>>,
+        annotations: Option<ToolAnnotations>,
+        task_support: TaskSupportMode,
+        input_schema_override: Option<Value>,
+        handler: H,
+    ) -> Self {
+        let input_schema =
+            ensure_object_schema(input_schema_override.unwrap_or_else(|| handler.input_schema()));
+        Self {
+            name,
+            title,
+            description,
+            output_schema,
+            icons,
+            annotations,
+            task_support,
+            required_client_capabilities: None,
+            service: None,
+            mrtr_handler: Some(Arc::new(handler)),
             input_schema,
         }
     }
@@ -1093,6 +1182,33 @@ impl ToolBuilder {
         }
     }
 
+    /// Set an SEP-2322 handler that may return either a complete tool result
+    /// or an input-required continuation.
+    ///
+    /// The handler receives [`RequestContext`], where
+    /// [`RequestContext::input_responses`] and
+    /// [`RequestContext::request_state`] expose values from a retry.
+    #[cfg(feature = "stateless")]
+    pub fn mrtr_handler<I, F, Fut>(self, handler: F) -> ToolBuilderWithMrtrHandler<I, F>
+    where
+        I: JsonSchema + DeserializeOwned + Send + Sync + 'static,
+        F: Fn(RequestContext, I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<RequestOutcome<CallToolResult>>> + Send + 'static,
+    {
+        ToolBuilderWithMrtrHandler {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            output_schema: self.output_schema,
+            input_schema_override: self.input_schema_override,
+            icons: self.icons,
+            annotations: self.annotations,
+            task_support: self.task_support,
+            handler,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
     /// Create a tool using the extractor pattern.
     ///
     /// This method provides an axum-inspired way to define handlers where state,
@@ -1316,6 +1432,22 @@ pub struct ToolBuilderWithHandler<I, F> {
     _phantom: std::marker::PhantomData<I>,
 }
 
+/// Builder state for an SEP-2322-capable tool handler.
+#[cfg(feature = "stateless")]
+#[doc(hidden)]
+pub struct ToolBuilderWithMrtrHandler<I, F> {
+    name: String,
+    title: Option<String>,
+    description: Option<String>,
+    output_schema: Option<Value>,
+    input_schema_override: Option<Value>,
+    icons: Option<Vec<ToolIcon>>,
+    annotations: Option<ToolAnnotations>,
+    task_support: TaskSupportMode,
+    handler: F,
+    _phantom: std::marker::PhantomData<I>,
+}
+
 /// Builder state for tools with no parameters.
 ///
 /// Created by [`ToolBuilder::no_params_handler`].
@@ -1431,7 +1563,9 @@ where
             annotations: self.annotations,
             task_support: self.task_support,
             required_client_capabilities: None,
-            service,
+            service: Some(service),
+            #[cfg(feature = "stateless")]
+            mrtr_handler: None,
             input_schema,
         }
     }
@@ -1548,6 +1682,32 @@ where
     }
 }
 
+#[cfg(feature = "stateless")]
+impl<I, F, Fut> ToolBuilderWithMrtrHandler<I, F>
+where
+    I: JsonSchema + DeserializeOwned + Send + Sync + 'static,
+    F: Fn(RequestContext, I) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<RequestOutcome<CallToolResult>>> + Send + 'static,
+{
+    /// Build the MRTR-capable tool.
+    pub fn build(self) -> Tool {
+        Tool::from_mrtr_handler(
+            self.name,
+            self.title,
+            self.description,
+            self.output_schema,
+            self.icons,
+            self.annotations,
+            self.task_support,
+            self.input_schema_override,
+            TypedMrtrHandler {
+                handler: self.handler,
+                _phantom: std::marker::PhantomData,
+            },
+        )
+    }
+}
+
 /// Builder state after a layer has been applied to the handler.
 ///
 /// This builder allows chaining additional layers and building the final tool.
@@ -1605,7 +1765,9 @@ where
             annotations: self.annotations,
             task_support: self.task_support,
             required_client_capabilities: None,
-            service,
+            service: Some(service),
+            #[cfg(feature = "stateless")]
+            mrtr_handler: None,
             input_schema,
         }
     }
@@ -1655,6 +1817,40 @@ where
 struct TypedHandler<I, F> {
     handler: F,
     _phantom: std::marker::PhantomData<I>,
+}
+
+#[cfg(feature = "stateless")]
+struct TypedMrtrHandler<I, F> {
+    handler: F,
+    _phantom: std::marker::PhantomData<I>,
+}
+
+#[cfg(feature = "stateless")]
+impl<I, F, Fut> MrtrToolHandler for TypedMrtrHandler<I, F>
+where
+    I: JsonSchema + DeserializeOwned + Send + Sync + 'static,
+    F: Fn(RequestContext, I) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<RequestOutcome<CallToolResult>>> + Send + 'static,
+{
+    fn call(
+        &self,
+        ctx: RequestContext,
+        args: Value,
+    ) -> BoxFuture<'_, Result<RequestOutcome<CallToolResult>>> {
+        Box::pin(async move {
+            let input: I = serde_json::from_value(args)
+                .map_err(|error| Error::invalid_params(format!("Invalid input: {error}")))?;
+            (self.handler)(ctx, input).await
+        })
+    }
+
+    fn input_schema(&self) -> Value {
+        let schema = schemars::schema_for!(I);
+        ensure_object_schema(
+            serde_json::to_value(schema)
+                .unwrap_or_else(|_| serde_json::json!({ "type": "object" })),
+        )
+    }
 }
 
 impl<I, F, Fut> ToolHandler for TypedHandler<I, F>
@@ -1831,6 +2027,26 @@ mod tests {
         let result = tool.call(serde_json::json!({"name": "World"})).await;
 
         assert!(!result.is_error);
+    }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn test_mrtr_builder_preserves_input_required_outcome() {
+        let tool = ToolBuilder::new("continue")
+            .mrtr_handler::<NoParams, _, _>(|_ctx, _input| async move {
+                Ok(RequestOutcome::input_required(
+                    crate::protocol::InputRequiredResult::new().with_request_state("signed-state"),
+                ))
+            })
+            .build();
+
+        let outcome = tool.call_outcome(serde_json::json!({})).await.unwrap();
+        assert_eq!(
+            outcome
+                .as_input_required()
+                .and_then(|result| result.request_state.as_deref()),
+            Some("signed-state")
+        );
     }
 
     #[tokio::test]

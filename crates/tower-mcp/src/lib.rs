@@ -136,9 +136,11 @@
 //! - [`GetPromptResult`] - Prompt expansion result
 //! - [`Content`] - Text, image, audio, or resource content
 //!
-//! ### Stateless (2026-07-28, requires `stateless` feature)
+//! ### Experimental 2026-07-28 protocol (requires `protocol-2026-07-28`)
 //! - [`stateless::StatelessRequestMeta`] - Per-request `_meta` carrying protocol version,
 //!   client identity, and client capabilities for sessionless 2026-07-28 requests
+//! - [`RequestOutcome`] and [`InputRequiredResult`] - SEP-2322 Multi Round-Trip Request results
+//! - [`RequestStateCodec`] - Expiring, integrity-protected continuation state
 //!
 //! ## Feature Flags
 //!
@@ -156,9 +158,11 @@
 //! - `http-client` - HTTP client transport for connecting to remote MCP servers
 //! - `oauth-client` - OAuth 2.0 client-side token acquisition via client credentials grant (requires `http-client`)
 //! - `macros` - Optional proc macros (`#[tool_fn]`, `#[prompt_fn]`, `#[resource_fn]`, `#[resource_template_fn]`)
-//! - `stateless` - Experimental 2026-07-28 stateless protocol mode (SEP-2575 + SEP-2567). Enables
+//! - `protocol-2026-07-28` - Compile the experimental implementation of the released final
+//!   protocol. Use [`ProtocolSupport`] to select enabled versions at runtime. Enables
 //!   version-gated sessionless dispatch, `server/discover` RPC, per-request `_meta` via
-//!   [`stateless::StatelessRequestMeta`], and `subscriptions/listen` SSE endpoint. Requires `http`.
+//!   [`stateless::StatelessRequestMeta`], `subscriptions/listen`, and SEP-2322 MRTR handlers.
+//! - `stateless` - Compatibility alias for the former 2026 protocol feature name.
 //!
 //! ## Middleware Placement Guide
 //!
@@ -332,10 +336,10 @@
 //!     .build();
 //! ```
 //!
-//! ### Stateless Mode (2026-07-28, requires `stateless` + `http` features)
+//! ### Stateless Mode (2026-07-28, requires `protocol-2026-07-28` + `http`)
 //!
-//! The `stateless` feature enables experimental support for the 2026-07-28 MCP protocol
-//! (SEP-2575 final + SEP-2567 accepted). In this mode the initialize/initialized handshake
+//! The `protocol-2026-07-28` feature enables experimental support for the final
+//! 2026-07-28 MCP protocol. In this mode the initialize/initialized handshake
 //! is replaced by two new RPCs:
 //!
 //! - **`server/discover`** -- stateless capability discovery. Clients that send requests with
@@ -348,8 +352,8 @@
 //!
 //! Per-request client identity and capabilities ride in each request's `_meta` object via
 //! [`stateless::StatelessRequestMeta`] rather than being negotiated once at session open.
-//! The `MCP-Protocol-Version` header value is the version gate: requests carrying `2026-07-28`
-//! or later route through the stateless path; older requests continue through the
+//! The `MCP-Protocol-Version` header value is the version gate: requests carrying exactly
+//! `2026-07-28` route through the stateless path; older requests continue through the
 //! session-based path unchanged.
 //!
 //! ```rust,ignore
@@ -429,15 +433,19 @@
 //!
 //! ## MCP Specification
 //!
-//! This crate implements the MCP specification (2025-11-25):
-//! <https://modelcontextprotocol.io/specification/2025-11-25>
+//! This crate implements MCP 2025-11-25 by default and provides an
+//! experimental implementation of the released 2026-07-28 specification:
+//! <https://modelcontextprotocol.io/specification/2026-07-28>
 //!
-//! The `stateless` feature additionally tracks the upcoming 2026-07-28 protocol defined by:
-//! - [SEP-2567](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2567) (accepted) --
+//! Enable it with `protocol-2026-07-28`; the legacy `stateless` feature name
+//! remains a compatibility alias. Major final-version work includes:
+//! - [SEP-2322](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2322) --
+//!   Multi Round-Trip Requests
+//! - [SEP-2567](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2567) --
 //!   `subscriptions/listen` SSE endpoint
-//! - [SEP-2575](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2575) (final) --
+//! - [SEP-2575](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2575) --
 //!   stateless session model, `server/discover`, per-request `_meta`
-//! - [SEP-2243](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2243) (final) --
+//! - [SEP-2243](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2243) --
 //!   strict HTTP headers (`Mcp-Method`, `Mcp-Name`, `MCP-Protocol-Version`)
 
 pub mod async_task;
@@ -453,6 +461,8 @@ pub mod extract;
 pub mod filter;
 pub mod jsonrpc;
 pub mod middleware;
+#[cfg(feature = "stateless")]
+pub mod mrtr;
 #[cfg(feature = "oauth")]
 pub mod oauth;
 pub mod prompt;
@@ -522,6 +532,10 @@ pub use middleware::{
     AuditLayer, AuditService, McpTracingLayer, McpTracingService, ToolCallLoggingLayer,
     ToolCallLoggingService,
 };
+#[cfg(feature = "stateless")]
+pub use mrtr::{MrtrRequest, RequestStateCodec, RequestStateError};
+#[cfg(feature = "stateless")]
+pub use prompt::MrtrPromptHandler;
 pub use prompt::{BoxPromptService, Prompt, PromptBuilder, PromptHandler, PromptRequest};
 #[allow(deprecated)]
 pub use protocol::{
@@ -537,7 +551,8 @@ pub use protocol::{
     ElicitationCompleteParams, ElicitationFormCapability, ElicitationUrlCapability, EmptyResult,
     GetPromptParams, GetPromptResult, GetPromptResultBuilder, GetTaskInfoParams,
     GetTaskResultParams, IconTheme, Implementation, IncludeContext, InitializeParams,
-    InitializeResult, IntegerSchema, JsonRpcErrorResponse, JsonRpcMessage, JsonRpcNotification,
+    InitializeResult, InputRequest, InputRequests, InputRequiredResult, InputResponse,
+    InputResponses, IntegerSchema, JsonRpcErrorResponse, JsonRpcMessage, JsonRpcNotification,
     JsonRpcRequest, JsonRpcResponse, JsonRpcResponseMessage, JsonRpcResultResponse,
     ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
     ListResourcesParams, ListResourcesResult, ListRootsParams, ListRootsResult, ListTasksParams,
@@ -546,10 +561,10 @@ pub use protocol::{
     MultiSelectEnumItems, MultiSelectEnumSchema, NumberSchema, PrimitiveSchemaDefinition,
     ProgressParams, ProgressToken, PromptArgument, PromptDefinition, PromptMessage,
     PromptReference, PromptRole, PromptsCapability, ReadResourceParams, ReadResourceResult,
-    RequestId, RequestMeta, ResourceContent, ResourceDefinition, ResourceReference,
-    ResourceTemplateDefinition, ResourcesCapability, Root, RootsCapability, SamplingCapability,
-    SamplingContent, SamplingContentOrArray, SamplingContextCapability, SamplingMessage,
-    SamplingTool, SamplingToolsCapability, ServerCapabilities, SetLogLevelParams,
+    RequestId, RequestMeta, RequestOutcome, ResourceContent, ResourceDefinition, ResourceReference,
+    ResourceTemplateDefinition, ResourcesCapability, ResultType, Root, RootsCapability,
+    SamplingCapability, SamplingContent, SamplingContentOrArray, SamplingContextCapability,
+    SamplingMessage, SamplingTool, SamplingToolsCapability, ServerCapabilities, SetLogLevelParams,
     SingleSelectEnumSchema, StringSchema, SubscribeResourceParams, TaskInfo, TaskObject,
     TaskRequestParams, TaskStatus, TaskStatusChangedParams, TaskStatusParams, TaskSupportMode,
     TasksCancelCapability, TasksCapability, TasksListCapability, TasksRequestsCapability,
@@ -567,8 +582,12 @@ pub use resource::{
     BoxResourceService, Resource, ResourceBuilder, ResourceHandler, ResourceRequest,
     ResourceTemplate, ResourceTemplateBuilder, ResourceTemplateHandler,
 };
+#[cfg(feature = "stateless")]
+pub use resource::{MrtrResourceHandler, MrtrResourceTemplateHandler};
 pub use router::{McpRouter, RouterRequest, RouterResponse, ToolAnnotationsMap};
 pub use session::{SessionPhase, SessionState};
+#[cfg(feature = "stateless")]
+pub use tool::MrtrToolHandler;
 pub use tool::{BoxToolService, GuardLayer, NoParams, Tool, ToolBuilder, ToolHandler, ToolRequest};
 pub use transport::{
     BidirectionalStdioTransport, CatchError, GenericStdioTransport, StdioTransport,

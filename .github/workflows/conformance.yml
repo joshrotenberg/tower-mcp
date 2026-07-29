@@ -235,7 +235,7 @@ jobs:
             --expected-failures ./conformance-baseline-client.yml
 
   draft-conformance:
-    name: Official 2026-07-28 Draft Suite
+    name: Official 2026-07-28 Suite
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -267,15 +267,13 @@ jobs:
           cat /tmp/conformance-server-draft.log
           exit 1
 
-      - name: Run official 2026-07-28 draft suite
+      - name: Run official 2026-07-28 suite
         run: |
-          # The 0.2.0-alpha.x line carries the 2026-07-28 draft scenarios.
-          # --suite all includes draft/pending-status scenarios
-          # (server-stateless, caching, header validation, the 14 MRTR
-          # input-required-result scenarios). Known gaps are inventoried in
-          # conformance-baseline-draft.yml, one entry per parity-roadmap
-          # phase issue (#929); the job fails on unexpected failures OR on
-          # stale baseline entries that started passing.
+          # The current 0.2.0-alpha.x package carries the final 2026-07-28
+          # scenarios. --suite all includes all final-protocol checks,
+          # including stateless requests, caching, header validation, and
+          # the 14 MRTR input-required-result scenarios. The empty baseline
+          # keeps CI strict if a regression appears.
           npx @modelcontextprotocol/conformance@0.2.0-alpha.10 server \
             --url http://127.0.0.1:3001/mcp \
             --spec-version 2026-07-28 \
@@ -287,7 +285,7 @@ jobs:
         run: cat /tmp/conformance-server-draft.log
 
   draft-client-conformance:
-    name: Official 2026-07-28 Draft Client Suite
+    name: Official 2026-07-28 Client Suite
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -300,10 +298,10 @@ jobs:
       - name: Build conformance client
         run: cargo build --manifest-path examples/conformance-client/Cargo.toml
 
-      - name: Run official 2026-07-28 draft client suite
+      - name: Run official 2026-07-28 client suite
         run: |
-          # The client half of the draft suite (#1027): the other three jobs
-          # cover stable client, stable server and draft server, so this was
+          # The client half of the final-version suite (#1027): the other three jobs
+          # cover stable client, stable server and final-version server, so this was
           # the least-visible coverage gap. Known gaps are inventoried in
           # conformance-baseline-draft-client.yml, grouped by SEP and tracked
           # in #953; the job fails on unexpected failures OR on stale baseline
@@ -334,7 +332,7 @@ jobs:
           sed 's/\x1b\[[0-9;]*m//g' "$log" > /tmp/conformance-draft-client-clean.log
           clean=/tmp/conformance-draft-client-clean.log
           {
-            echo '## Official 2026-07-28 draft client suite'
+            echo '## Official 2026-07-28 client suite'
             echo
             if grep -q '^Total:' "$clean"; then
               echo "Unbaselined: $(grep -m1 '^Total:' "$clean" | sed 's/^Total: //')"

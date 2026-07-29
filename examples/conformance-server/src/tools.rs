@@ -1,10 +1,14 @@
 use base64::Engine;
+use serde::{Deserialize, Serialize};
 use tower_mcp::protocol::{
-    Content, CreateMessageParams, LogLevel, LoggingMessageParams, ResourceContent, SamplingMessage,
+    Content, CreateMessageParams, ElicitRequestParams, InputRequest, InputRequests,
+    InputRequiredResult, ListRootsParams, LogLevel, LoggingMessageParams, ResourceContent,
+    SamplingMessage,
 };
 use tower_mcp::{
-    CallToolResult, ClientCapabilities, ElicitFormParams, ElicitFormSchema, ElicitMode,
-    SamplingCapability, TaskSupportMode, Tool, ToolBuilder,
+    CallToolResult, ClientCapabilities, ElicitFormParams, ElicitFormSchema, ElicitMode, Error,
+    NoParams, RequestContext, RequestOutcome, SamplingCapability, TaskSupportMode, Tool,
+    ToolBuilder,
     extract::{Context, RawArgs},
 };
 
@@ -69,7 +73,334 @@ pub fn build_tools() -> Vec<Tool> {
         build_streaming_diagnostic(),
         build_trigger_tool_change(),
         build_trigger_prompt_change(),
+        build_input_required_elicitation(),
+        build_input_required_sampling(),
+        build_input_required_list_roots(),
+        build_input_required_request_state(),
+        build_input_required_multiple_inputs(),
+        build_input_required_multi_round(),
+        build_input_required_tampered_state(),
+        build_input_required_capabilities(),
     ]
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ContinuationState {
+    flow: String,
+    round: u8,
+}
+
+fn elicitation_request(
+    message: impl Into<String>,
+    field: &str,
+    schema: serde_json::Value,
+) -> InputRequest {
+    InputRequest::Elicit(ElicitRequestParams::Form(ElicitFormParams {
+        mode: Some(ElicitMode::Form),
+        message: message.into(),
+        requested_schema: ElicitFormSchema::new().raw_field(field, schema, true),
+        meta: None,
+    }))
+}
+
+fn string_elicitation(message: impl Into<String>, field: &str) -> InputRequest {
+    elicitation_request(message, field, serde_json::json!({ "type": "string" }))
+}
+
+fn sampling_request(message: impl Into<String>, max_tokens: u32) -> InputRequest {
+    InputRequest::CreateMessage(CreateMessageParams::new(
+        vec![SamplingMessage::user(message)],
+        max_tokens,
+    ))
+}
+
+fn roots_request() -> InputRequest {
+    InputRequest::ListRoots(ListRootsParams::default())
+}
+
+fn input_required(
+    requests: impl IntoIterator<Item = (impl Into<String>, InputRequest)>,
+) -> RequestOutcome<CallToolResult> {
+    RequestOutcome::input_required(InputRequiredResult::with_requests(
+        requests
+            .into_iter()
+            .map(|(key, request)| (key.into(), request))
+            .collect(),
+    ))
+}
+
+fn signed_input_required(
+    ctx: &RequestContext,
+    requests: InputRequests,
+    state: ContinuationState,
+) -> Result<RequestOutcome<CallToolResult>, Error> {
+    let codec = ctx
+        .request_state_codec()
+        .ok_or_else(|| Error::internal("request-state codec is not configured"))?;
+    let token = codec
+        .encode(&state)
+        .map_err(|error| Error::internal(format!("failed to encode request state: {error}")))?;
+    Ok(RequestOutcome::input_required(
+        InputRequiredResult::with_requests(requests).with_request_state(token),
+    ))
+}
+
+fn decode_state(ctx: &RequestContext) -> Result<Option<ContinuationState>, Error> {
+    let Some(token) = ctx.request_state() else {
+        return Ok(None);
+    };
+    let codec = ctx
+        .request_state_codec()
+        .ok_or_else(|| Error::internal("request-state codec is not configured"))?;
+    codec
+        .decode(token)
+        .map(Some)
+        .map_err(|error| Error::invalid_params(format!("invalid requestState: {error}")))
+}
+
+fn build_input_required_elicitation() -> Tool {
+    ToolBuilder::new("test_input_required_result_elicitation")
+        .description("SEP-2322 elicitation continuation fixture")
+        .mrtr_handler::<NoParams, _, _>(|ctx, _| async move {
+            if ctx
+                .input_responses()
+                .is_some_and(|responses| responses.contains_key("user_name"))
+            {
+                return Ok(RequestOutcome::Complete(CallToolResult::text(
+                    "Hello, Alice!",
+                )));
+            }
+            Ok(input_required([(
+                "user_name",
+                string_elicitation("What is your name?", "name"),
+            )]))
+        })
+        .build()
+}
+
+fn build_input_required_sampling() -> Tool {
+    ToolBuilder::new("test_input_required_result_sampling")
+        .description("SEP-2322 sampling continuation fixture")
+        .mrtr_handler::<NoParams, _, _>(|ctx, _| async move {
+            if ctx
+                .input_responses()
+                .is_some_and(|responses| responses.contains_key("capital_question"))
+            {
+                return Ok(RequestOutcome::Complete(CallToolResult::text(
+                    "The capital of France is Paris.",
+                )));
+            }
+            Ok(input_required([(
+                "capital_question",
+                sampling_request("What is the capital of France?", 100),
+            )]))
+        })
+        .build()
+}
+
+fn build_input_required_list_roots() -> Tool {
+    ToolBuilder::new("test_input_required_result_list_roots")
+        .description("SEP-2322 roots continuation fixture")
+        .mrtr_handler::<NoParams, _, _>(|ctx, _| async move {
+            if ctx
+                .input_responses()
+                .is_some_and(|responses| responses.contains_key("client_roots"))
+            {
+                return Ok(RequestOutcome::Complete(CallToolResult::text(
+                    "Received client roots",
+                )));
+            }
+            Ok(input_required([("client_roots", roots_request())]))
+        })
+        .build()
+}
+
+fn build_input_required_request_state() -> Tool {
+    ToolBuilder::new("test_input_required_result_request_state")
+        .description("SEP-2322 integrity-protected requestState fixture")
+        .mrtr_handler::<NoParams, _, _>(|ctx, _| async move {
+            let responses = ctx.input_responses();
+            if responses.is_some_and(|responses| responses.contains_key("confirm")) {
+                let state = decode_state(&ctx)?
+                    .ok_or_else(|| Error::invalid_params("requestState is required"))?;
+                if state.flow != "request-state" || state.round != 1 {
+                    return Err(Error::invalid_params(
+                        "requestState belongs to another flow",
+                    ));
+                }
+                return Ok(RequestOutcome::Complete(CallToolResult::text("state-ok")));
+            }
+
+            signed_input_required(
+                &ctx,
+                [(
+                    "confirm".to_string(),
+                    elicitation_request(
+                        "Please confirm",
+                        "ok",
+                        serde_json::json!({ "type": "boolean" }),
+                    ),
+                )]
+                .into_iter()
+                .collect(),
+                ContinuationState {
+                    flow: "request-state".into(),
+                    round: 1,
+                },
+            )
+        })
+        .build()
+}
+
+fn build_input_required_multiple_inputs() -> Tool {
+    ToolBuilder::new("test_input_required_result_multiple_inputs")
+        .description("SEP-2322 heterogeneous inputRequests fixture")
+        .mrtr_handler::<NoParams, _, _>(|ctx, _| async move {
+            let complete = ctx.input_responses().is_some_and(|responses| {
+                ["user_name", "greeting", "client_roots"]
+                    .iter()
+                    .all(|key| responses.contains_key(*key))
+            });
+            if complete {
+                let state = decode_state(&ctx)?
+                    .ok_or_else(|| Error::invalid_params("requestState is required"))?;
+                if state.flow != "multiple-inputs" || state.round != 1 {
+                    return Err(Error::invalid_params(
+                        "requestState belongs to another flow",
+                    ));
+                }
+                return Ok(RequestOutcome::Complete(CallToolResult::text(
+                    "All input received",
+                )));
+            }
+
+            signed_input_required(
+                &ctx,
+                [
+                    (
+                        "user_name".to_string(),
+                        string_elicitation("What is your name?", "name"),
+                    ),
+                    (
+                        "greeting".to_string(),
+                        sampling_request("Generate a greeting", 50),
+                    ),
+                    ("client_roots".to_string(), roots_request()),
+                ]
+                .into_iter()
+                .collect(),
+                ContinuationState {
+                    flow: "multiple-inputs".into(),
+                    round: 1,
+                },
+            )
+        })
+        .build()
+}
+
+fn build_input_required_multi_round() -> Tool {
+    ToolBuilder::new("test_input_required_result_multi_round")
+        .description("SEP-2322 evolving multi-round continuation fixture")
+        .mrtr_handler::<NoParams, _, _>(|ctx, _| async move {
+            match decode_state(&ctx)? {
+                None => signed_input_required(
+                    &ctx,
+                    [(
+                        "step1".to_string(),
+                        string_elicitation("Step 1: What is your name?", "name"),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    ContinuationState {
+                        flow: "multi-round".into(),
+                        round: 1,
+                    },
+                ),
+                Some(state) if state.flow == "multi-round" && state.round == 1 => {
+                    if !ctx
+                        .input_responses()
+                        .is_some_and(|responses| responses.contains_key("step1"))
+                    {
+                        return Err(Error::invalid_params("step1 response is required"));
+                    }
+                    signed_input_required(
+                        &ctx,
+                        [(
+                            "step2".to_string(),
+                            string_elicitation("Step 2: What is your favorite color?", "color"),
+                        )]
+                        .into_iter()
+                        .collect(),
+                        ContinuationState {
+                            flow: "multi-round".into(),
+                            round: 2,
+                        },
+                    )
+                }
+                Some(state) if state.flow == "multi-round" && state.round == 2 => {
+                    if !ctx
+                        .input_responses()
+                        .is_some_and(|responses| responses.contains_key("step2"))
+                    {
+                        return Err(Error::invalid_params("step2 response is required"));
+                    }
+                    Ok(RequestOutcome::Complete(CallToolResult::text(
+                        "Multi-round input complete",
+                    )))
+                }
+                Some(_) => Err(Error::invalid_params(
+                    "requestState belongs to another flow or round",
+                )),
+            }
+        })
+        .build()
+}
+
+fn build_input_required_tampered_state() -> Tool {
+    ToolBuilder::new("test_input_required_result_tampered_state")
+        .description("SEP-2322 tampered requestState rejection fixture")
+        .mrtr_handler::<NoParams, _, _>(|ctx, _| async move {
+            let Some(state) = decode_state(&ctx)? else {
+                return signed_input_required(
+                    &ctx,
+                    [(
+                        "confirm".to_string(),
+                        elicitation_request(
+                            "Please confirm",
+                            "ok",
+                            serde_json::json!({ "type": "boolean" }),
+                        ),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    ContinuationState {
+                        flow: "tampered-state".into(),
+                        round: 1,
+                    },
+                );
+            };
+            if state.flow != "tampered-state" || state.round != 1 {
+                return Err(Error::invalid_params(
+                    "requestState belongs to another flow",
+                ));
+            }
+            Ok(RequestOutcome::Complete(CallToolResult::text(
+                "State validated",
+            )))
+        })
+        .build()
+}
+
+fn build_input_required_capabilities() -> Tool {
+    ToolBuilder::new("test_input_required_result_capabilities")
+        .description("SEP-2322 per-request capability filtering fixture")
+        .mrtr_handler::<NoParams, _, _>(|_ctx, _| async move {
+            Ok(input_required([(
+                "sampling_only",
+                sampling_request("Generate a capability-safe response", 50),
+            )]))
+        })
+        .build()
 }
 
 /// Diagnostic fixture for the final protocol's per-request capability gate.

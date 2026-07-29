@@ -626,6 +626,9 @@ pub enum McpResponse {
     Initialize(InitializeResult),
     ListTools(ListToolsResult),
     CallTool(CallToolResult),
+    /// SEP-2322 response indicating that the original request needs one or
+    /// more client inputs before it can complete.
+    InputRequired(InputRequiredResult),
     ListResources(ListResourcesResult),
     ListResourceTemplates(ListResourceTemplatesResult),
     ReadResource(ReadResourceResult),
@@ -4823,11 +4826,87 @@ impl InputRequiredResult {
             meta: None,
         }
     }
+
+    /// Create an input-required result carrying the requests the client must
+    /// fulfil before retrying the original method.
+    pub fn with_requests(input_requests: InputRequests) -> Self {
+        Self {
+            input_requests: Some(input_requests),
+            ..Self::new()
+        }
+    }
+
+    /// Attach opaque server state that the client must echo unchanged on its
+    /// next attempt.
+    pub fn with_request_state(mut self, request_state: impl Into<String>) -> Self {
+        self.request_state = Some(request_state.into());
+        self
+    }
+
+    /// Validate the invariants required by SEP-2322.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.result_type != ResultType::InputRequired {
+            return Err("resultType must be \"input_required\"");
+        }
+        if self.input_requests.is_none() && self.request_state.is_none() {
+            return Err("at least one of inputRequests or requestState must be present");
+        }
+        Ok(())
+    }
 }
 
 impl Default for InputRequiredResult {
     fn default() -> Self {
         InputRequiredResult::new()
+    }
+}
+
+/// Result of a request that may either complete or ask the client for
+/// additional input (SEP-2322).
+///
+/// This is the server-handler outcome for `tools/call`, `prompts/get`, and
+/// `resources/read`. Ordinary handlers continue returning their established
+/// complete result type; MRTR-aware handlers return this enum.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RequestOutcome<T> {
+    /// The request completed normally.
+    Complete(T),
+    /// The client must fulfil the embedded requests and retry.
+    InputRequired(InputRequiredResult),
+}
+
+impl<T> RequestOutcome<T> {
+    /// Create an input-required outcome.
+    pub fn input_required(result: InputRequiredResult) -> Self {
+        RequestOutcome::InputRequired(result)
+    }
+
+    /// Whether this outcome completed the request.
+    pub fn is_complete(&self) -> bool {
+        matches!(self, RequestOutcome::Complete(_))
+    }
+
+    /// Borrow the complete result, if present.
+    pub fn as_complete(&self) -> Option<&T> {
+        match self {
+            RequestOutcome::Complete(result) => Some(result),
+            RequestOutcome::InputRequired(_) => None,
+        }
+    }
+
+    /// Borrow the input-required result, if present.
+    pub fn as_input_required(&self) -> Option<&InputRequiredResult> {
+        match self {
+            RequestOutcome::Complete(_) => None,
+            RequestOutcome::InputRequired(result) => Some(result),
+        }
+    }
+}
+
+impl<T> From<T> for RequestOutcome<T> {
+    fn from(result: T) -> Self {
+        RequestOutcome::Complete(result)
     }
 }
 
@@ -6564,6 +6643,33 @@ mod draft_2026_07_28_tests {
         let back: InputRequiredResult = serde_json::from_value(v).unwrap();
         assert_eq!(back.result_type, ResultType::InputRequired);
         assert_eq!(back.request_state.as_deref(), Some("opaque-blob"));
+    }
+
+    #[test]
+    fn input_required_builders_validate_and_request_outcome_preserves_variant() {
+        let requests: InputRequests = [(
+            "roots".to_string(),
+            InputRequest::ListRoots(ListRootsParams::default()),
+        )]
+        .into_iter()
+        .collect();
+        let result =
+            InputRequiredResult::with_requests(requests).with_request_state("opaque-state");
+        assert!(result.validate().is_ok());
+
+        let outcome: RequestOutcome<CallToolResult> = RequestOutcome::input_required(result);
+        assert!(!outcome.is_complete());
+        assert_eq!(
+            outcome
+                .as_input_required()
+                .and_then(|result| result.request_state.as_deref()),
+            Some("opaque-state")
+        );
+
+        assert!(InputRequiredResult::new().validate().is_err());
+        let complete: RequestOutcome<CallToolResult> = CallToolResult::text("done").into();
+        assert!(complete.is_complete());
+        assert!(complete.as_complete().is_some());
     }
 
     #[test]

@@ -509,6 +509,32 @@ impl RequestContext {
         self.extension::<crate::stateless::StatelessRequestMeta>()
     }
 
+    /// SEP-2322 continuation values supplied by the client on this attempt.
+    #[cfg(feature = "stateless")]
+    pub fn mrtr(&self) -> Option<&crate::mrtr::MrtrRequest> {
+        self.extension::<crate::mrtr::MrtrRequest>()
+    }
+
+    /// Client responses from the prior MRTR round, if any.
+    #[cfg(feature = "stateless")]
+    pub fn input_responses(&self) -> Option<&crate::protocol::InputResponses> {
+        self.mrtr()
+            .and_then(crate::mrtr::MrtrRequest::input_responses)
+    }
+
+    /// Opaque request state echoed by the client, if any.
+    #[cfg(feature = "stateless")]
+    pub fn request_state(&self) -> Option<&str> {
+        self.mrtr()
+            .and_then(crate::mrtr::MrtrRequest::request_state)
+    }
+
+    /// Router-configured request-state codec shared by this handler.
+    #[cfg(feature = "stateless")]
+    pub fn request_state_codec(&self) -> Option<&crate::mrtr::RequestStateCodec> {
+        self.extension::<crate::mrtr::RequestStateCodec>()
+    }
+
     /// Get the request ID
     pub fn request_id(&self) -> &RequestId {
         &self.request_id

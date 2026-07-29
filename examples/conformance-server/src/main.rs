@@ -1,7 +1,7 @@
 //! MCP Conformance Test Server
 //!
 //! This server implements all MCP protocol features for conformance testing.
-//! It passes all 39 official MCP conformance tests.
+//! It passes all official 2025-11-25 and 2026-07-28 server checks.
 //!
 //! ## Running
 //!
@@ -32,7 +32,7 @@ mod tools;
 use clap::Parser;
 use tower_mcp::context::notification_channel;
 use tower_mcp::protocol::DeprecationInfo;
-use tower_mcp::{HttpTransport, McpRouter, StdioTransport};
+use tower_mcp::{HttpTransport, McpRouter, RequestStateCodec, StdioTransport};
 
 #[derive(Parser)]
 #[command(name = "conformance-server")]
@@ -64,7 +64,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .server_info("conformance-server", "0.1.0")
         .instructions(
             "MCP conformance test server implementing all spec features. \
-             This server passes all 39 official MCP conformance tests and \
+             This server passes all official MCP server conformance checks and \
              demonstrates tools, resources, prompts, progress notifications, \
              logging, sampling, and elicitation.",
         )
@@ -81,7 +81,11 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
             remove_in: None,
             replacement: None,
         })
-        .with_notification_sender(tx);
+        .with_notification_sender(tx)
+        .with_extension(RequestStateCodec::new(
+            b"tower-mcp-conformance-state-key-2026-07-28",
+            std::time::Duration::from_secs(300),
+        )?);
 
     for tool in tools::build_tools() {
         router = router.tool(tool);

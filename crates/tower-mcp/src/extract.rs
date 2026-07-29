@@ -1062,7 +1062,9 @@ where
             annotations: self.annotations,
             task_support: self.task_support,
             required_client_capabilities: None,
-            service,
+            service: Some(service),
+            #[cfg(feature = "stateless")]
+            mrtr_handler: None,
             input_schema: self.input_schema,
         }
     }
@@ -1187,7 +1189,9 @@ where
             annotations: self.annotations,
             task_support: self.task_support,
             required_client_capabilities: None,
-            service,
+            service: Some(service),
+            #[cfg(feature = "stateless")]
+            mrtr_handler: None,
             input_schema: self.input_schema,
         }
     }
@@ -1292,7 +1296,9 @@ where
             annotations: self.annotations,
             task_support: self.task_support,
             required_client_capabilities: None,
-            service,
+            service: Some(service),
+            #[cfg(feature = "stateless")]
+            mrtr_handler: None,
             input_schema,
         }
     }
