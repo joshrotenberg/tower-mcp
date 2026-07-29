@@ -10,6 +10,7 @@
 use async_trait::async_trait;
 
 use crate::error::Result;
+use crate::protocol::RequestId;
 
 /// Low-level transport for sending and receiving raw JSON-RPC messages.
 ///
@@ -75,6 +76,25 @@ pub trait ClientTransport: Send + 'static {
     /// The default implementation is a no-op (for transports like stdio
     /// that don't have sessions).
     async fn reset_session(&mut self) {}
+
+    /// Cancel one in-flight request.
+    ///
+    /// Message-oriented transports such as stdio use the protocol's
+    /// `notifications/cancelled` notification. HTTP overrides this method to
+    /// close only the response stream belonging to the request.
+    async fn cancel_request(&mut self, request_id: &RequestId) -> Result<()> {
+        self.send(
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {
+                    "requestId": request_id,
+                }
+            })
+            .to_string(),
+        )
+        .await
+    }
 
     /// Whether this transport supports automatic session recovery.
     ///

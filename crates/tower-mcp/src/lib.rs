@@ -143,6 +143,8 @@
 //! - [`RequestStateCodec`] - Expiring, integrity-protected continuation state
 //! - `McpClient::discover` - Sessionless client discovery with per-request metadata,
 //!   runtime version selection, SEP-2243 headers, and bounded MRTR auto-driving
+//! - `McpClient::listen_subscriptions` - Long-lived, correlated notification streams with
+//!   typed acknowledgments and transport-specific cancellation
 //!
 //! ## Feature Flags
 //!
@@ -351,7 +353,9 @@
 //! - **`subscriptions/listen`** -- client-initiated SSE subscription. A POST of a
 //!   `subscriptions/listen` request with `MCP-Protocol-Version: 2026-07-28` opens a
 //!   server-push stream that is not tied to any session, allowing stateless clients to
-//!   receive notifications.
+//!   receive notifications. [`McpClient::listen_subscriptions`] returns a handle that
+//!   exposes the accepted filter and subscription ID; dropping or cancelling the handle
+//!   closes only that request's response stream.
 //!
 //! Per-request client identity and capabilities ride in each request's `_meta` object via
 //! [`stateless::StatelessRequestMeta`] rather than being negotiated once at session open.
@@ -561,19 +565,20 @@ pub use protocol::{
     ListResourcesParams, ListResourcesResult, ListRootsParams, ListRootsResult, ListTasksParams,
     ListTasksResult, ListToolsParams, ListToolsResult, LogLevel, LoggingCapability,
     LoggingMessageParams, McpNotification, McpRequest, McpResponse, ModelHint, ModelPreferences,
-    MultiSelectEnumItems, MultiSelectEnumSchema, NumberSchema, PrimitiveSchemaDefinition,
-    ProgressParams, ProgressToken, PromptArgument, PromptDefinition, PromptMessage,
-    PromptReference, PromptRole, PromptsCapability, ReadResourceParams, ReadResourceResult,
-    RequestId, RequestMeta, RequestOutcome, ResourceContent, ResourceDefinition, ResourceReference,
-    ResourceTemplateDefinition, ResourcesCapability, ResultType, Root, RootsCapability,
-    SamplingCapability, SamplingContent, SamplingContentOrArray, SamplingContextCapability,
-    SamplingMessage, SamplingTool, SamplingToolsCapability, ServerCapabilities, SetLogLevelParams,
-    SingleSelectEnumSchema, StringSchema, SubscribeResourceParams, TaskInfo, TaskObject,
-    TaskRequestParams, TaskStatus, TaskStatusChangedParams, TaskStatusParams, TaskSupportMode,
-    TasksCancelCapability, TasksCapability, TasksListCapability, TasksRequestsCapability,
-    TasksToolsCallCapability, TasksToolsRequestsCapability, ToolAnnotations, ToolChoice,
-    ToolDefinition, ToolExecution, ToolIcon, ToolsCapability, UnsubscribeResourceParams,
-    UpdateTaskParams,
+    MultiSelectEnumItems, MultiSelectEnumSchema, NotificationMeta, NumberSchema,
+    PrimitiveSchemaDefinition, ProgressParams, ProgressToken, PromptArgument, PromptDefinition,
+    PromptMessage, PromptReference, PromptRole, PromptsCapability, ReadResourceParams,
+    ReadResourceResult, RequestId, RequestMeta, RequestOutcome, ResourceContent,
+    ResourceDefinition, ResourceReference, ResourceTemplateDefinition, ResourcesCapability,
+    ResultType, Root, RootsCapability, SamplingCapability, SamplingContent, SamplingContentOrArray,
+    SamplingContextCapability, SamplingMessage, SamplingTool, SamplingToolsCapability,
+    ServerCapabilities, SetLogLevelParams, SingleSelectEnumSchema, StringSchema,
+    SubscribeResourceParams, SubscriptionFilter, SubscriptionsAcknowledgedParams,
+    SubscriptionsListenParams, SubscriptionsListenResult, TaskInfo, TaskObject, TaskRequestParams,
+    TaskStatus, TaskStatusChangedParams, TaskStatusParams, TaskSupportMode, TasksCancelCapability,
+    TasksCapability, TasksListCapability, TasksRequestsCapability, TasksToolsCallCapability,
+    TasksToolsRequestsCapability, ToolAnnotations, ToolChoice, ToolDefinition, ToolExecution,
+    ToolIcon, ToolsCapability, UnsubscribeResourceParams, UpdateTaskParams,
 };
 pub use protocol::{RESULT_TYPE_TASK, TASKS_EXTENSION_ID};
 #[cfg(feature = "dynamic-tools")]

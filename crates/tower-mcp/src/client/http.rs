@@ -53,6 +53,7 @@ use tokio::task::JoinHandle;
 
 use super::transport::ClientTransport;
 use crate::error::{Error, Result};
+use crate::protocol::{RequestId, notifications};
 
 const MCP_METHOD_HEADER: &str = "mcp-method";
 const MCP_NAME_HEADER: &str = "mcp-name";
@@ -241,6 +242,12 @@ pub struct HttpClientTransport {
     incoming_tx: mpsc::Sender<String>,
     /// Handle to the SSE background task, if running.
     sse_task: Option<JoinHandle<()>>,
+    /// In-flight POST response streams, keyed by their JSON-RPC request ID.
+    ///
+    /// Final `subscriptions/listen` requests stay here until cancelled or the
+    /// server closes them. Other completed tasks are pruned on subsequent
+    /// sends.
+    request_tasks: HashMap<RequestId, JoinHandle<()>>,
     /// The last SSE event ID received, for stream resumption.
     last_event_id: Arc<RwLock<Option<String>>>,
     /// Server-requested retry delay from SSE `retry:` field.
@@ -299,6 +306,7 @@ impl HttpClientTransport {
             incoming_rx: rx,
             incoming_tx: tx,
             sse_task: None,
+            request_tasks: HashMap::new(),
             last_event_id: Arc::new(RwLock::new(None)),
             sse_retry_delay: Arc::new(RwLock::new(None)),
             sse_reconnect_signal: Arc::new(Notify::new()),
@@ -337,6 +345,7 @@ impl HttpClientTransport {
             incoming_rx: rx,
             incoming_tx: tx,
             sse_task: None,
+            request_tasks: HashMap::new(),
             last_event_id: Arc::new(RwLock::new(None)),
             sse_retry_delay: Arc::new(RwLock::new(None)),
             sse_reconnect_signal: Arc::new(Notify::new()),
@@ -798,8 +807,13 @@ impl ClientTransport for HttpClientTransport {
             .client
             .post(&self.url)
             .header("Content-Type", "application/json")
-            .header("Accept", "application/json, text/event-stream")
-            .timeout(timeout);
+            .header("Accept", "application/json, text/event-stream");
+        // A subscription is intentionally long-lived; its handle owns the
+        // timeout/cancellation decision. Every ordinary request remains
+        // bounded by the configured request timeout.
+        if method != Some("subscriptions/listen") {
+            request = request.timeout(timeout);
+        }
 
         if !is_modern_request && let Some(ref session_id) = self.session_id {
             request = request.header("mcp-session-id", session_id);
@@ -863,7 +877,7 @@ impl ClientTransport for HttpClientTransport {
         // This prevents a deadlock when the server blocks on a
         // bidirectional request (sampling/elicitation) that requires the
         // client to respond via the SSE channel.
-        if self.session_id.is_some() && !is_modern_request && !is_notification {
+        if !is_notification && (self.session_id.is_some() || is_modern_request) {
             let tx = self.incoming_tx.clone();
             // The caller is parked on this request id in the message loop's
             // correlation map. Every failure branch below delivers a frame
@@ -874,12 +888,17 @@ impl ClientTransport for HttpClientTransport {
                 .as_ref()
                 .and_then(|value| value.get("id"))
                 .cloned();
+            let request_id = req_id
+                .clone()
+                .and_then(|value| serde_json::from_value(value).ok());
+            let is_subscription = method == Some("subscriptions/listen");
             let connected = self.connected.clone();
             let last_event_id = self.last_event_id.clone();
             let sse_retry_delay = self.sse_retry_delay.clone();
             let sse_reconnect_signal = self.sse_reconnect_signal.clone();
             let max_sse_event_size = self.config.max_sse_event_size;
-            tokio::spawn(async move {
+            self.request_tasks.retain(|_, task| !task.is_finished());
+            let task = tokio::spawn(async move {
                 let response = match request.send().await {
                     Ok(r) => r,
                     Err(e) => {
@@ -915,7 +934,7 @@ impl ClientTransport for HttpClientTransport {
                     // this error instead of hanging.
                     if !body.is_empty()
                         && let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&body)
-                        && v.get("error").is_some()
+                        && is_jsonrpc_error_response(&v)
                     {
                         let is_session_signal =
                             v.pointer("/error/code").and_then(|c| c.as_i64()) == Some(-32005);
@@ -955,6 +974,7 @@ impl ClientTransport for HttpClientTransport {
                     let mut parser = SseParser::with_limit(max_sse_event_size);
                     let mut had_retry = false;
                     let mut had_data = false;
+                    let mut subscription_acknowledged = false;
 
                     use futures::StreamExt;
                     while let Some(result) = stream.next().await {
@@ -985,7 +1005,119 @@ impl ClientTransport for HttpClientTransport {
                                     }
                                     if !event.data.is_empty() {
                                         had_data = true;
+                                        let value =
+                                            serde_json::from_str::<serde_json::Value>(&event.data);
+                                        let value = match value {
+                                            Ok(value) => value,
+                                            Err(error) if is_subscription => {
+                                                if let Some(id) = &req_id {
+                                                    let _ = tx
+                                                        .send(transport_error_frame(
+                                                            id,
+                                                            &format!(
+                                                                "subscription stream returned invalid JSON: {error}"
+                                                            ),
+                                                        ))
+                                                        .await;
+                                                }
+                                                return;
+                                            }
+                                            Err(_) => {
+                                                let _ = tx.send(event.data).await;
+                                                continue;
+                                            }
+                                        };
+                                        let is_terminal =
+                                            value.get("id").zip(req_id.as_ref()).is_some_and(
+                                                |(actual, expected)| {
+                                                    json_request_ids_match(actual, expected)
+                                                },
+                                            ) && (value.get("result").is_some()
+                                                || value.get("error").is_some());
+
+                                        if is_subscription {
+                                            let violation = if is_terminal {
+                                                if value.get("error").is_some() {
+                                                    None
+                                                } else if !subscription_acknowledged {
+                                                    Some(
+                                                        "subscriptions/listen completed before acknowledgment",
+                                                    )
+                                                } else if !value
+                                                    .pointer(
+                                                        "/result/_meta/io.modelcontextprotocol~1subscriptionId",
+                                                    )
+                                                    .zip(req_id.as_ref())
+                                                    .is_some_and(|(actual, expected)| {
+                                                        json_request_ids_match(actual, expected)
+                                                    })
+                                                {
+                                                    Some(
+                                                        "subscriptions/listen result carried a missing or mismatched subscription ID",
+                                                    )
+                                                } else {
+                                                    None
+                                                }
+                                            } else if value.get("method").is_some()
+                                                && value.get("id").is_none()
+                                            {
+                                                let correlated = value
+                                                    .pointer(
+                                                        "/params/_meta/io.modelcontextprotocol~1subscriptionId",
+                                                    )
+                                                    .zip(req_id.as_ref())
+                                                    .is_some_and(|(actual, expected)| {
+                                                        json_request_ids_match(actual, expected)
+                                                    });
+                                                let is_acknowledgment = value
+                                                    .get("method")
+                                                    .and_then(serde_json::Value::as_str)
+                                                    == Some(
+                                                        notifications::SUBSCRIPTIONS_ACKNOWLEDGED,
+                                                    );
+                                                if !correlated {
+                                                    Some(
+                                                        "subscription notification carried a missing or mismatched subscription ID",
+                                                    )
+                                                } else if !subscription_acknowledged
+                                                    && !is_acknowledgment
+                                                {
+                                                    Some(
+                                                        "subscription notification arrived before acknowledgment",
+                                                    )
+                                                } else if subscription_acknowledged
+                                                    && is_acknowledgment
+                                                {
+                                                    Some(
+                                                        "subscription stream sent a duplicate acknowledgment",
+                                                    )
+                                                } else {
+                                                    if is_acknowledgment {
+                                                        subscription_acknowledged = true;
+                                                    }
+                                                    None
+                                                }
+                                            } else {
+                                                Some(
+                                                    "subscription stream returned an unrelated JSON-RPC message",
+                                                )
+                                            };
+                                            if let Some(message) = violation {
+                                                if let Some(id) = &req_id {
+                                                    let _ = tx
+                                                        .send(transport_error_frame(id, message))
+                                                        .await;
+                                                }
+                                                return;
+                                            }
+                                        }
                                         let _ = tx.send(event.data).await;
+                                        if is_terminal {
+                                            // The request is complete. Close the response
+                                            // body ourselves even if a non-conforming server
+                                            // leaves the SSE stream open after its final reply.
+                                            return;
+                                        }
                                     }
                                 }
                             }
@@ -1000,19 +1132,20 @@ impl ClientTransport for HttpClientTransport {
                     // the server expects us to reconnect the GET notification stream.
                     // Signal the SSE loop to close its current stream and reconnect
                     // with the updated last_event_id and sse_retry_delay.
-                    if had_retry && !had_data {
+                    if !is_modern_request && had_retry && !had_data {
                         sse_reconnect_signal.notify_one();
-                    } else if !had_data {
+                    } else {
                         // The response stream closed without ever delivering a
-                        // data frame, so nothing correlated the request. Wake
-                        // the caller rather than leave it hanging.
+                        // terminal response. Acknowledgments and ordinary
+                        // notifications do not complete a request, so wake the
+                        // caller rather than leave it hanging.
                         if let Some(id) = &req_id {
-                            let _ = tx
-                                .send(transport_error_frame(
-                                    id,
-                                    "server closed the response stream without a reply",
-                                ))
-                                .await;
+                            let reason = if had_data {
+                                "server closed the response stream before the final reply"
+                            } else {
+                                "server closed the response stream without a reply"
+                            };
+                            let _ = tx.send(transport_error_frame(id, reason)).await;
                         }
                     }
                 } else {
@@ -1064,6 +1197,9 @@ impl ClientTransport for HttpClientTransport {
                     }
                 }
             });
+            if let Some(request_id) = request_id {
+                self.request_tasks.insert(request_id, task);
+            }
             return Ok(());
         }
 
@@ -1161,7 +1297,6 @@ impl ClientTransport for HttpClientTransport {
             .map_err(|e| Error::Transport(format!("Failed to read response: {}", e)))?;
 
         for msg in extract_json_messages(&body) {
-            let msg = self.normalize_incoming_message(msg);
             self.incoming_tx
                 .send(msg)
                 .await
@@ -1173,7 +1308,11 @@ impl ClientTransport for HttpClientTransport {
 
     async fn recv(&mut self) -> Result<Option<String>> {
         match self.incoming_rx.recv().await {
-            Some(msg) => Ok(Some(msg)),
+            // All response paths converge here, including background final
+            // POSTs. Normalize tools/list results on the transport-owning
+            // task so validated x-mcp-header mappings are available to the
+            // next tools/call without sharing mutable state across tasks.
+            Some(msg) => Ok(Some(self.normalize_incoming_message(msg))),
             None => {
                 self.connected.store(false, Ordering::Release);
                 Ok(None)
@@ -1187,6 +1326,10 @@ impl ClientTransport for HttpClientTransport {
 
     async fn close(&mut self) -> Result<()> {
         self.connected.store(false, Ordering::Release);
+
+        for (_, task) in self.request_tasks.drain() {
+            task.abort();
+        }
 
         // Abort SSE task
         if let Some(task) = self.sse_task.take() {
@@ -1223,6 +1366,10 @@ impl ClientTransport for HttpClientTransport {
     async fn reset_session(&mut self) {
         tracing::info!("Resetting session for re-initialization");
 
+        for (_, task) in self.request_tasks.drain() {
+            task.abort();
+        }
+
         // Abort SSE task
         if let Some(task) = self.sse_task.take() {
             task.abort();
@@ -1240,6 +1387,17 @@ impl ClientTransport for HttpClientTransport {
 
     fn supports_session_recovery(&self) -> bool {
         self.config.session_recovery
+    }
+
+    async fn cancel_request(&mut self, request_id: &RequestId) -> Result<()> {
+        if let Some(task) = self.request_tasks.remove(request_id) {
+            // Dropping reqwest's response byte stream closes this request's
+            // HTTP response body, which is the final protocol's cancellation
+            // signal. Other concurrent POST streams remain alive.
+            task.abort();
+            let _ = task.await;
+        }
+        Ok(())
     }
 }
 
@@ -1445,6 +1603,17 @@ fn transport_error_frame(id: &serde_json::Value, message: &str) -> String {
         "error": { "code": -32000, "message": message },
     })
     .to_string()
+}
+
+fn json_request_ids_match(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    left == right
+        || match (left, right) {
+            (serde_json::Value::Number(number), serde_json::Value::String(value))
+            | (serde_json::Value::String(value), serde_json::Value::Number(number)) => number
+                .as_i64()
+                .is_some_and(|number| value.parse::<i64>() == Ok(number)),
+            _ => false,
+        }
 }
 
 fn extract_json_messages(body: &str) -> Vec<String> {

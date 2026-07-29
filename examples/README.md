@@ -28,7 +28,7 @@ cargo run --example websocket_server --features websocket
 # Clients (start http_server first, or run stateless_http_client standalone)
 cargo run --example http_client --features http-client
 cargo run --example http_sse_client --features http
-cargo run --example stateless_http_client --features "http,stateless"
+cargo run --example stateless_http_client --features "http,http-client,protocol-2026-07-28"
 
 # Dynamic capabilities
 cargo run --example dynamic_capabilities --features dynamic-tools

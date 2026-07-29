@@ -17,7 +17,7 @@ use tower_mcp::{
     ElicitResult, GetPromptResult, HttpTransport, LogLevel, LoggingMessageParams, McpClientBuilder,
     McpRouter, NoParams, NotificationHandler, PromptBuilder, PromptMessage, PromptRole,
     ReadResourceResult, ResourceBuilder, ResourceContent, ResourceTemplateBuilder, Root,
-    SamplingContent, SamplingContentOrArray, SamplingMessage, ToolBuilder,
+    SamplingContent, SamplingContentOrArray, SamplingMessage, SubscriptionFilter, ToolBuilder,
     client::{HttpClientConfig, HttpClientTransport, McpClient},
     extract::{Context, RawArgs},
     transport::http::SessionConfig,
@@ -2253,9 +2253,11 @@ mod stateless_tests {
     use super::*;
     use axum::extract::State;
     use axum::http::{HeaderMap, StatusCode};
+    use axum::response::sse::{Event, Sse};
     use axum::response::{IntoResponse, Response};
     use axum::routing::post;
     use axum::{Json, Router};
+    use std::convert::Infallible;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower_mcp::stateless::StatelessConfig;
 
@@ -2390,6 +2392,353 @@ mod stateless_tests {
             )
                 .into_response(),
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct SubscriptionClientState {
+        active_streams: Arc<AtomicUsize>,
+        dropped_streams: Arc<AtomicUsize>,
+        tools_list_calls: Arc<AtomicUsize>,
+        cancellation_posts: Arc<AtomicUsize>,
+    }
+
+    enum SubscriptionStreamMode {
+        LongLived,
+        Graceful,
+        Abrupt,
+        BeforeAcknowledgment,
+        MismatchedId,
+    }
+
+    struct SubscriptionStream {
+        phase: u8,
+        id: serde_json::Value,
+        notifications: serde_json::Value,
+        mode: SubscriptionStreamMode,
+        state: SubscriptionClientState,
+    }
+
+    impl Drop for SubscriptionStream {
+        fn drop(&mut self) {
+            self.state.active_streams.fetch_sub(1, Ordering::SeqCst);
+            self.state.dropped_streams.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    async fn subscription_client_endpoint(
+        State(state): State<SubscriptionClientState>,
+        headers: HeaderMap,
+        Json(body): Json<serde_json::Value>,
+    ) -> Response {
+        let id = body.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        let method = body
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        match method {
+            "server/discover" => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "resultType": "complete",
+                        "supportedVersions": ["2026-07-28"],
+                        "capabilities": {},
+                        "ttlMs": 0,
+                        "cacheScope": "private"
+                    }
+                })),
+            )
+                .into_response(),
+            "tools/list" => {
+                state.tools_list_calls.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "resultType": "complete",
+                            "tools": [],
+                            "ttlMs": 0,
+                            "cacheScope": "private"
+                        }
+                    })),
+                )
+                    .into_response()
+            }
+            "subscriptions/listen" => {
+                if headers
+                    .get("mcp-protocol-version")
+                    .and_then(|value| value.to_str().ok())
+                    != Some("2026-07-28")
+                    || headers
+                        .get("mcp-method")
+                        .and_then(|value| value.to_str().ok())
+                        != Some("subscriptions/listen")
+                    || body.pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
+                        != Some(&serde_json::json!("2026-07-28"))
+                {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+
+                let notifications = body["params"]["notifications"].clone();
+                let mode = if notifications["resourcesListChanged"] == serde_json::Value::Bool(true)
+                {
+                    SubscriptionStreamMode::Graceful
+                } else if notifications["promptsListChanged"] == serde_json::Value::Bool(true) {
+                    SubscriptionStreamMode::Abrupt
+                } else if notifications["resourceSubscriptions"][0]
+                    == serde_json::json!("before-ack")
+                {
+                    SubscriptionStreamMode::BeforeAcknowledgment
+                } else if notifications["resourceSubscriptions"][0] == serde_json::json!("wrong-id")
+                {
+                    SubscriptionStreamMode::MismatchedId
+                } else {
+                    SubscriptionStreamMode::LongLived
+                };
+                state.active_streams.fetch_add(1, Ordering::SeqCst);
+                let stream = futures::stream::unfold(
+                    SubscriptionStream {
+                        phase: 0,
+                        id,
+                        notifications,
+                        mode,
+                        state,
+                    },
+                    |mut stream| async move {
+                        let message = match stream.phase {
+                            0 => match stream.mode {
+                                SubscriptionStreamMode::BeforeAcknowledgment => {
+                                    serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "method": "notifications/tools/list_changed",
+                                        "params": {
+                                            "_meta": {
+                                                "io.modelcontextprotocol/subscriptionId": stream.id
+                                            }
+                                        }
+                                    })
+                                }
+                                SubscriptionStreamMode::MismatchedId => serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "notifications/subscriptions/acknowledged",
+                                    "params": {
+                                        "_meta": {
+                                            "io.modelcontextprotocol/subscriptionId": 999
+                                        },
+                                        "notifications": stream.notifications
+                                    }
+                                }),
+                                _ => serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "notifications/subscriptions/acknowledged",
+                                    "params": {
+                                        "_meta": {
+                                            "io.modelcontextprotocol/subscriptionId": stream.id
+                                        },
+                                        "notifications": stream.notifications
+                                    }
+                                }),
+                            },
+                            1 => match stream.mode {
+                                SubscriptionStreamMode::LongLived => serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "notifications/tools/list_changed",
+                                    "params": {
+                                        "_meta": {
+                                            "io.modelcontextprotocol/subscriptionId": stream.id
+                                        }
+                                    }
+                                }),
+                                SubscriptionStreamMode::Graceful => serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": stream.id,
+                                    "result": {
+                                        "resultType": "complete",
+                                        "_meta": {
+                                            "io.modelcontextprotocol/subscriptionId": stream.id
+                                        }
+                                    }
+                                }),
+                                SubscriptionStreamMode::Abrupt => return None,
+                                SubscriptionStreamMode::BeforeAcknowledgment
+                                | SubscriptionStreamMode::MismatchedId => {
+                                    std::future::pending::<()>().await;
+                                    unreachable!()
+                                }
+                            },
+                            _ => match stream.mode {
+                                SubscriptionStreamMode::LongLived => {
+                                    std::future::pending::<()>().await;
+                                    unreachable!()
+                                }
+                                SubscriptionStreamMode::Graceful
+                                | SubscriptionStreamMode::Abrupt => return None,
+                                SubscriptionStreamMode::BeforeAcknowledgment
+                                | SubscriptionStreamMode::MismatchedId => unreachable!(),
+                            },
+                        };
+                        stream.phase += 1;
+                        Some((
+                            Ok::<_, Infallible>(Event::default().data(message.to_string())),
+                            stream,
+                        ))
+                    },
+                );
+                Sse::new(stream).into_response()
+            }
+            "notifications/cancelled" => {
+                state.cancellation_posts.fetch_add(1, Ordering::SeqCst);
+                StatusCode::ACCEPTED.into_response()
+            }
+            _ => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
+    async fn wait_for_counter(counter: &AtomicUsize, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while counter.load(Ordering::SeqCst) != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn final_http_client_manages_concurrent_subscription_streams() {
+        let state = SubscriptionClientState::default();
+        let app = Router::new()
+            .route("/", post(subscription_client_endpoint))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let tools_changed = Arc::new(AtomicUsize::new(0));
+        let handler = NotificationHandler::new().on_tools_changed({
+            let tools_changed = tools_changed.clone();
+            move || {
+                tools_changed.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let config = HttpClientConfig {
+            request_timeout: Duration::from_millis(100),
+            sse_reconnect: false,
+            ..Default::default()
+        };
+        let client = McpClient::builder()
+            .protocol_support(tower_mcp::ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+            .connect(HttpClientTransport::with_config(url, config), handler)
+            .await
+            .unwrap();
+        client.discover("test-client", "1.0.0").await.unwrap();
+
+        let filter = SubscriptionFilter {
+            tools_list_changed: Some(true),
+            ..Default::default()
+        };
+        let mut first = client.listen_subscriptions(filter.clone()).await.unwrap();
+        let mut second = client.listen_subscriptions(filter).await.unwrap();
+        assert_ne!(first.id(), second.id());
+        assert_eq!(
+            first.acknowledged().await.unwrap().tools_list_changed,
+            Some(true)
+        );
+        assert_eq!(
+            second.acknowledged().await.unwrap().tools_list_changed,
+            Some(true)
+        );
+        wait_for_counter(&state.active_streams, 2).await;
+        wait_for_counter(&tools_changed, 2).await;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(state.dropped_streams.load(Ordering::SeqCst), 0);
+        client.list_tools().await.unwrap();
+
+        first.cancel().await.unwrap();
+        wait_for_counter(&state.active_streams, 1).await;
+        client.list_tools().await.unwrap();
+        second.cancel().await.unwrap();
+        wait_for_counter(&state.active_streams, 0).await;
+        assert_eq!(state.dropped_streams.load(Ordering::SeqCst), 2);
+        assert_eq!(state.tools_list_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(state.cancellation_posts.load(Ordering::SeqCst), 0);
+
+        let mut graceful = client
+            .listen_subscriptions(SubscriptionFilter {
+                resources_list_changed: Some(true),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            graceful
+                .acknowledged()
+                .await
+                .unwrap()
+                .resources_list_changed,
+            Some(true)
+        );
+        let graceful_id = graceful.id().clone();
+        let result = graceful.wait().await.unwrap();
+        assert_eq!(
+            result.meta.and_then(|meta| meta.subscription_id),
+            Some(graceful_id)
+        );
+
+        let mut abrupt = client
+            .listen_subscriptions(SubscriptionFilter {
+                prompts_list_changed: Some(true),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            abrupt.acknowledged().await.unwrap().prompts_list_changed,
+            Some(true)
+        );
+        let error = tokio::time::timeout(Duration::from_secs(2), abrupt.wait())
+            .await
+            .expect("abrupt close should not leave the subscription pending")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("closed the response stream before the final reply")
+        );
+
+        for (resource, expected) in [
+            (
+                "before-ack",
+                "subscription notification arrived before acknowledgment",
+            ),
+            (
+                "wrong-id",
+                "subscription notification carried a missing or mismatched subscription ID",
+            ),
+        ] {
+            let invalid = client
+                .listen_subscriptions(SubscriptionFilter {
+                    resource_subscriptions: Some(vec![resource.to_string()]),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let error = tokio::time::timeout(Duration::from_secs(2), invalid.wait())
+                .await
+                .expect("protocol violation should end the subscription")
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+
+        client.shutdown().await.unwrap();
+        server.abort();
     }
 
     #[tokio::test]

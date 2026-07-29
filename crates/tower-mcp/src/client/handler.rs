@@ -58,7 +58,7 @@ use async_trait::async_trait;
 
 use crate::protocol::{
     CreateMessageParams, CreateMessageResult, ElicitRequestParams, ElicitResult, ListRootsResult,
-    LogLevel, LoggingMessageParams, ProgressParams,
+    LogLevel, LoggingMessageParams, ProgressParams, RequestId, SubscriptionFilter,
 };
 use tower_mcp_types::JsonRpcError;
 
@@ -84,6 +84,27 @@ pub enum ServerNotification {
     ToolsListChanged,
     /// The list of available prompts has changed.
     PromptsListChanged,
+    /// The server acknowledged a `subscriptions/listen` stream.
+    SubscriptionAcknowledged {
+        /// JSON-RPC request ID that identifies the subscription.
+        subscription_id: RequestId,
+        /// Subset of the requested filter the server agreed to honor.
+        notifications: SubscriptionFilter,
+    },
+    /// A notification delivered on a `subscriptions/listen` stream.
+    Subscription {
+        /// JSON-RPC request ID that identifies the subscription.
+        subscription_id: RequestId,
+        /// The ordinary notification carried by this subscription.
+        notification: Box<ServerNotification>,
+    },
+    /// The server cancelled an active subscription.
+    SubscriptionCancelled {
+        /// JSON-RPC request ID that identified the subscription.
+        subscription_id: RequestId,
+        /// Optional diagnostic reason from the server.
+        reason: Option<String>,
+    },
     /// An unknown or unrecognized notification.
     Unknown {
         /// The notification method name.
@@ -275,30 +296,8 @@ impl NotificationHandler {
         self.on_prompts_changed = Some(Box::new(f));
         self
     }
-}
 
-impl Default for NotificationHandler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl std::fmt::Debug for NotificationHandler {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NotificationHandler")
-            .field("on_progress", &self.on_progress.is_some())
-            .field("on_log_message", &self.on_log_message.is_some())
-            .field("on_resource_updated", &self.on_resource_updated.is_some())
-            .field("on_resources_changed", &self.on_resources_changed.is_some())
-            .field("on_tools_changed", &self.on_tools_changed.is_some())
-            .field("on_prompts_changed", &self.on_prompts_changed.is_some())
-            .finish()
-    }
-}
-
-#[async_trait]
-impl ClientHandler for NotificationHandler {
-    async fn on_notification(&self, notification: ServerNotification) {
+    fn dispatch_notification(&self, notification: ServerNotification) {
         match notification {
             ServerNotification::Progress(params) => {
                 if let Some(cb) = &self.on_progress {
@@ -330,8 +329,42 @@ impl ClientHandler for NotificationHandler {
                     cb();
                 }
             }
-            ServerNotification::Unknown { .. } => {}
+            // Preserve the existing callback API for subscription-delivered
+            // events while custom ClientHandler implementations can inspect
+            // the wrapper and correlate concurrent streams.
+            ServerNotification::Subscription { notification, .. } => {
+                self.dispatch_notification(*notification);
+            }
+            ServerNotification::SubscriptionAcknowledged { .. }
+            | ServerNotification::SubscriptionCancelled { .. }
+            | ServerNotification::Unknown { .. } => {}
         }
+    }
+}
+
+impl Default for NotificationHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for NotificationHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NotificationHandler")
+            .field("on_progress", &self.on_progress.is_some())
+            .field("on_log_message", &self.on_log_message.is_some())
+            .field("on_resource_updated", &self.on_resource_updated.is_some())
+            .field("on_resources_changed", &self.on_resources_changed.is_some())
+            .field("on_tools_changed", &self.on_tools_changed.is_some())
+            .field("on_prompts_changed", &self.on_prompts_changed.is_some())
+            .finish()
+    }
+}
+
+#[async_trait]
+impl ClientHandler for NotificationHandler {
+    async fn on_notification(&self, notification: ServerNotification) {
+        self.dispatch_notification(notification);
     }
 }
 

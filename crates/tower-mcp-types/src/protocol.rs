@@ -237,6 +237,8 @@ pub mod notifications {
     pub const INITIALIZED: &str = "notifications/initialized";
     /// Sent when a request is cancelled
     pub const CANCELLED: &str = "notifications/cancelled";
+    /// Acknowledges a `subscriptions/listen` request and its accepted filter.
+    pub const SUBSCRIPTIONS_ACKNOWLEDGED: &str = "notifications/subscriptions/acknowledged";
     /// Progress updates for long-running operations
     pub const PROGRESS: &str = "notifications/progress";
     /// Tool list has changed
@@ -497,10 +499,7 @@ pub enum McpNotification {
 /// client-to-server only (`requestId` MUST reference a request the client
 /// issued); on stdio, the server may still send it, but solely to terminate
 /// a `subscriptions/listen` stream by referencing that request's id -- it
-/// MUST NOT use it to cancel any other request. This crate does not
-/// currently send `notifications/cancelled` from the server for any
-/// purpose, so no code changes; the `subscriptions/listen` termination case
-/// is part of #952.
+/// MUST NOT use it to cancel any other request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CancelledParams {
@@ -1726,16 +1725,19 @@ pub struct SubscriptionsListenParams {
     pub meta: Option<Value>,
 }
 
-/// Result of the `subscriptions/listen` RPC.
+/// Graceful final result of the `subscriptions/listen` RPC.
 ///
-/// In practice the HTTP transport opens an SSE stream and never serializes
-/// this type as a JSON-RPC result. It is provided for completeness and for
-/// transports that want a typed acknowledgement shape.
+/// A server sends this empty complete result before it closes a subscription
+/// stream on its own initiative. An abrupt transport close has no result.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SubscriptionsListenResult {
-    /// Optional protocol-level metadata.
+    /// Always [`ResultType::Complete`].
+    #[serde(default)]
+    pub result_type: ResultType,
+    /// Identifies the subscription that ended.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
-    pub meta: Option<Value>,
+    pub meta: Option<NotificationMeta>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -4914,8 +4916,8 @@ impl<T> From<T> for RequestOutcome<T> {
     }
 }
 
-/// Notification meta (`_meta`) carried by notifications delivered on a
-/// `subscriptions/listen` stream (SEP-2575).
+/// Subscription meta (`_meta`) carried by messages delivered on a
+/// `subscriptions/listen` stream.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NotificationMeta {
     /// Identifies the subscription stream a notification was delivered on: the
@@ -4979,10 +4981,13 @@ pub struct SubscriptionFilter {
     pub resource_subscriptions: Option<Vec<String>>,
 }
 
-/// Parameters for a `notifications/subscriptions/acknowledged` notification
-/// (SEP-2575): the subset of requested notification types the server will honor.
+/// Parameters for a `notifications/subscriptions/acknowledged` notification:
+/// the subset of requested notification types the server will honor.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SubscriptionsAcknowledgedParams {
+    /// Identifies the `subscriptions/listen` request being acknowledged.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<NotificationMeta>,
     /// The notification types the server agreed to honor. Types the server does
     /// not support are omitted.
     pub notifications: SubscriptionFilter,
@@ -6737,11 +6742,31 @@ mod draft_2026_07_28_tests {
         assert!(v.get("promptsListChanged").is_none()); // None is omitted
 
         let ack = SubscriptionsAcknowledgedParams {
+            meta: None,
             notifications: filter,
         };
         let back: SubscriptionsAcknowledgedParams =
             serde_json::from_value(serde_json::to_value(&ack).unwrap()).unwrap();
         assert_eq!(back.notifications.tools_list_changed, Some(true));
+
+        let result = SubscriptionsListenResult {
+            result_type: ResultType::Complete,
+            meta: Some(NotificationMeta {
+                subscription_id: Some(RequestId::Number(7)),
+            }),
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["resultType"], json!("complete"));
+        assert_eq!(
+            value["_meta"]["io.modelcontextprotocol/subscriptionId"],
+            json!(7)
+        );
+        let back: SubscriptionsListenResult = serde_json::from_value(value).unwrap();
+        assert!(back.result_type.is_complete());
+        assert_eq!(
+            back.meta.and_then(|meta| meta.subscription_id),
+            Some(RequestId::Number(7))
+        );
     }
 
     #[test]

@@ -68,16 +68,18 @@ use crate::error::{Error, ErrorCode, McpErrorCode, Result};
 #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
 use crate::protocol::DiscoverParams;
 use crate::protocol::{
-    CacheScope, CallToolParams, CallToolResult, CancelTaskParams, ClientCapabilities,
-    CompleteParams, CompleteResult, CompletionArgument, CompletionReference, CreateTaskResult,
-    DiscoverResult, ElicitationCapability, GetPromptParams, GetPromptResult, GetTaskInfoParams,
-    Implementation, InitializeParams, InitializeResult, InputRequest, InputRequests, InputResponse,
-    InputResponses, JsonRpcNotification, JsonRpcRequest, ListPromptsParams, ListPromptsResult,
-    ListResourceTemplatesParams, ListResourceTemplatesResult, ListResourcesParams,
-    ListResourcesResult, ListRootsResult, ListToolsParams, ListToolsResult, PromptDefinition,
-    ReadResourceParams, ReadResourceResult, RequestId, RequestMeta, RequestOutcome,
-    ResourceDefinition, ResourceTemplateDefinition, Root, RootsCapability, SamplingCapability,
-    TaskObject, TaskRequestParams, ToolDefinition, notifications,
+    CacheScope, CallToolParams, CallToolResult, CancelTaskParams, CancelledParams,
+    ClientCapabilities, CompleteParams, CompleteResult, CompletionArgument, CompletionReference,
+    CreateTaskResult, DiscoverResult, ElicitationCapability, GetPromptParams, GetPromptResult,
+    GetTaskInfoParams, Implementation, InitializeParams, InitializeResult, InputRequest,
+    InputRequests, InputResponse, InputResponses, JsonRpcNotification, JsonRpcRequest,
+    ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
+    ListResourcesParams, ListResourcesResult, ListRootsResult, ListToolsParams, ListToolsResult,
+    PromptDefinition, ReadResourceParams, ReadResourceResult, RequestId, RequestMeta,
+    RequestOutcome, ResourceDefinition, ResourceTemplateDefinition, Root, RootsCapability,
+    SamplingCapability, SubscriptionFilter, SubscriptionsAcknowledgedParams,
+    SubscriptionsListenParams, SubscriptionsListenResult, TaskObject, TaskRequestParams,
+    ToolDefinition, notifications,
 };
 use response_cache::{CacheLookup, ClientResponseCache};
 use tower_mcp_types::JsonRpcError;
@@ -122,6 +124,18 @@ enum LoopCommand {
         params: serde_json::Value,
         response_tx: oneshot::Sender<Result<serde_json::Value>>,
     },
+    /// Open a long-lived `subscriptions/listen` request and return its ID.
+    StartSubscription {
+        params: serde_json::Value,
+        id_tx: oneshot::Sender<RequestId>,
+        acknowledgment_tx: oneshot::Sender<SubscriptionFilter>,
+        response_tx: oneshot::Sender<Result<serde_json::Value>>,
+    },
+    /// Cancel one active subscription request.
+    CancelRequest {
+        request_id: RequestId,
+        done_tx: Option<oneshot::Sender<Result<()>>>,
+    },
     /// Send a JSON-RPC notification (no response expected).
     Notify {
         method: String,
@@ -136,6 +150,110 @@ enum LoopCommand {
     },
     /// Graceful shutdown.
     Shutdown,
+}
+
+/// An active `subscriptions/listen` request.
+///
+/// The handle exposes the JSON-RPC request ID used as the subscription ID,
+/// the server's acknowledged filter, graceful server completion, and explicit
+/// cancellation. Dropping an active handle requests cancellation on a
+/// best-effort basis; callers that need confirmation should call
+/// [`cancel()`](Self::cancel).
+#[must_use = "dropping the handle cancels the active subscription"]
+pub struct SubscriptionHandle {
+    request_id: RequestId,
+    command_tx: mpsc::Sender<LoopCommand>,
+    acknowledgment_rx: Option<oneshot::Receiver<SubscriptionFilter>>,
+    response_rx: Option<oneshot::Receiver<Result<serde_json::Value>>>,
+    active: bool,
+}
+
+impl SubscriptionHandle {
+    /// The JSON-RPC request ID that identifies this subscription.
+    pub fn id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    /// Wait for the server's mandatory first-message acknowledgment.
+    ///
+    /// The returned filter is the subset the server agreed to honor.
+    pub async fn acknowledged(&mut self) -> Result<SubscriptionFilter> {
+        let receiver = self.acknowledgment_rx.take().ok_or_else(|| {
+            Error::Transport("subscription acknowledgment was already consumed".to_string())
+        })?;
+        receiver
+            .await
+            .map_err(|_| Error::Transport("subscription ended before acknowledgment".to_string()))
+    }
+
+    /// Wait for the server to end the subscription gracefully.
+    ///
+    /// An HTTP disconnect without a terminal response is reported as a
+    /// transport error. Dropping this future drops the handle and cancels the
+    /// subscription.
+    pub async fn wait(mut self) -> Result<SubscriptionsListenResult> {
+        let receiver = self.response_rx.take().ok_or_else(|| {
+            Error::Transport("subscription result was already consumed".to_string())
+        })?;
+        let value = receiver
+            .await
+            .map_err(|_| Error::Transport("connection closed".to_string()))??;
+        self.active = false;
+        let result: SubscriptionsListenResult = serde_json::from_value(value).map_err(|error| {
+            Error::Transport(format!(
+                "failed to deserialize subscriptions/listen response: {error}"
+            ))
+        })?;
+        if !result.result_type.is_complete() {
+            return Err(Error::Transport(format!(
+                "subscriptions/listen ended with unexpected result type {:?}",
+                result.result_type
+            )));
+        }
+        let response_id = result
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.subscription_id.as_ref())
+            .ok_or_else(|| {
+                Error::Transport(
+                    "subscriptions/listen result omitted its subscription ID".to_string(),
+                )
+            })?;
+        if !request_ids_match(response_id, &self.request_id) {
+            return Err(Error::Transport(
+                "subscriptions/listen result carried the wrong subscription ID".to_string(),
+            ));
+        }
+        Ok(result)
+    }
+
+    /// Cancel the subscription and wait until its transport stream is closed.
+    pub async fn cancel(mut self) -> Result<()> {
+        let (done_tx, done_rx) = oneshot::channel();
+        self.command_tx
+            .send(LoopCommand::CancelRequest {
+                request_id: self.request_id.clone(),
+                done_tx: Some(done_tx),
+            })
+            .await
+            .map_err(|_| Error::Transport("connection closed".to_string()))?;
+        let result = done_rx
+            .await
+            .map_err(|_| Error::Transport("connection closed".to_string()))?;
+        self.active = false;
+        result
+    }
+}
+
+impl Drop for SubscriptionHandle {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.command_tx.try_send(LoopCommand::CancelRequest {
+                request_id: self.request_id.clone(),
+                done_tx: None,
+            });
+        }
+    }
 }
 
 /// MCP client with a background message loop.
@@ -899,6 +1017,61 @@ impl McpClient {
             meta: None,
         };
         self.send_request("resources/read", &params).await
+    }
+
+    /// Open a final-protocol `subscriptions/listen` notification stream.
+    ///
+    /// The returned handle owns the long-lived request. Use
+    /// [`SubscriptionHandle::acknowledged`] to inspect the subset accepted by
+    /// the server, [`SubscriptionHandle::wait`] to observe graceful server
+    /// closure, or [`SubscriptionHandle::cancel`] to close the stream.
+    /// Notifications continue to flow through the configured
+    /// [`ClientHandler`] and carry their subscription ID in
+    /// [`ServerNotification::Subscription`].
+    pub async fn listen_subscriptions(
+        &self,
+        notifications: SubscriptionFilter,
+    ) -> Result<SubscriptionHandle> {
+        self.ensure_initialized()?;
+        if !self.uses_final_protocol().await {
+            return Err(Error::Transport(
+                "subscriptions/listen requires the 2026-07-28 protocol".to_string(),
+            ));
+        }
+
+        let params = SubscriptionsListenParams {
+            notifications: Some(notifications),
+            meta: None,
+        };
+        let params = serde_json::to_value(params).map_err(|error| {
+            Error::Transport(format!(
+                "failed to serialize subscriptions/listen params: {error}"
+            ))
+        })?;
+        let params = self.with_final_request_meta(params).await?;
+        let (id_tx, id_rx) = oneshot::channel();
+        let (acknowledgment_tx, acknowledgment_rx) = oneshot::channel();
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(LoopCommand::StartSubscription {
+                params,
+                id_tx,
+                acknowledgment_tx,
+                response_tx,
+            })
+            .await
+            .map_err(|_| Error::Transport("connection closed".to_string()))?;
+        let request_id = id_rx
+            .await
+            .map_err(|_| Error::Transport("connection closed".to_string()))?;
+
+        Ok(SubscriptionHandle {
+            request_id,
+            command_tx: self.command_tx.clone(),
+            acknowledgment_rx: Some(acknowledgment_rx),
+            response_rx: Some(response_rx),
+            active: true,
+        })
     }
 
     /// Subscribe to `notifications/resources/updated` for one resource
@@ -1678,7 +1851,9 @@ impl Drop for McpClient {
 
 /// A pending request waiting for a response from the server.
 struct PendingRequest {
+    method: String,
     response_tx: oneshot::Sender<Result<serde_json::Value>>,
+    acknowledgment_tx: Option<oneshot::Sender<SubscriptionFilter>>,
 }
 
 /// Background message loop that multiplexes incoming/outgoing messages.
@@ -1715,12 +1890,76 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
                         };
 
                         tracing::debug!(method = %method, id = ?id, "Sending request");
-                        pending_requests.insert(id, PendingRequest { response_tx });
+                        pending_requests.insert(id, PendingRequest {
+                            method,
+                            response_tx,
+                            acknowledgment_tx: None,
+                        });
 
                         if let Err(e) = transport.send(&json).await {
                             tracing::error!(error = %e, "Transport send error");
                             fail_all_pending(&mut pending_requests, &format!("Transport error: {}", e));
                             break;
+                        }
+                    }
+                    Some(LoopCommand::StartSubscription {
+                        params,
+                        id_tx,
+                        acknowledgment_tx,
+                        response_tx,
+                    }) => {
+                        let id = RequestId::Number(next_id.fetch_add(1, Ordering::Relaxed));
+                        let request = JsonRpcRequest::new(id.clone(), "subscriptions/listen")
+                            .with_params(params);
+                        let json = match serde_json::to_string(&request) {
+                            Ok(json) => json,
+                            Err(error) => {
+                                let _ = response_tx.send(Err(Error::Transport(
+                                    format!("Serialization failed: {error}")
+                                )));
+                                continue;
+                            }
+                        };
+
+                        tracing::debug!(id = ?id, "Opening subscription");
+                        pending_requests.insert(id.clone(), PendingRequest {
+                            method: "subscriptions/listen".to_string(),
+                            response_tx,
+                            acknowledgment_tx: Some(acknowledgment_tx),
+                        });
+                        let _ = id_tx.send(id);
+
+                        if let Err(error) = transport.send(&json).await {
+                            tracing::error!(%error, "Subscription transport send error");
+                            fail_all_pending(
+                                &mut pending_requests,
+                                &format!("Transport error: {error}"),
+                            );
+                            break;
+                        }
+                    }
+                    Some(LoopCommand::CancelRequest {
+                        request_id,
+                        done_tx,
+                    }) => {
+                        let result = if pending_requests
+                            .get(&request_id)
+                            .is_some_and(|pending| pending.method == "subscriptions/listen")
+                        {
+                            let result = transport.cancel_request(&request_id).await;
+                            if result.is_ok()
+                                && let Some(pending) = pending_requests.remove(&request_id)
+                            {
+                                let _ = pending.response_tx.send(Err(Error::Transport(
+                                    "subscription cancelled".to_string(),
+                                )));
+                            }
+                            result
+                        } else {
+                            Ok(())
+                        };
+                        if let Some(done_tx) = done_tx {
+                            let _ = done_tx.send(result);
                         }
                     }
                     Some(LoopCommand::Notify { method, params }) => {
@@ -1912,8 +2151,112 @@ async fn handle_incoming<T: ClientTransport, H: ClientHandler>(
         let params = parsed.get("params").cloned();
         invalidate_response_cache(response_cache, method, params.as_ref()).await;
         let notification = parse_server_notification(method, params);
-        handler.on_notification(notification).await;
+        let should_dispatch = match &notification {
+            ServerNotification::SubscriptionAcknowledged {
+                subscription_id,
+                notifications,
+            } => {
+                let Some(key) = matching_subscription_id(pending_requests, subscription_id) else {
+                    tracing::warn!(
+                        id = ?subscription_id,
+                        "Ignoring acknowledgment for unknown subscription"
+                    );
+                    return;
+                };
+                if let Some(sender) = pending_requests
+                    .get_mut(&key)
+                    .and_then(|pending| pending.acknowledgment_tx.take())
+                {
+                    let _ = sender.send(notifications.clone());
+                    true
+                } else {
+                    tracing::warn!(
+                        id = ?subscription_id,
+                        "Ignoring duplicate subscription acknowledgment"
+                    );
+                    false
+                }
+            }
+            ServerNotification::Subscription {
+                subscription_id, ..
+            } => {
+                let Some(key) = matching_subscription_id(pending_requests, subscription_id) else {
+                    tracing::warn!(
+                        id = ?subscription_id,
+                        "Ignoring notification for unknown subscription"
+                    );
+                    return;
+                };
+                let before_acknowledgment = pending_requests
+                    .get(&key)
+                    .is_some_and(|pending| pending.acknowledgment_tx.is_some());
+                if before_acknowledgment {
+                    tracing::warn!(
+                        id = ?subscription_id,
+                        "Ending subscription that received a notification before acknowledgment"
+                    );
+                    if let Some(pending) = pending_requests.remove(&key) {
+                        let _ = pending.response_tx.send(Err(Error::Transport(
+                            "subscription notification arrived before acknowledgment".to_string(),
+                        )));
+                    }
+                    false
+                } else {
+                    true
+                }
+            }
+            ServerNotification::SubscriptionCancelled {
+                subscription_id,
+                reason,
+            } => {
+                let Some(key) = matching_subscription_id(pending_requests, subscription_id) else {
+                    tracing::warn!(
+                        id = ?subscription_id,
+                        "Ignoring cancellation for unknown or non-subscription request"
+                    );
+                    return;
+                };
+                if let Some(pending) = pending_requests.remove(&key) {
+                    let message = reason.as_deref().map_or_else(
+                        || "subscription cancelled by server".to_string(),
+                        |reason| format!("subscription cancelled by server: {reason}"),
+                    );
+                    let _ = pending.response_tx.send(Err(Error::Transport(message)));
+                }
+                true
+            }
+            _ => true,
+        };
+        if should_dispatch {
+            handler.on_notification(notification).await;
+        }
     }
+}
+
+fn matching_subscription_id(
+    pending_requests: &HashMap<RequestId, PendingRequest>,
+    id: &RequestId,
+) -> Option<RequestId> {
+    if pending_requests
+        .get(id)
+        .is_some_and(|pending| pending.method == "subscriptions/listen")
+    {
+        return Some(id.clone());
+    }
+    pending_requests.iter().find_map(|(candidate, pending)| {
+        (pending.method == "subscriptions/listen" && request_ids_match(candidate, id))
+            .then(|| candidate.clone())
+    })
+}
+
+fn request_ids_match(left: &RequestId, right: &RequestId) -> bool {
+    left == right
+        || matches!(
+            (left, right),
+            (RequestId::Number(number), RequestId::String(value))
+                | (RequestId::String(value), RequestId::Number(number))
+                if value.parse::<i64>() == Ok(*number)
+        )
 }
 
 async fn invalidate_response_cache(
@@ -2009,6 +2352,12 @@ fn handle_response(
             .response_tx
             .send(Err(Error::JsonRpc(json_rpc_error)));
     } else if let Some(result) = parsed.get("result") {
+        if pending.method == "subscriptions/listen" && pending.acknowledgment_tx.is_some() {
+            let _ = pending.response_tx.send(Err(Error::Transport(
+                "subscriptions/listen completed before acknowledgment".to_string(),
+            )));
+            return;
+        }
         let _ = pending.response_tx.send(Ok(result.clone()));
     } else {
         let _ = pending
@@ -2074,40 +2423,79 @@ fn parse_server_notification(
     method: &str,
     params: Option<serde_json::Value>,
 ) -> ServerNotification {
-    match method {
+    if method == notifications::SUBSCRIPTIONS_ACKNOWLEDGED {
+        if let Some(params) = &params
+            && let Ok(acknowledgment) =
+                serde_json::from_value::<SubscriptionsAcknowledgedParams>(params.clone())
+            && let Some(subscription_id) = acknowledgment.meta.and_then(|meta| meta.subscription_id)
+        {
+            return ServerNotification::SubscriptionAcknowledged {
+                subscription_id,
+                notifications: acknowledgment.notifications,
+            };
+        }
+        return ServerNotification::Unknown {
+            method: method.to_string(),
+            params,
+        };
+    }
+    if method == notifications::CANCELLED {
+        if let Some(params) = &params
+            && let Ok(cancelled) = serde_json::from_value::<CancelledParams>(params.clone())
+            && let Some(subscription_id) = cancelled.request_id
+        {
+            return ServerNotification::SubscriptionCancelled {
+                subscription_id,
+                reason: cancelled.reason,
+            };
+        }
+        return ServerNotification::Unknown {
+            method: method.to_string(),
+            params,
+        };
+    }
+
+    let subscription_id = params
+        .as_ref()
+        .and_then(|params| params.pointer("/_meta/io.modelcontextprotocol~1subscriptionId"))
+        .and_then(|id| serde_json::from_value::<RequestId>(id.clone()).ok());
+    let notification = match method {
         notifications::PROGRESS => {
-            if let Some(params) = params
+            if let Some(params) = params.clone()
                 && let Ok(p) = serde_json::from_value(params)
             {
-                return ServerNotification::Progress(p);
-            }
-            ServerNotification::Unknown {
-                method: method.to_string(),
-                params: None,
+                ServerNotification::Progress(p)
+            } else {
+                ServerNotification::Unknown {
+                    method: method.to_string(),
+                    params: None,
+                }
             }
         }
         notifications::MESSAGE => {
-            if let Some(params) = params
+            if let Some(params) = params.clone()
                 && let Ok(p) = serde_json::from_value(params)
             {
-                return ServerNotification::LogMessage(p);
-            }
-            ServerNotification::Unknown {
-                method: method.to_string(),
-                params: None,
+                ServerNotification::LogMessage(p)
+            } else {
+                ServerNotification::Unknown {
+                    method: method.to_string(),
+                    params: None,
+                }
             }
         }
         notifications::RESOURCE_UPDATED => {
             if let Some(params) = &params
                 && let Some(uri) = params.get("uri").and_then(|u| u.as_str())
             {
-                return ServerNotification::ResourceUpdated {
+                ServerNotification::ResourceUpdated {
                     uri: uri.to_string(),
-                };
-            }
-            ServerNotification::Unknown {
-                method: method.to_string(),
-                params,
+                }
+            } else {
+                ServerNotification::Unknown {
+                    method: method.to_string(),
+                    params: params.clone(),
+                }
             }
         }
         notifications::RESOURCES_LIST_CHANGED => ServerNotification::ResourcesListChanged,
@@ -2115,8 +2503,16 @@ fn parse_server_notification(
         notifications::PROMPTS_LIST_CHANGED => ServerNotification::PromptsListChanged,
         _ => ServerNotification::Unknown {
             method: method.to_string(),
-            params,
+            params: params.clone(),
         },
+    };
+    if let Some(subscription_id) = subscription_id {
+        ServerNotification::Subscription {
+            subscription_id,
+            notification: Box::new(notification),
+        }
+    } else {
+        notification
     }
 }
 
@@ -2365,6 +2761,324 @@ mod tests {
             "ttlMs": 0,
             "cacheScope": "private"
         })
+    }
+
+    #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+    struct SubscriptionTestTransport {
+        incoming_tx: mpsc::Sender<String>,
+        incoming_rx: mpsc::Receiver<String>,
+        outgoing: Arc<Mutex<Vec<String>>>,
+        connected: Arc<AtomicBool>,
+    }
+
+    #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+    impl SubscriptionTestTransport {
+        fn new() -> Self {
+            let (incoming_tx, incoming_rx) = mpsc::channel(32);
+            Self {
+                incoming_tx,
+                incoming_rx,
+                outgoing: Arc::new(Mutex::new(Vec::new())),
+                connected: Arc::new(AtomicBool::new(true)),
+            }
+        }
+    }
+
+    #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+    #[async_trait]
+    impl ClientTransport for SubscriptionTestTransport {
+        async fn send(&mut self, message: &str) -> Result<()> {
+            self.outgoing.lock().unwrap().push(message.to_string());
+            let value: serde_json::Value = serde_json::from_str(message)
+                .map_err(|error| Error::Transport(error.to_string()))?;
+            let Some(id) = value.get("id").cloned() else {
+                return Ok(());
+            };
+            match value
+                .get("method")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+            {
+                "server/discover" => {
+                    self.incoming_tx
+                        .send(
+                            serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": final_discover_result()
+                            })
+                            .to_string(),
+                        )
+                        .await
+                        .map_err(|_| Error::Transport("test channel closed".to_string()))?;
+                }
+                "subscriptions/listen" => {
+                    let notifications = value["params"]["notifications"].clone();
+                    self.incoming_tx
+                        .send(
+                            serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "method": notifications::SUBSCRIPTIONS_ACKNOWLEDGED,
+                                "params": {
+                                    "_meta": {
+                                        "io.modelcontextprotocol/subscriptionId": id
+                                    },
+                                    "notifications": notifications
+                                }
+                            })
+                            .to_string(),
+                        )
+                        .await
+                        .map_err(|_| Error::Transport("test channel closed".to_string()))?;
+
+                    if value["params"]["notifications"]["promptsListChanged"]
+                        == serde_json::Value::Bool(true)
+                    {
+                        self.incoming_tx
+                            .send(
+                                serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "result": {
+                                        "resultType": "complete",
+                                        "_meta": {
+                                            "io.modelcontextprotocol/subscriptionId": id
+                                        }
+                                    }
+                                })
+                                .to_string(),
+                            )
+                            .await
+                            .map_err(|_| Error::Transport("test channel closed".to_string()))?;
+                    } else {
+                        self.incoming_tx
+                            .send(
+                                serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "method": notifications::TOOLS_LIST_CHANGED,
+                                    "params": {
+                                        "_meta": {
+                                            "io.modelcontextprotocol/subscriptionId": id
+                                        }
+                                    }
+                                })
+                                .to_string(),
+                            )
+                            .await
+                            .map_err(|_| Error::Transport("test channel closed".to_string()))?;
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+
+        async fn recv(&mut self) -> Result<Option<String>> {
+            Ok(self.incoming_rx.recv().await)
+        }
+
+        fn is_connected(&self) -> bool {
+            self.connected.load(Ordering::Acquire)
+        }
+
+        async fn close(&mut self) -> Result<()> {
+            self.connected.store(false, Ordering::Release);
+            Ok(())
+        }
+    }
+
+    #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+    #[tokio::test]
+    async fn final_subscriptions_correlate_and_cancel_over_message_transport() {
+        let transport = SubscriptionTestTransport::new();
+        let outgoing = transport.outgoing.clone();
+        let incoming = transport.incoming_tx.clone();
+        let received = Arc::new(Mutex::new(Vec::new()));
+
+        struct RecordingHandler(Arc<Mutex<Vec<ServerNotification>>>);
+
+        #[async_trait]
+        impl ClientHandler for RecordingHandler {
+            async fn on_notification(&self, notification: ServerNotification) {
+                self.0.lock().unwrap().push(notification);
+            }
+        }
+
+        let client = McpClient::builder()
+            .protocol_support(ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+            .connect(transport, RecordingHandler(received.clone()))
+            .await
+            .unwrap();
+        client.discover("test-client", "1.0.0").await.unwrap();
+
+        let requested = SubscriptionFilter {
+            tools_list_changed: Some(true),
+            ..Default::default()
+        };
+        let mut first = client
+            .listen_subscriptions(requested.clone())
+            .await
+            .unwrap();
+        let mut second = client.listen_subscriptions(requested).await.unwrap();
+        assert_ne!(first.id(), second.id());
+        assert_eq!(
+            first.acknowledged().await.unwrap().tools_list_changed,
+            Some(true)
+        );
+        assert_eq!(
+            second.acknowledged().await.unwrap().tools_list_changed,
+            Some(true)
+        );
+
+        for _ in 0..100 {
+            if received
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|notification| {
+                    matches!(
+                        notification,
+                        ServerNotification::Subscription {
+                            notification,
+                            ..
+                        } if matches!(notification.as_ref(), ServerNotification::ToolsListChanged)
+                    )
+                })
+                .count()
+                == 2
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let subscription_ids: Vec<RequestId> = received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|notification| match notification {
+                ServerNotification::Subscription {
+                    subscription_id,
+                    notification,
+                } if matches!(notification.as_ref(), ServerNotification::ToolsListChanged) => {
+                    Some(subscription_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(subscription_ids, [first.id().clone(), second.id().clone()]);
+
+        incoming
+            .send(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": notifications::CANCELLED,
+                    "params": {
+                        "requestId": 999,
+                        "reason": "not a subscription"
+                    }
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !received.lock().unwrap().iter().any(|notification| matches!(
+                notification,
+                ServerNotification::SubscriptionCancelled { subscription_id, .. }
+                    if subscription_id == &RequestId::Number(999)
+            ))
+        );
+
+        let first_id = first.id().clone();
+        let second_id = second.id().clone();
+        first.cancel().await.unwrap();
+        second.cancel().await.unwrap();
+        let cancellation_ids: Vec<RequestId> = outgoing
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|message| {
+                let value: serde_json::Value = serde_json::from_str(message).unwrap();
+                (value["method"] == notifications::CANCELLED)
+                    .then(|| serde_json::from_value(value["params"]["requestId"].clone()).unwrap())
+            })
+            .collect();
+        assert_eq!(cancellation_ids, [first_id, second_id]);
+    }
+
+    #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+    #[tokio::test]
+    async fn final_subscription_observes_graceful_completion() {
+        let client = McpClient::builder()
+            .protocol_support(ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+            .connect_simple(SubscriptionTestTransport::new())
+            .await
+            .unwrap();
+        client.discover("test-client", "1.0.0").await.unwrap();
+
+        let mut handle = client
+            .listen_subscriptions(SubscriptionFilter {
+                prompts_list_changed: Some(true),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            handle.acknowledged().await.unwrap().prompts_list_changed,
+            Some(true)
+        );
+        let expected_id = handle.id().clone();
+        let result = handle.wait().await.unwrap();
+        assert!(result.result_type.is_complete());
+        assert_eq!(
+            result.meta.and_then(|meta| meta.subscription_id),
+            Some(expected_id)
+        );
+    }
+
+    #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+    #[tokio::test]
+    async fn final_subscription_accepts_server_cancellation_only_for_active_listen() {
+        let transport = SubscriptionTestTransport::new();
+        let incoming = transport.incoming_tx.clone();
+        let client = McpClient::builder()
+            .protocol_support(ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+            .connect_simple(transport)
+            .await
+            .unwrap();
+        client.discover("test-client", "1.0.0").await.unwrap();
+
+        let mut handle = client
+            .listen_subscriptions(SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        handle.acknowledged().await.unwrap();
+        let id = handle.id().clone();
+        incoming
+            .send(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": notifications::CANCELLED,
+                    "params": {
+                        "requestId": id,
+                        "reason": "server shutdown"
+                    }
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        let error = handle.wait().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("subscription cancelled by server: server shutdown")
+        );
     }
 
     #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
@@ -3158,6 +3872,57 @@ mod tests {
             }
             _ => panic!("Expected Unknown"),
         }
+
+        let notification = parse_server_notification(
+            notifications::SUBSCRIPTIONS_ACKNOWLEDGED,
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/subscriptionId": 7
+                },
+                "notifications": {
+                    "toolsListChanged": true
+                }
+            })),
+        );
+        assert!(matches!(
+            notification,
+            ServerNotification::SubscriptionAcknowledged {
+                subscription_id: RequestId::Number(7),
+                ..
+            }
+        ));
+
+        let notification = parse_server_notification(
+            notifications::TOOLS_LIST_CHANGED,
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/subscriptionId": "stream-a"
+                }
+            })),
+        );
+        assert!(matches!(
+            notification,
+            ServerNotification::Subscription {
+                subscription_id: RequestId::String(id),
+                notification,
+            } if id == "stream-a"
+                && matches!(notification.as_ref(), ServerNotification::ToolsListChanged)
+        ));
+
+        let notification = parse_server_notification(
+            notifications::CANCELLED,
+            Some(serde_json::json!({
+                "requestId": 7,
+                "reason": "done"
+            })),
+        );
+        assert!(matches!(
+            notification,
+            ServerNotification::SubscriptionCancelled {
+                subscription_id: RequestId::Number(7),
+                reason: Some(reason),
+            } if reason == "done"
+        ));
     }
 
     // =========================================================================
@@ -3174,7 +3939,14 @@ mod tests {
         let mut rxs = Vec::new();
         for id in ids {
             let (tx, rx) = oneshot::channel();
-            map.insert(id.clone(), PendingRequest { response_tx: tx });
+            map.insert(
+                id.clone(),
+                PendingRequest {
+                    method: "test".to_string(),
+                    response_tx: tx,
+                    acknowledgment_tx: None,
+                },
+            );
             rxs.push(rx);
         }
         (map, rxs)

@@ -18,22 +18,22 @@
 //! # Running
 //!
 //! ```bash
-//! cargo run --example stateless_http_client --features "http,stateless"
+//! cargo run --example stateless_http_client \
+//!   --features "http,http-client,protocol-2026-07-28"
 //! ```
 //!
 //! No separate server process is needed -- the server is started in-process.
-//! The `stateless` feature is required for the server to route 2026-07-28
-//! requests without a session.
+//! The `protocol-2026-07-28` feature is required for the server and client to
+//! compile this experimental final-protocol implementation.
 
 use std::time::Duration;
 
-use futures::StreamExt;
-use reqwest::Client;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tower_mcp::{CallToolResult, HttpTransport, McpRouter, ToolBuilder};
-
-const PROTOCOL_VERSION: &str = "2026-07-28";
+use tower_mcp::{
+    CallToolResult, HttpTransport, McpRouter, ProtocolSupport, SubscriptionFilter, ToolBuilder,
+    client::{HttpClientTransport, McpClient},
+};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct AddInput {
@@ -87,7 +87,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Give the server a moment to start.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let client = Client::new();
+    let client = McpClient::builder()
+        .protocol_support(ProtocolSupport::try_new(["2026-07-28"])?)
+        .connect_simple(HttpClientTransport::new(&base_url))
+        .await?;
 
     // -----------------------------------------------------------------------
     // Step 1: server/discover
@@ -97,39 +100,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the server supports.
     // -----------------------------------------------------------------------
     println!("=== Step 1: server/discover ===");
-    println!("POST {} (no session, no initialize)", base_url);
-
-    let discover_response = client
-        .post(&base_url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json")
-        .header("MCP-Protocol-Version", PROTOCOL_VERSION)
-        .header("Mcp-Method", "server/discover")
-        .json(&serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "server/discover"
-        }))
-        .send()
-        .await?;
-
-    // Stateless: no MCP-Session-Id must be present.
-    assert!(
-        discover_response.headers().get("mcp-session-id").is_none(),
-        "server returned an unexpected MCP-Session-Id in stateless mode"
-    );
-    println!("Confirmed: no session ID returned (stateless)");
-
-    let discover_body: serde_json::Value = discover_response.json().await?;
-    let result = &discover_body["result"];
-    println!(
-        "Server: {}",
-        result["serverInfo"]["name"].as_str().unwrap_or("(unknown)")
-    );
-    if let Some(versions) = result["supportedVersions"].as_array() {
-        let version_list: Vec<&str> = versions.iter().filter_map(|v| v.as_str()).collect();
-        println!("Supported protocol versions: {}", version_list.join(", "));
+    let discovery = client.discover("stateless-example-client", "1.0.0").await?;
+    if let Some(server_info) = discovery.meta.and_then(|meta| meta.server_info) {
+        println!("Server: {}", server_info.name);
     }
+    println!(
+        "Supported protocol versions: {}",
+        discovery.supported_versions.join(", ")
+    );
+    println!("Selected protocol: 2026-07-28 (no session ID)");
     println!();
 
     // -----------------------------------------------------------------------
@@ -140,31 +119,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // -----------------------------------------------------------------------
     println!("=== Step 2: tools/list ===");
 
-    let list_response = client
-        .post(&base_url)
-        .header("Content-Type", "application/json")
-        .header("MCP-Protocol-Version", PROTOCOL_VERSION)
-        .header("Mcp-Method", "tools/list")
-        .json(&serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/list"
-        }))
-        .send()
-        .await?;
-
-    let list_body: serde_json::Value = list_response.json().await?;
-    let tools = list_body["result"]["tools"]
-        .as_array()
-        .map(|a| a.as_slice())
-        .unwrap_or_default();
-
-    println!("Available tools ({}):", tools.len());
-    for tool in tools {
+    let tools = client.list_tools().await?;
+    println!("Available tools ({}):", tools.tools.len());
+    for tool in tools.tools {
         println!(
             "  - {} : {}",
-            tool["name"].as_str().unwrap_or("(unnamed)"),
-            tool["description"].as_str().unwrap_or("(no description)")
+            tool.name,
+            tool.description.unwrap_or_default()
         );
     }
     println!();
@@ -177,104 +138,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // -----------------------------------------------------------------------
     println!("=== Step 3: tools/call (add, a=10, b=32) ===");
 
-    let call_response = client
-        .post(&base_url)
-        .header("Content-Type", "application/json")
-        .header("MCP-Protocol-Version", PROTOCOL_VERSION)
-        .header("Mcp-Method", "tools/call")
-        .header("Mcp-Name", "add")
-        .json(&serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 3,
-            "method": "tools/call",
-            "params": {
-                "name": "add",
-                "arguments": { "a": 10, "b": 32 }
-            }
-        }))
-        .send()
+    let result = client
+        .call_tool("add", serde_json::json!({ "a": 10, "b": 32 }))
         .await?;
-
-    let call_body: serde_json::Value = call_response.json().await?;
-    if let Some(content) = call_body["result"]["content"].as_array() {
-        for item in content {
-            if item["type"] == "text" {
-                println!("Result: {}", item["text"].as_str().unwrap_or("(empty)"));
-            }
-        }
-    }
+    println!("Result: {}", result.first_text().unwrap_or("(empty)"));
     println!();
 
     // -----------------------------------------------------------------------
     // Step 4: subscriptions/listen
     //
     // Opens a server-push SSE stream. In the 2026-07-28 protocol this is a
-    // POST (not a GET) with Accept: text/event-stream. The server delivers
-    // notifications for any in-flight requests that carry a progressToken.
-    // We read for a short window and then disconnect.
+    // POST (not a GET) with Accept: text/event-stream. The client validates
+    // the server's mandatory first-message acknowledgment, keeps the stream
+    // open for a short window, and cancels it by closing this response stream.
     // -----------------------------------------------------------------------
     println!("=== Step 4: subscriptions/listen (SSE stream, 1-second window) ===");
 
-    let listen_response = client
-        .post(&base_url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "text/event-stream")
-        .header("MCP-Protocol-Version", PROTOCOL_VERSION)
-        .header("Mcp-Method", "subscriptions/listen")
-        .json(&serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 4,
-            "method": "subscriptions/listen",
-            "params": {}
-        }))
-        .send()
+    let mut subscription = client
+        .listen_subscriptions(SubscriptionFilter {
+            tools_list_changed: Some(true),
+            ..Default::default()
+        })
         .await?;
-
-    let content_type = listen_response
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    println!("Response Content-Type: {}", content_type);
-
-    let mut stream = listen_response.bytes_stream();
-    let deadline = tokio::time::sleep(Duration::from_secs(1));
-    tokio::pin!(deadline);
-
-    let mut event_count = 0usize;
-    loop {
-        tokio::select! {
-            chunk = stream.next() => {
-                match chunk {
-                    Some(Ok(bytes)) => {
-                        let text = String::from_utf8_lossy(&bytes);
-                        // Print non-empty, non-comment SSE lines for visibility.
-                        for line in text.lines() {
-                            if !line.is_empty() && !line.starts_with(':') {
-                                println!("  SSE: {}", line);
-                            }
-                        }
-                        event_count += 1;
-                    }
-                    Some(Err(e)) => {
-                        println!("  Stream error: {}", e);
-                        break;
-                    }
-                    None => {
-                        println!("  Stream closed by server");
-                        break;
-                    }
-                }
-            }
-            _ = &mut deadline => {
-                println!("  Disconnecting after 1-second window ({} chunk(s) received)", event_count);
-                break;
-            }
-        }
-    }
+    let accepted = subscription.acknowledged().await?;
+    println!(
+        "Subscription {:?} acknowledged: toolsListChanged={:?}",
+        subscription.id(),
+        accepted.tools_list_changed
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    subscription.cancel().await?;
+    println!("Subscription cancelled by closing its HTTP response stream");
 
     println!();
     println!("Done. All four stateless 2026-07-28 requests completed.");
+    client.shutdown().await?;
 
     Ok(())
 }
