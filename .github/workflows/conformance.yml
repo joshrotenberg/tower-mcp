@@ -95,9 +95,12 @@ jobs:
             -o /tmp/discover-body.json
           response=$(cat /tmp/discover-body.json)
           echo "server/discover response: $response"
-          # DiscoverResult serializes as camelCase: supportedVersions, serverInfo, capabilities
+          # DiscoverResult serializes as camelCase: supportedVersions, capabilities.
+          # Server identity moved into _meta["io.modelcontextprotocol/serverInfo"]
+          # in the final 2026-07-28 schema (it was a top-level serverInfo field
+          # pre-finalization).
           echo "$response" | grep -q '"supportedVersions"' || { echo "FAIL: supportedVersions missing"; exit 1; }
-          echo "$response" | grep -q '"serverInfo"' || { echo "FAIL: serverInfo missing"; exit 1; }
+          echo "$response" | grep -q '"io.modelcontextprotocol/serverInfo"' || { echo "FAIL: _meta serverInfo missing"; exit 1; }
           echo "$response" | grep -q '"capabilities"' || { echo "FAIL: capabilities missing"; exit 1; }
           echo "PASS: server/discover returned well-formed DiscoverResult"
           # server/discover must NOT set mcp-session-id: stateless responses are sessionless (#865)

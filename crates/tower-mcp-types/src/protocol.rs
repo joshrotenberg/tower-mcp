@@ -1626,7 +1626,9 @@ pub struct DiscoverParams {}
 ///
 /// The final 2026-07-28 schema dropped the `serverInfo` body field (server
 /// identity now lives in `_meta["io.modelcontextprotocol/serverInfo"]`, via
-/// [`ResultMeta`]) and made this a [`CacheableResult`]-shaped type. This
+/// [`ResultMeta`]) and made this a `CacheableResult`-shaped type (the spec's
+/// name for the interface; this crate has no such Rust type -- each
+/// cacheable result inlines its own `ttl_ms`/`cache_scope` fields). This
 /// crate keeps `ttl_ms`/`cache_scope` as `Option` rather than the spec's
 /// required `number`/`string` -- the same "`None` means no opinion"
 /// convention used by every other cacheable result in this file (see
