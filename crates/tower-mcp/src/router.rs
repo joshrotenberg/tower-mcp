@@ -1727,6 +1727,27 @@ impl McpRouter {
         }
     }
 
+    /// Return a snapshot of a registered tool's input schema.
+    ///
+    /// HTTP transport validation uses this before dispatch to enforce
+    /// SEP-2243 `x-mcp-header` mappings. Static tools take precedence over
+    /// dynamic tools, matching `tools/list` and `tools/call`.
+    pub(crate) fn tool_input_schema(&self, name: &str) -> Option<serde_json::Value> {
+        if let Some(tool) = self.inner.tools.get(name) {
+            return Some(tool.input_schema.clone());
+        }
+        #[cfg(feature = "dynamic-tools")]
+        if let Some(tool) = self
+            .inner
+            .dynamic_tools
+            .as_ref()
+            .and_then(|tools| tools.get(name))
+        {
+            return Some(tool.input_schema.clone());
+        }
+        None
+    }
+
     fn capabilities(&self) -> ServerCapabilities {
         let has_resources =
             !self.inner.resources.is_empty() || !self.inner.resource_templates.is_empty();

@@ -2502,6 +2502,28 @@ fn is_response(parsed: &serde_json::Value) -> bool {
         && (parsed.get("result").is_some() || parsed.get("error").is_some())
 }
 
+/// Resolve the selected tool's input schema when the transport owns an
+/// [`McpRouter`]. Pre-built services do not expose their tool registry, so
+/// supplied custom headers can still be checked there but missing headers
+/// cannot be inferred before dispatch.
+fn request_tool_input_schema(
+    service_source: &ServiceSource,
+    parsed: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    if parsed.get("method").and_then(serde_json::Value::as_str) != Some("tools/call") {
+        return None;
+    }
+    let name = parsed
+        .get("params")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|params| params.get("name"))
+        .and_then(serde_json::Value::as_str)?;
+    match service_source {
+        ServiceSource::Router { router, .. } => router.tool_input_schema(name),
+        ServiceSource::Service(_) => None,
+    }
+}
+
 /// Return whether an HTTP request claims the modern, per-request-metadata
 /// protocol era.
 ///
@@ -2680,6 +2702,7 @@ async fn handle_post(
         .and_then(|method| method.as_str())
         .unwrap_or_default()
         .to_string();
+    let tool_input_schema = request_tool_input_schema(&state.service_source, &parsed);
     let modern_request = claims_modern_protocol(&headers, &parsed);
 
     // The modern protocol is selected by its per-request `_meta` envelope,
@@ -2726,7 +2749,12 @@ async fn handle_post(
         }
 
         let sep_2243_mode = super::http_headers::mode_for_version(&body_version);
-        if let Err(error) = super::http_headers::validate(&headers, &parsed, sep_2243_mode) {
+        if let Err(error) = super::http_headers::validate_with_tool_schema(
+            &headers,
+            &parsed,
+            sep_2243_mode,
+            tool_input_schema.as_ref(),
+        ) {
             tracing::warn!(
                 mode = ?sep_2243_mode,
                 version = %body_version,
@@ -2788,7 +2816,12 @@ async fn handle_post(
             // SEP-2243 validation before `parsed` is consumed by deserialization.
             // 2026-07-28 falls into strict mode, so missing Mcp-Method is an error.
             let sep_2243_mode = super::http_headers::mode_for_version(version);
-            if let Err(err) = super::http_headers::validate(&headers, &parsed, sep_2243_mode) {
+            if let Err(err) = super::http_headers::validate_with_tool_schema(
+                &headers,
+                &parsed,
+                sep_2243_mode,
+                tool_input_schema.as_ref(),
+            ) {
                 tracing::warn!(
                     mode = ?sep_2243_mode,
                     version = %version,
@@ -3235,7 +3268,12 @@ async fn handle_post(
         session.protocol_version.read().await.clone()
     };
     let sep_2243_mode = super::http_headers::mode_for_version(&sep_2243_version);
-    if let Err(err) = super::http_headers::validate(&headers, &parsed, sep_2243_mode) {
+    if let Err(err) = super::http_headers::validate_with_tool_schema(
+        &headers,
+        &parsed,
+        sep_2243_mode,
+        tool_input_schema.as_ref(),
+    ) {
         tracing::warn!(
             mode = ?sep_2243_mode,
             version = %sep_2243_version,
@@ -5116,6 +5154,79 @@ mod tests {
             ))
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn sep_2243_final_request_requires_schema_annotated_header() {
+        use crate::extract::RawArgs;
+        use crate::{CallToolResult, ToolBuilder};
+
+        let tool = ToolBuilder::new("route")
+            .input_schema(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tenant_id": {
+                        "type": "string",
+                        "x-mcp-header": "Tenant"
+                    }
+                }
+            }))
+            .extractor_handler((), |RawArgs(args): RawArgs| async move {
+                Ok(CallToolResult::text(args["tenant_id"].to_string()))
+            })
+            .build();
+        let app = HttpTransport::new(
+            McpRouter::new()
+                .server_info("header-test", "1.0.0")
+                .tool(tool),
+        )
+        .disable_origin_validation()
+        .into_router();
+
+        let request = |custom_header: Option<&'static str>| {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri("/")
+                .header("Content-Type", "application/json")
+                .header(MCP_PROTOCOL_VERSION_HEADER, EXPERIMENTAL_PROTOCOL_VERSION)
+                .header(MCP_METHOD_HEADER, "tools/call")
+                .header(MCP_NAME_HEADER, "route");
+            if let Some(value) = custom_header {
+                builder = builder.header("Mcp-Param-Tenant", value);
+            }
+            builder
+                .body(Body::from(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 9,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "route",
+                            "arguments": {"tenant_id": "acme"},
+                            "_meta": {
+                                "io.modelcontextprotocol/protocolVersion":
+                                    EXPERIMENTAL_PROTOCOL_VERSION,
+                                "io.modelcontextprotocol/clientCapabilities": {}
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+
+        let response = app.clone().oneshot(request(None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["id"], 9);
+        assert_eq!(error["error"]["code"], -32020);
+
+        let response = app.oneshot(request(Some("acme"))).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
 

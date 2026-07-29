@@ -1,7 +1,7 @@
 //! SEP-2243: HTTP header standardization for the Streamable HTTP transport.
 //!
 //! This module implements the server-side validation rules from SEP-2243
-//! (FINAL 2026-04-15). The SEP requires POST requests to include several
+//! (FINAL 2026-07-28). The SEP requires POST requests to include several
 //! headers that mirror fields from the JSON-RPC body so that network
 //! intermediaries (load balancers, proxies, observability tools, WAFs)
 //! can route and process MCP traffic without parsing the body.
@@ -27,7 +27,7 @@
 //! Mcp-Param-{Name}: =?base64?{Base64Value}?=
 //! ```
 //!
-//! The `=?base64?` prefix is case-insensitive.
+//! The `=?base64?` prefix and `?=` suffix are case-sensitive.
 //!
 //! ## Errors
 //!
@@ -57,7 +57,7 @@ use super::http::{MCP_METHOD_HEADER, MCP_NAME_HEADER, MCP_PARAM_HEADER_PREFIX};
 
 /// Base64 sentinel prefix used for Base64-encoded header values.
 ///
-/// Per SEP-2243 this prefix is case-insensitive.
+/// Per SEP-2243 this prefix is case-sensitive.
 const BASE64_PREFIX: &str = "=?base64?";
 /// Base64 sentinel suffix used for Base64-encoded header values.
 const BASE64_SUFFIX: &str = "?=";
@@ -98,10 +98,26 @@ pub(super) fn mode_for_version(version: &str) -> Sep2243Mode {
 ///
 /// The caller is responsible for short-circuiting with a `400 Bad
 /// Request` response.
-pub(super) fn validate(
+#[cfg(test)]
+fn validate(
     headers: &axum::http::HeaderMap,
     parsed: &Value,
     mode: Sep2243Mode,
+) -> Result<(), JsonRpcError> {
+    validate_with_tool_schema(headers, parsed, mode, None)
+}
+
+/// Validate SEP-2243 headers with the selected tool's input schema.
+///
+/// Supplying the schema lets the server enforce the body-to-header direction:
+/// every non-null argument whose property carries `x-mcp-header` must have its
+/// declared `Mcp-Param-*` header. Without a schema, supplied headers are still
+/// checked using their suffix as a best-effort body property name.
+pub(super) fn validate_with_tool_schema(
+    headers: &axum::http::HeaderMap,
+    parsed: &Value,
+    mode: Sep2243Mode,
+    tool_input_schema: Option<&Value>,
 ) -> Result<(), JsonRpcError> {
     let body_method = parsed
         .get("method")
@@ -133,8 +149,9 @@ pub(super) fn validate(
     // authoritative value per SEP-2243 — header values are advisory for
     // routing and are validated against the body).
     let name_source: Option<NameSource> = match body_method.as_deref() {
-        Some("tools/call") | Some("prompts/get") => Some(NameSource::ParamsName),
-        Some("resources/read") => Some(NameSource::ParamsUri),
+        Some("tools/call") | Some("prompts/get") => Some(NameSource::Name),
+        Some("resources/read") => Some(NameSource::Uri),
+        Some("tasks/get" | "tasks/update" | "tasks/cancel") => Some(NameSource::TaskId),
         _ => None,
     };
 
@@ -163,12 +180,14 @@ pub(super) fn validate(
         }
     }
 
-    // Mcp-Param-* validation: every Mcp-Param-{Name} header must
-    // correspond to a value in params.arguments.{Name} (case-insensitive
-    // match on the header suffix). Per the SEP, header-omitted-but-body-
-    // present is a non-conforming client and a server-side error in
-    // strict mode; we mirror the same.
-    validate_param_headers(headers, parsed, mode)?;
+    if let Some(schema) = tool_input_schema {
+        validate_schema_param_headers(headers, parsed, mode, schema)?;
+    } else {
+        // A pre-built Service does not expose a tool registry. Continue to
+        // validate any supplied Mcp-Param-* values, but missing headers cannot
+        // be inferred without the selected tool's schema.
+        validate_param_headers(headers, parsed, mode)?;
+    }
 
     Ok(())
 }
@@ -178,17 +197,20 @@ pub(super) fn validate(
 #[derive(Debug, Clone, Copy)]
 enum NameSource {
     /// `params.name` (`tools/call`, `prompts/get`).
-    ParamsName,
+    Name,
     /// `params.uri` (`resources/read`).
-    ParamsUri,
+    Uri,
+    /// `params.taskId` (`tasks/get`, `tasks/update`, `tasks/cancel`).
+    TaskId,
 }
 
 impl NameSource {
     fn extract(self, parsed: &Value) -> Option<String> {
         let params = parsed.get("params")?;
         let key = match self {
-            NameSource::ParamsName => "name",
-            NameSource::ParamsUri => "uri",
+            NameSource::Name => "name",
+            NameSource::Uri => "uri",
+            NameSource::TaskId => "taskId",
         };
         params.get(key).and_then(|v| v.as_str()).map(str::to_string)
     }
@@ -213,15 +235,10 @@ fn header_str(headers: &axum::http::HeaderMap, name: &str) -> Result<Option<Stri
 }
 
 /// Decode the SEP-2243 Base64 sentinel `=?base64?...?=` if present.
-/// Otherwise return the raw value. The prefix is case-insensitive per
-/// the spec's "Base64 Decoding" conformance table (`=?BASE64?...?=` is
-/// accepted).
+/// Otherwise return the raw value. The final specification requires the
+/// sentinel markers to use exactly this lowercase spelling.
 fn decode_sentinel(value: &str) -> Result<String, String> {
-    let lower = value.to_ascii_lowercase();
-    if lower.starts_with(BASE64_PREFIX) && value.ends_with(BASE64_SUFFIX) {
-        // Strip the prefix using the original casing length; the
-        // lowercase form is byte-length-equal because the prefix is
-        // ASCII.
+    if value.starts_with(BASE64_PREFIX) && value.ends_with(BASE64_SUFFIX) {
         let body = &value[BASE64_PREFIX.len()..value.len() - BASE64_SUFFIX.len()];
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(body)
@@ -230,6 +247,199 @@ fn decode_sentinel(value: &str) -> Result<String, String> {
     } else {
         Ok(value.to_string())
     }
+}
+
+#[derive(Debug)]
+struct CustomHeaderMapping {
+    suffix: String,
+    property_path: Vec<String>,
+}
+
+/// Collect the statically reachable `x-mcp-header` annotations from a tool
+/// input schema. Traversal follows only `properties` chains, exactly matching
+/// SEP-2243's extraction rule.
+fn custom_header_mappings(schema: &Value) -> Result<Vec<CustomHeaderMapping>, JsonRpcError> {
+    fn annotation_count(value: &Value) -> usize {
+        match value {
+            Value::Object(object) => {
+                usize::from(object.contains_key("x-mcp-header"))
+                    + object.values().map(annotation_count).sum::<usize>()
+            }
+            Value::Array(values) => values.iter().map(annotation_count).sum(),
+            _ => 0,
+        }
+    }
+
+    fn is_tchar(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            )
+    }
+
+    fn primitive_header_type(schema: &Value) -> bool {
+        match schema.get("type") {
+            Some(Value::String(kind)) => matches!(kind.as_str(), "string" | "integer" | "boolean"),
+            Some(Value::Array(kinds)) => {
+                let mut primitive = false;
+                for kind in kinds {
+                    match kind.as_str() {
+                        Some("string" | "integer" | "boolean") if !primitive => primitive = true,
+                        Some("null") => {}
+                        _ => return false,
+                    }
+                }
+                primitive
+            }
+            _ => false,
+        }
+    }
+
+    fn walk(
+        schema: &Value,
+        path: &mut Vec<String>,
+        seen: &mut std::collections::HashSet<String>,
+        mappings: &mut Vec<CustomHeaderMapping>,
+    ) -> Result<(), JsonRpcError> {
+        let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+            return Ok(());
+        };
+
+        for (property_name, property_schema) in properties {
+            path.push(property_name.clone());
+            if let Some(annotation) = property_schema.get("x-mcp-header") {
+                let suffix = annotation.as_str().ok_or_else(|| {
+                    JsonRpcError::header_mismatch(format!(
+                        "x-mcp-header at {} must be a string",
+                        path.join(".")
+                    ))
+                })?;
+                if suffix.is_empty() || !suffix.bytes().all(is_tchar) {
+                    return Err(JsonRpcError::header_mismatch(format!(
+                        "invalid x-mcp-header value {suffix:?} at {}",
+                        path.join(".")
+                    )));
+                }
+                if !primitive_header_type(property_schema) {
+                    return Err(JsonRpcError::header_mismatch(format!(
+                        "x-mcp-header at {} requires a string, integer, or boolean property",
+                        path.join(".")
+                    )));
+                }
+                if !seen.insert(suffix.to_ascii_lowercase()) {
+                    return Err(JsonRpcError::header_mismatch(format!(
+                        "duplicate x-mcp-header value {suffix:?}"
+                    )));
+                }
+                mappings.push(CustomHeaderMapping {
+                    suffix: suffix.to_string(),
+                    property_path: path.clone(),
+                });
+            }
+            walk(property_schema, path, seen, mappings)?;
+            path.pop();
+        }
+        Ok(())
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut mappings = Vec::new();
+    walk(schema, &mut Vec::new(), &mut seen, &mut mappings)?;
+    if annotation_count(schema) != mappings.len() {
+        return Err(JsonRpcError::header_mismatch(
+            "x-mcp-header annotation is not statically reachable through properties",
+        ));
+    }
+    Ok(mappings)
+}
+
+fn value_at_property_path<'a>(root: &'a Value, path: &[String]) -> Option<&'a Value> {
+    path.iter().try_fold(root, |value, key| value.get(key))
+}
+
+/// Validate custom parameter headers using the selected tool's schema.
+fn validate_schema_param_headers(
+    headers: &axum::http::HeaderMap,
+    parsed: &Value,
+    mode: Sep2243Mode,
+    schema: &Value,
+) -> Result<(), JsonRpcError> {
+    let mappings = custom_header_mappings(schema)?;
+    let arguments = parsed
+        .get("params")
+        .and_then(|params| params.get("arguments"))
+        .unwrap_or(&Value::Null);
+
+    for mapping in mappings {
+        let full_name = format!("{MCP_PARAM_HEADER_PREFIX}{}", mapping.suffix);
+        let header_name =
+            axum::http::HeaderName::from_bytes(full_name.as_bytes()).map_err(|e| {
+                JsonRpcError::header_mismatch(format!(
+                    "invalid x-mcp-header value {:?}: {e}",
+                    mapping.suffix
+                ))
+            })?;
+        let values: Vec<_> = headers.get_all(&header_name).iter().collect();
+        if values.len() > 1 {
+            return Err(JsonRpcError::header_mismatch(format!(
+                "duplicate {full_name} header"
+            )));
+        }
+
+        let body_value = value_at_property_path(arguments, &mapping.property_path)
+            .filter(|value| !value.is_null());
+        match (values.first(), body_value) {
+            (None, Some(_)) if matches!(mode, Sep2243Mode::Strict) => {
+                return Err(JsonRpcError::header_mismatch(format!(
+                    "{full_name} header is required when argument {} is present",
+                    mapping.property_path.join(".")
+                )));
+            }
+            (Some(_), None) => {
+                return Err(JsonRpcError::header_mismatch(format!(
+                    "{full_name} header is present but argument {} is missing or null",
+                    mapping.property_path.join(".")
+                )));
+            }
+            (Some(raw), Some(body_value)) => {
+                let value = raw.to_str().map_err(|e| {
+                    JsonRpcError::header_mismatch(format!(
+                        "{full_name} contains invalid bytes: {e}"
+                    ))
+                })?;
+                let decoded = decode_sentinel(value.trim()).map_err(|message| {
+                    JsonRpcError::header_mismatch(format!("{full_name}: {message}"))
+                })?;
+                let body_repr = json_value_to_header_string(body_value).map_err(|message| {
+                    JsonRpcError::header_mismatch(format!(
+                        "{full_name}: body value cannot be represented as a header: {message}"
+                    ))
+                })?;
+                if decoded != body_repr {
+                    return Err(JsonRpcError::header_mismatch(format!(
+                        "{full_name} header value {decoded:?} does not match body value {body_repr:?}"
+                    )));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
 }
 
 /// Validate every `Mcp-Param-*` header against the corresponding entry
@@ -496,6 +706,32 @@ mod tests {
     }
 
     #[test]
+    fn task_methods_use_task_id_as_mcp_name() {
+        for method in ["tasks/get", "tasks/update", "tasks/cancel"] {
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": method,
+                "params": {"taskId": "task-123"}
+            });
+            validate(
+                &hm(&[("mcp-method", method), ("mcp-name", "task-123")]),
+                &body,
+                Sep2243Mode::Strict,
+            )
+            .unwrap();
+
+            let err = validate(
+                &hm(&[("mcp-method", method), ("mcp-name", "other-task")]),
+                &body,
+                Sep2243Mode::Strict,
+            )
+            .unwrap_err();
+            assert_eq!(err.code, -32020, "method={method}");
+        }
+    }
+
+    #[test]
     fn other_methods_dont_require_mcp_name() {
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"});
         validate(
@@ -540,10 +776,10 @@ mod tests {
     }
 
     #[test]
-    fn base64_sentinel_case_insensitive_prefix() {
+    fn base64_sentinel_prefix_is_case_sensitive() {
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                           "params": {"name": "Hello"}});
-        validate(
+        let err = validate(
             &hm(&[
                 ("mcp-method", "tools/call"),
                 ("mcp-name", "=?BASE64?SGVsbG8=?="),
@@ -551,7 +787,8 @@ mod tests {
             &body,
             Sep2243Mode::Strict,
         )
-        .unwrap();
+        .unwrap_err();
+        assert_eq!(err.code, -32020);
     }
 
     #[test]
@@ -647,6 +884,158 @@ mod tests {
             Sep2243Mode::Strict,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn schema_requires_annotated_argument_header_in_strict_mode() {
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "route", "arguments": {"tenant_id": "acme"}}});
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "tenant_id": {"type": "string", "x-mcp-header": "Tenant"}
+            }
+        });
+        let err = validate_with_tool_schema(
+            &hm(&[("mcp-method", "tools/call"), ("mcp-name", "route")]),
+            &body,
+            Sep2243Mode::Strict,
+            Some(&schema),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, -32020);
+        assert!(err.message.contains("mcp-param-Tenant"));
+    }
+
+    #[test]
+    fn schema_maps_annotation_name_to_exact_nested_property_path() {
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {
+            "name": "route",
+            "arguments": {"routing": {"tenant_id": "acme"}}
+        }});
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "routing": {
+                    "type": "object",
+                    "properties": {
+                        "tenant_id": {"type": "string", "x-mcp-header": "Tenant"}
+                    }
+                }
+            }
+        });
+        validate_with_tool_schema(
+            &hm(&[
+                ("mcp-method", "tools/call"),
+                ("mcp-name", "route"),
+                ("mcp-param-tenant", "acme"),
+            ]),
+            &body,
+            Sep2243Mode::Strict,
+            Some(&schema),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn schema_does_not_require_header_for_missing_or_null_argument() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "tenant": {
+                    "type": ["string", "null"],
+                    "x-mcp-header": "Tenant"
+                }
+            }
+        });
+        for arguments in [json!({}), json!({"tenant": null})] {
+            let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "route", "arguments": arguments}});
+            validate_with_tool_schema(
+                &hm(&[("mcp-method", "tools/call"), ("mcp-name", "route")]),
+                &body,
+                Sep2243Mode::Strict,
+                Some(&schema),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn schema_missing_header_remains_optional_in_lenient_mode() {
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "route", "arguments": {"tenant": "acme"}}});
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "tenant": {"type": "string", "x-mcp-header": "Tenant"}
+            }
+        });
+        validate_with_tool_schema(
+            &hm(&[("mcp-method", "tools/call"), ("mcp-name", "route")]),
+            &body,
+            Sep2243Mode::Lenient,
+            Some(&schema),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn schema_rejects_duplicate_annotation_names_case_insensitively() {
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "route", "arguments": {}}});
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "a": {"type": "string", "x-mcp-header": "Tenant"},
+                "b": {"type": "string", "x-mcp-header": "TENANT"}
+            }
+        });
+        let err = validate_with_tool_schema(
+            &hm(&[("mcp-method", "tools/call"), ("mcp-name", "route")]),
+            &body,
+            Sep2243Mode::Strict,
+            Some(&schema),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, -32020);
+        assert!(err.message.contains("duplicate x-mcp-header"));
+    }
+
+    #[test]
+    fn schema_rejects_annotations_outside_direct_properties_chains() {
+        for schema in [
+            json!({
+                "type": "object",
+                "allOf": [{
+                    "properties": {
+                        "tenant": {"type": "string", "x-mcp-header": "Tenant"}
+                    }
+                }]
+            }),
+            json!({
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "tenant": {"type": "string", "x-mcp-header": "Tenant"}
+                    }
+                }
+            }),
+        ] {
+            let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "route", "arguments": {}}});
+            let err = validate_with_tool_schema(
+                &hm(&[("mcp-method", "tools/call"), ("mcp-name", "route")]),
+                &body,
+                Sep2243Mode::Strict,
+                Some(&schema),
+            )
+            .unwrap_err();
+            assert_eq!(err.code, -32020);
+            assert!(err.message.contains("not statically reachable"));
+        }
     }
 
     #[test]
