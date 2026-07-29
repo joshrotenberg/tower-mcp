@@ -11,6 +11,191 @@ use serde_json::Value;
 
 use crate::error::JsonRpcError;
 
+/// A protocol metadata key or extension declaration violated the MCP naming
+/// rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MetaValidationError {
+    /// A `_meta` value was not a JSON object.
+    ExpectedObject,
+    /// An extension identifier omitted its mandatory vendor prefix.
+    MissingExtensionPrefix(String),
+    /// The prefix before `/` is malformed.
+    InvalidPrefix(String),
+    /// The name after `/` (or the whole unprefixed key) is malformed.
+    InvalidName(String),
+    /// An extension's settings value was not a JSON object.
+    InvalidExtensionSettings(String),
+}
+
+impl std::fmt::Display for MetaValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ExpectedObject => write!(f, "_meta must be a JSON object"),
+            Self::MissingExtensionPrefix(key) => {
+                write!(f, "extension identifier {key:?} requires a prefix")
+            }
+            Self::InvalidPrefix(key) => {
+                write!(f, "metadata key {key:?} has an invalid prefix")
+            }
+            Self::InvalidName(key) => write!(f, "metadata key {key:?} has an invalid name"),
+            Self::InvalidExtensionSettings(key) => {
+                write!(f, "extension {key:?} settings must be a JSON object")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MetaValidationError {}
+
+/// Validate one MCP `_meta` key.
+///
+/// A key consists of an optional prefix followed by a name. A prefix is one or
+/// more dot-separated labels and ends in `/`; labels start with an ASCII
+/// letter, end with an ASCII alphanumeric character, and contain only ASCII
+/// alphanumerics or `-`. A non-empty name starts and ends with an ASCII
+/// alphanumeric character and may additionally contain `-`, `_`, or `.`.
+///
+/// This checks syntax only. Prefixes whose second label is `mcp` or
+/// `modelcontextprotocol` are reserved for MCP, but remain valid for the
+/// protocol's own keys.
+pub fn validate_meta_key(key: &str) -> Result<(), MetaValidationError> {
+    let (prefix, name) = match key.split_once('/') {
+        Some((prefix, name)) => (Some(prefix), name),
+        None => (None, key),
+    };
+
+    if let Some(prefix) = prefix
+        && (prefix.is_empty()
+            || prefix.split('.').any(|label| {
+                let bytes = label.as_bytes();
+                bytes.is_empty()
+                    || !bytes[0].is_ascii_alphabetic()
+                    || !bytes[bytes.len() - 1].is_ascii_alphanumeric()
+                    || !bytes
+                        .iter()
+                        .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+            }))
+    {
+        return Err(MetaValidationError::InvalidPrefix(key.to_string()));
+    }
+
+    let bytes = name.as_bytes();
+    if !bytes.is_empty()
+        && (!bytes[0].is_ascii_alphanumeric()
+            || !bytes[bytes.len() - 1].is_ascii_alphanumeric()
+            || !bytes
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'.')))
+    {
+        return Err(MetaValidationError::InvalidName(key.to_string()));
+    }
+
+    Ok(())
+}
+
+/// Validate an MCP extension identifier.
+///
+/// Extension identifiers use the `_meta` key grammar, but the prefix is
+/// mandatory.
+pub fn validate_extension_identifier(identifier: &str) -> Result<(), MetaValidationError> {
+    if !identifier.contains('/') {
+        return Err(MetaValidationError::MissingExtensionPrefix(
+            identifier.to_string(),
+        ));
+    }
+    validate_meta_key(identifier)
+}
+
+/// Validate a JSON value used as an MCP `_meta` object.
+pub fn validate_meta_object(meta: &Value) -> Result<(), MetaValidationError> {
+    let object = meta
+        .as_object()
+        .ok_or(MetaValidationError::ExpectedObject)?;
+    object.keys().try_for_each(|key| validate_meta_key(key))
+}
+
+/// Validate an MCP capability extension map.
+///
+/// In addition to the mandatory-prefix key rule, every extension value must be
+/// a JSON settings object.
+pub fn validate_extensions(extensions: &HashMap<String, Value>) -> Result<(), MetaValidationError> {
+    for (identifier, settings) in extensions {
+        validate_extension_identifier(identifier)?;
+        if !settings.is_object() {
+            return Err(MetaValidationError::InvalidExtensionSettings(
+                identifier.clone(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) mod meta_object_serde {
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde_json::Value;
+
+    pub fn serialize<T, S>(meta: &Option<T>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        T: Serialize,
+        S: Serializer,
+    {
+        if let Some(meta) = meta {
+            let value = serde_json::to_value(meta).map_err(serde::ser::Error::custom)?;
+            super::validate_meta_object(&value).map_err(serde::ser::Error::custom)?;
+        }
+        meta.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+    where
+        T: serde::de::DeserializeOwned,
+        D: Deserializer<'de>,
+    {
+        let value = Option::<Value>::deserialize(deserializer)?;
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        super::validate_meta_object(&value).map_err(D::Error::custom)?;
+        serde_json::from_value(value)
+            .map(Some)
+            .map_err(D::Error::custom)
+    }
+}
+
+mod extension_map_serde {
+    use std::collections::HashMap;
+
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde_json::Value;
+
+    pub fn serialize<S>(
+        extensions: &Option<HashMap<String, Value>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if let Some(extensions) = extensions {
+            super::validate_extensions(extensions).map_err(serde::ser::Error::custom)?;
+        }
+        extensions.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<HashMap<String, Value>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let extensions = Option::<HashMap<String, Value>>::deserialize(deserializer)?;
+        if let Some(extensions) = extensions.as_ref() {
+            super::validate_extensions(extensions).map_err(D::Error::custom)?;
+        }
+        Ok(extensions)
+    }
+}
+
 /// The JSON-RPC version. MUST be "2.0".
 pub const JSONRPC_VERSION: &str = "2.0";
 
@@ -312,7 +497,12 @@ pub struct LoggingMessageParams {
     #[serde(default)]
     pub data: Value,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -346,7 +536,12 @@ pub struct SetLogLevelParams {
     /// Minimum log level to receive
     pub level: LogLevel,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<RequestMeta>,
 }
 
@@ -518,7 +713,12 @@ pub struct CancelledParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -537,7 +737,12 @@ pub struct ProgressParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -672,7 +877,12 @@ pub struct InitializeParams {
     pub capabilities: ClientCapabilities,
     pub client_info: Implementation,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -693,9 +903,12 @@ pub struct ClientCapabilities {
     ///
     /// Keys MUST follow the `_meta` key naming rules (reverse-DNS prefix
     /// mandatory, e.g. `io.modelcontextprotocol/tasks`) per the final
-    /// 2026-07-28 schema. Not currently validated on receipt -- this crate
-    /// has no `_meta`-key-naming validation anywhere yet, not just here.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// 2026-07-28 schema.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "extension_map_serde"
+    )]
     pub extensions: Option<HashMap<String, serde_json::Value>>,
 }
 
@@ -842,7 +1055,12 @@ pub struct Root {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -875,7 +1093,12 @@ impl Root {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListRootsParams {
     /// Optional metadata
-    #[serde(default, rename = "_meta", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<RequestMeta>,
 }
 
@@ -885,7 +1108,12 @@ pub struct ListRootsResult {
     /// The list of roots available to the server
     pub roots: Vec<Root>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -1022,7 +1250,12 @@ pub struct CompleteParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<CompletionContext>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -1075,7 +1308,12 @@ pub struct CompleteResult {
     /// The completion suggestions
     pub completion: Completion,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -1189,7 +1427,12 @@ pub struct SamplingMessage {
     /// The content of the message (single item or array)
     pub content: SamplingContentOrArray,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -1311,7 +1554,12 @@ pub enum SamplingContent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         annotations: Option<ContentAnnotations>,
         /// Optional protocol-level metadata
-        #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "_meta",
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "crate::protocol::meta_object_serde"
+        )]
         meta: Option<Value>,
     },
     /// Image content
@@ -1325,7 +1573,12 @@ pub enum SamplingContent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         annotations: Option<ContentAnnotations>,
         /// Optional protocol-level metadata
-        #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "_meta",
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "crate::protocol::meta_object_serde"
+        )]
         meta: Option<Value>,
     },
     /// Audio content (if supported)
@@ -1339,7 +1592,12 @@ pub enum SamplingContent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         annotations: Option<ContentAnnotations>,
         /// Optional protocol-level metadata
-        #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "_meta",
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "crate::protocol::meta_object_serde"
+        )]
         meta: Option<Value>,
     },
     /// Tool use request from the model (SEP-1577)
@@ -1352,7 +1610,12 @@ pub enum SamplingContent {
         /// Input arguments for the tool
         input: Value,
         /// Optional protocol-level metadata
-        #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "_meta",
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "crate::protocol::meta_object_serde"
+        )]
         meta: Option<Value>,
     },
     /// Result of a tool invocation (SEP-1577)
@@ -1374,7 +1637,12 @@ pub enum SamplingContent {
         #[serde(default, rename = "isError", skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
         /// Optional protocol-level metadata
-        #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "_meta",
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "crate::protocol::meta_object_serde"
+        )]
         meta: Option<Value>,
     },
 }
@@ -1476,7 +1744,12 @@ pub struct CreateMessageParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskRequestParams>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -1556,7 +1829,12 @@ pub struct CreateMessageResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -1615,7 +1893,12 @@ pub struct Implementation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub website_url: Option<String>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -1630,7 +1913,12 @@ pub struct InitializeResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -1650,7 +1938,12 @@ pub struct InitializeResult {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DiscoverParams {
     /// Required per-request metadata for the final protocol.
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<RequestMeta>,
 }
 
@@ -1691,7 +1984,12 @@ pub struct DiscoverResult {
     pub instructions: Option<String>,
     /// Protocol-level metadata. Carries server identity
     /// (`io.modelcontextprotocol/serverInfo`) per SEP-2575.
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<ResultMeta>,
 }
 
@@ -1721,7 +2019,12 @@ pub struct SubscriptionsListenParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notifications: Option<SubscriptionFilter>,
     /// Optional protocol-level metadata.
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -1736,7 +2039,12 @@ pub struct SubscriptionsListenResult {
     #[serde(default)]
     pub result_type: ResultType,
     /// Identifies the subscription that ended.
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<NotificationMeta>,
 }
 
@@ -1764,9 +2072,12 @@ pub struct ServerCapabilities {
     ///
     /// Keys MUST follow the `_meta` key naming rules (reverse-DNS prefix
     /// mandatory, e.g. `io.modelcontextprotocol/tasks`) per the final
-    /// 2026-07-28 schema. Not currently validated on receipt -- this crate
-    /// has no `_meta`-key-naming validation anywhere yet, not just here.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// 2026-07-28 schema.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "extension_map_serde"
+    )]
     pub extensions: Option<HashMap<String, serde_json::Value>>,
 }
 
@@ -1914,7 +2225,12 @@ pub struct ListToolsParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<RequestMeta>,
 }
 
@@ -1933,7 +2249,12 @@ pub struct ListToolsResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_scope: Option<CacheScope>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -1962,7 +2283,12 @@ pub struct ToolDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub execution: Option<ToolExecution>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -2112,7 +2438,12 @@ pub struct CallToolParams {
     )]
     pub request_state: Option<String>,
     /// Request metadata including progress token
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<RequestMeta>,
     /// Task parameters for async execution
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2151,7 +2482,12 @@ pub struct CallToolResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_content: Option<Value>,
     /// Optional metadata (e.g., for io.modelcontextprotocol/related-task)
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -2511,7 +2847,12 @@ pub enum Content {
         #[serde(skip_serializing_if = "Option::is_none")]
         annotations: Option<ContentAnnotations>,
         /// Optional protocol-level metadata
-        #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "_meta",
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "crate::protocol::meta_object_serde"
+        )]
         meta: Option<Value>,
     },
     /// Base64-encoded image content.
@@ -2525,7 +2866,12 @@ pub enum Content {
         #[serde(skip_serializing_if = "Option::is_none")]
         annotations: Option<ContentAnnotations>,
         /// Optional protocol-level metadata
-        #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "_meta",
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "crate::protocol::meta_object_serde"
+        )]
         meta: Option<Value>,
     },
     /// Base64-encoded audio content.
@@ -2539,7 +2885,12 @@ pub enum Content {
         #[serde(skip_serializing_if = "Option::is_none")]
         annotations: Option<ContentAnnotations>,
         /// Optional protocol-level metadata
-        #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "_meta",
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "crate::protocol::meta_object_serde"
+        )]
         meta: Option<Value>,
     },
     /// Embedded resource content.
@@ -2550,7 +2901,12 @@ pub enum Content {
         #[serde(skip_serializing_if = "Option::is_none")]
         annotations: Option<ContentAnnotations>,
         /// Optional protocol-level metadata
-        #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "_meta",
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "crate::protocol::meta_object_serde"
+        )]
         meta: Option<Value>,
     },
     /// Link to a resource (without embedding the content)
@@ -2577,7 +2933,12 @@ pub enum Content {
         #[serde(skip_serializing_if = "Option::is_none")]
         annotations: Option<ContentAnnotations>,
         /// Optional protocol-level metadata
-        #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "_meta",
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "crate::protocol::meta_object_serde"
+        )]
         meta: Option<Value>,
     },
 }
@@ -2681,7 +3042,12 @@ pub struct ResourceContent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blob: Option<String>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -2694,7 +3060,12 @@ pub struct ListResourcesParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<RequestMeta>,
 }
 
@@ -2711,7 +3082,12 @@ pub struct ListResourcesResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_scope: Option<CacheScope>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -2737,7 +3113,12 @@ pub struct ResourceDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<ContentAnnotations>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -2761,7 +3142,12 @@ pub struct ReadResourceParams {
     )]
     pub request_state: Option<String>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<RequestMeta>,
 }
 
@@ -2782,7 +3168,12 @@ pub struct ReadResourceResult {
     )]
     pub cache_scope: Option<CacheScope>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -3015,7 +3406,12 @@ impl ReadResourceResult {
 pub struct SubscribeResourceParams {
     pub uri: String,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<RequestMeta>,
 }
 
@@ -3023,7 +3419,12 @@ pub struct SubscribeResourceParams {
 pub struct UnsubscribeResourceParams {
     pub uri: String,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<RequestMeta>,
 }
 
@@ -3034,7 +3435,12 @@ pub struct ListResourceTemplatesParams {
     #[serde(default)]
     pub cursor: Option<String>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<RequestMeta>,
 }
 
@@ -3054,7 +3460,12 @@ pub struct ListResourceTemplatesResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_scope: Option<CacheScope>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -3099,7 +3510,12 @@ pub struct ResourceTemplateDefinition {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub arguments: Vec<PromptArgument>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -3112,7 +3528,12 @@ pub struct ListPromptsParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<RequestMeta>,
 }
 
@@ -3129,7 +3550,12 @@ pub struct ListPromptsResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_scope: Option<CacheScope>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -3147,7 +3573,12 @@ pub struct PromptDefinition {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub arguments: Vec<PromptArgument>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -3182,7 +3613,12 @@ pub struct GetPromptParams {
     )]
     pub request_state: Option<String>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<RequestMeta>,
 }
 
@@ -3256,7 +3692,12 @@ pub struct GetPromptResult {
     pub description: Option<String>,
     pub messages: Vec<PromptMessage>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -3480,7 +3921,12 @@ pub struct PromptMessage {
     pub role: PromptRole,
     pub content: Content,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -3612,7 +4058,12 @@ pub struct TaskObject {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<crate::error::JsonRpcError>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -3686,6 +4137,7 @@ impl Serialize for CreateTaskResult {
                 .map_err(|e| serde::ser::Error::custom(format!("task mirror: {e}")))?,
         );
         if let Some(meta) = &self.meta {
+            validate_meta_object(meta).map_err(serde::ser::Error::custom)?;
             obj.insert("_meta".to_string(), meta.clone());
         }
         value.serialize(serializer)
@@ -3702,6 +4154,9 @@ impl<'de> Deserialize<'de> for CreateTaskResult {
         // object and disambiguating.
         let value = Value::deserialize(deserializer)?;
         let meta = value.get("_meta").filter(|v| !v.is_null()).cloned();
+        if let Some(meta) = meta.as_ref() {
+            validate_meta_object(meta).map_err(serde::de::Error::custom)?;
+        }
         if let Some(task_val) = value.get("task")
             && task_val.is_object()
             && task_val
@@ -3730,7 +4185,12 @@ pub struct ListTasksParams {
     #[serde(default)]
     pub cursor: Option<String>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<RequestMeta>,
 }
 
@@ -3752,7 +4212,12 @@ pub struct GetTaskInfoParams {
     /// Task ID to query
     pub task_id: String,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<RequestMeta>,
 }
 
@@ -3763,7 +4228,12 @@ pub struct GetTaskResultParams {
     /// Task ID to get result for
     pub task_id: String,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<RequestMeta>,
 }
 
@@ -3777,7 +4247,12 @@ pub struct CancelTaskParams {
     #[serde(default)]
     pub reason: Option<String>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<RequestMeta>,
 }
 
@@ -3801,7 +4276,12 @@ pub struct UpdateTaskParams {
     #[serde(default)]
     pub input_responses: HashMap<String, Value>,
     /// Optional protocol-level metadata.
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<RequestMeta>,
 }
 
@@ -3829,7 +4309,12 @@ pub struct TaskStatusParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub poll_interval: Option<u64>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -3852,7 +4337,12 @@ pub struct ElicitFormParams {
     /// Schema for the form fields (restricted subset of JSON Schema)
     pub requested_schema: ElicitFormSchema,
     /// Request metadata including progress token
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<RequestMeta>,
 }
 
@@ -3898,7 +4388,12 @@ pub struct ElicitUrlParams {
     /// The URL the user should navigate to
     pub url: String,
     /// Request metadata including progress token
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<RequestMeta>,
 }
 
@@ -4397,7 +4892,12 @@ pub struct ElicitResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<std::collections::HashMap<String, ElicitFieldValue>>,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -4462,7 +4962,12 @@ pub struct ElicitationCompleteParams {
     /// The ID of the elicitation that completed
     pub elicitation_id: String,
     /// Optional protocol-level metadata
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -4813,7 +5318,12 @@ pub struct InputRequiredResult {
     )]
     pub request_state: Option<String>,
     /// Result-level metadata (`_meta`).
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<Value>,
 }
 
@@ -4986,7 +5496,12 @@ pub struct SubscriptionFilter {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SubscriptionsAcknowledgedParams {
     /// Identifies the `subscriptions/listen` request being acknowledged.
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
     pub meta: Option<NotificationMeta>,
     /// The notification types the server agreed to honor. Types the server does
     /// not support are omitted.
@@ -4997,6 +5512,123 @@ pub struct SubscriptionsAcknowledgedParams {
 mod tests {
     use super::*;
     use crate::error::JsonRpcError;
+
+    // =========================================================================
+    // Metadata and extension key validation
+    // =========================================================================
+
+    #[test]
+    fn meta_key_validation_matches_the_spec_grammar() {
+        for key in [
+            "",
+            "progressToken",
+            "traceparent",
+            "io.modelcontextprotocol/protocolVersion",
+            "com.example/feature-name_1.2",
+            "vendor/",
+        ] {
+            assert_eq!(validate_meta_key(key), Ok(()), "{key:?} should be valid");
+        }
+
+        for key in [
+            "/name",
+            "1vendor/name",
+            "com..example/name",
+            "com.example-/name",
+            "com_example/name",
+            "com.example//name",
+            "com.example/-name",
+            "name-",
+            "na:me",
+            "métadata",
+        ] {
+            assert!(validate_meta_key(key).is_err(), "{key:?} should be invalid");
+        }
+
+        assert!(matches!(
+            validate_extension_identifier("tasks"),
+            Err(MetaValidationError::MissingExtensionPrefix(key)) if key == "tasks"
+        ));
+        assert_eq!(
+            validate_extension_identifier("io.modelcontextprotocol/tasks"),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn every_typed_meta_field_rejects_invalid_objects_and_keys() {
+        let valid: InitializeParams = serde_json::from_value(serde_json::json!({
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": { "name": "client", "version": "1" },
+            "_meta": {
+                "progressToken": 1,
+                "com.example/feature": true
+            }
+        }))
+        .unwrap();
+        assert!(valid.meta.is_some());
+
+        for meta in [
+            serde_json::json!([]),
+            serde_json::json!({"bad/key/again": true}),
+            serde_json::json!({"-bad": true}),
+        ] {
+            let value = serde_json::json!({
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "client", "version": "1" },
+                "_meta": meta
+            });
+            assert!(serde_json::from_value::<InitializeParams>(value).is_err());
+        }
+
+        let invalid_outbound = InitializeParams {
+            protocol_version: "2025-11-25".to_string(),
+            capabilities: ClientCapabilities::default(),
+            client_info: Implementation {
+                name: "client".to_string(),
+                version: "1".to_string(),
+                title: None,
+                description: None,
+                icons: None,
+                website_url: None,
+                meta: None,
+            },
+            meta: Some(serde_json::json!({"bad key": true})),
+        };
+        assert!(serde_json::to_value(invalid_outbound).is_err());
+    }
+
+    #[test]
+    fn capability_extensions_require_prefixed_keys_and_object_settings() {
+        let valid: ClientCapabilities = serde_json::from_value(serde_json::json!({
+            "extensions": {
+                "io.modelcontextprotocol/tasks": {},
+                "com.example/feature": { "version": 1 }
+            }
+        }))
+        .unwrap();
+        assert_eq!(valid.extensions.as_ref().map(HashMap::len), Some(2));
+
+        for extensions in [
+            serde_json::json!({"tasks": {}}),
+            serde_json::json!({"com.example/-feature": {}}),
+            serde_json::json!({"com.example/feature": true}),
+        ] {
+            let value = serde_json::json!({ "extensions": extensions });
+            assert!(serde_json::from_value::<ClientCapabilities>(value).is_err());
+        }
+
+        let invalid_outbound = ServerCapabilities {
+            extensions: Some(HashMap::from([(
+                "unprefixed".to_string(),
+                serde_json::json!({}),
+            )])),
+            ..ServerCapabilities::default()
+        };
+        assert!(serde_json::to_value(invalid_outbound).is_err());
+    }
 
     // =========================================================================
     // Protocol version constants

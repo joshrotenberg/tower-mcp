@@ -2554,10 +2554,14 @@ fn validate_modern_request_meta(
         .ok_or_else(|| {
             JsonRpcError::invalid_params("Modern requests require a params object containing _meta")
         })?;
-    let meta = params
+    let meta_value = params
         .get("_meta")
-        .and_then(serde_json::Value::as_object)
         .ok_or_else(|| JsonRpcError::invalid_params("Modern requests require a _meta object"))?;
+    crate::protocol::validate_meta_object(meta_value)
+        .map_err(|error| JsonRpcError::invalid_params(error.to_string()))?;
+    let meta = meta_value
+        .as_object()
+        .expect("validate_meta_object accepted a JSON object");
     let protocol_version = meta
         .get("io.modelcontextprotocol/protocolVersion")
         .and_then(serde_json::Value::as_str)
@@ -7173,6 +7177,71 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["id"], 101);
         assert_eq!(json["error"]["code"], ErrorCode::InvalidParams.code());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "stateless")]
+    async fn stateless_v2026_rejects_invalid_meta_and_extension_keys_with_http_400() {
+        let app = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .disable_host_validation()
+            .into_router();
+
+        let build_request =
+            |id: i64, extra_meta: serde_json::Value, extensions: serde_json::Value| {
+                let mut meta = serde_json::json!({
+                    "io.modelcontextprotocol/protocolVersion": EXPERIMENTAL_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {
+                        "extensions": extensions
+                    }
+                });
+                meta.as_object_mut()
+                    .unwrap()
+                    .extend(extra_meta.as_object().unwrap().clone());
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/json")
+                    .header(MCP_METHOD_HEADER, "server/discover")
+                    .header(MCP_PROTOCOL_VERSION_HEADER, EXPERIMENTAL_PROTOCOL_VERSION)
+                    .body(Body::from(
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "method": "server/discover",
+                            "params": { "_meta": meta }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap()
+            };
+
+        for request in [
+            build_request(
+                111,
+                serde_json::json!({"com.example/-invalid": true}),
+                serde_json::json!({}),
+            ),
+            build_request(
+                112,
+                serde_json::json!({}),
+                serde_json::json!({"unprefixed": {}}),
+            ),
+            build_request(
+                113,
+                serde_json::json!({}),
+                serde_json::json!({"com.example/feature": true}),
+            ),
+        ] {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["error"]["code"], ErrorCode::InvalidParams.code());
+        }
     }
 
     #[tokio::test]
