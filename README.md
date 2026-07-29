@@ -606,15 +606,20 @@ from the JSON-RPC frame, and MRTR results are followed through the configured
 client handler with a bounded round count:
 
 ```rust,no_run
+use std::time::Duration;
 use tower_mcp::{HttpClientTransport, ProtocolSupport};
-use tower_mcp::client::McpClient;
+use tower_mcp::client::{ClientCacheConfig, McpClient};
 
 # async fn connect() -> Result<(), tower_mcp::BoxError> {
 let support = ProtocolSupport::try_new(["2026-07-28"])?;
+let cache = ClientCacheConfig::default()
+    .with_partition("user-123")
+    .with_max_ttl(Duration::from_secs(60 * 60));
 let transport = HttpClientTransport::new("https://example.com/mcp");
 let client = McpClient::builder()
     .protocol_support(support)
     .max_mrtr_rounds(8)
+    .response_cache(cache)
     .connect_simple(transport)
     .await?;
 
@@ -623,6 +628,13 @@ println!("server versions: {:?}", discovery.supported_versions);
 # Ok(())
 # }
 ```
+
+On the final lifecycle, `server/discover`, paginated list operations, and
+`resources/read` honor `ttlMs` and `cacheScope`. Private entries use the
+configured authorization-context partition; list/resource notifications
+invalidate matching entries. The cache is bounded, caps server TTLs at 24
+hours by default, never stores MRTR retries, and can be disabled or configured
+to serve stale data after refresh errors.
 
 MRTR-aware tool, prompt, resource, and resource-template handlers return
 `RequestOutcome<T>`. Retry values are exposed on `RequestContext`, while

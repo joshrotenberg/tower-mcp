@@ -38,6 +38,7 @@ mod http;
 mod oauth;
 #[cfg(feature = "oauth-client")]
 mod oauth_authcode;
+mod response_cache;
 mod stdio;
 mod transport;
 
@@ -51,6 +52,7 @@ pub use oauth::{
 };
 #[cfg(feature = "oauth-client")]
 pub use oauth_authcode::{OAuthAuthCodeConfig, OAuthAuthorizationCode};
+pub use response_cache::{ClientCacheConfig, DEFAULT_MAX_CACHE_TTL};
 pub use stdio::StdioClientTransport;
 pub use transport::ClientTransport;
 
@@ -66,18 +68,51 @@ use crate::error::{Error, Result};
 #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
 use crate::protocol::DiscoverParams;
 use crate::protocol::{
-    CallToolParams, CallToolResult, CancelTaskParams, ClientCapabilities, CompleteParams,
-    CompleteResult, CompletionArgument, CompletionReference, CreateTaskResult, DiscoverResult,
-    ElicitationCapability, GetPromptParams, GetPromptResult, GetTaskInfoParams, Implementation,
-    InitializeParams, InitializeResult, InputRequest, InputRequests, InputResponse, InputResponses,
-    JsonRpcNotification, JsonRpcRequest, ListPromptsParams, ListPromptsResult,
+    CacheScope, CallToolParams, CallToolResult, CancelTaskParams, ClientCapabilities,
+    CompleteParams, CompleteResult, CompletionArgument, CompletionReference, CreateTaskResult,
+    DiscoverResult, ElicitationCapability, GetPromptParams, GetPromptResult, GetTaskInfoParams,
+    Implementation, InitializeParams, InitializeResult, InputRequest, InputRequests, InputResponse,
+    InputResponses, JsonRpcNotification, JsonRpcRequest, ListPromptsParams, ListPromptsResult,
     ListResourceTemplatesParams, ListResourceTemplatesResult, ListResourcesParams,
     ListResourcesResult, ListRootsResult, ListToolsParams, ListToolsResult, PromptDefinition,
     ReadResourceParams, ReadResourceResult, RequestId, RequestMeta, RequestOutcome,
     ResourceDefinition, ResourceTemplateDefinition, Root, RootsCapability, SamplingCapability,
     TaskObject, TaskRequestParams, ToolDefinition, notifications,
 };
+use response_cache::{CacheLookup, ClientResponseCache};
 use tower_mcp_types::JsonRpcError;
+
+trait CacheableResponse:
+    Clone + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static
+{
+    fn ttl_ms(&self) -> Option<u64>;
+    fn cache_scope(&self) -> Option<CacheScope>;
+}
+
+macro_rules! impl_cacheable_response {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl CacheableResponse for $ty {
+                fn ttl_ms(&self) -> Option<u64> {
+                    self.ttl_ms
+                }
+
+                fn cache_scope(&self) -> Option<CacheScope> {
+                    self.cache_scope
+                }
+            }
+        )+
+    };
+}
+
+impl_cacheable_response!(
+    DiscoverResult,
+    ListToolsResult,
+    ListResourcesResult,
+    ListResourceTemplatesResult,
+    ListPromptsResult,
+    ReadResourceResult,
+);
 
 /// Internal command sent from McpClient methods to the background loop.
 enum LoopCommand {
@@ -163,6 +198,8 @@ pub struct McpClient {
     recovery_lock: Mutex<()>,
     /// Maximum number of input-required rounds auto-driven per operation.
     max_mrtr_rounds: usize,
+    /// SEP-2549 final-protocol response cache.
+    response_cache: Arc<ClientResponseCache>,
 }
 
 /// Builder for configuring and connecting an [`McpClient`].
@@ -189,6 +226,7 @@ pub struct McpClientBuilder {
     roots: Vec<Root>,
     protocol_support: ProtocolSupport,
     max_mrtr_rounds: usize,
+    cache_config: ClientCacheConfig,
 }
 
 impl McpClientBuilder {
@@ -201,6 +239,7 @@ impl McpClientBuilder {
             // existing client off the established initialize/session path.
             protocol_support: ProtocolSupport::stable(),
             max_mrtr_rounds: 8,
+            cache_config: ClientCacheConfig::default(),
         }
     }
 
@@ -238,6 +277,18 @@ impl McpClientBuilder {
     /// Zero is normalized to one. The default is eight rounds.
     pub fn max_mrtr_rounds(mut self, rounds: usize) -> Self {
         self.max_mrtr_rounds = rounds.max(1);
+        self
+    }
+
+    /// Configure the SEP-2549 final-protocol response cache.
+    pub fn response_cache(mut self, config: ClientCacheConfig) -> Self {
+        self.cache_config = config;
+        self
+    }
+
+    /// Disable the SEP-2549 response cache.
+    pub fn disable_response_cache(mut self) -> Self {
+        self.cache_config.enabled = false;
         self
     }
 
@@ -279,6 +330,7 @@ impl McpClientBuilder {
             self.roots,
             self.protocol_support,
             self.max_mrtr_rounds,
+            self.cache_config,
         )
         .await
     }
@@ -327,6 +379,7 @@ impl McpClient {
         roots: Vec<Root>,
         protocol_support: ProtocolSupport,
         max_mrtr_rounds: usize,
+        cache_config: ClientCacheConfig,
     ) -> Result<Self>
     where
         T: ClientTransport,
@@ -336,12 +389,22 @@ impl McpClient {
         let (command_tx, command_rx) = mpsc::channel::<LoopCommand>(64);
         let connected = Arc::new(AtomicBool::new(true));
         let roots = Arc::new(RwLock::new(roots));
+        let response_cache = ClientResponseCache::new(cache_config);
 
         let loop_connected = connected.clone();
         let loop_roots = roots.clone();
+        let loop_response_cache = response_cache.clone();
 
         let task = tokio::spawn(async move {
-            message_loop(transport, handler, command_rx, loop_connected, loop_roots).await;
+            message_loop(
+                transport,
+                handler,
+                command_rx,
+                loop_connected,
+                loop_roots,
+                loop_response_cache,
+            )
+            .await;
         });
 
         Ok(Self {
@@ -360,6 +423,7 @@ impl McpClient {
             init_params: RwLock::new(None),
             recovery_lock: Mutex::new(()),
             max_mrtr_rounds,
+            response_cache,
         })
     }
 
@@ -381,6 +445,25 @@ impl McpClient {
     /// Return the exact ordered protocol implementations enabled for this client.
     pub fn protocol_support(&self) -> &ProtocolSupport {
         &self.protocol_support
+    }
+
+    /// Clear every cached final-protocol response held by this client.
+    pub async fn clear_response_cache(&self) {
+        self.response_cache.clear().await;
+    }
+
+    /// Change the authorization-context partition used for private responses.
+    ///
+    /// Previously cached private entries become inaccessible, while public
+    /// entries remain reusable. Call this before issuing requests after the
+    /// authenticated principal changes.
+    pub async fn set_cache_partition(&self, partition: impl Into<String>) {
+        self.response_cache.set_partition(partition.into()).await;
+    }
+
+    /// Return the number of response-cache entries held by this client.
+    pub async fn response_cache_len(&self) -> usize {
+        self.response_cache.len().await
     }
 
     /// Get the server discovery result after the final lifecycle is active.
@@ -477,8 +560,20 @@ impl McpClient {
             let params = DiscoverParams {
                 meta: Some(self.request_meta_for(&candidate, &client_info)),
             };
+            let cache_key = serde_json::to_string(&(
+                client_name,
+                client_version,
+                candidate.as_str(),
+                &self.capabilities,
+            ))
+            .expect("discovery cache key is serializable");
             match self
-                .send_request_once::<_, DiscoverResult>("server/discover", &params)
+                .send_cacheable_request_when::<_, DiscoverResult>(
+                    "server/discover",
+                    &cache_key,
+                    &params,
+                    true,
+                )
                 .await
             {
                 Ok(result) => {
@@ -532,15 +627,7 @@ impl McpClient {
 
     /// List available tools.
     pub async fn list_tools(&self) -> Result<ListToolsResult> {
-        self.ensure_initialized()?;
-        self.send_request(
-            "tools/list",
-            &ListToolsParams {
-                cursor: None,
-                meta: None,
-            },
-        )
-        .await
+        self.list_tools_with_cursor(None).await
     }
 
     /// Call a tool.
@@ -686,28 +773,85 @@ impl McpClient {
 
     /// List available resources.
     pub async fn list_resources(&self) -> Result<ListResourcesResult> {
-        self.ensure_initialized()?;
-        self.send_request(
-            "resources/list",
-            &ListResourcesParams {
-                cursor: None,
-                meta: None,
-            },
-        )
-        .await
+        self.list_resources_with_cursor(None).await
     }
 
     /// Read a resource.
     pub async fn read_resource(&self, uri: &str) -> Result<ReadResourceResult> {
+        self.ensure_initialized()?;
+        let cache_enabled = self.uses_final_protocol().await && self.response_cache.enabled();
+        let generation = if cache_enabled {
+            self.response_cache
+                .capture_generation("resources/read", uri)
+                .await
+        } else {
+            0
+        };
+        let mut generation_active = cache_enabled;
+        let mut stale = None;
+        if cache_enabled {
+            match self.response_cache.lookup("resources/read", uri).await {
+                CacheLookup::Fresh(value) => {
+                    if let Some(result) = decode_cached(&value, "resources/read") {
+                        self.response_cache
+                            .release_generation("resources/read", uri)
+                            .await;
+                        return Ok(result);
+                    }
+                    self.response_cache.evict_resource(uri).await;
+                }
+                CacheLookup::Stale(value) => stale = Some(value),
+                CacheLookup::Miss => {}
+            }
+        }
+
         let mut input_responses = None;
         let mut request_state = None;
+        let mut followed_input_required = false;
         for round in 0..=self.max_mrtr_rounds {
-            match self
+            let outcome = match self
                 .read_resource_once(uri, input_responses.take(), request_state.take())
-                .await?
+                .await
             {
-                RequestOutcome::Complete(result) => return Ok(result),
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    if generation_active {
+                        self.response_cache
+                            .release_generation("resources/read", uri)
+                            .await;
+                    }
+                    if self.response_cache.serve_stale_on_error()
+                        && let Some(value) = stale.as_ref()
+                        && let Some(result) = decode_cached(value, "resources/read")
+                    {
+                        tracing::warn!(
+                            uri,
+                            error = %error,
+                            "Serving stale resources/read response after refresh failure"
+                        );
+                        return Ok(result);
+                    }
+                    return Err(error);
+                }
+            };
+            match outcome {
+                RequestOutcome::Complete(result) => {
+                    if generation_active && !followed_input_required {
+                        self.write_cached_response("resources/read", uri, generation, &result)
+                            .await;
+                    }
+                    return Ok(result);
+                }
                 RequestOutcome::InputRequired(required) => {
+                    if !followed_input_required {
+                        followed_input_required = true;
+                        if generation_active {
+                            self.response_cache
+                                .release_generation("resources/read", uri)
+                                .await;
+                            generation_active = false;
+                        }
+                    }
                     if round == self.max_mrtr_rounds {
                         return Err(Error::Transport(format!(
                             "MRTR round limit ({}) exceeded for resources/read",
@@ -784,22 +928,19 @@ impl McpClient {
 
     /// List available prompts.
     pub async fn list_prompts(&self) -> Result<ListPromptsResult> {
-        self.ensure_initialized()?;
-        self.send_request(
-            "prompts/list",
-            &ListPromptsParams {
-                cursor: None,
-                meta: None,
-            },
-        )
-        .await
+        self.list_prompts_with_cursor(None).await
     }
 
     /// List tools with an optional pagination cursor.
     pub async fn list_tools_with_cursor(&self, cursor: Option<String>) -> Result<ListToolsResult> {
         self.ensure_initialized()?;
-        self.send_request("tools/list", &ListToolsParams { cursor, meta: None })
-            .await
+        let cache_key = pagination_cache_key(cursor.as_deref());
+        self.send_cacheable_request(
+            "tools/list",
+            &cache_key,
+            &ListToolsParams { cursor, meta: None },
+        )
+        .await
     }
 
     /// List resources with an optional pagination cursor.
@@ -808,8 +949,10 @@ impl McpClient {
         cursor: Option<String>,
     ) -> Result<ListResourcesResult> {
         self.ensure_initialized()?;
-        self.send_request(
+        let cache_key = pagination_cache_key(cursor.as_deref());
+        self.send_cacheable_request(
             "resources/list",
+            &cache_key,
             &ListResourcesParams { cursor, meta: None },
         )
         .await
@@ -817,15 +960,7 @@ impl McpClient {
 
     /// List resource templates.
     pub async fn list_resource_templates(&self) -> Result<ListResourceTemplatesResult> {
-        self.ensure_initialized()?;
-        self.send_request(
-            "resources/templates/list",
-            &ListResourceTemplatesParams {
-                cursor: None,
-                meta: None,
-            },
-        )
-        .await
+        self.list_resource_templates_with_cursor(None).await
     }
 
     /// List resource templates with an optional pagination cursor.
@@ -834,8 +969,10 @@ impl McpClient {
         cursor: Option<String>,
     ) -> Result<ListResourceTemplatesResult> {
         self.ensure_initialized()?;
-        self.send_request(
+        let cache_key = pagination_cache_key(cursor.as_deref());
+        self.send_cacheable_request(
             "resources/templates/list",
+            &cache_key,
             &ListResourceTemplatesParams { cursor, meta: None },
         )
         .await
@@ -847,8 +984,13 @@ impl McpClient {
         cursor: Option<String>,
     ) -> Result<ListPromptsResult> {
         self.ensure_initialized()?;
-        self.send_request("prompts/list", &ListPromptsParams { cursor, meta: None })
-            .await
+        let cache_key = pagination_cache_key(cursor.as_deref());
+        self.send_cacheable_request(
+            "prompts/list",
+            &cache_key,
+            &ListPromptsParams { cursor, meta: None },
+        )
+        .await
     }
 
     /// List all tools, following pagination cursors until exhausted.
@@ -1117,6 +1259,115 @@ impl McpClient {
 
     // --- Internal helpers ---
 
+    async fn send_cacheable_request<P, R>(
+        &self,
+        method: &str,
+        cache_key: &str,
+        params: &P,
+    ) -> Result<R>
+    where
+        P: serde::Serialize,
+        R: CacheableResponse,
+    {
+        let cache_allowed = self.uses_final_protocol().await;
+        self.send_cacheable_request_when(method, cache_key, params, cache_allowed)
+            .await
+    }
+
+    async fn send_cacheable_request_when<P, R>(
+        &self,
+        method: &str,
+        cache_key: &str,
+        params: &P,
+        cache_allowed: bool,
+    ) -> Result<R>
+    where
+        P: serde::Serialize,
+        R: CacheableResponse,
+    {
+        if !cache_allowed || !self.response_cache.enabled() {
+            return self.send_request(method, params).await;
+        }
+
+        let generation = self
+            .response_cache
+            .capture_generation(method, cache_key)
+            .await;
+        let mut stale = None;
+        match self.response_cache.lookup(method, cache_key).await {
+            CacheLookup::Fresh(value) => {
+                if let Some(result) = decode_cached(&value, method) {
+                    self.response_cache
+                        .release_generation(method, cache_key)
+                        .await;
+                    tracing::debug!(method, "Serving fresh response from cache");
+                    return Ok(result);
+                }
+                self.response_cache.evict_method(method).await;
+            }
+            CacheLookup::Stale(value) => stale = Some(value),
+            CacheLookup::Miss => {}
+        }
+
+        match self.send_request(method, params).await {
+            Ok(result) => {
+                self.write_cached_response(method, cache_key, generation, &result)
+                    .await;
+                Ok(result)
+            }
+            Err(error) => {
+                self.response_cache
+                    .release_generation(method, cache_key)
+                    .await;
+                if self.response_cache.serve_stale_on_error()
+                    && let Some(value) = stale.as_ref()
+                    && let Some(result) = decode_cached(value, method)
+                {
+                    tracing::warn!(
+                        method,
+                        error = %error,
+                        "Serving stale response after cache refresh failure"
+                    );
+                    return Ok(result);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn write_cached_response<R: CacheableResponse>(
+        &self,
+        method: &str,
+        cache_key: &str,
+        generation: u64,
+        result: &R,
+    ) {
+        match serde_json::to_value(result) {
+            Ok(value) => {
+                self.response_cache
+                    .write(
+                        method,
+                        cache_key,
+                        generation,
+                        value,
+                        result.ttl_ms(),
+                        result.cache_scope(),
+                    )
+                    .await;
+            }
+            Err(error) => {
+                self.response_cache
+                    .release_generation(method, cache_key)
+                    .await;
+                tracing::warn!(
+                    method,
+                    error = %error,
+                    "Skipping response-cache write after serialization failure"
+                );
+            }
+        }
+    }
+
     async fn send_request<P: serde::Serialize, R: serde::de::DeserializeOwned>(
         &self,
         method: &str,
@@ -1339,6 +1590,27 @@ impl McpClient {
     }
 }
 
+fn pagination_cache_key(cursor: Option<&str>) -> String {
+    serde_json::to_string(&cursor).expect("pagination cursor cache key is serializable")
+}
+
+fn decode_cached<R: serde::de::DeserializeOwned>(
+    value: &serde_json::Value,
+    method: &str,
+) -> Option<R> {
+    match serde_json::from_value(value.clone()) {
+        Ok(result) => Some(result),
+        Err(error) => {
+            tracing::warn!(
+                method,
+                error = %error,
+                "Discarding response-cache entry that no longer deserializes"
+            );
+            None
+        }
+    }
+}
+
 impl Drop for McpClient {
     fn drop(&mut self) {
         if let Some(task) = self.task.take() {
@@ -1363,6 +1635,7 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
     mut command_rx: mpsc::Receiver<LoopCommand>,
     connected: Arc<AtomicBool>,
     roots: Arc<RwLock<Vec<Root>>>,
+    response_cache: Arc<ClientResponseCache>,
 ) {
     let handler = Arc::new(handler);
     let mut pending_requests: HashMap<RequestId, PendingRequest> = HashMap::new();
@@ -1435,6 +1708,7 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
                             &handler,
                             &roots,
                             &mut transport,
+                            &response_cache,
                         ).await;
                     }
                     Ok(None) => {
@@ -1506,6 +1780,7 @@ async fn handle_incoming<T: ClientTransport, H: ClientHandler>(
     handler: &Arc<H>,
     roots: &Arc<RwLock<Vec<Root>>>,
     transport: &mut T,
+    response_cache: &Arc<ClientResponseCache>,
 ) {
     let parsed: serde_json::Value = match serde_json::from_str(line) {
         Ok(v) => v,
@@ -1582,8 +1857,39 @@ async fn handle_incoming<T: ClientTransport, H: ClientHandler>(
     if parsed.get("method").is_some() && parsed.get("id").is_none() {
         let method = parsed["method"].as_str().unwrap_or("");
         let params = parsed.get("params").cloned();
+        invalidate_response_cache(response_cache, method, params.as_ref()).await;
         let notification = parse_server_notification(method, params);
         handler.on_notification(notification).await;
+    }
+}
+
+async fn invalidate_response_cache(
+    response_cache: &ClientResponseCache,
+    method: &str,
+    params: Option<&serde_json::Value>,
+) {
+    match method {
+        notifications::TOOLS_LIST_CHANGED => {
+            response_cache.evict_method("tools/list").await;
+        }
+        notifications::PROMPTS_LIST_CHANGED => {
+            response_cache.evict_method("prompts/list").await;
+        }
+        notifications::RESOURCES_LIST_CHANGED => {
+            response_cache.evict_method("resources/list").await;
+            response_cache
+                .evict_method("resources/templates/list")
+                .await;
+        }
+        notifications::RESOURCE_UPDATED => {
+            if let Some(uri) = params
+                .and_then(|value| value.get("uri"))
+                .and_then(serde_json::Value::as_str)
+            {
+                response_cache.evict_resource(uri).await;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1969,6 +2275,174 @@ mod tests {
             );
             assert!(meta["io.modelcontextprotocol/clientCapabilities"].is_object());
         }
+    }
+
+    #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+    fn final_discover_result() -> serde_json::Value {
+        serde_json::json!({
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {},
+            "ttlMs": 0,
+            "cacheScope": "private"
+        })
+    }
+
+    #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+    fn cacheable_tools_result(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "resultType": "complete",
+            "tools": [{
+                "name": name,
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
+                }
+            }],
+            "ttlMs": 60_000,
+            "cacheScope": "private"
+        })
+    }
+
+    #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+    #[tokio::test]
+    async fn final_cache_serves_a_fresh_list_without_a_round_trip() {
+        let transport = MockTransport::with_responses(vec![
+            final_discover_result(),
+            cacheable_tools_result("cached"),
+        ]);
+        let outgoing = transport.outgoing.clone();
+        let client = McpClient::builder()
+            .protocol_support(ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+            .connect_simple(transport)
+            .await
+            .unwrap();
+        client.discover("test-client", "1.0.0").await.unwrap();
+
+        let first = client.list_tools().await.unwrap();
+        let second = client.list_tools().await.unwrap();
+
+        assert_eq!(first.tools[0].name, "cached");
+        assert_eq!(second.tools[0].name, "cached");
+        assert_eq!(outgoing.lock().unwrap().len(), 2);
+        assert_eq!(client.response_cache_len().await, 1);
+    }
+
+    #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+    #[tokio::test]
+    async fn disabling_final_cache_forces_each_list_request() {
+        let transport = MockTransport::with_responses(vec![
+            final_discover_result(),
+            cacheable_tools_result("first"),
+            cacheable_tools_result("second"),
+        ]);
+        let outgoing = transport.outgoing.clone();
+        let client = McpClient::builder()
+            .protocol_support(ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+            .disable_response_cache()
+            .connect_simple(transport)
+            .await
+            .unwrap();
+        client.discover("test-client", "1.0.0").await.unwrap();
+
+        assert_eq!(client.list_tools().await.unwrap().tools[0].name, "first");
+        assert_eq!(client.list_tools().await.unwrap().tools[0].name, "second");
+        assert_eq!(outgoing.lock().unwrap().len(), 3);
+        assert_eq!(client.response_cache_len().await, 0);
+    }
+
+    #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+    #[tokio::test]
+    async fn list_changed_notification_invalidates_a_fresh_entry() {
+        let transport = MockTransport::with_responses(vec![
+            final_discover_result(),
+            cacheable_tools_result("first"),
+            cacheable_tools_result("second"),
+        ]);
+        let incoming = transport.incoming_tx.clone();
+        let outgoing = transport.outgoing.clone();
+        let notification_seen = Arc::new(AtomicBool::new(false));
+        let handler = NotificationHandler::new().on_tools_changed({
+            let notification_seen = notification_seen.clone();
+            move || notification_seen.store(true, Ordering::Release)
+        });
+        let client = McpClient::builder()
+            .protocol_support(ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+            .connect(transport, handler)
+            .await
+            .unwrap();
+        client.discover("test-client", "1.0.0").await.unwrap();
+        assert_eq!(client.list_tools().await.unwrap().tools[0].name, "first");
+
+        incoming
+            .send(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": notifications::TOOLS_LIST_CHANGED,
+                    "params": {}
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if notification_seen.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(notification_seen.load(Ordering::Acquire));
+
+        assert_eq!(client.list_tools().await.unwrap().tools[0].name, "second");
+        assert_eq!(outgoing.lock().unwrap().len(), 3);
+    }
+
+    #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+    #[tokio::test]
+    async fn rotating_private_partition_refetches_resource() {
+        let resource_result = |text: &str| {
+            serde_json::json!({
+                "resultType": "complete",
+                "contents": [{
+                    "uri": "config://app",
+                    "text": text
+                }],
+                "ttlMs": 60_000,
+                "cacheScope": "private"
+            })
+        };
+        let transport = MockTransport::with_responses(vec![
+            final_discover_result(),
+            resource_result("principal-a"),
+            resource_result("principal-b"),
+        ]);
+        let outgoing = transport.outgoing.clone();
+        let client = McpClient::builder()
+            .protocol_support(ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+            .response_cache(ClientCacheConfig::default().with_partition("principal-a"))
+            .connect_simple(transport)
+            .await
+            .unwrap();
+        client.discover("test-client", "1.0.0").await.unwrap();
+
+        assert_eq!(
+            client
+                .read_resource("config://app")
+                .await
+                .unwrap()
+                .first_text(),
+            Some("principal-a")
+        );
+        client.set_cache_partition("principal-b").await;
+        assert_eq!(
+            client
+                .read_resource("config://app")
+                .await
+                .unwrap()
+                .first_text(),
+            Some("principal-b")
+        );
+        assert_eq!(outgoing.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]
