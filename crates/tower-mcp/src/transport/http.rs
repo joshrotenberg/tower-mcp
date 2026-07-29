@@ -2,7 +2,7 @@
 //!
 //! Implements the Streamable HTTP transport from MCP specification 2025-11-25,
 //! with version-gated support for the 2026-07-28 stateless protocol (SEP-2575 /
-//! SEP-2567) when the `stateless` feature is compiled in.
+//! SEP-2567) when the `protocol-2026-07-28` feature is compiled in.
 //!
 //! ## Features
 //!
@@ -12,18 +12,18 @@
 //! - SSE event IDs and stream resumption via `Last-Event-ID` header (SEP-1699)
 //! - Configurable session TTL and cleanup
 //! - **Sampling support**: Server-to-client LLM requests via SSE + POST
-//! - **Stateless mode** (`stateless` feature): version-gated dispatch for
-//!   2026-07-28+ clients with per-request `_meta` and no session handshake
+//! - **2026 protocol mode** (`protocol-2026-07-28` feature): version-gated
+//!   dispatch with per-request `_meta` and no session handshake
 //!
 //! ## Stateless mode (2026-07-28 protocol)
 //!
-//! When the `stateless` feature is compiled in, the transport handles two
-//! distinct stateless paths:
+//! When the `protocol-2026-07-28` feature (or its former `stateless` alias) is
+//! compiled in, the transport handles two distinct stateless paths:
 //!
-//! ### Automatic version-gated path (2026-07-28+)
+//! ### Automatic version-gated path (2026-07-28)
 //!
-//! Any request that arrives with `MCP-Protocol-Version: 2026-07-28` (or
-//! later) and no `mcp-session-id` header is dispatched statelessly, regardless
+//! Any request that arrives with `MCP-Protocol-Version: 2026-07-28` and no
+//! `mcp-session-id` header is dispatched statelessly, regardless
 //! of whether [`HttpTransport::stateless()`] was called. The client is fully
 //! self-identifying: every request carries its protocol version, client info,
 //! and client capabilities in the `_meta` object; no initialize handshake is
@@ -53,7 +53,7 @@
 //!
 //! This replaces the `GET /` SSE endpoint used by the 2025-11-25 protocol. The
 //! `GET /` endpoint is still supported for 2025-11-25 sessions; `subscriptions/listen`
-//! is only available for 2026-07-28+ clients.
+//! is only available for 2026-07-28 clients.
 //!
 //! ```text
 //! Client (2026-07-28)                          Server
@@ -79,7 +79,7 @@
 //!
 //! Validation is **lenient** for 2025-11-25 clients: headers present in the
 //! request are validated for consistency with the body, but missing headers are
-//! not an error. Validation is **strict** for 2026-07-28+ clients: `Mcp-Method`
+//! not an error. Validation is **strict** for 2026-07-28 clients: `Mcp-Method`
 //! must be present on every POST and `Mcp-Name` must be present for the three
 //! named methods. Violations return `-32020` (HeaderMismatch).
 //!
@@ -262,14 +262,14 @@ use crate::context::{
 use crate::error::{Error, JsonRpcError, Result};
 use crate::jsonrpc::JsonRpcService;
 use crate::protocol::{
-    ClientCapabilities, Implementation, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    LATEST_PROTOCOL_VERSION, McpNotification, RequestId, SUPPORTED_PROTOCOL_VERSIONS,
-    UPCOMING_PROTOCOL_VERSION,
+    ClientCapabilities, EXPERIMENTAL_PROTOCOL_VERSION, Implementation, JsonRpcNotification,
+    JsonRpcRequest, JsonRpcResponse, LATEST_PROTOCOL_VERSION, McpNotification, RequestId,
 };
 use crate::router::{McpRouter, RouterRequest, RouterResponse};
 use crate::transport::service::{
     CatchError, InjectAnnotations, McpBoxService, ServiceFactory, identity_factory,
 };
+use crate::{ProtocolSupport, ProtocolSupportError};
 use tower::util::BoxCloneService;
 
 /// SEP-2575 per-request `_meta` extraction. Pulls `StatelessRequestMeta` from
@@ -307,12 +307,6 @@ pub const MCP_NAME_HEADER: &str = "mcp-name";
 /// marked with the `x-mcp-header` JSON Schema extension. The full header
 /// name is `Mcp-Param-{Name}`.
 pub const MCP_PARAM_HEADER_PREFIX: &str = "mcp-param-";
-
-/// First MCP protocol version that mandates SEP-2243 HTTP header
-/// validation. Prior versions are treated leniently: present headers are
-/// still validated for body consistency, but missing headers are not an
-/// error.
-pub(super) const SEP_2243_MIN_PROTOCOL_VERSION: &str = "2026-07-28";
 
 /// Default maximum POST body size in bytes (4 MiB, matching rmcp).
 ///
@@ -1271,6 +1265,8 @@ enum ServiceSource {
 struct AppState {
     /// Source for creating new session services
     service_source: ServiceSource,
+    /// Exact protocol versions accepted and advertised by this transport.
+    protocol_support: ProtocolSupport,
     /// Session store
     sessions: Arc<SessionRegistry>,
     /// Whether to validate Origin header
@@ -1331,6 +1327,7 @@ pub(crate) struct OAuthConfig {
 ///   `.layer()` is not supported in this mode.
 pub struct HttpTransport {
     service_source: ServiceSource,
+    protocol_support: ProtocolSupport,
     validate_origin: bool,
     allowed_origins: Vec<String>,
     validate_host: bool,
@@ -1375,6 +1372,7 @@ impl HttpTransport {
                 router,
                 factory: identity_factory(),
             },
+            protocol_support: ProtocolSupport::default(),
             validate_origin: true,
             allowed_origins: vec![],
             validate_host: true,
@@ -1434,6 +1432,7 @@ impl HttpTransport {
             service_source: ServiceSource::Service(Arc::new(std::sync::Mutex::new(
                 BoxCloneService::new(service),
             ))),
+            protocol_support: ProtocolSupport::default(),
             validate_origin: true,
             allowed_origins: vec![],
             validate_host: true,
@@ -1584,6 +1583,32 @@ impl HttpTransport {
     pub fn require_sessions(mut self) -> Self {
         self.optional_sessions = false;
         self
+    }
+
+    /// Set the exact protocol versions this transport accepts and advertises.
+    ///
+    /// By default, every protocol implementation compiled into tower-mcp is
+    /// enabled. This setting can narrow that set per server instance. Versions
+    /// are advertised by `server/discover` in the order supplied.
+    pub fn protocol_support(mut self, support: ProtocolSupport) -> Self {
+        self.protocol_support = support;
+        self
+    }
+
+    /// Construct and set an exact runtime protocol-version allow-list.
+    ///
+    /// Returns an error when the list is empty, duplicated, or names a version
+    /// whose Cargo feature was not compiled.
+    pub fn protocol_versions<I, S>(
+        mut self,
+        versions: I,
+    ) -> std::result::Result<Self, ProtocolSupportError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.protocol_support = ProtocolSupport::try_new(versions)?;
+        Ok(self)
     }
 
     /// Enable SSE-wrapping for synchronous JSON-RPC responses.
@@ -1966,6 +1991,7 @@ impl HttpTransport {
 
         Arc::new(AppState {
             service_source: self.service_source.clone(),
+            protocol_support: self.protocol_support.clone(),
             sessions,
             validate_origin: self.validate_origin,
             allowed_origins: self.allowed_origins.clone(),
@@ -2406,6 +2432,7 @@ async fn handle_post(
 
         if let Some(ref version) = version_in_play
             && is_stateless_protocol_version(version)
+            && state.protocol_support.contains(version)
             && get_session_id(&headers).is_none()
             // `subscriptions/listen` opens an SSE stream; let it fall through to the
             // dedicated intercept below rather than handling it as a plain RPC call.
@@ -2476,6 +2503,7 @@ async fn handle_post(
             };
 
             let mut ext = crate::router::Extensions::new();
+            ext.insert(state.protocol_support.clone());
             #[cfg(feature = "oauth")]
             if let Some(claims) = http_extensions.get::<crate::oauth::token::TokenClaims>() {
                 ext.insert(claims.clone());
@@ -2536,12 +2564,9 @@ async fn handle_post(
                         }
                     };
 
-                    // For `initialize`: the router's version negotiation falls
-                    // back to `LATEST_PROTOCOL_VERSION` ("2025-11-25") because
-                    // 2026-07-28 is not yet in `SUPPORTED_PROTOCOL_VERSIONS` at
-                    // the types layer. Patch the response to reflect the version
-                    // the transport is actually serving so the client sees the
-                    // version it requested.
+                    // Keep the response aligned with the version selected for
+                    // this sessionless request. The router also receives the
+                    // runtime allow-list through Extensions.
                     if is_init
                         && let JsonRpcResponse::Result(ref mut result) = response
                         && let Some(pv) = result.result.get_mut("protocolVersion")
@@ -2627,6 +2652,7 @@ async fn handle_post(
             };
 
             let mut ext = crate::router::Extensions::new();
+            ext.insert(state.protocol_support.clone());
             #[cfg(feature = "oauth")]
             if let Some(claims) = http_extensions.get::<crate::oauth::token::TokenClaims>() {
                 ext.insert(claims.clone());
@@ -2754,7 +2780,7 @@ async fn handle_post(
             } else {
                 session.protocol_version.read().await.clone()
             };
-            if version_supports_subscriptions_listen(&effective_version) {
+            if version_supports_subscriptions_listen(&effective_version, &state.protocol_support) {
                 return handle_subscriptions_listen_sse(session).await;
             } else {
                 return json_rpc_error_response(
@@ -2770,14 +2796,14 @@ async fn handle_post(
     // -32022 and `{ supported, requested }` data, not a plain-text 400.
     if !is_init
         && let Some(version) = get_protocol_version(&headers)
-        && !SUPPORTED_PROTOCOL_VERSIONS.contains(&version.as_str())
+        && !state.protocol_support.contains(&version)
     {
         let id = extract_request_id(&parsed);
         return json_rpc_error_response(
             id,
             JsonRpcError::unsupported_protocol_version(
                 version,
-                SUPPORTED_PROTOCOL_VERSIONS.iter().copied(),
+                state.protocol_support.versions().iter().map(String::as_str),
             ),
         );
     }
@@ -2933,6 +2959,7 @@ async fn handle_post(
     // skipped to avoid pointless allocation.
     #[allow(unused_mut)]
     let mut ext = crate::router::Extensions::new();
+    ext.insert(state.protocol_support.clone());
     #[cfg(feature = "oauth")]
     if let Some(claims) = http_extensions.get::<crate::oauth::token::TokenClaims>() {
         ext.insert(claims.clone());
@@ -2996,20 +3023,24 @@ async fn handle_post(
 /// Returns `true` when the given protocol version string enables `subscriptions/listen`.
 ///
 /// `subscriptions/listen` is part of the 2026-07-28 spec (SEP-2575 / SEP-2567).
-/// Version strings are YYYY-MM-DD dates, so lexicographic comparison is correct.
-fn version_supports_subscriptions_listen(version: &str) -> bool {
-    version >= UPCOMING_PROTOCOL_VERSION
+/// Unknown future dates do not opt into behavior that has not been compiled
+/// and explicitly enabled.
+fn version_supports_subscriptions_listen(
+    version: &str,
+    protocol_support: &ProtocolSupport,
+) -> bool {
+    version == EXPERIMENTAL_PROTOCOL_VERSION && protocol_support.contains(version)
 }
 
 /// Returns `true` when the given protocol version string enables stateless
 /// (sessionless) mode for the HTTP transport.
 ///
 /// Stateless mode is introduced in the 2026-07-28 protocol (SEP-2575 /
-/// SEP-2567). Version strings are YYYY-MM-DD; lexicographic comparison is
-/// correct for date-ordered MCP versions.
+/// SEP-2567). Only the exact, compiled-and-enabled version opts in; unknown
+/// future dates must not silently inherit experimental behavior.
 #[cfg(feature = "stateless")]
 fn is_stateless_protocol_version(version: &str) -> bool {
-    version >= UPCOMING_PROTOCOL_VERSION
+    version == EXPERIMENTAL_PROTOCOL_VERSION
 }
 
 /// Stamp `_meta["io.modelcontextprotocol/serverInfo"]` onto a successful
@@ -3646,6 +3677,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_protocol_allowlist_drives_discovery() {
+        let transport = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .protocol_versions(["2025-03-26"])
+            .unwrap();
+        let app = transport.into_router();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "server/discover"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["result"]["supportedVersions"],
+            serde_json::json!(["2025-03-26"])
+        );
+    }
+
+    #[tokio::test]
     async fn test_oversized_body_rejected_with_413() {
         let transport = HttpTransport::new(create_test_router())
             .disable_origin_validation()
@@ -3921,15 +3986,15 @@ mod tests {
             "error data must use 'supported', not 'supportedVersions': {:?}",
             json["error"]["data"]
         );
-        // The supported set must exactly match SUPPORTED_PROTOCOL_VERSIONS --
+        // The supported set must exactly match the compiled transport default --
         // no extras, none missing.
-        let expected: Vec<serde_json::Value> = SUPPORTED_PROTOCOL_VERSIONS
+        let expected: Vec<serde_json::Value> = crate::COMPILED_PROTOCOL_VERSIONS
             .iter()
             .map(|v| serde_json::json!(v))
             .collect();
         assert_eq!(
             supported, &expected,
-            "data.supported must exactly match SUPPORTED_PROTOCOL_VERSIONS"
+            "data.supported must exactly match COMPILED_PROTOCOL_VERSIONS"
         );
     }
 
@@ -3943,17 +4008,14 @@ mod tests {
         let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
         let app = transport.into_router();
 
-        // "1999-01-01" is below UPCOMING_PROTOCOL_VERSION ("2026-07-28"), so it
-        // does not enter the version-gated stateless block. It is also not in
-        // SUPPORTED_PROTOCOL_VERSIONS, so it triggers the -32022 version check
-        // at lines ~2370-2382. No session header is sent, exercising the
-        // sessionless request path through version validation.
+        // A future-looking unknown version must not enter the experimental
+        // stateless path merely because its date sorts after 2026-07-28.
         let req = Request::builder()
             .method("POST")
             .uri("/")
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
-            .header(MCP_PROTOCOL_VERSION_HEADER, "1999-01-01")
+            .header(MCP_PROTOCOL_VERSION_HEADER, "2099-01-01")
             .body(Body::from(
                 serde_json::json!({
                     "jsonrpc": "2.0",
@@ -3974,7 +4036,7 @@ mod tests {
             "must return UnsupportedProtocolVersion (-32022): {json}"
         );
         assert_eq!(
-            json["error"]["data"]["requested"], "1999-01-01",
+            json["error"]["data"]["requested"], "2099-01-01",
             "data.requested must echo the version: {json}"
         );
         // Field name must be `supported`, not `supportedVersions`.
@@ -3985,13 +4047,13 @@ mod tests {
         let supported = json["error"]["data"]["supported"]
             .as_array()
             .expect("data.supported must be an array");
-        let expected: Vec<serde_json::Value> = SUPPORTED_PROTOCOL_VERSIONS
+        let expected: Vec<serde_json::Value> = crate::COMPILED_PROTOCOL_VERSIONS
             .iter()
             .map(|v| serde_json::json!(v))
             .collect();
         assert_eq!(
             supported, &expected,
-            "data.supported must exactly match SUPPORTED_PROTOCOL_VERSIONS"
+            "data.supported must exactly match COMPILED_PROTOCOL_VERSIONS"
         );
     }
 

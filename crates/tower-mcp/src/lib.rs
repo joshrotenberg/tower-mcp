@@ -363,9 +363,10 @@
 //!     .stateless(StatelessConfig::new());
 //! ```
 //!
-//! The 2026-07-28 protocol is experimental. The `UPCOMING_PROTOCOL_VERSION` constant in
-//! `tower_mcp::protocol` tracks the target version string and will not appear in
-//! `SUPPORTED_PROTOCOL_VERSIONS` until the spec is stable.
+//! The 2026-07-28 implementation is experimental. Enable the
+//! `protocol-2026-07-28` Cargo feature to compile it, then use
+//! [`ProtocolSupport`] to narrow the versions enabled by an individual
+//! transport at runtime.
 //!
 //! ### Router Composition
 //!
@@ -456,6 +457,10 @@ pub mod middleware;
 pub mod oauth;
 pub mod prompt;
 pub mod protocol;
+mod protocol_support;
+pub use protocol_support::{
+    COMPILED_PROTOCOL_VERSIONS, ProtocolSupport, ProtocolSupportError, is_protocol_version_compiled,
+};
 #[cfg(feature = "proxy")]
 pub mod proxy;
 #[cfg(feature = "dynamic-tools")]

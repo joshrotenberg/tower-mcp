@@ -117,7 +117,8 @@ use tower_mcp::schemars::JsonSchema;
 | `proxy` | Multi-server aggregation proxy (`McpProxy`) |
 | `macros` | Optional proc macros (`#[tool_fn]`, `#[prompt_fn]`, `#[resource_fn]`, `#[resource_template_fn]`) |
 | `resilience` | Re-export tower-resilience circuit breaker, rate limiter, and bulkhead layers |
-| `stateless` | Experimental 2026-07-28 stateless protocol mode (SEP-2575 final + SEP-2567 accepted) -- version-gated sessionless dispatch, `server/discover` RPC, `subscriptions/listen` SSE endpoint, per-request `_meta` client capabilities. Requires `http`. |
+| `protocol-2026-07-28` | Compile the experimental implementation of the released 2026-07-28 protocol. Use `ProtocolSupport` to narrow the exact versions enabled by a server at runtime. |
+| `stateless` | Compatibility alias for the former 2026 protocol feature name. New integrations should use `protocol-2026-07-28`. |
 
 Example with features:
 
@@ -592,10 +593,12 @@ tower-mcp targets the [MCP specification 2025-11-25](https://modelcontextprotoco
 
 Because the suite is upstream-maintained and grows with the spec, these counts shift as new scenarios are added -- treat the green CI badge as the source of truth, not any single snapshot. CI fails when a baselined scenario regresses further or starts passing (stale baseline), so the baselines cannot silently rot.
 
-The `stateless` feature enables an experimental 2026-07-28 protocol path (version-gated, behind
+The `protocol-2026-07-28` feature enables the experimental implementation of the released
+2026-07-28 protocol (version-gated, behind
 `MCP-Protocol-Version: 2026-07-28`) covering `server/discover`, `subscriptions/listen`, and per-request
-`_meta` capabilities as defined by SEP-2575 (final) and SEP-2567 (accepted). The 2026-07-28
-version is not yet stable and is not included in `SUPPORTED_PROTOCOL_VERSIONS`.
+`_meta` capabilities as defined by SEP-2575 and SEP-2567. It is not enabled by default and is
+not yet included in `SUPPORTED_PROTOCOL_VERSIONS`; compile-time availability and per-transport
+runtime enablement are reported separately.
 
 [SEP-2484](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2484) (accepted) makes merged conformance scenarios a prerequisite for standards-track SEPs reaching `final`, which elevates the conformance suite from a nice-to-have to spec-gating infrastructure. We run it on every PR to catch regressions early and to stay ahead of new scenarios as the spec evolves.
 

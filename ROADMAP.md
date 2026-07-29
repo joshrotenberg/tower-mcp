@@ -3,7 +3,7 @@
 ## Current Status
 
 - **Version**: 0.14.x
-- **Spec version**: 2025-11-25 (plus the 2026-07-28 draft behind the `stateless` feature)
+- **Spec version**: 2025-11-25 by default (plus the released 2026-07-28 protocol as an experimental implementation behind `protocol-2026-07-28`)
 - **Server conformance (2025-11-25)**: 39/39
 - **Client conformance (2025-11-25)**: 264/266 (two offline-access gaps, tracked in #953)
 - **Server conformance (2026-07-28)**: 67/101 (gaps baselined, tracked in #929)

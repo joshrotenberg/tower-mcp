@@ -15,13 +15,16 @@
 //!
 //! # Stateless protocol support (2026-07-28)
 //!
-//! This crate also tracks the next protocol version (`2026-07-28`) that adds
+//! This crate also tracks the experimental implementation of protocol version
+//! `2026-07-28`, which adds
 //! stateless operation, per-request `_meta`, and the `server/discover` RPC.
 //! Key items:
 //!
-//! - [`protocol::UPCOMING_PROTOCOL_VERSION`] -- the `"2026-07-28"` version
-//!   string, not yet in `SUPPORTED_PROTOCOL_VERSIONS`. Useful for codegen
-//!   tools and conformance harnesses that need to reference it explicitly.
+//! - [`protocol::EXPERIMENTAL_PROTOCOL_VERSION`] -- the `"2026-07-28"` wire
+//!   version, not yet enabled by default. Useful for codegen tools and
+//!   conformance harnesses that need to reference it explicitly.
+//! - [`protocol::KNOWN_PROTOCOL_VERSIONS`] -- every version whose wire format
+//!   is represented here, independent of runtime compile-time features.
 //! - [`protocol::DiscoverResult`] / [`protocol::DiscoverParams`] -- types for
 //!   the `server/discover` RPC (SEP-2575), which returns the server's supported
 //!   protocol versions and capabilities without requiring an `initialize`

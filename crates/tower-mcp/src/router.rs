@@ -1863,14 +1863,24 @@ impl McpRouter {
                     "Client initializing"
                 );
 
-                // Protocol version negotiation: respond with same version if supported,
-                // otherwise respond with our latest supported version
-                let protocol_version = if crate::protocol::SUPPORTED_PROTOCOL_VERSIONS
-                    .contains(&params.protocol_version.as_str())
-                {
+                // HTTP and other configurable transports inject their exact
+                // runtime allow-list. Direct router use retains the stable
+                // default policy.
+                let protocol_support = extensions.get::<crate::ProtocolSupport>();
+                let requested_is_supported = protocol_support.map_or_else(
+                    || {
+                        crate::protocol::SUPPORTED_PROTOCOL_VERSIONS
+                            .contains(&params.protocol_version.as_str())
+                    },
+                    |support| support.contains(&params.protocol_version),
+                );
+                let protocol_version = if requested_is_supported {
                     params.protocol_version
                 } else {
-                    crate::protocol::LATEST_PROTOCOL_VERSION.to_string()
+                    protocol_support.map_or_else(
+                        || crate::protocol::LATEST_PROTOCOL_VERSION.to_string(),
+                        |support| support.preferred().to_string(),
+                    )
                 };
 
                 // Transition session state to Initializing
@@ -1898,11 +1908,17 @@ impl McpRouter {
                 // on subsequent requests.
                 tracing::debug!("Stateless server/discover request");
                 let server_info = self.implementation();
+                let supported_versions = extensions.get::<crate::ProtocolSupport>().map_or_else(
+                    || {
+                        crate::protocol::SUPPORTED_PROTOCOL_VERSIONS
+                            .iter()
+                            .map(|version| (*version).to_string())
+                            .collect()
+                    },
+                    |support| support.versions().to_vec(),
+                );
                 Ok(McpResponse::Discover(DiscoverResult {
-                    supported_versions: crate::protocol::SUPPORTED_PROTOCOL_VERSIONS
-                        .iter()
-                        .map(|v| (*v).to_string())
-                        .collect(),
+                    supported_versions,
                     capabilities: self.capabilities(),
                     ttl_ms: None,
                     cache_scope: None,

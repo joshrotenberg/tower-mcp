@@ -78,13 +78,11 @@ pub(super) enum Sep2243Mode {
 /// Decide which validation mode applies for the negotiated protocol
 /// version.
 ///
-/// Returns [`Sep2243Mode::Strict`] when `version` is at or beyond the
-/// SEP-2243 inclusion version, [`Sep2243Mode::Lenient`] otherwise.
-///
-/// Version strings are compared lexicographically. The MCP version
-/// format is `YYYY-MM-DD`, which sorts correctly under lexical compare.
+/// Returns [`Sep2243Mode::Strict`] for the explicitly implemented 2026-07-28
+/// protocol, [`Sep2243Mode::Lenient`] otherwise. Unsupported future versions
+/// must not silently inherit experimental behavior based on date ordering.
 pub(super) fn mode_for_version(version: &str) -> Sep2243Mode {
-    if version >= super::http::SEP_2243_MIN_PROTOCOL_VERSION {
+    if version == crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION {
         Sep2243Mode::Strict
     } else {
         Sep2243Mode::Lenient
@@ -371,9 +369,9 @@ mod tests {
     }
 
     #[test]
-    fn mode_strict_at_or_after_2026_07_28() {
+    fn mode_is_exactly_gated_on_2026_07_28() {
         assert_eq!(mode_for_version("2026-07-28"), Sep2243Mode::Strict);
-        assert_eq!(mode_for_version("2027-01-01"), Sep2243Mode::Strict);
+        assert_eq!(mode_for_version("2027-01-01"), Sep2243Mode::Lenient);
     }
 
     #[test]
