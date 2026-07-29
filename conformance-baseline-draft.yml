@@ -8,11 +8,15 @@
 # starts passing (stale entry) or a non-baselined scenario fails.
 #
 # Status at 0.2.0-alpha.10 (2026-07-28, re-baselined after the 2026-07-28
-# protocol finalization): 67/101 checks pass; 28/40 scenarios fully green
-# (10 baselined). No regressions from finalization; two formerly warning-only
-# entries (input-required-result-missing-input-response and
-# input-required-result-ignore-extra-params) now pass cleanly and were
-# dropped from this file.
+# protocol finalization): 67/101 checks pass, unchanged from alpha.9's
+# 66/102 modulo the harness dropping one check between versions. No
+# regressions from finalization; the failing scenario set is identical to
+# alpha.9's. Note that input-required-result-missing-input-response and
+# input-required-result-ignore-extra-params report "0 passed, 0 failed" in
+# the summary (they run no checks pending MRTR fixture tools) but the
+# harness's expected-failures gate still counts a zero-check scenario as an
+# unexpected failure unless baselined -- keep both entries even though the
+# summary line renders them with a checkmark.
 #
 # Format (0.2.x suite): plain scenario-name strings under `server:` /
 # `client:` keys; reasons live in these comments.
@@ -34,14 +38,17 @@ server:
 
   # SEP-2322 MRTR is not implemented (#950). Scenarios that fully pass do so
   # because correct non-MRTR behavior (rejecting unsupported methods)
-  # coincides with the spec.
+  # coincides with the spec; the two zero-check entries below also need the
+  # MRTR fixture tools to run any checks at all.
   - input-required-result-basic-elicitation
   - input-required-result-basic-sampling
   - input-required-result-basic-list-roots
   - input-required-result-request-state
   - input-required-result-multiple-input-requests
   - input-required-result-multi-round
+  - input-required-result-missing-input-response
   - input-required-result-non-tool-request
   - input-required-result-result-type
   - input-required-result-tampered-state
   - input-required-result-capability-check
+  - input-required-result-ignore-extra-params
