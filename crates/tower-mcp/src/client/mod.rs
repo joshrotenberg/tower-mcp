@@ -64,7 +64,7 @@ use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::ProtocolSupport;
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorCode, McpErrorCode, Result};
 #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
 use crate::protocol::DiscoverParams;
 use crate::protocol::{
@@ -631,6 +631,12 @@ impl McpClient {
     }
 
     /// Call a tool.
+    ///
+    /// On the final lifecycle, a header mismatch, method-not-found, or
+    /// invalid-params response can indicate that the cached tool schema is
+    /// stale. The client invalidates `tools/list`, refreshes it, and retries
+    /// the rejected round once. These errors are raised before tool execution,
+    /// so the bounded retry does not replay a completed side effect.
     pub async fn call_tool(
         &self,
         name: &str,
@@ -638,16 +644,20 @@ impl McpClient {
     ) -> Result<CallToolResult> {
         let mut input_responses = None;
         let mut request_state = None;
+        let mut schema_retry_available = self.uses_final_protocol().await;
         for round in 0..=self.max_mrtr_rounds {
-            match self
-                .call_tool_once(
-                    name,
-                    arguments.clone(),
-                    input_responses.take(),
-                    request_state.take(),
-                )
-                .await?
-            {
+            let params = CallToolParams {
+                name: name.to_string(),
+                arguments: arguments.clone(),
+                input_responses: input_responses.take(),
+                request_state: request_state.take(),
+                meta: None,
+                task: None,
+            };
+            let outcome = self
+                .send_tool_request_with_schema_retry(&params, &mut schema_retry_available)
+                .await?;
+            match outcome {
                 RequestOutcome::Complete(result) => return Ok(result),
                 RequestOutcome::InputRequired(required) => {
                     if round == self.max_mrtr_rounds {
@@ -718,7 +728,9 @@ impl McpClient {
             meta: None,
             task: Some(TaskRequestParams { ttl: ttl_ms }),
         };
-        self.send_request("tools/call", &params).await
+        let mut schema_retry_available = self.uses_final_protocol().await;
+        self.send_tool_request_with_schema_retry(&params, &mut schema_retry_available)
+            .await
     }
 
     /// Fetch a task's current state via `tasks/get` (SEP-2663).
@@ -1259,6 +1271,37 @@ impl McpClient {
 
     // --- Internal helpers ---
 
+    async fn send_tool_request_with_schema_retry<R>(
+        &self,
+        params: &CallToolParams,
+        retry_available: &mut bool,
+    ) -> Result<R>
+    where
+        R: serde::de::DeserializeOwned,
+    {
+        match self.send_request("tools/call", params).await {
+            Err(error) if *retry_available && is_stale_tool_schema_error(&error) => {
+                *retry_available = false;
+                self.response_cache.evict_method("tools/list").await;
+                tracing::info!(
+                    tool = params.name,
+                    error = %error,
+                    "Refreshing tools/list before one stale-schema retry"
+                );
+                if let Err(refresh_error) = self.list_tools().await {
+                    tracing::warn!(
+                        tool = params.name,
+                        error = %refresh_error,
+                        "Could not refresh tools/list after stale-schema rejection"
+                    );
+                    return Err(error);
+                }
+                self.send_request("tools/call", params).await
+            }
+            result => result,
+        }
+    }
+
     async fn send_cacheable_request<P, R>(
         &self,
         method: &str,
@@ -1592,6 +1635,16 @@ impl McpClient {
 
 fn pagination_cache_key(cursor: Option<&str>) -> String {
     serde_json::to_string(&cursor).expect("pagination cursor cache key is serializable")
+}
+
+fn is_stale_tool_schema_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::JsonRpc(error)
+            if error.code == McpErrorCode::HeaderMismatch.code()
+                || error.code == ErrorCode::MethodNotFound.code()
+                || error.code == ErrorCode::InvalidParams.code()
+    )
 }
 
 fn decode_cached<R: serde::de::DeserializeOwned>(
@@ -2090,8 +2143,8 @@ mod tests {
     /// `recv()` blocks when no messages are available (instead of returning
     /// EOF), keeping the background message loop alive.
     struct MockTransport {
-        /// Pre-configured response payloads (result values, not full envelopes).
-        responses: Arc<Mutex<Vec<serde_json::Value>>>,
+        /// Pre-configured result or error replies (not full envelopes).
+        responses: Arc<Mutex<Vec<MockReply>>>,
         /// Index of the next response to use.
         response_idx: Arc<std::sync::atomic::AtomicUsize>,
         /// Channel sender for feeding responses back to `recv()`.
@@ -2101,6 +2154,11 @@ mod tests {
         /// Collected outgoing messages from `send()`.
         outgoing: Arc<Mutex<Vec<String>>>,
         connected: Arc<AtomicBool>,
+    }
+
+    enum MockReply {
+        Result(serde_json::Value),
+        Error(JsonRpcError),
     }
 
     #[allow(dead_code)]
@@ -2123,6 +2181,20 @@ mod tests {
         /// ID and pairs it with the next response from this list, sending the
         /// complete JSON-RPC response through the channel for `recv()`.
         fn with_responses(responses: Vec<serde_json::Value>) -> Self {
+            let (tx, rx) = mpsc::channel(32);
+            Self {
+                responses: Arc::new(Mutex::new(
+                    responses.into_iter().map(MockReply::Result).collect(),
+                )),
+                response_idx: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                incoming_tx: tx,
+                incoming_rx: rx,
+                outgoing: Arc::new(Mutex::new(Vec::new())),
+                connected: Arc::new(AtomicBool::new(true)),
+            }
+        }
+
+        fn with_replies(responses: Vec<MockReply>) -> Self {
             let (tx, rx) = mpsc::channel(32);
             Self {
                 responses: Arc::new(Mutex::new(responses)),
@@ -2148,12 +2220,19 @@ mod tests {
                         .response_idx
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let responses = self.responses.lock().unwrap();
-                    if let Some(result) = responses.get(idx) {
-                        let response = serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": result
-                        });
+                    if let Some(reply) = responses.get(idx) {
+                        let response = match reply {
+                            MockReply::Result(result) => serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": result
+                            }),
+                            MockReply::Error(error) => serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": error
+                            }),
+                        };
                         let _ = self.incoming_tx.try_send(response.to_string());
                     }
                 }
@@ -2445,6 +2524,128 @@ mod tests {
         assert_eq!(outgoing.lock().unwrap().len(), 3);
     }
 
+    #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+    #[tokio::test]
+    async fn final_tool_call_refreshes_stale_schema_and_retries_once() {
+        let transport = MockTransport::with_replies(vec![
+            MockReply::Result(final_discover_result()),
+            MockReply::Result(cacheable_tools_result("changing-tool")),
+            MockReply::Error(JsonRpcError::header_mismatch("stale x-mcp-header mapping")),
+            MockReply::Result(cacheable_tools_result("changing-tool")),
+            MockReply::Result(serde_json::json!({
+                "resultType": "complete",
+                "content": [{"type": "text", "text": "retried"}]
+            })),
+        ]);
+        let outgoing = transport.outgoing.clone();
+        let client = McpClient::builder()
+            .protocol_support(ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+            .connect_simple(transport)
+            .await
+            .unwrap();
+        client.discover("test-client", "1.0.0").await.unwrap();
+        client.list_tools().await.unwrap();
+
+        let result = client
+            .call_tool("changing-tool", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(result.first_text(), Some("retried"));
+
+        let methods: Vec<String> = outgoing
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|message| {
+                serde_json::from_str::<serde_json::Value>(message).unwrap()["method"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            methods,
+            [
+                "server/discover",
+                "tools/list",
+                "tools/call",
+                "tools/list",
+                "tools/call"
+            ]
+        );
+    }
+
+    #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+    #[tokio::test]
+    async fn final_stale_schema_retry_is_bounded() {
+        let transport = MockTransport::with_replies(vec![
+            MockReply::Result(final_discover_result()),
+            MockReply::Result(cacheable_tools_result("changing-tool")),
+            MockReply::Error(JsonRpcError::header_mismatch("first rejection")),
+            MockReply::Result(cacheable_tools_result("changing-tool")),
+            MockReply::Error(JsonRpcError::header_mismatch("second rejection")),
+        ]);
+        let outgoing = transport.outgoing.clone();
+        let client = McpClient::builder()
+            .protocol_support(ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+            .connect_simple(transport)
+            .await
+            .unwrap();
+        client.discover("test-client", "1.0.0").await.unwrap();
+        client.list_tools().await.unwrap();
+
+        let error = client
+            .call_tool("changing-tool", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::JsonRpc(error) if error.code == McpErrorCode::HeaderMismatch.code()
+        ));
+        assert_eq!(outgoing.lock().unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn legacy_tool_call_does_not_retry_a_header_mismatch() {
+        let transport = MockTransport::with_replies(vec![
+            MockReply::Result(mock_initialize_response()),
+            MockReply::Error(JsonRpcError::header_mismatch("legacy rejection")),
+        ]);
+        let outgoing = transport.outgoing.clone();
+        let client = McpClient::connect(transport).await.unwrap();
+        client.initialize("test-client", "1.0.0").await.unwrap();
+
+        let error = client
+            .call_tool("changing-tool", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::JsonRpc(error) if error.code == McpErrorCode::HeaderMismatch.code()
+        ));
+        let messages = outgoing.lock().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.contains("tools/list"))
+        );
+    }
+
+    #[test]
+    fn stale_tool_schema_errors_are_pre_execution_protocol_errors() {
+        for error in [
+            Error::JsonRpc(JsonRpcError::header_mismatch("mismatch")),
+            Error::JsonRpc(JsonRpcError::method_not_found("tool")),
+            Error::JsonRpc(JsonRpcError::invalid_params("arguments")),
+        ] {
+            assert!(is_stale_tool_schema_error(&error));
+        }
+        assert!(!is_stale_tool_schema_error(&Error::JsonRpc(
+            JsonRpcError::internal_error("executed")
+        )));
+    }
+
     #[tokio::test]
     async fn test_list_tools() {
         let client = McpClient::connect(MockTransport::with_responses(vec![
@@ -2732,7 +2933,9 @@ mod tests {
         let inject_tx_clone = inject_tx.clone();
 
         let transport = MockTransport {
-            responses: Arc::new(Mutex::new(responses)),
+            responses: Arc::new(Mutex::new(
+                responses.into_iter().map(MockReply::Result).collect(),
+            )),
             response_idx: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             incoming_tx: inject_tx,
             incoming_rx: rx,

@@ -2251,6 +2251,12 @@ async fn test_optional_sessions_with_session_id_still_works() {
 #[cfg(feature = "stateless")]
 mod stateless_tests {
     use super::*;
+    use axum::extract::State;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tower_mcp::stateless::StatelessConfig;
 
     /// Start a server with stateless mode enabled.
@@ -2271,6 +2277,154 @@ mod stateless_tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         (url, handle)
+    }
+
+    #[derive(Clone, Default)]
+    struct StaleSchemaState {
+        list_calls: Arc<AtomicUsize>,
+        tool_calls: Arc<AtomicUsize>,
+        mirrored_headers: Arc<Mutex<Vec<(bool, bool)>>>,
+    }
+
+    async fn stale_schema_endpoint(
+        State(state): State<StaleSchemaState>,
+        headers: HeaderMap,
+        Json(body): Json<serde_json::Value>,
+    ) -> Response {
+        let id = body.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        match body
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+        {
+            "server/discover" => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "resultType": "complete",
+                        "supportedVersions": ["2026-07-28"],
+                        "capabilities": {},
+                        "ttlMs": 0,
+                        "cacheScope": "private"
+                    }
+                })),
+            )
+                .into_response(),
+            "tools/list" => {
+                let suffix = if state.list_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    "Region"
+                } else {
+                    "Zone"
+                };
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "resultType": "complete",
+                            "tools": [{
+                                "name": "changing-tool",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "region": {
+                                            "type": "string",
+                                            "x-mcp-header": suffix
+                                        }
+                                    }
+                                }
+                            }],
+                            "ttlMs": 60_000,
+                            "cacheScope": "private"
+                        }
+                    })),
+                )
+                    .into_response()
+            }
+            "tools/call" => {
+                state.mirrored_headers.lock().unwrap().push((
+                    headers.contains_key("mcp-param-region"),
+                    headers.contains_key("mcp-param-zone"),
+                ));
+                if state.tool_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {
+                                "code": -32020,
+                                "message": "cached tool schema is stale"
+                            }
+                        })),
+                    )
+                        .into_response()
+                } else {
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "resultType": "complete",
+                                "content": [{
+                                    "type": "text",
+                                    "text": "fresh headers"
+                                }]
+                            }
+                        })),
+                    )
+                        .into_response()
+                }
+            }
+            _ => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32601, "message": "unknown method"}
+                })),
+            )
+                .into_response(),
+        }
+    }
+
+    #[tokio::test]
+    async fn final_client_refreshes_headers_after_stale_schema_rejection() {
+        let state = StaleSchemaState::default();
+        let app = Router::new()
+            .route("/", post(stale_schema_endpoint))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = McpClient::builder()
+            .protocol_support(tower_mcp::ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+            .connect_simple(HttpClientTransport::new(url))
+            .await
+            .unwrap();
+        client.discover("test-client", "1.0.0").await.unwrap();
+        client.list_tools().await.unwrap();
+
+        let result = client
+            .call_tool("changing-tool", serde_json::json!({"region": "us-west1"}))
+            .await
+            .unwrap();
+        assert_eq!(result.first_text(), Some("fresh headers"));
+        assert_eq!(state.list_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(state.tool_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *state.mirrored_headers.lock().unwrap(),
+            [(true, false), (false, true)]
+        );
+
+        server.abort();
     }
 
     /// tools/list works without initialize or session, just protocol version header.
