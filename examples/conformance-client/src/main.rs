@@ -40,6 +40,11 @@ async fn main() {
         // Core scenarios
         "initialize" => core_scenarios::initialize(&server_url).await,
         "tools_call" => core_scenarios::tools_call(&server_url).await,
+        "request-metadata" => core_scenarios::initialize(&server_url).await,
+        "http-standard-headers" => core_scenarios::http_standard_headers(&server_url).await,
+        "http-custom-headers" => core_scenarios::http_custom_headers(&server_url, &context).await,
+        "http-invalid-tool-headers" => core_scenarios::http_invalid_tool_headers(&server_url).await,
+        "sep-2322-client-request-state" => core_scenarios::mrtr_request_state(&server_url).await,
         "sse-retry" => core_scenarios::sse_retry(&server_url).await,
         "elicitation-sep1034-client-defaults" | "elicitation-defaults" => {
             core_scenarios::elicitation_defaults(&server_url).await

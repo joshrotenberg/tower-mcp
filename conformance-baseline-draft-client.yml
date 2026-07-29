@@ -7,38 +7,15 @@
 # as the gaps close; CI fails when a baselined scenario starts passing (stale
 # entry) or a non-baselined scenario fails.
 #
-# Status at 0.2.0-alpha.10 (2026-07-29, re-baselined after the 2026-07-28
-# protocol finalization): 171/213 checks pass; 3/32 scenarios fully green
-# (auth/pre-registration, auth/resource-mismatch, json-schema-ref-no-deref),
-# 29 baselined. Identical scenario set to alpha.9; no regressions or new
-# passes from finalization.
+# Status at 0.2.0-alpha.10 after the final client lifecycle/header/MRTR work:
+# 210 checks pass; 9/32 scenarios are fully green and 23 auth scenarios remain
+# baselined. The exact total includes scenario-specific header assertions that
+# were previously skipped because those methods were never exercised.
 #
 # Format (0.2.x suite): plain scenario-name strings under the `client:` key;
 # reasons live in these comments.
 
 client:
-  # SEP-2575: the client does not send `MCP-Protocol-Version` on the
-  # initialize POST (it only sets the header once initialize has returned a
-  # version), and does not populate the required per-request `_meta` fields.
-  # The harness answers a header-less POST with HTTP 400 / -32020, so
-  # every scenario that gets past auth and then makes an MCP call stops there.
-  # This one gap accounts for most of the entries below. Client work in #953.
-  - request-metadata
-  - tools_call
-
-  # SEP-2322 MRTR is not implemented client-side (#950 for the protocol work,
-  # #953 for the client surface): no request-state echo, no input-required
-  # result handling.
-  - sep-2322-client-request-state
-
-  # SEP-2243 custom/standard HTTP headers, client half (#952 server side,
-  # #953 client side): no `Mcp-Method` header on outgoing POSTs, no mirroring
-  # of x-mcp-header-annotated tool arguments into `Mcp-Param-*` headers, and no
-  # schema-aware exclusion of tools carrying invalid header annotations.
-  - http-standard-headers
-  - http-custom-headers
-  - http-invalid-tool-headers
-
   # SEP-837: Dynamic Client Registration omits `application_type`. One missing
   # field, but it is a MUST, so it fails every scenario that registers.
   - auth/metadata-default

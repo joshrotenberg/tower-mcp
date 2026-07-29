@@ -1,19 +1,42 @@
 //! Core conformance scenarios (non-auth).
 
 use anyhow::Result;
-use tower_mcp::HttpClientTransport;
-use tower_mcp::client::McpClient;
+use tower_mcp::client::{McpClient, McpClientBuilder};
+use tower_mcp::{HttpClientTransport, ProtocolSupport};
 
 use crate::handlers;
+
+fn requested_protocol_version() -> String {
+    std::env::var("MCP_CONFORMANCE_PROTOCOL_VERSION")
+        .unwrap_or_else(|_| tower_mcp::protocol::LATEST_PROTOCOL_VERSION.to_string())
+}
+
+fn client_builder() -> Result<McpClientBuilder> {
+    let version = requested_protocol_version();
+    let mut builder = McpClient::builder();
+    if version == tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION {
+        builder = builder.protocol_support(ProtocolSupport::try_new([version])?);
+    }
+    Ok(builder)
+}
+
+async fn activate(client: &McpClient) -> Result<()> {
+    if requested_protocol_version() == tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION {
+        client.discover("conformance-client", "0.1.0").await?;
+    } else {
+        client.initialize("conformance-client", "0.1.0").await?;
+    }
+    Ok(())
+}
 
 /// `initialize` -- Connect, list tools, disconnect.
 pub async fn initialize(server_url: &str) -> Result<()> {
     let transport = HttpClientTransport::new(server_url);
-    let client = McpClient::builder()
+    let client = client_builder()?
         .connect(transport, handlers::BasicHandler)
         .await?;
 
-    client.initialize("conformance-client", "0.1.0").await?;
+    activate(&client).await?;
     let tools = client.list_tools().await?;
     tracing::info!("Listed {} tools", tools.tools.len());
 
@@ -24,13 +47,13 @@ pub async fn initialize(server_url: &str) -> Result<()> {
 /// `tools_call` -- Connect with full handler, list and call all tools.
 pub async fn tools_call(server_url: &str) -> Result<()> {
     let transport = HttpClientTransport::new(server_url);
-    let client = McpClient::builder()
+    let client = client_builder()?
         .with_sampling()
         .with_elicitation()
         .connect(transport, handlers::FullHandler)
         .await?;
 
-    client.initialize("conformance-client", "0.1.0").await?;
+    activate(&client).await?;
     let tools = client.list_tools().await?;
     tracing::info!("Listed {} tools", tools.tools.len());
 
@@ -47,6 +70,114 @@ pub async fn tools_call(server_url: &str) -> Result<()> {
                 tracing::warn!(tool = %tool.name, error = %e, "Tool call failed");
             }
         }
+    }
+
+    client.shutdown().await?;
+    Ok(())
+}
+
+/// Exercise all named and unnamed request headers required by SEP-2243.
+pub async fn http_standard_headers(server_url: &str) -> Result<()> {
+    let transport = HttpClientTransport::new(server_url);
+    let client = client_builder()?
+        .connect(transport, handlers::BasicHandler)
+        .await?;
+    activate(&client).await?;
+
+    let tools = client.list_tools().await?;
+    if let Some(tool) = tools.tools.first() {
+        client
+            .call_tool(&tool.name, build_tool_arguments(&tool.input_schema))
+            .await?;
+    }
+    let resources = client.list_resources().await?;
+    if let Some(resource) = resources.resources.first() {
+        client.read_resource(&resource.uri).await?;
+    }
+    let prompts = client.list_prompts().await?;
+    if let Some(prompt) = prompts.prompts.first() {
+        client.get_prompt(&prompt.name, None).await?;
+    }
+
+    client.shutdown().await?;
+    Ok(())
+}
+
+/// Mirror every schema-designated tool argument into its MCP parameter header.
+pub async fn http_custom_headers(
+    server_url: &str,
+    context: &Option<serde_json::Value>,
+) -> Result<()> {
+    let transport = HttpClientTransport::new(server_url);
+    let client = client_builder()?
+        .connect(transport, handlers::BasicHandler)
+        .await?;
+    activate(&client).await?;
+    client.list_tools().await?;
+
+    let calls = context
+        .as_ref()
+        .and_then(|value| value.get("toolCalls"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("conformance context did not include toolCalls"))?;
+    for call in calls {
+        let name = call
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("tool call is missing name"))?;
+        let arguments = call
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        client.call_tool(name, arguments).await?;
+    }
+
+    client.shutdown().await?;
+    Ok(())
+}
+
+/// Confirm invalid header annotations are excluded without hiding valid tools.
+pub async fn http_invalid_tool_headers(server_url: &str) -> Result<()> {
+    let transport = HttpClientTransport::new(server_url);
+    let client = client_builder()?
+        .connect(transport, handlers::BasicHandler)
+        .await?;
+    activate(&client).await?;
+    let tools = client.list_tools().await?;
+    let valid = tools
+        .tools
+        .iter()
+        .find(|tool| tool.name == "valid_tool")
+        .ok_or_else(|| anyhow::anyhow!("valid_tool was filtered from tools/list"))?;
+    client
+        .call_tool(&valid.name, serde_json::json!({ "region": "us-west1" }))
+        .await?;
+
+    client.shutdown().await?;
+    Ok(())
+}
+
+/// Exercise request-state echo, omission, request-id freshness, and isolation.
+pub async fn mrtr_request_state(server_url: &str) -> Result<()> {
+    let transport = HttpClientTransport::new(server_url);
+    let client = client_builder()?
+        .with_elicitation()
+        .connect(transport, handlers::FullHandler)
+        .await?;
+    activate(&client).await?;
+    let tools = client.list_tools().await?;
+
+    for name in [
+        "test_mrtr_unrelated",
+        "test_mrtr_echo_state",
+        "test_mrtr_no_state",
+        "test_mrtr_no_result_type",
+    ] {
+        anyhow::ensure!(
+            tools.tools.iter().any(|tool| tool.name == name),
+            "MRTR fixture tool {name} was not listed"
+        );
+        client.call_tool(name, serde_json::json!({})).await?;
     }
 
     client.shutdown().await?;

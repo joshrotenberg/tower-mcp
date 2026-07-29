@@ -61,17 +61,21 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+use crate::ProtocolSupport;
 use crate::error::{Error, Result};
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+use crate::protocol::DiscoverParams;
 use crate::protocol::{
     CallToolParams, CallToolResult, CancelTaskParams, ClientCapabilities, CompleteParams,
-    CompleteResult, CompletionArgument, CompletionReference, CreateTaskResult,
+    CompleteResult, CompletionArgument, CompletionReference, CreateTaskResult, DiscoverResult,
     ElicitationCapability, GetPromptParams, GetPromptResult, GetTaskInfoParams, Implementation,
-    InitializeParams, InitializeResult, JsonRpcNotification, JsonRpcRequest, ListPromptsParams,
-    ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
-    ListResourcesParams, ListResourcesResult, ListRootsResult, ListToolsParams, ListToolsResult,
-    PromptDefinition, ReadResourceParams, ReadResourceResult, RequestId, ResourceDefinition,
-    ResourceTemplateDefinition, Root, RootsCapability, SamplingCapability, TaskObject,
-    TaskRequestParams, ToolDefinition, notifications,
+    InitializeParams, InitializeResult, InputRequest, InputRequests, InputResponse, InputResponses,
+    JsonRpcNotification, JsonRpcRequest, ListPromptsParams, ListPromptsResult,
+    ListResourceTemplatesParams, ListResourceTemplatesResult, ListResourcesParams,
+    ListResourcesResult, ListRootsResult, ListToolsParams, ListToolsResult, PromptDefinition,
+    ReadResourceParams, ReadResourceResult, RequestId, RequestMeta, RequestOutcome,
+    ResourceDefinition, ResourceTemplateDefinition, Root, RootsCapability, SamplingCapability,
+    TaskObject, TaskRequestParams, ToolDefinition, notifications,
 };
 use tower_mcp_types::JsonRpcError;
 
@@ -90,6 +94,11 @@ enum LoopCommand {
     },
     /// Reset the transport's session state for re-initialization.
     ResetSession { done_tx: oneshot::Sender<()> },
+    /// Fulfil embedded MRTR requests through the configured client handler.
+    ResolveInputs {
+        requests: InputRequests,
+        response_tx: oneshot::Sender<Result<InputResponses>>,
+    },
     /// Graceful shutdown.
     Shutdown,
 }
@@ -134,6 +143,14 @@ pub struct McpClient {
     server_info: RwLock<Option<InitializeResult>>,
     /// Client capabilities declared during initialization.
     capabilities: ClientCapabilities,
+    /// Exact ordered set of protocol implementations enabled for this client.
+    protocol_support: ProtocolSupport,
+    /// Protocol selected by the discover-based final lifecycle.
+    selected_protocol_version: RwLock<Option<String>>,
+    /// Client identity repeated in final-protocol request metadata.
+    client_info: RwLock<Option<Implementation>>,
+    /// Server discovery result, when the final lifecycle is active.
+    discovery: RwLock<Option<DiscoverResult>>,
     /// Current roots (shared with the loop for roots/list responses).
     roots: Arc<RwLock<Vec<Root>>>,
     /// Whether the transport is still connected.
@@ -144,6 +161,8 @@ pub struct McpClient {
     init_params: RwLock<Option<(String, String)>>,
     /// Lock to prevent concurrent session recovery attempts.
     recovery_lock: Mutex<()>,
+    /// Maximum number of input-required rounds auto-driven per operation.
+    max_mrtr_rounds: usize,
 }
 
 /// Builder for configuring and connecting an [`McpClient`].
@@ -168,6 +187,8 @@ pub struct McpClient {
 pub struct McpClientBuilder {
     capabilities: ClientCapabilities,
     roots: Vec<Root>,
+    protocol_support: ProtocolSupport,
+    max_mrtr_rounds: usize,
 }
 
 impl McpClientBuilder {
@@ -176,6 +197,10 @@ impl McpClientBuilder {
         Self {
             capabilities: ClientCapabilities::default(),
             roots: Vec::new(),
+            // Merely compiling an experimental implementation must not move an
+            // existing client off the established initialize/session path.
+            protocol_support: ProtocolSupport::stable(),
+            max_mrtr_rounds: 8,
         }
     }
 
@@ -195,6 +220,24 @@ impl McpClientBuilder {
     /// Configure custom capabilities for this client.
     pub fn with_capabilities(mut self, capabilities: ClientCapabilities) -> Self {
         self.capabilities = capabilities;
+        self
+    }
+
+    /// Set the exact ordered protocol versions enabled for this client.
+    ///
+    /// The default is [`ProtocolSupport::stable`], even when the experimental
+    /// final-protocol implementation was compiled. Applications opt into
+    /// 2026-07-28 explicitly and then call `McpClient::discover`.
+    pub fn protocol_support(mut self, support: ProtocolSupport) -> Self {
+        self.protocol_support = support;
+        self
+    }
+
+    /// Bound the number of MRTR rounds automatically followed for one request.
+    ///
+    /// Zero is normalized to one. The default is eight rounds.
+    pub fn max_mrtr_rounds(mut self, rounds: usize) -> Self {
+        self.max_mrtr_rounds = rounds.max(1);
         self
     }
 
@@ -229,7 +272,15 @@ impl McpClientBuilder {
         T: ClientTransport,
         H: ClientHandler,
     {
-        McpClient::connect_inner(transport, handler, self.capabilities, self.roots).await
+        McpClient::connect_inner(
+            transport,
+            handler,
+            self.capabilities,
+            self.roots,
+            self.protocol_support,
+            self.max_mrtr_rounds,
+        )
+        .await
     }
 
     /// Connect to a server without a handler.
@@ -274,6 +325,8 @@ impl McpClient {
         handler: H,
         capabilities: ClientCapabilities,
         roots: Vec<Root>,
+        protocol_support: ProtocolSupport,
+        max_mrtr_rounds: usize,
     ) -> Result<Self>
     where
         T: ClientTransport,
@@ -297,11 +350,16 @@ impl McpClient {
             initialized: AtomicBool::new(false),
             server_info: RwLock::new(None),
             capabilities,
+            protocol_support,
+            selected_protocol_version: RwLock::new(None),
+            client_info: RwLock::new(None),
+            discovery: RwLock::new(None),
             roots,
             connected,
             supports_session_recovery,
             init_params: RwLock::new(None),
             recovery_lock: Mutex::new(()),
+            max_mrtr_rounds,
         })
     }
 
@@ -318,6 +376,21 @@ impl McpClient {
     /// Get the server info (available after initialization).
     pub async fn server_info(&self) -> Option<InitializeResult> {
         self.server_info.read().await.clone()
+    }
+
+    /// Return the exact ordered protocol implementations enabled for this client.
+    pub fn protocol_support(&self) -> &ProtocolSupport {
+        &self.protocol_support
+    }
+
+    /// Get the server discovery result after the final lifecycle is active.
+    pub async fn discovery(&self) -> Option<DiscoverResult> {
+        self.discovery.read().await.clone()
+    }
+
+    /// Get the protocol version selected for the discover-based lifecycle.
+    pub async fn selected_protocol_version(&self) -> Option<String> {
+        self.selected_protocol_version.read().await.clone()
     }
 
     /// Get the server info synchronously (best-effort, non-blocking).
@@ -364,6 +437,99 @@ impl McpClient {
         Ok(result)
     }
 
+    /// Start the sessionless 2026-07-28 lifecycle with `server/discover`.
+    ///
+    /// This path is available only when the final implementation was compiled.
+    /// The client sends required per-request metadata from the first request,
+    /// retries one `Unsupported protocol version` response using the server's
+    /// advertised intersection, and then repeats the selected version,
+    /// capabilities, and client identity on every subsequent request.
+    #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+    pub async fn discover(
+        &self,
+        client_name: &str,
+        client_version: &str,
+    ) -> Result<DiscoverResult> {
+        use crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION;
+
+        let client_info = Implementation {
+            name: client_name.to_string(),
+            version: client_version.to_string(),
+            ..Default::default()
+        };
+        *self.client_info.write().await = Some(client_info.clone());
+
+        let mut candidate = self
+            .protocol_support
+            .versions()
+            .iter()
+            .find(|version| version.as_str() == EXPERIMENTAL_PROTOCOL_VERSION)
+            .cloned()
+            .ok_or_else(|| {
+                Error::Transport(
+                    "2026-07-28 is not enabled for this client; configure ProtocolSupport"
+                        .to_string(),
+                )
+            })?;
+        let mut retried_unsupported = false;
+
+        loop {
+            let params = DiscoverParams {
+                meta: Some(self.request_meta_for(&candidate, &client_info)),
+            };
+            match self
+                .send_request_once::<_, DiscoverResult>("server/discover", &params)
+                .await
+            {
+                Ok(result) => {
+                    let selected = self
+                        .protocol_support
+                        .versions()
+                        .iter()
+                        .find(|version| {
+                            result
+                                .supported_versions
+                                .iter()
+                                .any(|supported| supported == *version)
+                        })
+                        .cloned()
+                        .ok_or_else(|| {
+                            Error::Transport(format!(
+                                "server and client have no protocol version in common; server: {:?}, client: {:?}",
+                                result.supported_versions,
+                                self.protocol_support.versions()
+                            ))
+                        })?;
+                    *self.selected_protocol_version.write().await = Some(selected);
+                    *self.discovery.write().await = Some(result.clone());
+                    self.initialized.store(true, Ordering::Release);
+                    return Ok(result);
+                }
+                Err(Error::JsonRpc(error)) if error.code == -32022 && !retried_unsupported => {
+                    let supported = error
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("supported"))
+                        .and_then(serde_json::Value::as_array)
+                        .ok_or_else(|| Error::JsonRpc(error.clone()))?;
+                    candidate = self
+                        .protocol_support
+                        .versions()
+                        .iter()
+                        .find(|version| {
+                            supported
+                                .iter()
+                                .any(|item| item.as_str() == Some(version.as_str()))
+                        })
+                        .cloned()
+                        .ok_or_else(|| Error::JsonRpc(error.clone()))?;
+                    retried_unsupported = true;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// List available tools.
     pub async fn list_tools(&self) -> Result<ListToolsResult> {
         self.ensure_initialized()?;
@@ -383,12 +549,54 @@ impl McpClient {
         name: &str,
         arguments: serde_json::Value,
     ) -> Result<CallToolResult> {
+        let mut input_responses = None;
+        let mut request_state = None;
+        for round in 0..=self.max_mrtr_rounds {
+            match self
+                .call_tool_once(
+                    name,
+                    arguments.clone(),
+                    input_responses.take(),
+                    request_state.take(),
+                )
+                .await?
+            {
+                RequestOutcome::Complete(result) => return Ok(result),
+                RequestOutcome::InputRequired(required) => {
+                    if round == self.max_mrtr_rounds {
+                        return Err(Error::Transport(format!(
+                            "MRTR round limit ({}) exceeded for tools/call",
+                            self.max_mrtr_rounds
+                        )));
+                    }
+                    let requests = required.input_requests.ok_or_else(|| {
+                        Error::Transport(
+                            "input_required result has no requests the client can fulfil"
+                                .to_string(),
+                        )
+                    })?;
+                    input_responses = Some(self.resolve_input_requests(requests).await?);
+                    request_state = required.request_state;
+                }
+            }
+        }
+        unreachable!("MRTR loop either completes or returns at the configured bound")
+    }
+
+    /// Send one tools/call attempt without automatically following MRTR input.
+    pub async fn call_tool_once(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+        input_responses: Option<InputResponses>,
+        request_state: Option<String>,
+    ) -> Result<RequestOutcome<CallToolResult>> {
         self.ensure_initialized()?;
         let params = CallToolParams {
             name: name.to_string(),
             arguments,
-            input_responses: None,
-            request_state: None,
+            input_responses,
+            request_state,
             meta: None,
             task: None,
         };
@@ -491,11 +699,47 @@ impl McpClient {
 
     /// Read a resource.
     pub async fn read_resource(&self, uri: &str) -> Result<ReadResourceResult> {
+        let mut input_responses = None;
+        let mut request_state = None;
+        for round in 0..=self.max_mrtr_rounds {
+            match self
+                .read_resource_once(uri, input_responses.take(), request_state.take())
+                .await?
+            {
+                RequestOutcome::Complete(result) => return Ok(result),
+                RequestOutcome::InputRequired(required) => {
+                    if round == self.max_mrtr_rounds {
+                        return Err(Error::Transport(format!(
+                            "MRTR round limit ({}) exceeded for resources/read",
+                            self.max_mrtr_rounds
+                        )));
+                    }
+                    let requests = required.input_requests.ok_or_else(|| {
+                        Error::Transport(
+                            "input_required result has no requests the client can fulfil"
+                                .to_string(),
+                        )
+                    })?;
+                    input_responses = Some(self.resolve_input_requests(requests).await?);
+                    request_state = required.request_state;
+                }
+            }
+        }
+        unreachable!("MRTR loop either completes or returns at the configured bound")
+    }
+
+    /// Send one resources/read attempt without automatically following MRTR.
+    pub async fn read_resource_once(
+        &self,
+        uri: &str,
+        input_responses: Option<InputResponses>,
+        request_state: Option<String>,
+    ) -> Result<RequestOutcome<ReadResourceResult>> {
         self.ensure_initialized()?;
         let params = ReadResourceParams {
             uri: uri.to_string(),
-            input_responses: None,
-            request_state: None,
+            input_responses,
+            request_state,
             meta: None,
         };
         self.send_request("resources/read", &params).await
@@ -511,6 +755,12 @@ impl McpClient {
     /// capabilities; one that does not will reject the request.
     pub async fn subscribe_resource(&self, uri: &str) -> Result<()> {
         self.ensure_initialized()?;
+        if self.uses_final_protocol().await {
+            return Err(Error::Transport(
+                "resources/subscribe was removed in 2026-07-28; use subscriptions/listen"
+                    .to_string(),
+            ));
+        }
         let _: serde_json::Value = self
             .send_request("resources/subscribe", &serde_json::json!({ "uri": uri }))
             .await?;
@@ -520,6 +770,12 @@ impl McpClient {
     /// Stop receiving updates for a resource (`resources/unsubscribe`).
     pub async fn unsubscribe_resource(&self, uri: &str) -> Result<()> {
         self.ensure_initialized()?;
+        if self.uses_final_protocol().await {
+            return Err(Error::Transport(
+                "resources/unsubscribe was removed in 2026-07-28; use subscriptions/listen"
+                    .to_string(),
+            ));
+        }
         let _: serde_json::Value = self
             .send_request("resources/unsubscribe", &serde_json::json!({ "uri": uri }))
             .await?;
@@ -676,12 +932,55 @@ impl McpClient {
         name: &str,
         arguments: Option<std::collections::HashMap<String, String>>,
     ) -> Result<GetPromptResult> {
+        let arguments = arguments.unwrap_or_default();
+        let mut input_responses = None;
+        let mut request_state = None;
+        for round in 0..=self.max_mrtr_rounds {
+            match self
+                .get_prompt_once(
+                    name,
+                    arguments.clone(),
+                    input_responses.take(),
+                    request_state.take(),
+                )
+                .await?
+            {
+                RequestOutcome::Complete(result) => return Ok(result),
+                RequestOutcome::InputRequired(required) => {
+                    if round == self.max_mrtr_rounds {
+                        return Err(Error::Transport(format!(
+                            "MRTR round limit ({}) exceeded for prompts/get",
+                            self.max_mrtr_rounds
+                        )));
+                    }
+                    let requests = required.input_requests.ok_or_else(|| {
+                        Error::Transport(
+                            "input_required result has no requests the client can fulfil"
+                                .to_string(),
+                        )
+                    })?;
+                    input_responses = Some(self.resolve_input_requests(requests).await?);
+                    request_state = required.request_state;
+                }
+            }
+        }
+        unreachable!("MRTR loop either completes or returns at the configured bound")
+    }
+
+    /// Send one prompts/get attempt without automatically following MRTR.
+    pub async fn get_prompt_once(
+        &self,
+        name: &str,
+        arguments: std::collections::HashMap<String, String>,
+        input_responses: Option<InputResponses>,
+        request_state: Option<String>,
+    ) -> Result<RequestOutcome<GetPromptResult>> {
         self.ensure_initialized()?;
         let params = GetPromptParams {
             name: name.to_string(),
-            arguments: arguments.unwrap_or_default(),
-            input_responses: None,
-            request_state: None,
+            arguments,
+            input_responses,
+            request_state,
             meta: None,
         };
         self.send_request("prompts/get", &params).await
@@ -689,6 +988,11 @@ impl McpClient {
 
     /// Ping the server.
     pub async fn ping(&self) -> Result<()> {
+        if self.uses_final_protocol().await {
+            return Err(Error::Transport(
+                "ping was removed from the 2026-07-28 core protocol".to_string(),
+            ));
+        }
         let _: serde_json::Value = self.send_request("ping", &serde_json::json!({})).await?;
         Ok(())
     }
@@ -762,7 +1066,7 @@ impl McpClient {
     /// Set roots and notify the server if initialized.
     pub async fn set_roots(&self, roots: Vec<Root>) -> Result<()> {
         *self.roots.write().await = roots;
-        if self.is_initialized() {
+        if self.is_initialized() && !self.uses_final_protocol().await {
             self.send_notification(notifications::ROOTS_LIST_CHANGED, &serde_json::json!({}))
                 .await?;
         }
@@ -772,7 +1076,7 @@ impl McpClient {
     /// Add a root and notify the server if initialized.
     pub async fn add_root(&self, root: Root) -> Result<()> {
         self.roots.write().await.push(root);
-        if self.is_initialized() {
+        if self.is_initialized() && !self.uses_final_protocol().await {
             self.send_notification(notifications::ROOTS_LIST_CHANGED, &serde_json::json!({}))
                 .await?;
         }
@@ -787,7 +1091,7 @@ impl McpClient {
         let removed = roots.len() < initial_len;
         drop(roots);
 
-        if removed && self.is_initialized() {
+        if removed && self.is_initialized() && !self.uses_final_protocol().await {
             self.send_notification(notifications::ROOTS_LIST_CHANGED, &serde_json::json!({}))
                 .await?;
         }
@@ -818,9 +1122,10 @@ impl McpClient {
         method: &str,
         params: &P,
     ) -> Result<R> {
+        let final_protocol = self.uses_final_protocol().await;
         match self.send_request_once(method, params).await {
             Err(Error::SessionExpired)
-                if self.supports_session_recovery && method != "initialize" =>
+                if self.supports_session_recovery && !final_protocol && method != "initialize" =>
             {
                 tracing::info!(method = %method, "Session expired, attempting recovery");
                 self.recover_session().await?;
@@ -838,6 +1143,7 @@ impl McpClient {
         self.ensure_connected()?;
         let params_value = serde_json::to_value(params)
             .map_err(|e| Error::Transport(format!("Failed to serialize params: {}", e)))?;
+        let params_value = self.with_final_request_meta(params_value).await?;
 
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
@@ -915,6 +1221,7 @@ impl McpClient {
         self.ensure_connected()?;
         let params_value = serde_json::to_value(params)
             .map_err(|e| Error::Transport(format!("Failed to serialize params: {}", e)))?;
+        let params_value = self.with_final_request_meta(params_value).await?;
 
         self.command_tx
             .send(LoopCommand::Notify {
@@ -925,6 +1232,96 @@ impl McpClient {
             .map_err(|_| Error::Transport("Connection closed".to_string()))?;
 
         Ok(())
+    }
+
+    async fn resolve_input_requests(&self, requests: InputRequests) -> Result<InputResponses> {
+        if !self.uses_final_protocol().await {
+            return Err(Error::Transport(
+                "input_required results require the 2026-07-28 client lifecycle".to_string(),
+            ));
+        }
+        for request in requests.values() {
+            let declared = match request {
+                InputRequest::CreateMessage(_) => self.capabilities.sampling.is_some(),
+                InputRequest::ListRoots(_) => self.capabilities.roots.is_some(),
+                InputRequest::Elicit(_) => self.capabilities.elicitation.is_some(),
+                _ => false,
+            };
+            if !declared {
+                return Err(Error::Transport(format!(
+                    "server requested undeclared MRTR input capability: {}",
+                    request.method_name()
+                )));
+            }
+        }
+
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(LoopCommand::ResolveInputs {
+                requests,
+                response_tx,
+            })
+            .await
+            .map_err(|_| Error::Transport("Connection closed".to_string()))?;
+        response_rx
+            .await
+            .map_err(|_| Error::Transport("Connection closed".to_string()))?
+    }
+
+    async fn uses_final_protocol(&self) -> bool {
+        self.selected_protocol_version.read().await.as_deref()
+            == Some(crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION)
+    }
+
+    fn request_meta_for(&self, version: &str, client_info: &Implementation) -> RequestMeta {
+        RequestMeta {
+            progress_token: None,
+            protocol_version: Some(version.to_string()),
+            client_info: Some(client_info.clone()),
+            client_capabilities: Some(self.capabilities.clone()),
+            log_level: None,
+        }
+    }
+
+    async fn with_final_request_meta(
+        &self,
+        mut params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let Some(version) = self.selected_protocol_version.read().await.clone() else {
+            return Ok(params);
+        };
+        if version != crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION {
+            return Ok(params);
+        }
+        let client_info = self.client_info.read().await.clone().ok_or_else(|| {
+            Error::Transport("final protocol selected without client identity".to_string())
+        })?;
+        let required = serde_json::to_value(self.request_meta_for(&version, &client_info))
+            .map_err(|e| Error::Transport(format!("Failed to serialize request metadata: {e}")))?;
+        let required = required
+            .as_object()
+            .expect("RequestMeta serializes as an object");
+
+        if !params.is_object() {
+            params = serde_json::json!({});
+        }
+        let params_object = params
+            .as_object_mut()
+            .expect("params was normalized to object");
+        let meta = params_object
+            .entry("_meta")
+            .or_insert_with(|| serde_json::json!({}));
+        if !meta.is_object() {
+            *meta = serde_json::json!({});
+        }
+        let meta = meta
+            .as_object_mut()
+            .expect("metadata was normalized to object");
+        for (key, value) in required {
+            meta.insert(key.clone(), value.clone());
+        }
+
+        Ok(params)
     }
 
     fn ensure_connected(&self) -> Result<()> {
@@ -1008,6 +1405,10 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
                             let _ = transport.send(&json).await;
                         }
                     }
+                    Some(LoopCommand::ResolveInputs { requests, response_tx }) => {
+                        let result = resolve_inputs_with_handler(&handler, &roots, requests).await;
+                        let _ = response_tx.send(result);
+                    }
                     Some(LoopCommand::ResetSession { done_tx }) => {
                         tracing::info!("Resetting transport session for re-initialization");
                         transport.reset_session().await;
@@ -1053,6 +1454,49 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
     connected.store(false, Ordering::Release);
     fail_all_pending(&mut pending_requests, "Connection closed");
     let _ = transport.close().await;
+}
+
+async fn resolve_inputs_with_handler<H: ClientHandler>(
+    handler: &Arc<H>,
+    roots: &Arc<RwLock<Vec<Root>>>,
+    requests: InputRequests,
+) -> Result<InputResponses> {
+    let mut responses = InputResponses::new();
+    for (key, request) in requests {
+        let response = match request {
+            InputRequest::CreateMessage(params) => InputResponse::CreateMessage(
+                handler
+                    .handle_create_message(params)
+                    .await
+                    .map_err(Error::JsonRpc)?,
+            ),
+            InputRequest::ListRoots(_) => {
+                let configured = roots.read().await.clone();
+                let result = if configured.is_empty() {
+                    handler.handle_list_roots().await.map_err(Error::JsonRpc)?
+                } else {
+                    ListRootsResult {
+                        roots: configured,
+                        meta: None,
+                    }
+                };
+                InputResponse::ListRoots(result)
+            }
+            InputRequest::Elicit(params) => InputResponse::Elicit(
+                handler
+                    .handle_elicit(params)
+                    .await
+                    .map_err(Error::JsonRpc)?,
+            ),
+            _ => {
+                return Err(Error::Transport(
+                    "unsupported MRTR input request method".to_string(),
+                ));
+            }
+        };
+        responses.insert(key, response);
+    }
+    Ok(responses)
 }
 
 /// Handle a single incoming message from the server.
@@ -1471,6 +1915,60 @@ mod tests {
 
         let server_info = client.server_info().await.unwrap();
         assert_eq!(server_info.server_info.name, "test-server");
+    }
+
+    #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+    #[tokio::test]
+    async fn final_discover_injects_metadata_on_every_request() {
+        let transport = MockTransport::with_responses(vec![
+            serde_json::json!({
+                "resultType": "complete",
+                "supportedVersions": ["2026-07-28"],
+                "capabilities": {}
+            }),
+            serde_json::json!({
+                "resultType": "complete",
+                "tools": [],
+                "ttlMs": 0,
+                "cacheScope": "private"
+            }),
+        ]);
+        let outgoing = transport.outgoing.clone();
+        let client = McpClient::builder()
+            .protocol_support(ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+            .with_elicitation()
+            .connect_simple(transport)
+            .await
+            .unwrap();
+
+        client.discover("test-client", "1.0.0").await.unwrap();
+        client.list_tools().await.unwrap();
+        assert_eq!(
+            client.selected_protocol_version().await.as_deref(),
+            Some("2026-07-28")
+        );
+
+        let messages: Vec<serde_json::Value> = outgoing
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|message| serde_json::from_str(message).unwrap())
+            .collect();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["method"], "server/discover");
+        assert_eq!(messages[1]["method"], "tools/list");
+        for message in messages {
+            let meta = &message["params"]["_meta"];
+            assert_eq!(
+                meta["io.modelcontextprotocol/protocolVersion"],
+                "2026-07-28"
+            );
+            assert_eq!(
+                meta["io.modelcontextprotocol/clientInfo"]["name"],
+                "test-client"
+            );
+            assert!(meta["io.modelcontextprotocol/clientCapabilities"].is_object());
+        }
     }
 
     #[tokio::test]

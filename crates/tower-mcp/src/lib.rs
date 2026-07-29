@@ -141,6 +141,8 @@
 //!   client identity, and client capabilities for sessionless 2026-07-28 requests
 //! - [`RequestOutcome`] and [`InputRequiredResult`] - SEP-2322 Multi Round-Trip Request results
 //! - [`RequestStateCodec`] - Expiring, integrity-protected continuation state
+//! - `McpClient::discover` - Sessionless client discovery with per-request metadata,
+//!   runtime version selection, SEP-2243 headers, and bounded MRTR auto-driving
 //!
 //! ## Feature Flags
 //!
@@ -161,7 +163,8 @@
 //! - `protocol-2026-07-28` - Compile the experimental implementation of the released final
 //!   protocol. Use [`ProtocolSupport`] to select enabled versions at runtime. Enables
 //!   version-gated sessionless dispatch, `server/discover` RPC, per-request `_meta` via
-//!   [`stateless::StatelessRequestMeta`], `subscriptions/listen`, and SEP-2322 MRTR handlers.
+//!   [`stateless::StatelessRequestMeta`], `subscriptions/listen`, SEP-2322 MRTR handlers,
+//!   and the discover-based [`McpClient`] path.
 //! - `stateless` - Compatibility alias for the former 2026 protocol feature name.
 //!
 //! ## Middleware Placement Guide

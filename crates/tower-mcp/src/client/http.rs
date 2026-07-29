@@ -47,11 +47,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use base64::Engine;
 use tokio::sync::{Notify, RwLock, mpsc};
 use tokio::task::JoinHandle;
 
 use super::transport::ClientTransport;
 use crate::error::{Error, Result};
+
+const MCP_METHOD_HEADER: &str = "mcp-method";
+const MCP_NAME_HEADER: &str = "mcp-name";
+const MCP_PARAM_HEADER_PREFIX: &str = "mcp-param-";
+const BASE64_SENTINEL_PREFIX: &str = "=?base64?";
+const BASE64_SENTINEL_SUFFIX: &str = "?=";
+
+#[derive(Debug, Clone)]
+struct CustomHeaderMapping {
+    suffix: String,
+    property_path: Vec<String>,
+}
 
 #[cfg(feature = "oauth-client")]
 use super::oauth::TokenProvider;
@@ -219,6 +232,8 @@ pub struct HttpClientTransport {
     session_id: Option<String>,
     /// Negotiated protocol version.
     protocol_version: Option<String>,
+    /// Validated custom-header mappings learned from the latest tools/list.
+    tool_header_mappings: HashMap<String, Vec<CustomHeaderMapping>>,
     /// Channel receiver for incoming messages (POST responses + SSE events).
     incoming_rx: mpsc::Receiver<String>,
     /// Channel sender used by `send()` to queue POST response bodies
@@ -280,6 +295,7 @@ impl HttpClientTransport {
             client: reqwest::Client::new(),
             session_id: None,
             protocol_version: None,
+            tool_header_mappings: HashMap::new(),
             incoming_rx: rx,
             incoming_tx: tx,
             sse_task: None,
@@ -317,6 +333,7 @@ impl HttpClientTransport {
             client,
             session_id: None,
             protocol_version: None,
+            tool_header_mappings: HashMap::new(),
             incoming_rx: rx,
             incoming_tx: tx,
             sse_task: None,
@@ -473,6 +490,76 @@ impl HttpClientTransport {
         self
     }
 
+    fn outgoing_custom_headers(&self, parsed: &serde_json::Value) -> Vec<(String, String)> {
+        if parsed.get("method").and_then(serde_json::Value::as_str) != Some("tools/call") {
+            return Vec::new();
+        }
+        let Some(params) = parsed.get("params") else {
+            return Vec::new();
+        };
+        let Some(name) = params.get("name").and_then(serde_json::Value::as_str) else {
+            return Vec::new();
+        };
+        let Some(mappings) = self.tool_header_mappings.get(name) else {
+            return Vec::new();
+        };
+        let arguments = params.get("arguments").unwrap_or(&serde_json::Value::Null);
+
+        mappings
+            .iter()
+            .filter_map(|mapping| {
+                let value = value_at_property_path(arguments, &mapping.property_path)?;
+                if value.is_null() {
+                    return None;
+                }
+                let rendered = json_value_to_header_string(value)?;
+                Some((
+                    format!("{MCP_PARAM_HEADER_PREFIX}{}", mapping.suffix),
+                    encode_header_value(&rendered),
+                ))
+            })
+            .collect()
+    }
+
+    fn normalize_incoming_message(&mut self, message: String) -> String {
+        if self.protocol_version.as_deref() != Some(crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION)
+        {
+            return message;
+        }
+        let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(&message) else {
+            return message;
+        };
+        let Some(tools) = parsed
+            .get_mut("result")
+            .and_then(|result| result.get_mut("tools"))
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            return message;
+        };
+
+        self.tool_header_mappings.clear();
+        tools.retain(|tool| {
+            let Some(name) = tool.get("name").and_then(serde_json::Value::as_str) else {
+                return false;
+            };
+            let Some(schema) = tool.get("inputSchema") else {
+                return false;
+            };
+            match custom_header_mappings(schema) {
+                Ok(mappings) => {
+                    self.tool_header_mappings.insert(name.to_string(), mappings);
+                    true
+                }
+                Err(error) => {
+                    tracing::warn!(tool = %name, %error, "Excluding tool with invalid x-mcp-header annotations");
+                    false
+                }
+            }
+        });
+
+        parsed.to_string()
+    }
+
     /// Start the SSE background stream after session is established.
     fn start_sse_stream(&mut self) {
         let url = self.url.clone();
@@ -508,6 +595,153 @@ impl HttpClientTransport {
     }
 }
 
+fn custom_header_mappings(
+    schema: &serde_json::Value,
+) -> std::result::Result<Vec<CustomHeaderMapping>, String> {
+    fn annotation_count(value: &serde_json::Value) -> usize {
+        match value {
+            serde_json::Value::Object(object) => {
+                usize::from(object.contains_key("x-mcp-header"))
+                    + object.values().map(annotation_count).sum::<usize>()
+            }
+            serde_json::Value::Array(values) => values.iter().map(annotation_count).sum::<usize>(),
+            _ => 0,
+        }
+    }
+
+    fn is_tchar(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            )
+    }
+
+    fn primitive_header_type(schema: &serde_json::Value) -> bool {
+        match schema.get("type") {
+            Some(serde_json::Value::String(kind)) => {
+                matches!(kind.as_str(), "string" | "number" | "integer" | "boolean")
+            }
+            Some(serde_json::Value::Array(kinds)) => {
+                let mut primitive = false;
+                for kind in kinds {
+                    match kind.as_str() {
+                        Some("string" | "number" | "integer" | "boolean") if !primitive => {
+                            primitive = true;
+                        }
+                        Some("null") => {}
+                        _ => return false,
+                    }
+                }
+                primitive
+            }
+            _ => false,
+        }
+    }
+
+    fn walk(
+        schema: &serde_json::Value,
+        path: &mut Vec<String>,
+        seen: &mut std::collections::HashSet<String>,
+        mappings: &mut Vec<CustomHeaderMapping>,
+    ) -> std::result::Result<(), String> {
+        let Some(properties) = schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+        else {
+            return Ok(());
+        };
+        for (property_name, property_schema) in properties {
+            path.push(property_name.clone());
+            if let Some(annotation) = property_schema.get("x-mcp-header") {
+                let suffix = annotation
+                    .as_str()
+                    .ok_or_else(|| format!("annotation at {} is not a string", path.join(".")))?;
+                if suffix.is_empty() || !suffix.bytes().all(is_tchar) {
+                    return Err(format!(
+                        "invalid header suffix {suffix:?} at {}",
+                        path.join(".")
+                    ));
+                }
+                if !primitive_header_type(property_schema) {
+                    return Err(format!(
+                        "annotation at {} is not on a primitive property",
+                        path.join(".")
+                    ));
+                }
+                if !seen.insert(suffix.to_ascii_lowercase()) {
+                    return Err(format!("duplicate header suffix {suffix:?}"));
+                }
+                mappings.push(CustomHeaderMapping {
+                    suffix: suffix.to_string(),
+                    property_path: path.clone(),
+                });
+            }
+            walk(property_schema, path, seen, mappings)?;
+            path.pop();
+        }
+        Ok(())
+    }
+
+    let mut mappings = Vec::new();
+    walk(
+        schema,
+        &mut Vec::new(),
+        &mut std::collections::HashSet::new(),
+        &mut mappings,
+    )?;
+    if annotation_count(schema) != mappings.len() {
+        return Err(
+            "x-mcp-header annotation is not statically reachable through properties".to_string(),
+        );
+    }
+    Ok(mappings)
+}
+
+fn value_at_property_path<'a>(
+    root: &'a serde_json::Value,
+    path: &[String],
+) -> Option<&'a serde_json::Value> {
+    path.iter().try_fold(root, |value, key| value.get(key))
+}
+
+fn json_value_to_header_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        serde_json::Value::Null | serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            None
+        }
+    }
+}
+
+fn encode_header_value(value: &str) -> String {
+    let unsafe_for_header =
+        value.trim() != value || value.bytes().any(|byte| !(0x20..=0x7e).contains(&byte));
+    if unsafe_for_header {
+        format!(
+            "{BASE64_SENTINEL_PREFIX}{}{BASE64_SENTINEL_SUFFIX}",
+            base64::engine::general_purpose::STANDARD.encode(value)
+        )
+    } else {
+        value.to_string()
+    }
+}
+
 #[async_trait]
 impl ClientTransport for HttpClientTransport {
     async fn send(&mut self, message: &str) -> Result<()> {
@@ -526,6 +760,25 @@ impl ClientTransport for HttpClientTransport {
             .as_ref()
             .map(|v| v.get("id").is_none())
             .unwrap_or(false);
+        let method = parsed_message
+            .as_ref()
+            .and_then(|value| value.get("method"))
+            .and_then(serde_json::Value::as_str);
+        let outbound_version = parsed_message
+            .as_ref()
+            .and_then(|value| {
+                value.pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
+            })
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let is_modern_request =
+            outbound_version.as_deref() == Some(crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION);
+        if is_modern_request {
+            self.protocol_version = outbound_version.clone();
+            // Final requests are sessionless even when a transitional peer
+            // incorrectly returns a legacy session header from discovery.
+            self.session_id = None;
+        }
         let timeout = if is_notification {
             self.config
                 .notification_timeout
@@ -542,12 +795,40 @@ impl ClientTransport for HttpClientTransport {
             .header("Accept", "application/json, text/event-stream")
             .timeout(timeout);
 
-        if let Some(ref session_id) = self.session_id {
+        if !is_modern_request && let Some(ref session_id) = self.session_id {
             request = request.header("mcp-session-id", session_id);
         }
 
-        if let Some(ref version) = self.protocol_version {
+        if let Some(version) = outbound_version.as_ref().or(self.protocol_version.as_ref()) {
             request = request.header("mcp-protocol-version", version);
+        }
+
+        if let Some(method) = method {
+            request = request.header(MCP_METHOD_HEADER, method);
+            let name = match method {
+                "tools/call" | "prompts/get" => parsed_message
+                    .as_ref()
+                    .and_then(|value| value.pointer("/params/name"))
+                    .and_then(serde_json::Value::as_str),
+                "resources/read" => parsed_message
+                    .as_ref()
+                    .and_then(|value| value.pointer("/params/uri"))
+                    .and_then(serde_json::Value::as_str),
+                "tasks/get" | "tasks/update" | "tasks/cancel" => parsed_message
+                    .as_ref()
+                    .and_then(|value| value.pointer("/params/taskId"))
+                    .and_then(serde_json::Value::as_str),
+                _ => None,
+            };
+            if let Some(name) = name {
+                request = request.header(MCP_NAME_HEADER, name);
+            }
+        }
+
+        if let Some(parsed) = parsed_message.as_ref() {
+            for (name, value) in self.outgoing_custom_headers(parsed) {
+                request = request.header(name, value);
+            }
         }
 
         for (key, value) in &self.config.headers {
@@ -576,14 +857,17 @@ impl ClientTransport for HttpClientTransport {
         // This prevents a deadlock when the server blocks on a
         // bidirectional request (sampling/elicitation) that requires the
         // client to respond via the SSE channel.
-        if self.session_id.is_some() && !is_notification {
+        if self.session_id.is_some() && !is_modern_request && !is_notification {
             let tx = self.incoming_tx.clone();
             // The caller is parked on this request id in the message loop's
             // correlation map. Every failure branch below delivers a frame
             // carrying it, so a background POST that dies (network error,
             // timeout, HTTP error, empty body, response stream closed early)
             // wakes the caller with an error instead of hanging it forever.
-            let req_id = parsed_message.and_then(|v| v.get("id").cloned());
+            let req_id = parsed_message
+                .as_ref()
+                .and_then(|value| value.get("id"))
+                .cloned();
             let connected = self.connected.clone();
             let last_event_id = self.last_event_id.clone();
             let sse_retry_delay = self.sse_retry_delay.clone();
@@ -802,7 +1086,7 @@ impl ClientTransport for HttpClientTransport {
         // 202 Accepted = notification acknowledged, no body
         if status == reqwest::StatusCode::ACCEPTED {
             // Still update session state if headers present
-            if let Some(sid) = new_session_id {
+            if !is_modern_request && let Some(sid) = new_session_id {
                 self.session_id = Some(sid);
             }
             if let Some(pv) = new_protocol_version {
@@ -812,6 +1096,22 @@ impl ClientTransport for HttpClientTransport {
         }
 
         if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            if is_modern_request
+                && let Ok(mut error) = serde_json::from_str::<serde_json::Value>(&body)
+                && error.get("error").is_some()
+            {
+                if error.get("id").is_none_or(serde_json::Value::is_null)
+                    && let Some(id) = parsed_message.as_ref().and_then(|value| value.get("id"))
+                {
+                    error["id"] = id.clone();
+                }
+                self.incoming_tx
+                    .send(error.to_string())
+                    .await
+                    .map_err(|_| Error::Transport("Internal channel closed".to_string()))?;
+                return Ok(());
+            }
             // 404 only signals an expired session once a session exists.
             // Before that (the initial `initialize`), a 404 means the URL is
             // wrong, and reporting it as "Session expired" sends users
@@ -829,7 +1129,6 @@ impl ClientTransport for HttpClientTransport {
                     self.url
                 )));
             }
-            let body = response.text().await.unwrap_or_default();
             return Err(Error::Transport(format!(
                 "HTTP {} from server: {}",
                 status, body
@@ -837,7 +1136,7 @@ impl ClientTransport for HttpClientTransport {
         }
 
         // Update session state
-        if let Some(sid) = new_session_id {
+        if !is_modern_request && let Some(sid) = new_session_id {
             let is_new_session = self.session_id.is_none();
             self.session_id = Some(sid);
 
@@ -856,6 +1155,7 @@ impl ClientTransport for HttpClientTransport {
             .map_err(|e| Error::Transport(format!("Failed to read response: {}", e)))?;
 
         for msg in extract_json_messages(&body) {
+            let msg = self.normalize_incoming_message(msg);
             self.incoming_tx
                 .send(msg)
                 .await
@@ -1580,5 +1880,90 @@ mod tests {
         let config = HttpClientConfig::default().basic_auth("user", "pw");
         let header = config.headers.get("Authorization").unwrap();
         assert!(header.starts_with("Basic "));
+    }
+
+    #[test]
+    fn sep_2243_encodes_only_unsafe_values() {
+        assert_eq!(encode_header_value("us west 1"), "us west 1");
+        assert_eq!(encode_header_value(""), "");
+        assert_eq!(encode_header_value(" padded "), "=?base64?IHBhZGRlZCA=?=");
+        assert_eq!(
+            encode_header_value("Hello, 世界"),
+            "=?base64?SGVsbG8sIOS4lueVjA==?="
+        );
+    }
+
+    #[test]
+    fn sep_2243_validates_custom_header_annotations() {
+        let mappings = custom_header_mappings(&serde_json::json!({
+            "type": "object",
+            "properties": {
+                "region": {"type": "string", "x-mcp-header": "Region"},
+                "priority": {"type": "integer", "x-mcp-header": "Priority"},
+                "ratio": {"type": "number", "x-mcp-header": "Ratio"}
+            }
+        }))
+        .unwrap();
+        assert_eq!(mappings.len(), 3);
+
+        for invalid in [
+            serde_json::json!({
+                "type": "object",
+                "properties": {"value": {"type": "object", "x-mcp-header": "Value"}}
+            }),
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "a": {"type": "string", "x-mcp-header": "Region"},
+                    "b": {"type": "string", "x-mcp-header": "region"}
+                }
+            }),
+            serde_json::json!({
+                "type": "object",
+                "properties": {"value": {"type": "string", "x-mcp-header": "Bad Header"}}
+            }),
+        ] {
+            assert!(custom_header_mappings(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn sep_2243_filters_invalid_tools_and_caches_valid_mappings() {
+        let mut transport = HttpClientTransport::new("http://localhost:3000");
+        transport.protocol_version =
+            Some(crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION.to_string());
+        let normalized = transport.normalize_incoming_message(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "tools": [
+                        {
+                            "name": "valid",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "region": {"type": "string", "x-mcp-header": "Region"}
+                                }
+                            }
+                        },
+                        {
+                            "name": "invalid",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "value": {"type": "array", "x-mcp-header": "Value"}
+                                }
+                            }
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&normalized).unwrap();
+        assert_eq!(parsed["result"]["tools"].as_array().unwrap().len(), 1);
+        assert!(transport.tool_header_mappings.contains_key("valid"));
+        assert!(!transport.tool_header_mappings.contains_key("invalid"));
     }
 }

@@ -1646,10 +1646,14 @@ pub struct InitializeResult {
 /// session or going through the initialize handshake. It is the stateless
 /// replacement for `initialize` in the 2026-07-28 protocol.
 ///
-/// The request takes no parameters today; the empty struct is reserved
-/// so future SEPs can add optional fields without breaking callers.
+/// The final lifecycle carries the same required per-request metadata on
+/// discovery that it carries on every subsequent request.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct DiscoverParams {}
+pub struct DiscoverParams {
+    /// Required per-request metadata for the final protocol.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<RequestMeta>,
+}
 
 /// Result of the `server/discover` RPC (SEP-2575).
 ///

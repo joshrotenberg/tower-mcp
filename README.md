@@ -38,7 +38,7 @@ If you've used [axum](https://docs.rs/axum), tower-mcp's API will feel familiar:
 | **Tower-native middleware** | Timeout, rate-limit, auth, tracing -- on the whole server or on individual tools. Any `tower::Layer` works. |
 | **All transports** | stdio, HTTP/SSE (with stream resumption), WebSocket, and child process. Same router, any transport. |
 | **In-process testing** | `TestClient` lets you test MCP servers without spawning a subprocess or opening a socket. |
-| **Conformance** | 39/39 server checks and 264/266 client checks (2025-11-25 suites, conformance@0.1.16) plus the official 2026-07-28 suites (114/114 server and 171/213 client checks at 0.2.0-alpha.10, client gaps baselined in [#953](https://github.com/joshrotenberg/tower-mcp/issues/953)) run in CI on every PR via the [official MCP conformance suite](https://github.com/modelcontextprotocol/conformance). The suite is upstream-maintained and grows with the spec, so this is a moving target -- not a one-time achievement. [SEP-2484](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2484) (accepted) makes conformance scenarios a prerequisite for standards-track SEPs reaching `final`. |
+| **Conformance** | 39/39 server checks and 264/266 client checks (2025-11-25 suites, conformance@0.1.16) plus the official 2026-07-28 suites (114/114 server; 210 passing client checks with the remaining auth scenarios baselined at 0.2.0-alpha.10) run in CI on every PR via the [official MCP conformance suite](https://github.com/modelcontextprotocol/conformance). The suite is upstream-maintained and grows with the spec, so this is a moving target -- not a one-time achievement. [SEP-2484](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2484) (accepted) makes conformance scenarios a prerequisite for standards-track SEPs reaching `final`. |
 | **Capability filtering** | Session-based tool/resource/prompt visibility for multi-tenant patterns. |
 | **No proc macros required** | Builder pattern API with optional trait-based tools. Nothing hidden behind `#[derive]`. Optional `#[tool_fn]` / `#[prompt_fn]` / `#[resource_fn]` macros available for convenience (feature: `macros`). |
 | **Async tasks** | Full task lifecycle -- background execution, cancellation, TTL cleanup, per-tool task support mode. Clients can poll or wait for long-running tool results. |
@@ -589,7 +589,7 @@ tower-mcp targets the [MCP specification 2025-11-25](https://modelcontextprotoco
 - **Server (2025-11-25):** 39/39 checks (`conformance@0.1.16`)
 - **Client (2025-11-25):** 264/266 checks (`conformance@0.1.16`; the two gaps are new offline-access scenarios, baselined in `conformance-baseline-client.yml` and tracked in [#953](https://github.com/joshrotenberg/tower-mcp/issues/953))
 - **Server (2026-07-28):** 114/114 checks (`conformance@0.2.0-alpha.10`, `--suite all`); the server baseline is empty
-- **Client (2026-07-28):** 171/213 checks (`conformance@0.2.0-alpha.10`, `--suite all`); gaps are baselined in `conformance-baseline-draft-client.yml`, grouped by SEP and tracked in [#953](https://github.com/joshrotenberg/tower-mcp/issues/953)
+- **Client (2026-07-28):** 210 passing checks and 9/32 scenarios fully green (`conformance@0.2.0-alpha.10`, `--suite all`); the 23 remaining auth scenarios are baselined in `conformance-baseline-draft-client.yml` and tracked in [#953](https://github.com/joshrotenberg/tower-mcp/issues/953)
 
 Because the suite is upstream-maintained and grows with the spec, these counts shift as new scenarios are added -- treat the green CI badge as the source of truth, not any single snapshot. CI fails when a baselined scenario regresses further or starts passing (stale baseline), so the baselines cannot silently rot.
 
@@ -599,6 +599,30 @@ The `protocol-2026-07-28` feature enables the experimental implementation of the
 `_meta` capabilities, and SEP-2322 Multi Round-Trip Requests. It is not enabled by default and is
 not yet included in `SUPPORTED_PROTOCOL_VERSIONS`; compile-time availability and per-transport
 runtime enablement are reported separately.
+
+Clients opt in independently at runtime, then use the discover-based lifecycle.
+Every later request receives the required `_meta`, HTTP headers are generated
+from the JSON-RPC frame, and MRTR results are followed through the configured
+client handler with a bounded round count:
+
+```rust,no_run
+use tower_mcp::{HttpClientTransport, ProtocolSupport};
+use tower_mcp::client::McpClient;
+
+# async fn connect() -> Result<(), tower_mcp::BoxError> {
+let support = ProtocolSupport::try_new(["2026-07-28"])?;
+let transport = HttpClientTransport::new("https://example.com/mcp");
+let client = McpClient::builder()
+    .protocol_support(support)
+    .max_mrtr_rounds(8)
+    .connect_simple(transport)
+    .await?;
+
+let discovery = client.discover("my-client", "1.0.0").await?;
+println!("server versions: {:?}", discovery.supported_versions);
+# Ok(())
+# }
+```
 
 MRTR-aware tool, prompt, resource, and resource-template handlers return
 `RequestOutcome<T>`. Retry values are exposed on `RequestContext`, while
