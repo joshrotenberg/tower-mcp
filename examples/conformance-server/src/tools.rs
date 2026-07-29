@@ -63,7 +63,7 @@ pub fn build_tools() -> Vec<Tool> {
         build_elicitation_sep1034_defaults(),
         build_elicitation_sep1330_enums(),
         build_per_request_meta(),
-        // SEP-2663: task-capable tool so the server advertises the tasks extension
+        // Stable task fixture. Final advertisement is withheld until #951 is complete.
         build_create_task(),
         // Fixtures for the official 2026-07-28 conformance suite (#948)
         build_json_schema_2020_12(),
@@ -896,18 +896,19 @@ fn build_elicitation_sep1330_enums() -> Tool {
         .build()
 }
 
-/// SEP-2663: A tool that opts in to async task support.
+/// A stable-protocol fixture that opts in to async task support.
 ///
 /// Registering at least one tool with `TaskSupportMode::Optional` (or `Required`)
-/// causes the router to advertise `io.modelcontextprotocol/tasks` in the server's
-/// `capabilities.extensions`, giving the conformance client a way to verify the
-/// tasks extension advertisement end-to-end.
+/// causes the router to advertise task support to stable clients, giving the
+/// conformance client a way to verify the legacy implementation end-to-end.
+/// The final 2026-07-28 path withholds this incomplete extension until #951 is
+/// fully implemented.
 fn build_create_task() -> Tool {
     ToolBuilder::new("test_create_task")
         .description(
             "A tool that supports async task execution (SEP-2663 tasks extension). \
-             Its presence in the tool list causes the server to advertise \
-             io.modelcontextprotocol/tasks in capabilities.extensions.",
+             The server advertises this partial implementation only on the \
+             stable protocol path.",
         )
         .task_support(TaskSupportMode::Optional)
         .extractor_handler((), |RawArgs(_args): RawArgs| async move {

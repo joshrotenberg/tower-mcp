@@ -298,8 +298,11 @@ pub async fn deprecated_capability(server_url: &str) -> Result<()> {
     Ok(())
 }
 
-/// `tasks-extension` -- Connect and verify the server advertises the
-/// `io.modelcontextprotocol/tasks` extension (SEP-2663).
+/// `tasks-extension` -- Connect with the stable lifecycle and verify the
+/// server advertises its partial task implementation.
+///
+/// The final 2026-07-28 lifecycle intentionally withholds the extension until
+/// the remaining SEP-2663 behavior tracked in #951 is complete.
 pub async fn tasks_extension(server_url: &str) -> Result<()> {
     let transport = HttpClientTransport::new(server_url);
     let client = McpClient::builder()

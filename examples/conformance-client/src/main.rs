@@ -56,7 +56,7 @@ async fn main() {
         // SEP-2577/2596: Deprecation metadata on capabilities
         "deprecated-capability" => core_scenarios::deprecated_capability(&server_url).await,
 
-        // SEP-2663: Tasks extension advertisement
+        // Stable task implementation advertisement (#951 tracks final support)
         "tasks-extension" => core_scenarios::tasks_extension(&server_url).await,
 
         // Auth scenarios - metadata discovery

@@ -65,6 +65,24 @@ fn task_store_error(e: TaskStoreError) -> Error {
     )))
 }
 
+/// Whether this request is using the final, stateless 2026-07-28 lifecycle.
+///
+/// Tasks support is intentionally withheld on that path until the complete
+/// SEP-2663 contract is implemented. Stable sessionful requests retain the
+/// crate's existing experimental task behavior.
+#[cfg(feature = "stateless")]
+fn is_final_protocol_request(extensions: &crate::context::Extensions) -> bool {
+    extensions
+        .get::<crate::stateless::StatelessRequestMeta>()
+        .and_then(|meta| meta.protocol_version.as_deref())
+        == Some(crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION)
+}
+
+#[cfg(not(feature = "stateless"))]
+fn is_final_protocol_request(_extensions: &crate::context::Extensions) -> bool {
+    false
+}
+
 /// Return whether `actual` contains every field and value in `required`.
 ///
 /// Client capability objects are extensible, so extra advertised properties
@@ -1968,6 +1986,25 @@ impl McpRouter {
         }
     }
 
+    /// Return the capability surface appropriate for a protocol version.
+    ///
+    /// The implementation has partial Tasks support for the stable sessionful
+    /// lifecycle, but is not yet conformant with final SEP-2663. Do not
+    /// advertise that partial implementation to 2026-07-28 clients.
+    fn capabilities_for_protocol(&self, protocol_version: Option<&str>) -> ServerCapabilities {
+        let mut capabilities = self.capabilities();
+        if protocol_version == Some(crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION) {
+            capabilities.tasks = None;
+            if let Some(extensions) = capabilities.extensions.as_mut() {
+                extensions.remove(tower_mcp_types::protocol::TASKS_EXTENSION_ID);
+                if extensions.is_empty() {
+                    capabilities.extensions = None;
+                }
+            }
+        }
+        capabilities
+    }
+
     /// Effective SEP-2549 cache scope to emit alongside a TTL hint.
     ///
     /// Returns the configured scope, or `private` (the conservative choice)
@@ -2045,10 +2082,11 @@ impl McpRouter {
 
                 // Transition session state to Initializing
                 self.session.mark_initializing();
+                let capabilities = self.capabilities_for_protocol(Some(&protocol_version));
 
                 Ok(McpResponse::Initialize(InitializeResult {
                     protocol_version,
-                    capabilities: self.capabilities(),
+                    capabilities,
                     server_info: self.implementation(),
                     instructions: if let Some(config) = &self.inner.auto_instructions {
                         Some(self.inner.generate_instructions(config))
@@ -2077,9 +2115,16 @@ impl McpRouter {
                     },
                     |support| support.versions().to_vec(),
                 );
+                // server/discover is itself the entry point for the final
+                // stateless lifecycle, so its advertised surface must be safe
+                // even when this router is invoked directly without transport
+                // metadata.
+                let capabilities = self.capabilities_for_protocol(Some(
+                    crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION,
+                ));
                 Ok(McpResponse::Discover(DiscoverResult {
                     supported_versions,
-                    capabilities: self.capabilities(),
+                    capabilities,
                     ttl_ms: None,
                     cache_scope: None,
                     instructions: if let Some(config) = &self.inner.auto_instructions {
@@ -2094,13 +2139,22 @@ impl McpRouter {
             }
 
             McpRequest::ListTools(params) => {
+                let final_protocol = is_final_protocol_request(&extensions);
                 let filter = self.inner.tool_filter.as_ref();
                 let disabled = self.inner.disabled_tools.read().unwrap().clone();
                 let is_visible = |t: &Tool| {
                     !disabled.contains(&t.name)
+                        && !(final_protocol && matches!(t.task_support, TaskSupportMode::Required))
                         && filter
                             .map(|f| f.is_visible(&self.session, t))
                             .unwrap_or(true)
+                };
+                let definition = |t: &Tool| {
+                    let mut definition = t.definition();
+                    if final_protocol {
+                        definition.execution = None;
+                    }
+                    definition
                 };
 
                 // Collect static tools
@@ -2109,7 +2163,7 @@ impl McpRouter {
                     .tools
                     .values()
                     .filter(|t| is_visible(t))
-                    .map(|t| t.definition())
+                    .map(|t| definition(t))
                     .collect();
 
                 // Merge dynamic tools (static tools win on name collision)
@@ -2119,7 +2173,7 @@ impl McpRouter {
                         tools.iter().map(|t| t.name.clone()).collect();
                     for t in dynamic.list() {
                         if !static_names.contains(&t.name) && is_visible(&t) {
-                            tools.push(t.definition());
+                            tools.push(definition(&t));
                         }
                     }
                 }
@@ -2190,6 +2244,21 @@ impl McpRouter {
                         "tool call completed"
                     );
                     return Err(filter.denial_error(&params.name));
+                }
+
+                // Required-task tools are absent from final discovery and
+                // behave as nonexistent if called by name. Optional tools
+                // remain available synchronously, but the task augmentation
+                // itself is rejected while final Tasks support is withheld.
+                if is_final_protocol_request(&extensions) {
+                    if matches!(tool.task_support, TaskSupportMode::Required) {
+                        return Err(Error::JsonRpc(JsonRpcError::method_not_found(&params.name)));
+                    }
+                    if params.task.is_some() {
+                        return Err(Error::JsonRpc(JsonRpcError::invalid_params(
+                            "The Tasks extension is not advertised for protocol version 2026-07-28",
+                        )));
+                    }
                 }
 
                 // Final 2026-07-28 requests declare client capabilities on
@@ -2801,6 +2870,10 @@ impl McpRouter {
             McpRequest::Ping => Ok(McpResponse::Pong(EmptyResult {})),
 
             McpRequest::GetTaskInfo(params) => {
+                if is_final_protocol_request(&extensions) {
+                    return Err(Error::JsonRpc(JsonRpcError::method_not_found("tasks/get")));
+                }
+
                 // SEP-2663 DetailedTask: `tasks/get` carries the
                 // status-discriminated payload inline. `completed` includes
                 // the result the synchronous request would have returned;
@@ -2834,6 +2907,12 @@ impl McpRouter {
             }
 
             McpRequest::UpdateTask(params) => {
+                if is_final_protocol_request(&extensions) {
+                    return Err(Error::JsonRpc(JsonRpcError::method_not_found(
+                        "tasks/update",
+                    )));
+                }
+
                 // SEP-2663 `tasks/update`: validate the task exists and
                 // acknowledge with an empty result. tower-mcp does not yet
                 // model server-initiated `inputRequests` for tasks (that's a
@@ -2857,6 +2936,12 @@ impl McpRouter {
             }
 
             McpRequest::CancelTask(params) => {
+                if is_final_protocol_request(&extensions) {
+                    return Err(Error::JsonRpc(JsonRpcError::method_not_found(
+                        "tasks/cancel",
+                    )));
+                }
+
                 // First check if the task exists and is not already terminal
                 let current = self
                     .inner
@@ -3265,6 +3350,191 @@ mod tests {
             ..Default::default()
         });
         extensions
+    }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn final_protocol_withholds_incomplete_tasks_advertisement() {
+        let optional = ToolBuilder::new("optional_task")
+            .task_support(TaskSupportMode::Optional)
+            .handler(|input: AddInput| async move {
+                Ok(CallToolResult::text(format!("{}", input.a + input.b)))
+            })
+            .build();
+        let required = ToolBuilder::new("required_task")
+            .task_support(TaskSupportMode::Required)
+            .handler(|input: AddInput| async move {
+                Ok(CallToolResult::text(format!("{}", input.a + input.b)))
+            })
+            .build();
+        let mut router = McpRouter::new().tool(optional).tool(required);
+
+        // Stable clients retain the existing capability surface.
+        let stable_capabilities = router.capabilities();
+        assert!(stable_capabilities.tasks.is_some());
+        assert!(
+            stable_capabilities
+                .extensions
+                .as_ref()
+                .is_some_and(|extensions| extensions.contains_key(TASKS_EXTENSION_ID))
+        );
+
+        // Final discovery must not claim support for the incomplete extension.
+        let response = router
+            .handle(
+                RequestId::Number(1),
+                McpRequest::Discover(DiscoverParams::default()),
+                Extensions::new(),
+            )
+            .await
+            .unwrap();
+        let McpResponse::Discover(result) = response else {
+            panic!("Expected Discover response");
+        };
+        assert!(result.capabilities.tasks.is_none());
+        assert!(
+            result
+                .capabilities
+                .extensions
+                .as_ref()
+                .is_none_or(|extensions| !extensions.contains_key(TASKS_EXTENSION_ID))
+        );
+
+        init_router(&mut router).await;
+
+        // Stable discovery keeps both tools and their execution metadata.
+        let response = router
+            .handle(
+                RequestId::Number(2),
+                McpRequest::ListTools(ListToolsParams::default()),
+                Extensions::new(),
+            )
+            .await
+            .unwrap();
+        let McpResponse::ListTools(result) = response else {
+            panic!("Expected ListTools response");
+        };
+        assert_eq!(result.tools.len(), 2);
+        assert!(result.tools.iter().all(|tool| tool.execution.is_some()));
+
+        // Final discovery keeps the synchronously callable optional tool, but
+        // strips Tasks metadata and hides the required-task-only tool.
+        let response = router
+            .handle(
+                RequestId::Number(3),
+                McpRequest::ListTools(ListToolsParams::default()),
+                final_extensions(ClientCapabilities::default()),
+            )
+            .await
+            .unwrap();
+        let McpResponse::ListTools(result) = response else {
+            panic!("Expected ListTools response");
+        };
+        assert_eq!(result.tools.len(), 1);
+        assert_eq!(result.tools[0].name, "optional_task");
+        assert!(result.tools[0].execution.is_none());
+    }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn final_protocol_rejects_incomplete_tasks_dispatch() {
+        let optional = ToolBuilder::new("optional_task")
+            .task_support(TaskSupportMode::Optional)
+            .handler(|input: AddInput| async move {
+                Ok(CallToolResult::text(format!("{}", input.a + input.b)))
+            })
+            .build();
+        let required = ToolBuilder::new("required_task")
+            .task_support(TaskSupportMode::Required)
+            .handler(|input: AddInput| async move {
+                Ok(CallToolResult::text(format!("{}", input.a + input.b)))
+            })
+            .build();
+        let mut router = McpRouter::new().tool(optional).tool(required);
+        init_router(&mut router).await;
+
+        // The optional tool remains synchronously callable on the final path.
+        let response = router
+            .handle(
+                RequestId::Number(1),
+                McpRequest::CallTool(CallToolParams {
+                    name: "optional_task".to_string(),
+                    arguments: serde_json::json!({"a": 1, "b": 2}),
+                    input_responses: None,
+                    request_state: None,
+                    meta: None,
+                    task: None,
+                }),
+                final_extensions(ClientCapabilities::default()),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(response, McpResponse::CallTool(_)));
+
+        // Task augmentation is invalid while the final extension is withheld.
+        let error = router
+            .handle(
+                RequestId::Number(2),
+                McpRequest::CallTool(CallToolParams {
+                    name: "optional_task".to_string(),
+                    arguments: serde_json::json!({"a": 1, "b": 2}),
+                    input_responses: None,
+                    request_state: None,
+                    meta: None,
+                    task: Some(TaskRequestParams { ttl: None }),
+                }),
+                final_extensions(ClientCapabilities::default()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::JsonRpc(error) if error.code == -32602));
+
+        // A required-task tool was hidden from discovery, so direct calls
+        // behave as though the tool does not exist.
+        let error = router
+            .handle(
+                RequestId::Number(3),
+                McpRequest::CallTool(CallToolParams {
+                    name: "required_task".to_string(),
+                    arguments: serde_json::json!({"a": 1, "b": 2}),
+                    input_responses: None,
+                    request_state: None,
+                    meta: None,
+                    task: None,
+                }),
+                final_extensions(ClientCapabilities::default()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::JsonRpc(error) if error.code == -32601));
+
+        let task_requests = [
+            McpRequest::GetTaskInfo(GetTaskInfoParams {
+                task_id: "task-unknown".to_string(),
+                meta: None,
+            }),
+            McpRequest::UpdateTask(UpdateTaskParams {
+                task_id: "task-unknown".to_string(),
+                input_responses: HashMap::new(),
+                meta: None,
+            }),
+            McpRequest::CancelTask(CancelTaskParams {
+                task_id: "task-unknown".to_string(),
+                reason: None,
+                meta: None,
+            }),
+        ];
+        for (index, request) in task_requests.into_iter().enumerate() {
+            let error = router
+                .handle(
+                    RequestId::Number(4 + index as i64),
+                    request,
+                    final_extensions(ClientCapabilities::default()),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::JsonRpc(error) if error.code == -32601));
+        }
     }
 
     #[cfg(feature = "stateless")]
