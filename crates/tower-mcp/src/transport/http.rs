@@ -1291,6 +1291,10 @@ struct AppState {
     /// SEP-1442 stateless mode configuration
     #[cfg(feature = "stateless")]
     stateless_config: Option<crate::stateless::StatelessConfig>,
+    /// Whether to stamp server identity into `_meta` on 2026-07-28 stateless
+    /// responses (see [`HttpTransport::stamp_server_info()`]).
+    #[cfg(feature = "stateless")]
+    stamp_server_info: bool,
     /// Whether to wrap synchronous responses in SSE format (rmcp compat)
     sse_responses: bool,
     /// Maximum accepted POST body size in bytes
@@ -1343,6 +1347,12 @@ pub struct HttpTransport {
     external_notifications: Option<NotificationReceiver>,
     #[cfg(feature = "stateless")]
     stateless_config: Option<crate::stateless::StatelessConfig>,
+    /// When true, 2026-07-28 stateless responses carry server identity in
+    /// `_meta["io.modelcontextprotocol/serverInfo"]`.
+    ///
+    /// See [`HttpTransport::stamp_server_info()`] for details.
+    #[cfg(feature = "stateless")]
+    stamp_server_info: bool,
     #[cfg(feature = "oauth")]
     oauth_config: Option<OAuthConfig>,
     /// When true, synchronous JSON-RPC responses are wrapped in SSE format.
@@ -1378,6 +1388,8 @@ impl HttpTransport {
             external_notifications: None,
             #[cfg(feature = "stateless")]
             stateless_config: None,
+            #[cfg(feature = "stateless")]
+            stamp_server_info: true,
             #[cfg(feature = "oauth")]
             oauth_config: None,
             sse_responses: false,
@@ -1435,6 +1447,8 @@ impl HttpTransport {
             external_notifications: None,
             #[cfg(feature = "stateless")]
             stateless_config: None,
+            #[cfg(feature = "stateless")]
+            stamp_server_info: true,
             #[cfg(feature = "oauth")]
             oauth_config: None,
             sse_responses: false,
@@ -1607,6 +1621,34 @@ impl HttpTransport {
     /// ```
     pub fn sse_responses(mut self, enabled: bool) -> Self {
         self.sse_responses = enabled;
+        self
+    }
+
+    /// Whether 2026-07-28 stateless responses carry server identity in
+    /// `_meta["io.modelcontextprotocol/serverInfo"]`.
+    ///
+    /// Per SEP-2575, servers SHOULD identify themselves in each result's
+    /// `_meta` "unless specifically configured not to do so" -- this is that
+    /// configuration. Only applies to the version-gated 2026-07-28 stateless
+    /// dispatch path (`stateless` feature); other protocol versions and
+    /// transports are unaffected, and identity there is carried by
+    /// `initialize`'s top-level `serverInfo` instead.
+    ///
+    /// Only takes effect when the transport was built from an [`McpRouter`]
+    /// (`HttpTransport::new`); a transport built from a pre-built service
+    /// (`HttpTransport::from_service`) has no router to read identity from
+    /// and never stamps, regardless of this setting.
+    ///
+    /// Default: `true`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let transport = HttpTransport::new(router).stamp_server_info(false);
+    /// ```
+    #[cfg(feature = "stateless")]
+    pub fn stamp_server_info(mut self, enabled: bool) -> Self {
+        self.stamp_server_info = enabled;
         self
     }
 
@@ -1934,6 +1976,8 @@ impl HttpTransport {
             strict_initialization: self.session_config.strict_initialization,
             #[cfg(feature = "stateless")]
             stateless_config: self.stateless_config.clone(),
+            #[cfg(feature = "stateless")]
+            stamp_server_info: self.stamp_server_info,
             sse_responses: self.sse_responses,
             max_body_size: self.max_body_size,
         })
@@ -2408,6 +2452,17 @@ async fn handle_post(
             // is the terminal response; otherwise the response falls back to
             // SSE with the notifications delivered ahead of the terminal
             // response.
+            // Captured before the match below borrows `router` into the
+            // ephemeral session; used to stamp `_meta.serverInfo` on the
+            // outgoing response (SEP-2575). `None` for a transport built
+            // from a pre-built service (no router to read identity from).
+            let server_identity = match &state.service_source {
+                ServiceSource::Router { router, .. } if state.stamp_server_info => {
+                    Some(router.implementation())
+                }
+                _ => None,
+            };
+
             let (notif_tx, mut notif_rx) = crate::context::notification_channel(64);
             let mut service = match &state.service_source {
                 ServiceSource::Router { router, factory } => {
@@ -2493,6 +2548,9 @@ async fn handle_post(
                     {
                         *pv = serde_json::Value::String(version.clone());
                     }
+                    if let Some(ref identity) = server_identity {
+                        stamp_server_info(&mut response, identity);
+                    }
 
                     let mut resp = if state.sse_responses {
                         sse_json_response(&response)
@@ -2514,6 +2572,7 @@ async fn handle_post(
                         is_init,
                         version.clone(),
                         cancel_guard,
+                        server_identity,
                     );
                     resp.headers_mut().insert(
                         MCP_PROTOCOL_VERSION_HEADER,
@@ -2953,6 +3012,33 @@ fn is_stateless_protocol_version(version: &str) -> bool {
     version >= UPCOMING_PROTOCOL_VERSION
 }
 
+/// Stamp `_meta["io.modelcontextprotocol/serverInfo"]` onto a successful
+/// response, per SEP-2575: servers SHOULD identify themselves in each
+/// result's `_meta` unless configured not to (see
+/// [`HttpTransport::stamp_server_info()`]).
+///
+/// A no-op for error responses, and for any result whose top-level JSON
+/// value isn't an object (defensive; every `McpResponse` variant serializes
+/// to an object).
+#[cfg(feature = "stateless")]
+fn stamp_server_info(response: &mut JsonRpcResponse, implementation: &Implementation) {
+    let JsonRpcResponse::Result(result) = response else {
+        return;
+    };
+    let Some(obj) = result.result.as_object_mut() else {
+        return;
+    };
+    let meta = obj
+        .entry("_meta")
+        .or_insert_with(|| serde_json::Value::Object(Default::default()));
+    let Some(meta_obj) = meta.as_object_mut() else {
+        return;
+    };
+    if let Ok(value) = serde_json::to_value(implementation) {
+        meta_obj.insert("io.modelcontextprotocol/serverInfo".to_string(), value);
+    }
+}
+
 /// Drop guard that cancels a per-request [`CancellationToken`] when the
 /// request is abandoned before its response is produced.
 ///
@@ -3003,6 +3089,7 @@ fn stateless_sse_with_notifications(
     is_init: bool,
     version: String,
     cancel_guard: CancelOnDisconnect,
+    server_identity: Option<Implementation>,
 ) -> Response {
     struct Ctx {
         call: Option<
@@ -3020,6 +3107,9 @@ fn stateless_sse_with_notifications(
         /// stream, and with it this state, is dropped) while the handler
         /// is still in flight. Disarmed once the handler resolves.
         cancel_guard: CancelOnDisconnect,
+        /// Stamped into `_meta.serverInfo` on the terminal response, if set
+        /// (see [`HttpTransport::stamp_server_info()`]).
+        server_identity: Option<Implementation>,
     }
 
     let mut queue = std::collections::VecDeque::new();
@@ -3035,6 +3125,7 @@ fn stateless_sse_with_notifications(
         is_init,
         version,
         cancel_guard,
+        server_identity,
     };
 
     let stream = futures::stream::unfold(ctx, |mut ctx| async move {
@@ -3076,6 +3167,9 @@ fn stateless_sse_with_notifications(
                                 && let Some(pv) = r.result.get_mut("protocolVersion")
                             {
                                 *pv = serde_json::Value::String(ctx.version.clone());
+                            }
+                            if let Some(ref identity) = ctx.server_identity {
+                                stamp_server_info(&mut response, identity);
                             }
                             serde_json::to_string(&response).ok()
                         }
@@ -6257,6 +6351,91 @@ mod tests {
         assert!(
             json.get("result").is_some(),
             "expected tools/call result, got: {json}"
+        );
+    }
+
+    /// A stateless 2026-07-28 request body helper for the serverInfo tests below.
+    fn stateless_tools_call_request() -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header(MCP_PROTOCOL_VERSION_HEADER, "2026-07-28")
+            .header(MCP_METHOD_HEADER, "tools/call")
+            .header(MCP_NAME_HEADER, "echo")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "echo",
+                        "arguments": {"message": "hello"},
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientInfo": {
+                                "name": "sc", "version": "1.0"
+                            },
+                            "io.modelcontextprotocol/clientCapabilities": {}
+                        }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    }
+
+    fn echo_router() -> McpRouter {
+        use crate::{CallToolResult, ToolBuilder};
+        McpRouter::new().server_info("t", "1.0.0").tool(
+            ToolBuilder::new("echo")
+                .description("echo")
+                .handler(|args: serde_json::Value| async move {
+                    Ok(CallToolResult::text(args.to_string()))
+                })
+                .build(),
+        )
+    }
+
+    /// SEP-2575: 2026-07-28 stateless responses carry server identity in
+    /// `_meta["io.modelcontextprotocol/serverInfo"]` by default.
+    #[tokio::test]
+    async fn stateless_v2026_response_stamps_server_info_by_default() {
+        let transport = HttpTransport::new(echo_router()).disable_origin_validation();
+        let app = transport.into_router();
+        let response = app.oneshot(stateless_tools_call_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "t",
+            "expected serverInfo stamped into result._meta, got: {json}"
+        );
+        assert_eq!(
+            json["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["version"],
+            "1.0.0"
+        );
+    }
+
+    /// `.stamp_server_info(false)` opts out of the SEP-2575 `_meta` stamp.
+    #[tokio::test]
+    async fn stateless_v2026_response_omits_server_info_when_disabled() {
+        let transport = HttpTransport::new(echo_router())
+            .disable_origin_validation()
+            .stamp_server_info(false);
+        let app = transport.into_router();
+        let response = app.oneshot(stateless_tools_call_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["result"].get("_meta").is_none(),
+            "expected no _meta when stamping is disabled, got: {json}"
         );
     }
 

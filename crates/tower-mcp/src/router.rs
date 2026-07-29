@@ -1681,6 +1681,26 @@ impl McpRouter {
     }
 
     /// Get server capabilities based on registered handlers
+    /// The server's identity, as configured via `.server_info()` and the
+    /// related `.server_title()` / `.server_description()` / etc. builders.
+    ///
+    /// Shared by the `initialize` and `server/discover` handlers, and by the
+    /// 2026-07-28 stateless HTTP dispatch (SEP-2575's "servers SHOULD
+    /// identify themselves in each result's `_meta`") since that path calls
+    /// in from outside this module and has no other way to read identity
+    /// off a router wrapped behind arbitrary `.layer()` middleware.
+    pub(crate) fn implementation(&self) -> Implementation {
+        Implementation {
+            name: self.inner.server_name.clone(),
+            version: self.inner.server_version.clone(),
+            title: self.inner.server_title.clone(),
+            description: self.inner.server_description.clone(),
+            icons: self.inner.server_icons.clone(),
+            website_url: self.inner.server_website_url.clone(),
+            meta: None,
+        }
+    }
+
     fn capabilities(&self) -> ServerCapabilities {
         let has_resources =
             !self.inner.resources.is_empty() || !self.inner.resource_templates.is_empty();
@@ -1859,15 +1879,7 @@ impl McpRouter {
                 Ok(McpResponse::Initialize(InitializeResult {
                     protocol_version,
                     capabilities: self.capabilities(),
-                    server_info: Implementation {
-                        name: self.inner.server_name.clone(),
-                        version: self.inner.server_version.clone(),
-                        title: self.inner.server_title.clone(),
-                        description: self.inner.server_description.clone(),
-                        icons: self.inner.server_icons.clone(),
-                        website_url: self.inner.server_website_url.clone(),
-                        meta: None,
-                    },
+                    server_info: self.implementation(),
                     instructions: if let Some(config) = &self.inner.auto_instructions {
                         Some(self.inner.generate_instructions(config))
                     } else {
@@ -1885,15 +1897,7 @@ impl McpRouter {
                 // so clients can pick one and signal it via MCP-Protocol-Version
                 // on subsequent requests.
                 tracing::debug!("Stateless server/discover request");
-                let server_info = Implementation {
-                    name: self.inner.server_name.clone(),
-                    version: self.inner.server_version.clone(),
-                    title: self.inner.server_title.clone(),
-                    description: self.inner.server_description.clone(),
-                    icons: self.inner.server_icons.clone(),
-                    website_url: self.inner.server_website_url.clone(),
-                    meta: None,
-                };
+                let server_info = self.implementation();
                 Ok(McpResponse::Discover(DiscoverResult {
                     supported_versions: crate::protocol::SUPPORTED_PROTOCOL_VERSIONS
                         .iter()
