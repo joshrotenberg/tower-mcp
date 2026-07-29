@@ -251,21 +251,29 @@ use axum::{
     response::{IntoResponse, Response, Sse, sse::Event},
     routing::{delete, get, post},
 };
+#[cfg(feature = "stateless")]
+use tokio::sync::mpsc;
 use tokio::sync::{Mutex, RwLock, broadcast, oneshot};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
+#[cfg(feature = "stateless")]
+use crate::context::ServerNotification;
 use crate::context::{
     ChannelClientRequester, ClientRequesterHandle, NotificationReceiver, OutgoingRequestReceiver,
     notification_channel, outgoing_request_channel,
 };
 use crate::error::{Error, JsonRpcError, Result};
+#[cfg(feature = "stateless")]
+use crate::error::{ErrorCode, McpErrorCode};
 use crate::jsonrpc::JsonRpcService;
 use crate::protocol::{
     ClientCapabilities, EXPERIMENTAL_PROTOCOL_VERSION, Implementation, JsonRpcNotification,
     JsonRpcRequest, JsonRpcResponse, LATEST_PROTOCOL_VERSION, McpNotification, RequestId,
     ResultType,
 };
+#[cfg(feature = "stateless")]
+use crate::protocol::{SubscriptionFilter, SubscriptionsListenParams};
 use crate::router::{McpRouter, RouterRequest, RouterResponse};
 use crate::transport::service::{
     CatchError, InjectAnnotations, McpBoxService, ServiceFactory, identity_factory,
@@ -1292,10 +1300,144 @@ struct AppState {
     /// responses (see [`HttpTransport::stamp_server_info()`]).
     #[cfg(feature = "stateless")]
     stamp_server_info: bool,
+    /// Active final-protocol `subscriptions/listen` streams.
+    #[cfg(feature = "stateless")]
+    modern_subscriptions: Arc<ModernSubscriptionRegistry>,
     /// Whether to wrap synchronous responses in SSE format (rmcp compat)
     sse_responses: bool,
     /// Maximum accepted POST body size in bytes
     max_body_size: usize,
+}
+
+#[cfg(feature = "stateless")]
+struct ModernSubscription {
+    subscription_id: RequestId,
+    filter: SubscriptionFilter,
+    tx: mpsc::UnboundedSender<String>,
+}
+
+/// Process-local registry for sessionless final-protocol subscriptions.
+///
+/// The 2026-07-28 transport deliberately has no session or replay state.
+/// Each listen POST owns one sender, removed when its response stream drops.
+#[cfg(feature = "stateless")]
+#[derive(Default)]
+struct ModernSubscriptionRegistry {
+    next_key: AtomicU64,
+    subscriptions: std::sync::Mutex<HashMap<u64, ModernSubscription>>,
+}
+
+#[cfg(feature = "stateless")]
+impl ModernSubscriptionRegistry {
+    fn register(
+        self: &Arc<Self>,
+        subscription_id: RequestId,
+        filter: SubscriptionFilter,
+    ) -> (mpsc::UnboundedReceiver<String>, ModernSubscriptionGuard) {
+        let key = self.next_key.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.subscriptions.lock().unwrap().insert(
+            key,
+            ModernSubscription {
+                subscription_id,
+                filter,
+                tx,
+            },
+        );
+        (
+            rx,
+            ModernSubscriptionGuard {
+                key,
+                registry: self.clone(),
+            },
+        )
+    }
+
+    /// Route subscription-scoped notifications and return whether the
+    /// notification belongs exclusively on listen streams.
+    fn publish(&self, notification: &ServerNotification) -> bool {
+        let subscription_scoped = matches!(
+            notification,
+            ServerNotification::ResourceUpdated { .. }
+                | ServerNotification::ResourcesListChanged
+                | ServerNotification::ToolsListChanged
+                | ServerNotification::PromptsListChanged
+        );
+        if !subscription_scoped {
+            return false;
+        }
+
+        let mut subscriptions = self.subscriptions.lock().unwrap();
+        tracing::trace!(
+            active_subscriptions = subscriptions.len(),
+            notification = ?notification,
+            "Routing final-protocol subscription notification"
+        );
+        subscriptions.retain(|_, subscription| {
+            if subscription_matches(notification, &subscription.filter)
+                && let Some(json) =
+                    tagged_subscription_notification(notification, &subscription.subscription_id)
+            {
+                return subscription.tx.send(json).is_ok();
+            }
+            !subscription.tx.is_closed()
+        });
+        true
+    }
+}
+
+#[cfg(feature = "stateless")]
+struct ModernSubscriptionGuard {
+    key: u64,
+    registry: Arc<ModernSubscriptionRegistry>,
+}
+
+#[cfg(feature = "stateless")]
+impl Drop for ModernSubscriptionGuard {
+    fn drop(&mut self) {
+        self.registry
+            .subscriptions
+            .lock()
+            .unwrap()
+            .remove(&self.key);
+    }
+}
+
+#[cfg(feature = "stateless")]
+fn subscription_matches(notification: &ServerNotification, filter: &SubscriptionFilter) -> bool {
+    match notification {
+        ServerNotification::ToolsListChanged => filter.tools_list_changed == Some(true),
+        ServerNotification::PromptsListChanged => filter.prompts_list_changed == Some(true),
+        ServerNotification::ResourcesListChanged => filter.resources_list_changed == Some(true),
+        ServerNotification::ResourceUpdated { uri } => filter
+            .resource_subscriptions
+            .as_ref()
+            .is_some_and(|subscriptions| subscriptions.iter().any(|item| item == uri)),
+        _ => false,
+    }
+}
+
+#[cfg(feature = "stateless")]
+fn tagged_subscription_notification(
+    notification: &ServerNotification,
+    subscription_id: &RequestId,
+) -> Option<String> {
+    let json = crate::transport::stdio::serialize_notification(notification)?;
+    let mut value: serde_json::Value = serde_json::from_str(&json).ok()?;
+    let object = value.as_object_mut()?;
+    let params = object
+        .entry("params")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()?;
+    let meta = params
+        .entry("_meta")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()?;
+    meta.insert(
+        "io.modelcontextprotocol/subscriptionId".to_string(),
+        serde_json::to_value(subscription_id).ok()?,
+    );
+    serde_json::to_string(&value).ok()
 }
 
 /// Configuration for OAuth 2.1 Protected Resource Metadata.
@@ -1971,12 +2113,39 @@ impl HttpTransport {
     }
 
     fn build_state(&self) -> Arc<AppState> {
+        #[cfg(feature = "stateless")]
+        let modern_subscriptions = Arc::new(ModernSubscriptionRegistry::default());
+
+        // Keep one transport-lifetime notification sender registered with
+        // dynamic registries. Per-request senders intentionally are not
+        // registered, but dynamic mutations still need a stable path to all
+        // active final-protocol listen streams.
+        #[cfg(feature = "stateless")]
+        let service_source = match &self.service_source {
+            ServiceSource::Router { router, factory } => {
+                let (tx, mut rx) = notification_channel(256);
+                let subscriptions = modern_subscriptions.clone();
+                tokio::spawn(async move {
+                    while let Some(notification) = rx.recv().await {
+                        subscriptions.publish(&notification);
+                    }
+                });
+                ServiceSource::Router {
+                    router: router.clone().with_notification_sender(tx),
+                    factory: factory.clone(),
+                }
+            }
+            ServiceSource::Service(service) => ServiceSource::Service(service.clone()),
+        };
+        #[cfg(not(feature = "stateless"))]
+        let service_source = self.service_source.clone();
+
         let sessions = Arc::new(SessionRegistry::new(
             self.session_config.clone(),
             self.sampling_enabled,
             self.session_store.clone(),
             self.event_store.clone(),
-            self.service_source.clone(),
+            service_source.clone(),
             self.auto_reinit_sessions,
         ));
 
@@ -1991,7 +2160,7 @@ impl HttpTransport {
         });
 
         Arc::new(AppState {
-            service_source: self.service_source.clone(),
+            service_source,
             protocol_support: self.protocol_support.clone(),
             sessions,
             validate_origin: self.validate_origin,
@@ -2005,6 +2174,8 @@ impl HttpTransport {
             stateless_config: self.stateless_config.clone(),
             #[cfg(feature = "stateless")]
             stamp_server_info: self.stamp_server_info,
+            #[cfg(feature = "stateless")]
+            modern_subscriptions,
             sse_responses: self.sse_responses,
             max_body_size: self.max_body_size,
         })
@@ -2035,7 +2206,12 @@ impl HttpTransport {
             store: state.sessions.clone(),
         };
 
-        spawn_external_notification_fanout(external_rx, state.sessions.clone());
+        spawn_external_notification_fanout(
+            external_rx,
+            state.sessions.clone(),
+            #[cfg(feature = "stateless")]
+            state.modern_subscriptions.clone(),
+        );
 
         let router = Router::new()
             .route("/", post(handle_post))
@@ -2065,7 +2241,12 @@ impl HttpTransport {
             store: state.sessions.clone(),
         };
 
-        spawn_external_notification_fanout(external_rx, state.sessions.clone());
+        spawn_external_notification_fanout(
+            external_rx,
+            state.sessions.clone(),
+            #[cfg(feature = "stateless")]
+            state.modern_subscriptions.clone(),
+        );
 
         let mcp_router = Router::new()
             .route("/", post(handle_post))
@@ -2136,12 +2317,15 @@ impl HttpTransport {
 fn spawn_external_notification_fanout(
     rx: Option<NotificationReceiver>,
     sessions: Arc<SessionRegistry>,
+    #[cfg(feature = "stateless")] modern_subscriptions: Arc<ModernSubscriptionRegistry>,
 ) {
     let Some(mut rx) = rx else {
         return;
     };
     tokio::spawn(async move {
         while let Some(notification) = rx.recv().await {
+            #[cfg(feature = "stateless")]
+            modern_subscriptions.publish(&notification);
             if let Some(json) = crate::transport::stdio::serialize_notification(&notification) {
                 sessions.broadcast_to_all(&json).await;
             }
@@ -2318,6 +2502,95 @@ fn is_response(parsed: &serde_json::Value) -> bool {
         && (parsed.get("result").is_some() || parsed.get("error").is_some())
 }
 
+/// Return whether an HTTP request claims the modern, per-request-metadata
+/// protocol era.
+///
+/// The body envelope is authoritative for era detection. The final-version
+/// header is also treated as a modern claim so a missing or malformed
+/// envelope receives the specified modern error instead of drifting into the
+/// legacy session path.
+fn claims_modern_protocol(headers: &HeaderMap, parsed: &serde_json::Value) -> bool {
+    get_protocol_version(headers).as_deref() == Some(EXPERIMENTAL_PROTOCOL_VERSION)
+        || parsed
+            .get("params")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|params| params.get("_meta"))
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|meta| meta.contains_key("io.modelcontextprotocol/protocolVersion"))
+}
+
+/// Validate the required modern per-request metadata and return its declared
+/// protocol version.
+///
+/// `clientInfo` is deliberately optional in the final specification.
+fn validate_modern_request_meta(
+    parsed: &serde_json::Value,
+) -> std::result::Result<String, JsonRpcError> {
+    let params = parsed
+        .get("params")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            JsonRpcError::invalid_params("Modern requests require a params object containing _meta")
+        })?;
+    let meta = params
+        .get("_meta")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| JsonRpcError::invalid_params("Modern requests require a _meta object"))?;
+    let protocol_version = meta
+        .get("io.modelcontextprotocol/protocolVersion")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            JsonRpcError::invalid_params(
+                "Missing or invalid _meta.io.modelcontextprotocol/protocolVersion",
+            )
+        })?;
+    let client_capabilities = meta
+        .get("io.modelcontextprotocol/clientCapabilities")
+        .ok_or_else(|| {
+            JsonRpcError::invalid_params("Missing _meta.io.modelcontextprotocol/clientCapabilities")
+        })?;
+    if !client_capabilities.is_object()
+        || serde_json::from_value::<ClientCapabilities>(client_capabilities.clone()).is_err()
+    {
+        return Err(JsonRpcError::invalid_params(
+            "Invalid _meta.io.modelcontextprotocol/clientCapabilities",
+        ));
+    }
+
+    Ok(protocol_version.to_string())
+}
+
+/// Methods present in legacy protocol unions but removed from the modern core.
+fn is_removed_modern_method(method: &str) -> bool {
+    matches!(
+        method,
+        "initialize"
+            | "notifications/initialized"
+            | "ping"
+            | "logging/setLevel"
+            | "resources/subscribe"
+            | "resources/unsubscribe"
+            | "notifications/roots/list_changed"
+    )
+}
+
+/// Map protocol errors whose final Streamable HTTP binding assigns a
+/// non-success status. Errors emitted after an SSE stream has opened remain
+/// in-band because the HTTP status is already committed.
+#[cfg(feature = "stateless")]
+fn modern_response_status(response: &JsonRpcResponse) -> StatusCode {
+    let JsonRpcResponse::Error(error) = response else {
+        return StatusCode::OK;
+    };
+    if error.error.code == ErrorCode::MethodNotFound as i32 {
+        StatusCode::NOT_FOUND
+    } else if error.error.code == McpErrorCode::MissingRequiredClientCapability.code() {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::OK
+    }
+}
+
 /// Extract request ID from a JSON value
 fn extract_request_id(parsed: &serde_json::Value) -> Option<RequestId> {
     parsed.get("id").and_then(|id| {
@@ -2407,6 +2680,70 @@ async fn handle_post(
         .and_then(|method| method.as_str())
         .unwrap_or_default()
         .to_string();
+    let modern_request = claims_modern_protocol(&headers, &parsed);
+
+    // The modern protocol is selected by its per-request `_meta` envelope,
+    // with the final-version HTTP header also acting as a signal for malformed
+    // requests whose envelope is missing. Resolve that era before consulting
+    // any legacy session state so modern traffic cannot accidentally fall
+    // through to the initialize/session lifecycle.
+    if modern_request {
+        let id = extract_request_id(&parsed);
+        let body_version = match validate_modern_request_meta(&parsed) {
+            Ok(version) => version,
+            Err(error) => {
+                return json_rpc_error_response_with_status(id, error, StatusCode::BAD_REQUEST);
+            }
+        };
+
+        let Some(header_version) = get_protocol_version(&headers) else {
+            return json_rpc_error_response_with_status(
+                id,
+                JsonRpcError::header_mismatch("MCP-Protocol-Version header is required"),
+                StatusCode::BAD_REQUEST,
+            );
+        };
+        if header_version != body_version {
+            return json_rpc_error_response_with_status(
+                id,
+                JsonRpcError::header_mismatch(format!(
+                    "MCP-Protocol-Version header value {header_version:?} does not match \
+                     request _meta protocol version {body_version:?}"
+                )),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+
+        if !state.protocol_support.contains(&body_version) {
+            return json_rpc_error_response_with_status(
+                id,
+                JsonRpcError::unsupported_protocol_version(
+                    body_version,
+                    state.protocol_support.versions().iter().map(String::as_str),
+                ),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+
+        let sep_2243_mode = super::http_headers::mode_for_version(&body_version);
+        if let Err(error) = super::http_headers::validate(&headers, &parsed, sep_2243_mode) {
+            tracing::warn!(
+                mode = ?sep_2243_mode,
+                version = %body_version,
+                error = %error.message,
+                "Rejecting modern request: HTTP header validation failed",
+            );
+            return json_rpc_error_response_with_status(id, error, StatusCode::BAD_REQUEST);
+        }
+
+        if is_removed_modern_method(&request_method) {
+            return json_rpc_error_response_with_status(
+                id,
+                JsonRpcError::method_not_found(&request_method),
+                StatusCode::NOT_FOUND,
+            );
+        }
+    }
 
     // SEP-2575 / SEP-2567: version-gated stateless mode for 2026-07-28+ clients.
     //
@@ -2421,7 +2758,7 @@ async fn handle_post(
     // `stateless_config` is set on the transport.
     #[cfg(feature = "stateless")]
     {
-        let version_in_play: Option<String> = if is_init {
+        let version_in_play: Option<String> = if is_init && !modern_request {
             // For `initialize`, read the version the client is requesting from
             // the params object.
             parsed
@@ -2439,7 +2776,6 @@ async fn handle_post(
         if let Some(ref version) = version_in_play
             && is_stateless_protocol_version(version)
             && state.protocol_support.contains(version)
-            && get_session_id(&headers).is_none()
             // `subscriptions/listen` opens an SSE stream; let it fall through to the
             // dedicated intercept below rather than handling it as a plain RPC call.
             && parsed.get("method").and_then(|m| m.as_str()) != Some("subscriptions/listen")
@@ -2546,16 +2882,63 @@ async fn handle_post(
             // Race the handler against its first notification. A closed
             // channel (no sender attached, or all senders dropped) simply
             // awaits the handler.
-            let first = tokio::select! {
-                result = &mut call => FirstOutbound::Response(result),
-                maybe = notif_rx.recv() => match maybe {
-                    Some(n) => FirstOutbound::Notification(n),
-                    None => FirstOutbound::Response((&mut call).await),
-                },
+            let first = loop {
+                let outbound = tokio::select! {
+                    // A handler may enqueue a notification and complete in
+                    // the same poll. Observe the queued notification first so
+                    // it is neither dropped nor raced behind the response.
+                    biased;
+                    maybe = notif_rx.recv() => match maybe {
+                        Some(n) => FirstOutbound::Notification(n),
+                        None => FirstOutbound::Response((&mut call).await),
+                    },
+                    result = &mut call => FirstOutbound::Response(result),
+                };
+                match outbound {
+                    FirstOutbound::Notification(notification)
+                        if state.modern_subscriptions.publish(&notification) =>
+                    {
+                        continue;
+                    }
+                    outbound => break outbound,
+                }
             };
 
             match first {
                 FirstOutbound::Response(result) => {
+                    // `select!` may observe a handler's ready response in the
+                    // same poll that the handler enqueued notifications.
+                    // Drain that queue before committing a JSON response.
+                    while let Ok(notification) = notif_rx.try_recv() {
+                        if state.modern_subscriptions.publish(&notification) {
+                            continue;
+                        }
+                        let ready_call: std::pin::Pin<
+                            Box<
+                                dyn std::future::Future<
+                                        Output = crate::error::Result<JsonRpcResponse>,
+                                    > + Send,
+                            >,
+                        > = Box::pin(async move { result });
+                        let mut resp = stateless_sse_with_notifications(
+                            notification,
+                            ready_call,
+                            notif_rx,
+                            StatelessSseContext {
+                                version: version.clone(),
+                                method: request_method.clone(),
+                                cancel_guard,
+                                server_identity,
+                                subscriptions: state.modern_subscriptions.clone(),
+                            },
+                        );
+                        resp.headers_mut().insert(
+                            MCP_PROTOCOL_VERSION_HEADER,
+                            HeaderValue::from_str(version).unwrap(),
+                        );
+                        return resp;
+                    }
+
                     // Handler finished; the response is about to be
                     // produced, so dropping the connection from here on is
                     // no longer a cancellation.
@@ -2584,11 +2967,13 @@ async fn handle_post(
                         stamp_server_info(&mut response, identity);
                     }
 
+                    let status = modern_response_status(&response);
                     let mut resp = if state.sse_responses {
                         sse_json_response(&response)
                     } else {
                         axum::Json(response).into_response()
                     };
+                    *resp.status_mut() = status;
                     resp.headers_mut().insert(
                         MCP_PROTOCOL_VERSION_HEADER,
                         HeaderValue::from_str(version).unwrap(),
@@ -2601,10 +2986,13 @@ async fn handle_post(
                         first_notif,
                         call,
                         notif_rx,
-                        version.clone(),
-                        request_method.clone(),
-                        cancel_guard,
-                        server_identity,
+                        StatelessSseContext {
+                            version: version.clone(),
+                            method: request_method.clone(),
+                            cancel_guard,
+                            server_identity,
+                            subscriptions: state.modern_subscriptions.clone(),
+                        },
                     );
                     resp.headers_mut().insert(
                         MCP_PROTOCOL_VERSION_HEADER,
@@ -2694,6 +3082,13 @@ async fn handle_post(
         }
     }
 
+    // Final-protocol subscriptions are sessionless long-lived POSTs. They
+    // must be established before consulting any legacy session state.
+    #[cfg(feature = "stateless")]
+    if modern_request && request_method == "subscriptions/listen" {
+        return handle_modern_subscriptions_listen_sse(state, &parsed).await;
+    }
+
     // Get or create session
     let session = if is_init {
         // Create new session for initialize
@@ -2720,7 +3115,7 @@ async fn handle_post(
                     .into_response();
             }
         }
-    } else if let Some(session_id) = get_session_id(&headers) {
+    } else if !modern_request && let Some(session_id) = get_session_id(&headers) {
         // Client sent a session ID -- look it up
         match state.sessions.get(&session_id).await {
             Some(s) => s,
@@ -3177,16 +3572,22 @@ impl Drop for CancelOnDisconnect {
 /// notification, any further notifications as they arrive, and finally the
 /// terminal response, after which the stream ends.
 #[cfg(feature = "stateless")]
+struct StatelessSseContext {
+    version: String,
+    method: String,
+    cancel_guard: CancelOnDisconnect,
+    server_identity: Option<Implementation>,
+    subscriptions: Arc<ModernSubscriptionRegistry>,
+}
+
+#[cfg(feature = "stateless")]
 fn stateless_sse_with_notifications(
     first: crate::context::ServerNotification,
     call: std::pin::Pin<
         Box<dyn std::future::Future<Output = crate::error::Result<JsonRpcResponse>> + Send>,
     >,
     rx: crate::context::NotificationReceiver,
-    version: String,
-    method: String,
-    cancel_guard: CancelOnDisconnect,
-    server_identity: Option<Implementation>,
+    request: StatelessSseContext,
 ) -> Response {
     struct Ctx {
         call: Option<
@@ -3207,10 +3608,13 @@ fn stateless_sse_with_notifications(
         /// Stamped into `_meta.serverInfo` on the terminal response, if set
         /// (see [`HttpTransport::stamp_server_info()`]).
         server_identity: Option<Implementation>,
+        subscriptions: Arc<ModernSubscriptionRegistry>,
     }
 
     let mut queue = std::collections::VecDeque::new();
-    if let Some(json) = crate::transport::stdio::serialize_notification(&first) {
+    if !request.subscriptions.publish(&first)
+        && let Some(json) = crate::transport::stdio::serialize_notification(&first)
+    {
         queue.push_back(json);
     }
     let ctx = Ctx {
@@ -3219,10 +3623,11 @@ fn stateless_sse_with_notifications(
         rx_open: true,
         queue,
         terminal: None,
-        version,
-        method,
-        cancel_guard,
-        server_identity,
+        version: request.version,
+        method: request.method,
+        cancel_guard: request.cancel_guard,
+        server_identity: request.server_identity,
+        subscriptions: request.subscriptions,
     };
 
     let stream = futures::stream::unfold(ctx, |mut ctx| async move {
@@ -3250,8 +3655,9 @@ fn stateless_sse_with_notifications(
                     // Drain notifications that were queued before the handler
                     // finished so they precede the terminal response.
                     while let Ok(n) = ctx.rx.try_recv() {
-                        if let Some(json) =
-                            crate::transport::stdio::serialize_notification(&n)
+                        if !ctx.subscriptions.publish(&n)
+                            && let Some(json) =
+                                crate::transport::stdio::serialize_notification(&n)
                         {
                             ctx.queue.push_back(json);
                         }
@@ -3290,8 +3696,9 @@ fn stateless_sse_with_notifications(
                 maybe = ctx.rx.recv(), if ctx.rx_open => {
                     match maybe {
                         Some(n) => {
-                            if let Some(json) =
-                                crate::transport::stdio::serialize_notification(&n)
+                            if !ctx.subscriptions.publish(&n)
+                                && let Some(json) =
+                                    crate::transport::stdio::serialize_notification(&n)
                             {
                                 ctx.queue.push_back(json);
                             }
@@ -3311,6 +3718,105 @@ fn stateless_sse_with_notifications(
                 .text("ping"),
         )
         .into_response()
+}
+
+#[cfg(feature = "stateless")]
+fn accepted_subscription_filter(requested: SubscriptionFilter) -> SubscriptionFilter {
+    SubscriptionFilter {
+        tools_list_changed: requested.tools_list_changed.filter(|enabled| *enabled),
+        prompts_list_changed: requested.prompts_list_changed.filter(|enabled| *enabled),
+        resources_list_changed: requested.resources_list_changed.filter(|enabled| *enabled),
+        resource_subscriptions: requested.resource_subscriptions,
+    }
+}
+
+/// Serve the final, sessionless `subscriptions/listen` protocol over its
+/// owning POST response.
+#[cfg(feature = "stateless")]
+async fn handle_modern_subscriptions_listen_sse(
+    state: Arc<AppState>,
+    parsed: &serde_json::Value,
+) -> Response {
+    let id = extract_request_id(parsed);
+    let Some(subscription_id) = id.clone() else {
+        return json_rpc_error_response_with_status(
+            None,
+            JsonRpcError::invalid_request("subscriptions/listen requires a request id"),
+            StatusCode::BAD_REQUEST,
+        );
+    };
+    let params = match parsed
+        .get("params")
+        .cloned()
+        .ok_or_else(|| JsonRpcError::invalid_params("subscriptions/listen requires params"))
+        .and_then(|value| {
+            serde_json::from_value::<SubscriptionsListenParams>(value)
+                .map_err(|error| JsonRpcError::invalid_params(error.to_string()))
+        }) {
+        Ok(params) => params,
+        Err(error) => {
+            return json_rpc_error_response_with_status(id, error, StatusCode::BAD_REQUEST);
+        }
+    };
+    let Some(requested) = params.notifications else {
+        return json_rpc_error_response_with_status(
+            id,
+            JsonRpcError::invalid_params("subscriptions/listen requires a notifications filter"),
+            StatusCode::BAD_REQUEST,
+        );
+    };
+    let accepted = accepted_subscription_filter(requested);
+    let (rx, guard) = state
+        .modern_subscriptions
+        .register(subscription_id.clone(), accepted.clone());
+    let acknowledgment = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/subscriptions/acknowledged",
+        "params": {
+            "_meta": {
+                "io.modelcontextprotocol/subscriptionId": subscription_id
+            },
+            "notifications": accepted
+        }
+    })
+    .to_string();
+
+    struct ModernListenStream {
+        first: Option<String>,
+        rx: mpsc::UnboundedReceiver<String>,
+        _guard: ModernSubscriptionGuard,
+    }
+
+    let stream = futures::stream::unfold(
+        ModernListenStream {
+            first: Some(acknowledgment),
+            rx,
+            _guard: guard,
+        },
+        |mut state| async move {
+            let message = match state.first.take() {
+                Some(first) => Some(first),
+                None => state.rx.recv().await,
+            }?;
+            Some((
+                Ok::<_, Infallible>(Event::default().event(SSE_MESSAGE_EVENT).data(message)),
+                state,
+            ))
+        },
+    );
+
+    let mut response = Sse::new(stream)
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(Duration::from_secs(30))
+                .text("ping"),
+        )
+        .into_response();
+    response.headers_mut().insert(
+        MCP_PROTOCOL_VERSION_HEADER,
+        HeaderValue::from_static(EXPERIMENTAL_PROTOCOL_VERSION),
+    );
+    response
 }
 
 /// Serve a `subscriptions/listen` request as an SSE stream.
@@ -3710,6 +4216,16 @@ fn json_rpc_error_response(
     axum::Json(response).into_response()
 }
 
+fn json_rpc_error_response_with_status(
+    id: Option<crate::protocol::RequestId>,
+    error: JsonRpcError,
+    status: StatusCode,
+) -> Response {
+    let mut response = json_rpc_error_response(id, error);
+    *response.status_mut() = status;
+    response
+}
+
 /// HTTP 413 response for a POST body exceeding [`HttpTransport::max_body_size`].
 fn body_too_large_response(limit: usize) -> Response {
     let mut resp = json_rpc_error_response(
@@ -3810,6 +4326,37 @@ mod tests {
         let before = serde_json::to_value(&legacy).unwrap();
         apply_protocol_result_fields(&mut legacy, "resources/read", "2025-11-25");
         assert_eq!(serde_json::to_value(legacy).unwrap(), before);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "stateless")]
+    async fn modern_subscription_registry_filters_and_tags_notifications() {
+        let registry = Arc::new(ModernSubscriptionRegistry::default());
+        let (mut rx, guard) = registry.register(
+            RequestId::String("listen-1".to_string()),
+            SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            },
+        );
+
+        assert!(registry.publish(&ServerNotification::PromptsListChanged));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        assert!(registry.publish(&ServerNotification::ToolsListChanged));
+        let message = rx.recv().await.expect("matching notification");
+        let json: serde_json::Value = serde_json::from_str(&message).unwrap();
+        assert_eq!(json["method"], "notifications/tools/list_changed");
+        assert_eq!(
+            json["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+            "listen-1"
+        );
+
+        drop(guard);
+        assert!(registry.subscriptions.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -6435,10 +6982,10 @@ mod tests {
     // Chunk 5: version-gated stateless mode for 2026-07-28+ clients
     // =========================================================================
 
-    /// 2026-07-28 initialize must NOT return mcp-session-id.
+    /// 2026-07-28 removed initialize entirely.
     #[tokio::test]
     #[cfg(feature = "stateless")]
-    async fn stateless_v2026_initialize_omits_session_id() {
+    async fn stateless_v2026_initialize_is_method_not_found() {
         let transport = HttpTransport::new(create_test_router())
             .disable_origin_validation()
             .disable_host_validation();
@@ -6449,6 +6996,7 @@ mod tests {
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream")
             .header(MCP_METHOD_HEADER, "initialize")
+            .header(MCP_PROTOCOL_VERSION_HEADER, EXPERIMENTAL_PROTOCOL_VERSION)
             .body(Body::from(
                 serde_json::json!({
                     "jsonrpc": "2.0",
@@ -6457,33 +7005,264 @@ mod tests {
                     "params": {
                         "protocolVersion": "2026-07-28",
                         "capabilities": {},
-                        "clientInfo": { "name": "sc", "version": "1.0" }
+                        "clientInfo": { "name": "sc", "version": "1.0" },
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {}
+                        }
                     }
                 })
                 .to_string(),
             ))
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(
             !response.headers().contains_key(MCP_SESSION_ID_HEADER),
-            "2026-07-28 initialize must not return mcp-session-id"
-        );
-        assert_eq!(
-            response
-                .headers()
-                .get(MCP_PROTOCOL_VERSION_HEADER)
-                .and_then(|v| v.to_str().ok()),
-            Some("2026-07-28")
+            "removed final method must not create a session"
         );
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["id"], 1);
+        assert_eq!(json["error"]["code"], ErrorCode::MethodNotFound.code());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "stateless")]
+    async fn stateless_v2026_rejects_missing_required_meta_with_http_400() {
+        let app = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .disable_host_validation()
+            .into_router();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header(MCP_METHOD_HEADER, "server/discover")
+            .header(MCP_PROTOCOL_VERSION_HEADER, EXPERIMENTAL_PROTOCOL_VERSION)
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 101,
+                    "method": "server/discover",
+                    "params": {}
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["id"], 101);
+        assert_eq!(json["error"]["code"], ErrorCode::InvalidParams.code());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "stateless")]
+    async fn stateless_v2026_rejects_missing_protocol_header_with_http_400() {
+        let app = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .disable_host_validation()
+            .into_router();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header(MCP_METHOD_HEADER, "server/discover")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 102,
+                    "method": "server/discover",
+                    "params": {
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {}
+                        }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["id"], 102);
+        assert_eq!(json["error"]["code"], McpErrorCode::HeaderMismatch.code());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "stateless")]
+    async fn stateless_v2026_unknown_method_is_http_404() {
+        let app = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .disable_host_validation()
+            .into_router();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header(MCP_METHOD_HEADER, "unknown/method")
+            .header(MCP_PROTOCOL_VERSION_HEADER, EXPERIMENTAL_PROTOCOL_VERSION)
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 103,
+                    "method": "unknown/method",
+                    "params": {
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {}
+                        }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["id"], 103);
+        assert_eq!(json["error"]["code"], ErrorCode::MethodNotFound.code());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "stateless")]
+    async fn stateless_v2026_ignores_legacy_session_and_resumption_headers() {
+        let app = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .disable_host_validation()
+            .into_router();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header(MCP_METHOD_HEADER, "tools/list")
+            .header(MCP_PROTOCOL_VERSION_HEADER, EXPERIMENTAL_PROTOCOL_VERSION)
+            .header(MCP_SESSION_ID_HEADER, "legacy-session-that-does-not-exist")
+            .header(LAST_EVENT_ID_HEADER, "legacy-event")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 104,
+                    "method": "tools/list",
+                    "params": {
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {}
+                        }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key(MCP_SESSION_ID_HEADER));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["result"]["tools"].is_array());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "stateless")]
+    async fn stateless_v2026_enforces_tool_client_capability_requirements() {
+        use crate::{CallToolResult, SamplingCapability, ToolBuilder};
+
+        let tool = ToolBuilder::new("sample")
+            .no_params_handler(|| async { Ok(CallToolResult::text("ok")) })
+            .build()
+            .require_client_capabilities(ClientCapabilities {
+                sampling: Some(SamplingCapability::default()),
+                ..ClientCapabilities::default()
+            });
+        let router = McpRouter::new()
+            .server_info("test-server", "1.0.0")
+            .tool(tool);
+        let app = HttpTransport::new(router)
+            .disable_origin_validation()
+            .disable_host_validation()
+            .into_router();
+
+        let build_request = |id: i64, capabilities: serde_json::Value| {
+            Request::builder()
+                .method("POST")
+                .uri("/")
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json")
+                .header(MCP_METHOD_HEADER, "tools/call")
+                .header(MCP_NAME_HEADER, "sample")
+                .header(MCP_PROTOCOL_VERSION_HEADER, EXPERIMENTAL_PROTOCOL_VERSION)
+                .body(Body::from(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "sample",
+                            "arguments": {},
+                            "_meta": {
+                                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                                "io.modelcontextprotocol/clientCapabilities": capabilities
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+
+        let response = app
+            .clone()
+            .oneshot(build_request(105, serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["id"], 105);
         assert_eq!(
-            json["result"]["protocolVersion"], "2026-07-28",
-            "initialize result must carry 2026-07-28 protocol version"
+            json["error"]["code"],
+            McpErrorCode::MissingRequiredClientCapability.code()
         );
+        assert_eq!(
+            json["error"]["data"]["requiredCapabilities"],
+            serde_json::json!({ "sampling": {} })
+        );
+
+        let response = app
+            .oneshot(build_request(106, serde_json::json!({ "sampling": {} })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["result"]["content"][0]["text"], "ok");
     }
 
     /// 2026-07-28 tools/call without session header succeeds.
@@ -6728,7 +7507,13 @@ mod tests {
                 serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": 1,
-                    "method": "tools/list"
+                    "method": "tools/list",
+                    "params": {
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {}
+                        }
+                    }
                 })
                 .to_string(),
             ))
@@ -6759,7 +7544,8 @@ mod tests {
         assert_eq!(json["result"]["cacheScope"], "private");
     }
 
-    /// 2026-07-28 stateless notification (no id) returns 202 and creates no session (#857).
+    /// A final-protocol cancellation notification returns 202 and creates no
+    /// session (#857).
     #[tokio::test]
     #[cfg(feature = "stateless")]
     async fn stateless_v2026_notification_returns_202_no_session() {
@@ -6771,11 +7557,19 @@ mod tests {
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
             .header(MCP_PROTOCOL_VERSION_HEADER, "2026-07-28")
-            .header(MCP_METHOD_HEADER, "notifications/initialized")
+            .header(MCP_METHOD_HEADER, "notifications/cancelled")
             .body(Body::from(
                 serde_json::json!({
                     "jsonrpc": "2.0",
-                    "method": "notifications/initialized"
+                    "method": "notifications/cancelled",
+                    "params": {
+                        "requestId": 99,
+                        "reason": "test",
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {}
+                        }
+                    }
                 })
                 .to_string(),
             ))
@@ -6814,7 +7608,13 @@ mod tests {
                 serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": 1,
-                    "method": "tools/list"
+                    "method": "tools/list",
+                    "params": {
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {}
+                        }
+                    }
                 })
                 .to_string(),
             ))

@@ -3,8 +3,8 @@ use tower_mcp::protocol::{
     Content, CreateMessageParams, LogLevel, LoggingMessageParams, ResourceContent, SamplingMessage,
 };
 use tower_mcp::{
-    CallToolResult, ElicitFormParams, ElicitFormSchema, ElicitMode, TaskSupportMode, Tool,
-    ToolBuilder,
+    CallToolResult, ClientCapabilities, ElicitFormParams, ElicitFormSchema, ElicitMode,
+    SamplingCapability, TaskSupportMode, Tool, ToolBuilder,
     extract::{Context, RawArgs},
 };
 
@@ -64,7 +64,89 @@ pub fn build_tools() -> Vec<Tool> {
         // Fixtures for the official 2026-07-28 conformance suite (#948)
         build_json_schema_2020_12(),
         build_custom_header(),
+        build_missing_capability(),
+        build_logging_diagnostic(),
+        build_streaming_diagnostic(),
+        build_trigger_tool_change(),
+        build_trigger_prompt_change(),
     ]
+}
+
+/// Diagnostic fixture for the final protocol's per-request capability gate.
+fn build_missing_capability() -> Tool {
+    ToolBuilder::new("test_missing_capability")
+        .description("Requires the caller to advertise the sampling capability")
+        .extractor_handler((), |RawArgs(_args): RawArgs| async move {
+            Ok(CallToolResult::text("sampling capability present"))
+        })
+        .build()
+        .require_client_capabilities(ClientCapabilities {
+            sampling: Some(SamplingCapability::default()),
+            ..ClientCapabilities::default()
+        })
+}
+
+/// Diagnostic fixture for final per-request log-level behavior.
+fn build_logging_diagnostic() -> Tool {
+    ToolBuilder::new("test_logging_tool")
+        .description("Emits a log notification when the request authorizes logging")
+        .extractor_handler((), |ctx: Context, RawArgs(_args): RawArgs| async move {
+            ctx.send_log(
+                LoggingMessageParams::new(
+                    LogLevel::Info,
+                    serde_json::json!("Diagnostic log message"),
+                )
+                .with_logger("conformance"),
+            );
+            Ok(CallToolResult::text("Logging diagnostic complete"))
+        })
+        .build()
+}
+
+/// Diagnostic fixture proving that a final-protocol handler cannot emit a
+/// legacy independent elicitation request on its response stream. MRTR-based
+/// elicitation itself remains tracked in #950.
+fn build_streaming_diagnostic() -> Tool {
+    ToolBuilder::new("test_streaming_elicitation")
+        .description("Verifies legacy in-flight elicitation is disabled on final response streams")
+        .extractor_handler((), |ctx: Context, RawArgs(_args): RawArgs| async move {
+            if ctx.can_elicit() {
+                Ok(CallToolResult::error(
+                    "Legacy independent elicitation must not be available",
+                ))
+            } else {
+                Ok(CallToolResult::text(
+                    "No independent elicitation request emitted",
+                ))
+            }
+        })
+        .build()
+}
+
+fn build_trigger_tool_change() -> Tool {
+    ToolBuilder::new("test_trigger_tool_change")
+        .description("Emits a tools/list_changed notification")
+        .extractor_handler((), |ctx: Context, RawArgs(_args): RawArgs| async move {
+            if ctx.notify_tools_list_changed() {
+                Ok(CallToolResult::text("Tool change emitted"))
+            } else {
+                Ok(CallToolResult::error("Notification channel unavailable"))
+            }
+        })
+        .build()
+}
+
+fn build_trigger_prompt_change() -> Tool {
+    ToolBuilder::new("test_trigger_prompt_change")
+        .description("Emits a prompts/list_changed notification")
+        .extractor_handler((), |ctx: Context, RawArgs(_args): RawArgs| async move {
+            if ctx.notify_prompts_list_changed() {
+                Ok(CallToolResult::text("Prompt change emitted"))
+            } else {
+                Ok(CallToolResult::error("Notification channel unavailable"))
+            }
+        })
+        .build()
 }
 
 /// Fixture for the `json-schema-2020-12` conformance scenario: a tool whose

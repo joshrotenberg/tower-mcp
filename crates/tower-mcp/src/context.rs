@@ -610,6 +610,36 @@ impl RequestContext {
         let _ = tx.try_send(ServerNotification::Progress(params));
     }
 
+    /// Notify subscribed clients that the tool list changed.
+    pub fn notify_tools_list_changed(&self) -> bool {
+        self.notification_tx
+            .as_ref()
+            .is_some_and(|tx| tx.try_send(ServerNotification::ToolsListChanged).is_ok())
+    }
+
+    /// Notify subscribed clients that the prompt list changed.
+    pub fn notify_prompts_list_changed(&self) -> bool {
+        self.notification_tx
+            .as_ref()
+            .is_some_and(|tx| tx.try_send(ServerNotification::PromptsListChanged).is_ok())
+    }
+
+    /// Notify subscribed clients that the resource list changed.
+    pub fn notify_resources_list_changed(&self) -> bool {
+        self.notification_tx.as_ref().is_some_and(|tx| {
+            tx.try_send(ServerNotification::ResourcesListChanged)
+                .is_ok()
+        })
+    }
+
+    /// Notify subscribed clients that one resource changed.
+    pub fn notify_resource_updated(&self, uri: impl Into<String>) -> bool {
+        self.notification_tx.as_ref().is_some_and(|tx| {
+            tx.try_send(ServerNotification::ResourceUpdated { uri: uri.into() })
+                .is_ok()
+        })
+    }
+
     /// Send a log message notification to the client
     ///
     /// This is a no-op if no notification sender is configured.
@@ -630,6 +660,33 @@ impl RequestContext {
         let Some(tx) = &self.notification_tx else {
             return;
         };
+
+        // The final protocol removed logging/setLevel. Log delivery is instead
+        // authorized per request: no logLevel means no log notifications.
+        #[cfg(feature = "stateless")]
+        if let Some(meta) = self.per_request_meta()
+            && meta.protocol_version.as_deref()
+                == Some(crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION)
+        {
+            let Some(request_level) = meta.log_level else {
+                return;
+            };
+            let request_level = match request_level {
+                crate::stateless::LogLevel::Debug => LogLevel::Debug,
+                crate::stateless::LogLevel::Info => LogLevel::Info,
+                crate::stateless::LogLevel::Notice => LogLevel::Notice,
+                crate::stateless::LogLevel::Warning => LogLevel::Warning,
+                crate::stateless::LogLevel::Error => LogLevel::Error,
+                crate::stateless::LogLevel::Critical => LogLevel::Critical,
+                crate::stateless::LogLevel::Alert => LogLevel::Alert,
+                crate::stateless::LogLevel::Emergency => LogLevel::Emergency,
+            };
+            if params.level > request_level {
+                return;
+            }
+            let _ = tx.try_send(ServerNotification::LogMessage(params));
+            return;
+        }
 
         // Filter by minimum log level set via logging/setLevel
         // LogLevel derives Ord with Emergency < Alert < ... < Debug,
@@ -1305,6 +1362,50 @@ mod tests {
             rx.try_recv().is_ok(),
             "Debug should pass when no min level is set"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "stateless")]
+    async fn final_request_log_level_is_required_and_filters_per_request() {
+        let (tx, mut rx) = notification_channel(10);
+        let mut extensions = Extensions::new();
+        extensions.insert(crate::stateless::StatelessRequestMeta {
+            protocol_version: Some(crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION.to_string()),
+            client_capabilities: Some(Default::default()),
+            ..Default::default()
+        });
+        let ctx = RequestContext::new(RequestId::Number(1))
+            .with_notification_sender(tx.clone())
+            .with_extensions(Arc::new(extensions));
+        ctx.send_log(LoggingMessageParams::new(
+            LogLevel::Emergency,
+            serde_json::Value::Null,
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "final requests without logLevel must receive no logs"
+        );
+
+        let mut extensions = Extensions::new();
+        extensions.insert(crate::stateless::StatelessRequestMeta {
+            protocol_version: Some(crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION.to_string()),
+            client_capabilities: Some(Default::default()),
+            log_level: Some(crate::stateless::LogLevel::Warning),
+            ..Default::default()
+        });
+        let ctx = RequestContext::new(RequestId::Number(2))
+            .with_notification_sender(tx)
+            .with_extensions(Arc::new(extensions));
+        ctx.send_log(LoggingMessageParams::new(
+            LogLevel::Info,
+            serde_json::Value::Null,
+        ));
+        assert!(rx.try_recv().is_err(), "Info must be filtered at Warning");
+        ctx.send_log(LoggingMessageParams::new(
+            LogLevel::Error,
+            serde_json::Value::Null,
+        ));
+        assert!(rx.try_recv().is_ok(), "Error must pass at Warning");
     }
 
     fn make_task_object(id: &str, status: TaskStatus) -> serde_json::Value {

@@ -44,6 +44,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::protocol::ClientCapabilities;
+
 /// Type-erased error type used for middleware composition.
 ///
 /// This is the standard error type in the tower ecosystem, used by
@@ -317,6 +319,28 @@ impl JsonRpcError {
         Self::mcp_error(McpErrorCode::HeaderMismatch, message)
     }
 
+    /// SEP-2575: the client did not advertise capabilities required to
+    /// service the request.
+    ///
+    /// The error data identifies the missing capability shape:
+    ///
+    /// ```text
+    /// data: { requiredCapabilities: { ... } }
+    /// ```
+    pub fn missing_required_client_capability(required_capabilities: ClientCapabilities) -> Self {
+        let data = MissingRequiredClientCapabilityData {
+            required_capabilities,
+        };
+        Self {
+            code: McpErrorCode::MissingRequiredClientCapability.code(),
+            message: "Client is missing a capability required by this request".to_string(),
+            data: Some(
+                serde_json::to_value(&data)
+                    .expect("MissingRequiredClientCapabilityData is serializable"),
+            ),
+        }
+    }
+
     /// SEP-2575: server does not support the protocol version the client
     /// requested. The error data carries both the AS-supported versions
     /// and the version the client asked for, matching the spec shape:
@@ -345,6 +369,14 @@ impl JsonRpcError {
             ),
         }
     }
+}
+
+/// SEP-2575 error data for `MissingRequiredClientCapability` (-32021).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissingRequiredClientCapabilityData {
+    /// The client capability shape required to service the request.
+    pub required_capabilities: ClientCapabilities,
 }
 
 /// SEP-2575 error data for `UnsupportedProtocolVersion` (-32022).
@@ -648,6 +680,28 @@ mod tests {
         let parsed: UnsupportedProtocolVersionData = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(parsed.supported, original.supported);
         assert_eq!(parsed.requested, original.requested);
+    }
+
+    #[test]
+    fn missing_required_client_capability_has_spec_shape() {
+        let required = ClientCapabilities {
+            sampling: Some(Default::default()),
+            ..Default::default()
+        };
+        let err = JsonRpcError::missing_required_client_capability(required);
+        assert_eq!(
+            err.code,
+            McpErrorCode::MissingRequiredClientCapability.code()
+        );
+        let data = err.data.expect("data must be present");
+        assert_eq!(
+            data,
+            serde_json::json!({
+                "requiredCapabilities": {
+                    "sampling": {}
+                }
+            })
+        );
     }
 
     // =========================================================================

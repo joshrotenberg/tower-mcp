@@ -50,7 +50,8 @@ use tower_service::Service;
 use crate::context::RequestContext;
 use crate::error::{Error, Result, ResultExt};
 use crate::protocol::{
-    CallToolResult, TaskSupportMode, ToolAnnotations, ToolDefinition, ToolExecution, ToolIcon,
+    CallToolResult, ClientCapabilities, TaskSupportMode, ToolAnnotations, ToolDefinition,
+    ToolExecution, ToolIcon,
 };
 
 // =============================================================================
@@ -488,6 +489,9 @@ pub struct Tool {
     pub annotations: Option<ToolAnnotations>,
     /// Task support mode for this tool
     pub task_support: TaskSupportMode,
+    /// Client capabilities required to invoke this tool in the modern
+    /// per-request protocol.
+    pub(crate) required_client_capabilities: Option<ClientCapabilities>,
     /// The boxed service that executes the tool
     pub(crate) service: BoxToolService,
     /// JSON Schema for the tool's input
@@ -504,6 +508,10 @@ impl std::fmt::Debug for Tool {
             .field("icons", &self.icons)
             .field("annotations", &self.annotations)
             .field("task_support", &self.task_support)
+            .field(
+                "required_client_capabilities",
+                &self.required_client_capabilities,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -523,6 +531,7 @@ impl Clone for Tool {
             icons: self.icons.clone(),
             annotations: self.annotations.clone(),
             task_support: self.task_support,
+            required_client_capabilities: self.required_client_capabilities.clone(),
             service: self.service.clone(),
             input_schema: self.input_schema.clone(),
         }
@@ -587,6 +596,23 @@ impl Tool {
             // Service is Infallible, so unwrap is safe
             service.oneshot(ToolRequest::new(ctx, args)).await.unwrap()
         })
+    }
+
+    /// Require the given client capability shape before this tool may be
+    /// invoked using the modern per-request protocol.
+    ///
+    /// Required objects are matched recursively. For example, requiring
+    /// `ClientCapabilities { sampling: Some(Default::default()), .. }`
+    /// accepts any advertised `sampling` capability, including one with
+    /// additional optional fields.
+    pub fn require_client_capabilities(mut self, required: ClientCapabilities) -> Self {
+        self.required_client_capabilities = Some(required);
+        self
+    }
+
+    /// Return the client capability shape required by this tool, if any.
+    pub fn required_client_capabilities(&self) -> Option<&ClientCapabilities> {
+        self.required_client_capabilities.as_ref()
     }
 
     /// Apply a guard to this built tool.
@@ -667,6 +693,7 @@ impl Tool {
             icons: self.icons.clone(),
             annotations: self.annotations.clone(),
             task_support: self.task_support,
+            required_client_capabilities: self.required_client_capabilities.clone(),
             service: self.service.clone(),
             input_schema: self.input_schema.clone(),
         }
@@ -699,6 +726,7 @@ impl Tool {
             icons,
             annotations,
             task_support,
+            required_client_capabilities: None,
             service,
             input_schema,
         }
@@ -1402,6 +1430,7 @@ where
             icons: self.icons,
             annotations: self.annotations,
             task_support: self.task_support,
+            required_client_capabilities: None,
             service,
             input_schema,
         }
@@ -1575,6 +1604,7 @@ where
             icons: self.icons,
             annotations: self.annotations,
             task_support: self.task_support,
+            required_client_capabilities: None,
             service,
             input_schema,
         }

@@ -90,7 +90,7 @@ jobs:
             -H "Content-Type: application/json" \
             -H "MCP-Protocol-Version: 2026-07-28" \
             -H "Mcp-Method: server/discover" \
-            -d '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{}}' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}' \
             -D /tmp/discover-headers.txt \
             -o /tmp/discover-body.json
           response=$(cat /tmp/discover-body.json)
@@ -111,17 +111,20 @@ jobs:
           fi
           echo "PASS: server/discover response does not include mcp-session-id header"
 
-      - name: Check stateless tools/call without _meta (#862)
+      - name: Check final request without _meta is rejected (#952)
         run: |
-          response=$(curl -s -X POST http://127.0.0.1:3001/mcp \
+          http_status=$(curl -s -o /tmp/missing-meta.json -w "%{http_code}" \
+            -X POST http://127.0.0.1:3001/mcp \
             -H "Content-Type: application/json" \
             -H "MCP-Protocol-Version: 2026-07-28" \
             -H "Mcp-Method: tools/call" \
             -H "Mcp-Name: test_simple_text" \
             -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"test_simple_text","arguments":{}}}')
+          response=$(cat /tmp/missing-meta.json)
           echo "stateless tools/call response: $response"
-          echo "$response" | grep -q '"result"' || { echo "FAIL: no result field"; exit 1; }
-          echo "PASS: stateless tools/call succeeded"
+          test "$http_status" = "400" || { echo "FAIL: expected HTTP 400, got $http_status"; exit 1; }
+          echo "$response" | grep -q -- '-32602' || { echo "FAIL: expected InvalidParams (-32602)"; exit 1; }
+          echo "PASS: missing final request metadata rejected"
 
       - name: Check test_per_request_meta with _meta block (#870)
         run: |
@@ -147,88 +150,40 @@ jobs:
           echo "$response" | grep -q 'test-client' || { echo "FAIL: client_name not reflected"; exit 1; }
           echo "PASS: per-request _meta threaded to handler"
 
-      - name: Check test_per_request_meta without _meta returns no meta (#870)
+      - name: Check test_per_request_meta without _meta is rejected (#952)
         run: |
-          response=$(curl -s -X POST http://127.0.0.1:3001/mcp \
+          http_status=$(curl -s -o /tmp/no-meta.json -w "%{http_code}" \
+            -X POST http://127.0.0.1:3001/mcp \
             -H "Content-Type: application/json" \
             -H "MCP-Protocol-Version: 2026-07-28" \
             -H "Mcp-Method: tools/call" \
             -H "Mcp-Name: test_per_request_meta" \
             -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"test_per_request_meta","arguments":{}}}')
+          response=$(cat /tmp/no-meta.json)
           echo "no-meta response: $response"
-          echo "$response" | grep -q '"no meta"' || { echo "FAIL: expected 'no meta' text"; exit 1; }
-          echo "PASS: absent _meta returns 'no meta'"
+          test "$http_status" = "400" || { echo "FAIL: expected HTTP 400, got $http_status"; exit 1; }
+          echo "$response" | grep -q -- '-32602' || { echo "FAIL: expected InvalidParams (-32602)"; exit 1; }
+          echo "PASS: absent required _meta is rejected"
 
       - name: Check subscriptions/listen opens SSE stream with 2026-07-28 (#868)
         run: |
-          # Step 1: establish a 2025-11-25 session to get an mcp-session-id.
-          # (2026-07-28 initialize is stateless and returns no session ID.)
-          curl -s -X POST http://127.0.0.1:3001/mcp \
-            -H "Content-Type: application/json" \
-            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"ci-test","version":"1.0"},"capabilities":{}}}' \
-            -D /tmp/init-headers.txt \
-            -o /tmp/init-body.json
-          session_id=$(grep -i "mcp-session-id" /tmp/init-headers.txt | awk '{print $2}' | tr -d '\r')
-          echo "Session ID: $session_id"
-          if [ -z "$session_id" ]; then
-            echo "FAIL: no mcp-session-id in initialize response"
-            cat /tmp/init-headers.txt
-            exit 1
-          fi
-
-          # Step 1b: send notifications/initialized to complete the handshake.
-          # The server enforces this before accepting tool/resource requests.
-          curl -s -X POST http://127.0.0.1:3001/mcp \
-            -H "Content-Type: application/json" \
-            -H "mcp-session-id: $session_id" \
-            -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
-            -o /dev/null
-
-          # Step 2: open subscriptions/listen SSE stream in the background, capture output.
-          # Sending MCP-Protocol-Version: 2026-07-28 on the request overrides the
-          # session's negotiated version and enables the SSE stream.
-          curl -s --max-time 5 \
+          # The final stream is sessionless. Capture the first SSE frame; curl
+          # times out because the subscription intentionally remains open.
+          curl -sN --max-time 2 \
             -X POST http://127.0.0.1:3001/mcp \
             -H "Content-Type: application/json" \
             -H "MCP-Protocol-Version: 2026-07-28" \
             -H "Mcp-Method: subscriptions/listen" \
             -H "Accept: text/event-stream" \
-            -H "mcp-session-id: $session_id" \
-            -d '{"jsonrpc":"2.0","id":5,"method":"subscriptions/listen","params":{}}' \
-            -o /tmp/sse-stream.txt &
-          SSE_PID=$!
-          sleep 1
-
-          # Step 3: confirm SSE stream content-type (via a parallel content-type probe).
-          content_type=$(curl -s -o /dev/null -w "%{content_type}" \
-            --max-time 3 \
-            -X POST http://127.0.0.1:3001/mcp \
-            -H "Content-Type: application/json" \
-            -H "MCP-Protocol-Version: 2026-07-28" \
-            -H "Mcp-Method: subscriptions/listen" \
-            -H "Accept: text/event-stream" \
-            -d '{"jsonrpc":"2.0","id":6,"method":"subscriptions/listen","params":{}}' || true)
-          echo "subscriptions/listen Content-Type: $content_type"
-          echo "$content_type" | grep -q "text/event-stream" || { echo "FAIL: expected text/event-stream"; kill $SSE_PID 2>/dev/null; exit 1; }
-          echo "PASS: subscriptions/listen returns SSE stream for 2026-07-28"
-
-          # Step 4: trigger log notifications on the established session.
-          # test_tool_with_logging sends three log notifications via ctx.send_log().
-          curl -s -X POST http://127.0.0.1:3001/mcp \
-            -H "Content-Type: application/json" \
-            -H "Mcp-Method: tools/call" \
-            -H "Mcp-Name: test_tool_with_logging" \
-            -H "mcp-session-id: $session_id" \
-            -d '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"test_tool_with_logging","arguments":{}}}' \
-            -o /dev/null
-          sleep 1
-
-          # Step 5: verify at least one SSE data line arrived.
-          kill $SSE_PID 2>/dev/null || true
+            -d '{"jsonrpc":"2.0","id":5,"method":"subscriptions/listen","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}},"notifications":{"toolsListChanged":true}}}' \
+            -D /tmp/sse-headers.txt \
+            -o /tmp/sse-stream.txt || true
+          grep -qi "content-type: text/event-stream" /tmp/sse-headers.txt || { echo "FAIL: expected text/event-stream"; exit 1; }
           echo "SSE stream output:"
           cat /tmp/sse-stream.txt
-          grep -q "^data:" /tmp/sse-stream.txt || { echo "FAIL: no data: lines in SSE stream"; exit 1; }
-          echo "PASS: notification event appeared in subscriptions/listen SSE stream"
+          grep -q '"notifications/subscriptions/acknowledged"' /tmp/sse-stream.txt || { echo "FAIL: missing acknowledgment"; exit 1; }
+          grep -q '"io.modelcontextprotocol/subscriptionId":5' /tmp/sse-stream.txt || { echo "FAIL: missing subscription ID"; exit 1; }
+          echo "PASS: subscriptions/listen returned its tagged acknowledgment"
 
       - name: Check subscriptions/listen returns JSON-RPC error without 2026-07-28 (#868)
         run: |

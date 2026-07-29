@@ -134,7 +134,7 @@ async fn stateless_v2026_discover_returns_supported_versions_no_session() {
         .header("Mcp-Protocol-Version", "2026-07-28")
         .header("Mcp-Method", "server/discover")
         .body(Body::from(
-            r#"{"jsonrpc":"2.0","id":1,"method":"server/discover"}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#,
         ))
         .unwrap();
     let response = app.oneshot(req).await.unwrap();

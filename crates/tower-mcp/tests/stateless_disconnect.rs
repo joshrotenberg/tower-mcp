@@ -96,7 +96,14 @@ async fn stateless_client_disconnect_cancels_in_flight_handler() {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "tools/call",
-        "params": {"name": "slow", "arguments": {}}
+        "params": {
+            "name": "slow",
+            "arguments": {},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        }
     })
     .to_string();
 
@@ -165,7 +172,14 @@ async fn stateless_normal_completion_does_not_cancel() {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "tools/call",
-        "params": {"name": "fast", "arguments": {}}
+        "params": {
+            "name": "fast",
+            "arguments": {},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        }
     })
     .to_string();
 

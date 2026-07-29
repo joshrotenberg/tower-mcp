@@ -65,6 +65,32 @@ fn task_store_error(e: TaskStoreError) -> Error {
     )))
 }
 
+/// Return whether `actual` contains every field and value in `required`.
+///
+/// Client capability objects are extensible, so extra advertised properties
+/// must not cause a required-capability check to fail.
+#[cfg(feature = "stateless")]
+fn json_value_contains(actual: &serde_json::Value, required: &serde_json::Value) -> bool {
+    match (actual, required) {
+        (serde_json::Value::Object(actual), serde_json::Value::Object(required)) => {
+            required.iter().all(|(key, value)| {
+                actual
+                    .get(key)
+                    .is_some_and(|a| json_value_contains(a, value))
+            })
+        }
+        _ => actual == required,
+    }
+}
+
+#[cfg(feature = "stateless")]
+fn client_capabilities_satisfy(actual: &ClientCapabilities, required: &ClientCapabilities) -> bool {
+    let actual = serde_json::to_value(actual).expect("ClientCapabilities is always serializable");
+    let required =
+        serde_json::to_value(required).expect("ClientCapabilities is always serializable");
+    json_value_contains(&actual, &required)
+}
+
 /// Apply pagination to a collected list of items.
 ///
 /// Returns the page of items and an optional `next_cursor`.
@@ -2030,6 +2056,24 @@ impl McpRouter {
                         "tool call completed"
                     );
                     return Err(filter.denial_error(&params.name));
+                }
+
+                // Final 2026-07-28 requests declare client capabilities on
+                // every request. Reject a tool before any handler work begins
+                // when its declared requirement is not present.
+                #[cfg(feature = "stateless")]
+                if let Some(required) = tool.required_client_capabilities()
+                    && let Some(meta) = extensions.get::<crate::stateless::StatelessRequestMeta>()
+                    && meta.protocol_version.as_deref()
+                        == Some(crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION)
+                    && !meta
+                        .client_capabilities
+                        .as_ref()
+                        .is_some_and(|actual| client_capabilities_satisfy(actual, required))
+                {
+                    return Err(Error::JsonRpc(
+                        JsonRpcError::missing_required_client_capability(required.clone()),
+                    ));
                 }
 
                 if let Some(task_params) = params.task {

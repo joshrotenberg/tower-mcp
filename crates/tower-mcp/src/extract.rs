@@ -1061,6 +1061,7 @@ where
             icons: self.icons,
             annotations: self.annotations,
             task_support: self.task_support,
+            required_client_capabilities: None,
             service,
             input_schema: self.input_schema,
         }
@@ -1185,6 +1186,7 @@ where
             icons: self.icons,
             annotations: self.annotations,
             task_support: self.task_support,
+            required_client_capabilities: None,
             service,
             input_schema: self.input_schema,
         }
@@ -1289,6 +1291,7 @@ where
             icons: self.icons,
             annotations: self.annotations,
             task_support: self.task_support,
+            required_client_capabilities: None,
             service,
             input_schema,
         }

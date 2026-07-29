@@ -113,6 +113,7 @@ pub mod testing;
 
 // Convenience re-exports
 pub use error::{
-    BoxError, Error, ErrorCode, JsonRpcError, McpErrorCode, Result, ResultExt, ToolError,
+    BoxError, Error, ErrorCode, JsonRpcError, McpErrorCode, MissingRequiredClientCapabilityData,
+    Result, ResultExt, ToolError,
 };
 pub use protocol::{CallToolResult, Content, GetPromptResult, ReadResourceResult};

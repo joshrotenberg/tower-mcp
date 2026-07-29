@@ -2,8 +2,7 @@
 //!
 //! `subscriptions/listen` opens a server-to-client notification stream over HTTP
 //! POST. The server responds with `Content-Type: text/event-stream` (SSE)
-//! when the negotiated or requested protocol version is >= 2026-07-28
-//! (the UPCOMING_PROTOCOL_VERSION). Requests that target an older-protocol
+//! for the final 2026-07-28 protocol. Requests that target an older-protocol
 //! server receive a JSON-RPC `Method Not Found` (-32601) error instead.
 
 #![cfg(feature = "http")]
@@ -32,7 +31,7 @@ fn app() -> axum::Router {
         .into_router()
 }
 
-/// POST a `subscriptions/listen` request with the given `Mcp-Protocol-Version` header.
+/// POST a `subscriptions/listen` request with the given protocol version.
 async fn post_subscriptions_listen(protocol_version: Option<&str>) -> axum::response::Response {
     let mut builder = Request::builder()
         .method("POST")
@@ -41,12 +40,31 @@ async fn post_subscriptions_listen(protocol_version: Option<&str>) -> axum::resp
         .header("Accept", "application/json, text/event-stream");
 
     if let Some(v) = protocol_version {
-        builder = builder.header("Mcp-Protocol-Version", v);
+        builder = builder
+            .header("Mcp-Protocol-Version", v)
+            .header("Mcp-Method", "subscriptions/listen");
     }
 
+    let params = if let Some(version) = protocol_version {
+        serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": version,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            },
+            "notifications": {}
+        })
+    } else {
+        serde_json::json!({})
+    };
     let request = builder
         .body(Body::from(
-            r#"{"jsonrpc":"2.0","id":1,"method":"subscriptions/listen","params":{}}"#,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "subscriptions/listen",
+                "params": params
+            })
+            .to_string(),
         ))
         .unwrap();
 
@@ -54,6 +72,7 @@ async fn post_subscriptions_listen(protocol_version: Option<&str>) -> axum::resp
 }
 
 #[tokio::test]
+#[cfg(feature = "stateless")]
 async fn subscriptions_listen_returns_sse_when_protocol_is_2026_07_28() {
     // Clients that request protocol 2026-07-28 get an SSE stream back.
     let response = post_subscriptions_listen(Some("2026-07-28")).await;
@@ -131,54 +150,23 @@ async fn subscriptions_listen_returns_method_not_found_for_old_protocol() {
     );
 }
 
-/// Initialize with 2025-11-25 (creates a session), then POST `subscriptions/listen`
-/// with a per-request `Mcp-Protocol-Version: 2026-07-28` header.
-///
-/// This exercises the header-override branch in `handle_post`: the session was
-/// negotiated at 2025-11-25, but the per-request header promotes the effective
-/// version to 2026-07-28, which enables the SSE path.
+/// Legacy session and replay headers are ignored by the sessionless final
+/// protocol.
 #[cfg(feature = "stateless")]
 #[tokio::test]
-async fn subscriptions_listen_via_session_with_header_override() {
+async fn subscriptions_listen_ignores_legacy_session_headers() {
     let a = app();
-
-    // Step 1: initialize with 2025-11-25 to create a session.
-    let init_request = Request::builder()
-        .method("POST")
-        .uri("/")
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json, text/event-stream")
-        .body(Body::from(
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}"#,
-        ))
-        .unwrap();
-
-    let init_resp = a.clone().oneshot(init_request).await.unwrap();
-    assert_eq!(
-        init_resp.status(),
-        StatusCode::OK,
-        "initialize must succeed"
-    );
-
-    let session_id = init_resp
-        .headers()
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .expect("initialize response must include mcp-session-id header");
-
-    // Step 2: POST subscriptions/listen with session ID + Mcp-Protocol-Version: 2026-07-28.
-    // The session is at 2025-11-25 but the per-request header overrides the
-    // effective version to 2026-07-28, so the server should return SSE.
     let listen_request = Request::builder()
         .method("POST")
         .uri("/")
         .header("Content-Type", "application/json")
         .header("Accept", "application/json, text/event-stream")
-        .header("mcp-session-id", &session_id)
+        .header("mcp-session-id", "legacy-session-that-does-not-exist")
+        .header("last-event-id", "legacy-event")
         .header("Mcp-Protocol-Version", "2026-07-28")
+        .header("Mcp-Method", "subscriptions/listen")
         .body(Body::from(
-            r#"{"jsonrpc":"2.0","id":2,"method":"subscriptions/listen","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"subscriptions/listen","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}},"notifications":{"toolsListChanged":true}}}"#,
         ))
         .unwrap();
 
@@ -186,7 +174,7 @@ async fn subscriptions_listen_via_session_with_header_override() {
     assert_eq!(
         listen_resp.status(),
         StatusCode::OK,
-        "subscriptions/listen with header override must return 200"
+        "final subscriptions/listen must ignore legacy session state"
     );
 
     let content_type = listen_resp
@@ -196,27 +184,38 @@ async fn subscriptions_listen_via_session_with_header_override() {
         .unwrap_or("");
     assert!(
         content_type.contains("text/event-stream"),
-        "expected Content-Type: text/event-stream for session+header override, got: {content_type}"
+        "expected Content-Type: text/event-stream, got: {content_type}"
     );
+}
+
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn subscriptions_listen_requires_notification_filter() {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("Mcp-Protocol-Version", "2026-07-28")
+        .header("Mcp-Method", "subscriptions/listen")
+        .body(Body::from(
+            r#"{"jsonrpc":"2.0","id":3,"method":"subscriptions/listen","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#,
+        ))
+        .unwrap();
+    let response = app().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["id"], 3);
+    assert_eq!(body["error"]["code"], -32602);
 }
 
 /// Exercise the pure session-fallback branch (no header, session carries version).
 ///
-/// With the `stateless` feature enabled, a 2026-07-28 initialize creates a
-/// stateless session (no persisted record). With `stateless` disabled the
-/// router negotiates the version down to `LATEST_PROTOCOL_VERSION` (2025-11-25)
-/// because 2026-07-28 is not yet in `SUPPORTED_PROTOCOL_VERSIONS`. In either
-/// case the session record does not carry 2026-07-28 after a standard
-/// `initialize` handshake, so the pure headerless fallback path cannot be
-/// exercised through the HTTP API without the per-request header override.
-///
-/// The header-override test (`subscriptions_listen_via_session_with_header_override`)
-/// covers the adjacent code path; this placeholder documents the gap.
-///
-/// If 2026-07-28 is promoted to `SUPPORTED_PROTOCOL_VERSIONS`, this test can
-/// be filled in: initialize without the stateless feature, capture the session
-/// ID, and POST `subscriptions/listen` with only the session ID header (no
-/// `Mcp-Protocol-Version`).
+/// Without final-protocol support compiled in, the legacy routing behavior
+/// remains MethodNotFound.
 #[cfg(not(feature = "stateless"))]
 #[tokio::test]
 async fn subscriptions_listen_session_fallback_placeholder() {

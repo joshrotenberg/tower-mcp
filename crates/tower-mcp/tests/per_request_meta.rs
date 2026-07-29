@@ -46,13 +46,23 @@ async fn call_tool(body: serde_json::Value) -> (serde_json::Value, Captured) {
     let app = HttpTransport::new(router(captured.clone()))
         .disable_origin_validation()
         .into_router();
-    let req = Request::builder()
+    let mut request = Request::builder()
         .method("POST")
         .uri("/")
         .header("Content-Type", "application/json")
-        .header("Accept", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
+        .header("Accept", "application/json");
+    if body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"]
+        == tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION
+    {
+        request = request.header(
+            "Mcp-Protocol-Version",
+            tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION,
+        );
+        request = request
+            .header("Mcp-Method", "tools/call")
+            .header("Mcp-Name", "inspect_meta");
+    }
+    let req = request.body(Body::from(body.to_string())).unwrap();
     let response = app.oneshot(req).await.unwrap();
     assert!(
         response.status().is_success(),
@@ -205,7 +215,9 @@ async fn session_path_stashes_per_request_meta() {
         .unwrap();
     app.clone().oneshot(notif_req).await.unwrap();
 
-    // tools/call with session header AND _meta in the body.
+    // tools/call with session header AND legacy-compatible _meta in the body.
+    // The final protocolVersion marker is intentionally omitted: its
+    // presence opts the request into the final sessionless lifecycle.
     let tool_req = Request::builder()
         .method("POST")
         .uri("/")
@@ -221,7 +233,6 @@ async fn session_path_stashes_per_request_meta() {
                     "name": "inspect_meta",
                     "arguments": {},
                     "_meta": {
-                        "io.modelcontextprotocol/protocolVersion": "2025-11-25",
                         "io.modelcontextprotocol/clientInfo": {
                             "name": "session-client",
                             "version": "0.1"
@@ -252,11 +263,7 @@ async fn session_path_stashes_per_request_meta() {
         .unwrap()
         .clone()
         .expect("session-based path must stash per-request meta on the handler context");
-    assert_eq!(
-        meta.protocol_version.as_deref(),
-        Some("2025-11-25"),
-        "handler must see protocol_version from session-based _meta"
-    );
+    assert!(meta.protocol_version.is_none());
     let info = meta
         .client_info
         .expect("clientInfo must be threaded through");
