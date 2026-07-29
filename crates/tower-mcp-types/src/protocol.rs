@@ -3837,7 +3837,16 @@ pub struct ElicitUrlParams {
     /// The elicitation mode (defaults to url if not specified)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<ElicitMode>,
-    /// Unique ID for this elicitation (opaque to client)
+    /// Unique ID for this elicitation (opaque to client).
+    ///
+    /// **2025-11-25 and earlier only.** The final 2026-07-28 schema removes
+    /// this field: MRTR (SEP-2322, not yet implemented -- see #950) replaces
+    /// the completion-notification-plus-ID pattern with a request retry, so
+    /// there is no longer a standalone async completion to correlate. This
+    /// field stays required and unconditionally sent for now, since this
+    /// crate does not yet distinguish 2026-07-28 elicitation requests from
+    /// 2025-11-25 ones -- see [`ElicitationCompleteParams`] for the paired
+    /// notification this ID was meant to correlate with.
     pub elicitation_id: String,
     /// Message explaining why the user needs to navigate to the URL
     pub message: String,
@@ -4388,7 +4397,20 @@ pub enum ElicitFieldValue {
     StringArray(Vec<String>),
 }
 
-/// Parameters for elicitation complete notification
+/// Parameters for elicitation complete notification.
+///
+/// **2025-11-25 and earlier only.** The final 2026-07-28 schema removes this
+/// notification (and the `elicitationId` field of URL-mode elicitation, see
+/// [`ElicitUrlParams::elicitation_id`]) -- not deprecated, removed outright,
+/// unlike Roots/Sampling/Logging's SEP-2577 12-month deprecation window.
+/// Under [Multi Round-Trip Requests](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2322)
+/// (SEP-2322, not yet implemented by this crate -- see #950), the client
+/// learns the outcome of an out-of-band interaction by retrying the original
+/// request rather than receiving a server-initiated completion signal, so
+/// the correlating ID this type carries no longer fits the protocol.
+/// tower-mcp does not currently send or handle this notification on any
+/// path; this type exists for callers constructing it directly against the
+/// 2025-11-25 wire format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ElicitationCompleteParams {
