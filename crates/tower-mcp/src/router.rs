@@ -1732,6 +1732,7 @@ impl McpRouter {
     /// HTTP transport validation uses this before dispatch to enforce
     /// SEP-2243 `x-mcp-header` mappings. Static tools take precedence over
     /// dynamic tools, matching `tools/list` and `tools/call`.
+    #[cfg(feature = "http")]
     pub(crate) fn tool_input_schema(&self, name: &str) -> Option<serde_json::Value> {
         if let Some(tool) = self.inner.tools.get(name) {
             return Some(tool.input_schema.clone());
