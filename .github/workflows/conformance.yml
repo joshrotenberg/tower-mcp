@@ -318,7 +318,7 @@ jobs:
           # conformance-baseline-draft.yml, one entry per parity-roadmap
           # phase issue (#929); the job fails on unexpected failures OR on
           # stale baseline entries that started passing.
-          npx @modelcontextprotocol/conformance@0.2.0-alpha.9 server \
+          npx @modelcontextprotocol/conformance@0.2.0-alpha.10 server \
             --url http://127.0.0.1:3001/mcp \
             --spec-version 2026-07-28 \
             --suite all \
@@ -355,7 +355,7 @@ jobs:
           # Actions default bash already sets it; stated here because the
           # gating depends on it).
           set -o pipefail
-          npx @modelcontextprotocol/conformance@0.2.0-alpha.9 client \
+          npx @modelcontextprotocol/conformance@0.2.0-alpha.10 client \
             --suite all \
             --spec-version 2026-07-28 \
             --command "cargo run --manifest-path examples/conformance-client/Cargo.toml --" \

@@ -7,9 +7,11 @@
 # as the gaps close; CI fails when a baselined scenario starts passing (stale
 # entry) or a non-baselined scenario fails.
 #
-# Status at 0.2.0-alpha.9 (2026-07-27): 171/213 checks pass; 3/32 scenarios
-# fully green (auth/pre-registration, auth/resource-mismatch,
-# json-schema-ref-no-deref), 29 baselined.
+# Status at 0.2.0-alpha.10 (2026-07-29, re-baselined after the 2026-07-28
+# protocol finalization): 171/213 checks pass; 3/32 scenarios fully green
+# (auth/pre-registration, auth/resource-mismatch, json-schema-ref-no-deref),
+# 29 baselined. Identical scenario set to alpha.9; no regressions or new
+# passes from finalization.
 #
 # Format (0.2.x suite): plain scenario-name strings under the `client:` key;
 # reasons live in these comments.

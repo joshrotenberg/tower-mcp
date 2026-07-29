@@ -7,8 +7,12 @@
 # Remove entries as the phases land; CI fails when a baselined scenario
 # starts passing (stale entry) or a non-baselined scenario fails.
 #
-# Status at 0.2.0-alpha.9 (2026-07-23, after the quick-wins PR): 66/102 checks
-# pass; 28/40 scenarios fully green (12 baselined).
+# Status at 0.2.0-alpha.10 (2026-07-28, re-baselined after the 2026-07-28
+# protocol finalization): 67/101 checks pass; 28/40 scenarios fully green
+# (10 baselined). No regressions from finalization; two formerly warning-only
+# entries (input-required-result-missing-input-response and
+# input-required-result-ignore-extra-params) now pass cleanly and were
+# dropped from this file.
 #
 # Format (0.2.x suite): plain scenario-name strings under `server:` /
 # `client:` keys; reasons live in these comments.
@@ -30,17 +34,14 @@ server:
 
   # SEP-2322 MRTR is not implemented (#950). Scenarios that fully pass do so
   # because correct non-MRTR behavior (rejecting unsupported methods)
-  # coincides with the spec; the two warning-only entries below also need
-  # the MRTR fixture tools.
+  # coincides with the spec.
   - input-required-result-basic-elicitation
   - input-required-result-basic-sampling
   - input-required-result-basic-list-roots
   - input-required-result-request-state
   - input-required-result-multiple-input-requests
   - input-required-result-multi-round
-  - input-required-result-missing-input-response
   - input-required-result-non-tool-request
   - input-required-result-result-type
   - input-required-result-tampered-state
   - input-required-result-capability-check
-  - input-required-result-ignore-extra-params

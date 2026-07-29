@@ -6,7 +6,7 @@
 - **Spec version**: 2025-11-25 (plus the 2026-07-28 draft behind the `stateless` feature)
 - **Server conformance (2025-11-25)**: 39/39
 - **Client conformance (2025-11-25)**: 264/266 (two offline-access gaps, tracked in #953)
-- **Server conformance (2026-07-28 draft)**: 66/102 (gaps baselined, tracked in #929)
+- **Server conformance (2026-07-28)**: 67/101 (gaps baselined, tracked in #929)
 - **MSRV**: 1.90 (Rust 2024 edition)
 
 ## SDK Tier Assessment
