@@ -1885,27 +1885,31 @@ impl McpRouter {
                 // so clients can pick one and signal it via MCP-Protocol-Version
                 // on subsequent requests.
                 tracing::debug!("Stateless server/discover request");
+                let server_info = Implementation {
+                    name: self.inner.server_name.clone(),
+                    version: self.inner.server_version.clone(),
+                    title: self.inner.server_title.clone(),
+                    description: self.inner.server_description.clone(),
+                    icons: self.inner.server_icons.clone(),
+                    website_url: self.inner.server_website_url.clone(),
+                    meta: None,
+                };
                 Ok(McpResponse::Discover(DiscoverResult {
                     supported_versions: crate::protocol::SUPPORTED_PROTOCOL_VERSIONS
                         .iter()
                         .map(|v| (*v).to_string())
                         .collect(),
                     capabilities: self.capabilities(),
-                    server_info: Implementation {
-                        name: self.inner.server_name.clone(),
-                        version: self.inner.server_version.clone(),
-                        title: self.inner.server_title.clone(),
-                        description: self.inner.server_description.clone(),
-                        icons: self.inner.server_icons.clone(),
-                        website_url: self.inner.server_website_url.clone(),
-                        meta: None,
-                    },
+                    ttl_ms: None,
+                    cache_scope: None,
                     instructions: if let Some(config) = &self.inner.auto_instructions {
                         Some(self.inner.generate_instructions(config))
                     } else {
                         self.inner.instructions.clone()
                     },
-                    meta: None,
+                    meta: Some(crate::protocol::ResultMeta {
+                        server_info: Some(server_info),
+                    }),
                 }))
             }
 
@@ -7072,13 +7076,14 @@ mod tests {
                     .expect("result.supportedVersions must be an array");
                 assert!(!versions.is_empty(), "supportedVersions must not be empty");
 
-                // serverInfo.name must match what we configured.
+                // Server identity lives in _meta, not the result body (SEP-2575 final).
                 assert_eq!(
-                    r.result["serverInfo"]["name"], "unit-test-server",
+                    r.result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+                    "unit-test-server",
                     "serverInfo.name must match configured value"
                 );
                 assert_eq!(
-                    r.result["serverInfo"]["version"], "4.2.0",
+                    r.result["_meta"]["io.modelcontextprotocol/serverInfo"]["version"], "4.2.0",
                     "serverInfo.version must match configured value"
                 );
 

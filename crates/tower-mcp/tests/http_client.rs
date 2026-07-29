@@ -2550,7 +2550,7 @@ mod stateless_tests {
         let body: serde_json::Value = resp.json().await.unwrap();
         let result = &body["result"];
         assert!(result["supportedVersions"].is_array());
-        assert!(result["serverInfo"]["name"].is_string());
+        assert!(result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"].is_string());
         assert!(result["capabilities"].is_object());
     }
 }

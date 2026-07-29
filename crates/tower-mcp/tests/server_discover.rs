@@ -71,8 +71,14 @@ async fn discover_returns_supported_versions_and_server_info() {
         versions.iter().all(|v| v.is_string()),
         "supportedVersions entries must be strings"
     );
-    assert_eq!(result["serverInfo"]["name"], "discover-test-server");
-    assert_eq!(result["serverInfo"]["version"], "9.9.9");
+    assert_eq!(
+        result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+        "discover-test-server"
+    );
+    assert_eq!(
+        result["_meta"]["io.modelcontextprotocol/serverInfo"]["version"],
+        "9.9.9"
+    );
     assert!(
         result.get("protocolVersion").is_none(),
         "server/discover must NOT include singular protocolVersion -- that's the initialize shape: {result}"

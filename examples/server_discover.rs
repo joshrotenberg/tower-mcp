@@ -179,14 +179,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The result uses supportedVersions (plural), NOT protocolVersion (singular).
     // That is the key structural difference from initialize.
     let result = &discover_body["result"];
+    // Server identity now lives in _meta, not the result body (SEP-2575 final).
+    let server_info = &result["_meta"]["io.modelcontextprotocol/serverInfo"];
     println!("Server info:");
-    println!(
-        "  name:    {}",
-        result["serverInfo"]["name"].as_str().unwrap_or("?")
-    );
+    println!("  name:    {}", server_info["name"].as_str().unwrap_or("?"));
     println!(
         "  version: {}",
-        result["serverInfo"]["version"].as_str().unwrap_or("?")
+        server_info["version"].as_str().unwrap_or("?")
     );
     println!();
 

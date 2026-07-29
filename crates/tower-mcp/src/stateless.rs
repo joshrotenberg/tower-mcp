@@ -393,27 +393,33 @@ mod tests {
 
     #[test]
     fn test_discover_result_serialization() {
-        use crate::protocol::{Implementation, ServerCapabilities};
+        use crate::protocol::{Implementation, ResultMeta, ServerCapabilities};
 
         let result = DiscoverResult {
             supported_versions: vec!["2025-11-25".to_string(), "2025-03-26".to_string()],
             capabilities: ServerCapabilities::default(),
-            server_info: Implementation {
-                name: "test-server".to_string(),
-                version: "1.0.0".to_string(),
-                title: None,
-                description: None,
-                icons: None,
-                website_url: None,
-                meta: None,
-            },
+            ttl_ms: None,
+            cache_scope: None,
             instructions: Some("Test instructions".to_string()),
-            meta: None,
+            meta: Some(ResultMeta {
+                server_info: Some(Implementation {
+                    name: "test-server".to_string(),
+                    version: "1.0.0".to_string(),
+                    title: None,
+                    description: None,
+                    icons: None,
+                    website_url: None,
+                    meta: None,
+                }),
+            }),
         };
 
         let json = serde_json::to_value(&result).unwrap();
         assert!(json["supportedVersions"].is_array());
-        assert_eq!(json["serverInfo"]["name"], "test-server");
+        assert_eq!(
+            json["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            "test-server"
+        );
     }
 
     #[test]

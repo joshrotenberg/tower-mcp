@@ -1623,7 +1623,15 @@ pub struct DiscoverParams {}
 /// replaced by `supported_versions` -- a `server/discover` call is
 /// version-independent, so the server enumerates every version it can
 /// speak and the client picks.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The final 2026-07-28 schema dropped the `serverInfo` body field (server
+/// identity now lives in `_meta["io.modelcontextprotocol/serverInfo"]`, via
+/// [`ResultMeta`]) and made this a [`CacheableResult`]-shaped type. This
+/// crate keeps `ttl_ms`/`cache_scope` as `Option` rather than the spec's
+/// required `number`/`string` -- the same "`None` means no opinion"
+/// convention used by every other cacheable result in this file (see
+/// [`CacheScope`]) -- rather than a one-off required-field type here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoverResult {
     /// All protocol versions this server can speak. The client picks one
@@ -1631,14 +1639,21 @@ pub struct DiscoverResult {
     pub supported_versions: Vec<String>,
     /// Server capabilities (same shape as the `initialize` result).
     pub capabilities: ServerCapabilities,
-    /// Server implementation info.
-    pub server_info: Implementation,
+    /// SEP-2549: client-cache TTL in milliseconds for this response.
+    /// `None` means "no opinion -- client policy decides".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_ms: Option<u64>,
+    /// SEP-2549: scope the cached result applies to. `None` means scope is
+    /// unspecified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_scope: Option<CacheScope>,
     /// Optional instructions describing how to use this server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
-    /// Optional protocol-level metadata.
+    /// Protocol-level metadata. Carries server identity
+    /// (`io.modelcontextprotocol/serverInfo`) per SEP-2575.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
-    pub meta: Option<Value>,
+    pub meta: Option<ResultMeta>,
 }
 
 // =============================================================================
@@ -4881,17 +4896,20 @@ mod tests {
         let r = DiscoverResult {
             supported_versions: vec!["2026-07-28".into(), "2025-11-25".into()],
             capabilities: ServerCapabilities::default(),
-            server_info: Implementation {
-                name: "test-server".into(),
-                version: "1.0.0".into(),
-                title: None,
-                description: None,
-                icons: None,
-                website_url: None,
-                meta: None,
-            },
+            ttl_ms: None,
+            cache_scope: None,
             instructions: None,
-            meta: None,
+            meta: Some(ResultMeta {
+                server_info: Some(Implementation {
+                    name: "test-server".into(),
+                    version: "1.0.0".into(),
+                    title: None,
+                    description: None,
+                    icons: None,
+                    website_url: None,
+                    meta: None,
+                }),
+            }),
         };
         let json = serde_json::to_value(&r).unwrap();
         assert_eq!(
@@ -4902,11 +4920,30 @@ mod tests {
             json.get("protocolVersion").is_none(),
             "server/discover must use supportedVersions, not protocolVersion, got: {json}"
         );
-        assert_eq!(json["serverInfo"]["name"], "test-server");
+        assert_eq!(
+            json["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            "test-server"
+        );
         assert!(
             json.get("instructions").is_none(),
             "instructions must be omitted when None, got: {json}"
         );
+    }
+
+    #[test]
+    fn discover_result_omits_meta_ttl_and_cache_scope_when_none() {
+        let r = DiscoverResult {
+            supported_versions: vec!["2026-07-28".into()],
+            capabilities: ServerCapabilities::default(),
+            ttl_ms: None,
+            cache_scope: None,
+            instructions: None,
+            meta: None,
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert!(json.get("_meta").is_none());
+        assert!(json.get("ttlMs").is_none());
+        assert!(json.get("cacheScope").is_none());
     }
 
     // =========================================================================
