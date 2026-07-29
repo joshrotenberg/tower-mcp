@@ -152,6 +152,9 @@ async fn stateless_v2026_discover_returns_supported_versions_no_session() {
         resp["result"]["supportedVersions"].is_array(),
         "supportedVersions must be an array: {resp}"
     );
+    assert_eq!(resp["result"]["resultType"], "complete");
+    assert_eq!(resp["result"]["ttlMs"], 0);
+    assert_eq!(resp["result"]["cacheScope"], "private");
     // No session must be created for a stateless discover call.
     assert_eq!(
         handle.session_count().await,

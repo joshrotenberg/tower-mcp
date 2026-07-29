@@ -264,6 +264,7 @@ use crate::jsonrpc::JsonRpcService;
 use crate::protocol::{
     ClientCapabilities, EXPERIMENTAL_PROTOCOL_VERSION, Implementation, JsonRpcNotification,
     JsonRpcRequest, JsonRpcResponse, LATEST_PROTOCOL_VERSION, McpNotification, RequestId,
+    ResultType,
 };
 use crate::router::{McpRouter, RouterRequest, RouterResponse};
 use crate::transport::service::{
@@ -2401,6 +2402,11 @@ async fn handle_post(
 
     // Check if this is an initialize request (creates new session)
     let is_init = is_initialize_request(&parsed);
+    let request_method = parsed
+        .get("method")
+        .and_then(|method| method.as_str())
+        .unwrap_or_default()
+        .to_string();
 
     // SEP-2575 / SEP-2567: version-gated stateless mode for 2026-07-28+ clients.
     //
@@ -2573,6 +2579,7 @@ async fn handle_post(
                     {
                         *pv = serde_json::Value::String(version.clone());
                     }
+                    apply_protocol_result_fields(&mut response, &request_method, version);
                     if let Some(ref identity) = server_identity {
                         stamp_server_info(&mut response, identity);
                     }
@@ -2594,8 +2601,8 @@ async fn handle_post(
                         first_notif,
                         call,
                         notif_rx,
-                        is_init,
                         version.clone(),
+                        request_method.clone(),
                         cancel_guard,
                         server_identity,
                     );
@@ -2663,7 +2670,7 @@ async fn handle_post(
                 service = service.with_extensions(ext);
             }
 
-            let response = match service.call_single(request).await {
+            let mut response = match service.call_single(request).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     return json_rpc_error_response(
@@ -2672,6 +2679,7 @@ async fn handle_post(
                     );
                 }
             };
+            apply_protocol_result_fields(&mut response, &request_method, &version);
 
             let mut resp = if state.sse_responses {
                 sse_json_response(&response)
@@ -2969,7 +2977,7 @@ async fn handle_post(
     if !ext.is_empty() {
         service = service.with_extensions(ext);
     }
-    let response = match service.call_single(request).await {
+    let mut response = match service.call_single(request).await {
         Ok(resp) => resp,
         Err(e) => {
             return json_rpc_error_response(None, JsonRpcError::internal_error(e.to_string()));
@@ -2996,6 +3004,18 @@ async fn handle_post(
         state.sessions.save_record(&session).await;
     }
 
+    let negotiated_version = session.protocol_version.read().await.clone();
+    let response_version = if request_method == "server/discover"
+        && state
+            .protocol_support
+            .contains(EXPERIMENTAL_PROTOCOL_VERSION)
+    {
+        EXPERIMENTAL_PROTOCOL_VERSION
+    } else {
+        &negotiated_version
+    };
+    apply_protocol_result_fields(&mut response, &request_method, response_version);
+
     // Build response with headers
     let mut resp = if state.sse_responses {
         sse_json_response(&response)
@@ -3011,10 +3031,9 @@ async fn handle_post(
     }
 
     // Always include the negotiated protocol version header
-    let version = session.protocol_version.read().await;
     resp.headers_mut().insert(
         MCP_PROTOCOL_VERSION_HEADER,
-        HeaderValue::from_str(&version).unwrap(),
+        HeaderValue::from_str(&negotiated_version).unwrap(),
     );
 
     resp
@@ -3041,6 +3060,53 @@ fn version_supports_subscriptions_listen(
 #[cfg(feature = "stateless")]
 fn is_stateless_protocol_version(version: &str) -> bool {
     version == EXPERIMENTAL_PROTOCOL_VERSION
+}
+
+/// Fill the required 2026-07-28 result envelope immediately before it reaches
+/// the wire, while preserving the legacy serde representation of public result
+/// types.
+///
+/// Every successful result gets `resultType: "complete"` unless it already
+/// owns a discriminator such as `input_required` or `task`. Cacheable methods
+/// also receive conservative defaults for fields omitted by a handler/router.
+fn apply_protocol_result_fields(
+    response: &mut JsonRpcResponse,
+    method: &str,
+    protocol_version: &str,
+) {
+    if protocol_version != EXPERIMENTAL_PROTOCOL_VERSION {
+        return;
+    }
+
+    let JsonRpcResponse::Result(result) = response else {
+        return;
+    };
+    ResultType::Complete.stamp_into(&mut result.result, protocol_version);
+
+    if !is_cacheable_result_method(method) {
+        return;
+    }
+    let Some(object) = result.result.as_object_mut() else {
+        return;
+    };
+    object
+        .entry("ttlMs")
+        .or_insert_with(|| serde_json::Value::Number(0.into()));
+    object
+        .entry("cacheScope")
+        .or_insert_with(|| serde_json::Value::String("private".to_string()));
+}
+
+fn is_cacheable_result_method(method: &str) -> bool {
+    matches!(
+        method,
+        "server/discover"
+            | "tools/list"
+            | "prompts/list"
+            | "resources/list"
+            | "resources/read"
+            | "resources/templates/list"
+    )
 }
 
 /// Stamp `_meta["io.modelcontextprotocol/serverInfo"]` onto a successful
@@ -3117,8 +3183,8 @@ fn stateless_sse_with_notifications(
         Box<dyn std::future::Future<Output = crate::error::Result<JsonRpcResponse>> + Send>,
     >,
     rx: crate::context::NotificationReceiver,
-    is_init: bool,
     version: String,
+    method: String,
     cancel_guard: CancelOnDisconnect,
     server_identity: Option<Implementation>,
 ) -> Response {
@@ -3132,8 +3198,8 @@ fn stateless_sse_with_notifications(
         rx_open: bool,
         queue: std::collections::VecDeque<String>,
         terminal: Option<String>,
-        is_init: bool,
         version: String,
+        method: String,
         /// Cancels the per-request token if the client disconnects (the
         /// stream, and with it this state, is dropped) while the handler
         /// is still in flight. Disarmed once the handler resolves.
@@ -3153,8 +3219,8 @@ fn stateless_sse_with_notifications(
         rx_open: true,
         queue,
         terminal: None,
-        is_init,
         version,
+        method,
         cancel_guard,
         server_identity,
     };
@@ -3193,12 +3259,17 @@ fn stateless_sse_with_notifications(
                     let terminal_json = match result {
                         Ok(mut response) => {
                             // Same initialize version patch as the JSON path.
-                            if ctx.is_init
+                            if ctx.method == "initialize"
                                 && let JsonRpcResponse::Result(ref mut r) = response
                                 && let Some(pv) = r.result.get_mut("protocolVersion")
                             {
                                 *pv = serde_json::Value::String(ctx.version.clone());
                             }
+                            apply_protocol_result_fields(
+                                &mut response,
+                                &ctx.method,
+                                &ctx.version,
+                            );
                             if let Some(ref identity) = ctx.server_identity {
                                 stamp_server_info(&mut response, identity);
                             }
@@ -3674,6 +3745,71 @@ mod tests {
 
     fn create_test_router() -> McpRouter {
         McpRouter::new().server_info("test-server", "1.0.0")
+    }
+
+    #[test]
+    fn final_result_fields_are_method_and_version_aware() {
+        for method in [
+            "server/discover",
+            "tools/list",
+            "prompts/list",
+            "resources/list",
+            "resources/read",
+            "resources/templates/list",
+        ] {
+            let mut response =
+                JsonRpcResponse::result(RequestId::Number(1), serde_json::json!({"value": true}));
+            apply_protocol_result_fields(&mut response, method, EXPERIMENTAL_PROTOCOL_VERSION);
+            let json = serde_json::to_value(response).unwrap();
+            assert_eq!(json["result"]["resultType"], "complete", "{method}");
+            assert_eq!(json["result"]["ttlMs"], 0, "{method}");
+            assert_eq!(json["result"]["cacheScope"], "private", "{method}");
+        }
+
+        let mut ordinary =
+            JsonRpcResponse::result(RequestId::Number(1), serde_json::json!({"content": []}));
+        apply_protocol_result_fields(&mut ordinary, "tools/call", EXPERIMENTAL_PROTOCOL_VERSION);
+        let json = serde_json::to_value(ordinary).unwrap();
+        assert_eq!(json["result"]["resultType"], "complete");
+        assert!(json["result"].get("ttlMs").is_none());
+        assert!(json["result"].get("cacheScope").is_none());
+    }
+
+    #[test]
+    fn final_result_fields_preserve_explicit_values_and_legacy_wire_shape() {
+        let explicit = serde_json::json!({
+            "contents": [],
+            "ttlMs": 42,
+            "cacheScope": "public"
+        });
+        let mut response = JsonRpcResponse::result(RequestId::Number(1), explicit.clone());
+        apply_protocol_result_fields(
+            &mut response,
+            "resources/read",
+            EXPERIMENTAL_PROTOCOL_VERSION,
+        );
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["result"]["ttlMs"], 42);
+        assert_eq!(json["result"]["cacheScope"], "public");
+
+        for discriminator in ["input_required", "task"] {
+            let mut response = JsonRpcResponse::result(
+                RequestId::Number(1),
+                serde_json::json!({"resultType": discriminator}),
+            );
+            apply_protocol_result_fields(
+                &mut response,
+                "tools/call",
+                EXPERIMENTAL_PROTOCOL_VERSION,
+            );
+            let json = serde_json::to_value(response).unwrap();
+            assert_eq!(json["result"]["resultType"], discriminator);
+        }
+
+        let mut legacy = JsonRpcResponse::result(RequestId::Number(1), explicit);
+        let before = serde_json::to_value(&legacy).unwrap();
+        apply_protocol_result_fields(&mut legacy, "resources/read", "2025-11-25");
+        assert_eq!(serde_json::to_value(legacy).unwrap(), before);
     }
 
     #[tokio::test]
@@ -6414,6 +6550,7 @@ mod tests {
             json.get("result").is_some(),
             "expected tools/call result, got: {json}"
         );
+        assert_eq!(json["result"]["resultType"], "complete");
     }
 
     /// A stateless 2026-07-28 request body helper for the serverInfo tests below.
@@ -6529,6 +6666,14 @@ mod tests {
             response.headers().contains_key(MCP_SESSION_ID_HEADER),
             "2025-11-25 initialize must return mcp-session-id"
         );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["result"].get("resultType").is_none(),
+            "legacy result must remain unchanged: {json}"
+        );
     }
 
     /// With require_sessions(), 2025-11-25 tools/list without session
@@ -6609,6 +6754,9 @@ mod tests {
             json["result"]["tools"].is_array(),
             "expected tools array in result, got: {json}"
         );
+        assert_eq!(json["result"]["resultType"], "complete");
+        assert_eq!(json["result"]["ttlMs"], 0);
+        assert_eq!(json["result"]["cacheScope"], "private");
     }
 
     /// 2026-07-28 stateless notification (no id) returns 202 and creates no session (#857).
