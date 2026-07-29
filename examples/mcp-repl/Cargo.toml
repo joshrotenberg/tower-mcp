@@ -15,7 +15,7 @@ name = "mcp-repl"
 path = "src/main.rs"
 
 [dependencies]
-tower-mcp = { workspace = true, features = ["http-client"] }
+tower-mcp = { workspace = true, features = ["http-client", "protocol-2026-07-28"] }
 async-trait.workspace = true
 tokio.workspace = true
 serde.workspace = true

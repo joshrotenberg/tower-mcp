@@ -47,23 +47,46 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use nu_ansi_term::{Color, Style};
 
 use tower_mcp::client::{
-    ChannelTransport, HttpClientConfig, HttpClientTransport, McpClient, NotificationHandler,
-    StdioClientTransport,
+    ChannelTransport, HttpClientConfig, HttpClientTransport, McpClient, McpClientBuilder,
+    NotificationHandler, StdioClientTransport,
 };
 use tower_mcp::protocol::{
-    Content, LogLevel, PromptDefinition, ResourceDefinition, ResourceTemplateDefinition,
-    TaskObject, ToolDefinition,
+    Content, DiscoverResult, Implementation, InitializeResult, LogLevel, PromptDefinition,
+    ResourceDefinition, ResourceTemplateDefinition, ServerCapabilities, TaskObject, ToolDefinition,
 };
+use tower_mcp::{ProtocolSupport, ProtocolSupportError};
 
 use alias::Aliases;
 use elicit::ReplClientHandler;
 use session::{Connector, Session, is_not_initialized, is_session_lost};
 use style::{json_pretty, paint, tag, task_status_style};
 use wire::{TracingTransport, wire};
+
+/// Lifecycle selected for this REPL connection.
+///
+/// The final implementation is compiled into the binary, but stable remains
+/// the runtime default so upgrading mcp-repl never silently changes a server's
+/// handshake. `final` is accepted as a convenient alias for the dated value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum ProtocolMode {
+    #[default]
+    Stable,
+    #[value(name = "2026-07-28", alias = "final")]
+    Final,
+}
+
+impl ProtocolMode {
+    fn support(self) -> Result<ProtocolSupport, ProtocolSupportError> {
+        match self {
+            Self::Stable => Ok(ProtocolSupport::stable()),
+            Self::Final => ProtocolSupport::try_new(["2026-07-28"]),
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -72,6 +95,11 @@ use wire::{TracingTransport, wire};
     trailing_var_arg = true
 )]
 struct Args {
+    /// Protocol lifecycle to use. `stable` uses initialize/initialized;
+    /// `2026-07-28` (alias: `final`) uses the sessionless discover lifecycle.
+    #[arg(long, value_enum, default_value = "stable")]
+    protocol: ProtocolMode,
+
     /// Connect to a streamable HTTP server at this URL instead of spawning
     /// a stdio child process.
     #[arg(long)]
@@ -139,9 +167,9 @@ struct Args {
     #[arg(long)]
     no_history: bool,
 
-    /// Do not transparently re-establish an HTTP session that the server has
-    /// lost (restart, OOM, or a 502/503 from the edge in front of it).
-    /// Session-loss errors surface as-is instead.
+    /// Do not transparently re-establish an interrupted HTTP connection
+    /// (restart, OOM, or a 502/503 from the edge in front of it).
+    /// Connection-loss errors surface as-is instead.
     #[arg(long)]
     no_reconnect: bool,
 
@@ -307,10 +335,88 @@ fn render_task(task: &TaskObject) {
     }
 }
 
+/// Lifecycle-neutral connection details used by the banner and `info`.
+#[derive(Clone, Debug)]
+struct ConnectionInfo {
+    protocol_version: String,
+    capabilities: ServerCapabilities,
+    server_info: Implementation,
+    instructions: Option<String>,
+}
+
+impl From<InitializeResult> for ConnectionInfo {
+    fn from(info: InitializeResult) -> Self {
+        Self {
+            protocol_version: info.protocol_version,
+            capabilities: info.capabilities,
+            server_info: info.server_info,
+            instructions: info.instructions,
+        }
+    }
+}
+
+impl ConnectionInfo {
+    fn from_discovery(discovery: DiscoverResult, protocol_version: String) -> Self {
+        let server_info = discovery
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.server_info.clone())
+            .unwrap_or_else(|| Implementation {
+                name: "MCP server".to_string(),
+                version: "unknown".to_string(),
+                ..Default::default()
+            });
+        Self {
+            protocol_version,
+            capabilities: discovery.capabilities,
+            server_info,
+            instructions: discovery.instructions,
+        }
+    }
+}
+
+async fn connection_info(client: &McpClient) -> Option<ConnectionInfo> {
+    if let Some(info) = client.server_info().await {
+        return Some(info.into());
+    }
+    let discovery = client.discovery().await?;
+    let protocol_version = client.selected_protocol_version().await?;
+    Some(ConnectionInfo::from_discovery(discovery, protocol_version))
+}
+
+async fn establish_connection(
+    client: &McpClient,
+    protocol: ProtocolMode,
+) -> tower_mcp::Result<ConnectionInfo> {
+    match protocol {
+        ProtocolMode::Stable => client
+            .initialize("mcp-repl", env!("CARGO_PKG_VERSION"))
+            .await
+            .map(Into::into),
+        ProtocolMode::Final => {
+            let discovery: DiscoverResult = client
+                .discover("mcp-repl", env!("CARGO_PKG_VERSION"))
+                .await?;
+            let protocol_version = client
+                .selected_protocol_version()
+                .await
+                .unwrap_or_else(|| "2026-07-28".to_string());
+            Ok(ConnectionInfo::from_discovery(discovery, protocol_version))
+        }
+    }
+}
+
+fn client_builder(protocol: ProtocolMode) -> Result<McpClientBuilder, ProtocolSupportError> {
+    Ok(McpClient::builder()
+        .protocol_support(protocol.support()?)
+        .with_elicitation()
+        .with_sampling())
+}
+
 /// The connection banner: server identity, negotiated protocol, and any
 /// server instructions (markdown-rendered when it looks like markdown).
 /// Printed at startup and replayed by the `info` command.
-fn print_banner(info: &tower_mcp::protocol::InitializeResult) {
+fn print_banner(info: &ConnectionInfo) {
     println!(
         "connected: {} v{} {}",
         paint(Style::new().bold(), &info.server_info.name),
@@ -788,21 +894,19 @@ fn http_connector(
     url: String,
     config: HttpClientConfig,
     make_handler: Arc<dyn Fn() -> ReplClientHandler + Send + Sync>,
+    protocol: ProtocolMode,
 ) -> Connector {
     Box::new(move || {
         let (url, config, handler) = (url.clone(), config.clone(), make_handler());
         Box::pin(async move {
-            let client = McpClient::builder()
-                .with_elicitation()
-                .with_sampling()
+            let client = client_builder(protocol)
+                .map_err(|error| tower_mcp::Error::Transport(error.to_string()))?
                 .connect(
                     TracingTransport::new(HttpClientTransport::with_config(url, config)),
                     handler,
                 )
                 .await?;
-            client
-                .initialize("mcp-repl", env!("CARGO_PKG_VERSION"))
-                .await?;
+            establish_connection(&client, protocol).await?;
             Ok(client)
         })
     })
@@ -997,7 +1101,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     // refuse an individual request, and a server can only ask when the
     // capability is declared, so `--sampling decline` still exercises the
     // server's rejection path.
-    let builder = McpClient::builder().with_elicitation().with_sampling();
+    let builder = client_builder(args.protocol)?;
     // Only `--http` can be resurrected. A stdio child that dies takes its
     // stdin and stdout with it (respawning it is a separate concern), and the
     // in-process demo router cannot lose a session at all.
@@ -1023,6 +1127,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
                         url.clone(),
                         config.clone(),
                         make_handler.clone(),
+                        args.protocol,
                     ));
                 }
                 builder
@@ -1048,12 +1153,10 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         }
     };
 
-    let init = client
-        .initialize("mcp-repl", env!("CARGO_PKG_VERSION"))
-        .await?;
-    let server_name = init.server_info.name.clone();
+    let info = establish_connection(&client, args.protocol).await?;
+    let server_name = info.server_info.name.clone();
     if !quiet {
-        print_banner(&init);
+        print_banner(&info);
     }
     let session = Arc::new(Session::new(client, connector));
     let client = session.client();
@@ -1065,7 +1168,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         // List the tools at startup so the surface is browsable immediately,
         // unless the server already enumerated them in its instructions (some
         // servers dump the whole surface there); then it would just repeat.
-        let instructions_list_tools = init
+        let instructions_list_tools = info
             .instructions
             .as_deref()
             .is_some_and(|instr| s.tools.first().is_some_and(|t| instr.contains(&t.name)));
@@ -1596,7 +1699,7 @@ async fn handle_line(
             );
             *surface.write().unwrap() = fresh;
         }
-        "info" => match client.server_info().await {
+        "info" => match connection_info(&client).await {
             Some(info) => {
                 // Replay the full startup banner, then add capabilities.
                 print_banner(&info);
@@ -1755,7 +1858,7 @@ async fn handle_subscription(client: &Arc<McpClient>, cmd: &str, uri: &str) {
     // A server that does not advertise the capability will reject the call.
     // Saying so first turns a bare protocol error into an explanation.
     if cmd == "subscribe"
-        && let Some(info) = client.server_info().await
+        && let Some(info) = connection_info(client).await
         && !subscribe::server_supports(
             &serde_json::to_value(&info.capabilities).unwrap_or_default(),
         )
@@ -2248,6 +2351,71 @@ fn render_value(value: &serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use tower_mcp::client::ClientTransport;
+
+    /// A single-response transport for pinning the final discovery wire shape.
+    struct DiscoveryTransport {
+        result: serde_json::Value,
+        incoming_tx: tokio::sync::mpsc::Sender<String>,
+        incoming_rx: tokio::sync::mpsc::Receiver<String>,
+        outgoing: Arc<Mutex<Vec<serde_json::Value>>>,
+        connected: bool,
+    }
+
+    impl DiscoveryTransport {
+        fn new(result: serde_json::Value) -> (Self, Arc<Mutex<Vec<serde_json::Value>>>) {
+            let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel(4);
+            let outgoing = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    result,
+                    incoming_tx,
+                    incoming_rx,
+                    outgoing: outgoing.clone(),
+                    connected: true,
+                },
+                outgoing,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl ClientTransport for DiscoveryTransport {
+        async fn send(&mut self, message: &str) -> tower_mcp::Result<()> {
+            let request: serde_json::Value = serde_json::from_str(message)?;
+            self.outgoing.lock().unwrap().push(request.clone());
+            if let Some(id) = request.get("id") {
+                self.incoming_tx
+                    .send(
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": self.result,
+                        })
+                        .to_string(),
+                    )
+                    .await
+                    .map_err(|error| tower_mcp::Error::Transport(error.to_string()))?;
+            }
+            Ok(())
+        }
+
+        async fn recv(&mut self) -> tower_mcp::Result<Option<String>> {
+            Ok(self.incoming_rx.recv().await)
+        }
+
+        fn is_connected(&self) -> bool {
+            self.connected
+        }
+
+        async fn close(&mut self) -> tower_mcp::Result<()> {
+            self.connected = false;
+            Ok(())
+        }
+    }
 
     fn jsonrpc(code: i32, message: &str) -> tower_mcp::Error {
         tower_mcp::Error::JsonRpc(tower_mcp::error::JsonRpcError {
@@ -2255,6 +2423,91 @@ mod tests {
             message: message.to_string(),
             data: None,
         })
+    }
+
+    #[test]
+    fn protocol_selection_is_stable_by_default_and_final_is_exact() {
+        let stable = Args::try_parse_from(["mcp-repl", "--demo"]).unwrap();
+        assert_eq!(stable.protocol, ProtocolMode::Stable);
+        assert_eq!(
+            stable.protocol.support().unwrap().versions(),
+            tower_mcp::protocol::SUPPORTED_PROTOCOL_VERSIONS
+        );
+
+        for value in ["2026-07-28", "final"] {
+            let final_args =
+                Args::try_parse_from(["mcp-repl", "--protocol", value, "--demo"]).unwrap();
+            assert_eq!(final_args.protocol, ProtocolMode::Final);
+            assert_eq!(
+                final_args.protocol.support().unwrap().versions(),
+                ["2026-07-28"]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stable_selection_uses_initialize() {
+        let client = client_builder(ProtocolMode::Stable)
+            .unwrap()
+            .connect_simple(ChannelTransport::new(demo_router()))
+            .await
+            .unwrap();
+        let info = establish_connection(&client, ProtocolMode::Stable)
+            .await
+            .unwrap();
+
+        assert_eq!(info.server_info.name, "mcp-repl-demo");
+        assert_eq!(
+            info.protocol_version,
+            tower_mcp::protocol::LATEST_PROTOCOL_VERSION
+        );
+        assert!(client.server_info().await.is_some());
+        assert!(client.discovery().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn final_selection_uses_discover_with_required_metadata() {
+        let (transport, outgoing) = DiscoveryTransport::new(serde_json::json!({
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {"tools": {}},
+            "ttlMs": 0,
+            "cacheScope": "private",
+            "_meta": {
+                "io.modelcontextprotocol/serverInfo": {
+                    "name": "final-test-server",
+                    "version": "1.0.0"
+                }
+            }
+        }));
+        let client = client_builder(ProtocolMode::Final)
+            .unwrap()
+            .connect_simple(transport)
+            .await
+            .unwrap();
+        let info = establish_connection(&client, ProtocolMode::Final)
+            .await
+            .unwrap();
+
+        assert_eq!(info.server_info.name, "final-test-server");
+        assert_eq!(info.protocol_version, "2026-07-28");
+        assert!(client.server_info().await.is_none());
+        assert!(client.discovery().await.is_some());
+
+        let sent = outgoing.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["method"], "server/discover");
+        assert_eq!(
+            sent[0]["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+            "2026-07-28"
+        );
+        assert!(
+            sent[0]["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"].is_object()
+        );
+        assert_eq!(
+            sent[0]["params"]["_meta"]["io.modelcontextprotocol/clientInfo"]["name"],
+            "mcp-repl"
+        );
     }
 
     #[test]

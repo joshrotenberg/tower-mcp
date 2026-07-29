@@ -21,7 +21,17 @@ cargo run -p mcp-repl -- cargo run --example getting_started
 
 # Connect to a streamable HTTP server:
 cargo run -p mcp-repl -- --http http://127.0.0.1:3001/mcp
+
+# Opt into the final, sessionless 2026-07-28 lifecycle:
+cargo run -p mcp-repl -- --protocol 2026-07-28 --http http://127.0.0.1:3001/mcp
 ```
+
+The binary compiles both stable and final protocol support. Runtime selection
+is explicit: `--protocol stable` (the default) uses
+`initialize`/`notifications/initialized`, while `--protocol 2026-07-28`
+(`--protocol final` is an alias) uses `server/discover` and sends the selected
+protocol metadata on every request. Keeping stable as the default means an
+mcp-repl upgrade cannot silently change an existing server's lifecycle.
 
 ### Try it against a live server
 
@@ -101,10 +111,10 @@ mcp-repl cratesio                  # a bare name works too
 ### Reconnecting
 
 A remote server that restarts, OOMs, or sits behind an edge returning 502/503
-loses the session, and every later request fails with a not-initialized or
-session-expired error. On an `--http` connection the REPL notices this,
-re-runs the handshake against a fresh transport, re-fetches the surface, and
-retries the command once:
+can interrupt a connection. On an `--http` connection the REPL notices this,
+creates a fresh transport, repeats the selected stable or final handshake,
+re-fetches the surface, and retries the command once. For stable servers this
+also replaces the lost session; final connections are sessionless.
 
 ```text
 > search query=tower
