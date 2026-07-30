@@ -73,18 +73,18 @@
 //!
 //! With the 2026-07-28 protocol, clients do not run an initialize handshake.
 //! Instead, every request carries the client's protocol version, identity, and
-//! capabilities in a `_meta` object. The HTTP transport extracts these fields
-//! and stashes them as a [`StatelessRequestMeta`](crate::stateless::StatelessRequestMeta)
+//! capabilities in a `_meta` object. JSON-RPC transports extract these fields
+//! and stash them as a [`StatelessRequestMeta`](crate::stateless::StatelessRequestMeta)
 //! extension on the [`RequestContext`], accessible via
 //! [`ctx.per_request_meta()`](RequestContext::per_request_meta).
 //!
 //! `per_request_meta()` returns `Some` when:
 //! - The `stateless` feature is compiled in, AND
-//! - The request was dispatched by the HTTP transport, AND
+//! - The request was dispatched by a JSON-RPC transport, AND
 //! - The request's `_meta` contained at least one recognized field.
 //!
-//! It returns `None` for stdio/WebSocket transports, for 2025-11-25 session-based
-//! requests, and when the request carried no `_meta`.
+//! It returns `None` for 2025-11-25 session-based requests and when the request
+//! carried no modern protocol metadata.
 //!
 //! The [`StatelessRequestMeta`](crate::stateless::StatelessRequestMeta) struct
 //! provides:
@@ -101,7 +101,7 @@
 //!
 //! async fn my_tool(ctx: RequestContext, input: MyInput) -> Result<CallToolResult> {
 //!     if let Some(meta) = ctx.per_request_meta() {
-//!         // Available for 2026-07-28+ clients on the HTTP transport
+//!         // Available for 2026-07-28 clients on JSON-RPC transports
 //!         if let Some(ref info) = meta.client_info {
 //!             tracing::info!(client = %info.name, version = %info.version, "request from");
 //!         }
@@ -480,12 +480,11 @@ impl RequestContext {
     /// SEP-2575 per-request `_meta` (protocol version, client info, client
     /// capabilities, log level) if the transport extracted it.
     ///
-    /// Returns `Some` for 2026-07-28+ clients on the HTTP transport when the
+    /// Returns `Some` for 2026-07-28 clients on JSON-RPC transports when the
     /// request carried a `_meta` object with recognized fields. Returns `None`
     /// when:
     /// - The request had no `_meta` field, or
-    /// - The transport does not stash per-request metadata (only the HTTP
-    ///   transport currently does this), or
+    /// - The transport does not use [`crate::jsonrpc::JsonRpcService`], or
     /// - The `stateless` feature is not compiled in.
     ///
     /// # Example

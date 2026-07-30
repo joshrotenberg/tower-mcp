@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use crate::error::Error;
 use crate::router::McpRouter;
 use crate::transport::http::{HttpTransport, SessionConfig, SessionHandle};
+use crate::{ProtocolSupport, ProtocolSupportError};
 
 /// A transport that serves the MCP Streamable HTTP protocol over a Unix
 /// domain socket.
@@ -86,6 +87,25 @@ impl UnixSocketTransport {
     pub fn require_sessions(mut self) -> Self {
         self.inner = self.inner.require_sessions();
         self
+    }
+
+    /// Set the exact protocol versions accepted by the delegated HTTP binding.
+    pub fn protocol_support(mut self, support: ProtocolSupport) -> Self {
+        self.inner = self.inner.protocol_support(support);
+        self
+    }
+
+    /// Construct and set an exact runtime protocol-version allow-list.
+    pub fn protocol_versions<I, V>(
+        mut self,
+        versions: I,
+    ) -> std::result::Result<Self, ProtocolSupportError>
+    where
+        I: IntoIterator<Item = V>,
+        V: Into<String>,
+    {
+        self.inner = self.inner.protocol_versions(versions)?;
+        Ok(self)
     }
 
     /// Set session configuration (TTL, max sessions, cleanup interval).
@@ -254,5 +274,68 @@ fn cleanup_socket(path: &PathBuf) {
                 e
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn delegates_runtime_protocol_configuration_to_http() {
+        let transport =
+            UnixSocketTransport::new(McpRouter::new().server_info("unix-protocol-test", "0.0.0"))
+                .protocol_support(ProtocolSupport::stable())
+                .protocol_versions(["2025-11-25"])
+                .unwrap();
+
+        // Building the router exercises the delegated HTTP configuration;
+        // UnixSocketTransport only replaces the listener.
+        let _router = transport.into_router();
+    }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn delegated_http_binding_enforces_protocol_selection() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let app =
+            UnixSocketTransport::new(McpRouter::new().server_info("unix-protocol-test", "0.0.0"))
+                .protocol_support(ProtocolSupport::stable())
+                .disable_origin_validation()
+                .into_router();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", "application/json")
+            .header("accept", "application/json")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "server/discover")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "server/discover",
+                    "params": {
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {}
+                        }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], -32022);
+        assert_eq!(body["error"]["data"]["requested"], "2026-07-28");
     }
 }

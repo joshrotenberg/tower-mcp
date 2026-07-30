@@ -3,11 +3,21 @@
 //! Reads JSON-RPC messages from stdin and writes responses to stdout.
 //! Uses line-delimited JSON format.
 //!
+//! # Protocol lifecycles
+//!
+//! Final 2026-07-28 requests carry protocol version and client capabilities
+//! inline in each request's `_meta` and can begin with a `server/discover`
+//! probe. Requests without that metadata retain the legacy initialize
+//! lifecycle, so both eras can coexist on one stdio stream. Use
+//! [`StdioTransport::protocol_support`] to set the exact runtime allow-list.
+//!
 //! # Bidirectional Support
 //!
-//! The [`BidirectionalStdioTransport`] enables server-to-client requests like
-//! sampling (LLM requests). It multiplexes the stdio streams to handle both
-//! incoming requests and outgoing requests/responses.
+//! For legacy protocols, [`BidirectionalStdioTransport`] enables
+//! server-to-client requests like sampling (LLM requests). It multiplexes the
+//! stdio streams to handle both incoming requests and outgoing
+//! requests/responses. Final 2026-07-28 handlers do not receive a client
+//! requester because that protocol does not permit server-initiated requests.
 //!
 //! # Server Notifications
 //!
@@ -36,6 +46,7 @@ use crate::protocol::{
 };
 use crate::router::{McpRouter, RouterRequest, RouterResponse};
 use crate::transport::service::{CatchError, InjectAnnotations};
+use crate::{ProtocolSupport, ProtocolSupportError};
 
 // ============================================================================
 // Shared helpers
@@ -195,6 +206,30 @@ impl StdioTransport {
         }
     }
 
+    /// Set the exact protocol versions this transport accepts and advertises.
+    ///
+    /// By default every implementation compiled into `tower-mcp` is enabled.
+    /// Final 2026-07-28 requests carry their version and capabilities in each
+    /// request's `_meta`; legacy initialize traffic may coexist on the same
+    /// stdio stream.
+    pub fn protocol_support(mut self, support: ProtocolSupport) -> Self {
+        self.service = self.service.protocol_support(support);
+        self
+    }
+
+    /// Construct and set an exact runtime protocol-version allow-list.
+    pub fn protocol_versions<I, V>(
+        mut self,
+        versions: I,
+    ) -> std::result::Result<Self, ProtocolSupportError>
+    where
+        I: IntoIterator<Item = V>,
+        V: Into<String>,
+    {
+        self.service = self.service.protocol_versions(versions)?;
+        Ok(self)
+    }
+
     /// Apply a tower middleware layer to this transport.
     ///
     /// This converts the `StdioTransport` into a [`GenericStdioTransport`] with
@@ -234,10 +269,12 @@ impl StdioTransport {
         <L::Service as Service<RouterRequest>>::Error: std::fmt::Display + Send,
         <L::Service as Service<RouterRequest>>::Future: Send,
     {
+        let protocol_support = self.service.configured_protocol_support().clone();
         let annotations = self.router.tool_annotations_map();
         let wrapped = layer.layer(self.router);
         let service = InjectAnnotations::new(CatchError::new(wrapped), annotations);
         GenericStdioTransport::with_notifications(service, self.notification_rx)
+            .protocol_support(protocol_support)
     }
 
     /// Run the transport, processing messages until EOF or error
@@ -419,6 +456,25 @@ where
         }
     }
 
+    /// Set the exact protocol versions this transport accepts and advertises.
+    pub fn protocol_support(mut self, support: ProtocolSupport) -> Self {
+        self.service = self.service.protocol_support(support);
+        self
+    }
+
+    /// Construct and set an exact runtime protocol-version allow-list.
+    pub fn protocol_versions<I, V>(
+        mut self,
+        versions: I,
+    ) -> std::result::Result<Self, ProtocolSupportError>
+    where
+        I: IntoIterator<Item = V>,
+        V: Into<String>,
+    {
+        self.service = self.service.protocol_versions(versions)?;
+        Ok(self)
+    }
+
     /// Run the transport, processing messages until EOF or error.
     ///
     /// Thin wrapper around [`Self::run_with_streams`] that wires up
@@ -588,6 +644,25 @@ impl SyncStdioTransport {
         Self { service, router }
     }
 
+    /// Set the exact protocol versions this transport accepts and advertises.
+    pub fn protocol_support(mut self, support: ProtocolSupport) -> Self {
+        self.service = self.service.protocol_support(support);
+        self
+    }
+
+    /// Construct and set an exact runtime protocol-version allow-list.
+    pub fn protocol_versions<I, V>(
+        mut self,
+        versions: I,
+    ) -> std::result::Result<Self, ProtocolSupportError>
+    where
+        I: IntoIterator<Item = V>,
+        V: Into<String>,
+    {
+        self.service = self.service.protocol_versions(versions)?;
+        Ok(self)
+    }
+
     /// Run the transport synchronously using a tokio runtime
     pub fn run_blocking(&mut self) -> Result<()> {
         let rt = tokio::runtime::Runtime::new()
@@ -656,9 +731,10 @@ struct PendingRequest {
 
 /// Bidirectional stdio transport with sampling support
 ///
-/// This transport supports both incoming requests from clients and outgoing
-/// requests to clients (for sampling/LLM requests). It multiplexes stdin/stdout
-/// to handle the bidirectional communication.
+/// For legacy protocol requests, this transport supports both incoming
+/// requests from clients and outgoing requests to clients (for sampling/LLM
+/// requests). It multiplexes stdin/stdout to handle the bidirectional
+/// communication. Final 2026-07-28 handlers cannot initiate requests.
 ///
 /// Server notifications (progress, logging, resource/tool/prompt list changes)
 /// are automatically forwarded to stdout as JSON-RPC notifications.
@@ -732,12 +808,35 @@ impl BidirectionalStdioTransport {
         }
     }
 
+    /// Set the exact protocol versions this transport accepts and advertises.
+    ///
+    /// Final handlers never receive the legacy client requester, because the
+    /// 2026-07-28 protocol forbids servers from initiating JSON-RPC requests.
+    pub fn protocol_support(mut self, support: ProtocolSupport) -> Self {
+        self.service = self.service.protocol_support(support);
+        self
+    }
+
+    /// Construct and set an exact runtime protocol-version allow-list.
+    pub fn protocol_versions<I, V>(
+        mut self,
+        versions: I,
+    ) -> std::result::Result<Self, ProtocolSupportError>
+    where
+        I: IntoIterator<Item = V>,
+        V: Into<String>,
+    {
+        self.service = self.service.protocol_versions(versions)?;
+        Ok(self)
+    }
+
     /// Get the client requester handle
     ///
     /// The requester is already wired into the router's request context by
-    /// [`Self::new`], so handlers can elicit and sample without further setup.
-    /// This getter exposes the same handle for advanced callers that want to
-    /// issue server-to-client requests directly.
+    /// [`Self::new`], so legacy handlers can elicit and sample without further
+    /// setup. Final 2026-07-28 handlers do not receive it. This getter exposes
+    /// the same handle for advanced callers that want to issue
+    /// server-to-client requests directly on legacy connections.
     pub fn client_requester(&self) -> ClientRequesterHandle {
         self.client_requester.clone()
     }

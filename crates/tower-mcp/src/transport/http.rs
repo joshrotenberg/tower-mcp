@@ -266,11 +266,10 @@ use crate::context::{
 use crate::error::{Error, JsonRpcError, Result};
 #[cfg(feature = "stateless")]
 use crate::error::{ErrorCode, McpErrorCode};
-use crate::jsonrpc::JsonRpcService;
+use crate::jsonrpc::{JsonRpcService, apply_protocol_result_fields};
 use crate::protocol::{
     ClientCapabilities, EXPERIMENTAL_PROTOCOL_VERSION, Implementation, JsonRpcNotification,
     JsonRpcRequest, JsonRpcResponse, LATEST_PROTOCOL_VERSION, McpNotification, RequestId,
-    ResultType,
 };
 #[cfg(feature = "stateless")]
 use crate::protocol::{SubscriptionFilter, SubscriptionsListenParams};
@@ -3497,53 +3496,6 @@ fn version_supports_subscriptions_listen(
 #[cfg(feature = "stateless")]
 fn is_stateless_protocol_version(version: &str) -> bool {
     version == EXPERIMENTAL_PROTOCOL_VERSION
-}
-
-/// Fill the required 2026-07-28 result envelope immediately before it reaches
-/// the wire, while preserving the legacy serde representation of public result
-/// types.
-///
-/// Every successful result gets `resultType: "complete"` unless it already
-/// owns a discriminator such as `input_required` or `task`. Cacheable methods
-/// also receive conservative defaults for fields omitted by a handler/router.
-fn apply_protocol_result_fields(
-    response: &mut JsonRpcResponse,
-    method: &str,
-    protocol_version: &str,
-) {
-    if protocol_version != EXPERIMENTAL_PROTOCOL_VERSION {
-        return;
-    }
-
-    let JsonRpcResponse::Result(result) = response else {
-        return;
-    };
-    ResultType::Complete.stamp_into(&mut result.result, protocol_version);
-
-    if !is_cacheable_result_method(method) {
-        return;
-    }
-    let Some(object) = result.result.as_object_mut() else {
-        return;
-    };
-    object
-        .entry("ttlMs")
-        .or_insert_with(|| serde_json::Value::Number(0.into()));
-    object
-        .entry("cacheScope")
-        .or_insert_with(|| serde_json::Value::String("private".to_string()));
-}
-
-fn is_cacheable_result_method(method: &str) -> bool {
-    matches!(
-        method,
-        "server/discover"
-            | "tools/list"
-            | "prompts/list"
-            | "resources/list"
-            | "resources/read"
-            | "resources/templates/list"
-    )
 }
 
 /// Stamp `_meta["io.modelcontextprotocol/serverInfo"]` onto a successful

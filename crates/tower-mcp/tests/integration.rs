@@ -6,10 +6,12 @@
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::collections::HashMap;
+#[cfg(feature = "oauth")]
+use tower_mcp::Extensions;
 use tower_mcp::{
-    CallToolResult, Extensions, GetPromptResult, JsonRpcRequest, JsonRpcResponse, JsonRpcService,
-    McpRouter, PromptBuilder, PromptMessage, PromptRole, ReadResourceResult, ResourceBuilder,
-    ResourceContent, TaskSupportMode, ToolBuilder,
+    CallToolResult, GetPromptResult, JsonRpcRequest, JsonRpcResponse, JsonRpcService, McpRouter,
+    PromptBuilder, PromptMessage, PromptRole, ReadResourceResult, ResourceBuilder, ResourceContent,
+    TaskSupportMode, ToolBuilder,
 };
 
 // =============================================================================

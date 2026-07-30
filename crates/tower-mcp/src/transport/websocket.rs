@@ -96,6 +96,7 @@ use crate::router::{McpRouter, RouterRequest, RouterResponse};
 use crate::transport::service::{
     CatchError, InjectAnnotations, McpBoxService, ServiceFactory, identity_factory,
 };
+use crate::{ProtocolSupport, ProtocolSupportError};
 
 /// Session state for WebSocket transport
 struct Session {
@@ -207,6 +208,7 @@ struct AppState {
     router_template: McpRouter,
     service_factory: ServiceFactory,
     sessions: SessionStore,
+    protocol_support: ProtocolSupport,
     /// Whether sampling is enabled
     sampling_enabled: bool,
 }
@@ -214,10 +216,24 @@ struct AppState {
 /// WebSocket transport for MCP servers
 ///
 /// Provides full-duplex communication over WebSocket.
+///
+/// WebSocket is a tower-mcp custom transport binding, not a standard
+/// 2026-07-28 MCP transport. JSON-RPC request bodies remain the source of
+/// truth for final per-request metadata. The optional `mcp.version.*`
+/// subprotocol is an upgrade-time compatibility hint constrained by this
+/// transport's exact [`ProtocolSupport`] allow-list.
+///
+/// Connection and cancellation semantics remain those of this custom binding:
+/// a WebSocket close terminates the connection, and reconnecting a stored
+/// session closes the older socket. It does not currently cancel an in-flight
+/// handler. `notifications/cancelled` is processed between requests, so it
+/// cannot interrupt a handler that is already executing. Final
+/// `subscriptions/listen` multiplexing is not implemented on this binding.
 pub struct WebSocketTransport {
     router: McpRouter,
     sampling_enabled: bool,
     service_factory: ServiceFactory,
+    protocol_support: ProtocolSupport,
     #[cfg(feature = "oauth")]
     oauth_config: Option<crate::oauth::ProtectedResourceMetadata>,
 }
@@ -229,6 +245,7 @@ impl WebSocketTransport {
             router,
             sampling_enabled: false,
             service_factory: identity_factory(),
+            protocol_support: ProtocolSupport::default(),
             #[cfg(feature = "oauth")]
             oauth_config: None,
         }
@@ -241,6 +258,25 @@ impl WebSocketTransport {
     pub fn with_sampling(mut self) -> Self {
         self.sampling_enabled = true;
         self
+    }
+
+    /// Set the exact protocol versions this custom binding accepts.
+    pub fn protocol_support(mut self, support: ProtocolSupport) -> Self {
+        self.protocol_support = support;
+        self
+    }
+
+    /// Construct and set an exact runtime protocol-version allow-list.
+    pub fn protocol_versions<I, V>(
+        mut self,
+        versions: I,
+    ) -> std::result::Result<Self, ProtocolSupportError>
+    where
+        I: IntoIterator<Item = V>,
+        V: Into<String>,
+    {
+        self.protocol_support = ProtocolSupport::try_new(versions)?;
+        Ok(self)
     }
 
     /// Configure OAuth 2.1 Protected Resource Metadata for this transport.
@@ -325,6 +361,7 @@ impl WebSocketTransport {
             router_template: self.router,
             service_factory: self.service_factory,
             sessions: SessionStore::new(),
+            protocol_support: self.protocol_support,
             sampling_enabled: self.sampling_enabled,
         });
 
@@ -347,6 +384,7 @@ impl WebSocketTransport {
             router_template: self.router,
             service_factory: self.service_factory,
             sessions: SessionStore::new(),
+            protocol_support: self.protocol_support,
             sampling_enabled: self.sampling_enabled,
         });
 
@@ -426,9 +464,10 @@ struct McpSubprotocols {
 /// Parse MCP subprotocols from the `Sec-WebSocket-Protocol` header.
 ///
 /// Returns the parsed subprotocols and the negotiated protocol version (if valid).
-fn parse_mcp_subprotocols(headers: &axum::http::HeaderMap) -> McpSubprotocols {
-    use crate::protocol::SUPPORTED_PROTOCOL_VERSIONS;
-
+fn parse_mcp_subprotocols(
+    headers: &axum::http::HeaderMap,
+    protocol_support: &ProtocolSupport,
+) -> McpSubprotocols {
     let mut result = McpSubprotocols::default();
 
     let Some(header) = headers.get("sec-websocket-protocol") else {
@@ -445,7 +484,7 @@ fn parse_mcp_subprotocols(headers: &axum::http::HeaderMap) -> McpSubprotocols {
                 result.selected.push(protocol.to_string());
             }
         } else if let Some(version) = protocol.strip_prefix("mcp.version.") {
-            if SUPPORTED_PROTOCOL_VERSIONS.contains(&version) {
+            if protocol_support.contains(version) {
                 result.protocol_version = Some(version.to_string());
                 result.selected.push(protocol.to_string());
             } else {
@@ -472,7 +511,7 @@ async fn handle_websocket(
     let (mut parts, _body) = request.into_parts();
 
     // Parse MCP subprotocols (mcp.auth.*, mcp.version.*) from Sec-WebSocket-Protocol
-    let subprotocols = parse_mcp_subprotocols(&parts.headers);
+    let subprotocols = parse_mcp_subprotocols(&parts.headers, &state.protocol_support);
     if let Some(ref version) = subprotocols.protocol_version {
         tracing::debug!(version = %version, "Client requested MCP protocol version via subprotocol");
     }
@@ -530,13 +569,30 @@ async fn handle_socket(
         )
         .await;
     let session_id = session.id.clone();
+    let protocol_support = state.protocol_support.clone();
 
     tracing::info!(session_id = %session_id, "WebSocket connection established");
 
     if state.sampling_enabled {
-        handle_socket_bidirectional(socket, session, &session_id, mcp_extensions, cancel_rx).await;
+        handle_socket_bidirectional(
+            socket,
+            session,
+            &session_id,
+            mcp_extensions,
+            protocol_support,
+            cancel_rx,
+        )
+        .await;
     } else {
-        handle_socket_simple(socket, session, &session_id, mcp_extensions, cancel_rx).await;
+        handle_socket_simple(
+            socket,
+            session,
+            &session_id,
+            mcp_extensions,
+            protocol_support,
+            cancel_rx,
+        )
+        .await;
     }
 
     // Cleanup session
@@ -550,9 +606,12 @@ async fn handle_socket_simple(
     session: Arc<Session>,
     session_id: &str,
     mcp_extensions: crate::router::Extensions,
+    protocol_support: ProtocolSupport,
     mut cancel_rx: watch::Receiver<bool>,
 ) {
-    let mut service = JsonRpcService::new(session.make_service()).with_extensions(mcp_extensions);
+    let mut service = JsonRpcService::new(session.make_service())
+        .with_extensions(mcp_extensions)
+        .protocol_support(protocol_support);
     let (mut sender, mut receiver) = socket.split();
 
     // Process incoming messages, also watching for cancellation (zombie prevention)
@@ -651,6 +710,7 @@ async fn handle_socket_bidirectional(
     session: Arc<Session>,
     session_id: &str,
     _mcp_extensions: crate::router::Extensions,
+    protocol_support: ProtocolSupport,
     mut cancel_rx: watch::Receiver<bool>,
 ) {
     // Create channels for outgoing requests
@@ -666,7 +726,8 @@ async fn handle_socket_bidirectional(
         .clone()
         .with_client_requester(client_requester);
     let mut service = JsonRpcService::new((session.service_factory)(router.clone()))
-        .with_extensions(_mcp_extensions);
+        .with_extensions(_mcp_extensions)
+        .protocol_support(protocol_support);
 
     // Track pending outgoing requests
     let pending_requests: Arc<Mutex<HashMap<RequestId, PendingRequest>>> =
@@ -993,7 +1054,7 @@ mod tests {
     #[test]
     fn test_parse_mcp_subprotocols_empty() {
         let headers = axum::http::HeaderMap::new();
-        let result = parse_mcp_subprotocols(&headers);
+        let result = parse_mcp_subprotocols(&headers, &ProtocolSupport::default());
         assert!(result.auth_token.is_none());
         assert!(result.protocol_version.is_none());
         assert!(result.selected.is_empty());
@@ -1008,7 +1069,7 @@ mod tests {
                 .parse()
                 .unwrap(),
         );
-        let result = parse_mcp_subprotocols(&headers);
+        let result = parse_mcp_subprotocols(&headers, &ProtocolSupport::default());
         assert_eq!(result.auth_token.as_deref(), Some("my-secret-token"));
         assert_eq!(result.protocol_version.as_deref(), Some("2025-11-25"));
         assert_eq!(result.selected.len(), 2);
@@ -1021,7 +1082,7 @@ mod tests {
             "sec-websocket-protocol",
             "mcp.version.1999-01-01".parse().unwrap(),
         );
-        let result = parse_mcp_subprotocols(&headers);
+        let result = parse_mcp_subprotocols(&headers, &ProtocolSupport::default());
         assert!(result.protocol_version.is_none());
         assert!(result.selected.is_empty());
     }
@@ -1033,7 +1094,7 @@ mod tests {
             "sec-websocket-protocol",
             "mcp.version.2025-03-26".parse().unwrap(),
         );
-        let result = parse_mcp_subprotocols(&headers);
+        let result = parse_mcp_subprotocols(&headers, &ProtocolSupport::default());
         assert_eq!(result.protocol_version.as_deref(), Some("2025-03-26"));
         assert_eq!(result.selected.len(), 1);
     }
@@ -1045,7 +1106,7 @@ mod tests {
             "sec-websocket-protocol",
             "mcp.auth.bearer-xyz123".parse().unwrap(),
         );
-        let result = parse_mcp_subprotocols(&headers);
+        let result = parse_mcp_subprotocols(&headers, &ProtocolSupport::default());
         assert_eq!(result.auth_token.as_deref(), Some("bearer-xyz123"));
         assert!(result.protocol_version.is_none());
     }
@@ -1059,11 +1120,65 @@ mod tests {
                 .parse()
                 .unwrap(),
         );
-        let result = parse_mcp_subprotocols(&headers);
+        let result = parse_mcp_subprotocols(&headers, &ProtocolSupport::default());
         assert_eq!(result.auth_token.as_deref(), Some("token"));
         assert_eq!(result.protocol_version.as_deref(), Some("2025-11-25"));
         // Only MCP subprotocols are selected
         assert_eq!(result.selected.len(), 2);
+    }
+
+    #[cfg(feature = "stateless")]
+    #[test]
+    fn websocket_subprotocol_uses_exact_runtime_allow_list() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "sec-websocket-protocol",
+            "mcp.version.2026-07-28, mcp.version.2025-11-25"
+                .parse()
+                .unwrap(),
+        );
+
+        let stable = parse_mcp_subprotocols(&headers, &ProtocolSupport::stable());
+        assert_eq!(stable.protocol_version.as_deref(), Some("2025-11-25"));
+        assert_eq!(stable.selected, vec!["mcp.version.2025-11-25"]);
+
+        let final_only = ProtocolSupport::try_new(["2026-07-28"]).unwrap();
+        let final_selected = parse_mcp_subprotocols(&headers, &final_only);
+        assert_eq!(
+            final_selected.protocol_version.as_deref(),
+            Some("2026-07-28")
+        );
+        assert_eq!(final_selected.selected, vec!["mcp.version.2026-07-28"]);
+    }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn websocket_request_body_selects_final_lifecycle() {
+        let router = create_test_router();
+        let service = identity_factory()(router.clone());
+        let mut service = JsonRpcService::new(service)
+            .protocol_support(ProtocolSupport::try_new(["2026-07-28"]).unwrap());
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "server/discover",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        });
+
+        let response = process_message(&mut service, &router, &request.to_string())
+            .await
+            .unwrap()
+            .expect("request response");
+        let response = serde_json::to_value(response).unwrap();
+        assert_eq!(response["result"]["resultType"], "complete");
+        assert_eq!(response["result"]["ttlMs"], 0);
+        assert_eq!(response["result"]["cacheScope"], "private");
+        assert_eq!(response["result"]["supportedVersions"][0], "2026-07-28");
     }
 
     #[tokio::test]

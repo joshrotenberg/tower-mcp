@@ -868,8 +868,12 @@ impl McpRouter {
             ctx
         };
 
-        // Set up client requester if configured (for sampling support)
-        let ctx = if let Some(requester) = &self.inner.client_requester {
+        // The final protocol does not permit servers to initiate JSON-RPC
+        // requests. Keep legacy sampling/elicitation available on sessionful
+        // requests, but do not expose the requester to final handlers.
+        let ctx = if !is_final_protocol_request(per_request)
+            && let Some(requester) = &self.inner.client_requester
+        {
             ctx.with_client_requester(requester.clone())
         } else {
             ctx
@@ -2040,7 +2044,7 @@ impl McpRouter {
     ) -> Result<McpResponse> {
         // Enforce session state - reject requests before initialization
         let method = request.method_name();
-        if !self.session.is_request_allowed(method) {
+        if !is_final_protocol_request(&extensions) && !self.session.is_request_allowed(method) {
             tracing::warn!(
                 method = %method,
                 phase = ?self.session.phase(),
@@ -2064,20 +2068,31 @@ impl McpRouter {
                 // runtime allow-list. Direct router use retains the stable
                 // default policy.
                 let protocol_support = extensions.get::<crate::ProtocolSupport>();
-                let requested_is_supported = protocol_support.map_or_else(
-                    || {
-                        crate::protocol::SUPPORTED_PROTOCOL_VERSIONS
-                            .contains(&params.protocol_version.as_str())
-                    },
-                    |support| support.contains(&params.protocol_version),
-                );
+                let requested_is_legacy = crate::protocol::SUPPORTED_PROTOCOL_VERSIONS
+                    .contains(&params.protocol_version.as_str());
+                let requested_is_supported = requested_is_legacy
+                    && protocol_support
+                        .is_none_or(|support| support.contains(&params.protocol_version));
                 let protocol_version = if requested_is_supported {
                     params.protocol_version
                 } else {
-                    protocol_support.map_or_else(
-                        || crate::protocol::LATEST_PROTOCOL_VERSION.to_string(),
-                        |support| support.preferred().to_string(),
-                    )
+                    match protocol_support {
+                        None => crate::protocol::LATEST_PROTOCOL_VERSION.to_string(),
+                        Some(support) => support
+                            .versions()
+                            .iter()
+                            .find(|version| {
+                                crate::protocol::SUPPORTED_PROTOCOL_VERSIONS
+                                    .contains(&version.as_str())
+                            })
+                            .cloned()
+                            .ok_or_else(|| {
+                                Error::JsonRpc(JsonRpcError::unsupported_protocol_version(
+                                    params.protocol_version,
+                                    support.versions().iter().map(String::as_str),
+                                ))
+                            })?,
+                    }
                 };
 
                 // Transition session state to Initializing

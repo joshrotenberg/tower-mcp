@@ -6,13 +6,14 @@
 //!
 //! ## Two stateless paths
 //!
-//! ### Automatic version-gated path (2026-07-28+)
+//! ### Automatic version-gated path (2026-07-28)
 //!
-//! When the `stateless` feature is compiled in, the HTTP transport automatically
-//! dispatches any request carrying `MCP-Protocol-Version: 2026-07-28` (or later)
-//! statelessly -- no session is created or looked up, and no initialize handshake
-//! is required. Client identity and capabilities flow through per-request `_meta`
-//! (see [`StatelessRequestMeta`]).
+//! When the `stateless` feature is compiled in, JSON-RPC transports
+//! automatically dispatch requests whose per-request `_meta` selects the exact
+//! 2026-07-28 protocol without an initialize handshake. HTTP additionally
+//! requires a matching `MCP-Protocol-Version` header. Client identity and
+//! capabilities flow through per-request `_meta` (see
+//! [`StatelessRequestMeta`]).
 //!
 //! **This path is always active when the feature is compiled in, regardless of
 //! whether [`StatelessConfig`] was provided to the transport.** Adding
@@ -86,8 +87,10 @@ pub struct StatelessRequestMeta {
 
     /// The MCP protocol version this request targets.
     ///
-    /// For HTTP transport this MUST match the `MCP-Protocol-Version` header
-    /// (see SEP-2243). Spec key: `io.modelcontextprotocol/protocolVersion`.
+    /// For HTTP this MUST match the `MCP-Protocol-Version` header. On stdio
+    /// and custom JSON-RPC bindings, this field independently selects the
+    /// request lifecycle. Spec key:
+    /// `io.modelcontextprotocol/protocolVersion`.
     #[serde(
         rename = "io.modelcontextprotocol/protocolVersion",
         skip_serializing_if = "Option::is_none"

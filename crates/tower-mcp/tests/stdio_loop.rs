@@ -14,6 +14,10 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::{Duration, timeout};
+#[cfg(feature = "stateless")]
+use tower_mcp::ProtocolSupport;
+#[cfg(feature = "stateless")]
+use tower_mcp::extract::RawArgs;
 use tower_mcp::extract::{Context, Json};
 use tower_mcp::protocol::{ElicitAction, ElicitFormParams, ElicitFormSchema};
 use tower_mcp::transport::stdio::BidirectionalStdioTransport;
@@ -183,6 +187,223 @@ async fn stdio_transport_eof_returns_ok() {
         result.is_ok(),
         "run_with_streams must return Ok on EOF, got: {result:?}"
     );
+}
+
+#[cfg(feature = "stateless")]
+fn modern_router() -> McpRouter {
+    let inspect = ToolBuilder::new("inspect_meta")
+        .description("Report final request metadata visible to the handler")
+        .extractor_handler((), |ctx: Context, RawArgs(_): RawArgs| async move {
+            let version = ctx
+                .per_request_meta()
+                .and_then(|meta| meta.protocol_version.as_deref())
+                .unwrap_or("absent");
+            Ok(CallToolResult::text(format!(
+                "{version}|can_elicit={}",
+                ctx.can_elicit()
+            )))
+        })
+        .build();
+    McpRouter::new()
+        .server_info("stdio-modern-test", "0.0.0")
+        .tool(inspect)
+}
+
+#[cfg(feature = "stateless")]
+fn final_meta(version: &str) -> serde_json::Value {
+    serde_json::json!({
+        "io.modelcontextprotocol/protocolVersion": version,
+        "io.modelcontextprotocol/clientInfo": {
+            "name": "stdio-loop-client",
+            "version": "1.0.0"
+        },
+        "io.modelcontextprotocol/clientCapabilities": {}
+    })
+}
+
+/// The final stdio lifecycle is selected independently on every request.
+/// A modern discovery probe and ordinary calls work before initialize, then
+/// legacy initialize traffic can continue on the same byte stream.
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn stdio_supports_final_and_legacy_lifecycles_on_one_stream() {
+    let mut transport = StdioTransport::new(modern_router());
+    let (server_stdin_writer, server_stdin) = tokio::io::duplex(32 * 1024);
+    let (server_stdout, server_stdout_reader) = tokio::io::duplex(32 * 1024);
+    let handle = tokio::spawn(async move {
+        transport
+            .run_with_streams(server_stdin, server_stdout)
+            .await
+    });
+
+    let final_version = tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION;
+    let requests = vec![
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+            "params": {"_meta": final_meta(final_version)}
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list",
+            "params": {"_meta": final_meta(final_version)}
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {
+                "name": "inspect_meta",
+                "arguments": {},
+                "_meta": final_meta(final_version)
+            }
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 4, "method": "ping",
+            "params": {"_meta": final_meta(final_version)}
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 5, "method": "server/discover",
+            "params": {"_meta": final_meta("2099-01-01")}
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 6, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "legacy-client", "version": "1.0.0"}
+            }
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0", "method": "notifications/initialized"
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}
+        }),
+    ];
+    let mut stdin_writer = server_stdin_writer;
+    for request in requests {
+        stdin_writer
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+    }
+    stdin_writer.flush().await.unwrap();
+    drop(stdin_writer);
+
+    let frames = read_n_frames(BufReader::new(server_stdout_reader), 7).await;
+    handle
+        .await
+        .expect("transport task join")
+        .expect("run_with_streams ok");
+    assert_eq!(frames.len(), 7, "unexpected frames: {frames:#?}");
+
+    assert_eq!(frames[0]["result"]["resultType"], "complete");
+    assert_eq!(frames[0]["result"]["ttlMs"], 0);
+    assert_eq!(frames[0]["result"]["cacheScope"], "private");
+    assert_eq!(frames[1]["result"]["resultType"], "complete");
+    assert_eq!(frames[1]["result"]["ttlMs"], 0);
+    assert_eq!(
+        frames[2]["result"]["content"][0]["text"],
+        format!("{final_version}|can_elicit=false")
+    );
+    assert_eq!(frames[2]["result"]["resultType"], "complete");
+    assert!(frames[2]["result"].get("ttlMs").is_none());
+    assert_eq!(frames[3]["error"]["code"], -32601);
+    assert_eq!(frames[4]["error"]["code"], -32022);
+    assert_eq!(frames[4]["error"]["data"]["requested"], "2099-01-01");
+
+    // Legacy responses retain their established wire shape.
+    assert!(frames[5]["result"].get("resultType").is_none());
+    assert!(frames[6]["result"].get("resultType").is_none());
+    assert_eq!(frames[6]["result"]["tools"].as_array().unwrap().len(), 1);
+}
+
+/// Runtime support can be narrowed even when the final implementation is
+/// present in the binary.
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn stdio_runtime_protocol_allow_list_is_exact() {
+    let mut transport =
+        StdioTransport::new(modern_router()).protocol_support(ProtocolSupport::stable());
+    let (server_stdin_writer, server_stdin) = tokio::io::duplex(4096);
+    let (server_stdout, server_stdout_reader) = tokio::io::duplex(4096);
+    let handle = tokio::spawn(async move {
+        transport
+            .run_with_streams(server_stdin, server_stdout)
+            .await
+    });
+
+    let request = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+        "params": {
+            "_meta": final_meta(tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION)
+        }
+    });
+    let mut stdin_writer = server_stdin_writer;
+    stdin_writer
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .unwrap();
+    drop(stdin_writer);
+
+    let frames = read_n_frames(BufReader::new(server_stdout_reader), 1).await;
+    handle
+        .await
+        .expect("transport task join")
+        .expect("run_with_streams ok");
+    assert_eq!(frames[0]["error"]["code"], -32022);
+    assert_eq!(
+        frames[0]["error"]["data"]["requested"],
+        tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION
+    );
+    assert!(
+        frames[0]["error"]["data"]["supported"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|version| version != tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION)
+    );
+}
+
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn bidi_final_handlers_cannot_initiate_client_requests() {
+    let mut transport = BidirectionalStdioTransport::new(modern_router());
+    let (server_stdin_writer, server_stdin) = tokio::io::duplex(8192);
+    let (server_stdout, server_stdout_reader) = tokio::io::duplex(8192);
+    let handle = tokio::spawn(async move {
+        transport
+            .run_with_streams(server_stdin, server_stdout)
+            .await
+    });
+
+    let request = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {
+            "name": "inspect_meta",
+            "arguments": {},
+            "_meta": final_meta(tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION)
+        }
+    });
+    let mut stdin_writer = server_stdin_writer;
+    stdin_writer
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .unwrap();
+    stdin_writer.flush().await.unwrap();
+
+    let mut reader = BufReader::new(server_stdout_reader);
+    let frame = timeout(Duration::from_secs(2), read_frame(&mut reader))
+        .await
+        .expect("final tool response");
+    assert_eq!(
+        frame["result"]["content"][0]["text"],
+        "2026-07-28|can_elicit=false"
+    );
+    assert_eq!(frame["result"]["resultType"], "complete");
+
+    drop(stdin_writer);
+    handle
+        .await
+        .expect("transport task join")
+        .expect("run_with_streams ok");
 }
 
 // ============================================================================

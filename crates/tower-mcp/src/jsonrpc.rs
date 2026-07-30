@@ -20,9 +20,10 @@ use tower_service::Service;
 
 use crate::error::{Error, JsonRpcError, Result};
 use crate::protocol::{
-    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, JsonRpcResponseMessage, McpRequest,
+    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, JsonRpcResponseMessage, McpRequest, ResultType,
 };
 use crate::router::{Extensions, RouterRequest, RouterResponse};
+use crate::{ProtocolSupport, ProtocolSupportError};
 
 /// Tower layer that adds JSON-RPC 2.0 framing to an MCP service.
 ///
@@ -81,6 +82,7 @@ impl<S> Layer<S> for JsonRpcLayer {
 pub struct JsonRpcService<S> {
     inner: S,
     extensions: Extensions,
+    protocol_support: ProtocolSupport,
 }
 
 impl<S> JsonRpcService<S> {
@@ -89,6 +91,7 @@ impl<S> JsonRpcService<S> {
         Self {
             inner,
             extensions: Extensions::new(),
+            protocol_support: ProtocolSupport::default(),
         }
     }
 
@@ -101,6 +104,33 @@ impl<S> JsonRpcService<S> {
         self
     }
 
+    /// Set the exact protocol versions this service accepts and advertises.
+    ///
+    /// The default enables every protocol implementation compiled into
+    /// `tower-mcp`. Transports expose the same policy so applications can
+    /// narrow support per server instance.
+    pub fn protocol_support(mut self, support: ProtocolSupport) -> Self {
+        self.protocol_support = support;
+        self
+    }
+
+    /// Construct and set an exact runtime protocol-version allow-list.
+    pub fn protocol_versions<I, V>(
+        mut self,
+        versions: I,
+    ) -> std::result::Result<Self, ProtocolSupportError>
+    where
+        I: IntoIterator<Item = V>,
+        V: Into<String>,
+    {
+        self.protocol_support = ProtocolSupport::try_new(versions)?;
+        Ok(self)
+    }
+
+    pub(crate) fn configured_protocol_support(&self) -> &ProtocolSupport {
+        &self.protocol_support
+    }
+
     /// Process a single JSON-RPC request
     pub async fn call_single(&mut self, req: JsonRpcRequest) -> Result<JsonRpcResponse>
     where
@@ -110,7 +140,13 @@ impl<S> JsonRpcService<S> {
             + 'static,
         S::Future: Send,
     {
-        process_single_request(self.inner.clone(), req, self.extensions.clone()).await
+        process_single_request(
+            self.inner.clone(),
+            req,
+            self.extensions.clone(),
+            self.protocol_support.clone(),
+        )
+        .await
     }
 
     /// Process a batch of JSON-RPC requests concurrently
@@ -137,9 +173,10 @@ impl<S> JsonRpcService<S> {
             .map(|req| {
                 let inner = self.inner.clone();
                 let extensions = self.extensions.clone();
+                let protocol_support = self.protocol_support.clone();
                 let req_id = req.id.clone();
                 async move {
-                    match process_single_request(inner, req, extensions).await {
+                    match process_single_request(inner, req, extensions, protocol_support).await {
                         Ok(resp) => resp,
                         Err(e) => {
                             // Convert errors to error responses instead of dropping
@@ -193,6 +230,7 @@ where
         Self {
             inner: self.inner.clone(),
             extensions: self.extensions.clone(),
+            protocol_support: self.protocol_support.clone(),
         }
     }
 }
@@ -217,23 +255,13 @@ where
     fn call(&mut self, req: JsonRpcRequest) -> Self::Future {
         let inner = self.inner.clone();
         let extensions = self.extensions.clone();
-        Box::pin(async move {
-            // Parse the MCP request from JSON-RPC
-            let mcp_request = McpRequest::from_jsonrpc(&req)?;
-
-            // Create router request
-            let router_req = RouterRequest {
-                id: req.id,
-                inner: mcp_request,
-                extensions,
-            };
-
-            // Call the inner service (oneshot handles poll_ready)
-            let response = inner.oneshot(router_req).await.unwrap(); // Infallible
-
-            // Convert to JSON-RPC response
-            Ok(response.into_jsonrpc())
-        })
+        let protocol_support = self.protocol_support.clone();
+        Box::pin(process_single_request(
+            inner,
+            req,
+            extensions,
+            protocol_support,
+        ))
     }
 }
 
@@ -258,10 +286,12 @@ where
     fn call(&mut self, msg: JsonRpcMessage) -> Self::Future {
         let inner = self.inner.clone();
         let extensions = self.extensions.clone();
+        let protocol_support = self.protocol_support.clone();
         Box::pin(async move {
             match msg {
                 JsonRpcMessage::Single(req) => {
-                    let response = process_single_request(inner, req, extensions).await?;
+                    let response =
+                        process_single_request(inner, req, extensions, protocol_support).await?;
                     Ok(JsonRpcResponseMessage::Single(response))
                 }
                 JsonRpcMessage::Batch(requests) => {
@@ -279,9 +309,17 @@ where
                         .map(|req| {
                             let inner = inner.clone();
                             let extensions = extensions.clone();
+                            let protocol_support = protocol_support.clone();
                             let req_id = req.id.clone();
                             async move {
-                                match process_single_request(inner, req, extensions).await {
+                                match process_single_request(
+                                    inner,
+                                    req,
+                                    extensions,
+                                    protocol_support,
+                                )
+                                .await
+                                {
                                     Ok(resp) => resp,
                                     Err(e) => {
                                         // Convert errors to error responses instead of dropping
@@ -320,7 +358,8 @@ where
 async fn process_single_request<S>(
     inner: S,
     req: JsonRpcRequest,
-    extensions: Extensions,
+    mut extensions: Extensions,
+    configured_protocol_support: ProtocolSupport,
 ) -> std::result::Result<JsonRpcResponse, Error>
 where
     S: Service<RouterRequest, Response = RouterResponse, Error = std::convert::Infallible>
@@ -332,6 +371,23 @@ where
     if let Err(e) = req.validate() {
         return Ok(JsonRpcResponse::error(Some(req.id), e));
     }
+
+    let method = req.method.clone();
+    #[cfg(feature = "stateless")]
+    let request_id = req.id.clone();
+    let protocol_support = extensions
+        .get::<ProtocolSupport>()
+        .cloned()
+        .unwrap_or(configured_protocol_support);
+    extensions.insert(protocol_support.clone());
+
+    #[cfg(feature = "stateless")]
+    let protocol_version = match prepare_modern_request(&req, &mut extensions, &protocol_support) {
+        Ok(version) => version,
+        Err(error) => return Ok(JsonRpcResponse::error(Some(request_id), error)),
+    };
+    #[cfg(not(feature = "stateless"))]
+    let protocol_version: Option<String> = None;
 
     // Parse the MCP request from JSON-RPC
     let mcp_request = match McpRequest::from_jsonrpc(&req) {
@@ -355,7 +411,140 @@ where
     let response = inner.oneshot(router_req).await.unwrap(); // Infallible
 
     // Convert to JSON-RPC response
-    Ok(response.into_jsonrpc())
+    let mut response = response.into_jsonrpc();
+    if let Some(version) = protocol_version.as_deref() {
+        apply_protocol_result_fields(&mut response, &method, version);
+    }
+    Ok(response)
+}
+
+/// Validate a request using the final per-request metadata lifecycle.
+///
+/// The protocol-version key is the era discriminator on transports without
+/// headers (stdio and custom bindings). Legacy initialize traffic can coexist
+/// on the same connection because requests without that key retain the
+/// sessionful path.
+#[cfg(feature = "stateless")]
+fn prepare_modern_request(
+    req: &JsonRpcRequest,
+    extensions: &mut Extensions,
+    protocol_support: &ProtocolSupport,
+) -> std::result::Result<Option<String>, JsonRpcError> {
+    let Some(params) = req.params.as_ref() else {
+        return Ok(None);
+    };
+    let Some(meta_value) = params.as_object().and_then(|params| params.get("_meta")) else {
+        return Ok(None);
+    };
+    let claims_modern = meta_value
+        .as_object()
+        .is_some_and(|meta| meta.contains_key("io.modelcontextprotocol/protocolVersion"));
+    if !claims_modern {
+        return Ok(None);
+    }
+
+    crate::protocol::validate_meta_object(meta_value)
+        .map_err(|error| JsonRpcError::invalid_params(error.to_string()))?;
+    let meta_object = meta_value
+        .as_object()
+        .expect("validate_meta_object accepted a JSON object");
+    let protocol_version = meta_object
+        .get("io.modelcontextprotocol/protocolVersion")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            JsonRpcError::invalid_params(
+                "Missing or invalid _meta.io.modelcontextprotocol/protocolVersion",
+            )
+        })?;
+    let client_capabilities = meta_object
+        .get("io.modelcontextprotocol/clientCapabilities")
+        .ok_or_else(|| {
+            JsonRpcError::invalid_params("Missing _meta.io.modelcontextprotocol/clientCapabilities")
+        })?;
+    if !client_capabilities.is_object()
+        || serde_json::from_value::<crate::protocol::ClientCapabilities>(
+            client_capabilities.clone(),
+        )
+        .is_err()
+    {
+        return Err(JsonRpcError::invalid_params(
+            "Invalid _meta.io.modelcontextprotocol/clientCapabilities",
+        ));
+    }
+    if !protocol_support.contains(protocol_version) {
+        return Err(JsonRpcError::unsupported_protocol_version(
+            protocol_version,
+            protocol_support.versions().iter().map(String::as_str),
+        ));
+    }
+    if protocol_version == crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION
+        && is_removed_modern_method(&req.method)
+    {
+        return Err(JsonRpcError::method_not_found(&req.method));
+    }
+
+    let meta: crate::stateless::StatelessRequestMeta =
+        serde_json::from_value(meta_value.clone())
+            .map_err(|error| JsonRpcError::invalid_params(error.to_string()))?;
+    extensions.insert(meta);
+    Ok(Some(protocol_version.to_string()))
+}
+
+/// Methods present in legacy protocol unions but removed from the final core.
+#[cfg(feature = "stateless")]
+fn is_removed_modern_method(method: &str) -> bool {
+    matches!(
+        method,
+        "initialize"
+            | "notifications/initialized"
+            | "ping"
+            | "logging/setLevel"
+            | "resources/subscribe"
+            | "resources/unsubscribe"
+            | "notifications/roots/list_changed"
+    )
+}
+
+/// Fill the required 2026-07-28 result envelope immediately before it reaches
+/// a JSON-RPC transport, while preserving legacy public result types.
+pub(crate) fn apply_protocol_result_fields(
+    response: &mut JsonRpcResponse,
+    method: &str,
+    protocol_version: &str,
+) {
+    if protocol_version != crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION {
+        return;
+    }
+
+    let JsonRpcResponse::Result(result) = response else {
+        return;
+    };
+    ResultType::Complete.stamp_into(&mut result.result, protocol_version);
+
+    if !is_cacheable_result_method(method) {
+        return;
+    }
+    let Some(object) = result.result.as_object_mut() else {
+        return;
+    };
+    object
+        .entry("ttlMs")
+        .or_insert_with(|| serde_json::Value::Number(0.into()));
+    object
+        .entry("cacheScope")
+        .or_insert_with(|| serde_json::Value::String("private".to_string()));
+}
+
+fn is_cacheable_result_method(method: &str) -> bool {
+    matches!(
+        method,
+        "server/discover"
+            | "tools/list"
+            | "prompts/list"
+            | "resources/list"
+            | "resources/read"
+            | "resources/templates/list"
+    )
 }
 
 #[cfg(test)]
@@ -444,6 +633,80 @@ mod tests {
 
         let responses = service.call_batch(requests).await.unwrap();
         assert_eq!(responses.len(), 2);
+    }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn modern_batch_metadata_is_isolated_per_request() {
+        let router = create_test_router();
+        let mut service = JsonRpcService::new(router);
+        let final_request = JsonRpcRequest::new(1, "tools/list").with_params(serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion":
+                    crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        }));
+        let legacy_request =
+            JsonRpcRequest::new(2, "tools/list").with_params(serde_json::json!({}));
+
+        let responses = service
+            .call_batch(vec![final_request, legacy_request])
+            .await
+            .unwrap();
+        let JsonRpcResponse::Result(final_response) = &responses[0] else {
+            panic!("final request should bypass legacy session state");
+        };
+        assert_eq!(final_response.result["resultType"], "complete");
+
+        let JsonRpcResponse::Error(legacy_response) = &responses[1] else {
+            panic!("legacy request must not inherit final request metadata");
+        };
+        assert_eq!(legacy_response.error.code, -32600);
+    }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn modern_request_requires_client_capabilities() {
+        let router = create_test_router();
+        let mut service = JsonRpcService::new(router);
+        let request = JsonRpcRequest::new(1, "server/discover").with_params(serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion":
+                    crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION
+            }
+        }));
+
+        let response = service.call_single(request).await.unwrap();
+        let JsonRpcResponse::Error(response) = response else {
+            panic!("missing clientCapabilities must be rejected");
+        };
+        assert_eq!(response.error.code, -32602);
+        assert!(response.error.message.contains("clientCapabilities"));
+    }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn final_only_policy_never_negotiates_final_via_initialize() {
+        let router = create_test_router();
+        let mut service = JsonRpcService::new(router).protocol_support(
+            ProtocolSupport::try_new([crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION]).unwrap(),
+        );
+        let request = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "legacy-client", "version": "1.0.0"}
+        }));
+
+        let response = service.call_single(request).await.unwrap();
+        let JsonRpcResponse::Error(response) = response else {
+            panic!("final-only policy must reject the removed initialize lifecycle");
+        };
+        assert_eq!(response.error.code, -32022);
+        assert_eq!(
+            response.error.data.unwrap()["supported"],
+            serde_json::json!([crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION])
+        );
     }
 
     #[tokio::test]
