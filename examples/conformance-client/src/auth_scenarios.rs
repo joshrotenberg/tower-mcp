@@ -5,7 +5,11 @@
 //! with the authorization code, enabling headless OAuth flows.
 
 use anyhow::{Context, Result};
-use tower_mcp::{HttpClientConfig, HttpClientTransport};
+use tower_mcp::{
+    HttpClientConfig, HttpClientTransport, OAuthAuthorizationServerMetadata,
+    OAuthClientRegistration, OAuthClientRegistrationOptions, OAuthDynamicClientRegistration,
+    resolve_oauth_client_registration,
+};
 
 use crate::handlers;
 
@@ -747,9 +751,6 @@ async fn perform_oauth_flow(
         .get("token_endpoint")
         .and_then(|v| v.as_str())
         .context("No token_endpoint in metadata")?;
-    let registration_endpoint = metadata
-        .get("registration_endpoint")
-        .and_then(|v| v.as_str());
     let expected_issuer = metadata.get("issuer").and_then(|v| v.as_str());
     let iss_required = metadata
         .get("authorization_response_iss_parameter_supported")
@@ -790,53 +791,34 @@ async fn perform_oauth_flow(
         selected_scope = union_scopes(selected_scope.as_deref(), Some("offline_access"));
     }
 
-    // Step 4: Dynamic client registration (if available)
-    let use_cimd = metadata
-        .get("client_id_metadata_document_supported")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let (client_id, client_secret) = if use_cimd {
-        (
-            "https://conformance-test.local/client-metadata.json".to_string(),
-            None,
-        )
-    } else if let Some(reg_endpoint) = registration_endpoint {
-        let grant_types = if refresh_supported {
-            serde_json::json!(["authorization_code", "refresh_token"])
-        } else {
-            serde_json::json!(["authorization_code"])
-        };
-        let reg_resp = http_plain
-            .post(reg_endpoint)
-            .json(&serde_json::json!({
-                "client_name": "conformance-client",
-                "application_type": "native",
-                "redirect_uris": ["http://localhost:23456/callback"],
-                "grant_types": grant_types,
-                "response_types": ["code"],
-                "token_endpoint_auth_method": auth_method
-            }))
-            .send()
-            .await?;
-
-        let reg: serde_json::Value = reg_resp.json().await?;
-        let cid = reg
-            .get("client_id")
-            .and_then(|v| v.as_str())
-            .context("No client_id in registration response")?
-            .to_string();
-        let csec = reg
-            .get("client_secret")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        (cid, csec)
+    // Step 4: Select pre-registration, CIMD, or DCR using the reusable
+    // authorization-code client policy. This flow has no pre-registered
+    // credentials, so it offers CIMD and native-application DCR.
+    let registration_metadata: OAuthAuthorizationServerMetadata =
+        serde_json::from_value(metadata.clone())
+            .context("Invalid authorization server registration metadata")?;
+    let grant_types = if refresh_supported {
+        vec!["authorization_code", "refresh_token"]
     } else {
-        // Use CIMD (Client ID Metadata Documents) -- client_id is a URL
-        (
-            "http://localhost:23456/client-metadata.json".to_string(),
-            None,
-        )
+        vec!["authorization_code"]
     };
+    let dynamic_registration = OAuthDynamicClientRegistration::native(
+        "conformance-client",
+        ["http://localhost:23456/callback"],
+    )
+    .grant_types(grant_types)
+    .token_endpoint_auth_method(auth_method.clone());
+    let registration_options = OAuthClientRegistrationOptions::new()
+        .with_client_id_metadata_document("https://conformance-test.local/client-metadata.json")
+        .with_dynamic_registration(dynamic_registration);
+    let registration = resolve_oauth_client_registration(
+        &http_plain,
+        &registration_metadata,
+        &registration_options,
+    )
+    .await?;
+    let client_id = registration.client_id().to_string();
+    let client_secret = registration.client_secret().map(str::to_string);
 
     // Step 5: Build authorization URL with PKCE
     let code_verifier = generate_code_verifier();
@@ -1012,6 +994,25 @@ async fn perform_oauth_flow_with_credentials(
         .get("token_endpoint")
         .and_then(|v| v.as_str())
         .context("No token_endpoint")?;
+    let registration_metadata: OAuthAuthorizationServerMetadata =
+        serde_json::from_value(metadata.clone())
+            .context("Invalid authorization server registration metadata")?;
+    let pre_registered = OAuthClientRegistration::pre_registered(
+        registration_metadata.issuer.clone(),
+        client_id,
+        Some(client_secret.to_string()),
+    );
+    let registration = resolve_oauth_client_registration(
+        &http_plain,
+        &registration_metadata,
+        &OAuthClientRegistrationOptions::new().with_pre_registered(pre_registered),
+    )
+    .await?;
+    let client_id = registration.client_id().to_string();
+    let client_secret = registration
+        .client_secret()
+        .context("Pre-registered client secret was not retained")?
+        .to_string();
 
     let code_verifier = generate_code_verifier();
     let code_challenge = generate_code_challenge(&code_verifier);
@@ -1020,7 +1021,7 @@ async fn perform_oauth_flow_with_credentials(
     let mut auth_url = format!(
         "{}?response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256",
         authorization_endpoint,
-        urlencoded(client_id),
+        urlencoded(&client_id),
         urlencoded("http://localhost:23456/callback"),
         urlencoded(&state),
         urlencoded(&code_challenge),
@@ -1059,7 +1060,7 @@ async fn perform_oauth_flow_with_credentials(
 
     let token_resp = http_plain
         .post(token_endpoint)
-        .basic_auth(client_id, Some(client_secret))
+        .basic_auth(&client_id, Some(&client_secret))
         .form(&token_params)
         .send()
         .await?;

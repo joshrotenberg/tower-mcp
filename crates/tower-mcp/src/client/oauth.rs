@@ -84,6 +84,8 @@ pub enum OAuthClientError {
     Discovery(String),
     /// Failed to request a token from the token endpoint.
     TokenRequest(String),
+    /// Failed to register an OAuth client.
+    Registration(String),
     /// The token response was invalid or missing required fields.
     InvalidResponse(String),
     /// Builder validation failed (missing required fields).
@@ -95,6 +97,7 @@ impl fmt::Display for OAuthClientError {
         match self {
             Self::Discovery(msg) => write!(f, "OAuth discovery error: {}", msg),
             Self::TokenRequest(msg) => write!(f, "OAuth token request error: {}", msg),
+            Self::Registration(msg) => write!(f, "OAuth client registration error: {}", msg),
             Self::InvalidResponse(msg) => write!(f, "OAuth invalid response: {}", msg),
             Self::BuildError(msg) => write!(f, "OAuth builder error: {}", msg),
         }
@@ -570,6 +573,9 @@ mod tests {
 
         let err = OAuthClientError::TokenRequest("timeout".into());
         assert_eq!(err.to_string(), "OAuth token request error: timeout");
+
+        let err = OAuthClientError::Registration("rejected".into());
+        assert_eq!(err.to_string(), "OAuth client registration error: rejected");
 
         let err = OAuthClientError::InvalidResponse("bad json".into());
         assert_eq!(err.to_string(), "OAuth invalid response: bad json");

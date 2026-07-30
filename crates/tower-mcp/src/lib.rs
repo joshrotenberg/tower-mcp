@@ -523,7 +523,12 @@ pub use client::{
 #[cfg(feature = "http-client")]
 pub use client::{HttpClientConfig, HttpClientTransport};
 #[cfg(feature = "oauth-client")]
-pub use client::{OAuthClientCredentials, OAuthClientError, TokenProvider};
+pub use client::{
+    OAuthApplicationType, OAuthAuthorizationServerMetadata, OAuthClientCredentials,
+    OAuthClientError, OAuthClientRegistration, OAuthClientRegistrationMethod,
+    OAuthClientRegistrationOptions, OAuthDynamicClientRegistration, TokenProvider,
+    discover_oauth_authorization_server, resolve_oauth_client_registration,
+};
 pub use context::{
     ChannelClientRequester, ClientRequester, ClientRequesterHandle, Extensions,
     NotificationReceiver, NotificationSender, OutgoingRequest, OutgoingRequestReceiver,

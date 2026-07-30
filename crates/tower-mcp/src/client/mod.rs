@@ -51,7 +51,12 @@ pub use oauth::{
     OAuthClientCredentials, OAuthClientCredentialsBuilder, OAuthClientError, TokenProvider,
 };
 #[cfg(feature = "oauth-client")]
-pub use oauth_authcode::{OAuthAuthCodeConfig, OAuthAuthorizationCode};
+pub use oauth_authcode::{
+    OAuthApplicationType, OAuthAuthCodeConfig, OAuthAuthorizationCode,
+    OAuthAuthorizationServerMetadata, OAuthClientRegistration, OAuthClientRegistrationMethod,
+    OAuthClientRegistrationOptions, OAuthDynamicClientRegistration,
+    discover_oauth_authorization_server, resolve_oauth_client_registration,
+};
 pub use response_cache::{ClientCacheConfig, DEFAULT_MAX_CACHE_TTL};
 pub use stdio::StdioClientTransport;
 pub use transport::ClientTransport;

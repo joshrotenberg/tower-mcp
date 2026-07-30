@@ -75,28 +75,36 @@ fn generate_state() -> String {
 // Authorization Server Discovery (RFC 8414)
 // =============================================================================
 
-/// OAuth authorization server metadata (subset of RFC 8414).
-#[derive(Debug, serde::Deserialize)]
-struct AuthorizationServerMetadata {
+/// OAuth authorization server metadata used by the authorization-code flow.
+///
+/// This includes the MCP client-registration capability fields in addition to
+/// the RFC 8414 endpoints needed by [`OAuthAuthorizationCode`].
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct OAuthAuthorizationServerMetadata {
     /// AS issuer identifier (RFC 8414 §2).
-    issuer: String,
-    authorization_endpoint: String,
-    token_endpoint: String,
-    #[allow(dead_code)]
-    registration_endpoint: Option<String>,
+    pub issuer: String,
+    /// Authorization endpoint.
+    pub authorization_endpoint: String,
+    /// Token endpoint.
+    pub token_endpoint: String,
+    /// Dynamic Client Registration endpoint (RFC 7591), when supported.
+    pub registration_endpoint: Option<String>,
+    /// Whether the AS supports OAuth Client ID Metadata Documents.
+    #[serde(default)]
+    pub client_id_metadata_document_supported: bool,
     /// RFC 9207 / SEP-2468: AS advertises that it includes `iss` in
     /// authorization responses. Drives the "absent iss is suspicious"
     /// branch of client-side validation.
     #[serde(default)]
-    authorization_response_iss_parameter_supported: bool,
+    pub authorization_response_iss_parameter_supported: bool,
 }
 
 /// Discover the authorization server metadata from the MCP server's
 /// Protected Resource Metadata (RFC 9728) or directly from well-known.
-async fn discover_auth_server(
+pub async fn discover_oauth_authorization_server(
     server_url: &str,
     client: &reqwest::Client,
-) -> Result<AuthorizationServerMetadata, OAuthClientError> {
+) -> Result<OAuthAuthorizationServerMetadata, OAuthClientError> {
     let base = server_url.trim_end_matches('/');
 
     // Try Protected Resource Metadata first (RFC 9728)
@@ -124,7 +132,7 @@ async fn discover_auth_server(
 async fn try_discover_via_prm(
     base: &str,
     client: &reqwest::Client,
-) -> Result<Option<AuthorizationServerMetadata>, OAuthClientError> {
+) -> Result<Option<OAuthAuthorizationServerMetadata>, OAuthClientError> {
     let prm_url = format!("{}/.well-known/oauth-protected-resource", base);
     let Ok(resp) = client.get(&prm_url).send().await else {
         return Ok(None);
@@ -167,7 +175,7 @@ async fn try_discover_via_prm(
 /// MCP requires exact string equality here. In particular, trailing slashes
 /// are significant and must not be normalized before comparison.
 fn validate_metadata_issuer(
-    metadata: &AuthorizationServerMetadata,
+    metadata: &OAuthAuthorizationServerMetadata,
     expected: &str,
 ) -> Result<(), OAuthClientError> {
     if metadata.issuer == expected {
@@ -178,6 +186,308 @@ fn validate_metadata_issuer(
             metadata.issuer
         )))
     }
+}
+
+// =============================================================================
+// Client registration
+// =============================================================================
+
+/// Client-registration mechanism selected for an authorization-code flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OAuthClientRegistrationMethod {
+    /// Credentials registered with a specific authorization server in advance.
+    PreRegistered,
+    /// A portable HTTPS Client ID Metadata Document URL.
+    ClientIdMetadataDocument,
+    /// Dynamic Client Registration (RFC 7591).
+    Dynamic,
+}
+
+/// Client credentials selected or created for an authorization-code flow.
+///
+/// [`bound_issuer()`](Self::bound_issuer) is set for pre-registered and
+/// dynamically registered clients. Client ID Metadata Document identifiers are
+/// portable across authorization servers and therefore have no issuer binding.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OAuthClientRegistration {
+    client_id: String,
+    client_secret: Option<String>,
+    method: OAuthClientRegistrationMethod,
+    bound_issuer: Option<String>,
+}
+
+impl fmt::Debug for OAuthClientRegistration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OAuthClientRegistration")
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("method", &self.method)
+            .field("bound_issuer", &self.bound_issuer)
+            .finish()
+    }
+}
+
+impl OAuthClientRegistration {
+    /// Create issuer-bound pre-registered client credentials.
+    pub fn pre_registered(
+        issuer: impl Into<String>,
+        client_id: impl Into<String>,
+        client_secret: Option<String>,
+    ) -> Self {
+        Self {
+            client_id: client_id.into(),
+            client_secret,
+            method: OAuthClientRegistrationMethod::PreRegistered,
+            bound_issuer: Some(issuer.into()),
+        }
+    }
+
+    /// OAuth client ID.
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    /// OAuth client secret, when the registration issued one.
+    pub fn client_secret(&self) -> Option<&str> {
+        self.client_secret.as_deref()
+    }
+
+    /// Registration mechanism used to obtain the client ID.
+    pub fn method(&self) -> OAuthClientRegistrationMethod {
+        self.method
+    }
+
+    /// Authorization-server issuer to which these credentials are bound.
+    ///
+    /// This is `None` only for portable Client ID Metadata Document URLs.
+    pub fn bound_issuer(&self) -> Option<&str> {
+        self.bound_issuer.as_deref()
+    }
+}
+
+/// OAuth application type sent during Dynamic Client Registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OAuthApplicationType {
+    /// Desktop, mobile, CLI, or locally hosted application.
+    Native,
+    /// Remotely hosted browser application.
+    Web,
+}
+
+/// Dynamic Client Registration request metadata.
+///
+/// Use [`native()`](Self::native) for desktop, mobile, CLI, and localhost
+/// clients, as required by the MCP 2026-07-28 authorization specification.
+#[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
+pub struct OAuthDynamicClientRegistration {
+    /// Human-readable client name.
+    pub client_name: String,
+    /// OIDC application type. MCP clients must choose this explicitly.
+    pub application_type: OAuthApplicationType,
+    /// Allowed redirect URIs.
+    pub redirect_uris: Vec<String>,
+    /// Requested OAuth grant types.
+    pub grant_types: Vec<String>,
+    /// Requested OAuth response types.
+    pub response_types: Vec<String>,
+    /// Token endpoint authentication method.
+    pub token_endpoint_auth_method: String,
+}
+
+impl OAuthDynamicClientRegistration {
+    /// Create registration metadata for a native application.
+    pub fn native(
+        client_name: impl Into<String>,
+        redirect_uris: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            client_name: client_name.into(),
+            application_type: OAuthApplicationType::Native,
+            redirect_uris: redirect_uris.into_iter().map(Into::into).collect(),
+            grant_types: vec!["authorization_code".to_string()],
+            response_types: vec!["code".to_string()],
+            token_endpoint_auth_method: "none".to_string(),
+        }
+    }
+
+    /// Create registration metadata for a web application.
+    pub fn web(
+        client_name: impl Into<String>,
+        redirect_uris: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            application_type: OAuthApplicationType::Web,
+            ..Self::native(client_name, redirect_uris)
+        }
+    }
+
+    /// Override the requested grant types.
+    pub fn grant_types(mut self, grant_types: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.grant_types = grant_types.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Override the token endpoint authentication method.
+    pub fn token_endpoint_auth_method(mut self, method: impl Into<String>) -> Self {
+        self.token_endpoint_auth_method = method.into();
+        self
+    }
+}
+
+/// Registration mechanisms available to an OAuth authorization-code client.
+///
+/// [`resolve_oauth_client_registration`] applies the MCP 2026-07-28 priority
+/// order: pre-registration, Client ID Metadata Documents, then Dynamic Client
+/// Registration.
+#[derive(Debug, Clone, Default)]
+pub struct OAuthClientRegistrationOptions {
+    /// Issuer-bound credentials registered ahead of time.
+    pub pre_registered: Option<OAuthClientRegistration>,
+    /// HTTPS URL of the client's metadata document.
+    pub client_id_metadata_document: Option<String>,
+    /// Metadata to send when falling back to Dynamic Client Registration.
+    pub dynamic_registration: Option<OAuthDynamicClientRegistration>,
+}
+
+impl OAuthClientRegistrationOptions {
+    /// Create an empty set of registration options.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Supply issuer-bound pre-registered credentials.
+    pub fn with_pre_registered(mut self, registration: OAuthClientRegistration) -> Self {
+        self.pre_registered = Some(registration);
+        self
+    }
+
+    /// Supply the client's HTTPS Client ID Metadata Document URL.
+    pub fn with_client_id_metadata_document(mut self, client_id: impl Into<String>) -> Self {
+        self.client_id_metadata_document = Some(client_id.into());
+        self
+    }
+
+    /// Enable Dynamic Client Registration as a fallback.
+    pub fn with_dynamic_registration(
+        mut self,
+        registration: OAuthDynamicClientRegistration,
+    ) -> Self {
+        self.dynamic_registration = Some(registration);
+        self
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DynamicClientRegistrationResponse {
+    client_id: String,
+    client_secret: Option<String>,
+}
+
+/// Select and, when necessary, perform OAuth client registration.
+///
+/// Pre-registered credentials are accepted only when their issuer binding
+/// exactly matches `metadata.issuer`. CIMD URLs must use HTTPS and contain a
+/// non-root path. If no configured mechanism is supported, the returned error
+/// tells the caller to prompt the user for client information.
+pub async fn resolve_oauth_client_registration(
+    client: &reqwest::Client,
+    metadata: &OAuthAuthorizationServerMetadata,
+    options: &OAuthClientRegistrationOptions,
+) -> Result<OAuthClientRegistration, OAuthClientError> {
+    if let Some(registration) = &options.pre_registered {
+        if registration.method != OAuthClientRegistrationMethod::PreRegistered {
+            return Err(OAuthClientError::BuildError(
+                "pre_registered must contain pre-registered credentials".to_string(),
+            ));
+        }
+        if registration.bound_issuer() != Some(metadata.issuer.as_str()) {
+            return Err(OAuthClientError::BuildError(format!(
+                "pre-registered credentials are bound to issuer {:?}, not `{}`",
+                registration.bound_issuer(),
+                metadata.issuer
+            )));
+        }
+        return Ok(registration.clone());
+    }
+
+    if metadata.client_id_metadata_document_supported
+        && let Some(client_id) = &options.client_id_metadata_document
+    {
+        validate_client_id_metadata_document_url(client_id)?;
+        return Ok(OAuthClientRegistration {
+            client_id: client_id.clone(),
+            client_secret: None,
+            method: OAuthClientRegistrationMethod::ClientIdMetadataDocument,
+            bound_issuer: None,
+        });
+    }
+
+    if let (Some(endpoint), Some(request)) = (
+        metadata.registration_endpoint.as_deref(),
+        options.dynamic_registration.as_ref(),
+    ) {
+        if request.redirect_uris.is_empty() {
+            return Err(OAuthClientError::BuildError(
+                "dynamic registration requires at least one redirect URI".to_string(),
+            ));
+        }
+
+        let response = client
+            .post(endpoint)
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| OAuthClientError::Registration(error.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body: String = response
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(1024)
+                .collect();
+            return Err(OAuthClientError::Registration(format!(
+                "dynamic client registration failed with {status}: {body}"
+            )));
+        }
+        let response: DynamicClientRegistrationResponse = response
+            .json()
+            .await
+            .map_err(|error| OAuthClientError::Registration(error.to_string()))?;
+        return Ok(OAuthClientRegistration {
+            client_id: response.client_id,
+            client_secret: response.client_secret,
+            method: OAuthClientRegistrationMethod::Dynamic,
+            bound_issuer: Some(metadata.issuer.clone()),
+        });
+    }
+
+    Err(OAuthClientError::BuildError(
+        "authorization server supports none of the configured client registration mechanisms; \
+         prompt the user for pre-registered client information"
+            .to_string(),
+    ))
+}
+
+fn validate_client_id_metadata_document_url(client_id: &str) -> Result<(), OAuthClientError> {
+    let url = reqwest::Url::parse(client_id).map_err(|error| {
+        OAuthClientError::BuildError(format!(
+            "invalid Client ID Metadata Document URL `{client_id}`: {error}"
+        ))
+    })?;
+    if url.scheme() != "https" || url.path() == "/" {
+        return Err(OAuthClientError::BuildError(format!(
+            "Client ID Metadata Document URL `{client_id}` must use HTTPS and contain a path"
+        )));
+    }
+    Ok(())
 }
 
 // =============================================================================
@@ -296,7 +606,7 @@ impl OAuthAuthorizationCode {
         let client = config.http_client.unwrap_or_default();
 
         // Discover auth server
-        let metadata = discover_auth_server(server_url, &client).await?;
+        let metadata = discover_oauth_authorization_server(server_url, &client).await?;
 
         // Generate PKCE
         let code_verifier = generate_code_verifier();
@@ -914,12 +1224,205 @@ mod tests {
         assert!(err.to_string().contains("issuer mismatch"), "got: {err}");
     }
 
-    fn authorization_server_metadata(issuer: &str) -> AuthorizationServerMetadata {
-        AuthorizationServerMetadata {
+    #[tokio::test]
+    async fn registration_prefers_pre_registered_credentials() {
+        let mut metadata = authorization_server_metadata("https://auth.example.com");
+        metadata.client_id_metadata_document_supported = true;
+        metadata.registration_endpoint = Some("http://127.0.0.1:9/register".to_string());
+        let pre_registered = OAuthClientRegistration::pre_registered(
+            "https://auth.example.com",
+            "configured-client",
+            Some("secret".to_string()),
+        );
+        let options = OAuthClientRegistrationOptions::new()
+            .with_pre_registered(pre_registered)
+            .with_client_id_metadata_document("https://client.example.com/client.json")
+            .with_dynamic_registration(OAuthDynamicClientRegistration::native(
+                "test-client",
+                ["http://127.0.0.1/callback"],
+            ));
+
+        let registration =
+            resolve_oauth_client_registration(&reqwest::Client::new(), &metadata, &options)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            registration.method(),
+            OAuthClientRegistrationMethod::PreRegistered
+        );
+        assert_eq!(registration.client_id(), "configured-client");
+        assert_eq!(registration.client_secret(), Some("secret"));
+        assert_eq!(
+            registration.bound_issuer(),
+            Some("https://auth.example.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_rejects_pre_registered_issuer_mismatch() {
+        let metadata = authorization_server_metadata("https://new-auth.example.com");
+        let options = OAuthClientRegistrationOptions::new().with_pre_registered(
+            OAuthClientRegistration::pre_registered(
+                "https://old-auth.example.com",
+                "configured-client",
+                None,
+            ),
+        );
+
+        let error = resolve_oauth_client_registration(&reqwest::Client::new(), &metadata, &options)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("bound to issuer"),
+            "got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_prefers_cimd_over_dynamic_registration() {
+        let mut metadata = authorization_server_metadata("https://auth.example.com");
+        metadata.client_id_metadata_document_supported = true;
+        metadata.registration_endpoint = Some("http://127.0.0.1:9/register".to_string());
+        let options = OAuthClientRegistrationOptions::new()
+            .with_client_id_metadata_document("https://client.example.com/client.json")
+            .with_dynamic_registration(OAuthDynamicClientRegistration::native(
+                "test-client",
+                ["http://127.0.0.1/callback"],
+            ));
+
+        let registration =
+            resolve_oauth_client_registration(&reqwest::Client::new(), &metadata, &options)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            registration.method(),
+            OAuthClientRegistrationMethod::ClientIdMetadataDocument
+        );
+        assert_eq!(
+            registration.client_id(),
+            "https://client.example.com/client.json"
+        );
+        assert_eq!(registration.bound_issuer(), None);
+    }
+
+    #[tokio::test]
+    async fn registration_rejects_invalid_cimd_url() {
+        let mut metadata = authorization_server_metadata("https://auth.example.com");
+        metadata.client_id_metadata_document_supported = true;
+        let options = OAuthClientRegistrationOptions::new()
+            .with_client_id_metadata_document("http://client.example.com/client.json");
+
+        let error = resolve_oauth_client_registration(&reqwest::Client::new(), &metadata, &options)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("must use HTTPS"), "got: {error}");
+    }
+
+    #[tokio::test]
+    async fn registration_falls_back_to_native_dcr_and_binds_issuer() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let header_end = loop {
+                let mut chunk = [0u8; 1024];
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0);
+                bytes.extend_from_slice(&chunk[..read]);
+                if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            while bytes.len() < header_end + content_length {
+                let mut chunk = [0u8; 1024];
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0);
+                bytes.extend_from_slice(&chunk[..read]);
+            }
+            let body: serde_json::Value =
+                serde_json::from_slice(&bytes[header_end..header_end + content_length]).unwrap();
+            request_tx.send(body).unwrap();
+
+            let response_body = r#"{"client_id":"dynamic-client","client_secret":"secret"}"#;
+            let response = format!(
+                "HTTP/1.1 201 Created\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let mut metadata = authorization_server_metadata("https://auth.example.com");
+        metadata.registration_endpoint = Some(format!("http://{address}/register"));
+        let options = OAuthClientRegistrationOptions::new().with_dynamic_registration(
+            OAuthDynamicClientRegistration::native("test-client", ["http://127.0.0.1/callback"])
+                .grant_types(["authorization_code", "refresh_token"])
+                .token_endpoint_auth_method("client_secret_basic"),
+        );
+
+        let registration =
+            resolve_oauth_client_registration(&reqwest::Client::new(), &metadata, &options)
+                .await
+                .unwrap();
+        let request = request_rx.await.unwrap();
+        server.await.unwrap();
+
+        assert_eq!(
+            registration.method(),
+            OAuthClientRegistrationMethod::Dynamic
+        );
+        assert_eq!(registration.client_id(), "dynamic-client");
+        assert_eq!(registration.client_secret(), Some("secret"));
+        assert_eq!(
+            registration.bound_issuer(),
+            Some("https://auth.example.com")
+        );
+        assert_eq!(request["application_type"], "native");
+        assert_eq!(request["grant_types"][1], "refresh_token");
+        assert_eq!(request["token_endpoint_auth_method"], "client_secret_basic");
+    }
+
+    #[tokio::test]
+    async fn registration_reports_when_user_input_is_required() {
+        let metadata = authorization_server_metadata("https://auth.example.com");
+        let error = resolve_oauth_client_registration(
+            &reqwest::Client::new(),
+            &metadata,
+            &OAuthClientRegistrationOptions::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("prompt the user"),
+            "got: {error}"
+        );
+    }
+
+    fn authorization_server_metadata(issuer: &str) -> OAuthAuthorizationServerMetadata {
+        OAuthAuthorizationServerMetadata {
             issuer: issuer.to_string(),
             authorization_endpoint: "https://auth.example.com/authorize".to_string(),
             token_endpoint: "https://auth.example.com/token".to_string(),
             registration_endpoint: None,
+            client_id_metadata_document_supported: false,
             authorization_response_iss_parameter_supported: false,
         }
     }
