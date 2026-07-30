@@ -125,6 +125,7 @@
 //! - [`ResourceBuilder`] - Builder for defining resources
 //! - [`PromptBuilder`] - Builder for defining prompts
 //! - [`StdioTransport`] - Stdio transport for CLI servers
+//! - [`McpAppResourceBuilder`] - Typed `ui://` resources for MCP Apps (requires `mcp-apps`)
 //!
 //! ### Client
 //! - [`McpClient`] - Client for connecting to MCP servers
@@ -162,6 +163,8 @@
 //! - `http-client` - HTTP client transport for connecting to remote MCP servers
 //! - `oauth-client` - OAuth 2.0 client-side token acquisition via client credentials grant (requires `http-client`)
 //! - `macros` - Optional proc macros (`#[tool_fn]`, `#[prompt_fn]`, `#[resource_fn]`, `#[resource_template_fn]`)
+//! - `mcp-apps` - Typed server support for the stable MCP Apps extension. Runtime
+//!   advertisement remains explicit through [`McpRouter::with_mcp_apps`].
 //! - `protocol-2026-07-28` - Compile the experimental implementation of the released final
 //!   protocol. Use [`ProtocolSupport`] to select enabled versions at runtime. Enables
 //!   version-gated sessionless dispatch, `server/discover` RPC, per-request `_meta` via
@@ -455,6 +458,8 @@
 //! - [SEP-2243](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2243) --
 //!   strict HTTP headers (`Mcp-Method`, `Mcp-Name`, `MCP-Protocol-Version`)
 
+#[cfg(feature = "mcp-apps")]
+pub mod apps;
 pub mod async_task;
 pub mod auth;
 pub mod client;
@@ -516,6 +521,13 @@ pub use tower_mcp_macros::tool_fn;
 pub use schemars;
 
 // Re-exports
+#[cfg(feature = "mcp-apps")]
+pub use apps::{
+    MCP_APP_HTML_MIME_TYPE, MCP_APPS_EXTENSION_ID, McpAppDomain, McpAppError, McpAppHtml,
+    McpAppResourceBuilder, McpAppUri, McpAppsCapabilitySettings, McpUiPermissions,
+    McpUiResourceCsp, McpUiResourceMeta, McpUiToolMeta, McpUiToolVisibility, mcp_app_tool_result,
+    mcp_apps_extension,
+};
 pub use async_task::{MemoryTaskStore, Task, TaskStore};
 pub use client::{
     ChannelTransport, ClientHandler, ClientTransport, McpClient, McpClientBuilder,

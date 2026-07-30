@@ -58,7 +58,8 @@ Implemented final-revision areas include:
 - Final client lifecycle, subscriptions, authorization conformance, and schema recovery
 - Reusable OAuth registration, bounded scope escalation, and issuer-keyed credential persistence
 - Compile-time/runtime protocol selection across HTTP, STDIO, WebSocket, Unix-over-HTTP, and JSON-RPC services
-- Extension-key validation and safe withholding of incomplete Tasks advertisement
+- Extension-key validation, explicit runtime negotiation, and safe withholding of incomplete Tasks advertisement
+- Feature-gated typed MCP Apps resources, tool linkage, visibility, CSP constraints, and text fallback
 
 ### In Progress
 
@@ -68,7 +69,7 @@ Implemented final-revision areas include:
 | 2322 | Multi Round-Trip Requests (MRTR) | Implemented; policy/composition follow-ups remain | #950 |
 | 2549 | Cache hints and response caching | Implemented | #1047, #1053 |
 | 2243 | Standard/custom HTTP headers | Implemented | #1049, #1051 |
-| 2133/1865 | Extensions and MCP Apps | Not yet implemented; tracked | #1060 |
+| 2133/1865 | Extensions and MCP Apps | Implemented; upstream conformance scenarios remain | #1060 |
 
 ### Monitoring
 
@@ -79,5 +80,5 @@ Open SEPs are tracked automatically via `.github/workflows/sep-sync.yml` and lab
 - **1.0.0 stable release**: API freeze and stability guarantees
 - **Promotion of 2026-07-28**: close the remaining transport, MRTR, Tasks, and extension gates in #929.
 - **Tasks extension**: complete input-required task state, notifications, expiry, and client update APIs (#951).
-- **MCP Apps and extension lifecycle**: audit and implement an opt-in, security-bounded surface (#1060).
+- **MCP Apps interoperability**: track and adopt upstream extension conformance scenarios as they land (#1060).
 - **SEP-1763 interceptors**: tower middleware maps naturally to this proposal.

@@ -19,6 +19,9 @@ cargo run --example rate_limiting
 # HTTP transport
 cargo run --example http_server --features http
 
+# Typed MCP Apps server (stdio)
+cargo run --example mcp_apps --features mcp-apps
+
 # Embed MCP inside an existing axum app
 cargo run --example axum_embedding --features http
 
@@ -47,6 +50,7 @@ cargo run --example tool_macro --features macros
 | Example | What it shows |
 |---------|---------------|
 | [getting_started](getting_started.rs) | Tools, resources, prompts, and stdio transport |
+| [mcp_apps](mcp_apps.rs) | Typed MCP Apps resources, tool linkage, visibility, negotiation, and text fallback |
 
 ### Transports
 

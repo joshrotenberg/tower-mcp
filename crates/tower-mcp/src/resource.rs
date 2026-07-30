@@ -77,6 +77,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use pin_project_lite::pin_project;
+use serde_json::Value;
 
 #[cfg(feature = "stateless")]
 use tower::ServiceExt;
@@ -461,6 +462,8 @@ pub struct Resource {
     pub size: Option<u64>,
     /// Optional annotations (audience, priority hints)
     pub annotations: Option<ContentAnnotations>,
+    /// Validated protocol metadata included in `resources/list`.
+    pub meta: Option<Value>,
     /// The boxed service that reads the resource
     service: Option<BoxResourceService>,
     #[cfg(feature = "stateless")]
@@ -478,6 +481,7 @@ impl Clone for Resource {
             icons: self.icons.clone(),
             size: self.size,
             annotations: self.annotations.clone(),
+            meta: self.meta.clone(),
             service: self.service.clone(),
             #[cfg(feature = "stateless")]
             mrtr_handler: self.mrtr_handler.clone(),
@@ -496,6 +500,7 @@ impl std::fmt::Debug for Resource {
             .field("icons", &self.icons)
             .field("size", &self.size)
             .field("annotations", &self.annotations)
+            .field("meta", &self.meta)
             .finish_non_exhaustive()
     }
 }
@@ -522,8 +527,18 @@ impl Resource {
             icons: self.icons.clone(),
             size: self.size,
             annotations: self.annotations.clone(),
-            meta: None,
+            meta: self.meta.clone(),
         }
+    }
+
+    /// Attach validated protocol metadata to this resource definition.
+    pub fn with_meta(
+        mut self,
+        meta: Value,
+    ) -> std::result::Result<Self, crate::protocol::MetaValidationError> {
+        crate::protocol::validate_meta_object(&meta)?;
+        self.meta = Some(meta);
+        Ok(self)
     }
 
     /// Read the resource without context
@@ -628,6 +643,7 @@ impl Resource {
             icons,
             size,
             annotations,
+            meta: None,
             service: Some(service),
             #[cfg(feature = "stateless")]
             mrtr_handler: None,
@@ -656,6 +672,7 @@ impl Resource {
             icons,
             size,
             annotations,
+            meta: None,
             service: None,
             mrtr_handler: Some(Arc::new(handler)),
         }
@@ -1072,6 +1089,7 @@ where
             icons: self.icons,
             size: self.size,
             annotations: self.annotations,
+            meta: None,
             service: None,
             mrtr_handler: Some(Arc::new(ServiceMrtrResourceHandler {
                 service: Mutex::new(service),
@@ -1220,6 +1238,7 @@ where
             icons: self.icons,
             size: self.size,
             annotations: self.annotations,
+            meta: None,
             service: Some(service),
             #[cfg(feature = "stateless")]
             mrtr_handler: None,
@@ -1352,6 +1371,7 @@ where
             icons: self.icons,
             size: self.size,
             annotations: self.annotations,
+            meta: None,
             service: Some(service),
             #[cfg(feature = "stateless")]
             mrtr_handler: None,

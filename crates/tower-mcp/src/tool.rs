@@ -668,6 +668,8 @@ pub struct Tool {
     pub icons: Option<Vec<ToolIcon>>,
     /// Tool annotations (hints about behavior)
     pub annotations: Option<ToolAnnotations>,
+    /// Validated protocol metadata included in `tools/list`.
+    pub meta: Option<Value>,
     /// Task support mode for this tool
     pub task_support: TaskSupportMode,
     /// Client capabilities required to invoke this tool in the modern
@@ -690,6 +692,7 @@ impl std::fmt::Debug for Tool {
             .field("output_schema", &self.output_schema)
             .field("icons", &self.icons)
             .field("annotations", &self.annotations)
+            .field("meta", &self.meta)
             .field("task_support", &self.task_support)
             .field(
                 "required_client_capabilities",
@@ -713,6 +716,7 @@ impl Clone for Tool {
             output_schema: self.output_schema.clone(),
             icons: self.icons.clone(),
             annotations: self.annotations.clone(),
+            meta: self.meta.clone(),
             task_support: self.task_support,
             required_client_capabilities: self.required_client_capabilities.clone(),
             service: self.service.clone(),
@@ -746,8 +750,18 @@ impl Tool {
             icons: self.icons.clone(),
             annotations: self.annotations.clone(),
             execution,
-            meta: None,
+            meta: self.meta.clone(),
         }
+    }
+
+    /// Attach validated protocol metadata to this tool definition.
+    pub fn with_meta(
+        mut self,
+        meta: Value,
+    ) -> std::result::Result<Self, crate::protocol::MetaValidationError> {
+        crate::protocol::validate_meta_object(&meta)?;
+        self.meta = Some(meta);
+        Ok(self)
     }
 
     /// Call the tool without context
@@ -921,6 +935,7 @@ impl Tool {
             output_schema: self.output_schema.clone(),
             icons: self.icons.clone(),
             annotations: self.annotations.clone(),
+            meta: self.meta.clone(),
             task_support: self.task_support,
             required_client_capabilities: self.required_client_capabilities.clone(),
             service: self.service.clone(),
@@ -956,6 +971,7 @@ impl Tool {
             output_schema,
             icons,
             annotations,
+            meta: None,
             task_support,
             required_client_capabilities: None,
             service: Some(service),
@@ -987,6 +1003,7 @@ impl Tool {
             output_schema,
             icons,
             annotations,
+            meta: None,
             task_support,
             required_client_capabilities: None,
             service: None,
@@ -1752,6 +1769,7 @@ where
             output_schema: self.output_schema,
             icons: self.icons,
             annotations: self.annotations,
+            meta: None,
             task_support: self.task_support,
             required_client_capabilities: None,
             service: Some(service),
@@ -1962,6 +1980,7 @@ where
             output_schema: self.output_schema,
             icons: self.icons,
             annotations: self.annotations,
+            meta: None,
             task_support: self.task_support,
             required_client_capabilities: None,
             service: None,
@@ -2060,6 +2079,7 @@ where
             output_schema: self.output_schema,
             icons: self.icons,
             annotations: self.annotations,
+            meta: None,
             task_support: self.task_support,
             required_client_capabilities: None,
             service: Some(service),

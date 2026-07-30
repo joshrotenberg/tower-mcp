@@ -31,6 +31,7 @@ base64.workspace = true
 thiserror = { workspace = true }
 sha2 = { workspace = true, optional = true }
 getrandom = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
 urlencoding = { workspace = true, optional = true }
 tower-resilience = { workspace = true, optional = true, default-features = false, features = ["circuitbreaker", "ratelimiter", "bulkhead"] }
 
@@ -48,7 +49,7 @@ jsonschema = "0.48"
 [features]
 default = []
 # Enable all optional features
-full = ["http", "websocket", "unix", "childproc", "oauth", "jwks", "testing", "dynamic-tools", "http-client", "oauth-client", "proxy", "macros", "resilience", "protocol-2026-07-28"]
+full = ["http", "websocket", "unix", "childproc", "oauth", "jwks", "testing", "dynamic-tools", "http-client", "oauth-client", "proxy", "macros", "resilience", "mcp-apps", "protocol-2026-07-28"]
 # Transport features
 http = ["dep:axum", "dep:hyper", "dep:http", "dep:http-body-util", "dep:tokio-stream", "dep:uuid"]
 websocket = ["dep:axum", "dep:uuid"]
@@ -72,6 +73,10 @@ proxy = []
 resilience = ["dep:tower-resilience"]
 # Proc macros for tool/resource/prompt definitions
 macros = ["dep:tower-mcp-macros"]
+# Typed server support for the stable MCP Apps extension (SEP-1865).
+# Enabling the API does not advertise or activate the extension; applications
+# must still call `McpRouter::with_mcp_apps`.
+mcp-apps = ["dep:url"]
 # Compile the experimental MCP 2026-07-28 implementation. Runtime transports
 # may narrow the compiled set with ProtocolSupport.
 protocol-2026-07-28 = ["stateless"]
@@ -125,6 +130,11 @@ features = ["rustls", "json", "stream"]
 [[example]]
 name = "getting_started"
 path = "../../examples/getting_started.rs"
+
+[[example]]
+name = "mcp_apps"
+path = "../../examples/mcp_apps.rs"
+required-features = ["mcp-apps"]
 
 # --- Transports ---
 [[example]]

@@ -117,6 +117,7 @@ use tower_mcp::schemars::JsonSchema;
 | `proxy` | Multi-server aggregation proxy (`McpProxy`) |
 | `macros` | Optional proc macros (`#[tool_fn]`, `#[prompt_fn]`, `#[resource_fn]`, `#[resource_template_fn]`) |
 | `resilience` | Re-export tower-resilience circuit breaker, rate limiter, and bulkhead layers |
+| `mcp-apps` | Typed, security-bounded server support for the stable MCP Apps extension. Runtime advertisement remains explicit via `McpRouter::with_mcp_apps()`. |
 | `protocol-2026-07-28` | Compile the experimental implementation of the released 2026-07-28 protocol. Use `ProtocolSupport` to narrow the exact versions enabled by a server at runtime. |
 | `stateless` | Compatibility alias for the former 2026 protocol feature name. New integrations should use `protocol-2026-07-28`. |
 
@@ -711,6 +712,8 @@ and cross-principal protections.
 - [x] [Async tasks](https://modelcontextprotocol.io/specification/2025-11-25/server/utilities/async) (task ID, status tracking, TTL cleanup, per-tool task support mode)
 - [x] [SSE event IDs and stream resumption](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#resumability-and-redelivery) (SEP-1699)
 - [x] [`_meta` field on all protocol types](https://modelcontextprotocol.io/specification/2025-11-25)
+- [x] [Protocol extension declaration and runtime negotiation (SEP-2133)](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2133)
+- [x] [Typed MCP Apps server resources and tool linkage (SEP-1865)](docs/mcp-apps.md) (requires `mcp-apps`; runtime opt-in remains explicit)
 - [x] [Strict HTTP headers: `Mcp-Method`, `Mcp-Name`, `MCP-Protocol-Version` (SEP-2243)](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2243) (final)
 - [x] [`server/discover` RPC -- stateless capability discovery (SEP-2575)](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2575) (requires `protocol-2026-07-28`)
 - [x] [`subscriptions/listen` SSE endpoint -- client-initiated server-push stream (SEP-2567)](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2567) (requires `protocol-2026-07-28`)
