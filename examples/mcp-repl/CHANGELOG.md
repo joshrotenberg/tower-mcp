@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.4] - 2026-07-30
+
+### Features
+
+- **mcp-repl:** Server profiles via config file ([#1017](https://github.com/joshrotenberg/tower-mcp/pull/1017))
+- **mcp-repl:** Wire tracing and last-exchange inspection ([#1020](https://github.com/joshrotenberg/tower-mcp/pull/1020))
+- **mcp-repl:** Respond to sampling/create requests ([#1023](https://github.com/joshrotenberg/tower-mcp/pull/1023))
+- **mcp-repl:** Command aliases ([#1022](https://github.com/joshrotenberg/tower-mcp/pull/1022))
+- **mcp-repl:** Auto-reconnect and session resurrection ([#1018](https://github.com/joshrotenberg/tower-mcp/pull/1018))
+- **mcp-repl:** Find command and did-you-mean for unknown commands ([#1021](https://github.com/joshrotenberg/tower-mcp/pull/1021))
+- **mcp-repl:** Subscribe to resource updates ([#1025](https://github.com/joshrotenberg/tower-mcp/pull/1025))
+- **mcp-repl:** Bench command for tool latency sampling ([#1024](https://github.com/joshrotenberg/tower-mcp/pull/1024))
+- **mcp-repl:** Output capture and pipe filtering ([#1033](https://github.com/joshrotenberg/tower-mcp/pull/1033))
+- **repl:** Select stable or final protocol lifecycle ([#1055](https://github.com/joshrotenberg/tower-mcp/pull/1055))
+
+
+
 ## [0.1.3] - 2026-07-24
 
 ### Bug Fixes

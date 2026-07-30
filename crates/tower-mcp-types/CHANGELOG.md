@@ -2,6 +2,44 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.15.0] - 2026-07-30
+
+### Documentation
+
+- Reconcile versions, example count, and conformance figures ([#1030](https://github.com/joshrotenberg/tower-mcp/pull/1030))
+- Note the 2026-07-28 removal of elicitation-complete correlation ([#1042](https://github.com/joshrotenberg/tower-mcp/pull/1042))
+- Correct smaller RC-to-final doc drift (#1037 part D) ([#1043](https://github.com/joshrotenberg/tower-mcp/pull/1043))
+
+### Features
+
+- **types:** 2026-07-28 model surface (resultType, MRTR, subscriptions, meta split) ([#1016](https://github.com/joshrotenberg/tower-mcp/pull/1016))
+- **types:** Align DiscoverResult with the final 2026-07-28 schema ([#1040](https://github.com/joshrotenberg/tower-mcp/pull/1040))
+- **protocol:** Add compile-time and runtime version policy ([#1046](https://github.com/joshrotenberg/tower-mcp/pull/1046))
+- **server:** Implement final HTTP lifecycle ([#1048](https://github.com/joshrotenberg/tower-mcp/pull/1048))
+- Implement final-protocol MRTR server support ([#1050](https://github.com/joshrotenberg/tower-mcp/pull/1050))
+- **client:** Support final MCP lifecycle ([#1051](https://github.com/joshrotenberg/tower-mcp/pull/1051))
+- **client:** Complete OAuth conformance ([#1052](https://github.com/joshrotenberg/tower-mcp/pull/1052))
+- **client:** Honor final response cache hints ([#1053](https://github.com/joshrotenberg/tower-mcp/pull/1053))
+- **client:** Support final protocol subscriptions ([#1056](https://github.com/joshrotenberg/tower-mcp/pull/1056))
+- Validate MCP metadata and extension keys ([#1057](https://github.com/joshrotenberg/tower-mcp/pull/1057))
+- **subscriptions:** Complete graceful server close ([#1064](https://github.com/joshrotenberg/tower-mcp/pull/1064))
+- **mrtr:** Compose handler middleware ([#1065](https://github.com/joshrotenberg/tower-mcp/pull/1065))
+- **client:** Add bounded OAuth scope escalation ([#1067](https://github.com/joshrotenberg/tower-mcp/pull/1067))
+- **apps:** Add typed MCP Apps server support ([#1070](https://github.com/joshrotenberg/tower-mcp/pull/1070))
+- **protocol:** Stabilize 2026 version naming ([#1071](https://github.com/joshrotenberg/tower-mcp/pull/1071))
+- **tasks:** Add exact SEP-2663 final wire types ([#1074](https://github.com/joshrotenberg/tower-mcp/pull/1074))
+
+### Miscellaneous Tasks
+
+- Add a draft-protocol client conformance job ([#1034](https://github.com/joshrotenberg/tower-mcp/pull/1034))
+- **conformance:** Re-baseline draft suite against harness 0.2.0-alpha.10 ([#1039](https://github.com/joshrotenberg/tower-mcp/pull/1039))
+
+### Testing
+
+- Property tests for wire and state-machine boundaries ([#1035](https://github.com/joshrotenberg/tower-mcp/pull/1035))
+
+
+
 ## [0.14.0] - 2026-07-24
 
 
