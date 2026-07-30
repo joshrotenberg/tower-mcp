@@ -746,6 +746,7 @@ The repo includes 31 examples; a selection organized by topic (the full set live
 | **Bidirectional** | [`sampling_server`](examples/sampling_server.rs), [`client_handler`](examples/client_handler.rs) |
 | **Dynamic** | [`dynamic_capabilities`](examples/dynamic_capabilities.rs) -- runtime tool/prompt/resource registration |
 | **Advanced** | [`proxy`](examples/proxy.rs), [`resource_templates`](examples/resource_templates.rs), [`structured_output`](examples/structured_output.rs), [`error_handling`](examples/error_handling.rs), [`testing`](examples/testing.rs) |
+| **Extensions** | [`tasks`](examples/tasks.rs) -- final Tasks extension (SEP-2663) and task ownership, [`mcp_apps`](examples/mcp_apps.rs) -- typed MCP Apps (SEP-1865) |
 | **Real-world** | [`weather_server`](examples/weather_server.rs) -- external API integration |
 | **Macros** | [`tool_macro`](examples/tool_macro.rs) -- `#[tool_fn]`, `#[prompt_fn]`, `#[resource_fn]` |
 

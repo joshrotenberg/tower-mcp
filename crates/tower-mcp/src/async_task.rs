@@ -22,6 +22,64 @@
 //! let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
 //! let router = McpRouter::new().task_store(store);
 //! ```
+//!
+//! See `examples/tasks.rs` for a runnable server.
+//!
+//! # Authorization
+//!
+//! SEP-2663 requires servers to authorize every task request, and warns that a
+//! task ID can act as a bearer token: whoever holds it can poll, update, or
+//! cancel the task. This module answers that in two layers.
+//!
+//! [`generate_task_id`] draws 128 bits from the system CSPRNG, so IDs cannot
+//! be enumerated or guessed. That only protects IDs nobody has seen, so each
+//! task also records the principal that created it (see [`TaskOwner`]), and
+//! every later operation must match under [`owner_matches`].
+//!
+//! Matching is equality, not "protect owned tasks and leave unowned ones
+//! open":
+//!
+//! | Task owner | Caller  | Result                                |
+//! |------------|---------|---------------------------------------|
+//! | none       | none    | allowed, no authentication configured |
+//! | `alice`    | `alice` | allowed                               |
+//! | `alice`    | `bob`   | denied                                |
+//! | `alice`    | none    | denied                                |
+//! | none       | `alice` | denied                                |
+//!
+//! The last row is deliberate. An unowned task can only exist if it was
+//! created with no authenticated context, so a request that now carries a
+//! principal is a different security context rather than an upgrade of the
+//! same one. Servers mixing public and authenticated paths (see
+//! [`AuthConfig::public_path`](crate::auth::AuthConfig::public_path)) should
+//! expect a task created anonymously to be unreachable once a token is
+//! presented.
+//!
+//! The principal comes from the OAuth `sub` claim that the HTTP and WebSocket
+//! transports bridge into request extensions. Without the `oauth` feature
+//! there is no principal, so every task is unowned and servers with no
+//! authentication behave as they did before ownership existed.
+//!
+//! ## Why a denial looks like a missing task
+//!
+//! A refused operation returns exactly what an unknown task returns: `-32602`
+//! with "Task not found".
+//!
+//! SEP-2663 mandates `-32602` for an invalid or nonexistent task ID, but
+//! leaves the authorization failure to the server: tasks should be bound to
+//! "some sort of authorization context, the implementation of which is left to
+//! individual servers according to their existing bespoke permission models".
+//! Reusing `-32602` is therefore tower-mcp policy, not a spec requirement.
+//!
+//! The reasoning is that answering "forbidden" would confirm the ID is real,
+//! which is what unguessable IDs exist to prevent. The same SEP notes that
+//! where binding is impossible "the task ID becomes the only line of defense
+//! against contamination". A server that prefers a distinguishable error can
+//! wrap the router and translate.
+//!
+//! Expiry follows the same rule: [`Task::is_expired`] runs from creation, and
+//! an expired task reads as absent rather than as expired, so a retention
+//! window cannot be probed either.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;

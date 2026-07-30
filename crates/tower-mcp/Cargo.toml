@@ -138,6 +138,11 @@ name = "mcp_apps"
 path = "../../examples/mcp_apps.rs"
 required-features = ["mcp-apps"]
 
+[[example]]
+name = "tasks"
+path = "../../examples/tasks.rs"
+required-features = ["protocol-2026-07-28"]
+
 # --- Transports ---
 [[example]]
 name = "http_server"
