@@ -868,22 +868,26 @@ impl McpRouter {
             ctx
         };
 
-        // The final protocol does not permit servers to initiate JSON-RPC
-        // requests. Keep legacy sampling/elicitation available on sessionful
-        // requests, but do not expose the requester to final handlers.
-        let ctx = if !is_final_protocol_request(per_request)
-            && let Some(requester) = &self.inner.client_requester
-        {
-            ctx.with_client_requester(requester.clone())
-        } else {
-            ctx
-        };
-
         // Start with router-level extensions, then layer per-request extensions
         // on top so they win on type collision. with_state() data stays
         // visible; per-request meta (SEP-2575) is now reachable too.
         let mut merged = (*self.inner.extensions).clone();
         merged.merge(per_request);
+
+        // The final protocol does not permit servers to initiate JSON-RPC
+        // requests. Legacy transports may provide a requester scoped to the
+        // originating request; prefer it over a transport-wide fallback so
+        // restricted requests stay on their associated response channel.
+        let ctx = if !is_final_protocol_request(per_request)
+            && let Some(requester) = merged
+                .get::<ClientRequesterHandle>()
+                .cloned()
+                .or_else(|| self.inner.client_requester.clone())
+        {
+            ctx.with_client_requester(requester)
+        } else {
+            ctx
+        };
 
         // Adopt a transport-provided cancellation token (e.g. HTTP stateless
         // client disconnect) so `ctx.is_cancelled()` / `ctx.cancelled()` and

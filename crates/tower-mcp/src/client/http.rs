@@ -88,7 +88,9 @@ use super::oauth::TokenProvider;
 pub struct HttpClientConfig {
     /// Custom headers to include on every request (e.g., auth tokens).
     pub headers: HashMap<String, String>,
-    /// Whether to automatically open the SSE stream after initialization.
+    /// Whether to automatically open the standalone SSE notification stream
+    /// after initialization. Associated POST response streams used for
+    /// sampling, elicitation, and roots requests work independently.
     /// Default: `true`.
     pub auto_sse: bool,
     /// Capacity of the internal message channel.
@@ -876,7 +878,7 @@ impl ClientTransport for HttpClientTransport {
         // so the message loop can continue processing incoming SSE messages.
         // This prevents a deadlock when the server blocks on a
         // bidirectional request (sampling/elicitation) that requires the
-        // client to respond via the SSE channel.
+        // client to handle a request on the originating POST response stream.
         if !is_notification && (self.session_id.is_some() || is_modern_request) {
             let tx = self.incoming_tx.clone();
             // The caller is parked on this request id in the message loop's

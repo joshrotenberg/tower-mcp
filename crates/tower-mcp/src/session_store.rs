@@ -5,6 +5,9 @@
 //!   in Redis, Postgres, etc. Persisted via the [`SessionStore`] trait.
 //! - **Runtime state** -- broadcast channels, pending request handles, service
 //!   instances. Held in-memory per server instance; cannot be serialized.
+//!   This includes legacy server-to-client requests associated with an
+//!   originating HTTP POST. Shared session metadata does not make those live
+//!   exchanges portable; use session affinity while they are in flight.
 //!
 //! By default transports use [`MemorySessionStore`], which keeps metadata in an
 //! in-process `HashMap` (behavior identical to earlier versions). External

@@ -10,6 +10,10 @@
 //! works if the client reconnects to the exact instance that saw the
 //! original events. An external [`EventStore`] fixes this.
 //!
+//! The store contains resumable notification events only. Legacy
+//! server-to-client requests are associated with an originating POST response
+//! stream and deliberately have no event IDs, persistence, or replay.
+//!
 //! # Example
 //!
 //! ```rust,no_run

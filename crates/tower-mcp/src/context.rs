@@ -247,6 +247,22 @@ impl ChannelClientRequester {
         }
     }
 
+    /// Create a requester that draws IDs from a transport-owned allocator.
+    ///
+    /// HTTP uses one allocator per session while giving each originating POST
+    /// its own request channel. This keeps server-to-client request IDs unique
+    /// without allowing those requests to escape onto an unrelated SSE stream.
+    #[cfg(feature = "http")]
+    pub(crate) fn with_id_allocator(
+        request_tx: OutgoingRequestSender,
+        next_id: Arc<AtomicI64>,
+    ) -> Self {
+        Self {
+            request_tx,
+            next_id,
+        }
+    }
+
     fn next_request_id(&self) -> RequestId {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         RequestId::Number(id)

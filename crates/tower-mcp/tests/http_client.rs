@@ -806,11 +806,30 @@ fn bidirectional_test_router() -> McpRouter {
         })
         .build();
 
+    let roots_tool = ToolBuilder::new("test_roots")
+        .description("Requests the client's roots")
+        .extractor_handler((), |ctx: Context, _: RawArgs| async move {
+            match ctx.request_raw("roots/list", serde_json::json!({})).await {
+                Ok(result) => {
+                    let uri = result
+                        .pointer("/roots/0/uri")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("no root");
+                    Ok(CallToolResult::text(uri))
+                }
+                Err(error) => Ok(CallToolResult::error(format!(
+                    "roots request failed: {error}"
+                ))),
+            }
+        })
+        .build();
+
     McpRouter::new()
         .server_info("test-bidirectional-server", "1.0.0")
         .tool(sampling_tool)
         .tool(confirm_tool)
         .tool(log_tool)
+        .tool(roots_tool)
 }
 
 /// Start a bidirectional HTTP server with sampling enabled.
@@ -918,7 +937,13 @@ impl ClientHandler for MockSamplingHandler {
 async fn test_http_client_sampling_round_trip() {
     let (url, _server) = start_bidirectional_server().await;
 
-    let transport = HttpClientTransport::new(&url);
+    let transport = HttpClientTransport::with_config(
+        &url,
+        HttpClientConfig {
+            auto_sse: false,
+            ..Default::default()
+        },
+    );
     let client = McpClientBuilder::new()
         .with_sampling()
         .connect(transport, MockSamplingHandler)
@@ -926,11 +951,8 @@ async fn test_http_client_sampling_round_trip() {
         .unwrap();
     client.initialize("test-client", "1.0.0").await.unwrap();
 
-    // Allow time for the SSE stream to establish (needed for bidirectional channel)
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
     // Call the tool that triggers server-side sampling
-    // Flow: client -> call_tool -> server ctx.sample() -> SSE request ->
+    // Flow: client -> call_tool -> server ctx.sample() -> originating POST SSE ->
     //       client MockSamplingHandler -> POST response -> server returns result
     let result = client
         .call_tool("test_sampling", serde_json::json!({}))
@@ -964,7 +986,13 @@ impl ClientHandler for MockElicitationHandler {
 async fn test_http_client_elicitation_confirm() {
     let (url, _server) = start_bidirectional_server().await;
 
-    let transport = HttpClientTransport::new(&url);
+    let transport = HttpClientTransport::with_config(
+        &url,
+        HttpClientConfig {
+            auto_sse: false,
+            ..Default::default()
+        },
+    );
     let client = McpClientBuilder::new()
         .with_elicitation()
         .with_sampling()
@@ -973,11 +1001,8 @@ async fn test_http_client_elicitation_confirm() {
         .unwrap();
     client.initialize("test-client", "1.0.0").await.unwrap();
 
-    // Allow time for the SSE stream to establish (needed for bidirectional channel)
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
     // Call the tool that triggers server-side elicitation via ctx.confirm()
-    // Flow: client -> call_tool -> server ctx.confirm("proceed?") -> SSE request ->
+    // Flow: client -> call_tool -> server ctx.confirm("proceed?") -> originating POST SSE ->
     //       client MockElicitationHandler -> POST response -> server returns "confirmed"
     let result = client
         .call_tool("test_confirm", serde_json::json!({}))
@@ -985,6 +1010,66 @@ async fn test_http_client_elicitation_confirm() {
         .unwrap();
 
     assert_eq!(result.first_text(), Some("confirmed"));
+
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_http_client_roots_request_uses_originating_post() {
+    let (url, _server) = start_bidirectional_server().await;
+
+    let transport = HttpClientTransport::with_config(
+        &url,
+        HttpClientConfig {
+            auto_sse: false,
+            ..Default::default()
+        },
+    );
+    let client = McpClientBuilder::new()
+        .with_roots(vec![Root::new("file:///associated")])
+        .connect_simple(transport)
+        .await
+        .unwrap();
+    client.initialize("test-client", "1.0.0").await.unwrap();
+
+    let result = client
+        .call_tool("test_roots", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(result.first_text(), Some("file:///associated"));
+
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_associated_posts_use_unique_server_request_ids() {
+    let (url, _server) = start_bidirectional_server().await;
+
+    let transport = HttpClientTransport::with_config(
+        &url,
+        HttpClientConfig {
+            auto_sse: false,
+            ..Default::default()
+        },
+    );
+    let client = McpClientBuilder::new()
+        .with_sampling()
+        .connect(transport, MockSamplingHandler)
+        .await
+        .unwrap();
+    client.initialize("test-client", "1.0.0").await.unwrap();
+
+    let (first, second) = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::join!(
+            client.call_tool("test_sampling", serde_json::json!({})),
+            client.call_tool("test_sampling", serde_json::json!({})),
+        )
+    })
+    .await
+    .expect("concurrent associated requests must not cross-talk or hang");
+
+    assert_eq!(first.unwrap().first_text(), Some("mock-llm-response"));
+    assert_eq!(second.unwrap().first_text(), Some("mock-llm-response"));
 
     client.shutdown().await.unwrap();
 }

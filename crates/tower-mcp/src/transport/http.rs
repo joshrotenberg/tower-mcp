@@ -92,13 +92,17 @@
 //! LLM completions from the client. The flow is:
 //!
 //! 1. Tool handler calls `ctx.sample(params)`
-//! 2. Server sends the sampling request on the SSE stream
+//! 2. Server upgrades that originating POST response to SSE and sends the
+//!    sampling request on it
 //! 3. Client receives the request and processes it
 //! 4. Client sends the response as a POST to the MCP endpoint
-//! 5. Server routes the response back to the waiting handler
+//! 5. Server routes the response back to the waiting handler and finishes the
+//!    original POST SSE stream with the tool result
 //!
-//! This follows the MCP spec which states servers MAY send JSON-RPC requests
-//! on the SSE stream.
+//! Restricted server-to-client requests are never sent on the standalone GET
+//! notification stream. Associated POST streams are process-local and are not
+//! resumable; deployments using sampling, elicitation, or roots requests need
+//! session affinity for the duration of the exchange.
 //!
 //! ## Session Reconnection
 //!
@@ -240,8 +244,10 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -260,8 +266,8 @@ use tokio_stream::wrappers::BroadcastStream;
 #[cfg(feature = "stateless")]
 use crate::context::ServerNotification;
 use crate::context::{
-    ChannelClientRequester, ClientRequesterHandle, NotificationReceiver, OutgoingRequestReceiver,
-    notification_channel, outgoing_request_channel,
+    ChannelClientRequester, ClientRequesterHandle, NotificationReceiver, OutgoingRequest,
+    OutgoingRequestReceiver, notification_channel, outgoing_request_channel,
 };
 use crate::error::{Error, JsonRpcError, Result};
 #[cfg(feature = "stateless")]
@@ -336,6 +342,8 @@ struct PendingRequest {
     response_tx: oneshot::Sender<Result<serde_json::Value>>,
 }
 
+type AssociatedCall = Pin<Box<dyn Future<Output = Result<JsonRpcResponse>> + Send + 'static>>;
+
 /// Session state for HTTP transport
 /// How a session produces its MCP service for request processing.
 enum SessionServiceSource {
@@ -363,8 +371,11 @@ struct Session {
     last_accessed: RwLock<Instant>,
     /// Pending outgoing requests waiting for responses
     pending_requests: Mutex<HashMap<RequestId, PendingRequest>>,
-    /// Receiver for outgoing requests (used by SSE stream)
-    request_rx: Mutex<Option<OutgoingRequestReceiver>>,
+    /// Session-wide allocator for request-scoped server-to-client request IDs.
+    ///
+    /// Each originating POST owns a separate channel, but IDs must remain
+    /// unique across concurrent POSTs in the same session.
+    request_id_allocator: Option<Arc<AtomicI64>>,
     /// Negotiated protocol version (set after initialize)
     protocol_version: RwLock<String>,
     /// Client implementation info advertised in the `initialize` request.
@@ -421,15 +432,10 @@ impl Session {
             }
         });
 
-        // Set up client requester if sampling is enabled
-        let (router, request_rx) = if sampling_enabled {
-            let (request_tx, request_rx) = outgoing_request_channel(32);
-            let client_requester: ClientRequesterHandle =
-                Arc::new(ChannelClientRequester::new(request_tx));
-            let router = router.with_client_requester(client_requester);
-            (router, Some(request_rx))
+        let request_id_allocator = if sampling_enabled {
+            Some(Arc::new(AtomicI64::new(1)))
         } else {
-            (router, None)
+            None
         };
 
         let now = Instant::now();
@@ -443,7 +449,7 @@ impl Session {
             created_at: now,
             last_accessed: RwLock::new(now),
             pending_requests: Mutex::new(HashMap::new()),
-            request_rx: Mutex::new(request_rx),
+            request_id_allocator,
             protocol_version: RwLock::new(LATEST_PROTOCOL_VERSION.to_string()),
             client_info: RwLock::new(None),
             client_capabilities: RwLock::new(None),
@@ -472,7 +478,7 @@ impl Session {
             created_at: now,
             last_accessed: RwLock::new(now),
             pending_requests: Mutex::new(HashMap::new()),
-            request_rx: Mutex::new(None),
+            request_id_allocator: None,
             protocol_version: RwLock::new(LATEST_PROTOCOL_VERSION.to_string()),
             client_info: RwLock::new(None),
             client_capabilities: RwLock::new(None),
@@ -515,14 +521,10 @@ impl Session {
             }
         });
 
-        let (router, request_rx) = if sampling_enabled {
-            let (request_tx, request_rx) = outgoing_request_channel(32);
-            let client_requester: ClientRequesterHandle =
-                Arc::new(ChannelClientRequester::new(request_tx));
-            let router = router.with_client_requester(client_requester);
-            (router, Some(request_rx))
+        let request_id_allocator = if sampling_enabled {
+            Some(Arc::new(AtomicI64::new(1)))
         } else {
-            (router, None)
+            None
         };
 
         let now = Instant::now();
@@ -536,7 +538,7 @@ impl Session {
             created_at: now,
             last_accessed: RwLock::new(now),
             pending_requests: Mutex::new(HashMap::new()),
-            request_rx: Mutex::new(request_rx),
+            request_id_allocator,
             protocol_version: RwLock::new(record.protocol_version.clone()),
             client_info: RwLock::new(record.client_info.clone()),
             client_capabilities: RwLock::new(record.client_capabilities.clone()),
@@ -566,7 +568,7 @@ impl Session {
             created_at: now,
             last_accessed: RwLock::new(now),
             pending_requests: Mutex::new(HashMap::new()),
-            request_rx: Mutex::new(None),
+            request_id_allocator: None,
             protocol_version: RwLock::new(record.protocol_version.clone()),
             client_info: RwLock::new(record.client_info.clone()),
             client_capabilities: RwLock::new(record.client_capabilities.clone()),
@@ -679,6 +681,22 @@ impl Session {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Fail request-scoped client requests whose originating POST is gone.
+    async fn fail_pending_requests(&self, ids: &[RequestId], message: &str) {
+        let removed = {
+            let mut pending = self.pending_requests.lock().await;
+            ids.iter()
+                .filter_map(|id| pending.remove(id))
+                .collect::<Vec<_>>()
+        };
+
+        for pending in removed {
+            let _ = pending
+                .response_tx
+                .send(Err(Error::Transport(message.to_string())));
         }
     }
 }
@@ -1289,8 +1307,6 @@ struct AppState {
     validate_host: bool,
     /// Allowed hosts (host:port). Localhost variants are always allowed.
     allowed_hosts: Vec<String>,
-    /// Whether sampling is enabled
-    sampling_enabled: bool,
     /// Whether sessions are optional (for clients that don't track session IDs)
     optional_sessions: bool,
     /// Whether to enforce `notifications/initialized` before tool dispatch
@@ -1626,8 +1642,10 @@ impl HttpTransport {
     /// Enable sampling support for this transport.
     ///
     /// When sampling is enabled, tool handlers can use `ctx.sample()` to
-    /// request LLM completions from connected clients. The server sends
-    /// sampling requests on the SSE stream, and clients respond via POST.
+    /// request LLM completions from connected clients. The server sends each
+    /// request on the SSE response stream of the POST that caused it, and the
+    /// client responds via a separate POST. These associated streams are not
+    /// replayed; use session affinity while a request is in flight.
     ///
     /// # Example
     ///
@@ -2133,7 +2151,6 @@ impl HttpTransport {
             allowed_origins: self.allowed_origins.clone(),
             validate_host: self.validate_host,
             allowed_hosts: self.allowed_hosts.clone(),
-            sampling_enabled: self.sampling_enabled,
             optional_sessions: self.optional_sessions,
             strict_initialization: self.session_config.strict_initialization,
             #[cfg(feature = "stateless")]
@@ -3377,13 +3394,76 @@ async fn handle_post(
     }
     #[cfg(feature = "stateless")]
     stash_per_request_meta(&request, &mut ext);
+
+    // SEP-2260: legacy server-to-client requests are associated with the
+    // client POST that caused them. Give this request its own channel while
+    // drawing IDs from the session-wide allocator so concurrent POSTs cannot
+    // collide or leak requests onto one another's response streams.
+    let mut associated_request_rx = if !is_init {
+        session.request_id_allocator.as_ref().map(|next_id| {
+            let (request_tx, request_rx) = outgoing_request_channel(32);
+            let requester: ClientRequesterHandle = Arc::new(
+                ChannelClientRequester::with_id_allocator(request_tx, next_id.clone()),
+            );
+            ext.insert(requester);
+            request_rx
+        })
+    } else {
+        None
+    };
+
     if !ext.is_empty() {
         service = service.with_extensions(ext);
     }
-    let mut response = match service.call_single(request).await {
-        Ok(resp) => resp,
-        Err(e) => {
-            return json_rpc_error_response(None, JsonRpcError::internal_error(e.to_string()));
+
+    let request_id = request.id.clone();
+    let mut call: AssociatedCall = Box::pin(async move { service.call_single(request).await });
+    let mut response = if let Some(mut request_rx) = associated_request_rx.take() {
+        tokio::select! {
+            result = &mut call => match result {
+                Ok(response) => response,
+                Err(error) => {
+                    return json_rpc_error_response(
+                        Some(request_id),
+                        JsonRpcError::internal_error(error.to_string()),
+                    );
+                }
+            },
+            outgoing = request_rx.recv() => {
+                match outgoing {
+                    Some(outgoing) => {
+                        let negotiated_version = session.protocol_version.read().await.clone();
+                        return associated_request_sse_response(
+                            session,
+                            call,
+                            request_rx,
+                            outgoing,
+                            request_id,
+                            request_method,
+                            negotiated_version,
+                        );
+                    }
+                    None => match call.await {
+                        Ok(response) => response,
+                        Err(error) => {
+                            return json_rpc_error_response(
+                                Some(request_id),
+                                JsonRpcError::internal_error(error.to_string()),
+                            );
+                        }
+                    },
+                }
+            }
+        }
+    } else {
+        match call.await {
+            Ok(response) => response,
+            Err(error) => {
+                return json_rpc_error_response(
+                    Some(request_id),
+                    JsonRpcError::internal_error(error.to_string()),
+                );
+            }
         }
     };
 
@@ -3440,6 +3520,163 @@ async fn handle_post(
     );
 
     resp
+}
+
+/// Keep legacy server-to-client requests on the POST response stream that
+/// caused them. These events deliberately have no SSE IDs and are not written
+/// to the session event store: their response channels only exist on this
+/// process and replaying them on another connection would break association.
+fn associated_request_sse_response(
+    session: Arc<Session>,
+    mut call: AssociatedCall,
+    mut request_rx: OutgoingRequestReceiver,
+    first_outgoing: OutgoingRequest,
+    original_request_id: RequestId,
+    request_method: String,
+    negotiated_version: String,
+) -> Response {
+    let (event_tx, event_rx) =
+        tokio::sync::mpsc::channel::<std::result::Result<Event, Infallible>>(32);
+    let call_version = negotiated_version.clone();
+
+    tokio::spawn(async move {
+        let mut pending_ids = Vec::new();
+        if !send_associated_request(&session, &event_tx, first_outgoing, &mut pending_ids).await {
+            session
+                .fail_pending_requests(
+                    &pending_ids,
+                    "originating POST disconnected before the client request was delivered",
+                )
+                .await;
+            return;
+        }
+
+        let mut requests_open = true;
+        loop {
+            tokio::select! {
+                _ = event_tx.closed() => {
+                    session
+                        .fail_pending_requests(
+                            &pending_ids,
+                            "originating POST response stream disconnected",
+                        )
+                        .await;
+                    return;
+                }
+                result = &mut call => {
+                    session
+                        .fail_pending_requests(
+                            &pending_ids,
+                            "originating POST completed before the client request response arrived",
+                        )
+                        .await;
+
+                    let mut response = match result {
+                        Ok(response) => response,
+                        Err(error) => JsonRpcResponse::error(
+                            Some(original_request_id),
+                            JsonRpcError::internal_error(error.to_string()),
+                        ),
+                    };
+                    apply_protocol_result_fields(
+                        &mut response,
+                        &request_method,
+                        &call_version,
+                    );
+
+                    match serde_json::to_string(&response) {
+                        Ok(data) => {
+                            let _ = event_tx
+                                .send(Ok(
+                                    Event::default()
+                                        .event(SSE_MESSAGE_EVENT)
+                                        .data(data),
+                                ))
+                                .await;
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                error = %error,
+                                "Failed to serialize associated POST response",
+                            );
+                        }
+                    }
+                    return;
+                }
+                outgoing = request_rx.recv(), if requests_open => {
+                    match outgoing {
+                        Some(outgoing) => {
+                            if !send_associated_request(
+                                &session,
+                                &event_tx,
+                                outgoing,
+                                &mut pending_ids,
+                            )
+                            .await
+                            {
+                                session
+                                    .fail_pending_requests(
+                                        &pending_ids,
+                                        "originating POST disconnected before the client request was delivered",
+                                    )
+                                    .await;
+                                return;
+                            }
+                        }
+                        None => requests_open = false,
+                    }
+                }
+            }
+        }
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(event_rx);
+    let mut response = Sse::new(stream)
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(Duration::from_secs(30))
+                .text("ping"),
+        )
+        .into_response();
+    response.headers_mut().insert(
+        MCP_PROTOCOL_VERSION_HEADER,
+        HeaderValue::from_str(&negotiated_version).unwrap(),
+    );
+    response
+}
+
+async fn send_associated_request(
+    session: &Session,
+    event_tx: &tokio::sync::mpsc::Sender<std::result::Result<Event, Infallible>>,
+    outgoing: OutgoingRequest,
+    pending_ids: &mut Vec<RequestId>,
+) -> bool {
+    let id = outgoing.id.clone();
+    let request = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: id.clone(),
+        method: outgoing.method,
+        params: Some(outgoing.params),
+    };
+    let data = match serde_json::to_string(&request) {
+        Ok(data) => data,
+        Err(error) => {
+            let _ = outgoing.response_tx.send(Err(Error::Internal(format!(
+                "Failed to serialize associated client request: {error}"
+            ))));
+            return true;
+        }
+    };
+
+    session
+        .add_pending_request(id.clone(), outgoing.response_tx)
+        .await;
+    pending_ids.push(id);
+
+    event_tx
+        .send(Ok(Event::default().event(SSE_MESSAGE_EVENT).data(data)))
+        .await
+        .is_ok()
 }
 
 /// Returns `true` when the given protocol version string enables `subscriptions/listen`.
@@ -3868,12 +4105,8 @@ async fn handle_get(
     // Check for Last-Event-ID header for stream resumption (SEP-1699)
     let last_event_id = get_last_event_id(&headers);
 
-    // If sampling is enabled, use bidirectional stream
-    if state.sampling_enabled {
-        return handle_get_bidirectional(session, last_event_id).await;
-    }
-
-    // Simple mode: just notifications
+    // GET is the resumable notification stream. Restricted server-to-client
+    // requests are emitted only on their originating POST response stream.
     let rx = session.notifications_tx.subscribe();
     let session_clone = session.clone();
 
@@ -3929,150 +4162,6 @@ async fn handle_get(
 
     // Chain replay stream with live stream
     let stream = replay_stream.chain(live_stream);
-
-    Sse::new(stream)
-        .keep_alive(
-            axum::response::sse::KeepAlive::new()
-                .interval(Duration::from_secs(30))
-                .text("ping"),
-        )
-        .into_response()
-}
-
-/// Handle GET requests with bidirectional support (sampling enabled)
-async fn handle_get_bidirectional(session: Arc<Session>, last_event_id: Option<u64>) -> Response {
-    // Take ownership of the request receiver for this SSE connection
-    let request_rx = {
-        let mut rx_guard = session.request_rx.lock().await;
-        rx_guard.take()
-    };
-
-    // Create a channel for the stream
-    let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<Event, Infallible>>(100);
-
-    // Replay buffered events if Last-Event-ID was provided (SEP-1699)
-    if let Some(after_id) = last_event_id {
-        let events = session.get_events_after(after_id).await;
-        tracing::debug!(
-            after_id = after_id,
-            replay_count = events.len(),
-            "Replaying buffered events for bidirectional stream resumption"
-        );
-        for event in events {
-            let sse_event = Event::default()
-                .id(event.id.to_string())
-                .event(SSE_MESSAGE_EVENT)
-                .data(event.data);
-            if tx.send(Ok(sse_event)).await.is_err() {
-                // Client disconnected before replay completed
-                return Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx))
-                    .keep_alive(
-                        axum::response::sse::KeepAlive::new()
-                            .interval(Duration::from_secs(30))
-                            .text("ping"),
-                    )
-                    .into_response();
-            }
-        }
-    }
-
-    // Spawn task to multiplex notifications and outgoing requests
-    let session_clone = session.clone();
-    tokio::spawn(async move {
-        let mut notification_rx = session_clone.notifications_tx.subscribe();
-
-        // If we have a request receiver, use select! to handle both
-        if let Some(mut req_rx) = request_rx {
-            loop {
-                tokio::select! {
-                    // Handle notifications
-                    result = notification_rx.recv() => {
-                        match result {
-                            Ok(msg) => {
-                                let event_id = session_clone.next_event_id();
-                                // Buffer the event for potential replay (SEP-1699)
-                                session_clone.buffer_event(event_id, msg.clone()).await;
-                                let event = Event::default()
-                                    .id(event_id.to_string())
-                                    .event(SSE_MESSAGE_EVENT)
-                                    .data(msg);
-                                if tx.send(Ok(event)).await.is_err() {
-                                    break; // Client disconnected
-                                }
-                            }
-                            Err(broadcast::error::RecvError::Closed) => break,
-                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        }
-                    }
-
-                    // Handle outgoing requests (sampling)
-                    Some(outgoing) = req_rx.recv() => {
-                        // Build JSON-RPC request
-                        let request = JsonRpcRequest {
-                            jsonrpc: "2.0".to_string(),
-                            id: outgoing.id.clone(),
-                            method: outgoing.method,
-                            params: Some(outgoing.params),
-                        };
-
-                        match serde_json::to_string(&request) {
-                            Ok(request_json) => {
-                                tracing::debug!(output = %request_json, "Sending request to client via SSE");
-
-                                // Store pending request
-                                session_clone.add_pending_request(
-                                    outgoing.id,
-                                    outgoing.response_tx,
-                                ).await;
-
-                                // Send on SSE stream
-                                let event_id = session_clone.next_event_id();
-                                // Buffer the event for potential replay (SEP-1699)
-                                session_clone.buffer_event(event_id, request_json.clone()).await;
-                                let event = Event::default()
-                                    .id(event_id.to_string())
-                                    .event(SSE_MESSAGE_EVENT)
-                                    .data(request_json);
-                                if tx.send(Ok(event)).await.is_err() {
-                                    break; // Client disconnected
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!(error = %e, "Failed to serialize outgoing request");
-                                // Notify the waiter of the error
-                                let _ = outgoing.response_tx.send(Err(Error::Internal(
-                                    format!("Failed to serialize request: {}", e),
-                                )));
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            // No request receiver, just handle notifications
-            loop {
-                match notification_rx.recv().await {
-                    Ok(msg) => {
-                        let event_id = session_clone.next_event_id();
-                        // Buffer the event for potential replay (SEP-1699)
-                        session_clone.buffer_event(event_id, msg.clone()).await;
-                        let event = Event::default()
-                            .id(event_id.to_string())
-                            .event(SSE_MESSAGE_EVENT)
-                            .data(msg);
-                        if tx.send(Ok(event)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                }
-            }
-        }
-    });
-
-    // Convert the receiver into a stream
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
 
     Sse::new(stream)
         .keep_alive(

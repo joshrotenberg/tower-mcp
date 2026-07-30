@@ -18,8 +18,13 @@
 //!    session store works; no cross-instance state needed.
 //! 2. **Shared stores.** Server instances plug [`session_store`] and
 //!    [`event_store`] into an external backend (Redis, Postgres, etc.) so
-//!    session metadata and SSE event buffers survive across instances.
-//!    Required when you can't (or don't want to) pin sessions to a host.
+//!    session metadata and resumable notification event buffers survive
+//!    across instances. This does not migrate live request state.
+//!
+//! Legacy sampling, elicitation, and roots requests are sent on the response
+//! stream of the POST that caused them. Their channels are intentionally
+//! process-local and non-resumable, so those exchanges require session
+//! affinity even when shared stores are configured.
 //!
 //! # Single-Instance Deployment
 //!
@@ -163,7 +168,11 @@
 //! ```
 //!
 //! See [`session_store`] and [`event_store`] for the trait definitions and
-//! the included in-memory / caching implementations.
+//! the included in-memory / caching implementations. Shared stores recover
+//! session metadata and resumable notification events; they do not move a
+//! live associated POST stream, its pending response handles, or its service
+//! future to another instance. Route the response POSTs for server-initiated
+//! requests back to the instance that owns the originating POST.
 //!
 //! # Reverse Proxies
 //!
