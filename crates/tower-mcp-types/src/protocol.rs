@@ -841,6 +841,26 @@ pub enum McpResponse {
     UnsubscribeResource(EmptyResult),
     ListPrompts(ListPromptsResult),
     GetPrompt(GetPromptResult),
+    // The final Tasks extension variants are declared before their legacy
+    // counterparts on purpose. This enum is `untagged`, so deserialization
+    // tries variants in declaration order, and each final type validates
+    // `resultType` in a custom deserializer. Strict-first means a genuine
+    // final payload matches its own variant and anything else falls through
+    // to the legacy shape; the reverse order would let `TaskObject` silently
+    // swallow a final `tasks/get` result.
+    /// Flat `resultType: "task"` handle for the final Tasks extension
+    /// (SEP-2663), as opposed to the legacy nested [`CreateTaskResult`].
+    FinalCreateTask(crate::tasks::CreateTaskResult),
+    /// Status-discriminated `tasks/get` result for the final Tasks extension
+    /// (SEP-2663).
+    FinalGetTask(crate::tasks::GetTaskResult),
+    /// Complete acknowledgement for a final `tasks/update` or `tasks/cancel`
+    /// (SEP-2663).
+    ///
+    /// One variant covers both methods because they produce byte-identical
+    /// results; two untagged variants that cannot be distinguished would be
+    /// worse than one that says so.
+    FinalTaskAck(crate::tasks::TaskAcknowledgement),
     CreateTask(CreateTaskResult),
     GetTaskInfo(TaskObject),
     /// Ack-only response for `tasks/update` (SEP-2663).

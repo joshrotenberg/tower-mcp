@@ -101,6 +101,33 @@ fn client_declares_tasks(_extensions: &crate::context::Extensions) -> bool {
     false
 }
 
+/// Decode the wire `inputResponses` map into typed responses.
+///
+/// A key whose value does not match any known response shape is dropped here
+/// rather than failing the request: the store treats an unmatched key as
+/// ignorable, and SEP-2663 requires ignoring responses that do not correspond
+/// to an outstanding request.
+fn decode_input_responses(
+    responses: &std::collections::HashMap<String, serde_json::Value>,
+) -> crate::protocol::InputResponses {
+    responses
+        .iter()
+        .filter_map(|(key, value)| {
+            serde_json::from_value(value.clone())
+                .ok()
+                .map(|response| (key.clone(), response))
+        })
+        .collect()
+}
+
+/// Error for a task the server cannot serve.
+///
+/// Unknown and expired tasks are deliberately indistinguishable, so a caller
+/// cannot probe for the existence of a task whose retention window closed.
+fn unknown_task_error(task_id: &str) -> JsonRpcError {
+    JsonRpcError::invalid_params(format!("Task not found: {task_id}"))
+}
+
 /// The client capability shape a server names in a `-32021` when it cannot
 /// service a request without the Tasks extension.
 fn tasks_client_capabilities() -> crate::protocol::ClientCapabilities {
@@ -2152,6 +2179,85 @@ impl McpRouter {
             .contains_key(tower_mcp_types::protocol::TASKS_EXTENSION_ID)
     }
 
+    /// Reject a final task method that was not negotiated by both peers.
+    ///
+    /// An unnegotiated method is reported as absent rather than forbidden:
+    /// the server genuinely does not serve it for this client.
+    fn require_negotiated_tasks(
+        &self,
+        extensions: &crate::context::Extensions,
+        method: &str,
+    ) -> Result<()> {
+        if self.final_tasks_enabled() && client_declares_tasks(extensions) {
+            Ok(())
+        } else {
+            Err(Error::JsonRpc(JsonRpcError::method_not_found(method)))
+        }
+    }
+
+    /// Serve a final `tasks/get` as a status-discriminated `DetailedTask`.
+    async fn final_get_task(&self, task_id: &str) -> Result<McpResponse> {
+        let (task, result, error) = self
+            .inner
+            .task_store
+            .get_task_result(task_id)
+            .await
+            .map_err(task_store_error)?
+            .ok_or_else(|| Error::JsonRpc(unknown_task_error(task_id)))?;
+
+        let mut metadata = crate::tasks::TaskMetadata::new(
+            task.task_id.clone(),
+            task.created_at.clone(),
+            task.last_updated_at.clone(),
+            task.ttl,
+        );
+        metadata.status_message = task.status_message.clone();
+        metadata.poll_interval_ms = task.poll_interval;
+
+        let detailed = match task.status {
+            TaskStatus::Working => crate::tasks::DetailedTask::working(metadata),
+            TaskStatus::InputRequired => {
+                // Every request still awaiting a response, not just the most
+                // recent one.
+                let outstanding = self
+                    .inner
+                    .task_store
+                    .outstanding_input_requests(task_id)
+                    .await
+                    .map_err(task_store_error)?
+                    .unwrap_or_default();
+                crate::tasks::DetailedTask::input_required(metadata, outstanding)
+            }
+            TaskStatus::Completed => {
+                // The exact object the synchronous call would have returned,
+                // including `isError: true` results.
+                let object = result
+                    .map(serde_json::to_value)
+                    .transpose()
+                    .map_err(|e| {
+                        Error::JsonRpc(JsonRpcError::internal_error(format!(
+                            "failed to encode task result: {e}"
+                        )))
+                    })?
+                    .and_then(|value| value.as_object().cloned())
+                    .unwrap_or_default();
+                crate::tasks::DetailedTask::completed(metadata, object)
+            }
+            TaskStatus::Failed => crate::tasks::DetailedTask::failed(
+                metadata,
+                error.unwrap_or_else(|| JsonRpcError::internal_error("Task failed")),
+            ),
+            TaskStatus::Cancelled => crate::tasks::DetailedTask::cancelled(metadata),
+            // `TaskStatus` is non_exhaustive. Report an unrecognized status as
+            // working rather than inventing a terminal state.
+            _ => crate::tasks::DetailedTask::working(metadata),
+        };
+
+        Ok(McpResponse::FinalGetTask(crate::tasks::GetTaskResult::new(
+            detailed,
+        )))
+    }
+
     /// Effective SEP-2549 cache scope to emit alongside a TTL hint.
     ///
     /// Returns the configured scope, or `private` (the conservative choice)
@@ -2538,6 +2644,25 @@ impl McpRouter {
                             ))
                         })?;
 
+                    // The final wire is flat with `resultType: "task"`; the
+                    // legacy shape nests a `task` compatibility mirror. Pick
+                    // by protocol version rather than emitting a hybrid.
+                    if is_final_protocol_request(&extensions) {
+                        let mut metadata = crate::tasks::TaskMetadata::new(
+                            task.task_id.clone(),
+                            task.created_at.clone(),
+                            task.last_updated_at.clone(),
+                            task.ttl,
+                        );
+                        metadata.status_message = task.status_message.clone();
+                        metadata.poll_interval_ms = task.poll_interval;
+                        return Ok(McpResponse::FinalCreateTask(
+                            crate::tasks::CreateTaskResult::new(crate::tasks::Task::new(
+                                metadata,
+                                task.status,
+                            )),
+                        ));
+                    }
                     Ok(McpResponse::CreateTask(CreateTaskResult::new(task)))
                 } else {
                     // Synchronous request: validate task_support != Required
@@ -3040,7 +3165,8 @@ impl McpRouter {
 
             McpRequest::GetTaskInfo(params) => {
                 if is_final_protocol_request(&extensions) {
-                    return Err(Error::JsonRpc(JsonRpcError::method_not_found("tasks/get")));
+                    self.require_negotiated_tasks(&extensions, "tasks/get")?;
+                    return self.final_get_task(&params.task_id).await;
                 }
 
                 // SEP-2663 DetailedTask: `tasks/get` carries the
@@ -3080,9 +3206,22 @@ impl McpRouter {
 
             McpRequest::UpdateTask(params) => {
                 if is_final_protocol_request(&extensions) {
-                    return Err(Error::JsonRpc(JsonRpcError::method_not_found(
-                        "tasks/update",
-                    )));
+                    self.require_negotiated_tasks(&extensions, "tasks/update")?;
+                    // Partial responses are the normal case: the store
+                    // consumes what matches an outstanding request and ignores
+                    // unknown, already-answered, and superseded keys.
+                    self.inner
+                        .task_store
+                        .apply_input_responses(
+                            &params.task_id,
+                            decode_input_responses(&params.input_responses),
+                        )
+                        .await
+                        .map_err(task_store_error)?
+                        .ok_or_else(|| Error::JsonRpc(unknown_task_error(&params.task_id)))?;
+                    return Ok(McpResponse::FinalTaskAck(
+                        crate::tasks::TaskAcknowledgement::new(),
+                    ));
                 }
 
                 // SEP-2663 `tasks/update`: validate the task exists and
@@ -3109,9 +3248,19 @@ impl McpRouter {
 
             McpRequest::CancelTask(params) => {
                 if is_final_protocol_request(&extensions) {
-                    return Err(Error::JsonRpc(JsonRpcError::method_not_found(
-                        "tasks/cancel",
-                    )));
+                    self.require_negotiated_tasks(&extensions, "tasks/cancel")?;
+                    // The final ack does not require a terminal transition:
+                    // cancelling an already-terminal task is acknowledged, and
+                    // the observable status is polled via `tasks/get`.
+                    self.inner
+                        .task_store
+                        .cancel_task(&params.task_id, params.reason.as_deref())
+                        .await
+                        .map_err(task_store_error)?
+                        .ok_or_else(|| Error::JsonRpc(unknown_task_error(&params.task_id)))?;
+                    return Ok(McpResponse::FinalTaskAck(
+                        crate::tasks::TaskAcknowledgement::new(),
+                    ));
                 }
 
                 // First check if the task exists and is not already terminal
@@ -3636,7 +3785,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            matches!(response, McpResponse::CreateTask(_)),
+            matches!(response, McpResponse::FinalCreateTask(_)),
             "a negotiated request must receive a task, got {response:?}"
         );
 
@@ -3650,6 +3799,127 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(response, McpResponse::CallTool(_)));
+    }
+
+    #[tokio::test]
+    async fn final_task_methods_serve_the_negotiated_wire_shapes() {
+        let router = McpRouter::new()
+            .tool(
+                ToolBuilder::new("optional_task")
+                    .task_support(TaskSupportMode::Optional)
+                    .handler(|input: AddInput| async move {
+                        Ok(CallToolResult::text(format!("{}", input.a + input.b)))
+                    })
+                    .build(),
+            )
+            .with_tasks();
+
+        let McpResponse::FinalCreateTask(created) = router
+            .handle(
+                RequestId::Number(1),
+                McpRequest::CallTool(CallToolParams {
+                    name: "optional_task".to_string(),
+                    arguments: serde_json::json!({"a": 1, "b": 2}),
+                    input_responses: None,
+                    request_state: None,
+                    meta: None,
+                    task: Some(TaskRequestParams { ttl: None }),
+                }),
+                tasks_client_extensions(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("Expected a final create-task response");
+        };
+
+        // Flat, with no legacy nested mirror.
+        let wire = serde_json::to_value(&created).unwrap();
+        assert_eq!(wire["resultType"], "task");
+        assert!(wire.get("task").is_none(), "final results are flat: {wire}");
+        assert!(wire["ttlMs"].is_number() || wire["ttlMs"].is_null());
+        assert!(wire.get("ttl").is_none(), "legacy field name leaked");
+        let task_id = created.task.metadata.task_id.clone();
+
+        // tasks/get returns a status-discriminated DetailedTask.
+        let McpResponse::FinalGetTask(fetched) = router
+            .handle(
+                RequestId::Number(2),
+                McpRequest::GetTaskInfo(GetTaskInfoParams {
+                    task_id: task_id.clone(),
+                    meta: None,
+                }),
+                tasks_client_extensions(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("Expected a final get-task response");
+        };
+        let wire = serde_json::to_value(&fetched).unwrap();
+        assert_eq!(wire["resultType"], "complete");
+        assert_eq!(wire["taskId"], serde_json::json!(task_id));
+        assert!(wire["status"].is_string());
+
+        // Both ack methods produce the complete acknowledgement.
+        for (id, request) in [
+            (
+                3,
+                McpRequest::UpdateTask(UpdateTaskParams {
+                    task_id: task_id.clone(),
+                    input_responses: HashMap::new(),
+                    meta: None,
+                }),
+            ),
+            (
+                4,
+                McpRequest::CancelTask(CancelTaskParams {
+                    task_id: task_id.clone(),
+                    reason: None,
+                    meta: None,
+                }),
+            ),
+        ] {
+            let response = router
+                .handle(RequestId::Number(id), request, tasks_client_extensions())
+                .await
+                .unwrap();
+            let McpResponse::FinalTaskAck(ack) = response else {
+                panic!("Expected a final ack for request {id}");
+            };
+            assert_eq!(
+                serde_json::to_value(&ack).unwrap(),
+                serde_json::json!({"resultType": "complete"})
+            );
+        }
+
+        // An unknown task is invalid params, not a method error.
+        let error = router
+            .handle(
+                RequestId::Number(5),
+                McpRequest::GetTaskInfo(GetTaskInfoParams {
+                    task_id: "does-not-exist".to_string(),
+                    meta: None,
+                }),
+                tasks_client_extensions(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::JsonRpc(e) if e.code == -32602));
+
+        // Without the client declaration the methods remain absent.
+        let error = router
+            .handle(
+                RequestId::Number(6),
+                McpRequest::GetTaskInfo(GetTaskInfoParams {
+                    task_id: task_id.clone(),
+                    meta: None,
+                }),
+                final_extensions(ClientCapabilities::default()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::JsonRpc(e) if e.code == -32601));
     }
 
     #[test]
