@@ -323,6 +323,8 @@ pub enum OAuthClientError {
     TokenRequest(String),
     /// Failed to register an OAuth client.
     Registration(String),
+    /// Failed to load, save, or remove persisted OAuth client credentials.
+    CredentialStore(String),
     /// Failed to reauthorize after an insufficient-scope challenge.
     ScopeEscalation(String),
     /// The token response was invalid or missing required fields.
@@ -337,6 +339,7 @@ impl fmt::Display for OAuthClientError {
             Self::Discovery(msg) => write!(f, "OAuth discovery error: {}", msg),
             Self::TokenRequest(msg) => write!(f, "OAuth token request error: {}", msg),
             Self::Registration(msg) => write!(f, "OAuth client registration error: {}", msg),
+            Self::CredentialStore(msg) => write!(f, "OAuth credential store error: {}", msg),
             Self::ScopeEscalation(msg) => write!(f, "OAuth scope escalation error: {}", msg),
             Self::InvalidResponse(msg) => write!(f, "OAuth invalid response: {}", msg),
             Self::BuildError(msg) => write!(f, "OAuth builder error: {}", msg),
@@ -816,6 +819,9 @@ mod tests {
 
         let err = OAuthClientError::Registration("rejected".into());
         assert_eq!(err.to_string(), "OAuth client registration error: rejected");
+
+        let err = OAuthClientError::CredentialStore("unavailable".into());
+        assert_eq!(err.to_string(), "OAuth credential store error: unavailable");
 
         let err = OAuthClientError::ScopeEscalation("denied".into());
         assert_eq!(err.to_string(), "OAuth scope escalation error: denied");

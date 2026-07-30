@@ -54,10 +54,11 @@ pub use oauth::{
 };
 #[cfg(feature = "oauth-client")]
 pub use oauth_authcode::{
-    OAuthApplicationType, OAuthAuthCodeConfig, OAuthAuthorizationCode,
-    OAuthAuthorizationServerMetadata, OAuthClientRegistration, OAuthClientRegistrationMethod,
-    OAuthClientRegistrationOptions, OAuthDynamicClientRegistration,
-    discover_oauth_authorization_server, resolve_oauth_client_registration,
+    MemoryOAuthClientRegistrationStore, OAuthApplicationType, OAuthAuthCodeConfig,
+    OAuthAuthorizationCode, OAuthAuthorizationServerMetadata, OAuthClientRegistration,
+    OAuthClientRegistrationMethod, OAuthClientRegistrationOptions, OAuthClientRegistrationStore,
+    OAuthDynamicClientRegistration, discover_oauth_authorization_server,
+    resolve_oauth_client_registration, resolve_oauth_client_registration_with_store,
 };
 pub use response_cache::{ClientCacheConfig, DEFAULT_MAX_CACHE_TTL};
 pub use stdio::StdioClientTransport;

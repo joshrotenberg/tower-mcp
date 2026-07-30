@@ -34,6 +34,7 @@
 //! # }
 //! ```
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -193,7 +194,8 @@ fn validate_metadata_issuer(
 // =============================================================================
 
 /// Client-registration mechanism selected for an authorization-code flow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum OAuthClientRegistrationMethod {
     /// Credentials registered with a specific authorization server in advance.
@@ -209,7 +211,11 @@ pub enum OAuthClientRegistrationMethod {
 /// [`bound_issuer()`](Self::bound_issuer) is set for pre-registered and
 /// dynamically registered clients. Client ID Metadata Document identifiers are
 /// portable across authorization servers and therefore have no issuer binding.
-#[derive(Clone, PartialEq, Eq)]
+///
+/// The serialized representation includes `client_secret` so persistent store
+/// implementations can round-trip credentials. Treat it as sensitive data and
+/// only serialize it into an appropriately protected secret store.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OAuthClientRegistration {
     client_id: String,
     client_secret: Option<String>,
@@ -246,6 +252,27 @@ impl OAuthClientRegistration {
         }
     }
 
+    /// Restore issuer-bound credentials obtained by Dynamic Client
+    /// Registration.
+    ///
+    /// Applications normally receive this form from
+    /// [`resolve_oauth_client_registration_with_store`]. This constructor lets
+    /// a persistent [`OAuthClientRegistrationStore`] rebuild a registration
+    /// from separately stored fields without relying on a particular
+    /// serialization format.
+    pub fn dynamically_registered(
+        issuer: impl Into<String>,
+        client_id: impl Into<String>,
+        client_secret: Option<String>,
+    ) -> Self {
+        Self {
+            client_id: client_id.into(),
+            client_secret,
+            method: OAuthClientRegistrationMethod::Dynamic,
+            bound_issuer: Some(issuer.into()),
+        }
+    }
+
     /// OAuth client ID.
     pub fn client_id(&self) -> &str {
         &self.client_id
@@ -266,6 +293,93 @@ impl OAuthClientRegistration {
     /// This is `None` only for portable Client ID Metadata Document URLs.
     pub fn bound_issuer(&self) -> Option<&str> {
         self.bound_issuer.as_deref()
+    }
+}
+
+/// Persistent storage for issuer-bound OAuth client registrations.
+///
+/// Implementations must use the exact validated authorization-server `issuer`
+/// string as the key. They must also protect client secrets at rest using an
+/// appropriate platform secret store or equivalent controls.
+///
+/// Only pre-registered and dynamically registered credentials are
+/// issuer-bound. Client ID Metadata Document URLs are portable and are not
+/// passed to this store by [`resolve_oauth_client_registration_with_store`].
+#[async_trait]
+pub trait OAuthClientRegistrationStore: Send + Sync {
+    /// Load client credentials registered with `issuer`.
+    async fn load(&self, issuer: &str)
+    -> Result<Option<OAuthClientRegistration>, OAuthClientError>;
+
+    /// Save client credentials under their exact authorization-server issuer.
+    async fn save(
+        &self,
+        issuer: &str,
+        registration: &OAuthClientRegistration,
+    ) -> Result<(), OAuthClientError>;
+
+    /// Remove client credentials for an authorization-server issuer.
+    async fn remove(&self, issuer: &str) -> Result<(), OAuthClientError>;
+}
+
+/// Process-local issuer-keyed OAuth client registration store.
+///
+/// This is useful for applications that only need credentials for the current
+/// process and as a reference implementation for persistent secret-store
+/// adapters. It does not persist credentials across process restarts.
+#[derive(Clone, Default)]
+pub struct MemoryOAuthClientRegistrationStore {
+    registrations: Arc<RwLock<HashMap<String, OAuthClientRegistration>>>,
+}
+
+impl fmt::Debug for MemoryOAuthClientRegistrationStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MemoryOAuthClientRegistrationStore")
+            .finish_non_exhaustive()
+    }
+}
+
+impl MemoryOAuthClientRegistrationStore {
+    /// Create an empty registration store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Return the number of issuer registrations currently stored.
+    pub async fn len(&self) -> usize {
+        self.registrations.read().await.len()
+    }
+
+    /// Return whether the store contains no registrations.
+    pub async fn is_empty(&self) -> bool {
+        self.registrations.read().await.is_empty()
+    }
+}
+
+#[async_trait]
+impl OAuthClientRegistrationStore for MemoryOAuthClientRegistrationStore {
+    async fn load(
+        &self,
+        issuer: &str,
+    ) -> Result<Option<OAuthClientRegistration>, OAuthClientError> {
+        Ok(self.registrations.read().await.get(issuer).cloned())
+    }
+
+    async fn save(
+        &self,
+        issuer: &str,
+        registration: &OAuthClientRegistration,
+    ) -> Result<(), OAuthClientError> {
+        self.registrations
+            .write()
+            .await
+            .insert(issuer.to_string(), registration.clone());
+        Ok(())
+    }
+
+    async fn remove(&self, issuer: &str) -> Result<(), OAuthClientError> {
+        self.registrations.write().await.remove(issuer);
+        Ok(())
     }
 }
 
@@ -400,6 +514,37 @@ pub async fn resolve_oauth_client_registration(
     metadata: &OAuthAuthorizationServerMetadata,
     options: &OAuthClientRegistrationOptions,
 ) -> Result<OAuthClientRegistration, OAuthClientError> {
+    resolve_oauth_client_registration_inner(client, metadata, options, None).await
+}
+
+/// Select or create an OAuth client registration with issuer-keyed
+/// persistence.
+///
+/// The resolver applies the same priority order as
+/// [`resolve_oauth_client_registration`]. On the Dynamic Client Registration
+/// path, it first reuses credentials stored under the metadata's exact
+/// validated `issuer`; newly registered credentials are saved under that key.
+///
+/// If protected-resource metadata later selects a different authorization
+/// server, the different issuer key guarantees that old credentials are not
+/// reused. The resolver performs a new Dynamic Client Registration with the
+/// new server instead. Stored credentials for the previous issuer are retained
+/// because another resource may still use that authorization server.
+pub async fn resolve_oauth_client_registration_with_store(
+    client: &reqwest::Client,
+    metadata: &OAuthAuthorizationServerMetadata,
+    options: &OAuthClientRegistrationOptions,
+    store: &dyn OAuthClientRegistrationStore,
+) -> Result<OAuthClientRegistration, OAuthClientError> {
+    resolve_oauth_client_registration_inner(client, metadata, options, Some(store)).await
+}
+
+async fn resolve_oauth_client_registration_inner(
+    client: &reqwest::Client,
+    metadata: &OAuthAuthorizationServerMetadata,
+    options: &OAuthClientRegistrationOptions,
+    store: Option<&dyn OAuthClientRegistrationStore>,
+) -> Result<OAuthClientRegistration, OAuthClientError> {
     if let Some(registration) = &options.pre_registered {
         if registration.method != OAuthClientRegistrationMethod::PreRegistered {
             return Err(OAuthClientError::BuildError(
@@ -426,6 +571,14 @@ pub async fn resolve_oauth_client_registration(
             method: OAuthClientRegistrationMethod::ClientIdMetadataDocument,
             bound_issuer: None,
         });
+    }
+
+    if options.dynamic_registration.is_some()
+        && let Some(store) = store
+        && let Some(registration) = store.load(&metadata.issuer).await?
+    {
+        validate_stored_dynamic_registration(&registration, &metadata.issuer)?;
+        return Ok(registration);
     }
 
     if let (Some(endpoint), Some(request)) = (
@@ -461,12 +614,15 @@ pub async fn resolve_oauth_client_registration(
             .json()
             .await
             .map_err(|error| OAuthClientError::Registration(error.to_string()))?;
-        return Ok(OAuthClientRegistration {
-            client_id: response.client_id,
-            client_secret: response.client_secret,
-            method: OAuthClientRegistrationMethod::Dynamic,
-            bound_issuer: Some(metadata.issuer.clone()),
-        });
+        let registration = OAuthClientRegistration::dynamically_registered(
+            metadata.issuer.clone(),
+            response.client_id,
+            response.client_secret,
+        );
+        if let Some(store) = store {
+            store.save(&metadata.issuer, &registration).await?;
+        }
+        return Ok(registration);
     }
 
     Err(OAuthClientError::BuildError(
@@ -474,6 +630,25 @@ pub async fn resolve_oauth_client_registration(
          prompt the user for pre-registered client information"
             .to_string(),
     ))
+}
+
+fn validate_stored_dynamic_registration(
+    registration: &OAuthClientRegistration,
+    issuer: &str,
+) -> Result<(), OAuthClientError> {
+    if registration.method() != OAuthClientRegistrationMethod::Dynamic {
+        return Err(OAuthClientError::CredentialStore(format!(
+            "stored registration for issuer `{issuer}` uses {:?}, expected dynamic registration",
+            registration.method()
+        )));
+    }
+    if registration.bound_issuer() != Some(issuer) {
+        return Err(OAuthClientError::CredentialStore(format!(
+            "stored registration is bound to issuer {:?}, not `{issuer}`",
+            registration.bound_issuer()
+        )));
+    }
+    Ok(())
 }
 
 fn validate_client_id_metadata_document_url(client_id: &str) -> Result<(), OAuthClientError> {
@@ -1399,6 +1574,126 @@ mod tests {
         assert_eq!(request["token_endpoint_auth_method"], "client_secret_basic");
     }
 
+    #[test]
+    fn registration_credentials_round_trip_for_persistent_stores() {
+        let registration = OAuthClientRegistration::dynamically_registered(
+            "https://auth.example.com",
+            "dynamic-client",
+            Some("stored-secret".to_string()),
+        );
+
+        let json = serde_json::to_string(&registration).unwrap();
+        let restored: OAuthClientRegistration = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored, registration);
+        assert!(!format!("{restored:?}").contains("stored-secret"));
+    }
+
+    #[tokio::test]
+    async fn stored_dynamic_registration_is_reused_for_exact_issuer() {
+        let issuer = "https://auth.example.com";
+        let registration = OAuthClientRegistration {
+            client_id: "stored-client".to_string(),
+            client_secret: Some("stored-secret".to_string()),
+            method: OAuthClientRegistrationMethod::Dynamic,
+            bound_issuer: Some(issuer.to_string()),
+        };
+        let store = MemoryOAuthClientRegistrationStore::new();
+        store.save(issuer, &registration).await.unwrap();
+        let options = OAuthClientRegistrationOptions::new().with_dynamic_registration(
+            OAuthDynamicClientRegistration::native("test-client", ["http://127.0.0.1/callback"]),
+        );
+        let metadata = authorization_server_metadata(issuer);
+
+        let resolved = resolve_oauth_client_registration_with_store(
+            &reqwest::Client::new(),
+            &metadata,
+            &options,
+            &store,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resolved, registration);
+        assert_eq!(store.len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn issuer_migration_registers_new_credentials_without_reusing_old() {
+        let old_issuer = "https://old-auth.example.com";
+        let new_issuer = "https://new-auth.example.com";
+        let old_registration = OAuthClientRegistration {
+            client_id: "old-client".to_string(),
+            client_secret: Some("old-secret".to_string()),
+            method: OAuthClientRegistrationMethod::Dynamic,
+            bound_issuer: Some(old_issuer.to_string()),
+        };
+        let store = MemoryOAuthClientRegistrationStore::new();
+        store.save(old_issuer, &old_registration).await.unwrap();
+        let (registration_endpoint, registration_task) =
+            dynamic_registration_endpoint("new-client", "new-secret").await;
+        let mut metadata = authorization_server_metadata(new_issuer);
+        metadata.registration_endpoint = Some(registration_endpoint);
+        let options = OAuthClientRegistrationOptions::new().with_dynamic_registration(
+            OAuthDynamicClientRegistration::native("test-client", ["http://127.0.0.1/callback"]),
+        );
+
+        let resolved = resolve_oauth_client_registration_with_store(
+            &reqwest::Client::new(),
+            &metadata,
+            &options,
+            &store,
+        )
+        .await
+        .unwrap();
+        registration_task.await.unwrap();
+
+        assert_eq!(resolved.client_id(), "new-client");
+        assert_eq!(resolved.bound_issuer(), Some(new_issuer));
+        assert_eq!(store.len().await, 2);
+        assert_eq!(
+            store.load(old_issuer).await.unwrap(),
+            Some(old_registration)
+        );
+        assert_eq!(
+            store
+                .load(new_issuer)
+                .await
+                .unwrap()
+                .as_ref()
+                .map(OAuthClientRegistration::client_id),
+            Some("new-client")
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupted_store_binding_is_rejected_instead_of_reused() {
+        let issuer = "https://new-auth.example.com";
+        let registration = OAuthClientRegistration {
+            client_id: "old-client".to_string(),
+            client_secret: None,
+            method: OAuthClientRegistrationMethod::Dynamic,
+            bound_issuer: Some("https://old-auth.example.com".to_string()),
+        };
+        let store = MemoryOAuthClientRegistrationStore::new();
+        store.save(issuer, &registration).await.unwrap();
+        let options = OAuthClientRegistrationOptions::new().with_dynamic_registration(
+            OAuthDynamicClientRegistration::native("test-client", ["http://127.0.0.1/callback"]),
+        );
+
+        let error = resolve_oauth_client_registration_with_store(
+            &reqwest::Client::new(),
+            &authorization_server_metadata(issuer),
+            &options,
+            &store,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, OAuthClientError::CredentialStore(_)));
+        assert!(error.to_string().contains("old-auth.example.com"));
+    }
+
     #[tokio::test]
     async fn registration_reports_when_user_input_is_required() {
         let metadata = authorization_server_metadata("https://auth.example.com");
@@ -1425,6 +1720,58 @@ mod tests {
             client_id_metadata_document_supported: false,
             authorization_response_iss_parameter_supported: false,
         }
+    }
+
+    async fn dynamic_registration_endpoint(
+        client_id: &'static str,
+        client_secret: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let header_end = loop {
+                let mut chunk = [0u8; 1024];
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0);
+                bytes.extend_from_slice(&chunk[..read]);
+                if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or_default();
+            while bytes.len() < header_end + content_length {
+                let mut chunk = [0u8; 1024];
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0);
+                bytes.extend_from_slice(&chunk[..read]);
+            }
+
+            let body = serde_json::json!({
+                "client_id": client_id,
+                "client_secret": client_secret,
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 201 Created\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        (format!("http://{address}/register"), task)
     }
 
     #[test]

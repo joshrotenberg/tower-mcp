@@ -6,10 +6,11 @@
 
 use anyhow::{Context, Result};
 use tower_mcp::{
-    HttpClientConfig, HttpClientTransport, OAuthAuthorizationServerMetadata, OAuthClientError,
-    OAuthClientRegistration, OAuthClientRegistrationOptions, OAuthDynamicClientRegistration,
+    HttpClientConfig, HttpClientTransport, MemoryOAuthClientRegistrationStore,
+    OAuthAuthorizationServerMetadata, OAuthClientError, OAuthClientRegistration,
+    OAuthClientRegistrationOptions, OAuthClientRegistrationStore, OAuthDynamicClientRegistration,
     OAuthScopeEscalationConfig, OAuthScopeEscalationHandler, OAuthScopeEscalationRequest,
-    TokenProvider, resolve_oauth_client_registration,
+    TokenProvider, resolve_oauth_client_registration, resolve_oauth_client_registration_with_store,
 };
 
 use crate::handlers;
@@ -83,14 +84,17 @@ pub async fn authorization_server_migration(
     server_url: &str,
     context: &Option<serde_json::Value>,
 ) -> Result<()> {
-    let first = perform_oauth_flow(server_url, context, None).await?;
+    let registrations = MemoryOAuthClientRegistrationStore::new();
+    let first =
+        perform_oauth_flow_with_store(server_url, context, None, Some(&registrations)).await?;
     let first_result = run_authed_client(server_url, &first.access_token).await;
     anyhow::ensure!(
         first_result.is_err(),
         "authorization-server migration scenario did not reject the first issuer's token"
     );
 
-    let second = perform_oauth_flow(server_url, context, None).await?;
+    let second =
+        perform_oauth_flow_with_store(server_url, context, None, Some(&registrations)).await?;
     run_authed_client(server_url, &second.access_token).await
 }
 
@@ -634,8 +638,17 @@ async fn get_resource_for_server(server_url: &str) -> Result<String> {
 /// 6. Exchange code for token
 async fn perform_oauth_flow(
     server_url: &str,
+    context: &Option<serde_json::Value>,
+    scope_override: Option<&str>,
+) -> Result<OAuthFlowResult> {
+    perform_oauth_flow_with_store(server_url, context, scope_override, None).await
+}
+
+async fn perform_oauth_flow_with_store(
+    server_url: &str,
     _context: &Option<serde_json::Value>,
     scope_override: Option<&str>,
+    registration_store: Option<&dyn OAuthClientRegistrationStore>,
 ) -> Result<OAuthFlowResult> {
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -776,12 +789,22 @@ async fn perform_oauth_flow(
     let registration_options = OAuthClientRegistrationOptions::new()
         .with_client_id_metadata_document("https://conformance-test.local/client-metadata.json")
         .with_dynamic_registration(dynamic_registration);
-    let registration = resolve_oauth_client_registration(
-        &http_plain,
-        &registration_metadata,
-        &registration_options,
-    )
-    .await?;
+    let registration = if let Some(store) = registration_store {
+        resolve_oauth_client_registration_with_store(
+            &http_plain,
+            &registration_metadata,
+            &registration_options,
+            store,
+        )
+        .await?
+    } else {
+        resolve_oauth_client_registration(
+            &http_plain,
+            &registration_metadata,
+            &registration_options,
+        )
+        .await?
+    };
     let client_id = registration.client_id().to_string();
     let client_secret = registration.client_secret().map(str::to_string);
 
