@@ -915,13 +915,15 @@ impl HttpRequestSendError {
 }
 
 async fn send_http_request(
-    mut request: reqwest::RequestBuilder,
+    request: reqwest::RequestBuilder,
     resource: &str,
     operation: &str,
     #[cfg(feature = "oauth-client")] token_provider: Option<Arc<dyn TokenProvider>>,
     #[cfg(feature = "oauth-client")] scope_escalation: Option<ScopeEscalationRuntime>,
     #[cfg(feature = "oauth-client")] initial_scope_revision: usize,
 ) -> std::result::Result<reqwest::Response, HttpRequestSendError> {
+    #[cfg(feature = "oauth-client")]
+    let mut request = request;
     #[cfg(not(feature = "oauth-client"))]
     let _ = (resource, operation);
 
