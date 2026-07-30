@@ -49,7 +49,7 @@ async fn task_augmented_call_polls_and_retrieves_result() {
         .call_tool_as_task("compute", serde_json::json!({}), Some(60_000))
         .await
         .expect("task-augmented call");
-    assert!(created.task.task_id.starts_with("task-"));
+    assert!(!created.task.task_id.is_empty());
     assert_eq!(created.task.status, TaskStatus::Working);
     assert!(
         created.task.result.is_none(),

@@ -23,16 +23,21 @@
 //! let router = McpRouter::new().task_store(store);
 //! ```
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::{BTreeSet, HashMap};
+use std::fmt::Write as _;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
-use crate::protocol::{CallToolResult, TaskObject, TaskStatus};
+use crate::error::JsonRpcError;
+use crate::protocol::{CallToolResult, InputRequests, InputResponses, TaskObject, TaskStatus};
 
-/// Default time-to-live for completed tasks (5 minutes, in milliseconds)
+/// Default time-to-live for a task (5 minutes, in milliseconds).
+///
+/// Per SEP-2663 the TTL runs from task creation, not from the moment the task
+/// reaches a terminal state.
 const DEFAULT_TTL_MS: u64 = 300_000;
 
 /// Default poll interval suggestion (2 seconds, in milliseconds)
@@ -63,8 +68,19 @@ pub struct Task {
     pub status_message: Option<String>,
     /// The result of the tool call (when completed)
     pub result: Option<CallToolResult>,
-    /// Error message (when failed)
-    pub error: Option<String>,
+    /// Structured execution error (when failed).
+    ///
+    /// SEP-2663 requires `tasks/get` to surface a JSON-RPC error object, not a
+    /// message string. A tool that returns `CallToolResult { isError: true }`
+    /// is a *completed* task carrying an error result, so it never sets this.
+    pub error: Option<JsonRpcError>,
+    /// Input requests currently awaiting a client response, keyed as sent.
+    pub input_requests: InputRequests,
+    /// Keys answered by a previous `tasks/update`.
+    pub answered_input_keys: BTreeSet<String>,
+    /// Keys displaced by a later [`TaskStore::require_input`] before being
+    /// answered.
+    pub superseded_input_keys: BTreeSet<String>,
     /// Cancellation token for aborting the task
     pub cancellation_token: CancellationToken,
     /// When the task reached terminal status (for TTL tracking)
@@ -91,6 +107,9 @@ impl Task {
             status_message: Some("Task started".to_string()),
             result: None,
             error: None,
+            input_requests: InputRequests::new(),
+            answered_input_keys: BTreeSet::new(),
+            superseded_input_keys: BTreeSet::new(),
             cancellation_token: CancellationToken { cancelled },
             completed_at: None,
             completion_notify: Arc::new(tokio::sync::Notify::new()),
@@ -113,18 +132,69 @@ impl Task {
         }
     }
 
-    /// Check if this task should be cleaned up (TTL expired)
+    /// Check if this task should be cleaned up (TTL expired).
+    ///
+    /// The clock runs from creation, per SEP-2663. A long-running task can
+    /// therefore expire while still working, which is the intended behavior:
+    /// `ttlMs` bounds how long the server retains the task, not how long it
+    /// lingers after finishing.
     pub fn is_expired(&self) -> bool {
-        if let Some(completed_at) = self.completed_at {
-            completed_at.elapsed() > Duration::from_millis(self.ttl)
-        } else {
-            false
-        }
+        self.created_at.elapsed() > Duration::from_millis(self.ttl)
+    }
+
+    /// Outstanding input requests, if the task is waiting on the client.
+    pub fn outstanding_input_requests(&self) -> &InputRequests {
+        &self.input_requests
     }
 
     /// Check if the task has been cancelled
     pub fn is_cancelled(&self) -> bool {
         self.cancellation_token.is_cancelled()
+    }
+}
+
+/// Generate an unguessable task identifier.
+///
+/// SEP-2663 notes that a task ID can function as a bearer token: anything that
+/// knows the ID can poll, update, or cancel the task. Identifiers are therefore
+/// 128 random bits from the system CSPRNG, rendered as hex, rather than a
+/// sequential counter.
+///
+/// # Panics
+///
+/// Panics if the operating system entropy source is unavailable. A server that
+/// cannot generate unguessable identifiers must not fall back to guessable
+/// ones.
+pub fn generate_task_id() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("system entropy source unavailable for task ID generation");
+    let mut id = String::with_capacity(2 * bytes.len());
+    for byte in bytes {
+        let _ = write!(id, "{byte:02x}");
+    }
+    id
+}
+
+/// Outcome of applying `tasks/update.inputResponses` to a task.
+///
+/// SEP-2663 requires partial responses to be honored: keys that match an
+/// outstanding request are consumed, everything else is ignored rather than
+/// rejected, and any request left unanswered stays outstanding.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AppliedInputResponses {
+    /// Keys matched to an outstanding request and consumed.
+    pub accepted: BTreeSet<String>,
+    /// Keys ignored because they were never issued, were already answered, or
+    /// were superseded by a later request.
+    pub ignored: BTreeSet<String>,
+    /// Requests still awaiting a response after this update.
+    pub still_outstanding: BTreeSet<String>,
+}
+
+impl AppliedInputResponses {
+    /// Whether every outstanding request has now been answered.
+    pub fn is_complete(&self) -> bool {
+        self.still_outstanding.is_empty()
     }
 }
 
@@ -172,7 +242,10 @@ pub type Result<T> = std::result::Result<T, TaskStoreError>;
 
 /// A task's current snapshot: the task object plus any result or error
 /// captured so far.
-pub type TaskSnapshot = (TaskObject, Option<CallToolResult>, Option<String>);
+///
+/// The error is a structured [`JsonRpcError`] because SEP-2663 requires
+/// `tasks/get` on a failed task to return a JSON-RPC error object.
+pub type TaskSnapshot = (TaskObject, Option<CallToolResult>, Option<JsonRpcError>);
 
 /// Storage backend for async task state.
 ///
@@ -185,6 +258,10 @@ pub type TaskSnapshot = (TaskObject, Option<CallToolResult>, Option<String>);
 /// - Terminal states ([`TaskStatus::is_terminal`]) are immutable: once a task
 ///   is completed, failed, or cancelled, further transitions must be rejected
 ///   (`Ok(false)` from the transition methods).
+/// - An expired task is indistinguishable from an unknown one. Reads return
+///   `None` once `ttlMs` has elapsed since creation, whether or not the entry
+///   has actually been reclaimed, so callers cannot probe for the existence of
+///   a task whose retention window has closed.
 /// - [`cancel_task`](Self::cancel_task) must signal the task's
 ///   [`CancellationToken`] even if the task is already terminal.
 /// - [`wait_for_completion`](Self::wait_for_completion) blocks until the task
@@ -219,20 +296,61 @@ pub trait TaskStore: Send + Sync + 'static {
     /// List all tasks, optionally filtered by status.
     async fn list_tasks(&self, status_filter: Option<TaskStatus>) -> Result<Vec<TaskObject>>;
 
-    /// Mark a task as requiring input.
+    /// Mark a task as requiring input, recording the requests to be answered.
     ///
-    /// Returns `Ok(false)` if the task is unknown or already terminal.
-    async fn require_input(&self, task_id: &str, message: &str) -> Result<bool>;
+    /// `requests` replaces the outstanding set. Any key that was outstanding
+    /// and is not re-issued becomes superseded; a re-issued key is a fresh
+    /// question and becomes outstanding again even if previously answered.
+    ///
+    /// Returns `Ok(false)` if the task is unknown, expired, or already
+    /// terminal.
+    async fn require_input(
+        &self,
+        task_id: &str,
+        requests: InputRequests,
+        message: Option<&str>,
+    ) -> Result<bool>;
+
+    /// Read the requests a task is currently waiting on.
+    ///
+    /// Returns an empty map when the task is not `input_required`, and `None`
+    /// when the task is unknown or expired.
+    async fn outstanding_input_requests(&self, task_id: &str) -> Result<Option<InputRequests>>;
+
+    /// Apply `tasks/update.inputResponses` to a task.
+    ///
+    /// Consumes the keys that match an outstanding request and ignores the
+    /// rest. When the last outstanding request is answered the task returns to
+    /// [`TaskStatus::Working`].
+    ///
+    /// Returns `None` if the task is unknown, expired, or already terminal.
+    async fn apply_input_responses(
+        &self,
+        task_id: &str,
+        responses: InputResponses,
+    ) -> Result<Option<AppliedInputResponses>>;
+
+    /// Update a task's time-to-live, measured from creation.
+    ///
+    /// SEP-2663 allows `ttlMs` to change over a task's lifetime. Returns
+    /// `Ok(false)` if the task is unknown or already expired.
+    async fn set_ttl(&self, task_id: &str, ttl_ms: u64) -> Result<bool>;
 
     /// Mark a task as completed with a result.
     ///
-    /// Returns `Ok(false)` if the task is unknown or already terminal.
+    /// A result carrying `isError: true` still completes the task: the tool
+    /// ran and produced a domain error, which SEP-2663 distinguishes from an
+    /// execution failure.
+    ///
+    /// Returns `Ok(false)` if the task is unknown, expired, or already
+    /// terminal.
     async fn complete_task(&self, task_id: &str, result: CallToolResult) -> Result<bool>;
 
-    /// Mark a task as failed with an error.
+    /// Mark a task as failed with a structured execution error.
     ///
-    /// Returns `Ok(false)` if the task is unknown or already terminal.
-    async fn fail_task(&self, task_id: &str, error: &str) -> Result<bool>;
+    /// Returns `Ok(false)` if the task is unknown, expired, or already
+    /// terminal.
+    async fn fail_task(&self, task_id: &str, error: JsonRpcError) -> Result<bool>;
 
     /// Cancel a task.
     ///
@@ -252,7 +370,6 @@ pub trait TaskStore: Send + Sync + 'static {
 #[derive(Debug, Clone)]
 pub struct MemoryTaskStore {
     tasks: Arc<RwLock<HashMap<String, Task>>>,
-    next_id: Arc<AtomicU64>,
 }
 
 impl Default for MemoryTaskStore {
@@ -266,20 +383,16 @@ impl MemoryTaskStore {
     pub fn new() -> Self {
         Self {
             tasks: Arc::new(RwLock::new(HashMap::new())),
-            next_id: Arc::new(AtomicU64::new(1)),
         }
-    }
-
-    /// Generate a unique task ID
-    fn generate_id(&self) -> String {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        format!("task-{}", id)
     }
 
     /// Remove expired tasks (call periodically for cleanup).
     ///
     /// Returns the number removed. Not part of the [`TaskStore`] trait;
     /// external backends typically expire entries natively (e.g. Redis TTL).
+    ///
+    /// Calling this is an optimization, not a correctness requirement: reads
+    /// already treat an expired task as absent.
     pub fn cleanup_expired(&self) -> usize {
         if let Ok(mut tasks) = self.tasks.write() {
             let before = tasks.len();
@@ -315,7 +428,7 @@ impl TaskStore for MemoryTaskStore {
         arguments: serde_json::Value,
         ttl: Option<u64>,
     ) -> Result<(String, CancellationToken)> {
-        let id = self.generate_id();
+        let id = generate_task_id();
         let task = Task::new(id.clone(), tool_name.to_string(), arguments, ttl);
         let token = task.cancellation_token.clone();
 
@@ -328,7 +441,10 @@ impl TaskStore for MemoryTaskStore {
 
     async fn get_task(&self, task_id: &str) -> Result<Option<TaskObject>> {
         Ok(if let Ok(tasks) = self.tasks.read() {
-            tasks.get(task_id).map(|t| t.to_task_object())
+            tasks
+                .get(task_id)
+                .filter(|t| !t.is_expired())
+                .map(|t| t.to_task_object())
         } else {
             None
         })
@@ -338,6 +454,7 @@ impl TaskStore for MemoryTaskStore {
         Ok(if let Ok(tasks) = self.tasks.read() {
             tasks
                 .get(task_id)
+                .filter(|t| !t.is_expired())
                 .map(|t| (t.to_task_object(), t.result.clone(), t.error.clone()))
         } else {
             None
@@ -350,7 +467,7 @@ impl TaskStore for MemoryTaskStore {
             let Ok(tasks) = self.tasks.read() else {
                 return Ok(None);
             };
-            let Some(task) = tasks.get(task_id) else {
+            let Some(task) = tasks.get(task_id).filter(|t| !t.is_expired()) else {
                 return Ok(None);
             };
             if task.status.is_terminal() {
@@ -374,6 +491,7 @@ impl TaskStore for MemoryTaskStore {
         Ok(if let Ok(tasks) = self.tasks.read() {
             tasks
                 .values()
+                .filter(|t| !t.is_expired())
                 .filter(|t| status_filter.is_none() || status_filter == Some(t.status))
                 .map(|t| t.to_task_object())
                 .collect()
@@ -382,18 +500,103 @@ impl TaskStore for MemoryTaskStore {
         })
     }
 
-    async fn require_input(&self, task_id: &str, message: &str) -> Result<bool> {
+    async fn require_input(
+        &self,
+        task_id: &str,
+        requests: InputRequests,
+        message: Option<&str>,
+    ) -> Result<bool> {
         let Ok(mut tasks) = self.tasks.write() else {
             return Ok(false);
         };
-        let Some(task) = tasks.get_mut(task_id) else {
+        let Some(task) = tasks.get_mut(task_id).filter(|t| !t.is_expired()) else {
             return Ok(false);
         };
         if task.status.is_terminal() {
             return Ok(false);
         }
+
+        // Outstanding requests the server did not re-issue are superseded.
+        for key in std::mem::take(&mut task.input_requests).into_keys() {
+            if !requests.contains_key(&key) {
+                task.superseded_input_keys.insert(key);
+            }
+        }
+        // A re-issued key is a fresh question, whatever its prior fate.
+        for key in requests.keys() {
+            task.answered_input_keys.remove(key);
+            task.superseded_input_keys.remove(key);
+        }
+
+        task.input_requests = requests;
         task.status = TaskStatus::InputRequired;
-        task.status_message = Some(message.to_string());
+        task.status_message = Some(
+            message
+                .map(str::to_string)
+                .unwrap_or_else(|| "Awaiting client input".to_string()),
+        );
+        task.last_updated_at_str = chrono_now_iso8601();
+        Ok(true)
+    }
+
+    async fn outstanding_input_requests(&self, task_id: &str) -> Result<Option<InputRequests>> {
+        Ok(if let Ok(tasks) = self.tasks.read() {
+            tasks
+                .get(task_id)
+                .filter(|t| !t.is_expired())
+                .map(|t| t.input_requests.clone())
+        } else {
+            None
+        })
+    }
+
+    async fn apply_input_responses(
+        &self,
+        task_id: &str,
+        responses: InputResponses,
+    ) -> Result<Option<AppliedInputResponses>> {
+        let Ok(mut tasks) = self.tasks.write() else {
+            return Ok(None);
+        };
+        let Some(task) = tasks.get_mut(task_id).filter(|t| !t.is_expired()) else {
+            return Ok(None);
+        };
+        if task.status.is_terminal() {
+            return Ok(None);
+        }
+
+        let mut applied = AppliedInputResponses::default();
+        for key in responses.into_keys() {
+            if task.input_requests.remove(&key).is_some() {
+                task.answered_input_keys.insert(key.clone());
+                applied.accepted.insert(key);
+            } else {
+                // Never issued, already answered, or superseded. All three are
+                // ignored rather than rejected, so a client replaying a stale
+                // update does not fail the task.
+                applied.ignored.insert(key);
+            }
+        }
+        applied.still_outstanding = task.input_requests.keys().cloned().collect();
+
+        if !applied.accepted.is_empty() {
+            task.last_updated_at_str = chrono_now_iso8601();
+        }
+        if applied.is_complete() && task.status == TaskStatus::InputRequired {
+            task.status = TaskStatus::Working;
+            task.status_message = Some("Task resumed".to_string());
+        }
+        Ok(Some(applied))
+    }
+
+    async fn set_ttl(&self, task_id: &str, ttl_ms: u64) -> Result<bool> {
+        let Ok(mut tasks) = self.tasks.write() else {
+            return Ok(false);
+        };
+        let Some(task) = tasks.get_mut(task_id).filter(|t| !t.is_expired()) else {
+            return Ok(false);
+        };
+        task.ttl = ttl_ms;
         task.last_updated_at_str = chrono_now_iso8601();
         Ok(true)
     }
@@ -402,7 +605,7 @@ impl TaskStore for MemoryTaskStore {
         let Ok(mut tasks) = self.tasks.write() else {
             return Ok(false);
         };
-        let Some(task) = tasks.get_mut(task_id) else {
+        let Some(task) = tasks.get_mut(task_id).filter(|t| !t.is_expired()) else {
             return Ok(false);
         };
         if task.status.is_terminal() {
@@ -411,25 +614,27 @@ impl TaskStore for MemoryTaskStore {
         task.status = TaskStatus::Completed;
         task.status_message = Some("Task completed".to_string());
         task.result = Some(result);
+        task.input_requests.clear();
         task.completed_at = Some(Instant::now());
         task.last_updated_at_str = chrono_now_iso8601();
         task.completion_notify.notify_waiters();
         Ok(true)
     }
 
-    async fn fail_task(&self, task_id: &str, error: &str) -> Result<bool> {
+    async fn fail_task(&self, task_id: &str, error: JsonRpcError) -> Result<bool> {
         let Ok(mut tasks) = self.tasks.write() else {
             return Ok(false);
         };
-        let Some(task) = tasks.get_mut(task_id) else {
+        let Some(task) = tasks.get_mut(task_id).filter(|t| !t.is_expired()) else {
             return Ok(false);
         };
         if task.status.is_terminal() {
             return Ok(false);
         }
         task.status = TaskStatus::Failed;
-        task.status_message = Some(format!("Task failed: {}", error));
-        task.error = Some(error.to_string());
+        task.status_message = Some(format!("Task failed: {}", error.message));
+        task.error = Some(error);
+        task.input_requests.clear();
         task.completed_at = Some(Instant::now());
         task.last_updated_at_str = chrono_now_iso8601();
         task.completion_notify.notify_waiters();
@@ -440,7 +645,7 @@ impl TaskStore for MemoryTaskStore {
         let Ok(mut tasks) = self.tasks.write() else {
             return Ok(None);
         };
-        let Some(task) = tasks.get_mut(task_id) else {
+        let Some(task) = tasks.get_mut(task_id).filter(|t| !t.is_expired()) else {
             return Ok(None);
         };
 
@@ -449,6 +654,7 @@ impl TaskStore for MemoryTaskStore {
 
         // If not already terminal, mark as cancelled
         if !task.status.is_terminal() {
+            task.input_requests.clear();
             task.status = TaskStatus::Cancelled;
             task.status_message = Some(
                 reason
@@ -528,6 +734,9 @@ fn is_leap_year(year: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{
+        ElicitAction, ElicitResult, InputRequest, InputResponse, ListRootsParams,
+    };
 
     #[tokio::test]
     async fn test_create_task() {
@@ -537,7 +746,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(id.starts_with("task-"));
+        assert!(!id.is_empty());
         assert!(!token.is_cancelled());
 
         let info = store
@@ -599,7 +808,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(store.fail_task(&id, "Something went wrong").await.unwrap());
+        assert!(
+            store
+                .fail_task(&id, JsonRpcError::internal_error("Something went wrong"))
+                .await
+                .unwrap()
+        );
 
         let info = store.get_task(&id).await.unwrap().unwrap();
         assert_eq!(info.status, TaskStatus::Failed);
@@ -656,7 +870,12 @@ mod tests {
             .unwrap();
 
         // Try to fail - should fail
-        assert!(!store.fail_task(&id, "Error").await.unwrap());
+        assert!(
+            !store
+                .fail_task(&id, JsonRpcError::internal_error("Error"))
+                .await
+                .unwrap()
+        );
 
         // Status should still be completed
         let info = store.get_task(&id).await.unwrap().unwrap();
@@ -764,5 +983,339 @@ mod tests {
         assert!(TaskStatus::Completed.is_terminal());
         assert!(TaskStatus::Failed.is_terminal());
         assert!(TaskStatus::Cancelled.is_terminal());
+    }
+
+    fn requests(keys: &[&str]) -> InputRequests {
+        keys.iter()
+            .map(|k| {
+                (
+                    k.to_string(),
+                    InputRequest::ListRoots(ListRootsParams { meta: None }),
+                )
+            })
+            .collect()
+    }
+
+    fn accept(key: &str) -> (String, InputResponse) {
+        (
+            key.to_string(),
+            InputResponse::Elicit(ElicitResult {
+                action: ElicitAction::Accept,
+                content: None,
+                meta: None,
+            }),
+        )
+    }
+
+    async fn working_task(store: &MemoryTaskStore, ttl: Option<u64>) -> String {
+        store
+            .create_task("tool", serde_json::json!({}), ttl)
+            .await
+            .unwrap()
+            .0
+    }
+
+    #[tokio::test]
+    async fn task_ids_are_unguessable_not_sequential() {
+        let store = MemoryTaskStore::new();
+        let mut ids = BTreeSet::new();
+        for _ in 0..64 {
+            ids.insert(working_task(&store, None).await);
+        }
+        assert_eq!(ids.len(), 64, "task IDs collided");
+
+        for id in &ids {
+            assert_eq!(id.len(), 32, "expected 128 bits of hex: {id}");
+            assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "{id}");
+            assert!(!id.starts_with("task-"), "sequential-looking ID: {id}");
+        }
+
+        // A counter would make every ID a near-neighbor of the last. Require
+        // the set to span a wide range of leading bytes instead.
+        let leading: BTreeSet<&str> = ids.iter().map(|id| &id[..2]).collect();
+        assert!(
+            leading.len() > 32,
+            "only {} distinct leading bytes across 64 IDs",
+            leading.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn ttl_runs_from_creation_and_expired_tasks_read_as_absent() {
+        let store = MemoryTaskStore::new();
+        let id = working_task(&store, Some(0)).await;
+
+        // TTL of 0 expires immediately, while the task is still working, so
+        // the clock plainly is not waiting for a terminal state.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        assert!(store.get_task(&id).await.unwrap().is_none());
+        assert!(store.get_task_result(&id).await.unwrap().is_none());
+        assert!(store.list_tasks(None).await.unwrap().is_empty());
+        assert!(
+            store
+                .outstanding_input_requests(&id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.cancel_task(&id, None).await.unwrap().is_none());
+        assert!(!store.set_ttl(&id, 60_000).await.unwrap());
+        assert!(
+            !store
+                .complete_task(&id, CallToolResult::text("late"))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn ttl_is_mutable_over_the_task_lifetime() {
+        let store = MemoryTaskStore::new();
+        let id = working_task(&store, Some(60_000)).await;
+
+        assert!(store.set_ttl(&id, 120_000).await.unwrap());
+        let task = store.get_task(&id).await.unwrap().unwrap();
+        assert_eq!(task.ttl, Some(120_000));
+
+        // Shortening the window to zero retires the task immediately.
+        assert!(store.set_ttl(&id, 0).await.unwrap());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(store.get_task(&id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn require_input_records_requests_and_exposes_them() {
+        let store = MemoryTaskStore::new();
+        let id = working_task(&store, None).await;
+
+        assert!(
+            store
+                .require_input(&id, requests(&["approval", "region"]), Some("need input"))
+                .await
+                .unwrap()
+        );
+
+        let task = store.get_task(&id).await.unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::InputRequired);
+        assert_eq!(task.status_message.as_deref(), Some("need input"));
+
+        let outstanding = store
+            .outstanding_input_requests(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            outstanding.keys().collect::<Vec<_>>(),
+            vec!["approval", "region"],
+            "every outstanding request must be exposed, not just the newest"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_input_responses_leave_the_rest_outstanding() {
+        let store = MemoryTaskStore::new();
+        let id = working_task(&store, None).await;
+        store
+            .require_input(&id, requests(&["approval", "region"]), None)
+            .await
+            .unwrap();
+
+        let applied = store
+            .apply_input_responses(&id, [accept("approval")].into_iter().collect())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(applied.accepted, ["approval".to_string()].into());
+        assert!(applied.ignored.is_empty());
+        assert_eq!(applied.still_outstanding, ["region".to_string()].into());
+        assert!(!applied.is_complete());
+
+        // The task stays blocked while anything is unanswered.
+        let task = store.get_task(&id).await.unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::InputRequired);
+        assert_eq!(
+            store
+                .outstanding_input_requests(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["region"]
+        );
+
+        // Answering the last one resumes the task.
+        let applied = store
+            .apply_input_responses(&id, [accept("region")].into_iter().collect())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(applied.is_complete());
+        assert_eq!(
+            store.get_task(&id).await.unwrap().unwrap().status,
+            TaskStatus::Working
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_answered_and_superseded_response_keys_are_ignored() {
+        let store = MemoryTaskStore::new();
+        let id = working_task(&store, None).await;
+        store
+            .require_input(&id, requests(&["approval", "stale"]), None)
+            .await
+            .unwrap();
+
+        // Answer one, then re-issue a set that drops `stale`, superseding it.
+        store
+            .apply_input_responses(&id, [accept("approval")].into_iter().collect())
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .require_input(&id, requests(&["region"]), None)
+            .await
+            .unwrap();
+
+        let applied = store
+            .apply_input_responses(
+                &id,
+                [accept("never-issued"), accept("approval"), accept("stale")]
+                    .into_iter()
+                    .collect(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            applied.accepted.is_empty(),
+            "none of these keys are outstanding"
+        );
+        assert_eq!(
+            applied.ignored,
+            [
+                "never-issued".to_string(),
+                "approval".to_string(),
+                "stale".to_string()
+            ]
+            .into(),
+            "unknown, already-answered, and superseded keys are all ignored"
+        );
+        assert_eq!(applied.still_outstanding, ["region".to_string()].into());
+        assert_eq!(
+            store.get_task(&id).await.unwrap().unwrap().status,
+            TaskStatus::InputRequired,
+            "ignoring a stale update must not resume or fail the task"
+        );
+    }
+
+    #[tokio::test]
+    async fn reissued_key_becomes_a_fresh_question() {
+        let store = MemoryTaskStore::new();
+        let id = working_task(&store, None).await;
+        store
+            .require_input(&id, requests(&["approval"]), None)
+            .await
+            .unwrap();
+        store
+            .apply_input_responses(&id, [accept("approval")].into_iter().collect())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The server asks the same key again: the earlier answer must not
+        // satisfy it.
+        store
+            .require_input(&id, requests(&["approval"]), None)
+            .await
+            .unwrap();
+        let applied = store
+            .apply_input_responses(&id, [accept("approval")].into_iter().collect())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(applied.accepted, ["approval".to_string()].into());
+        assert!(applied.is_complete());
+    }
+
+    #[tokio::test]
+    async fn failed_tasks_preserve_the_structured_error() {
+        let store = MemoryTaskStore::new();
+        let id = working_task(&store, None).await;
+
+        let mut error = JsonRpcError::invalid_params("bad region");
+        error.data = Some(serde_json::json!({"field": "region"}));
+        assert!(store.fail_task(&id, error).await.unwrap());
+
+        let (_, result, error) = store.get_task_result(&id).await.unwrap().unwrap();
+        assert!(result.is_none());
+        let error = error.expect("structured error must survive the store");
+        assert_eq!(
+            error.code, -32602,
+            "the original code must not be flattened"
+        );
+        assert_eq!(error.message, "bad region");
+        assert_eq!(error.data.unwrap()["field"], "region");
+    }
+
+    #[tokio::test]
+    async fn tool_error_results_complete_the_task() {
+        let store = MemoryTaskStore::new();
+        let id = working_task(&store, None).await;
+
+        let mut result = CallToolResult::text("domain failure");
+        result.is_error = true;
+        assert!(store.complete_task(&id, result).await.unwrap());
+
+        let (task, result, error) = store.get_task_result(&id).await.unwrap().unwrap();
+        assert_eq!(
+            task.status,
+            TaskStatus::Completed,
+            "isError is a domain error, not an execution failure"
+        );
+        assert!(result.unwrap().is_error);
+        assert!(error.is_none(), "no JSON-RPC error accompanies isError");
+    }
+
+    #[tokio::test]
+    async fn terminal_states_clear_outstanding_requests() {
+        for (label, terminate) in [("completed", true), ("cancelled", false)] {
+            let store = MemoryTaskStore::new();
+            let id = working_task(&store, None).await;
+            store
+                .require_input(&id, requests(&["approval"]), None)
+                .await
+                .unwrap();
+
+            if terminate {
+                store
+                    .complete_task(&id, CallToolResult::text("done"))
+                    .await
+                    .unwrap();
+            } else {
+                store.cancel_task(&id, None).await.unwrap();
+            }
+
+            assert!(
+                store
+                    .outstanding_input_requests(&id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_empty(),
+                "{label} task still advertises outstanding input requests"
+            );
+            assert!(
+                store
+                    .apply_input_responses(&id, [accept("approval")].into_iter().collect())
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{label} task accepted a late input response"
+            );
+        }
     }
 }

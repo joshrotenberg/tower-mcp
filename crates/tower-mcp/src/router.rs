@@ -2442,22 +2442,16 @@ impl McpRouter {
 
                         if cancellation_token.is_cancelled() {
                             tracing::debug!(task_id = %task_id_clone, "Task cancelled during execution");
-                        } else if result.is_error {
-                            // Tool returned an error result
-                            let error_msg = result.first_text().unwrap_or("Tool execution failed");
-                            if let Err(e) = task_store.fail_task(&task_id_clone, error_msg).await {
-                                tracing::warn!(task_id = %task_id_clone, error = %e, "failed to record task failure");
-                            }
-                            tracing::info!(
-                                target: "mcp::tools",
-                                tool = %tool_name,
-                                task_id = %task_id_clone,
-                                duration_ms,
-                                status = "error",
-                                error = %error_msg,
-                                "tool call completed"
-                            );
                         } else {
+                            // A tool result carrying `isError: true` completes
+                            // the task: the tool ran and produced a domain
+                            // error. SEP-2663 reserves `failed` for execution
+                            // failures, which surface as a JSON-RPC error.
+                            let status = if result.is_error { "error" } else { "success" };
+                            let error_msg = result
+                                .is_error
+                                .then(|| result.first_text().unwrap_or("Tool execution failed"))
+                                .map(str::to_string);
                             if let Err(e) = task_store.complete_task(&task_id_clone, result).await {
                                 tracing::warn!(task_id = %task_id_clone, error = %e, "failed to record task completion");
                             }
@@ -2466,7 +2460,8 @@ impl McpRouter {
                                 tool = %tool_name,
                                 task_id = %task_id_clone,
                                 duration_ms,
-                                status = "success",
+                                status,
+                                error = error_msg.as_deref().unwrap_or_default(),
                                 "tool call completed"
                             );
                         }
@@ -3011,9 +3006,12 @@ impl McpRouter {
                 match task.status {
                     TaskStatus::Completed => task.result = result,
                     TaskStatus::Failed => {
-                        task.error = Some(JsonRpcError::internal_error(
-                            error.unwrap_or_else(|| "Task failed".to_string()),
-                        ));
+                        // The store preserves the structured error, so the
+                        // original code and data survive to the client instead
+                        // of being flattened into an internal-error message.
+                        task.error = Some(
+                            error.unwrap_or_else(|| JsonRpcError::internal_error("Task failed")),
+                        );
                     }
                     _ => {}
                 }
@@ -4674,7 +4672,7 @@ mod tests {
 
         match resp.inner {
             Ok(McpResponse::CreateTask(result)) => {
-                assert!(result.task.task_id.starts_with("task-"));
+                assert!(!result.task.task_id.is_empty());
                 assert_eq!(result.task.status, TaskStatus::Working);
             }
             _ => panic!("Expected CreateTask response"),
@@ -4746,9 +4744,29 @@ mod tests {
         async fn require_input(
             &self,
             task_id: &str,
-            message: &str,
+            requests: crate::protocol::InputRequests,
+            message: Option<&str>,
         ) -> crate::async_task::Result<bool> {
-            self.inner.require_input(task_id, message).await
+            self.inner.require_input(task_id, requests, message).await
+        }
+
+        async fn outstanding_input_requests(
+            &self,
+            task_id: &str,
+        ) -> crate::async_task::Result<Option<crate::protocol::InputRequests>> {
+            self.inner.outstanding_input_requests(task_id).await
+        }
+
+        async fn apply_input_responses(
+            &self,
+            task_id: &str,
+            responses: crate::protocol::InputResponses,
+        ) -> crate::async_task::Result<Option<crate::async_task::AppliedInputResponses>> {
+            self.inner.apply_input_responses(task_id, responses).await
+        }
+
+        async fn set_ttl(&self, task_id: &str, ttl_ms: u64) -> crate::async_task::Result<bool> {
+            self.inner.set_ttl(task_id, ttl_ms).await
         }
 
         async fn complete_task(
@@ -4761,7 +4779,11 @@ mod tests {
             self.inner.complete_task(task_id, result).await
         }
 
-        async fn fail_task(&self, task_id: &str, error: &str) -> crate::async_task::Result<bool> {
+        async fn fail_task(
+            &self,
+            task_id: &str,
+            error: JsonRpcError,
+        ) -> crate::async_task::Result<bool> {
             self.inner.fail_task(task_id, error).await
         }
 

@@ -30,7 +30,9 @@ regex = "1"
 base64.workspace = true
 thiserror = { workspace = true }
 sha2 = { workspace = true, optional = true }
-getrandom = { workspace = true, optional = true }
+# Required: task identifiers can act as bearer tokens and are generated from
+# system entropy (SEP-2663).
+getrandom = { workspace = true }
 url = { workspace = true, optional = true }
 urlencoding = { workspace = true, optional = true }
 tower-resilience = { workspace = true, optional = true, default-features = false, features = ["circuitbreaker", "ratelimiter", "bulkhead"] }
@@ -64,7 +66,7 @@ testing = ["tower-mcp-types/testing"]
 # HTTP client transport for connecting to remote MCP servers
 http-client = ["dep:reqwest"]
 # OAuth 2.0 client-side token acquisition (client credentials + authorization code)
-oauth-client = ["http-client", "dep:sha2", "dep:getrandom", "dep:urlencoding"]
+oauth-client = ["http-client", "dep:sha2", "dep:urlencoding"]
 # Runtime tool (de)registration via DynamicToolRegistry
 dynamic-tools = []
 # MCP proxy for aggregating multiple backend servers

@@ -5,6 +5,10 @@
 .tmp/
 CLAUDE.md
 
+# Local scratch: checkouts of other SDKs, repro servers, working notes.
+# Contains embedded git repos, so `git add -A` would otherwise commit gitlinks.
+/tmp/
+
 # cargo-llvm-cov report output (see the Coverage job in ci.yml)
 /lcov.info
 /coverage-summary.json

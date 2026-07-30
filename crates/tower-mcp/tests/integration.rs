@@ -1645,7 +1645,7 @@ async fn test_task_create_via_tools_call() {
                 .get("task")
                 .expect("response should have 'task' field");
             let task_id = task.get("taskId").expect("task should have 'taskId'");
-            assert!(task_id.as_str().unwrap().starts_with("task-"));
+            assert!(!task_id.as_str().unwrap().is_empty());
             assert_eq!(task.get("status").unwrap().as_str().unwrap(), "working");
             assert!(
                 task.get("createdAt").is_some(),
