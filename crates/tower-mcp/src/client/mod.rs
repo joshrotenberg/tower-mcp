@@ -87,7 +87,7 @@ use crate::protocol::{
     RequestOutcome, ResourceDefinition, ResourceTemplateDefinition, Root, RootsCapability,
     SamplingCapability, SubscriptionFilter, SubscriptionsAcknowledgedParams,
     SubscriptionsListenParams, SubscriptionsListenResult, TaskObject, TaskRequestParams,
-    ToolDefinition, notifications,
+    ToolDefinition, UpdateTaskParams, notifications,
 };
 use response_cache::{CacheLookup, ClientResponseCache};
 use tower_mcp_types::JsonRpcError;
@@ -893,6 +893,36 @@ impl McpClient {
             meta: None,
         };
         let _ack: serde_json::Value = self.send_request("tasks/cancel", &params).await?;
+        Ok(())
+    }
+
+    /// Answer a task's outstanding input requests via `tasks/update`
+    /// (SEP-2663).
+    ///
+    /// Responses are matched to outstanding requests by key. Read the keys
+    /// from the `inputRequests` of an `input_required` task returned by
+    /// [`task_get`](Self::task_get).
+    ///
+    /// A partial map is valid and expected: requests left unanswered stay
+    /// outstanding and the task remains `input_required` until every one is
+    /// answered. Keys the server does not currently have outstanding, whether
+    /// unknown, already answered, or superseded by a later request, are
+    /// ignored rather than rejected, so replaying a stale update is safe.
+    ///
+    /// The acknowledgment carries no data and is discarded. Poll
+    /// [`task_get`](Self::task_get) to observe the resulting state.
+    pub async fn task_update(&self, task_id: &str, input_responses: InputResponses) -> Result<()> {
+        self.ensure_initialized()?;
+        let input_responses = input_responses
+            .into_iter()
+            .map(|(key, response)| serde_json::to_value(response).map(|value| (key, value)))
+            .collect::<std::result::Result<_, _>>()?;
+        let params = UpdateTaskParams {
+            task_id: task_id.to_string(),
+            input_responses,
+            meta: None,
+        };
+        let _ack: serde_json::Value = self.send_request("tasks/update", &params).await?;
         Ok(())
     }
 

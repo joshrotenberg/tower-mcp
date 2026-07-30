@@ -134,3 +134,72 @@ async fn task_get_unknown_id_errors() {
         .expect_err("unknown task id must error");
     assert!(err.to_string().contains("not found"), "got: {err}");
 }
+
+/// `task_update` answers outstanding requests and tolerates stale keys.
+///
+/// The store ignores any key it does not currently have outstanding, so a
+/// client replaying an update must not fail the task.
+#[tokio::test]
+async fn task_update_sends_typed_responses_and_tolerates_stale_keys() {
+    use tower_mcp::protocol::{ElicitAction, ElicitResult, InputResponse, InputResponses};
+
+    let client = McpClient::connect(ChannelTransport::new(task_router()))
+        .await
+        .expect("connect");
+    client
+        .initialize("test", "1.0.0")
+        .await
+        .expect("initialize");
+
+    let created = client
+        .call_tool_as_task("compute", serde_json::json!({}), None)
+        .await
+        .expect("task-augmented call");
+
+    let mut responses = InputResponses::new();
+    responses.insert(
+        "approval".to_string(),
+        InputResponse::Elicit(ElicitResult {
+            action: ElicitAction::Accept,
+            content: None,
+            meta: None,
+        }),
+    );
+
+    // Nothing is outstanding on this task, so every key is ignorable. The
+    // call must still succeed: ignoring is the specified behavior, not an
+    // error condition.
+    client
+        .task_update(&created.task.task_id, responses.clone())
+        .await
+        .expect("tasks/update with no outstanding requests must be accepted");
+
+    // Replaying the same update is equally safe.
+    client
+        .task_update(&created.task.task_id, responses)
+        .await
+        .expect("replayed tasks/update must be accepted");
+
+    // An empty map is a valid no-op.
+    client
+        .task_update(&created.task.task_id, InputResponses::new())
+        .await
+        .expect("empty tasks/update must be accepted");
+
+    // The task was not disturbed by any of it.
+    let done = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.task_wait(&created.task.task_id),
+    )
+    .await
+    .expect("task_wait timed out")
+    .expect("task_wait");
+    assert_eq!(done.status, TaskStatus::Completed);
+
+    // Unknown task ids error rather than silently succeeding.
+    let err = client
+        .task_update("task-does-not-exist", InputResponses::new())
+        .await
+        .expect_err("unknown task id must error");
+    assert!(err.to_string().contains("not found"), "got: {err}");
+}
