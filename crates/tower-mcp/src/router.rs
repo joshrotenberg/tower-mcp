@@ -83,6 +83,22 @@ fn is_final_protocol_request(_extensions: &crate::context::Extensions) -> bool {
     false
 }
 
+#[cfg(feature = "stateless")]
+fn final_client_capabilities(
+    extensions: &crate::context::Extensions,
+) -> Option<&ClientCapabilities> {
+    extensions
+        .get::<crate::stateless::StatelessRequestMeta>()
+        .and_then(|meta| meta.client_capabilities.as_ref())
+}
+
+#[cfg(not(feature = "stateless"))]
+fn final_client_capabilities(
+    _extensions: &crate::context::Extensions,
+) -> Option<&ClientCapabilities> {
+    None
+}
+
 /// Return whether `actual` contains every field and value in `required`.
 ///
 /// Client capability objects are extensible, so extra advertised properties
@@ -351,6 +367,8 @@ struct McpRouterInner {
     prompt_filter: Option<PromptFilter>,
     /// Router-level extensions (for state and middleware data)
     extensions: Arc<crate::context::Extensions>,
+    /// Locally supported MCP protocol extensions and their server settings.
+    protocol_extensions: HashMap<String, serde_json::Value>,
     /// Minimum log level for filtering outgoing log notifications (set by client via logging/setLevel)
     min_log_level: Arc<RwLock<LogLevel>>,
     /// Page size for list method pagination (None = return all results)
@@ -499,6 +517,7 @@ impl McpRouter {
                 task_store: Arc::new(MemoryTaskStore::new()),
                 subscriptions: Arc::new(RwLock::new(HashSet::new())),
                 extensions: Arc::new(crate::context::Extensions::new()),
+                protocol_extensions: HashMap::new(),
                 completion_handler: None,
                 tool_filter: None,
                 resource_filter: None,
@@ -844,6 +863,20 @@ impl McpRouter {
         self.with_state(value)
     }
 
+    /// Advertise one validated MCP protocol extension.
+    ///
+    /// This is separate from [`with_extension`](Self::with_extension), which
+    /// stores process-local Rust values for handlers. Protocol extensions are
+    /// advertised on the wire and become active only when the client declares
+    /// the same identifier.
+    pub fn with_protocol_extension(mut self, extension: crate::ExtensionDeclaration) -> Self {
+        let (identifier, settings) = extension.into_parts();
+        Arc::make_mut(&mut self.inner)
+            .protocol_extensions
+            .insert(identifier, settings);
+        self
+    }
+
     /// Get the router's extensions.
     pub fn extensions(&self) -> &crate::context::Extensions {
         &self.inner.extensions
@@ -892,6 +925,23 @@ impl McpRouter {
         // visible; per-request meta (SEP-2575) is now reachable too.
         let mut merged = (*self.inner.extensions).clone();
         merged.merge(per_request);
+        let negotiated_extensions = if is_final_protocol_request(per_request) {
+            let server_capabilities = self
+                .capabilities_for_protocol(Some(crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION));
+            final_client_capabilities(per_request)
+                .map(|client_capabilities| {
+                    crate::NegotiatedExtensions::from_capabilities(
+                        client_capabilities,
+                        &server_capabilities,
+                    )
+                })
+                .unwrap_or_default()
+        } else {
+            self.session
+                .get::<crate::NegotiatedExtensions>()
+                .unwrap_or_default()
+        };
+        merged.insert(negotiated_extensions);
 
         // The final protocol does not permit servers to initiate JSON-RPC
         // requests. Legacy transports may provide a requester scoped to the
@@ -1432,6 +1482,13 @@ impl McpRouter {
             inner.prompts.insert(name.clone(), prompt.clone());
         }
 
+        // Merge protocol extension declarations (last wins).
+        for (identifier, settings) in &other_inner.protocol_extensions {
+            inner
+                .protocol_extensions
+                .insert(identifier.clone(), settings.clone());
+        }
+
         self
     }
 
@@ -1500,6 +1557,14 @@ impl McpRouter {
         // Merge prompts (no prefix - could be added in future if needed)
         for (name, prompt) in &other_inner.prompts {
             inner.prompts.insert(name.clone(), prompt.clone());
+        }
+
+        // Protocol extensions are server-wide declarations and are not
+        // namespace-prefixed. Nested declarations use last-write-wins.
+        for (identifier, settings) in &other_inner.protocol_extensions {
+            inner
+                .protocol_extensions
+                .insert(identifier.clone(), settings.clone());
         }
 
         self
@@ -2003,21 +2068,19 @@ impl McpRouter {
             },
             experimental: None,
             extensions: {
+                let mut map = self.inner.protocol_extensions.clone();
                 let has_task_support = self
                     .inner
                     .tools
                     .values()
                     .any(|t| !matches!(t.task_support, TaskSupportMode::Forbidden));
                 if has_task_support {
-                    let mut map = std::collections::HashMap::new();
                     map.insert(
                         tower_mcp_types::protocol::TASKS_EXTENSION_ID.to_string(),
                         serde_json::json!({}),
                     );
-                    Some(map)
-                } else {
-                    None
                 }
+                (!map.is_empty()).then_some(map)
             },
         }
     }
@@ -2130,6 +2193,12 @@ impl McpRouter {
                 // Transition session state to Initializing
                 self.session.mark_initializing();
                 let capabilities = self.capabilities_for_protocol(Some(&protocol_version));
+                self.session.insert(params.capabilities.clone());
+                self.session
+                    .insert(crate::NegotiatedExtensions::from_capabilities(
+                        &params.capabilities,
+                        &capabilities,
+                    ));
 
                 Ok(McpResponse::Initialize(InitializeResult {
                     protocol_version,
@@ -3397,6 +3466,111 @@ mod tests {
             ..Default::default()
         });
         extensions
+    }
+
+    #[test]
+    fn router_advertises_only_locally_declared_protocol_extensions() {
+        let router = McpRouter::new().with_protocol_extension(
+            crate::ExtensionDeclaration::new(
+                "com.example/rendering",
+                serde_json::json!({"formats": ["html"]}),
+            )
+            .unwrap(),
+        );
+
+        let stable = router.capabilities();
+        let final_capabilities =
+            router.capabilities_for_protocol(Some(crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION));
+        for capabilities in [stable, final_capabilities] {
+            let extensions = capabilities.extensions.unwrap();
+            assert_eq!(extensions.len(), 1);
+            assert_eq!(extensions["com.example/rendering"]["formats"][0], "html");
+            assert!(!extensions.contains_key("com.example/client-only"));
+        }
+    }
+
+    #[tokio::test]
+    async fn initialize_persists_negotiated_extensions_for_legacy_contexts() {
+        let router = McpRouter::new().with_protocol_extension(
+            crate::ExtensionDeclaration::new(
+                "com.example/shared",
+                serde_json::json!({"server": true}),
+            )
+            .unwrap(),
+        );
+        let client_capabilities = ClientCapabilities {
+            extensions: Some(HashMap::from([
+                (
+                    "com.example/shared".to_string(),
+                    serde_json::json!({"client": true}),
+                ),
+                ("com.example/client-only".to_string(), serde_json::json!({})),
+            ])),
+            ..ClientCapabilities::default()
+        };
+
+        router
+            .handle(
+                RequestId::Number(1),
+                McpRequest::Initialize(InitializeParams {
+                    protocol_version: crate::protocol::LATEST_PROTOCOL_VERSION.to_string(),
+                    capabilities: client_capabilities,
+                    client_info: Implementation {
+                        name: "extension-test".to_string(),
+                        version: "1.0.0".to_string(),
+                        title: None,
+                        description: None,
+                        icons: None,
+                        website_url: None,
+                        meta: None,
+                    },
+                    meta: None,
+                }),
+                Extensions::new(),
+            )
+            .await
+            .unwrap();
+
+        let context = router.create_context(RequestId::Number(2), None);
+        let negotiated = context.negotiated_extensions().unwrap();
+        assert!(negotiated.contains("com.example/shared"));
+        assert!(!negotiated.contains("com.example/client-only"));
+    }
+
+    #[cfg(feature = "stateless")]
+    #[test]
+    fn final_request_context_exposes_only_negotiated_extensions() {
+        let router = McpRouter::new().with_protocol_extension(
+            crate::ExtensionDeclaration::new(
+                "com.example/shared",
+                serde_json::json!({"server": true}),
+            )
+            .unwrap(),
+        );
+        let per_request = final_extensions(ClientCapabilities {
+            extensions: Some(HashMap::from([
+                (
+                    "com.example/shared".to_string(),
+                    serde_json::json!({"client": true}),
+                ),
+                ("com.example/client-only".to_string(), serde_json::json!({})),
+            ])),
+            ..ClientCapabilities::default()
+        });
+
+        let context =
+            router.create_context_with_extensions(RequestId::Number(1), None, &per_request);
+        let negotiated = context.negotiated_extensions().unwrap();
+
+        assert_eq!(negotiated.len(), 1);
+        assert_eq!(
+            negotiated
+                .get("com.example/shared")
+                .unwrap()
+                .client_settings()["client"],
+            true
+        );
+        assert!(!negotiated.contains("com.example/client-only"));
     }
 
     #[cfg(feature = "stateless")]

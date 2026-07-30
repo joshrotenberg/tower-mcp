@@ -480,6 +480,14 @@ impl RequestContext {
         self.extensions.get::<T>()
     }
 
+    /// Protocol extensions declared by both the client and server.
+    ///
+    /// Unknown or one-sided declarations are not included. The returned view
+    /// preserves each peer's settings object for extension-specific policy.
+    pub fn negotiated_extensions(&self) -> Option<&crate::NegotiatedExtensions> {
+        self.extension()
+    }
+
     /// Get a mutable reference to the extensions.
     ///
     /// This allows middleware to insert data that handlers can access via

@@ -379,6 +379,19 @@ impl McpClientBuilder {
         self
     }
 
+    /// Add one validated MCP protocol-extension declaration.
+    ///
+    /// Repeated declarations for the same identifier use last-write-wins
+    /// semantics. Other configured capabilities are preserved.
+    pub fn with_protocol_extension(mut self, extension: crate::ExtensionDeclaration) -> Self {
+        let (identifier, settings) = extension.into_parts();
+        self.capabilities
+            .extensions
+            .get_or_insert_default()
+            .insert(identifier, settings);
+        self
+    }
+
     /// Set the exact ordered protocol versions enabled for this client.
     ///
     /// The default is [`ProtocolSupport::stable`], even when the experimental
@@ -3584,6 +3597,25 @@ mod tests {
     fn test_builder_with_elicitation() {
         let builder = McpClientBuilder::new().with_elicitation();
         assert!(builder.capabilities.elicitation.is_some());
+    }
+
+    #[test]
+    fn builder_adds_protocol_extension_without_replacing_other_capabilities() {
+        let extension = crate::ExtensionDeclaration::new(
+            "com.example/rendering",
+            serde_json::json!({"formats": ["html"]}),
+        )
+        .unwrap();
+        let builder = McpClientBuilder::new()
+            .with_sampling()
+            .with_protocol_extension(extension);
+
+        assert!(builder.capabilities.sampling.is_some());
+        assert_eq!(
+            builder.capabilities.extensions.as_ref().unwrap()["com.example/rendering"]["formats"]
+                [0],
+            "html"
+        );
     }
 
     #[test]

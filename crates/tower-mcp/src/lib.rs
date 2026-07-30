@@ -464,6 +464,7 @@ pub mod deployment;
 pub mod error;
 #[cfg(any(feature = "http", feature = "websocket"))]
 pub mod event_store;
+pub mod extension;
 pub mod extract;
 pub mod filter;
 pub mod jsonrpc;
@@ -539,6 +540,7 @@ pub use context::{
     outgoing_request_channel,
 };
 pub use error::{BoxError, Error, Result, ResultExt, ToolError};
+pub use extension::{ExtensionDeclaration, NegotiatedExtension, NegotiatedExtensions};
 pub use filter::{
     CapabilityFilter, DenialBehavior, Filterable, PromptFilter, ResourceFilter, ToolFilter,
 };
