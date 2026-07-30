@@ -5,8 +5,9 @@
 - **Version**: 0.14.x
 - **Spec version**: 2025-11-25 by default (plus the released 2026-07-28 protocol as an experimental implementation behind `protocol-2026-07-28`)
 - **Server conformance (2025-11-25)**: 39/39
-- **Client conformance (2025-11-25)**: 295/295 (empty baseline)
+- **Client conformance (2025-11-25)**: 311/311 (empty baseline)
 - **Server conformance (2026-07-28)**: 114/114 (empty baseline)
+- **Client conformance (2026-07-28)**: 399/399 (empty baseline)
 - **MSRV**: 1.90 (Rust 2024 edition)
 
 ## SDK Tier Assessment
@@ -16,7 +17,7 @@ tower-mcp targets Tier 2 per the [MCP SDK Tiering System](https://modelcontextpr
 | # | Requirement | Status |
 |---|-------------|--------|
 | 1 | Server conformance >= 80% | 100% (39/39) |
-| 2 | Client conformance >= 80% | 295/295 |
+| 2 | Client conformance >= 80% | 311/311 stable; 399/399 final |
 | 3 | Issue triage within 1 month | Active |
 | 4 | P0 resolution within 2 weeks | 0 open |
 | 5 | Stable release >= 1.0.0 | 0.14.x -- pre-1.0 |
@@ -55,6 +56,7 @@ Implemented final-revision areas include:
 - Multi Round-Trip Requests (MRTR) and result discriminators
 - `subscriptions/listen`, cache hints, and strict MCP HTTP headers
 - Final client lifecycle, subscriptions, authorization conformance, and schema recovery
+- Reusable OAuth registration, bounded scope escalation, and issuer-keyed credential persistence
 - Compile-time/runtime protocol selection across HTTP, STDIO, WebSocket, Unix-over-HTTP, and JSON-RPC services
 - Extension-key validation and safe withholding of incomplete Tasks advertisement
 
@@ -75,8 +77,7 @@ Open SEPs are tracked automatically via `.github/workflows/sep-sync.yml` and lab
 ## Future Directions
 
 - **1.0.0 stable release**: API freeze and stability guarantees
-- **Promotion of 2026-07-28**: close the remaining transport, MRTR, auth, Tasks, and extension gates in #929.
+- **Promotion of 2026-07-28**: close the remaining transport, MRTR, Tasks, and extension gates in #929.
 - **Tasks extension**: complete input-required task state, notifications, expiry, and client update APIs (#951).
-- **Reusable authorization APIs**: expose DCR/CIMD, scope step-up, and issuer-keyed credential persistence (#953).
 - **MCP Apps and extension lifecycle**: audit and implement an opt-in, security-bounded surface (#1060).
 - **SEP-1763 interceptors**: tower middleware maps naturally to this proposal.
