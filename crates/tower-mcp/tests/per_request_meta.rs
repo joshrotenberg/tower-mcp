@@ -52,11 +52,11 @@ async fn call_tool(body: serde_json::Value) -> (serde_json::Value, Captured) {
         .header("Content-Type", "application/json")
         .header("Accept", "application/json");
     if body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"]
-        == tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION
+        == tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28
     {
         request = request.header(
             "Mcp-Protocol-Version",
-            tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION,
+            tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28,
         );
         request = request
             .header("Mcp-Method", "tools/call")

@@ -236,7 +236,7 @@ async fn stdio_supports_final_and_legacy_lifecycles_on_one_stream() {
             .await
     });
 
-    let final_version = tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION;
+    let final_version = tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28;
     let requests = vec![
         serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "server/discover",
@@ -333,7 +333,7 @@ async fn stdio_runtime_protocol_allow_list_is_exact() {
     let request = serde_json::json!({
         "jsonrpc": "2.0", "id": 1, "method": "server/discover",
         "params": {
-            "_meta": final_meta(tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION)
+            "_meta": final_meta(tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28)
         }
     });
     let mut stdin_writer = server_stdin_writer;
@@ -351,14 +351,14 @@ async fn stdio_runtime_protocol_allow_list_is_exact() {
     assert_eq!(frames[0]["error"]["code"], -32022);
     assert_eq!(
         frames[0]["error"]["data"]["requested"],
-        tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION
+        tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28
     );
     assert!(
         frames[0]["error"]["data"]["supported"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|version| version != tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION)
+            .all(|version| version != tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28)
     );
 }
 
@@ -396,7 +396,7 @@ async fn stdio_multiplexes_and_gracefully_closes_final_subscriptions() {
     });
     let mut writer = server_stdin_writer;
     let mut reader = BufReader::new(server_stdout_reader);
-    let version = tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION;
+    let version = tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28;
 
     let tools_listen = serde_json::json!({
         "jsonrpc": "2.0",
@@ -636,7 +636,7 @@ async fn stdio_subscription_validation_uses_runtime_protocol_policy() {
         "id": 9,
         "method": "subscriptions/listen",
         "params": {
-            "_meta": final_meta(tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION),
+            "_meta": final_meta(tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28),
             "notifications": {"toolsListChanged": true}
         }
     });
@@ -655,7 +655,7 @@ async fn stdio_subscription_validation_uses_runtime_protocol_policy() {
     assert_eq!(frames[0]["error"]["code"], -32022);
     assert_eq!(
         frames[0]["error"]["data"]["requested"],
-        tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION
+        tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28
     );
 }
 
@@ -670,7 +670,7 @@ async fn stdio_subscription_requires_final_metadata_and_filter() {
             .run_with_streams(server_stdin, server_stdout)
             .await
     });
-    let version = tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION;
+    let version = tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28;
     let missing_filter = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 10,
@@ -738,7 +738,7 @@ async fn middleware_wrapped_stdio_preserves_subscription_routing() {
         "id": "layered",
         "method": "subscriptions/listen",
         "params": {
-            "_meta": final_meta(tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION),
+            "_meta": final_meta(tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28),
             "notifications": {"toolsListChanged": true}
         }
     });
@@ -793,7 +793,7 @@ async fn bidi_stdio_preserves_subscription_routing() {
         "id": 71,
         "method": "subscriptions/listen",
         "params": {
-            "_meta": final_meta(tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION),
+            "_meta": final_meta(tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28),
             "notifications": {"toolsListChanged": true}
         }
     });
@@ -846,7 +846,7 @@ async fn bidi_final_handlers_cannot_initiate_client_requests() {
         "params": {
             "name": "inspect_meta",
             "arguments": {},
-            "_meta": final_meta(tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION)
+            "_meta": final_meta(tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28)
         }
     });
     let mut stdin_writer = server_stdin_writer;

@@ -118,7 +118,7 @@ use tower_mcp::schemars::JsonSchema;
 | `macros` | Optional proc macros (`#[tool_fn]`, `#[prompt_fn]`, `#[resource_fn]`, `#[resource_template_fn]`) |
 | `resilience` | Re-export tower-resilience circuit breaker, rate limiter, and bulkhead layers |
 | `mcp-apps` | Typed, security-bounded server support for the stable MCP Apps extension. Runtime advertisement remains explicit via `McpRouter::with_mcp_apps()`. |
-| `protocol-2026-07-28` | Compile the experimental implementation of the released 2026-07-28 protocol. Use `ProtocolSupport` to narrow the exact versions enabled by a server at runtime. |
+| `protocol-2026-07-28` | Compile the released 2026-07-28 protocol implementation. Use `ProtocolSupport` to narrow the exact versions enabled by a client or server at runtime. |
 | `stateless` | Compatibility alias for the former 2026 protocol feature name. New integrations should use `protocol-2026-07-28`. |
 
 Example with features:
@@ -594,12 +594,20 @@ tower-mcp targets the [MCP specification 2025-11-25](https://modelcontextprotoco
 
 Because the suite is upstream-maintained and grows with the spec, these counts shift as new scenarios are added -- treat the green CI badge as the source of truth, not any single snapshot. The empty baselines make any new failure immediately visible.
 
-The `protocol-2026-07-28` feature enables the experimental implementation of the released
-2026-07-28 protocol (version-gated, behind
+The `protocol-2026-07-28` feature enables the released, opt-in 2026-07-28
+protocol implementation (version-gated, behind
 `MCP-Protocol-Version: 2026-07-28`) covering `server/discover`, `subscriptions/listen`, per-request
 `_meta` capabilities, and SEP-2322 Multi Round-Trip Requests. It is not enabled by default and is
-not yet included in `SUPPORTED_PROTOCOL_VERSIONS`; compile-time availability and per-transport
+intentionally not included in `SUPPORTED_PROTOCOL_VERSIONS`; compile-time availability and per-transport
 runtime enablement are reported separately.
+
+`PROTOCOL_VERSION_2026_07_28` is the canonical constant for the released wire
+revision. The former status-bearing names `EXPERIMENTAL_PROTOCOL_VERSION` and
+`UPCOMING_PROTOCOL_VERSION` remain deprecated aliases. `LATEST_PROTOCOL_VERSION`
+and `SUPPORTED_PROTOCOL_VERSIONS` continue to describe the non-breaking default
+compatibility set, not every published protocol. Use
+`COMPILED_PROTOCOL_VERSIONS` and `ProtocolSupport` to inspect and select the
+implementations available to a particular build and runtime.
 
 Clients opt in independently at runtime, then use the discover-based lifecycle.
 Every later request receives the required `_meta`, HTTP headers are generated

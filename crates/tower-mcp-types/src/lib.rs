@@ -15,14 +15,13 @@
 //!
 //! # Stateless protocol support (2026-07-28)
 //!
-//! This crate also tracks the experimental implementation of protocol version
-//! `2026-07-28`, which adds
+//! This crate also represents the released `2026-07-28` protocol, which adds
 //! stateless operation, per-request `_meta`, and the `server/discover` RPC.
 //! Key items:
 //!
-//! - [`protocol::EXPERIMENTAL_PROTOCOL_VERSION`] -- the `"2026-07-28"` wire
-//!   version, not yet enabled by default. Useful for codegen tools and
-//!   conformance harnesses that need to reference it explicitly.
+//! - [`protocol::PROTOCOL_VERSION_2026_07_28`] -- the canonical
+//!   `"2026-07-28"` wire-version constant. Runtime enablement is a separate
+//!   concern in the parent `tower-mcp` crate.
 //! - [`protocol::KNOWN_PROTOCOL_VERSIONS`] -- every version whose wire format
 //!   is represented here, independent of runtime compile-time features.
 //! - [`protocol::DiscoverResult`] / [`protocol::DiscoverParams`] -- types for

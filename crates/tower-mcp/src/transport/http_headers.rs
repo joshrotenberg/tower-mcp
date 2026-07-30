@@ -80,9 +80,9 @@ pub(super) enum Sep2243Mode {
 ///
 /// Returns [`Sep2243Mode::Strict`] for the explicitly implemented 2026-07-28
 /// protocol, [`Sep2243Mode::Lenient`] otherwise. Unsupported future versions
-/// must not silently inherit experimental behavior based on date ordering.
+/// must not silently inherit revision-specific behavior based on date ordering.
 pub(super) fn mode_for_version(version: &str) -> Sep2243Mode {
-    if version == crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION {
+    if version == crate::protocol::PROTOCOL_VERSION_2026_07_28 {
         Sep2243Mode::Strict
     } else {
         Sep2243Mode::Lenient

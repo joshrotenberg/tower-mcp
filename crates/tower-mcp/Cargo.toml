@@ -77,8 +77,8 @@ macros = ["dep:tower-mcp-macros"]
 # Enabling the API does not advertise or activate the extension; applications
 # must still call `McpRouter::with_mcp_apps`.
 mcp-apps = ["dep:url"]
-# Compile the experimental MCP 2026-07-28 implementation. Runtime transports
-# may narrow the compiled set with ProtocolSupport.
+# Compile the released MCP 2026-07-28 implementation. Runtime clients and
+# servers may narrow the compiled set with ProtocolSupport.
 protocol-2026-07-28 = ["stateless"]
 # Compatibility alias for the former feature name. New consumers should enable
 # `protocol-2026-07-28`; existing `stateless` users retain the same behavior.

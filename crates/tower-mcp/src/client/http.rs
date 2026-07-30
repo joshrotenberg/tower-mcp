@@ -654,8 +654,7 @@ impl HttpClientTransport {
     }
 
     fn normalize_incoming_message(&mut self, message: String) -> String {
-        if self.protocol_version.as_deref() != Some(crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION)
-        {
+        if self.protocol_version.as_deref() != Some(crate::protocol::PROTOCOL_VERSION_2026_07_28) {
             return message;
         }
         let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(&message) else {
@@ -1068,7 +1067,7 @@ impl ClientTransport for HttpClientTransport {
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
         let is_modern_request =
-            outbound_version.as_deref() == Some(crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION);
+            outbound_version.as_deref() == Some(crate::protocol::PROTOCOL_VERSION_2026_07_28);
         if is_modern_request {
             self.protocol_version = outbound_version.clone();
             // Final requests are sessionless even when a transitional peer
@@ -2444,8 +2443,7 @@ mod tests {
     #[test]
     fn sep_2243_filters_invalid_tools_and_caches_valid_mappings() {
         let mut transport = HttpClientTransport::new("http://localhost:3000");
-        transport.protocol_version =
-            Some(crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION.to_string());
+        transport.protocol_version = Some(crate::protocol::PROTOCOL_VERSION_2026_07_28.to_string());
         let normalized = transport.normalize_incoming_message(
             serde_json::json!({
                 "jsonrpc": "2.0",

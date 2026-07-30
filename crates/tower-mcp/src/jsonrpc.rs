@@ -498,7 +498,7 @@ fn prepare_modern_request(
             protocol_support.versions().iter().map(String::as_str),
         ));
     }
-    if protocol_version == crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION
+    if protocol_version == crate::protocol::PROTOCOL_VERSION_2026_07_28
         && is_removed_modern_method(&req.method)
     {
         return Err(JsonRpcError::method_not_found(&req.method));
@@ -533,7 +533,7 @@ pub(crate) fn apply_protocol_result_fields(
     method: &str,
     protocol_version: &str,
 ) {
-    if protocol_version != crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION {
+    if protocol_version != crate::protocol::PROTOCOL_VERSION_2026_07_28 {
         return;
     }
 
@@ -664,7 +664,7 @@ mod tests {
         let final_request = JsonRpcRequest::new(1, "tools/list").with_params(serde_json::json!({
             "_meta": {
                 "io.modelcontextprotocol/protocolVersion":
-                    crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION,
+                    crate::protocol::PROTOCOL_VERSION_2026_07_28,
                 "io.modelcontextprotocol/clientCapabilities": {}
             }
         }));
@@ -694,7 +694,7 @@ mod tests {
         let request = JsonRpcRequest::new(1, "server/discover").with_params(serde_json::json!({
             "_meta": {
                 "io.modelcontextprotocol/protocolVersion":
-                    crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION
+                    crate::protocol::PROTOCOL_VERSION_2026_07_28
             }
         }));
 
@@ -711,7 +711,7 @@ mod tests {
     async fn final_only_policy_never_negotiates_final_via_initialize() {
         let router = create_test_router();
         let mut service = JsonRpcService::new(router).protocol_support(
-            ProtocolSupport::try_new([crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION]).unwrap(),
+            ProtocolSupport::try_new([crate::protocol::PROTOCOL_VERSION_2026_07_28]).unwrap(),
         );
         let request = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
             "protocolVersion": "2025-11-25",
@@ -726,7 +726,7 @@ mod tests {
         assert_eq!(response.error.code, -32022);
         assert_eq!(
             response.error.data.unwrap()["supported"],
-            serde_json::json!([crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION])
+            serde_json::json!([crate::protocol::PROTOCOL_VERSION_2026_07_28])
         );
     }
 

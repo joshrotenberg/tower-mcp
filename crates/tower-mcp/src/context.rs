@@ -715,7 +715,7 @@ impl RequestContext {
         #[cfg(feature = "stateless")]
         if let Some(meta) = self.per_request_meta()
             && meta.protocol_version.as_deref()
-                == Some(crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION)
+                == Some(crate::protocol::PROTOCOL_VERSION_2026_07_28)
         {
             let Some(request_level) = meta.log_level else {
                 return;
@@ -1419,7 +1419,7 @@ mod tests {
         let (tx, mut rx) = notification_channel(10);
         let mut extensions = Extensions::new();
         extensions.insert(crate::stateless::StatelessRequestMeta {
-            protocol_version: Some(crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION.to_string()),
+            protocol_version: Some(crate::protocol::PROTOCOL_VERSION_2026_07_28.to_string()),
             client_capabilities: Some(Default::default()),
             ..Default::default()
         });
@@ -1437,7 +1437,7 @@ mod tests {
 
         let mut extensions = Extensions::new();
         extensions.insert(crate::stateless::StatelessRequestMeta {
-            protocol_version: Some(crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION.to_string()),
+            protocol_version: Some(crate::protocol::PROTOCOL_VERSION_2026_07_28.to_string()),
             client_capabilities: Some(Default::default()),
             log_level: Some(crate::stateless::LogLevel::Warning),
             ..Default::default()

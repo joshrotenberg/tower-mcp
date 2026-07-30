@@ -274,8 +274,8 @@ use crate::error::{Error, JsonRpcError, Result};
 use crate::error::{ErrorCode, McpErrorCode};
 use crate::jsonrpc::{JsonRpcService, apply_protocol_result_fields};
 use crate::protocol::{
-    ClientCapabilities, EXPERIMENTAL_PROTOCOL_VERSION, Implementation, JsonRpcNotification,
-    JsonRpcRequest, JsonRpcResponse, LATEST_PROTOCOL_VERSION, McpNotification, RequestId,
+    ClientCapabilities, Implementation, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
+    LATEST_PROTOCOL_VERSION, McpNotification, PROTOCOL_VERSION_2026_07_28, RequestId,
 };
 #[cfg(feature = "stateless")]
 use crate::protocol::{SubscriptionFilter, SubscriptionsListenParams};
@@ -2592,7 +2592,7 @@ fn request_tool_input_schema(
 /// envelope receives the specified modern error instead of drifting into the
 /// legacy session path.
 fn claims_modern_protocol(headers: &HeaderMap, parsed: &serde_json::Value) -> bool {
-    get_protocol_version(headers).as_deref() == Some(EXPERIMENTAL_PROTOCOL_VERSION)
+    get_protocol_version(headers).as_deref() == Some(PROTOCOL_VERSION_2026_07_28)
         || parsed
             .get("params")
             .and_then(serde_json::Value::as_object)
@@ -3566,11 +3566,9 @@ async fn handle_post(
 
     let negotiated_version = session.protocol_version.read().await.clone();
     let response_version = if request_method == "server/discover"
-        && state
-            .protocol_support
-            .contains(EXPERIMENTAL_PROTOCOL_VERSION)
+        && state.protocol_support.contains(PROTOCOL_VERSION_2026_07_28)
     {
-        EXPERIMENTAL_PROTOCOL_VERSION
+        PROTOCOL_VERSION_2026_07_28
     } else {
         &negotiated_version
     };
@@ -3765,7 +3763,7 @@ fn version_supports_subscriptions_listen(
     version: &str,
     protocol_support: &ProtocolSupport,
 ) -> bool {
-    version == EXPERIMENTAL_PROTOCOL_VERSION && protocol_support.contains(version)
+    version == PROTOCOL_VERSION_2026_07_28 && protocol_support.contains(version)
 }
 
 /// Returns `true` when the given protocol version string enables stateless
@@ -3773,10 +3771,10 @@ fn version_supports_subscriptions_listen(
 ///
 /// Stateless mode is introduced in the 2026-07-28 protocol (SEP-2575 /
 /// SEP-2567). Only the exact, compiled-and-enabled version opts in; unknown
-/// future dates must not silently inherit experimental behavior.
+/// future dates must not silently inherit revision-specific behavior.
 #[cfg(feature = "stateless")]
 fn is_stateless_protocol_version(version: &str) -> bool {
-    version == EXPERIMENTAL_PROTOCOL_VERSION
+    version == PROTOCOL_VERSION_2026_07_28
 }
 
 /// Stamp `_meta["io.modelcontextprotocol/serverInfo"]` onto a successful
@@ -4079,7 +4077,7 @@ async fn handle_modern_subscriptions_listen_sse(
         .into_response();
     response.headers_mut().insert(
         MCP_PROTOCOL_VERSION_HEADER,
-        HeaderValue::from_static(EXPERIMENTAL_PROTOCOL_VERSION),
+        HeaderValue::from_static(PROTOCOL_VERSION_2026_07_28),
     );
     response
 }
@@ -4392,7 +4390,7 @@ mod tests {
         ] {
             let mut response =
                 JsonRpcResponse::result(RequestId::Number(1), serde_json::json!({"value": true}));
-            apply_protocol_result_fields(&mut response, method, EXPERIMENTAL_PROTOCOL_VERSION);
+            apply_protocol_result_fields(&mut response, method, PROTOCOL_VERSION_2026_07_28);
             let json = serde_json::to_value(response).unwrap();
             assert_eq!(json["result"]["resultType"], "complete", "{method}");
             assert_eq!(json["result"]["ttlMs"], 0, "{method}");
@@ -4401,7 +4399,7 @@ mod tests {
 
         let mut ordinary =
             JsonRpcResponse::result(RequestId::Number(1), serde_json::json!({"content": []}));
-        apply_protocol_result_fields(&mut ordinary, "tools/call", EXPERIMENTAL_PROTOCOL_VERSION);
+        apply_protocol_result_fields(&mut ordinary, "tools/call", PROTOCOL_VERSION_2026_07_28);
         let json = serde_json::to_value(ordinary).unwrap();
         assert_eq!(json["result"]["resultType"], "complete");
         assert!(json["result"].get("ttlMs").is_none());
@@ -4416,11 +4414,7 @@ mod tests {
             "cacheScope": "public"
         });
         let mut response = JsonRpcResponse::result(RequestId::Number(1), explicit.clone());
-        apply_protocol_result_fields(
-            &mut response,
-            "resources/read",
-            EXPERIMENTAL_PROTOCOL_VERSION,
-        );
+        apply_protocol_result_fields(&mut response, "resources/read", PROTOCOL_VERSION_2026_07_28);
         let json = serde_json::to_value(response).unwrap();
         assert_eq!(json["result"]["ttlMs"], 42);
         assert_eq!(json["result"]["cacheScope"], "public");
@@ -4430,11 +4424,7 @@ mod tests {
                 RequestId::Number(1),
                 serde_json::json!({"resultType": discriminator}),
             );
-            apply_protocol_result_fields(
-                &mut response,
-                "tools/call",
-                EXPERIMENTAL_PROTOCOL_VERSION,
-            );
+            apply_protocol_result_fields(&mut response, "tools/call", PROTOCOL_VERSION_2026_07_28);
             let json = serde_json::to_value(response).unwrap();
             assert_eq!(json["result"]["resultType"], discriminator);
         }
@@ -4808,7 +4798,7 @@ mod tests {
         let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
         let app = transport.into_router();
 
-        // A future-looking unknown version must not enter the experimental
+        // A future-looking unknown version must not enter the 2026-07-28
         // stateless path merely because its date sorts after 2026-07-28.
         let req = Request::builder()
             .method("POST")
@@ -5269,7 +5259,7 @@ mod tests {
                 .method("POST")
                 .uri("/")
                 .header("Content-Type", "application/json")
-                .header(MCP_PROTOCOL_VERSION_HEADER, EXPERIMENTAL_PROTOCOL_VERSION)
+                .header(MCP_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION_2026_07_28)
                 .header(MCP_METHOD_HEADER, "tools/call")
                 .header(MCP_NAME_HEADER, "route");
             if let Some(value) = custom_header {
@@ -5286,7 +5276,7 @@ mod tests {
                             "arguments": {"tenant_id": "acme"},
                             "_meta": {
                                 "io.modelcontextprotocol/protocolVersion":
-                                    EXPERIMENTAL_PROTOCOL_VERSION,
+                                    PROTOCOL_VERSION_2026_07_28,
                                 "io.modelcontextprotocol/clientCapabilities": {}
                             }
                         }
@@ -7186,7 +7176,7 @@ mod tests {
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream")
             .header(MCP_METHOD_HEADER, "initialize")
-            .header(MCP_PROTOCOL_VERSION_HEADER, EXPERIMENTAL_PROTOCOL_VERSION)
+            .header(MCP_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION_2026_07_28)
             .body(Body::from(
                 serde_json::json!({
                     "jsonrpc": "2.0",
@@ -7232,7 +7222,7 @@ mod tests {
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
             .header(MCP_METHOD_HEADER, "server/discover")
-            .header(MCP_PROTOCOL_VERSION_HEADER, EXPERIMENTAL_PROTOCOL_VERSION)
+            .header(MCP_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION_2026_07_28)
             .body(Body::from(
                 serde_json::json!({
                     "jsonrpc": "2.0",
@@ -7265,7 +7255,7 @@ mod tests {
         let build_request =
             |id: i64, extra_meta: serde_json::Value, extensions: serde_json::Value| {
                 let mut meta = serde_json::json!({
-                    "io.modelcontextprotocol/protocolVersion": EXPERIMENTAL_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/protocolVersion": PROTOCOL_VERSION_2026_07_28,
                     "io.modelcontextprotocol/clientCapabilities": {
                         "extensions": extensions
                     }
@@ -7279,7 +7269,7 @@ mod tests {
                     .header("Content-Type", "application/json")
                     .header("Accept", "application/json")
                     .header(MCP_METHOD_HEADER, "server/discover")
-                    .header(MCP_PROTOCOL_VERSION_HEADER, EXPERIMENTAL_PROTOCOL_VERSION)
+                    .header(MCP_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION_2026_07_28)
                     .body(Body::from(
                         serde_json::json!({
                             "jsonrpc": "2.0",
@@ -7371,7 +7361,7 @@ mod tests {
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
             .header(MCP_METHOD_HEADER, "unknown/method")
-            .header(MCP_PROTOCOL_VERSION_HEADER, EXPERIMENTAL_PROTOCOL_VERSION)
+            .header(MCP_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION_2026_07_28)
             .body(Body::from(
                 serde_json::json!({
                     "jsonrpc": "2.0",
@@ -7411,7 +7401,7 @@ mod tests {
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
             .header(MCP_METHOD_HEADER, "tools/list")
-            .header(MCP_PROTOCOL_VERSION_HEADER, EXPERIMENTAL_PROTOCOL_VERSION)
+            .header(MCP_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION_2026_07_28)
             .header(MCP_SESSION_ID_HEADER, "legacy-session-that-does-not-exist")
             .header(LAST_EVENT_ID_HEADER, "legacy-event")
             .body(Body::from(
@@ -7468,7 +7458,7 @@ mod tests {
                 .header("Accept", "application/json")
                 .header(MCP_METHOD_HEADER, "tools/call")
                 .header(MCP_NAME_HEADER, "sample")
-                .header(MCP_PROTOCOL_VERSION_HEADER, EXPERIMENTAL_PROTOCOL_VERSION)
+                .header(MCP_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION_2026_07_28)
                 .body(Body::from(
                     serde_json::json!({
                         "jsonrpc": "2.0",

@@ -12,7 +12,7 @@ fn requested_protocol_version() -> String {
 }
 
 pub(crate) fn uses_final_protocol() -> bool {
-    requested_protocol_version() == tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION
+    requested_protocol_version() == tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28
 }
 
 pub(crate) fn client_builder() -> Result<McpClientBuilder> {

@@ -75,7 +75,7 @@ fn is_final_protocol_request(extensions: &crate::context::Extensions) -> bool {
     extensions
         .get::<crate::stateless::StatelessRequestMeta>()
         .and_then(|meta| meta.protocol_version.as_deref())
-        == Some(crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION)
+        == Some(crate::protocol::PROTOCOL_VERSION_2026_07_28)
 }
 
 #[cfg(not(feature = "stateless"))]
@@ -148,7 +148,7 @@ fn validate_input_required_result(
     let meta = extensions
         .get::<crate::stateless::StatelessRequestMeta>()
         .filter(|meta| {
-            meta.protocol_version.as_deref() == Some(crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION)
+            meta.protocol_version.as_deref() == Some(crate::protocol::PROTOCOL_VERSION_2026_07_28)
         })
         .ok_or_else(|| {
             Error::invalid_params(
@@ -926,8 +926,8 @@ impl McpRouter {
         let mut merged = (*self.inner.extensions).clone();
         merged.merge(per_request);
         let negotiated_extensions = if is_final_protocol_request(per_request) {
-            let server_capabilities = self
-                .capabilities_for_protocol(Some(crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION));
+            let server_capabilities =
+                self.capabilities_for_protocol(Some(crate::protocol::PROTOCOL_VERSION_2026_07_28));
             final_client_capabilities(per_request)
                 .map(|client_capabilities| {
                     crate::NegotiatedExtensions::from_capabilities(
@@ -2092,7 +2092,7 @@ impl McpRouter {
     /// advertise that partial implementation to 2026-07-28 clients.
     fn capabilities_for_protocol(&self, protocol_version: Option<&str>) -> ServerCapabilities {
         let mut capabilities = self.capabilities();
-        if protocol_version == Some(crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION) {
+        if protocol_version == Some(crate::protocol::PROTOCOL_VERSION_2026_07_28) {
             capabilities.tasks = None;
             if let Some(extensions) = capabilities.extensions.as_mut() {
                 extensions.remove(tower_mcp_types::protocol::TASKS_EXTENSION_ID);
@@ -2235,9 +2235,8 @@ impl McpRouter {
                 // stateless lifecycle, so its advertised surface must be safe
                 // even when this router is invoked directly without transport
                 // metadata.
-                let capabilities = self.capabilities_for_protocol(Some(
-                    crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION,
-                ));
+                let capabilities = self
+                    .capabilities_for_protocol(Some(crate::protocol::PROTOCOL_VERSION_2026_07_28));
                 Ok(McpResponse::Discover(DiscoverResult {
                     supported_versions,
                     capabilities,
@@ -2384,7 +2383,7 @@ impl McpRouter {
                 if let Some(required) = tool.required_client_capabilities()
                     && let Some(meta) = extensions.get::<crate::stateless::StatelessRequestMeta>()
                     && meta.protocol_version.as_deref()
-                        == Some(crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION)
+                        == Some(crate::protocol::PROTOCOL_VERSION_2026_07_28)
                     && !meta
                         .client_capabilities
                         .as_ref()
@@ -3461,7 +3460,7 @@ mod tests {
     fn final_extensions(client_capabilities: ClientCapabilities) -> Extensions {
         let mut extensions = Extensions::new();
         extensions.insert(crate::stateless::StatelessRequestMeta {
-            protocol_version: Some(EXPERIMENTAL_PROTOCOL_VERSION.to_string()),
+            protocol_version: Some(PROTOCOL_VERSION_2026_07_28.to_string()),
             client_capabilities: Some(client_capabilities),
             ..Default::default()
         });
@@ -3480,7 +3479,7 @@ mod tests {
 
         let stable = router.capabilities();
         let final_capabilities =
-            router.capabilities_for_protocol(Some(crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION));
+            router.capabilities_for_protocol(Some(crate::protocol::PROTOCOL_VERSION_2026_07_28));
         for capabilities in [stable, final_capabilities] {
             let extensions = capabilities.extensions.unwrap();
             assert_eq!(extensions.len(), 1);

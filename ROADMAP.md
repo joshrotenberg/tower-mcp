@@ -3,7 +3,7 @@
 ## Current Status
 
 - **Version**: 0.14.x
-- **Spec version**: 2025-11-25 by default (plus the released 2026-07-28 protocol as an experimental implementation behind `protocol-2026-07-28`)
+- **Spec version**: 2025-11-25 by default, plus the released 2026-07-28 protocol as an opt-in implementation behind `protocol-2026-07-28`
 - **Server conformance (2025-11-25)**: 39/39
 - **Client conformance (2025-11-25)**: 311/311 (empty baseline)
 - **Server conformance (2026-07-28)**: 114/114 (empty baseline)
@@ -46,9 +46,12 @@ All features from the 2025-11-25 spec are implemented, including:
 - Sampling (all transports)
 - Completion (autocomplete)
 
-The released 2026-07-28 revision is implemented behind the experimental
+The released 2026-07-28 revision is implemented behind the opt-in
 `protocol-2026-07-28` feature with an exact per-instance `ProtocolSupport`
-allow-list. The legacy 2025-era implementation remains the default.
+allow-list. `PROTOCOL_VERSION_2026_07_28` is the canonical wire-version
+constant; the former `EXPERIMENTAL_PROTOCOL_VERSION` and
+`UPCOMING_PROTOCOL_VERSION` names are deprecated compatibility aliases. The
+legacy 2025-era implementation remains the non-breaking default.
 
 Implemented final-revision areas include:
 
@@ -65,7 +68,7 @@ Implemented final-revision areas include:
 
 | SEP | Title | Status | Issue |
 |-----|-------|--------|-------|
-| 2575/2567 | Final stateless/sessionless MCP lifecycle | Implemented (experimental, `protocol-2026-07-28`) | #929, #1059 |
+| 2575/2567 | Final stateless/sessionless MCP lifecycle | Implemented (opt-in, `protocol-2026-07-28`) | #929, #1059 |
 | 2322 | Multi Round-Trip Requests (MRTR) | Implemented; policy/composition follow-ups remain | #950 |
 | 2549 | Cache hints and response caching | Implemented | #1047, #1053 |
 | 2243 | Standard/custom HTTP headers | Implemented | #1049, #1051 |
@@ -78,7 +81,7 @@ Open SEPs are tracked automatically via `.github/workflows/sep-sync.yml` and lab
 ## Future Directions
 
 - **1.0.0 stable release**: API freeze and stability guarantees
-- **Promotion of 2026-07-28**: close the remaining transport, MRTR, Tasks, and extension gates in #929.
+- **Default protocol transition**: keep 2025-11-25 as the non-breaking default while exposing released 2026-07-28 through explicit compile-time and runtime selection (#929).
 - **Tasks extension**: complete input-required task state, notifications, expiry, and client update APIs (#951).
 - **MCP Apps interoperability**: track and adopt upstream extension conformance scenarios as they land (#1060).
 - **SEP-1763 interceptors**: tower middleware maps naturally to this proposal.

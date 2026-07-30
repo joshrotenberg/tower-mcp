@@ -24,7 +24,7 @@
 //!
 //! No separate server process is needed -- the server is started in-process.
 //! The `protocol-2026-07-28` feature is required for the server and client to
-//! compile this experimental final-protocol implementation.
+//! compile this opt-in final-protocol implementation.
 
 use std::time::Duration;
 

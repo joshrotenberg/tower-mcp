@@ -216,33 +216,34 @@ pub const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 /// ```
 pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-03-26"];
 
-/// The released protocol version whose tower-mcp implementation is experimental.
+/// The released 2026-07-28 protocol version.
 ///
-/// Downstream tooling (code generators, conformance harnesses, and feature-gated
-/// runtimes) can reference the wire version without implying that the full
-/// implementation is enabled. Once the implementation passes its promotion
-/// gates, this value will move into
-/// [`SUPPORTED_PROTOCOL_VERSIONS`] and become the new
-/// [`LATEST_PROTOCOL_VERSION`].
-///
-/// See [tower-mcp#929] for the implementation and promotion checklist.
-///
-/// [tower-mcp#929]: https://github.com/joshrotenberg/tower-mcp/issues/929
-pub const EXPERIMENTAL_PROTOCOL_VERSION: &str = "2026-07-28";
+/// This date-specific constant describes the wire revision without implying
+/// compile-time or runtime enablement. In `tower-mcp`, compile the implementation
+/// with the `protocol-2026-07-28` feature and select it for a particular runtime
+/// with `ProtocolSupport`.
+pub const PROTOCOL_VERSION_2026_07_28: &str = "2026-07-28";
 
 /// All protocol versions understood by this types crate (newest first).
 ///
 /// "Known" means the crate can represent at least part of the version's wire
 /// format. It does not mean a runtime implementation was compiled or enabled.
 pub const KNOWN_PROTOCOL_VERSIONS: &[&str] =
-    &[EXPERIMENTAL_PROTOCOL_VERSION, "2025-11-25", "2025-03-26"];
+    &[PROTOCOL_VERSION_2026_07_28, "2025-11-25", "2025-03-26"];
 
-/// Deprecated alias for [`EXPERIMENTAL_PROTOCOL_VERSION`].
+/// Deprecated implementation-status name for [`PROTOCOL_VERSION_2026_07_28`].
 #[deprecated(
     since = "0.15.0",
-    note = "the 2026-07-28 spec has shipped; use EXPERIMENTAL_PROTOCOL_VERSION"
+    note = "the 2026-07-28 implementation is released and opt-in; use PROTOCOL_VERSION_2026_07_28"
 )]
-pub const UPCOMING_PROTOCOL_VERSION: &str = EXPERIMENTAL_PROTOCOL_VERSION;
+pub const EXPERIMENTAL_PROTOCOL_VERSION: &str = PROTOCOL_VERSION_2026_07_28;
+
+/// Deprecated alias for [`PROTOCOL_VERSION_2026_07_28`].
+#[deprecated(
+    since = "0.15.0",
+    note = "the 2026-07-28 spec has shipped; use PROTOCOL_VERSION_2026_07_28"
+)]
+pub const UPCOMING_PROTOCOL_VERSION: &str = PROTOCOL_VERSION_2026_07_28;
 
 /// JSON-RPC 2.0 request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -808,7 +809,7 @@ impl RequestMeta {
     /// `clientCapabilities` are required; earlier versions carry neither and
     /// always pass.
     pub fn validate_for_version(&self, protocol_version: &str) -> Result<(), MissingMetaKey> {
-        if protocol_version == EXPERIMENTAL_PROTOCOL_VERSION {
+        if protocol_version == PROTOCOL_VERSION_2026_07_28 {
             if self.protocol_version.is_none() {
                 return Err(MissingMetaKey("io.modelcontextprotocol/protocolVersion"));
             }
@@ -5216,7 +5217,7 @@ impl ResultType {
 /// explicitly implemented protocol versions opt in; an unknown future date
 /// must not silently inherit 2026 behavior.
 pub fn version_carries_result_type(protocol_version: &str) -> bool {
-    protocol_version == EXPERIMENTAL_PROTOCOL_VERSION
+    protocol_version == PROTOCOL_VERSION_2026_07_28
 }
 
 impl From<String> for ResultType {
@@ -5648,13 +5649,13 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn experimental_version_is_known_and_not_enabled_by_default() {
-        assert_eq!(EXPERIMENTAL_PROTOCOL_VERSION, "2026-07-28");
-        assert!(KNOWN_PROTOCOL_VERSIONS.contains(&EXPERIMENTAL_PROTOCOL_VERSION));
+    fn released_version_is_known_and_not_enabled_by_default() {
+        assert_eq!(PROTOCOL_VERSION_2026_07_28, "2026-07-28");
+        assert!(KNOWN_PROTOCOL_VERSIONS.contains(&PROTOCOL_VERSION_2026_07_28));
         assert!(
-            !SUPPORTED_PROTOCOL_VERSIONS.contains(&EXPERIMENTAL_PROTOCOL_VERSION),
-            "do not enable EXPERIMENTAL_PROTOCOL_VERSION by default until the \
-             #929 promotion gates pass; current: {:?}",
+            !SUPPORTED_PROTOCOL_VERSIONS.contains(&PROTOCOL_VERSION_2026_07_28),
+            "the released 2026-07-28 implementation remains explicitly \
+             compile-time/runtime selectable; current default set: {:?}",
             SUPPORTED_PROTOCOL_VERSIONS
         );
         assert!(SUPPORTED_PROTOCOL_VERSIONS.contains(&LATEST_PROTOCOL_VERSION));
@@ -5662,8 +5663,9 @@ mod tests {
 
     #[test]
     #[allow(deprecated)]
-    fn upcoming_version_alias_remains_compatible() {
-        assert_eq!(UPCOMING_PROTOCOL_VERSION, EXPERIMENTAL_PROTOCOL_VERSION);
+    fn deprecated_version_aliases_remain_compatible() {
+        assert_eq!(EXPERIMENTAL_PROTOCOL_VERSION, PROTOCOL_VERSION_2026_07_28);
+        assert_eq!(UPCOMING_PROTOCOL_VERSION, PROTOCOL_VERSION_2026_07_28);
     }
 
     // =========================================================================
@@ -7344,14 +7346,14 @@ mod draft_2026_07_28_tests {
     #[test]
     fn request_meta_carries_sep2575_keys_and_validates_by_version() {
         let meta = RequestMeta {
-            protocol_version: Some(EXPERIMENTAL_PROTOCOL_VERSION.to_string()),
+            protocol_version: Some(PROTOCOL_VERSION_2026_07_28.to_string()),
             client_capabilities: Some(ClientCapabilities::default()),
             ..Default::default()
         };
         let v = serde_json::to_value(&meta).unwrap();
         assert_eq!(
             v["io.modelcontextprotocol/protocolVersion"],
-            json!(EXPERIMENTAL_PROTOCOL_VERSION)
+            json!(PROTOCOL_VERSION_2026_07_28)
         );
         assert!(
             v.get("io.modelcontextprotocol/clientCapabilities")
@@ -7359,12 +7361,12 @@ mod draft_2026_07_28_tests {
         );
         // Version-aware required-key validation (SEP-2575).
         assert!(
-            meta.validate_for_version(EXPERIMENTAL_PROTOCOL_VERSION)
+            meta.validate_for_version(PROTOCOL_VERSION_2026_07_28)
                 .is_ok()
         );
         assert!(
             RequestMeta::default()
-                .validate_for_version(EXPERIMENTAL_PROTOCOL_VERSION)
+                .validate_for_version(PROTOCOL_VERSION_2026_07_28)
                 .is_err()
         );
         assert!(
@@ -7469,19 +7471,19 @@ mod draft_2026_07_28_tests {
         let params = ListToolsParams {
             cursor: None,
             meta: Some(RequestMeta {
-                protocol_version: Some(EXPERIMENTAL_PROTOCOL_VERSION.to_string()),
+                protocol_version: Some(PROTOCOL_VERSION_2026_07_28.to_string()),
                 ..Default::default()
             }),
         };
         let v = serde_json::to_value(&params).unwrap();
         assert_eq!(
             v["_meta"]["io.modelcontextprotocol/protocolVersion"],
-            json!(EXPERIMENTAL_PROTOCOL_VERSION)
+            json!(PROTOCOL_VERSION_2026_07_28)
         );
         let back: ListToolsParams = serde_json::from_value(v).unwrap();
         assert_eq!(
             back.meta.unwrap().protocol_version.as_deref(),
-            Some(EXPERIMENTAL_PROTOCOL_VERSION)
+            Some(PROTOCOL_VERSION_2026_07_28)
         );
     }
 
@@ -7497,7 +7499,7 @@ mod draft_2026_07_28_tests {
 
         // 2026-07-28 carries the discriminator.
         let mut v = baseline.clone();
-        assert!(ResultType::Complete.stamp_into(&mut v, EXPERIMENTAL_PROTOCOL_VERSION));
+        assert!(ResultType::Complete.stamp_into(&mut v, PROTOCOL_VERSION_2026_07_28));
         assert_eq!(v["resultType"], json!("complete"));
         assert_eq!(v["content"], baseline["content"]);
 
@@ -7507,7 +7509,7 @@ mod draft_2026_07_28_tests {
         assert_eq!(v, baseline);
 
         assert!(!version_carries_result_type("2025-11-25"));
-        assert!(version_carries_result_type(EXPERIMENTAL_PROTOCOL_VERSION));
+        assert!(version_carries_result_type(PROTOCOL_VERSION_2026_07_28));
         assert!(!version_carries_result_type("2027-01-01"));
     }
 
@@ -7516,16 +7518,16 @@ mod draft_2026_07_28_tests {
         // InputRequiredResult and CreateTaskResult write their own resultType;
         // stamping must not overwrite it with "complete".
         let mut v = serde_json::to_value(InputRequiredResult::new()).unwrap();
-        assert!(!ResultType::Complete.stamp_into(&mut v, EXPERIMENTAL_PROTOCOL_VERSION));
+        assert!(!ResultType::Complete.stamp_into(&mut v, PROTOCOL_VERSION_2026_07_28));
         assert_eq!(v["resultType"], json!("input_required"));
 
         let mut v = json!({"resultType": RESULT_TYPE_TASK, "taskId": "t1"});
-        assert!(!ResultType::Complete.stamp_into(&mut v, EXPERIMENTAL_PROTOCOL_VERSION));
+        assert!(!ResultType::Complete.stamp_into(&mut v, PROTOCOL_VERSION_2026_07_28));
         assert_eq!(v["resultType"], json!("task"));
 
         // A non-object result (the empty result some methods return) is a no-op.
         let mut v = json!(null);
-        assert!(!ResultType::Complete.stamp_into(&mut v, EXPERIMENTAL_PROTOCOL_VERSION));
+        assert!(!ResultType::Complete.stamp_into(&mut v, PROTOCOL_VERSION_2026_07_28));
         assert_eq!(v, json!(null));
     }
 
@@ -7545,7 +7547,7 @@ mod draft_2026_07_28_tests {
         );
         let parsed: CallToolResult = serde_json::from_value(example).unwrap();
         let mut round_tripped = serde_json::to_value(&parsed).unwrap();
-        assert!(ResultType::Complete.stamp_into(&mut round_tripped, EXPERIMENTAL_PROTOCOL_VERSION));
+        assert!(ResultType::Complete.stamp_into(&mut round_tripped, PROTOCOL_VERSION_2026_07_28));
         assert_eq!(round_tripped["resultType"], json!("complete"));
         assert_eq!(round_tripped["content"][0]["text"], json!("42"));
 

@@ -7,17 +7,17 @@
 use std::collections::HashSet;
 
 #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
-use crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION;
+use crate::protocol::PROTOCOL_VERSION_2026_07_28;
 use crate::protocol::SUPPORTED_PROTOCOL_VERSIONS;
 
 /// Protocol versions compiled into this build, in preference order.
 ///
-/// Enabling `protocol-2026-07-28` adds the experimental implementation. The
-/// former `stateless` feature remains a compatibility alias and produces the
-/// same compiled set.
+/// Enabling `protocol-2026-07-28` adds the released, opt-in implementation.
+/// The former `stateless` feature remains a compatibility alias and produces
+/// the same compiled set.
 #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
 pub const COMPILED_PROTOCOL_VERSIONS: &[&str] =
-    &[EXPERIMENTAL_PROTOCOL_VERSION, "2025-11-25", "2025-03-26"];
+    &[PROTOCOL_VERSION_2026_07_28, "2025-11-25", "2025-03-26"];
 
 /// Protocol versions compiled into this build, in preference order.
 #[cfg(not(any(feature = "protocol-2026-07-28", feature = "stateless")))]
@@ -79,9 +79,9 @@ impl ProtocolSupport {
         }
     }
 
-    /// Enable only the stable-by-default protocol versions.
+    /// Enable only the stable-by-default compatibility set.
     ///
-    /// This excludes experimental implementations even when their Cargo
+    /// This excludes opt-in protocol implementations even when their Cargo
     /// features are compiled.
     pub fn stable() -> Self {
         Self {
@@ -155,7 +155,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stable_policy_excludes_experimental_versions() {
+    fn stable_policy_excludes_opt_in_versions() {
         let support = ProtocolSupport::stable();
         assert_eq!(support.versions(), SUPPORTED_PROTOCOL_VERSIONS);
         assert_eq!(support.preferred(), "2025-11-25");
@@ -179,9 +179,9 @@ mod tests {
 
     #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
     #[test]
-    fn experimental_feature_adds_2026_implementation() {
-        assert!(is_protocol_version_compiled(EXPERIMENTAL_PROTOCOL_VERSION));
-        assert!(ProtocolSupport::compiled().contains(EXPERIMENTAL_PROTOCOL_VERSION));
+    fn opt_in_feature_adds_2026_implementation() {
+        assert!(is_protocol_version_compiled(PROTOCOL_VERSION_2026_07_28));
+        assert!(ProtocolSupport::compiled().contains(PROTOCOL_VERSION_2026_07_28));
     }
 
     #[cfg(not(any(feature = "protocol-2026-07-28", feature = "stateless")))]

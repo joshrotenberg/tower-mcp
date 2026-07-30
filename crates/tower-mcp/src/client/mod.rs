@@ -352,8 +352,8 @@ impl McpClientBuilder {
         Self {
             capabilities: ClientCapabilities::default(),
             roots: Vec::new(),
-            // Merely compiling an experimental implementation must not move an
-            // existing client off the established initialize/session path.
+            // Merely compiling an opt-in implementation must not move an existing
+            // client off the established initialize/session path.
             protocol_support: ProtocolSupport::stable(),
             max_mrtr_rounds: 8,
             cache_config: ClientCacheConfig::default(),
@@ -394,8 +394,8 @@ impl McpClientBuilder {
 
     /// Set the exact ordered protocol versions enabled for this client.
     ///
-    /// The default is [`ProtocolSupport::stable`], even when the experimental
-    /// final-protocol implementation was compiled. Applications opt into
+    /// The default is [`ProtocolSupport::stable`], even when the opt-in final
+    /// protocol implementation was compiled. Applications select
     /// 2026-07-28 explicitly and then call `McpClient::discover`.
     pub fn protocol_support(mut self, support: ProtocolSupport) -> Self {
         self.protocol_support = support;
@@ -663,7 +663,7 @@ impl McpClient {
         client_name: &str,
         client_version: &str,
     ) -> Result<DiscoverResult> {
-        use crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION;
+        use crate::protocol::PROTOCOL_VERSION_2026_07_28;
 
         let client_info = Implementation {
             name: client_name.to_string(),
@@ -676,7 +676,7 @@ impl McpClient {
             .protocol_support
             .versions()
             .iter()
-            .find(|version| version.as_str() == EXPERIMENTAL_PROTOCOL_VERSION)
+            .find(|version| version.as_str() == PROTOCOL_VERSION_2026_07_28)
             .cloned()
             .ok_or_else(|| {
                 Error::Transport(
@@ -1749,7 +1749,7 @@ impl McpClient {
 
     async fn uses_final_protocol(&self) -> bool {
         self.selected_protocol_version.read().await.as_deref()
-            == Some(crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION)
+            == Some(crate::protocol::PROTOCOL_VERSION_2026_07_28)
     }
 
     fn request_meta_for(&self, version: &str, client_info: &Implementation) -> RequestMeta {
@@ -1769,7 +1769,7 @@ impl McpClient {
         let Some(version) = self.selected_protocol_version.read().await.clone() else {
             return Ok(params);
         };
-        if version != crate::protocol::EXPERIMENTAL_PROTOCOL_VERSION {
+        if version != crate::protocol::PROTOCOL_VERSION_2026_07_28 {
             return Ok(params);
         }
         let client_info = self.client_info.read().await.clone().ok_or_else(|| {

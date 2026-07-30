@@ -137,7 +137,7 @@
 //! - [`GetPromptResult`] - Prompt expansion result
 //! - [`Content`] - Text, image, audio, or resource content
 //!
-//! ### Experimental 2026-07-28 protocol (requires `protocol-2026-07-28`)
+//! ### Released 2026-07-28 protocol (requires `protocol-2026-07-28`)
 //! - [`stateless::StatelessRequestMeta`] - Per-request `_meta` carrying protocol version,
 //!   client identity, and client capabilities for sessionless 2026-07-28 requests
 //! - [`RequestOutcome`] and [`InputRequiredResult`] - SEP-2322 Multi Round-Trip Request results
@@ -165,8 +165,8 @@
 //! - `macros` - Optional proc macros (`#[tool_fn]`, `#[prompt_fn]`, `#[resource_fn]`, `#[resource_template_fn]`)
 //! - `mcp-apps` - Typed server support for the stable MCP Apps extension. Runtime
 //!   advertisement remains explicit through [`McpRouter::with_mcp_apps`].
-//! - `protocol-2026-07-28` - Compile the experimental implementation of the released final
-//!   protocol. Use [`ProtocolSupport`] to select enabled versions at runtime. Enables
+//! - `protocol-2026-07-28` - Compile the released 2026-07-28 implementation.
+//!   Use [`ProtocolSupport`] to select enabled versions at runtime. Enables
 //!   version-gated sessionless dispatch, `server/discover` RPC, per-request `_meta` via
 //!   [`stateless::StatelessRequestMeta`], `subscriptions/listen`, SEP-2322 MRTR handlers,
 //!   and the discover-based [`McpClient`] path.
@@ -346,8 +346,8 @@
 //!
 //! ### Stateless Mode (2026-07-28, requires `protocol-2026-07-28` + `http`)
 //!
-//! The `protocol-2026-07-28` feature enables experimental support for the final
-//! 2026-07-28 MCP protocol. In this mode the initialize/initialized handshake
+//! The `protocol-2026-07-28` feature enables the released 2026-07-28 MCP
+//! protocol. In this mode the initialize/initialized handshake
 //! is replaced by two new RPCs:
 //!
 //! - **`server/discover`** -- stateless capability discovery. Clients that send requests with
@@ -377,7 +377,7 @@
 //!     .stateless(StatelessConfig::new());
 //! ```
 //!
-//! The 2026-07-28 implementation is experimental. Enable the
+//! The 2026-07-28 implementation is opt-in. Enable the
 //! `protocol-2026-07-28` Cargo feature to compile it, then use
 //! [`ProtocolSupport`] to narrow the versions enabled by an individual
 //! transport at runtime.
@@ -443,8 +443,8 @@
 //!
 //! ## MCP Specification
 //!
-//! This crate implements MCP 2025-11-25 by default and provides an
-//! experimental implementation of the released 2026-07-28 specification:
+//! This crate implements MCP 2025-11-25 by default and provides an opt-in
+//! implementation of the released 2026-07-28 specification:
 //! <https://modelcontextprotocol.io/specification/2026-07-28>
 //!
 //! Enable it with `protocol-2026-07-28`; the legacy `stateless` feature name
