@@ -76,7 +76,7 @@ Implemented final-revision areas include:
 
 ### Monitoring
 
-Open SEPs are tracked automatically via `.github/workflows/sep-sync.yml` and labeled `spec-tracking` in issues.
+Open SEPs are read from the [`SEP` label](https://github.com/modelcontextprotocol/modelcontextprotocol/labels/SEP) upstream. Issues are filed here only for SEPs this crate has committed to implementing.
 
 ## Future Directions
 
