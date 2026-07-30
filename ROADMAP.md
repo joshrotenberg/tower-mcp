@@ -5,8 +5,8 @@
 - **Version**: 0.14.x
 - **Spec version**: 2025-11-25 by default (plus the released 2026-07-28 protocol as an experimental implementation behind `protocol-2026-07-28`)
 - **Server conformance (2025-11-25)**: 39/39
-- **Client conformance (2025-11-25)**: 264/266 (two offline-access gaps, tracked in #953)
-- **Server conformance (2026-07-28)**: 67/101 (gaps baselined, tracked in #929)
+- **Client conformance (2025-11-25)**: 295/295 (empty baseline)
+- **Server conformance (2026-07-28)**: 114/114 (empty baseline)
 - **MSRV**: 1.90 (Rust 2024 edition)
 
 ## SDK Tier Assessment
@@ -16,11 +16,11 @@ tower-mcp targets Tier 2 per the [MCP SDK Tiering System](https://modelcontextpr
 | # | Requirement | Status |
 |---|-------------|--------|
 | 1 | Server conformance >= 80% | 100% (39/39) |
-| 2 | Client conformance >= 80% | 264/266 |
+| 2 | Client conformance >= 80% | 295/295 |
 | 3 | Issue triage within 1 month | Active |
 | 4 | P0 resolution within 2 weeks | 0 open |
 | 5 | Stable release >= 1.0.0 | 0.14.x -- pre-1.0 |
-| 6 | Spec tracking within 6 months | Current (2025-11-25) |
+| 6 | Spec tracking within 6 months | Current (2026-07-28) |
 | 7 | Documentation coverage | In progress |
 | 8 | Dependency update policy | dependabot.yml |
 | 9 | Roadmap | This file |
@@ -45,12 +45,28 @@ All features from the 2025-11-25 spec are implemented, including:
 - Sampling (all transports)
 - Completion (autocomplete)
 
+The released 2026-07-28 revision is implemented behind the experimental
+`protocol-2026-07-28` feature with an exact per-instance `ProtocolSupport`
+allow-list. The legacy 2025-era implementation remains the default.
+
+Implemented final-revision areas include:
+
+- Stateless `server/discover` lifecycle and per-request metadata
+- Multi Round-Trip Requests (MRTR) and result discriminators
+- `subscriptions/listen`, cache hints, and strict MCP HTTP headers
+- Final client lifecycle, subscriptions, authorization conformance, and schema recovery
+- Compile-time/runtime protocol selection across HTTP, STDIO, WebSocket, Unix-over-HTTP, and JSON-RPC services
+- Extension-key validation and safe withholding of incomplete Tasks advertisement
+
 ### In Progress
 
 | SEP | Title | Status | Issue |
 |-----|-------|--------|-------|
-| 1442 | Stateless MCP mode | Implemented (experimental, `stateless` feature) | #748 |
-| 1288 | WebSocket transport | Implemented (binary rejection, subprotocols, zombie prevention) | #745-#747 |
+| 2575/2567 | Final stateless/sessionless MCP lifecycle | Implemented (experimental, `protocol-2026-07-28`) | #929, #1059 |
+| 2322 | Multi Round-Trip Requests (MRTR) | Implemented; policy/composition follow-ups remain | #950 |
+| 2549 | Cache hints and response caching | Implemented | #1047, #1053 |
+| 2243 | Standard/custom HTTP headers | Implemented | #1049, #1051 |
+| 2133/1865 | Extensions and MCP Apps | Not yet implemented; tracked | #1060 |
 
 ### Monitoring
 
@@ -59,6 +75,8 @@ Open SEPs are tracked automatically via `.github/workflows/sep-sync.yml` and lab
 ## Future Directions
 
 - **1.0.0 stable release**: API freeze and stability guarantees
-- **SEP-1442 transport completion**: WebSocket stateless mode, per-request capabilities wiring
-- **SEP-1763 interceptors**: tower middleware maps naturally to this proposal
-- **Distributed session support**: sticky routing documentation, stateless mode as primary solution
+- **Promotion of 2026-07-28**: close the remaining transport, MRTR, auth, Tasks, and extension gates in #929.
+- **Tasks extension**: complete input-required task state, notifications, expiry, and client update APIs (#951).
+- **Reusable authorization APIs**: expose DCR/CIMD, scope step-up, and issuer-keyed credential persistence (#953).
+- **MCP Apps and extension lifecycle**: audit and implement an opt-in, security-bounded surface (#1060).
+- **SEP-1763 interceptors**: tower middleware maps naturally to this proposal.
