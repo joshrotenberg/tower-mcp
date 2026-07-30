@@ -113,7 +113,9 @@ struct StateEnvelope<T> {
 /// that may receive a retry. Use [`encode_for`](Self::encode_for) and
 /// [`decode_for`](Self::decode_for) when an authenticated subject is
 /// available; subject binding prevents one user from replaying another user's
-/// continuation token.
+/// continuation token. Binding is intentionally explicit: authentication
+/// middleware may place any application-defined principal type in request
+/// extensions, so the transport-neutral codec cannot safely infer one.
 #[derive(Clone)]
 pub struct RequestStateCodec {
     key: std::sync::Arc<[u8]>,

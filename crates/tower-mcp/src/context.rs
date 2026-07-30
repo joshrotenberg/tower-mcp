@@ -840,10 +840,10 @@ impl RequestContext {
     ///
     /// **Protocol note:** `ElicitUrlParams::elicitation_id` and the callback
     /// notification it correlates with are a 2025-11-25-and-earlier pattern.
-    /// The final 2026-07-28 schema removes both in favor of MRTR (SEP-2322,
-    /// not yet implemented -- see #950), where the client learns the outcome
-    /// by retrying the original request instead of receiving a completion
-    /// notification.
+    /// The final 2026-07-28 schema removes both in favor of MRTR (SEP-2322).
+    /// Use an MRTR-capable tool, prompt, or resource handler there; the client
+    /// learns the outcome by retrying the original request instead of receiving
+    /// a completion notification.
     ///
     /// # Example
     ///

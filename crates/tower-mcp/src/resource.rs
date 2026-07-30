@@ -78,8 +78,13 @@ use std::task::{Context, Poll};
 
 use pin_project_lite::pin_project;
 
+#[cfg(feature = "stateless")]
+use tower::ServiceExt;
 use tower::util::BoxCloneService;
 use tower_service::Service;
+
+#[cfg(feature = "stateless")]
+use tokio::sync::Mutex;
 
 use crate::context::RequestContext;
 use crate::error::{Error, Result};
@@ -116,6 +121,10 @@ impl ResourceRequest {
 /// This is the internal service type that resources use. Middleware errors are
 /// caught and converted to error results, so the service never fails at the Tower level.
 pub type BoxResourceService = BoxCloneService<ResourceRequest, ReadResourceResult, Infallible>;
+
+#[cfg(feature = "stateless")]
+type BoxMrtrResourceService =
+    BoxCloneService<ResourceRequest, RequestOutcome<ReadResourceResult>, Infallible>;
 
 /// Catches errors from the inner service and converts them to error results.
 ///
@@ -220,6 +229,63 @@ where
     }
 }
 
+#[cfg(feature = "stateless")]
+#[derive(Clone)]
+struct MrtrResourceCatchError<S> {
+    inner: S,
+}
+
+#[cfg(feature = "stateless")]
+impl<S> MrtrResourceCatchError<S> {
+    fn new(inner: S) -> Self {
+        Self { inner }
+    }
+}
+
+#[cfg(feature = "stateless")]
+impl<S> Service<ResourceRequest> for MrtrResourceCatchError<S>
+where
+    S: Service<ResourceRequest, Response = RequestOutcome<ReadResourceResult>>
+        + Clone
+        + Send
+        + 'static,
+    S::Error: fmt::Display + Send + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = RequestOutcome<ReadResourceResult>;
+    type Error = Infallible;
+    type Future =
+        Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        match self.inner.poll_ready(cx) {
+            Poll::Ready(Ok(())) | Poll::Ready(Err(_)) => Poll::Ready(Ok(())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn call(&mut self, req: ResourceRequest) -> Self::Future {
+        let uri = req.uri.clone();
+        let future = self.inner.call(req);
+        Box::pin(async move {
+            Ok(match future.await {
+                Ok(outcome) => outcome,
+                Err(error) => RequestOutcome::Complete(ReadResourceResult {
+                    contents: vec![ResourceContent {
+                        uri,
+                        mime_type: Some("text/plain".to_string()),
+                        text: Some(format!("Error reading resource: {error}")),
+                        blob: None,
+                        meta: None,
+                    }],
+                    meta: None,
+                    ..Default::default()
+                }),
+            })
+        })
+    }
+}
+
 /// A boxed future for resource handlers
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -250,6 +316,76 @@ pub trait MrtrResourceHandler: Send + Sync {
         &self,
         ctx: RequestContext,
     ) -> BoxFuture<'_, Result<RequestOutcome<ReadResourceResult>>>;
+}
+
+#[cfg(feature = "stateless")]
+struct MrtrResourceHandlerService<H> {
+    handler: Arc<H>,
+}
+
+#[cfg(feature = "stateless")]
+impl<H> MrtrResourceHandlerService<H> {
+    fn new(handler: H) -> Self {
+        Self {
+            handler: Arc::new(handler),
+        }
+    }
+}
+
+#[cfg(feature = "stateless")]
+impl<H> Clone for MrtrResourceHandlerService<H> {
+    fn clone(&self) -> Self {
+        Self {
+            handler: self.handler.clone(),
+        }
+    }
+}
+
+#[cfg(feature = "stateless")]
+impl<H> Service<ResourceRequest> for MrtrResourceHandlerService<H>
+where
+    H: MrtrResourceHandler + 'static,
+{
+    type Response = RequestOutcome<ReadResourceResult>;
+    type Error = Error;
+    type Future =
+        Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: ResourceRequest) -> Self::Future {
+        let handler = self.handler.clone();
+        Box::pin(async move { handler.read(req.ctx).await })
+    }
+}
+
+#[cfg(feature = "stateless")]
+struct ServiceMrtrResourceHandler {
+    service: Mutex<BoxMrtrResourceService>,
+    uri: String,
+}
+
+#[cfg(feature = "stateless")]
+impl MrtrResourceHandler for ServiceMrtrResourceHandler {
+    fn read(
+        &self,
+        ctx: RequestContext,
+    ) -> BoxFuture<'_, Result<RequestOutcome<ReadResourceResult>>> {
+        Box::pin(async move {
+            let request = ResourceRequest::new(ctx, self.uri.clone());
+            let mut service = self.service.lock().await.clone();
+            let outcome = service
+                .ready()
+                .await
+                .expect("MRTR resource service is infallible")
+                .call(request)
+                .await
+                .expect("MRTR resource service is infallible");
+            Ok(outcome)
+        })
+    }
 }
 
 /// Adapts a `ResourceHandler` to a Tower `Service<ResourceRequest>`.
@@ -839,6 +975,21 @@ pub struct ResourceBuilderWithMrtrHandler<F> {
 }
 
 #[cfg(feature = "stateless")]
+#[doc(hidden)]
+pub struct ResourceBuilderWithMrtrLayer<F, L> {
+    uri: String,
+    name: Option<String>,
+    title: Option<String>,
+    description: Option<String>,
+    mime_type: Option<String>,
+    icons: Option<Vec<ToolIcon>>,
+    size: Option<u64>,
+    annotations: Option<ContentAnnotations>,
+    handler: F,
+    layer: L,
+}
+
+#[cfg(feature = "stateless")]
 impl<F, Fut> ResourceBuilderWithMrtrHandler<F>
 where
     F: Fn(RequestContext) -> Fut + Send + Sync + 'static,
@@ -861,6 +1012,91 @@ where
                 handler: self.handler,
             },
         )
+    }
+
+    /// Apply a Tower layer to every attempt at this MRTR-capable resource.
+    ///
+    /// Each retry is an independent request, so the layer runs once per
+    /// round. Middleware failures become complete resource error results,
+    /// matching non-MRTR resource middleware.
+    pub fn layer<L>(self, layer: L) -> ResourceBuilderWithMrtrLayer<F, L> {
+        ResourceBuilderWithMrtrLayer {
+            uri: self.uri,
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            mime_type: self.mime_type,
+            icons: self.icons,
+            size: self.size,
+            annotations: self.annotations,
+            handler: self.handler,
+            layer,
+        }
+    }
+}
+
+#[cfg(feature = "stateless")]
+#[allow(private_bounds)]
+impl<F, Fut, L> ResourceBuilderWithMrtrLayer<F, L>
+where
+    F: Fn(RequestContext) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<RequestOutcome<ReadResourceResult>>> + Send + 'static,
+    L: tower::Layer<MrtrResourceHandlerService<MrtrContextHandler<F>>>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    L::Service: Service<ResourceRequest, Response = RequestOutcome<ReadResourceResult>>
+        + Clone
+        + Send
+        + 'static,
+    <L::Service as Service<ResourceRequest>>::Error: fmt::Display + Send + 'static,
+    <L::Service as Service<ResourceRequest>>::Future: Send + 'static,
+{
+    /// Build the MRTR resource with the applied layer(s).
+    pub fn build(self) -> Resource {
+        let name = self.name.unwrap_or_else(|| self.uri.clone());
+        let handler = MrtrContextHandler {
+            handler: self.handler,
+        };
+        let service = MrtrResourceHandlerService::new(handler);
+        let service = self.layer.layer(service);
+        let service = BoxCloneService::new(MrtrResourceCatchError::new(service));
+
+        Resource {
+            uri: self.uri.clone(),
+            name,
+            title: self.title,
+            description: self.description,
+            mime_type: self.mime_type,
+            icons: self.icons,
+            size: self.size,
+            annotations: self.annotations,
+            service: None,
+            mrtr_handler: Some(Arc::new(ServiceMrtrResourceHandler {
+                service: Mutex::new(service),
+                uri: self.uri,
+            })),
+        }
+    }
+
+    /// Apply an additional Tower layer.
+    pub fn layer<L2>(
+        self,
+        layer: L2,
+    ) -> ResourceBuilderWithMrtrLayer<F, tower::layer::util::Stack<L2, L>> {
+        ResourceBuilderWithMrtrLayer {
+            uri: self.uri,
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            mime_type: self.mime_type,
+            icons: self.icons,
+            size: self.size,
+            annotations: self.annotations,
+            handler: self.handler,
+            layer: tower::layer::util::Stack::new(layer, self.layer),
+        }
     }
 }
 
@@ -1857,6 +2093,30 @@ mod tests {
                 .as_input_required()
                 .and_then(|result| result.request_state.as_deref()),
             Some("signed-state")
+        );
+    }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn mrtr_resource_composes_middleware() {
+        let resource = ResourceBuilder::new("test://layered-continue")
+            .mrtr_handler(|_ctx| async move {
+                Ok(RequestOutcome::input_required(
+                    crate::protocol::InputRequiredResult::new().with_request_state("layered-state"),
+                ))
+            })
+            .layer(TimeoutLayer::new(Duration::from_secs(1)))
+            .build();
+
+        let outcome = resource
+            .read_outcome_with_context(RequestContext::new(crate::protocol::RequestId::Number(2)))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome
+                .as_input_required()
+                .and_then(|result| result.request_state.as_deref()),
+            Some("layered-state")
         );
     }
 

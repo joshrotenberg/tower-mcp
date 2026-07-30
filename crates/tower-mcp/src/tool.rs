@@ -44,8 +44,13 @@ use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+#[cfg(feature = "stateless")]
+use tower::ServiceExt;
 use tower::util::BoxCloneService;
 use tower_service::Service;
+
+#[cfg(feature = "stateless")]
+use tokio::sync::Mutex;
 
 use crate::context::RequestContext;
 use crate::error::{Error, Result, ResultExt};
@@ -83,6 +88,10 @@ impl ToolRequest {
 /// caught and converted to `CallToolResult::error()` responses, so the
 /// service never fails at the Tower level.
 pub type BoxToolService = BoxCloneService<ToolRequest, CallToolResult, Infallible>;
+
+/// A boxed MRTR-capable tool service.
+#[cfg(feature = "stateless")]
+type BoxMrtrToolService = BoxCloneService<ToolRequest, RequestOutcome<CallToolResult>, Infallible>;
 
 /// Catches errors from the inner service and converts them to `CallToolResult::error()`.
 ///
@@ -168,6 +177,54 @@ where
     }
 }
 
+/// Catches errors from an MRTR-capable tool service.
+///
+/// Per-tool middleware has the same error semantics for complete and MRTR
+/// handlers: middleware and handler failures become complete tool error
+/// results, while input-required outcomes pass through unchanged.
+#[cfg(feature = "stateless")]
+#[derive(Clone)]
+struct MrtrToolCatchError<S> {
+    inner: S,
+}
+
+#[cfg(feature = "stateless")]
+impl<S> MrtrToolCatchError<S> {
+    fn new(inner: S) -> Self {
+        Self { inner }
+    }
+}
+
+#[cfg(feature = "stateless")]
+impl<S> Service<ToolRequest> for MrtrToolCatchError<S>
+where
+    S: Service<ToolRequest, Response = RequestOutcome<CallToolResult>> + Clone + Send + 'static,
+    S::Error: fmt::Display + Send + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = RequestOutcome<CallToolResult>;
+    type Error = Infallible;
+    type Future =
+        Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        match self.inner.poll_ready(cx) {
+            Poll::Ready(Ok(())) | Poll::Ready(Err(_)) => Poll::Ready(Ok(())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn call(&mut self, req: ToolRequest) -> Self::Future {
+        let future = self.inner.call(req);
+        Box::pin(async move {
+            Ok(match future.await {
+                Ok(outcome) => outcome,
+                Err(error) => RequestOutcome::Complete(CallToolResult::error(error.to_string())),
+            })
+        })
+    }
+}
+
 /// A tower [`Layer`](tower::Layer) that applies a guard function before the inner service.
 ///
 /// Guards run before the tool handler and can short-circuit with an error message.
@@ -237,16 +294,17 @@ pub struct GuardService<G, S> {
     inner: S,
 }
 
-impl<G, S> Service<ToolRequest> for GuardService<G, S>
+impl<G, S, R> Service<ToolRequest> for GuardService<G, S>
 where
     G: Fn(&ToolRequest) -> std::result::Result<(), String> + Clone + Send + Sync + 'static,
-    S: Service<ToolRequest, Response = CallToolResult> + Clone + Send + 'static,
+    S: Service<ToolRequest, Response = R> + Clone + Send + 'static,
     S::Error: Into<Error> + Send,
     S::Future: Send,
+    R: Send + 'static,
 {
-    type Response = CallToolResult;
+    type Response = R;
     type Error = Error;
-    type Future = Pin<Box<dyn Future<Output = std::result::Result<CallToolResult, Error>> + Send>>;
+    type Future = Pin<Box<dyn Future<Output = std::result::Result<R, Error>> + Send>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
         self.inner.poll_ready(cx).map_err(Into::into)
@@ -439,6 +497,114 @@ pub trait MrtrToolHandler: Send + Sync {
 
     /// Get the tool's input schema.
     fn input_schema(&self) -> Value;
+}
+
+/// Adapts an MRTR handler to Tower's service abstraction.
+#[cfg(feature = "stateless")]
+struct MrtrToolHandlerService<H> {
+    handler: Arc<H>,
+}
+
+#[cfg(feature = "stateless")]
+impl<H> MrtrToolHandlerService<H> {
+    fn new(handler: H) -> Self {
+        Self {
+            handler: Arc::new(handler),
+        }
+    }
+}
+
+#[cfg(feature = "stateless")]
+impl<H> Clone for MrtrToolHandlerService<H> {
+    fn clone(&self) -> Self {
+        Self {
+            handler: self.handler.clone(),
+        }
+    }
+}
+
+#[cfg(feature = "stateless")]
+impl<H> Service<ToolRequest> for MrtrToolHandlerService<H>
+where
+    H: MrtrToolHandler + 'static,
+{
+    type Response = RequestOutcome<CallToolResult>;
+    type Error = Error;
+    type Future =
+        Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: ToolRequest) -> Self::Future {
+        let handler = self.handler.clone();
+        Box::pin(async move { handler.call(req.ctx, req.args).await })
+    }
+}
+
+/// Runs an erased MRTR Tower service as an MRTR handler.
+#[cfg(feature = "stateless")]
+struct ServiceMrtrToolHandler {
+    service: Mutex<BoxMrtrToolService>,
+    input_schema: Value,
+}
+
+#[cfg(feature = "stateless")]
+struct GuardedMrtrToolHandler<G> {
+    guard: G,
+    inner: Arc<dyn MrtrToolHandler>,
+}
+
+#[cfg(feature = "stateless")]
+impl<G> MrtrToolHandler for GuardedMrtrToolHandler<G>
+where
+    G: Fn(&ToolRequest) -> std::result::Result<(), String> + Clone + Send + Sync + 'static,
+{
+    fn call(
+        &self,
+        ctx: RequestContext,
+        args: Value,
+    ) -> BoxFuture<'_, Result<RequestOutcome<CallToolResult>>> {
+        let request = ToolRequest::new(ctx, args);
+        match (self.guard)(&request) {
+            Ok(()) => self.inner.call(request.ctx, request.args),
+            Err(message) => {
+                Box::pin(
+                    async move { Ok(RequestOutcome::Complete(CallToolResult::error(message))) },
+                )
+            }
+        }
+    }
+
+    fn input_schema(&self) -> Value {
+        self.inner.input_schema()
+    }
+}
+
+#[cfg(feature = "stateless")]
+impl MrtrToolHandler for ServiceMrtrToolHandler {
+    fn call(
+        &self,
+        ctx: RequestContext,
+        args: Value,
+    ) -> BoxFuture<'_, Result<RequestOutcome<CallToolResult>>> {
+        Box::pin(async move {
+            let mut service = self.service.lock().await.clone();
+            let outcome = service
+                .ready()
+                .await
+                .expect("MRTR tool service is infallible")
+                .call(ToolRequest::new(ctx, args))
+                .await
+                .expect("MRTR tool service is infallible");
+            Ok(outcome)
+        })
+    }
+
+    fn input_schema(&self) -> Value {
+        self.input_schema.clone()
+    }
 }
 
 /// Adapts a `ToolHandler` to a Tower `Service<ToolRequest>`.
@@ -700,11 +866,19 @@ impl Tool {
     where
         G: Fn(&ToolRequest) -> std::result::Result<(), String> + Clone + Send + Sync + 'static,
     {
+        #[cfg(feature = "stateless")]
+        if let Some(inner) = self.mrtr_handler.clone() {
+            return Tool {
+                mrtr_handler: Some(Arc::new(GuardedMrtrToolHandler { guard, inner })),
+                ..self
+            };
+        }
+
         let guarded = GuardService {
             guard,
             inner: self
                 .service
-                .expect("with_guard is not supported on an MRTR tool"),
+                .expect("tool must have a complete or MRTR handler"),
         };
         let caught = ToolCatchError::new(guarded);
         Tool {
@@ -1448,6 +1622,23 @@ pub struct ToolBuilderWithMrtrHandler<I, F> {
     _phantom: std::marker::PhantomData<I>,
 }
 
+/// Builder state after a layer has been applied to an MRTR handler.
+#[cfg(feature = "stateless")]
+#[doc(hidden)]
+pub struct ToolBuilderWithMrtrLayer<I, F, L> {
+    name: String,
+    title: Option<String>,
+    description: Option<String>,
+    output_schema: Option<Value>,
+    input_schema_override: Option<Value>,
+    icons: Option<Vec<ToolIcon>>,
+    annotations: Option<ToolAnnotations>,
+    task_support: TaskSupportMode,
+    handler: F,
+    layer: L,
+    _phantom: std::marker::PhantomData<I>,
+}
+
 /// Builder state for tools with no parameters.
 ///
 /// Created by [`ToolBuilder::no_params_handler`].
@@ -1705,6 +1896,112 @@ where
                 _phantom: std::marker::PhantomData,
             },
         )
+    }
+
+    /// Apply a Tower layer to every attempt at this MRTR-capable tool.
+    ///
+    /// Each MRTR retry is an independent request, so the layer runs once per
+    /// round. Middleware failures become complete tool error results, matching
+    /// the behavior of layers on non-MRTR tools.
+    pub fn layer<L>(self, layer: L) -> ToolBuilderWithMrtrLayer<I, F, L> {
+        ToolBuilderWithMrtrLayer {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            output_schema: self.output_schema,
+            input_schema_override: self.input_schema_override,
+            icons: self.icons,
+            annotations: self.annotations,
+            task_support: self.task_support,
+            handler: self.handler,
+            layer,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// Apply a guard to every attempt at this MRTR-capable tool.
+    pub fn guard<G>(self, guard: G) -> ToolBuilderWithMrtrLayer<I, F, GuardLayer<G>>
+    where
+        G: Fn(&ToolRequest) -> std::result::Result<(), String> + Clone + Send + Sync + 'static,
+    {
+        self.layer(GuardLayer::new(guard))
+    }
+}
+
+#[cfg(feature = "stateless")]
+#[allow(private_bounds)]
+impl<I, F, Fut, L> ToolBuilderWithMrtrLayer<I, F, L>
+where
+    I: JsonSchema + DeserializeOwned + Send + Sync + 'static,
+    F: Fn(RequestContext, I) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<RequestOutcome<CallToolResult>>> + Send + 'static,
+    L: tower::Layer<MrtrToolHandlerService<TypedMrtrHandler<I, F>>> + Clone + Send + Sync + 'static,
+    L::Service:
+        Service<ToolRequest, Response = RequestOutcome<CallToolResult>> + Clone + Send + 'static,
+    <L::Service as Service<ToolRequest>>::Error: fmt::Display + Send + 'static,
+    <L::Service as Service<ToolRequest>>::Future: Send + 'static,
+{
+    /// Build the MRTR-capable tool with the applied layer(s).
+    pub fn build(self) -> Tool {
+        let input_schema = self.input_schema_override.unwrap_or_else(|| {
+            let schema = schemars::schema_for!(I);
+            serde_json::to_value(schema).unwrap_or_else(|_| serde_json::json!({ "type": "object" }))
+        });
+        let input_schema = ensure_object_schema(input_schema);
+        let service = MrtrToolHandlerService::new(TypedMrtrHandler {
+            handler: self.handler,
+            _phantom: std::marker::PhantomData,
+        });
+        let service = self.layer.layer(service);
+        let service = BoxCloneService::new(MrtrToolCatchError::new(service));
+
+        Tool {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            output_schema: self.output_schema,
+            icons: self.icons,
+            annotations: self.annotations,
+            task_support: self.task_support,
+            required_client_capabilities: None,
+            service: None,
+            mrtr_handler: Some(Arc::new(ServiceMrtrToolHandler {
+                service: Mutex::new(service),
+                input_schema: input_schema.clone(),
+            })),
+            input_schema,
+        }
+    }
+
+    /// Apply an additional Tower layer.
+    pub fn layer<L2>(
+        self,
+        layer: L2,
+    ) -> ToolBuilderWithMrtrLayer<I, F, tower::layer::util::Stack<L2, L>> {
+        ToolBuilderWithMrtrLayer {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            output_schema: self.output_schema,
+            input_schema_override: self.input_schema_override,
+            icons: self.icons,
+            annotations: self.annotations,
+            task_support: self.task_support,
+            handler: self.handler,
+            layer: tower::layer::util::Stack::new(layer, self.layer),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// Apply an additional guard.
+    pub fn guard<G>(
+        self,
+        guard: G,
+    ) -> ToolBuilderWithMrtrLayer<I, F, tower::layer::util::Stack<GuardLayer<G>, L>>
+    where
+        G: Fn(&ToolRequest) -> std::result::Result<(), String> + Clone + Send + Sync + 'static,
+    {
+        self.layer(GuardLayer::new(guard))
     }
 }
 
@@ -2047,6 +2344,60 @@ mod tests {
                 .and_then(|result| result.request_state.as_deref()),
             Some("signed-state")
         );
+    }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn mrtr_builder_composes_guards_and_layers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        use tower::timeout::TimeoutLayer;
+
+        let rounds = Arc::new(AtomicUsize::new(0));
+        let observed = rounds.clone();
+        let tool = ToolBuilder::new("guarded_continue")
+            .mrtr_handler::<NoParams, _, _>(|_ctx, _input| async move {
+                Ok(RequestOutcome::input_required(
+                    crate::protocol::InputRequiredResult::new().with_request_state("continue"),
+                ))
+            })
+            .layer(TimeoutLayer::new(Duration::from_secs(1)))
+            .guard(move |_request| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .build();
+
+        for _ in 0..2 {
+            assert!(
+                tool.call_outcome(serde_json::json!({}))
+                    .await
+                    .unwrap()
+                    .as_input_required()
+                    .is_some()
+            );
+        }
+        assert_eq!(rounds.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn built_mrtr_tool_accepts_a_guard() {
+        let tool = ToolBuilder::new("denied_continue")
+            .mrtr_handler::<NoParams, _, _>(|_ctx, _input| async move {
+                Ok(RequestOutcome::input_required(
+                    crate::protocol::InputRequiredResult::new().with_request_state("unreachable"),
+                ))
+            })
+            .build()
+            .with_guard(|_request| Err("MRTR access denied".to_string()));
+
+        let outcome = tool.call_outcome(serde_json::json!({})).await.unwrap();
+        let result = outcome
+            .as_complete()
+            .expect("guard rejection is a complete tool error");
+        assert!(result.is_error);
+        assert_eq!(result.first_text(), Some("MRTR access denied"));
     }
 
     #[tokio::test]

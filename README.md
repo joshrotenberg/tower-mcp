@@ -665,6 +665,26 @@ let tool = ToolBuilder::new("workspace_summary")
     .build();
 ```
 
+Each MRTR retry is an independent MCP request. Router/transport middleware
+therefore runs once per round, and MRTR tool, prompt, and static-resource
+builders support the same per-handler `.layer()` composition as complete
+handlers. Tool `.guard()` checks also run on every round. Resource templates
+use router/transport middleware for both complete and MRTR handlers because
+they do not have a separate per-template Tower service.
+
+The server does not own a continuation loop, so there is no server-global
+round counter to configure. Clients bound automatic retries with
+`McpClientBuilder::max_mrtr_rounds`; a server workflow that needs its own cap
+should encode and verify a round counter inside `requestState`.
+
+`RequestStateCodec` intentionally leaves authenticated-principal binding under
+application control: HTTP/custom-service authentication can place any
+application-defined identity in request extensions. If continuation state can
+affect authorization, resource access, or business logic, use `encode_for` and
+`decode_for` with that stable principal identifier on every round. This keeps
+the codec transport-neutral while following the final specification's replay
+and cross-principal protections.
+
 [SEP-2484](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2484) (accepted) makes merged conformance scenarios a prerequisite for standards-track SEPs reaching `final`, which elevates the conformance suite from a nice-to-have to spec-gating infrastructure. We run it on every PR to catch regressions early and to stay ahead of new scenarios as the spec evolves.
 
 - [x] [JSON-RPC 2.0 message format](https://modelcontextprotocol.io/specification/2025-11-25/basic#messages)

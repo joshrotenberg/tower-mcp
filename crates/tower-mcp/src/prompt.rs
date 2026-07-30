@@ -105,6 +105,10 @@ impl PromptRequest {
 /// handler can consume it without knowing the concrete middleware stack.
 pub type BoxPromptService = BoxCloneService<PromptRequest, GetPromptResult, Infallible>;
 
+#[cfg(feature = "stateless")]
+type BoxMrtrPromptService =
+    BoxCloneService<PromptRequest, RequestOutcome<GetPromptResult>, Infallible>;
+
 /// A service wrapper that catches errors from middleware and converts them
 /// into prompt errors, maintaining the `Error = Infallible` contract.
 ///
@@ -198,6 +202,61 @@ where
     }
 }
 
+#[cfg(feature = "stateless")]
+#[derive(Clone)]
+struct MrtrPromptCatchError<S> {
+    inner: S,
+}
+
+#[cfg(feature = "stateless")]
+impl<S> MrtrPromptCatchError<S> {
+    fn new(inner: S) -> Self {
+        Self { inner }
+    }
+}
+
+#[cfg(feature = "stateless")]
+impl<S> Service<PromptRequest> for MrtrPromptCatchError<S>
+where
+    S: Service<PromptRequest, Response = RequestOutcome<GetPromptResult>> + Clone + Send + 'static,
+    S::Error: fmt::Display + Send + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = RequestOutcome<GetPromptResult>;
+    type Error = Infallible;
+    type Future =
+        Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        match self.inner.poll_ready(cx) {
+            Poll::Ready(Ok(())) | Poll::Ready(Err(_)) => Poll::Ready(Ok(())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn call(&mut self, req: PromptRequest) -> Self::Future {
+        let future = self.inner.call(req);
+        Box::pin(async move {
+            Ok(match future.await {
+                Ok(outcome) => outcome,
+                Err(error) => RequestOutcome::Complete(GetPromptResult {
+                    description: Some(format!("Prompt error: {error}")),
+                    messages: vec![PromptMessage {
+                        role: PromptRole::Assistant,
+                        content: Content::Text {
+                            text: format!("Error generating prompt: {error}"),
+                            annotations: None,
+                            meta: None,
+                        },
+                        meta: None,
+                    }],
+                    meta: None,
+                }),
+            })
+        })
+    }
+}
+
 /// Adapts a prompt handler function into a `Service<PromptRequest>`.
 ///
 /// This allows the handler to be wrapped with tower middleware layers.
@@ -243,6 +302,42 @@ where
 #[doc(hidden)]
 pub struct PromptContextHandlerService<F> {
     handler: F,
+}
+
+#[cfg(feature = "stateless")]
+#[doc(hidden)]
+pub struct MrtrPromptHandlerService<F> {
+    handler: F,
+}
+
+#[cfg(feature = "stateless")]
+impl<F: Clone> Clone for MrtrPromptHandlerService<F> {
+    fn clone(&self) -> Self {
+        Self {
+            handler: self.handler.clone(),
+        }
+    }
+}
+
+#[cfg(feature = "stateless")]
+impl<F, Fut> Service<PromptRequest> for MrtrPromptHandlerService<F>
+where
+    F: Fn(RequestContext, HashMap<String, String>) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Result<RequestOutcome<GetPromptResult>>> + Send + 'static,
+{
+    type Response = RequestOutcome<GetPromptResult>;
+    type Error = Error;
+    type Future =
+        Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: PromptRequest) -> Self::Future {
+        let handler = self.handler.clone();
+        Box::pin(async move { handler(req.context, req.arguments).await })
+    }
 }
 
 impl<F> Clone for PromptContextHandlerService<F>
@@ -827,6 +922,41 @@ where
             })),
         }
     }
+
+    /// Apply a Tower layer to every attempt at this MRTR-capable prompt.
+    ///
+    /// Each retry is an independent request, so the layer runs once per
+    /// round. Middleware failures become complete prompt error results,
+    /// matching non-MRTR prompt middleware.
+    #[allow(private_bounds)]
+    pub fn layer<L>(self, layer: L) -> Prompt
+    where
+        L: Layer<MrtrPromptHandlerService<F>> + Send + Sync + 'static,
+        L::Service: Service<PromptRequest, Response = RequestOutcome<GetPromptResult>>
+            + Clone
+            + Send
+            + 'static,
+        <L::Service as Service<PromptRequest>>::Error: fmt::Display + Send + 'static,
+        <L::Service as Service<PromptRequest>>::Future: Send + 'static,
+    {
+        let service = MrtrPromptHandlerService {
+            handler: self.handler,
+        };
+        let service = layer.layer(service);
+        let service = BoxCloneService::new(MrtrPromptCatchError::new(service));
+
+        Prompt {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            icons: self.icons,
+            arguments: self.arguments,
+            handler: None,
+            mrtr_handler: Some(Arc::new(ServiceMrtrPromptHandler {
+                service: Mutex::new(service),
+            })),
+        }
+    }
 }
 
 /// Builder state after context-aware handler is specified
@@ -917,6 +1047,33 @@ struct ContextAwareHandler<F> {
 #[cfg(feature = "stateless")]
 struct MrtrContextHandler<F> {
     handler: F,
+}
+
+#[cfg(feature = "stateless")]
+struct ServiceMrtrPromptHandler {
+    service: Mutex<BoxMrtrPromptService>,
+}
+
+#[cfg(feature = "stateless")]
+impl MrtrPromptHandler for ServiceMrtrPromptHandler {
+    fn get(
+        &self,
+        ctx: RequestContext,
+        arguments: HashMap<String, String>,
+    ) -> BoxFuture<'_, Result<RequestOutcome<GetPromptResult>>> {
+        Box::pin(async move {
+            let request = PromptRequest::new(ctx, arguments);
+            let mut service = self.service.lock().await.clone();
+            let outcome = service
+                .ready()
+                .await
+                .expect("MRTR prompt service is infallible")
+                .call(request)
+                .await
+                .expect("MRTR prompt service is infallible");
+            Ok(outcome)
+        })
+    }
 }
 
 #[cfg(feature = "stateless")]
@@ -1494,6 +1651,32 @@ mod tests {
                 .as_input_required()
                 .and_then(|result| result.request_state.as_deref()),
             Some("signed-state")
+        );
+    }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn mrtr_prompt_composes_middleware() {
+        use std::time::Duration;
+        use tower::timeout::TimeoutLayer;
+
+        let prompt = PromptBuilder::new("layered_continue")
+            .mrtr_handler(|_ctx, _args| async move {
+                Ok(RequestOutcome::input_required(
+                    crate::protocol::InputRequiredResult::new().with_request_state("layered-state"),
+                ))
+            })
+            .layer(TimeoutLayer::new(Duration::from_secs(1)));
+
+        let outcome = prompt
+            .get_outcome_with_context(RequestContext::new(RequestId::Number(2)), HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome
+                .as_input_required()
+                .and_then(|result| result.request_state.as_deref()),
+            Some("layered-state")
         );
     }
 
