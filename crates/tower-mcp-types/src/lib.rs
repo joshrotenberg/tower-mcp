@@ -106,6 +106,7 @@
 
 pub mod error;
 pub mod protocol;
+pub mod tasks;
 
 #[cfg(feature = "testing")]
 pub mod testing;

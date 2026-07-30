@@ -495,6 +495,7 @@ pub mod session;
 pub mod session_store;
 #[cfg(feature = "stateless")]
 pub mod stateless;
+pub mod tasks;
 #[cfg(feature = "testing")]
 pub mod testing;
 pub mod tool;
