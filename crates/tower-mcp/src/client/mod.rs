@@ -210,16 +210,7 @@ impl SubscriptionHandle {
                 result.result_type
             )));
         }
-        let response_id = result
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.subscription_id.as_ref())
-            .ok_or_else(|| {
-                Error::Transport(
-                    "subscriptions/listen result omitted its subscription ID".to_string(),
-                )
-            })?;
-        if !request_ids_match(response_id, &self.request_id) {
+        if !request_ids_match(&result.meta.subscription_id, &self.request_id) {
             return Err(Error::Transport(
                 "subscriptions/listen result carried the wrong subscription ID".to_string(),
             ));
@@ -3031,10 +3022,7 @@ mod tests {
         let expected_id = handle.id().clone();
         let result = handle.wait().await.unwrap();
         assert!(result.result_type.is_complete());
-        assert_eq!(
-            result.meta.and_then(|meta| meta.subscription_id),
-            Some(expected_id)
-        );
+        assert_eq!(result.meta.subscription_id, expected_id);
     }
 
     #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]

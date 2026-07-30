@@ -2772,10 +2772,7 @@ mod stateless_tests {
         );
         let graceful_id = graceful.id().clone();
         let result = graceful.wait().await.unwrap();
-        assert_eq!(
-            result.meta.and_then(|meta| meta.subscription_id),
-            Some(graceful_id)
-        );
+        assert_eq!(result.meta.subscription_id, graceful_id);
 
         let mut abrupt = client
             .listen_subscriptions(SubscriptionFilter {

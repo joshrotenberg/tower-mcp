@@ -2,8 +2,9 @@
 
 use crate::context::ServerNotification;
 use crate::protocol::{
-    JsonRpcNotification, JsonRpcResponse, NotificationMeta, RequestId, ResultType,
-    SubscriptionFilter, SubscriptionsAcknowledgedParams, SubscriptionsListenResult, notifications,
+    Implementation, JsonRpcNotification, JsonRpcResponse, NotificationMeta, RequestId, ResultType,
+    SubscriptionFilter, SubscriptionsAcknowledgedParams, SubscriptionsListenResult,
+    SubscriptionsListenResultMeta, notifications,
 };
 
 pub(crate) fn accepted_subscription_filter(requested: SubscriptionFilter) -> SubscriptionFilter {
@@ -68,12 +69,16 @@ pub(crate) fn subscription_acknowledgment(
     )
 }
 
-pub(crate) fn subscription_complete_response(subscription_id: RequestId) -> JsonRpcResponse {
+pub(crate) fn subscription_complete_response(
+    subscription_id: RequestId,
+    server_info: Option<Implementation>,
+) -> JsonRpcResponse {
     let result = SubscriptionsListenResult {
         result_type: ResultType::Complete,
-        meta: Some(NotificationMeta {
-            subscription_id: Some(subscription_id.clone()),
-        }),
+        meta: SubscriptionsListenResultMeta {
+            subscription_id: subscription_id.clone(),
+            server_info,
+        },
     };
     JsonRpcResponse::result(
         subscription_id,

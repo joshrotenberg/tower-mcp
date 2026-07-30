@@ -563,6 +563,10 @@ async fn stdio_multiplexes_and_gracefully_closes_final_subscriptions() {
         complete["result"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
         22
     );
+    assert_eq!(
+        complete["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+        "stdio-subscription-test"
+    );
 
     let list = serde_json::json!({
         "jsonrpc": "2.0",
@@ -760,6 +764,12 @@ async fn middleware_wrapped_stdio_preserves_subscription_routing() {
         .expect("layered graceful result");
     assert_eq!(complete["id"], "layered");
     assert_eq!(complete["result"]["resultType"], "complete");
+    assert!(
+        complete["result"]["_meta"]
+            .get("io.modelcontextprotocol/serverInfo")
+            .is_none(),
+        "generic services do not expose server identity to the transport"
+    );
     control.shutdown().unwrap();
     task.await
         .expect("transport task join")
@@ -809,6 +819,10 @@ async fn bidi_stdio_preserves_subscription_routing() {
         .expect("bidirectional graceful result");
     assert_eq!(complete["id"], 71);
     assert_eq!(complete["result"]["resultType"], "complete");
+    assert_eq!(
+        complete["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+        "stdio-subscription-test"
+    );
     control.shutdown().unwrap();
     task.await
         .expect("transport task join")

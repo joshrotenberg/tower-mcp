@@ -2032,20 +2032,33 @@ pub struct SubscriptionsListenParams {
 ///
 /// A server sends this empty complete result before it closes a subscription
 /// stream on its own initiative. An abrupt transport close has no result.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubscriptionsListenResult {
     /// Always [`ResultType::Complete`].
     #[serde(default)]
     pub result_type: ResultType,
-    /// Identifies the subscription that ended.
+    /// Required result metadata identifying the subscription that ended.
+    #[serde(rename = "_meta")]
+    pub meta: SubscriptionsListenResultMeta,
+}
+
+/// Result metadata for a gracefully closed `subscriptions/listen` request.
+///
+/// Unlike [`NotificationMeta`], the subscription ID is required because this
+/// metadata appears only on the terminal result of a known subscription.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscriptionsListenResultMeta {
+    /// The JSON-RPC ID of the `subscriptions/listen` request being closed.
+    #[serde(rename = "io.modelcontextprotocol/subscriptionId")]
+    pub subscription_id: RequestId,
+    /// Identifies the server software producing the response.
     #[serde(
-        rename = "_meta",
+        rename = "io.modelcontextprotocol/serverInfo",
         default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::protocol::meta_object_serde"
+        skip_serializing_if = "Option::is_none"
     )]
-    pub meta: Option<NotificationMeta>,
+    pub server_info: Option<Implementation>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -7383,9 +7396,18 @@ mod draft_2026_07_28_tests {
 
         let result = SubscriptionsListenResult {
             result_type: ResultType::Complete,
-            meta: Some(NotificationMeta {
-                subscription_id: Some(RequestId::Number(7)),
-            }),
+            meta: SubscriptionsListenResultMeta {
+                subscription_id: RequestId::Number(7),
+                server_info: Some(Implementation {
+                    name: "test-server".to_string(),
+                    version: "1.0.0".to_string(),
+                    title: None,
+                    description: None,
+                    icons: None,
+                    website_url: None,
+                    meta: None,
+                }),
+            },
         };
         let value = serde_json::to_value(&result).unwrap();
         assert_eq!(value["resultType"], json!("complete"));
@@ -7393,11 +7415,23 @@ mod draft_2026_07_28_tests {
             value["_meta"]["io.modelcontextprotocol/subscriptionId"],
             json!(7)
         );
+        assert_eq!(
+            value["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            json!("test-server")
+        );
         let back: SubscriptionsListenResult = serde_json::from_value(value).unwrap();
         assert!(back.result_type.is_complete());
+        assert_eq!(back.meta.subscription_id, RequestId::Number(7));
         assert_eq!(
-            back.meta.and_then(|meta| meta.subscription_id),
-            Some(RequestId::Number(7))
+            back.meta.server_info.map(|info| info.name),
+            Some("test-server".to_string())
+        );
+        assert!(
+            serde_json::from_value::<SubscriptionsListenResult>(serde_json::json!({
+                "resultType": "complete"
+            }))
+            .is_err(),
+            "final subscription results require _meta and a subscription ID"
         );
     }
 

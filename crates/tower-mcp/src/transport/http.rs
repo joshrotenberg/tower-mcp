@@ -285,7 +285,8 @@ use crate::transport::service::{
 };
 #[cfg(feature = "stateless")]
 use crate::transport::subscriptions::{
-    accepted_subscription_filter, subscription_matches, tagged_subscription_notification,
+    accepted_subscription_filter, subscription_complete_response, subscription_matches,
+    tagged_subscription_notification,
 };
 use crate::{ProtocolSupport, ProtocolSupportError};
 use tower::util::BoxCloneService;
@@ -1225,7 +1226,7 @@ pub struct SessionInfo {
     pub last_activity: Duration,
 }
 
-/// A handle for querying and managing HTTP transport sessions.
+/// A handle for managing HTTP transport sessions and final subscription streams.
 ///
 /// Obtained from [`HttpTransport::into_router_with_handle()`] or
 /// [`HttpTransport::into_router_at_with_handle()`]. The handle is cheap to
@@ -1245,10 +1246,15 @@ pub struct SessionInfo {
 ///     println!("{}: created {:?} ago", info.id, info.created_at);
 /// }
 /// handle.terminate_session("session-id").await;
+///
+/// // During graceful server shutdown (with the `stateless` feature):
+/// handle.close_subscriptions();
 /// ```
 #[derive(Clone)]
 pub struct SessionHandle {
     store: Arc<SessionRegistry>,
+    #[cfg(feature = "stateless")]
+    modern_subscriptions: Arc<ModernSubscriptionRegistry>,
 }
 
 impl SessionHandle {
@@ -1275,6 +1281,21 @@ impl SessionHandle {
     /// Terminates a session by ID, returning `true` if the session existed.
     pub async fn terminate_session(&self, id: &str) -> bool {
         self.store.remove(id).await
+    }
+
+    /// Returns the number of active final-protocol subscription streams.
+    #[cfg(feature = "stateless")]
+    pub fn subscription_count(&self) -> usize {
+        self.modern_subscriptions.len()
+    }
+
+    /// Gracefully finish every active final-protocol subscription stream.
+    ///
+    /// Each stream receives its terminal `SubscriptionsListenResult` before
+    /// closing. Returns the number of streams that were drained.
+    #[cfg(feature = "stateless")]
+    pub fn close_subscriptions(&self) -> usize {
+        self.modern_subscriptions.close_all()
     }
 }
 
@@ -1340,14 +1361,22 @@ struct ModernSubscription {
 /// The 2026-07-28 transport deliberately has no session or replay state.
 /// Each listen POST owns one sender, removed when its response stream drops.
 #[cfg(feature = "stateless")]
-#[derive(Default)]
 struct ModernSubscriptionRegistry {
     next_key: AtomicU64,
     subscriptions: std::sync::Mutex<HashMap<u64, ModernSubscription>>,
+    server_info: Option<Implementation>,
 }
 
 #[cfg(feature = "stateless")]
 impl ModernSubscriptionRegistry {
+    fn new(server_info: Option<Implementation>) -> Self {
+        Self {
+            next_key: AtomicU64::new(0),
+            subscriptions: std::sync::Mutex::new(HashMap::new()),
+            server_info,
+        }
+    }
+
     fn register(
         self: &Arc<Self>,
         subscription_id: RequestId,
@@ -1402,6 +1431,39 @@ impl ModernSubscriptionRegistry {
             !subscription.tx.is_closed()
         });
         true
+    }
+
+    fn len(&self) -> usize {
+        self.subscriptions.lock().unwrap().len()
+    }
+
+    /// Gracefully finish every active HTTP listen stream.
+    fn close_all(&self) -> usize {
+        let subscriptions = {
+            let mut active = self.subscriptions.lock().unwrap();
+            active
+                .drain()
+                .map(|(_, subscription)| subscription)
+                .collect::<Vec<_>>()
+        };
+        let count = subscriptions.len();
+        for subscription in subscriptions {
+            let response = subscription_complete_response(
+                subscription.subscription_id,
+                self.server_info.clone(),
+            );
+            if let Ok(json) = serde_json::to_string(&response) {
+                let _ = subscription.tx.send(json);
+            }
+        }
+        count
+    }
+}
+
+#[cfg(feature = "stateless")]
+impl Default for ModernSubscriptionRegistry {
+    fn default() -> Self {
+        Self::new(None)
     }
 }
 
@@ -2098,7 +2160,14 @@ impl HttpTransport {
 
     fn build_state(&self) -> Arc<AppState> {
         #[cfg(feature = "stateless")]
-        let modern_subscriptions = Arc::new(ModernSubscriptionRegistry::default());
+        let modern_subscriptions = Arc::new(ModernSubscriptionRegistry::new(
+            match &self.service_source {
+                ServiceSource::Router { router, .. } if self.stamp_server_info => {
+                    Some(router.implementation())
+                }
+                _ => None,
+            },
+        ));
 
         // Keep one transport-lifetime notification sender registered with
         // dynamic registries. Per-request senders intentionally are not
@@ -2108,6 +2177,10 @@ impl HttpTransport {
         let service_source = match &self.service_source {
             ServiceSource::Router { router, factory } => {
                 let (tx, mut rx) = notification_channel(256);
+                let direct_subscriptions = modern_subscriptions.clone();
+                router.attach_modern_notification_sink(Arc::new(move |notification| {
+                    direct_subscriptions.publish(notification)
+                }));
                 let subscriptions = modern_subscriptions.clone();
                 tokio::spawn(async move {
                     while let Some(notification) = rx.recv().await {
@@ -2170,8 +2243,8 @@ impl HttpTransport {
         router
     }
 
-    /// Build the axum router and return a [`SessionHandle`] for querying
-    /// session metrics (e.g., active session count).
+    /// Build the axum router and return a [`SessionHandle`] for managing
+    /// sessions and final subscription streams.
     ///
     /// # Example
     ///
@@ -2187,6 +2260,8 @@ impl HttpTransport {
         let state = self.build_state();
         let handle = SessionHandle {
             store: state.sessions.clone(),
+            #[cfg(feature = "stateless")]
+            modern_subscriptions: state.modern_subscriptions.clone(),
         };
 
         spawn_external_notification_fanout(
@@ -2216,12 +2291,14 @@ impl HttpTransport {
     }
 
     /// Build an axum router mounted at a specific path and return a
-    /// [`SessionHandle`] for querying session metrics.
+    /// [`SessionHandle`] for managing sessions and final subscription streams.
     pub fn into_router_at_with_handle(mut self, path: &str) -> (Router, SessionHandle) {
         let external_rx = self.external_notifications.take();
         let state = self.build_state();
         let handle = SessionHandle {
             store: state.sessions.clone(),
+            #[cfg(feature = "stateless")]
+            modern_subscriptions: state.modern_subscriptions.clone(),
         };
 
         spawn_external_notification_fanout(

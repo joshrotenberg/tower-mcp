@@ -212,6 +212,55 @@ async fn subscriptions_listen_requires_notification_filter() {
     assert_eq!(body["error"]["code"], -32602);
 }
 
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn server_gracefully_drains_http_subscription_streams() {
+    let router = router();
+    let publisher = router.clone();
+    let (app, handle) = HttpTransport::new(router)
+        .disable_origin_validation()
+        .disable_host_validation()
+        .into_router_with_handle();
+    let request = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("Mcp-Protocol-Version", "2026-07-28")
+        .header("Mcp-Method", "subscriptions/listen")
+        .body(Body::from(
+            r#"{"jsonrpc":"2.0","id":"graceful-http","method":"subscriptions/listen","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}},"notifications":{"resourceSubscriptions":["file:///wanted"]}}}"#,
+        ))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(handle.subscription_count(), 1);
+    assert!(publisher.notify_resource_updated("file:///ignored"));
+    assert!(publisher.notify_resource_updated("file:///wanted"));
+    assert_eq!(handle.close_subscriptions(), 1);
+    assert_eq!(handle.subscription_count(), 0);
+
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8(bytes.to_vec()).unwrap();
+    let acknowledgment = body
+        .find("notifications/subscriptions/acknowledged")
+        .expect("stream must begin with an acknowledgment");
+    let completion = body
+        .find("\"resultType\":\"complete\"")
+        .expect("stream must end with a graceful result");
+    assert!(acknowledgment < completion);
+    assert!(body.contains("\"id\":\"graceful-http\""));
+    assert!(body.contains("\"io.modelcontextprotocol/subscriptionId\":\"graceful-http\""));
+    assert!(body.contains("\"io.modelcontextprotocol/serverInfo\""));
+    assert!(body.contains("\"name\":\"listen-test-server\""));
+    assert!(body.contains("notifications/resources/updated"));
+    assert!(body.contains("file:///wanted"));
+    assert!(!body.contains("file:///ignored"));
+}
+
 /// Exercise the pure session-fallback branch (no header, session carries version).
 ///
 /// Without final-protocol support compiled in, the legacy routing behavior

@@ -44,12 +44,12 @@ use tower_service::Service;
 
 use crate::error::{Error, Result};
 use crate::jsonrpc::JsonRpcService;
+#[cfg(feature = "stateless")]
+use crate::protocol::{Implementation, SubscriptionFilter, SubscriptionsListenParams};
 use crate::protocol::{
     JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, JsonRpcResponseMessage,
     McpNotification, RequestId, notifications,
 };
-#[cfg(feature = "stateless")]
-use crate::protocol::{SubscriptionFilter, SubscriptionsListenParams};
 use crate::router::{McpRouter, RouterRequest, RouterResponse};
 use crate::transport::service::{CatchError, InjectAnnotations};
 #[cfg(feature = "stateless")]
@@ -111,6 +111,7 @@ fn stdio_control_channel() -> (
 struct StdioSubscriptions {
     active: HashMap<RequestId, SubscriptionFilter>,
     modern_mode: bool,
+    server_info: Option<Implementation>,
 }
 
 #[cfg(feature = "stateless")]
@@ -254,7 +255,7 @@ impl StdioSubscriptions {
             return Ok(None);
         }
         Ok(Some(serde_json::to_string(
-            &subscription_complete_response(request_id.clone()),
+            &subscription_complete_response(request_id.clone(), self.server_info.clone()),
         )?))
     }
 
@@ -536,7 +537,10 @@ impl StdioTransport {
     {
         let mut reader = BufReader::new(reader);
         #[cfg(feature = "stateless")]
-        let mut subscriptions = StdioSubscriptions::default();
+        let mut subscriptions = StdioSubscriptions {
+            server_info: Some(self.router.implementation()),
+            ..StdioSubscriptions::default()
+        };
 
         tracing::info!("Stdio transport started, waiting for input");
 
@@ -1261,7 +1265,10 @@ impl BidirectionalStdioTransport {
         let writer = Arc::new(Mutex::new(writer));
         let mut reader = BufReader::new(reader);
         #[cfg(feature = "stateless")]
-        let mut subscriptions = StdioSubscriptions::default();
+        let mut subscriptions = StdioSubscriptions {
+            server_info: Some(self.router.implementation()),
+            ..StdioSubscriptions::default()
+        };
 
         tracing::info!("Bidirectional stdio transport started, waiting for input");
 

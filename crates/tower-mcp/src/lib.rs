@@ -574,11 +574,12 @@ pub use protocol::{
     SamplingContextCapability, SamplingMessage, SamplingTool, SamplingToolsCapability,
     ServerCapabilities, SetLogLevelParams, SingleSelectEnumSchema, StringSchema,
     SubscribeResourceParams, SubscriptionFilter, SubscriptionsAcknowledgedParams,
-    SubscriptionsListenParams, SubscriptionsListenResult, TaskInfo, TaskObject, TaskRequestParams,
-    TaskStatus, TaskStatusChangedParams, TaskStatusParams, TaskSupportMode, TasksCancelCapability,
-    TasksCapability, TasksListCapability, TasksRequestsCapability, TasksToolsCallCapability,
-    TasksToolsRequestsCapability, ToolAnnotations, ToolChoice, ToolDefinition, ToolExecution,
-    ToolIcon, ToolsCapability, UnsubscribeResourceParams, UpdateTaskParams,
+    SubscriptionsListenParams, SubscriptionsListenResult, SubscriptionsListenResultMeta, TaskInfo,
+    TaskObject, TaskRequestParams, TaskStatus, TaskStatusChangedParams, TaskStatusParams,
+    TaskSupportMode, TasksCancelCapability, TasksCapability, TasksListCapability,
+    TasksRequestsCapability, TasksToolsCallCapability, TasksToolsRequestsCapability,
+    ToolAnnotations, ToolChoice, ToolDefinition, ToolExecution, ToolIcon, ToolsCapability,
+    UnsubscribeResourceParams, UpdateTaskParams,
 };
 pub use protocol::{RESULT_TYPE_TASK, TASKS_EXTENSION_ID};
 #[cfg(feature = "dynamic-tools")]

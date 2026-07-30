@@ -302,6 +302,9 @@ struct AutoInstructionsConfig {
     suffix: Option<String>,
 }
 
+#[cfg(all(feature = "http", feature = "stateless"))]
+type ModernNotificationSink = Arc<dyn Fn(&ServerNotification) -> bool + Send + Sync + 'static>;
+
 /// Inner configuration that is shared across clones
 #[derive(Clone)]
 struct McpRouterInner {
@@ -326,6 +329,12 @@ struct McpRouterInner {
     in_flight: Arc<RwLock<HashMap<RequestId, CancellationToken>>>,
     /// Channel for sending notifications to connected clients
     notification_tx: Option<NotificationSender>,
+    /// Transport-lifetime sink for final HTTP subscription notifications.
+    ///
+    /// The lock is shared across router clones so an application-owned clone
+    /// can publish after the transport attaches its subscription registry.
+    #[cfg(all(feature = "http", feature = "stateless"))]
+    modern_notification_sink: Arc<RwLock<Option<ModernNotificationSink>>>,
     /// Handle for sending requests to the client (for sampling, etc.)
     client_requester: Option<ClientRequesterHandle>,
     /// Task store for async operations
@@ -484,6 +493,8 @@ impl McpRouter {
                 prompts: HashMap::new(),
                 in_flight: Arc::new(RwLock::new(HashMap::new())),
                 notification_tx: None,
+                #[cfg(all(feature = "http", feature = "stateless"))]
+                modern_notification_sink: Arc::new(RwLock::new(None)),
                 client_requester: None,
                 task_store: Arc::new(MemoryTaskStore::new()),
                 subscriptions: Arc::new(RwLock::new(HashSet::new())),
@@ -748,6 +759,14 @@ impl McpRouter {
         }
         inner.notification_tx = Some(tx);
         self
+    }
+
+    /// Attach the transport-lifetime final subscription notification path.
+    #[cfg(all(feature = "http", feature = "stateless"))]
+    pub(crate) fn attach_modern_notification_sink(&self, sink: ModernNotificationSink) {
+        if let Ok(mut active) = self.inner.modern_notification_sink.write() {
+            *active = Some(sink);
+        }
     }
 
     /// Get the notification sender (if configured)
@@ -1731,21 +1750,30 @@ impl McpRouter {
 
     /// Notify clients that a subscribed resource has been updated
     ///
-    /// Only sends the notification if the resource is currently subscribed.
+    /// Legacy sessions receive the notification only after
+    /// `resources/subscribe`. Final HTTP listeners are filtered by their
+    /// `subscriptions/listen` registration.
     /// Returns `true` if the notification was sent.
     pub fn notify_resource_updated(&self, uri: &str) -> bool {
-        // Only notify if the resource is subscribed
-        if !self.is_subscribed(uri) {
-            return false;
+        let notification = ServerNotification::ResourceUpdated {
+            uri: uri.to_string(),
+        };
+        let mut sent = false;
+
+        if self.is_subscribed(uri)
+            && let Some(tx) = &self.inner.notification_tx
+        {
+            sent |= tx.try_send(notification.clone()).is_ok();
         }
 
-        let Some(tx) = &self.inner.notification_tx else {
-            return false;
-        };
-        tx.try_send(ServerNotification::ResourceUpdated {
-            uri: uri.to_string(),
-        })
-        .is_ok()
+        #[cfg(all(feature = "http", feature = "stateless"))]
+        if let Ok(active) = self.inner.modern_notification_sink.read()
+            && let Some(sink) = active.as_ref()
+        {
+            sent |= sink(&notification);
+        }
+
+        sent
     }
 
     /// Notify clients that the list of available resources has changed
