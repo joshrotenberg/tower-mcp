@@ -669,6 +669,47 @@ impl TaskStore for MemoryTaskStore {
     }
 }
 
+/// Build the validated extension declaration for the final Tasks extension.
+///
+/// The SEP-2663 capability shape is an empty object: support is declared by
+/// the identifier's presence, with no settings to negotiate.
+pub fn tasks_extension() -> crate::ExtensionDeclaration {
+    crate::ExtensionDeclaration::empty(crate::protocol::TASKS_EXTENSION_ID)
+        .expect("the built-in Tasks extension declaration is valid")
+}
+
+impl crate::McpRouter {
+    /// Advertise final Tasks support (SEP-2663) from this server.
+    ///
+    /// Compiling the task APIs does not advertise them. A server opts in here,
+    /// and only then does the final protocol path advertise
+    /// `io.modelcontextprotocol/tasks`, accept task-augmented `tools/call`
+    /// requests, or serve the final task methods. Legacy 2025-11-25 task
+    /// behavior is unaffected either way.
+    pub fn with_tasks(self) -> Self {
+        self.with_protocol_extension(tasks_extension())
+    }
+}
+
+impl crate::McpClientBuilder {
+    /// Declare final Tasks support (SEP-2663) from this client.
+    pub fn with_tasks(self) -> Self {
+        self.with_protocol_extension(tasks_extension())
+    }
+}
+
+impl crate::RequestContext {
+    /// Whether both peers negotiated the final Tasks extension.
+    ///
+    /// Task dispatch keys off this rather than off the protocol version: a
+    /// 2026-07-28 request from a client that did not declare the extension
+    /// must not receive a task.
+    pub fn supports_tasks(&self) -> bool {
+        self.negotiated_extensions()
+            .is_some_and(|extensions| extensions.contains(crate::protocol::TASKS_EXTENSION_ID))
+    }
+}
+
 /// Generate ISO 8601 timestamp for current time
 fn chrono_now_iso8601() -> String {
     use std::time::SystemTime;

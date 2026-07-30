@@ -83,6 +83,40 @@ fn is_final_protocol_request(_extensions: &crate::context::Extensions) -> bool {
     false
 }
 
+/// Whether this request's client declared the final Tasks extension.
+///
+/// Final requests carry client capabilities per request, so negotiation is
+/// decided from the request itself rather than from session state.
+#[cfg(feature = "stateless")]
+fn client_declares_tasks(extensions: &crate::context::Extensions) -> bool {
+    final_client_capabilities(extensions).is_some_and(|capabilities| {
+        capabilities.extensions.as_ref().is_some_and(|declared| {
+            declared.contains_key(tower_mcp_types::protocol::TASKS_EXTENSION_ID)
+        })
+    })
+}
+
+#[cfg(not(feature = "stateless"))]
+fn client_declares_tasks(_extensions: &crate::context::Extensions) -> bool {
+    false
+}
+
+/// The client capability shape a server names in a `-32021` when it cannot
+/// service a request without the Tasks extension.
+fn tasks_client_capabilities() -> crate::protocol::ClientCapabilities {
+    crate::protocol::ClientCapabilities {
+        extensions: Some(
+            [(
+                tower_mcp_types::protocol::TASKS_EXTENSION_ID.to_string(),
+                serde_json::json!({}),
+            )]
+            .into_iter()
+            .collect(),
+        ),
+        ..Default::default()
+    }
+}
+
 #[cfg(feature = "stateless")]
 fn final_client_capabilities(
     extensions: &crate::context::Extensions,
@@ -2087,14 +2121,18 @@ impl McpRouter {
 
     /// Return the capability surface appropriate for a protocol version.
     ///
-    /// The implementation has partial Tasks support for the stable sessionful
-    /// lifecycle, but is not yet conformant with final SEP-2663. Do not
-    /// advertise that partial implementation to 2026-07-28 clients.
+    /// `capabilities.tasks` is the legacy 2025-11-25 shape and is never
+    /// advertised on the final path. The final extension is advertised only
+    /// when the server opted in via [`McpRouter::with_tasks`]; merely
+    /// registering task-capable tools does not advertise it, so a server that
+    /// has not opted in presents no Tasks surface to a 2026-07-28 client.
     fn capabilities_for_protocol(&self, protocol_version: Option<&str>) -> ServerCapabilities {
         let mut capabilities = self.capabilities();
         if protocol_version == Some(crate::protocol::PROTOCOL_VERSION_2026_07_28) {
             capabilities.tasks = None;
-            if let Some(extensions) = capabilities.extensions.as_mut() {
+            if !self.final_tasks_enabled()
+                && let Some(extensions) = capabilities.extensions.as_mut()
+            {
                 extensions.remove(tower_mcp_types::protocol::TASKS_EXTENSION_ID);
                 if extensions.is_empty() {
                     capabilities.extensions = None;
@@ -2102,6 +2140,16 @@ impl McpRouter {
             }
         }
         capabilities
+    }
+
+    /// Whether this server opted into the final Tasks extension.
+    ///
+    /// Distinct from the synthesized advertisement in [`Self::capabilities`],
+    /// which reflects registered tools rather than an explicit choice.
+    pub(crate) fn final_tasks_enabled(&self) -> bool {
+        self.inner
+            .protocol_extensions
+            .contains_key(tower_mcp_types::protocol::TASKS_EXTENSION_ID)
     }
 
     /// Effective SEP-2549 cache scope to emit alongside a TTL hint.
@@ -2361,18 +2409,29 @@ impl McpRouter {
                     return Err(filter.denial_error(&params.name));
                 }
 
-                // Required-task tools are absent from final discovery and
-                // behave as nonexistent if called by name. Optional tools
-                // remain available synchronously, but the task augmentation
-                // itself is rejected while final Tasks support is withheld.
+                // On the final path, task behavior follows negotiation rather
+                // than protocol version. A client that did not declare the
+                // extension must never receive a task.
                 if is_final_protocol_request(&extensions) {
-                    if matches!(tool.task_support, TaskSupportMode::Required) {
-                        return Err(Error::JsonRpc(JsonRpcError::method_not_found(&params.name)));
-                    }
-                    if params.task.is_some() {
-                        return Err(Error::JsonRpc(JsonRpcError::invalid_params(
-                            "The Tasks extension is not advertised for protocol version 2026-07-28",
-                        )));
+                    let tasks_negotiated =
+                        self.final_tasks_enabled() && client_declares_tasks(&extensions);
+
+                    if !tasks_negotiated {
+                        if matches!(tool.task_support, TaskSupportMode::Required) {
+                            // The server cannot service this tool without a
+                            // task, so say which capability is missing instead
+                            // of hiding the tool.
+                            return Err(Error::JsonRpc(
+                                JsonRpcError::missing_required_client_capability(
+                                    tasks_client_capabilities(),
+                                ),
+                            ));
+                        }
+                        if params.task.is_some() {
+                            return Err(Error::JsonRpc(JsonRpcError::invalid_params(
+                                "The Tasks extension was not negotiated for this request",
+                            )));
+                        }
                     }
                 }
 
@@ -3465,6 +3524,134 @@ mod tests {
         extensions
     }
 
+    fn tasks_client_extensions() -> Extensions {
+        final_extensions(ClientCapabilities {
+            extensions: Some(
+                [(TASKS_EXTENSION_ID.to_string(), serde_json::json!({}))]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn final_tasks_require_server_opt_in_and_client_declaration() {
+        let tool = || {
+            ToolBuilder::new("optional_task")
+                .task_support(TaskSupportMode::Optional)
+                .handler(|input: AddInput| async move {
+                    Ok(CallToolResult::text(format!("{}", input.a + input.b)))
+                })
+                .build()
+        };
+        let task_params = |task| CallToolParams {
+            name: "optional_task".to_string(),
+            arguments: serde_json::json!({"a": 1, "b": 2}),
+            input_responses: None,
+            request_state: None,
+            meta: None,
+            task,
+        };
+
+        // Registering a task-capable tool is not an opt-in: a server that
+        // never called `with_tasks` advertises nothing on the final path and
+        // still refuses the augmentation even to a declaring client.
+        let implicit = McpRouter::new().tool(tool());
+        let McpResponse::Discover(result) = implicit
+            .handle(
+                RequestId::Number(1),
+                McpRequest::Discover(DiscoverParams::default()),
+                Extensions::new(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("Expected Discover response");
+        };
+        assert!(
+            result
+                .capabilities
+                .extensions
+                .as_ref()
+                .is_none_or(|extensions| !extensions.contains_key(TASKS_EXTENSION_ID))
+        );
+        let error = implicit
+            .handle(
+                RequestId::Number(2),
+                McpRequest::CallTool(task_params(Some(TaskRequestParams { ttl: None }))),
+                tasks_client_extensions(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::JsonRpc(e) if e.code == -32602));
+
+        // Opting in advertises the extension.
+        let router = McpRouter::new().tool(tool()).with_tasks();
+        let McpResponse::Discover(result) = router
+            .handle(
+                RequestId::Number(3),
+                McpRequest::Discover(DiscoverParams::default()),
+                Extensions::new(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("Expected Discover response");
+        };
+        assert!(
+            result
+                .capabilities
+                .extensions
+                .as_ref()
+                .is_some_and(|extensions| extensions.contains_key(TASKS_EXTENSION_ID)),
+            "with_tasks() must advertise the extension on the final path"
+        );
+        assert!(
+            result.capabilities.tasks.is_none(),
+            "the legacy capability shape is never advertised on the final path"
+        );
+
+        // A client that did not declare the extension still gets no task.
+        let error = router
+            .handle(
+                RequestId::Number(4),
+                McpRequest::CallTool(task_params(Some(TaskRequestParams { ttl: None }))),
+                final_extensions(ClientCapabilities::default()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::JsonRpc(e) if e.code == -32602),
+            "server opt-in alone must not be enough"
+        );
+
+        // Both sides declared: the augmentation is accepted.
+        let response = router
+            .handle(
+                RequestId::Number(5),
+                McpRequest::CallTool(task_params(Some(TaskRequestParams { ttl: None }))),
+                tasks_client_extensions(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(response, McpResponse::CreateTask(_)),
+            "a negotiated request must receive a task, got {response:?}"
+        );
+
+        // An unaugmented call on the same tool stays synchronous.
+        let response = router
+            .handle(
+                RequestId::Number(6),
+                McpRequest::CallTool(task_params(None)),
+                tasks_client_extensions(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(response, McpResponse::CallTool(_)));
+    }
+
     #[test]
     fn router_advertises_only_locally_declared_protocol_extensions() {
         let router = McpRouter::new().with_protocol_extension(
@@ -3707,8 +3894,9 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, Error::JsonRpc(error) if error.code == -32602));
 
-        // A required-task tool was hidden from discovery, so direct calls
-        // behave as though the tool does not exist.
+        // A required-task tool cannot run without a task, so the server names
+        // the capability the client is missing rather than pretending the tool
+        // does not exist.
         let error = router
             .handle(
                 RequestId::Number(3),
@@ -3724,7 +3912,15 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(error, Error::JsonRpc(error) if error.code == -32601));
+        let Error::JsonRpc(error) = error else {
+            panic!("expected a JSON-RPC error");
+        };
+        assert_eq!(error.code, -32021);
+        assert_eq!(
+            error.data.as_ref().unwrap()["requiredCapabilities"]["extensions"]["io.modelcontextprotocol/tasks"],
+            serde_json::json!({}),
+            "the error must name the extension the client needs to declare"
+        );
 
         let task_requests = [
             McpRequest::GetTaskInfo(GetTaskInfoParams {
