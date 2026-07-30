@@ -120,6 +120,24 @@ fn decode_input_responses(
         .collect()
 }
 
+/// The authenticated principal for this request, if any.
+///
+/// Sourced from the OAuth `sub` claim that the HTTP and WebSocket transports
+/// bridge into MCP extensions. Without the `oauth` feature there is no
+/// principal, so tasks are unowned and behave as they did before ownership
+/// existed.
+#[cfg(feature = "oauth")]
+fn request_principal(extensions: &crate::context::Extensions) -> Option<String> {
+    extensions
+        .get::<crate::oauth::token::TokenClaims>()
+        .and_then(|claims| claims.sub.clone())
+}
+
+#[cfg(not(feature = "oauth"))]
+fn request_principal(_extensions: &crate::context::Extensions) -> Option<String> {
+    None
+}
+
 /// Error for a task the server cannot serve.
 ///
 /// Unknown and expired tasks are deliberately indistinguishable, so a caller
@@ -2195,6 +2213,36 @@ impl McpRouter {
         }
     }
 
+    /// Verify the caller may act on this task.
+    ///
+    /// A task the caller does not own is reported exactly as an unknown task.
+    /// Distinguishing the two would confirm that an ID is real, which is the
+    /// thing unguessable IDs exist to prevent.
+    async fn authorize_task(
+        &self,
+        task_id: &str,
+        extensions: &crate::context::Extensions,
+    ) -> Result<()> {
+        let owner = self
+            .inner
+            .task_store
+            .task_owner(task_id)
+            .await
+            .map_err(task_store_error)?
+            .ok_or_else(|| Error::JsonRpc(unknown_task_error(task_id)))?;
+
+        if crate::async_task::owner_matches(&owner, request_principal(extensions).as_deref()) {
+            Ok(())
+        } else {
+            tracing::debug!(
+                target: "mcp::tasks",
+                task_id = %task_id,
+                "task operation refused: principal does not own the task"
+            );
+            Err(Error::JsonRpc(unknown_task_error(task_id)))
+        }
+    }
+
     /// Serve a final `tasks/get` as a status-discriminated `DetailedTask`.
     async fn final_get_task(&self, task_id: &str) -> Result<McpResponse> {
         let (task, result, error) = self
@@ -2572,7 +2620,12 @@ impl McpRouter {
                     let (task_id, cancellation_token) = self
                         .inner
                         .task_store
-                        .create_task(&params.name, params.arguments.clone(), task_params.ttl)
+                        .create_task(
+                            &params.name,
+                            params.arguments.clone(),
+                            task_params.ttl,
+                            request_principal(&extensions),
+                        )
                         .await
                         .map_err(task_store_error)?;
 
@@ -3166,8 +3219,10 @@ impl McpRouter {
             McpRequest::GetTaskInfo(params) => {
                 if is_final_protocol_request(&extensions) {
                     self.require_negotiated_tasks(&extensions, "tasks/get")?;
+                    self.authorize_task(&params.task_id, &extensions).await?;
                     return self.final_get_task(&params.task_id).await;
                 }
+                self.authorize_task(&params.task_id, &extensions).await?;
 
                 // SEP-2663 DetailedTask: `tasks/get` carries the
                 // status-discriminated payload inline. `completed` includes
@@ -3207,6 +3262,7 @@ impl McpRouter {
             McpRequest::UpdateTask(params) => {
                 if is_final_protocol_request(&extensions) {
                     self.require_negotiated_tasks(&extensions, "tasks/update")?;
+                    self.authorize_task(&params.task_id, &extensions).await?;
                     // Partial responses are the normal case: the store
                     // consumes what matches an outstanding request and ignores
                     // unknown, already-answered, and superseded keys.
@@ -3223,6 +3279,8 @@ impl McpRouter {
                         crate::tasks::TaskAcknowledgement::new(),
                     ));
                 }
+
+                self.authorize_task(&params.task_id, &extensions).await?;
 
                 // SEP-2663 `tasks/update`: validate the task exists and
                 // acknowledge with an empty result. tower-mcp does not yet
@@ -3249,6 +3307,7 @@ impl McpRouter {
             McpRequest::CancelTask(params) => {
                 if is_final_protocol_request(&extensions) {
                     self.require_negotiated_tasks(&extensions, "tasks/cancel")?;
+                    self.authorize_task(&params.task_id, &extensions).await?;
                     // The final ack does not require a terminal transition:
                     // cancelling an already-terminal task is acknowledged, and
                     // the observable status is polled via `tasks/get`.
@@ -3262,6 +3321,8 @@ impl McpRouter {
                         crate::tasks::TaskAcknowledgement::new(),
                     ));
                 }
+
+                self.authorize_task(&params.task_id, &extensions).await?;
 
                 // First check if the task exists and is not already terminal
                 let current = self
@@ -3920,6 +3981,136 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, Error::JsonRpc(e) if e.code == -32601));
+    }
+
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn task_operations_are_bound_to_the_creating_principal() {
+        fn as_principal(subject: &str) -> Extensions {
+            let mut extensions = tasks_client_extensions();
+            extensions.insert(crate::oauth::token::TokenClaims {
+                sub: Some(subject.to_string()),
+                iss: None,
+                aud: None,
+                exp: None,
+                scope: None,
+                client_id: None,
+                extra: HashMap::new(),
+            });
+            extensions
+        }
+
+        let router = McpRouter::new()
+            .tool(
+                ToolBuilder::new("optional_task")
+                    .task_support(TaskSupportMode::Optional)
+                    .handler(|input: AddInput| async move {
+                        Ok(CallToolResult::text(format!("{}", input.a + input.b)))
+                    })
+                    .build(),
+            )
+            .with_tasks();
+
+        let McpResponse::FinalCreateTask(created) = router
+            .handle(
+                RequestId::Number(1),
+                McpRequest::CallTool(CallToolParams {
+                    name: "optional_task".to_string(),
+                    arguments: serde_json::json!({"a": 1, "b": 2}),
+                    input_responses: None,
+                    request_state: None,
+                    meta: None,
+                    task: Some(TaskRequestParams { ttl: None }),
+                }),
+                as_principal("alice"),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("Expected a final create-task response");
+        };
+        let task_id = created.task.metadata.task_id.clone();
+
+        // The owner is served normally.
+        assert!(
+            router
+                .handle(
+                    RequestId::Number(2),
+                    McpRequest::GetTaskInfo(GetTaskInfoParams {
+                        task_id: task_id.clone(),
+                        meta: None,
+                    }),
+                    as_principal("alice"),
+                )
+                .await
+                .is_ok()
+        );
+
+        // Knowing the ID is not authority. Every operation is refused for a
+        // different principal, and for one that dropped its token.
+        for (id, label, context) in [
+            (3, "another principal", as_principal("bob")),
+            (4, "no principal", tasks_client_extensions()),
+        ] {
+            for (offset, request) in [
+                McpRequest::GetTaskInfo(GetTaskInfoParams {
+                    task_id: task_id.clone(),
+                    meta: None,
+                }),
+                McpRequest::UpdateTask(UpdateTaskParams {
+                    task_id: task_id.clone(),
+                    input_responses: HashMap::new(),
+                    meta: None,
+                }),
+                McpRequest::CancelTask(CancelTaskParams {
+                    task_id: task_id.clone(),
+                    reason: None,
+                    meta: None,
+                }),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let error = router
+                    .handle(
+                        RequestId::Number(id * 10 + offset as i64),
+                        request,
+                        context.clone(),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(error, Error::JsonRpc(ref e) if e.code == -32602),
+                    "{label} was served: {error:?}"
+                );
+                // The refusal must be indistinguishable from an unknown task,
+                // or it confirms the ID is real.
+                let Error::JsonRpc(error) = error else {
+                    unreachable!()
+                };
+                assert!(
+                    error.message.contains("not found"),
+                    "refusal leaked that the task exists: {}",
+                    error.message
+                );
+            }
+        }
+
+        // The task survived every refused operation.
+        assert!(
+            router
+                .handle(
+                    RequestId::Number(9),
+                    McpRequest::GetTaskInfo(GetTaskInfoParams {
+                        task_id: task_id.clone(),
+                        meta: None,
+                    }),
+                    as_principal("alice"),
+                )
+                .await
+                .is_ok(),
+            "a refused cancel must not have cancelled the task"
+        );
     }
 
     #[test]
@@ -5172,15 +5363,25 @@ mod tests {
             tool_name: &str,
             arguments: serde_json::Value,
             ttl: Option<u64>,
+            owner: crate::async_task::TaskOwner,
         ) -> crate::async_task::Result<(String, crate::async_task::CancellationToken)> {
             self.creates
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.inner.create_task(tool_name, arguments, ttl).await
+            self.inner
+                .create_task(tool_name, arguments, ttl, owner)
+                .await
         }
 
         async fn get_task(&self, task_id: &str) -> crate::async_task::Result<Option<TaskObject>> {
             self.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.inner.get_task(task_id).await
+        }
+
+        async fn task_owner(
+            &self,
+            task_id: &str,
+        ) -> crate::async_task::Result<Option<crate::async_task::TaskOwner>> {
+            self.inner.task_owner(task_id).await
         }
 
         async fn get_task_result(

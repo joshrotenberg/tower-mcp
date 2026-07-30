@@ -74,6 +74,11 @@ pub struct Task {
     /// message string. A tool that returns `CallToolResult { isError: true }`
     /// is a *completed* task carrying an error result, so it never sets this.
     pub error: Option<JsonRpcError>,
+    /// Principal that created the task, or `None` when it was created
+    /// without an authenticated context.
+    ///
+    /// Never serialized: ownership is an authorization fact, not wire state.
+    pub owner: TaskOwner,
     /// Input requests currently awaiting a client response, keyed as sent.
     pub input_requests: InputRequests,
     /// Keys answered by a previous `tasks/update`.
@@ -91,7 +96,13 @@ pub struct Task {
 
 impl Task {
     /// Create a new task
-    fn new(id: String, tool_name: String, arguments: serde_json::Value, ttl: Option<u64>) -> Self {
+    fn new(
+        id: String,
+        tool_name: String,
+        arguments: serde_json::Value,
+        ttl: Option<u64>,
+        owner: TaskOwner,
+    ) -> Self {
         let cancelled = Arc::new(AtomicBool::new(false));
         let now_str = chrono_now_iso8601();
         Self {
@@ -107,6 +118,7 @@ impl Task {
             status_message: Some("Task started".to_string()),
             result: None,
             error: None,
+            owner,
             input_requests: InputRequests::new(),
             answered_input_keys: BTreeSet::new(),
             superseded_input_keys: BTreeSet::new(),
@@ -173,6 +185,26 @@ pub fn generate_task_id() -> String {
         let _ = write!(id, "{byte:02x}");
     }
     id
+}
+
+/// The principal a task belongs to.
+///
+/// `None` means the task was created without an authenticated context, which
+/// is the normal case for a server with no authentication configured.
+///
+/// SEP-2663 notes that a task ID can behave as a bearer token. Recording the
+/// owner is what stops the ID from being sufficient authority on its own once
+/// a second principal learns it.
+pub type TaskOwner = Option<String>;
+
+/// Whether `principal` may act on a task owned by `owner`.
+///
+/// Matching is equality, not "protect owned tasks and leave unowned ones
+/// open". An unowned task can only exist if it was created with no
+/// authenticated context, so a request that now carries a principal is a
+/// different security context and is refused.
+pub fn owner_matches(owner: &TaskOwner, principal: Option<&str>) -> bool {
+    owner.as_deref() == principal
 }
 
 /// Outcome of applying `tasks/update.inputResponses` to a task.
@@ -270,15 +302,25 @@ pub type TaskSnapshot = (TaskObject, Option<CallToolResult>, Option<JsonRpcError
 ///   trait.
 #[async_trait]
 pub trait TaskStore: Send + Sync + 'static {
-    /// Create and store a new task.
+    /// Create and store a new task owned by `owner`.
     ///
     /// Returns the task ID and a cancellation token for the spawned work.
+    /// `owner` is the authenticated principal responsible for the task, or
+    /// `None` when the request carried no authenticated context.
     async fn create_task(
         &self,
         tool_name: &str,
         arguments: serde_json::Value,
         ttl: Option<u64>,
+        owner: TaskOwner,
     ) -> Result<(String, CancellationToken)>;
+
+    /// Read a task's owner.
+    ///
+    /// The outer `Option` distinguishes a known task from an unknown or
+    /// expired one; the inner [`TaskOwner`] distinguishes an owned task from
+    /// one created without an authenticated principal.
+    async fn task_owner(&self, task_id: &str) -> Result<Option<TaskOwner>>;
 
     /// Get task object by ID. Returns `None` if unknown.
     async fn get_task(&self, task_id: &str) -> Result<Option<TaskObject>>;
@@ -427,9 +469,10 @@ impl TaskStore for MemoryTaskStore {
         tool_name: &str,
         arguments: serde_json::Value,
         ttl: Option<u64>,
+        owner: TaskOwner,
     ) -> Result<(String, CancellationToken)> {
         let id = generate_task_id();
-        let task = Task::new(id.clone(), tool_name.to_string(), arguments, ttl);
+        let task = Task::new(id.clone(), tool_name.to_string(), arguments, ttl, owner);
         let token = task.cancellation_token.clone();
 
         if let Ok(mut tasks) = self.tasks.write() {
@@ -445,6 +488,17 @@ impl TaskStore for MemoryTaskStore {
                 .get(task_id)
                 .filter(|t| !t.is_expired())
                 .map(|t| t.to_task_object())
+        } else {
+            None
+        })
+    }
+
+    async fn task_owner(&self, task_id: &str) -> Result<Option<TaskOwner>> {
+        Ok(if let Ok(tasks) = self.tasks.read() {
+            tasks
+                .get(task_id)
+                .filter(|t| !t.is_expired())
+                .map(|t| t.owner.clone())
         } else {
             None
         })
@@ -783,7 +837,7 @@ mod tests {
     async fn test_create_task() {
         let store = MemoryTaskStore::new();
         let (id, token) = store
-            .create_task("test-tool", serde_json::json!({"a": 1}), None)
+            .create_task("test-tool", serde_json::json!({"a": 1}), None, None)
             .await
             .unwrap();
 
@@ -803,7 +857,7 @@ mod tests {
     async fn test_task_lifecycle() {
         let store = MemoryTaskStore::new();
         let (id, _) = store
-            .create_task("test-tool", serde_json::json!({}), None)
+            .create_task("test-tool", serde_json::json!({}), None, None)
             .await
             .unwrap();
 
@@ -823,7 +877,7 @@ mod tests {
     async fn test_task_cancellation() {
         let store = MemoryTaskStore::new();
         let (id, token) = store
-            .create_task("test-tool", serde_json::json!({}), None)
+            .create_task("test-tool", serde_json::json!({}), None, None)
             .await
             .unwrap();
 
@@ -845,7 +899,7 @@ mod tests {
     async fn test_task_failure() {
         let store = MemoryTaskStore::new();
         let (id, _) = store
-            .create_task("test-tool", serde_json::json!({}), None)
+            .create_task("test-tool", serde_json::json!({}), None, None)
             .await
             .unwrap();
 
@@ -865,15 +919,15 @@ mod tests {
     async fn test_list_tasks() {
         let store = MemoryTaskStore::new();
         store
-            .create_task("tool1", serde_json::json!({}), None)
+            .create_task("tool1", serde_json::json!({}), None, None)
             .await
             .unwrap();
         store
-            .create_task("tool2", serde_json::json!({}), None)
+            .create_task("tool2", serde_json::json!({}), None, None)
             .await
             .unwrap();
         let (id3, _) = store
-            .create_task("tool3", serde_json::json!({}), None)
+            .create_task("tool3", serde_json::json!({}), None, None)
             .await
             .unwrap();
 
@@ -900,7 +954,7 @@ mod tests {
     async fn test_terminal_state_immutable() {
         let store = MemoryTaskStore::new();
         let (id, _) = store
-            .create_task("test-tool", serde_json::json!({}), None)
+            .create_task("test-tool", serde_json::json!({}), None, None)
             .await
             .unwrap();
 
@@ -927,15 +981,15 @@ mod tests {
     async fn test_task_ids_unique() {
         let store = MemoryTaskStore::new();
         let (id1, _) = store
-            .create_task("tool", serde_json::json!({}), None)
+            .create_task("tool", serde_json::json!({}), None, None)
             .await
             .unwrap();
         let (id2, _) = store
-            .create_task("tool", serde_json::json!({}), None)
+            .create_task("tool", serde_json::json!({}), None, None)
             .await
             .unwrap();
         let (id3, _) = store
-            .create_task("tool", serde_json::json!({}), None)
+            .create_task("tool", serde_json::json!({}), None, None)
             .await
             .unwrap();
 
@@ -948,7 +1002,7 @@ mod tests {
     async fn test_get_task_result() {
         let store = MemoryTaskStore::new();
         let (id, _) = store
-            .create_task("test-tool", serde_json::json!({}), None)
+            .create_task("test-tool", serde_json::json!({}), None, None)
             .await
             .unwrap();
 
@@ -966,7 +1020,7 @@ mod tests {
     async fn test_wait_for_completion_returns_terminal_snapshot() {
         let store = MemoryTaskStore::new();
         let (id, _) = store
-            .create_task("test-tool", serde_json::json!({}), None)
+            .create_task("test-tool", serde_json::json!({}), None, None)
             .await
             .unwrap();
 
@@ -993,7 +1047,7 @@ mod tests {
         // Compile-time check that TaskStore is object-safe.
         let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
         let (id, _) = store
-            .create_task("tool", serde_json::json!({}), None)
+            .create_task("tool", serde_json::json!({}), None, None)
             .await
             .unwrap();
         assert!(store.get_task(&id).await.unwrap().is_some());
@@ -1050,7 +1104,7 @@ mod tests {
 
     async fn working_task(store: &MemoryTaskStore, ttl: Option<u64>) -> String {
         store
-            .create_task("tool", serde_json::json!({}), ttl)
+            .create_task("tool", serde_json::json!({}), ttl, None)
             .await
             .unwrap()
             .0
@@ -1319,6 +1373,57 @@ mod tests {
         );
         assert!(result.unwrap().is_error);
         assert!(error.is_none(), "no JSON-RPC error accompanies isError");
+    }
+
+    #[tokio::test]
+    async fn tasks_record_their_creating_principal() {
+        let store = MemoryTaskStore::new();
+        let (owned, _) = store
+            .create_task("tool", serde_json::json!({}), None, Some("alice".into()))
+            .await
+            .unwrap();
+        let (unowned, _) = store
+            .create_task("tool", serde_json::json!({}), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.task_owner(&owned).await.unwrap(),
+            Some(Some("alice".to_string()))
+        );
+        assert_eq!(store.task_owner(&unowned).await.unwrap(), Some(None));
+        assert_eq!(
+            store.task_owner("does-not-exist").await.unwrap(),
+            None,
+            "an unknown task has no owner record at all"
+        );
+
+        // Ownership is an authorization fact and must not reach the wire.
+        let wire = serde_json::to_value(store.get_task(&owned).await.unwrap().unwrap()).unwrap();
+        assert!(
+            wire.get("owner").is_none(),
+            "owner leaked to the wire: {wire}"
+        );
+        assert!(!wire.to_string().contains("alice"));
+    }
+
+    #[test]
+    fn owner_matching_is_equality_not_leniency() {
+        assert!(owner_matches(&None, None), "no auth configured");
+        assert!(owner_matches(&Some("alice".into()), Some("alice")));
+
+        assert!(
+            !owner_matches(&Some("alice".into()), Some("bob")),
+            "a different principal must not inherit the task"
+        );
+        assert!(
+            !owner_matches(&Some("alice".into()), None),
+            "dropping the token must not grant access"
+        );
+        assert!(
+            !owner_matches(&None, Some("alice")),
+            "an unowned task belongs to a different security context"
+        );
     }
 
     #[tokio::test]
