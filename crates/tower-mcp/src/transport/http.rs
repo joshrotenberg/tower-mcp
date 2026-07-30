@@ -277,6 +277,10 @@ use crate::router::{McpRouter, RouterRequest, RouterResponse};
 use crate::transport::service::{
     CatchError, InjectAnnotations, McpBoxService, ServiceFactory, identity_factory,
 };
+#[cfg(feature = "stateless")]
+use crate::transport::subscriptions::{
+    accepted_subscription_filter, subscription_matches, tagged_subscription_notification,
+};
 use crate::{ProtocolSupport, ProtocolSupportError};
 use tower::util::BoxCloneService;
 
@@ -1400,43 +1404,6 @@ impl Drop for ModernSubscriptionGuard {
             .unwrap()
             .remove(&self.key);
     }
-}
-
-#[cfg(feature = "stateless")]
-fn subscription_matches(notification: &ServerNotification, filter: &SubscriptionFilter) -> bool {
-    match notification {
-        ServerNotification::ToolsListChanged => filter.tools_list_changed == Some(true),
-        ServerNotification::PromptsListChanged => filter.prompts_list_changed == Some(true),
-        ServerNotification::ResourcesListChanged => filter.resources_list_changed == Some(true),
-        ServerNotification::ResourceUpdated { uri } => filter
-            .resource_subscriptions
-            .as_ref()
-            .is_some_and(|subscriptions| subscriptions.iter().any(|item| item == uri)),
-        _ => false,
-    }
-}
-
-#[cfg(feature = "stateless")]
-fn tagged_subscription_notification(
-    notification: &ServerNotification,
-    subscription_id: &RequestId,
-) -> Option<String> {
-    let json = crate::transport::stdio::serialize_notification(notification)?;
-    let mut value: serde_json::Value = serde_json::from_str(&json).ok()?;
-    let object = value.as_object_mut()?;
-    let params = object
-        .entry("params")
-        .or_insert_with(|| serde_json::json!({}))
-        .as_object_mut()?;
-    let meta = params
-        .entry("_meta")
-        .or_insert_with(|| serde_json::json!({}))
-        .as_object_mut()?;
-    meta.insert(
-        "io.modelcontextprotocol/subscriptionId".to_string(),
-        serde_json::to_value(subscription_id).ok()?,
-    );
-    serde_json::to_string(&value).ok()
 }
 
 /// Configuration for OAuth 2.1 Protected Resource Metadata.
@@ -3712,16 +3679,6 @@ fn stateless_sse_with_notifications(
                 .text("ping"),
         )
         .into_response()
-}
-
-#[cfg(feature = "stateless")]
-fn accepted_subscription_filter(requested: SubscriptionFilter) -> SubscriptionFilter {
-    SubscriptionFilter {
-        tools_list_changed: requested.tools_list_changed.filter(|enabled| *enabled),
-        prompts_list_changed: requested.prompts_list_changed.filter(|enabled| *enabled),
-        resources_list_changed: requested.resources_list_changed.filter(|enabled| *enabled),
-        resource_subscriptions: requested.resource_subscriptions,
-    }
 }
 
 /// Serve the final, sessionless `subscriptions/listen` protocol over its

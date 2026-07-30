@@ -24,13 +24,17 @@
 //! [`StdioTransport`] and [`BidirectionalStdioTransport`] automatically set up
 //! notification channels and forward server notifications (progress, logging,
 //! resource/tool/prompt list changes) to stdout as JSON-RPC notifications.
+//! Once a final `subscriptions/listen` request is accepted, list and resource
+//! change notifications use final subscription filtering and ID tagging for
+//! the rest of that stream; they are not also broadcast in the legacy
+//! untagged form.
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::context::{
     ChannelClientRequester, ClientRequesterHandle, NotificationReceiver, OutgoingRequest,
@@ -44,13 +48,226 @@ use crate::protocol::{
     JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, JsonRpcResponseMessage,
     McpNotification, RequestId, notifications,
 };
+#[cfg(feature = "stateless")]
+use crate::protocol::{SubscriptionFilter, SubscriptionsListenParams};
 use crate::router::{McpRouter, RouterRequest, RouterResponse};
 use crate::transport::service::{CatchError, InjectAnnotations};
+#[cfg(feature = "stateless")]
+use crate::transport::subscriptions::{
+    accepted_subscription_filter, subscription_acknowledgment, subscription_complete_response,
+    subscription_matches, tagged_subscription_notification,
+};
 use crate::{ProtocolSupport, ProtocolSupportError};
 
 // ============================================================================
 // Shared helpers
 // ============================================================================
+
+enum StdioControl {
+    #[cfg(feature = "stateless")]
+    CloseSubscription(RequestId),
+    Shutdown,
+}
+
+/// Cloneable control handle for an asynchronous stdio server.
+///
+/// The handle can gracefully finish one final-protocol subscription without
+/// closing the shared stdio channel, or gracefully finish every active
+/// subscription and stop the transport.
+#[derive(Clone)]
+pub struct StdioTransportHandle {
+    control_tx: mpsc::UnboundedSender<StdioControl>,
+}
+
+impl StdioTransportHandle {
+    /// Gracefully finish one active `subscriptions/listen` request.
+    ///
+    /// The transport writes a `SubscriptionsListenResult` for `request_id`.
+    /// Unknown or already-finished IDs are harmless.
+    #[cfg(feature = "stateless")]
+    pub fn close_subscription(&self, request_id: RequestId) -> Result<()> {
+        self.control_tx
+            .send(StdioControl::CloseSubscription(request_id))
+            .map_err(|_| Error::Transport("stdio transport is not running".to_string()))
+    }
+
+    /// Gracefully finish all subscriptions and stop the stdio transport.
+    pub fn shutdown(&self) -> Result<()> {
+        self.control_tx
+            .send(StdioControl::Shutdown)
+            .map_err(|_| Error::Transport("stdio transport is not running".to_string()))
+    }
+}
+
+fn stdio_control_channel() -> (
+    mpsc::UnboundedSender<StdioControl>,
+    mpsc::UnboundedReceiver<StdioControl>,
+) {
+    mpsc::unbounded_channel()
+}
+
+#[cfg(feature = "stateless")]
+#[derive(Default)]
+struct StdioSubscriptions {
+    active: HashMap<RequestId, SubscriptionFilter>,
+    modern_mode: bool,
+}
+
+#[cfg(feature = "stateless")]
+enum StdioSubscriptionInput {
+    NotHandled,
+    Handled(Vec<String>),
+}
+
+#[cfg(feature = "stateless")]
+impl StdioSubscriptions {
+    fn handle_input<S>(
+        &mut self,
+        service: &JsonRpcService<S>,
+        parsed: &serde_json::Value,
+    ) -> Result<StdioSubscriptionInput> {
+        let method = parsed.get("method").and_then(serde_json::Value::as_str);
+
+        if method == Some(notifications::CANCELLED) && parsed.get("id").is_none() {
+            let notification: JsonRpcNotification = match serde_json::from_value(parsed.clone()) {
+                Ok(notification) => notification,
+                Err(_) => return Ok(StdioSubscriptionInput::NotHandled),
+            };
+            let Ok(McpNotification::Cancelled(params)) =
+                McpNotification::from_jsonrpc(&notification)
+            else {
+                return Ok(StdioSubscriptionInput::NotHandled);
+            };
+            if let Some(request_id) = params.request_id
+                && self.active.remove(&request_id).is_some()
+            {
+                tracing::debug!(?request_id, "Cancelled stdio subscription");
+                return Ok(StdioSubscriptionInput::Handled(Vec::new()));
+            }
+            return Ok(StdioSubscriptionInput::NotHandled);
+        }
+
+        if method != Some("subscriptions/listen") || parsed.get("id").is_none() {
+            return Ok(StdioSubscriptionInput::NotHandled);
+        }
+
+        let claims_modern = parsed
+            .pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
+            .is_some();
+        if !claims_modern {
+            return Ok(StdioSubscriptionInput::NotHandled);
+        }
+
+        let request: JsonRpcRequest = match serde_json::from_value(parsed.clone()) {
+            Ok(request) => request,
+            Err(error) => {
+                let response = parse_error_response(error.to_string());
+                return Ok(StdioSubscriptionInput::Handled(vec![
+                    serde_json::to_string(&response)?,
+                ]));
+            }
+        };
+        let request_id = request.id.clone();
+        if let Err(error) = service.validate_request_protocol(&request) {
+            let response = JsonRpcResponse::error(Some(request_id), error);
+            return Ok(StdioSubscriptionInput::Handled(vec![
+                serde_json::to_string(&response)?,
+            ]));
+        }
+
+        let params = request
+            .params
+            .clone()
+            .ok_or_else(|| {
+                crate::error::JsonRpcError::invalid_params("subscriptions/listen requires params")
+            })
+            .and_then(|value| {
+                serde_json::from_value::<SubscriptionsListenParams>(value)
+                    .map_err(|error| crate::error::JsonRpcError::invalid_params(error.to_string()))
+            });
+        let params = match params {
+            Ok(params) => params,
+            Err(error) => {
+                let response = JsonRpcResponse::error(Some(request_id), error);
+                return Ok(StdioSubscriptionInput::Handled(vec![
+                    serde_json::to_string(&response)?,
+                ]));
+            }
+        };
+        let Some(requested) = params.notifications else {
+            let response = JsonRpcResponse::error(
+                Some(request_id),
+                crate::error::JsonRpcError::invalid_params(
+                    "subscriptions/listen requires a notifications filter",
+                ),
+            );
+            return Ok(StdioSubscriptionInput::Handled(vec![
+                serde_json::to_string(&response)?,
+            ]));
+        };
+        if self.active.contains_key(&request_id) {
+            let response = JsonRpcResponse::error(
+                Some(request_id),
+                crate::error::JsonRpcError::invalid_request(
+                    "subscription request id is already active",
+                ),
+            );
+            return Ok(StdioSubscriptionInput::Handled(vec![
+                serde_json::to_string(&response)?,
+            ]));
+        }
+
+        let accepted = accepted_subscription_filter(requested);
+        let acknowledgment = subscription_acknowledgment(request_id.clone(), accepted.clone());
+        let acknowledgment = serde_json::to_string(&acknowledgment)?;
+        self.modern_mode = true;
+        self.active.insert(request_id, accepted);
+        Ok(StdioSubscriptionInput::Handled(vec![acknowledgment]))
+    }
+
+    /// Route a subscription-scoped notification and suppress its untagged
+    /// form whenever at least one final subscription is active.
+    fn route_notification(&self, notification: &ServerNotification) -> Option<Vec<String>> {
+        if !self.modern_mode
+            || !matches!(
+                notification,
+                ServerNotification::ResourceUpdated { .. }
+                    | ServerNotification::ResourcesListChanged
+                    | ServerNotification::ToolsListChanged
+                    | ServerNotification::PromptsListChanged
+            )
+        {
+            return None;
+        }
+
+        Some(
+            self.active
+                .iter()
+                .filter(|(_, filter)| subscription_matches(notification, filter))
+                .filter_map(|(id, _)| tagged_subscription_notification(notification, id))
+                .collect(),
+        )
+    }
+
+    fn close(&mut self, request_id: &RequestId) -> Result<Option<String>> {
+        if self.active.remove(request_id).is_none() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::to_string(
+            &subscription_complete_response(request_id.clone()),
+        )?))
+    }
+
+    fn close_all(&mut self) -> Result<Vec<String>> {
+        let ids: Vec<_> = self.active.keys().cloned().collect();
+        ids.into_iter()
+            .map(|id| {
+                self.close(&id)?
+                    .ok_or_else(|| Error::Internal("active subscription disappeared".to_string()))
+            })
+            .collect()
+    }
+}
 
 /// Strip an optional UTF-8 BOM, then trim whitespace.
 ///
@@ -191,18 +408,31 @@ pub struct StdioTransport {
     service: JsonRpcService<McpRouter>,
     router: McpRouter,
     notification_rx: NotificationReceiver,
+    control_tx: mpsc::UnboundedSender<StdioControl>,
+    control_rx: mpsc::UnboundedReceiver<StdioControl>,
 }
 
 impl StdioTransport {
     /// Create a new stdio transport wrapping an MCP router
     pub fn new(router: McpRouter) -> Self {
         let (notif_tx, notification_rx) = notification_channel(256);
+        let (control_tx, control_rx) = stdio_control_channel();
         let router = router.with_notification_sender(notif_tx);
         let service = JsonRpcService::new(router.clone());
         Self {
             service,
             router,
             notification_rx,
+            control_tx,
+            control_rx,
+        }
+    }
+
+    /// Return a cloneable handle for graceful subscription closure or server
+    /// shutdown while [`Self::run`] is active.
+    pub fn handle(&self) -> StdioTransportHandle {
+        StdioTransportHandle {
+            control_tx: self.control_tx.clone(),
         }
     }
 
@@ -273,8 +503,12 @@ impl StdioTransport {
         let annotations = self.router.tool_annotations_map();
         let wrapped = layer.layer(self.router);
         let service = InjectAnnotations::new(CatchError::new(wrapped), annotations);
-        GenericStdioTransport::with_notifications(service, self.notification_rx)
-            .protocol_support(protocol_support)
+        GenericStdioTransport {
+            service: JsonRpcService::new(service).protocol_support(protocol_support),
+            notification_rx: Some(self.notification_rx),
+            control_tx: self.control_tx,
+            control_rx: self.control_rx,
+        }
     }
 
     /// Run the transport, processing messages until EOF or error
@@ -301,6 +535,8 @@ impl StdioTransport {
         W: tokio::io::AsyncWrite + Unpin + Send,
     {
         let mut reader = BufReader::new(reader);
+        #[cfg(feature = "stateless")]
+        let mut subscriptions = StdioSubscriptions::default();
 
         tracing::info!("Stdio transport started, waiting for input");
 
@@ -327,6 +563,22 @@ impl StdioTransport {
 
                     tracing::debug!(input = %trimmed, "Received message");
 
+                    #[cfg(feature = "stateless")]
+                    {
+                        let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
+                            Ok(parsed) => parsed,
+                            Err(_) => serde_json::Value::Null,
+                        };
+                        if let StdioSubscriptionInput::Handled(frames) =
+                            subscriptions.handle_input(&self.service, &parsed)?
+                        {
+                            for frame in frames {
+                                write_line_to_stdout(&mut writer, &frame).await?;
+                            }
+                            continue;
+                        }
+                    }
+
                     match process_line(&mut self.service, &self.router, trimmed).await {
                         Ok(Some(response)) => {
                             let response_json = serde_json::to_string(&response).map_err(|e| {
@@ -351,9 +603,35 @@ impl StdioTransport {
 
                 // Forward server notifications to stdout
                 Some(notification) = self.notification_rx.recv() => {
+                    #[cfg(feature = "stateless")]
+                    if let Some(frames) = subscriptions.route_notification(&notification) {
+                        for json in frames {
+                            tracing::debug!(output = %json, "Sending subscription notification");
+                            write_line_to_stdout(&mut writer, &json).await?;
+                        }
+                        continue;
+                    }
                     if let Some(json) = serialize_notification(&notification) {
                         tracing::debug!(output = %json, "Sending notification");
                         write_line_to_stdout(&mut writer, &json).await?;
+                    }
+                }
+
+                Some(control) = self.control_rx.recv() => {
+                    match control {
+                        #[cfg(feature = "stateless")]
+                        StdioControl::CloseSubscription(request_id) => {
+                            if let Some(json) = subscriptions.close(&request_id)? {
+                                write_line_to_stdout(&mut writer, &json).await?;
+                            }
+                        }
+                        StdioControl::Shutdown => {
+                            #[cfg(feature = "stateless")]
+                            for json in subscriptions.close_all()? {
+                                write_line_to_stdout(&mut writer, &json).await?;
+                            }
+                            break;
+                        }
                     }
                 }
             }
@@ -417,6 +695,8 @@ where
 {
     service: JsonRpcService<S>,
     notification_rx: Option<NotificationReceiver>,
+    control_tx: mpsc::UnboundedSender<StdioControl>,
+    control_rx: mpsc::UnboundedReceiver<StdioControl>,
 }
 
 impl<S> GenericStdioTransport<S>
@@ -436,9 +716,12 @@ where
     /// notifications (progress, logging, list changes) will not reach the client.
     /// Use [`GenericStdioTransport::with_notifications`] instead to enable them.
     pub fn new(service: S) -> Self {
+        let (control_tx, control_rx) = stdio_control_channel();
         Self {
             service: JsonRpcService::new(service),
             notification_rx: None,
+            control_tx,
+            control_rx,
         }
     }
 
@@ -450,9 +733,20 @@ where
     ///
     /// [`notification_channel()`]: crate::context::notification_channel
     pub fn with_notifications(service: S, notification_rx: NotificationReceiver) -> Self {
+        let (control_tx, control_rx) = stdio_control_channel();
         Self {
             service: JsonRpcService::new(service),
             notification_rx: Some(notification_rx),
+            control_tx,
+            control_rx,
+        }
+    }
+
+    /// Return a cloneable handle for graceful subscription closure or server
+    /// shutdown while [`Self::run`] is active.
+    pub fn handle(&self) -> StdioTransportHandle {
+        StdioTransportHandle {
+            control_tx: self.control_tx.clone(),
         }
     }
 
@@ -494,6 +788,8 @@ where
         W: tokio::io::AsyncWrite + Unpin + Send,
     {
         let mut reader = BufReader::new(reader);
+        #[cfg(feature = "stateless")]
+        let mut subscriptions = StdioSubscriptions::default();
 
         tracing::info!("Generic stdio transport started, waiting for input");
 
@@ -513,28 +809,72 @@ where
                             break;
                         }
 
-                        Self::process_input(&mut self.service, &line, &mut writer).await?;
+                        Self::process_input(
+                            &mut self.service,
+                            &line,
+                            &mut writer,
+                            true,
+                            #[cfg(feature = "stateless")]
+                            &mut subscriptions,
+                        ).await?;
                     }
 
                     Some(notification) = notif_rx.recv() => {
+                        #[cfg(feature = "stateless")]
+                        if let Some(frames) = subscriptions.route_notification(&notification) {
+                            for json in frames {
+                                tracing::debug!(output = %json, "Sending subscription notification");
+                                write_line_to_stdout(&mut writer, &json).await?;
+                            }
+                            continue;
+                        }
                         if let Some(json) = serialize_notification(&notification) {
                             tracing::debug!(output = %json, "Sending notification");
                             write_line_to_stdout(&mut writer, &json).await?;
                         }
                     }
+
+                    Some(control) = self.control_rx.recv() => {
+                        if Self::handle_control(
+                            control,
+                            &mut writer,
+                            #[cfg(feature = "stateless")]
+                            &mut subscriptions,
+                        ).await? {
+                            break;
+                        }
+                    }
                 }
             } else {
-                let bytes_read = reader
-                    .read_line(&mut line)
-                    .await
-                    .map_err(|e| Error::Transport(format!("Failed to read from stdin: {}", e)))?;
-
-                if bytes_read == 0 {
-                    tracing::info!("Stdin closed, shutting down");
-                    break;
+                tokio::select! {
+                    result = reader.read_line(&mut line) => {
+                        let bytes_read = result.map_err(|e| {
+                            Error::Transport(format!("Failed to read from stdin: {}", e))
+                        })?;
+                        if bytes_read == 0 {
+                            tracing::info!("Stdin closed, shutting down");
+                            break;
+                        }
+                        Self::process_input(
+                            &mut self.service,
+                            &line,
+                            &mut writer,
+                            false,
+                            #[cfg(feature = "stateless")]
+                            &mut subscriptions,
+                        ).await?;
+                    }
+                    Some(control) = self.control_rx.recv() => {
+                        if Self::handle_control(
+                            control,
+                            &mut writer,
+                            #[cfg(feature = "stateless")]
+                            &mut subscriptions,
+                        ).await? {
+                            break;
+                        }
+                    }
                 }
-
-                Self::process_input(&mut self.service, &line, &mut writer).await?;
             }
         }
 
@@ -545,6 +885,8 @@ where
         service: &mut JsonRpcService<S>,
         line: &str,
         writer: &mut W,
+        subscriptions_enabled: bool,
+        #[cfg(feature = "stateless")] subscriptions: &mut StdioSubscriptions,
     ) -> Result<()>
     where
         W: tokio::io::AsyncWrite + Unpin + Send,
@@ -564,6 +906,19 @@ where
                 return Ok(());
             }
         };
+
+        #[cfg(feature = "stateless")]
+        if subscriptions_enabled
+            && let StdioSubscriptionInput::Handled(frames) =
+                subscriptions.handle_input(service, &parsed)?
+        {
+            for frame in frames {
+                write_line_to_stdout(writer, &frame).await?;
+            }
+            return Ok(());
+        }
+        #[cfg(not(feature = "stateless"))]
+        let _ = subscriptions_enabled;
 
         if parsed.get("id").is_none() {
             // Notification - log and ignore since we don't have router access
@@ -597,6 +952,34 @@ where
             }
         }
         Ok(())
+    }
+
+    async fn handle_control<W>(
+        control: StdioControl,
+        writer: &mut W,
+        #[cfg(feature = "stateless")] subscriptions: &mut StdioSubscriptions,
+    ) -> Result<bool>
+    where
+        W: tokio::io::AsyncWrite + Unpin + Send,
+    {
+        #[cfg(not(feature = "stateless"))]
+        let _ = &mut *writer;
+        match control {
+            #[cfg(feature = "stateless")]
+            StdioControl::CloseSubscription(request_id) => {
+                if let Some(json) = subscriptions.close(&request_id)? {
+                    write_line_to_stdout(writer, &json).await?;
+                }
+                Ok(false)
+            }
+            StdioControl::Shutdown => {
+                #[cfg(feature = "stateless")]
+                for json in subscriptions.close_all()? {
+                    write_line_to_stdout(writer, &json).await?;
+                }
+                Ok(true)
+            }
+        }
     }
 
     async fn write_error<W>(
@@ -782,6 +1165,8 @@ pub struct BidirectionalStdioTransport {
     pending_requests: Arc<Mutex<HashMap<RequestId, PendingRequest>>>,
     /// Channel for receiving server notifications to forward to the client
     notification_rx: NotificationReceiver,
+    control_tx: mpsc::UnboundedSender<StdioControl>,
+    control_rx: mpsc::UnboundedReceiver<StdioControl>,
 }
 
 impl BidirectionalStdioTransport {
@@ -792,6 +1177,7 @@ impl BidirectionalStdioTransport {
             Arc::new(ChannelClientRequester::new(request_tx));
 
         let (notif_tx, notification_rx) = notification_channel(256);
+        let (control_tx, control_rx) = stdio_control_channel();
         let router = router
             .with_notification_sender(notif_tx)
             .with_client_requester(client_requester.clone());
@@ -805,6 +1191,16 @@ impl BidirectionalStdioTransport {
             client_requester,
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             notification_rx,
+            control_tx,
+            control_rx,
+        }
+    }
+
+    /// Return a cloneable handle for graceful subscription closure or server
+    /// shutdown while [`Self::run`] is active.
+    pub fn handle(&self) -> StdioTransportHandle {
+        StdioTransportHandle {
+            control_tx: self.control_tx.clone(),
         }
     }
 
@@ -864,6 +1260,8 @@ impl BidirectionalStdioTransport {
     {
         let writer = Arc::new(Mutex::new(writer));
         let mut reader = BufReader::new(reader);
+        #[cfg(feature = "stateless")]
+        let mut subscriptions = StdioSubscriptions::default();
 
         tracing::info!("Bidirectional stdio transport started, waiting for input");
 
@@ -887,7 +1285,12 @@ impl BidirectionalStdioTransport {
                         continue;
                     }
 
-                    self.handle_incoming_message(trimmed, writer.clone()).await?;
+                    self.handle_incoming_message(
+                        trimmed,
+                        writer.clone(),
+                        #[cfg(feature = "stateless")]
+                        &mut subscriptions,
+                    ).await?;
                 }
 
                 // Handle outgoing requests to send to the client
@@ -897,9 +1300,35 @@ impl BidirectionalStdioTransport {
 
                 // Forward server notifications to the client
                 Some(notification) = self.notification_rx.recv() => {
+                    #[cfg(feature = "stateless")]
+                    if let Some(frames) = subscriptions.route_notification(&notification) {
+                        for json in frames {
+                            tracing::debug!(output = %json, "Sending subscription notification");
+                            self.write_line(&json, writer.clone()).await?;
+                        }
+                        continue;
+                    }
                     if let Some(json) = serialize_notification(&notification) {
                         tracing::debug!(output = %json, "Sending notification");
                         self.write_line(&json, writer.clone()).await?;
+                    }
+                }
+
+                Some(control) = self.control_rx.recv() => {
+                    match control {
+                        #[cfg(feature = "stateless")]
+                        StdioControl::CloseSubscription(request_id) => {
+                            if let Some(json) = subscriptions.close(&request_id)? {
+                                self.write_line(&json, writer.clone()).await?;
+                            }
+                        }
+                        StdioControl::Shutdown => {
+                            #[cfg(feature = "stateless")]
+                            for json in subscriptions.close_all()? {
+                                self.write_line(&json, writer.clone()).await?;
+                            }
+                            break;
+                        }
                     }
                 }
             }
@@ -909,7 +1338,12 @@ impl BidirectionalStdioTransport {
     }
 
     /// Handle an incoming message from stdin
-    async fn handle_incoming_message<W>(&mut self, line: &str, writer: Arc<Mutex<W>>) -> Result<()>
+    async fn handle_incoming_message<W>(
+        &mut self,
+        line: &str,
+        writer: Arc<Mutex<W>>,
+        #[cfg(feature = "stateless")] subscriptions: &mut StdioSubscriptions,
+    ) -> Result<()>
     where
         W: tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
@@ -931,6 +1365,16 @@ impl BidirectionalStdioTransport {
             && (parsed.get("result").is_some() || parsed.get("error").is_some())
         {
             return self.handle_response(&parsed).await;
+        }
+
+        #[cfg(feature = "stateless")]
+        if let StdioSubscriptionInput::Handled(frames) =
+            subscriptions.handle_input(&self.service, &parsed)?
+        {
+            for frame in frames {
+                self.write_line(&frame, writer.clone()).await?;
+            }
+            return Ok(());
         }
 
         // Check if it's a notification (no id field)

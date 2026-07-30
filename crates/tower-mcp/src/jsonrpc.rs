@@ -131,6 +131,27 @@ impl<S> JsonRpcService<S> {
         &self.protocol_support
     }
 
+    /// Validate the lifecycle metadata on a request without dispatching it.
+    ///
+    /// Long-lived transport-owned requests such as `subscriptions/listen`
+    /// need to be accepted by the binding before they reach the ordinary
+    /// request/response router. Keeping this validation here ensures those
+    /// transport paths honor the same runtime protocol allow-list and modern
+    /// metadata rules as [`Self::call_single`].
+    #[cfg(feature = "stateless")]
+    pub(crate) fn validate_request_protocol(
+        &self,
+        req: &JsonRpcRequest,
+    ) -> std::result::Result<Option<String>, JsonRpcError> {
+        req.validate()?;
+        let mut extensions = self.extensions.clone();
+        let protocol_support = extensions
+            .get::<ProtocolSupport>()
+            .cloned()
+            .unwrap_or_else(|| self.protocol_support.clone());
+        prepare_modern_request(req, &mut extensions, &protocol_support)
+    }
+
     /// Process a single JSON-RPC request
     pub async fn call_single(&mut self, req: JsonRpcRequest) -> Result<JsonRpcResponse>
     where

@@ -363,6 +363,459 @@ async fn stdio_runtime_protocol_allow_list_is_exact() {
 }
 
 #[cfg(feature = "stateless")]
+fn subscription_router() -> McpRouter {
+    let emit = ToolBuilder::new("emit_changes")
+        .description("Emit every core subscription-scoped notification")
+        .extractor_handler((), |ctx: Context, RawArgs(_): RawArgs| async move {
+            ctx.notify_tools_list_changed();
+            ctx.notify_prompts_list_changed();
+            ctx.notify_resources_list_changed();
+            ctx.notify_resource_updated("file:///watched");
+            Ok(CallToolResult::text("emitted"))
+        })
+        .build();
+    McpRouter::new()
+        .server_info("stdio-subscription-test", "0.0.0")
+        .tool(emit)
+}
+
+/// Final subscriptions share stdout, preserve numeric/string IDs verbatim,
+/// filter every delivered notification, and distinguish silent client
+/// cancellation from graceful server closure.
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn stdio_multiplexes_and_gracefully_closes_final_subscriptions() {
+    let mut transport = StdioTransport::new(subscription_router());
+    let control = transport.handle();
+    let (server_stdin_writer, server_stdin) = tokio::io::duplex(32 * 1024);
+    let (server_stdout, server_stdout_reader) = tokio::io::duplex(32 * 1024);
+    let transport_task = tokio::spawn(async move {
+        transport
+            .run_with_streams(server_stdin, server_stdout)
+            .await
+    });
+    let mut writer = server_stdin_writer;
+    let mut reader = BufReader::new(server_stdout_reader);
+    let version = tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION;
+
+    let tools_listen = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "tools-sub",
+        "method": "subscriptions/listen",
+        "params": {
+            "_meta": final_meta(version),
+            "notifications": {
+                "toolsListChanged": true,
+                "promptsListChanged": false
+            }
+        }
+    });
+    writer
+        .write_all(format!("{tools_listen}\n").as_bytes())
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+    let tools_ack = timeout(Duration::from_secs(2), read_frame(&mut reader))
+        .await
+        .expect("tools subscription acknowledgment");
+    assert_eq!(
+        tools_ack["method"],
+        "notifications/subscriptions/acknowledged"
+    );
+    assert_eq!(
+        tools_ack["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+        "tools-sub"
+    );
+    assert_eq!(
+        tools_ack["params"]["notifications"]["toolsListChanged"],
+        true
+    );
+    assert!(
+        tools_ack["params"]["notifications"]
+            .get("promptsListChanged")
+            .is_none(),
+        "false filters must be omitted from the honored filter: {tools_ack}"
+    );
+
+    let resources_listen = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 22,
+        "method": "subscriptions/listen",
+        "params": {
+            "_meta": final_meta(version),
+            "notifications": {
+                "promptsListChanged": true,
+                "resourcesListChanged": true,
+                "resourceSubscriptions": ["file:///watched"]
+            }
+        }
+    });
+    writer
+        .write_all(format!("{resources_listen}\n").as_bytes())
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+    let resources_ack = timeout(Duration::from_secs(2), read_frame(&mut reader))
+        .await
+        .expect("resources subscription acknowledgment");
+    assert_eq!(
+        resources_ack["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+        22
+    );
+
+    let emit = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {
+            "name": "emit_changes",
+            "arguments": {},
+            "_meta": final_meta(version)
+        }
+    });
+    writer
+        .write_all(format!("{emit}\n").as_bytes())
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+
+    let mut first_delivery = Vec::new();
+    for _ in 0..5 {
+        first_delivery.push(
+            timeout(Duration::from_secs(2), read_frame(&mut reader))
+                .await
+                .expect("first subscription delivery"),
+        );
+    }
+    assert!(first_delivery.iter().any(|frame| frame["id"] == 3));
+    let delivered: Vec<_> = first_delivery
+        .iter()
+        .filter(|frame| frame.get("method").is_some())
+        .collect();
+    assert_eq!(
+        delivered.len(),
+        4,
+        "unexpected delivery: {first_delivery:#?}"
+    );
+    for frame in delivered {
+        let method = frame["method"].as_str().unwrap();
+        let id = &frame["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"];
+        match method {
+            "notifications/tools/list_changed" => assert_eq!(id, "tools-sub"),
+            "notifications/prompts/list_changed"
+            | "notifications/resources/list_changed"
+            | "notifications/resources/updated" => assert_eq!(id, 22),
+            _ => panic!("unexpected subscription notification: {frame}"),
+        }
+    }
+
+    // Client cancellation is silent and removes only the named subscription.
+    let cancel = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": {"requestId": "tools-sub"}
+    });
+    let emit_again = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "tools/call",
+        "params": {
+            "name": "emit_changes",
+            "arguments": {},
+            "_meta": final_meta(version)
+        }
+    });
+    writer
+        .write_all(format!("{cancel}\n{emit_again}\n").as_bytes())
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+
+    let mut after_cancel = Vec::new();
+    for _ in 0..4 {
+        after_cancel.push(
+            timeout(Duration::from_secs(2), read_frame(&mut reader))
+                .await
+                .expect("delivery after cancellation"),
+        );
+    }
+    assert!(after_cancel.iter().any(|frame| frame["id"] == 4));
+    assert!(
+        after_cancel
+            .iter()
+            .filter(|frame| frame.get("method").is_some())
+            .all(|frame| {
+                frame["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"]
+                    == serde_json::json!(22)
+            })
+    );
+
+    // Server closure returns the complete result but leaves stdout usable.
+    control
+        .close_subscription(tower_mcp::RequestId::Number(22))
+        .unwrap();
+    let complete = timeout(Duration::from_secs(2), read_frame(&mut reader))
+        .await
+        .expect("graceful subscription result");
+    assert_eq!(complete["id"], 22);
+    assert_eq!(complete["result"]["resultType"], "complete");
+    assert_eq!(
+        complete["result"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+        22
+    );
+
+    let list = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "tools/list",
+        "params": {"_meta": final_meta(version)}
+    });
+    writer
+        .write_all(format!("{list}\n").as_bytes())
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+    let list_response = timeout(Duration::from_secs(2), read_frame(&mut reader))
+        .await
+        .expect("shared channel remains usable");
+    assert_eq!(list_response["id"], 5);
+
+    // Whole-server shutdown drains every remaining subscription result.
+    let shutdown_listen = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "shutdown-sub",
+        "method": "subscriptions/listen",
+        "params": {
+            "_meta": final_meta(version),
+            "notifications": {"toolsListChanged": true}
+        }
+    });
+    writer
+        .write_all(format!("{shutdown_listen}\n").as_bytes())
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+    let shutdown_ack = timeout(Duration::from_secs(2), read_frame(&mut reader))
+        .await
+        .expect("shutdown subscription acknowledgment");
+    assert_eq!(
+        shutdown_ack["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+        "shutdown-sub"
+    );
+    control.shutdown().unwrap();
+    let shutdown_result = timeout(Duration::from_secs(2), read_frame(&mut reader))
+        .await
+        .expect("shutdown drains subscription result");
+    assert_eq!(shutdown_result["id"], "shutdown-sub");
+    assert_eq!(shutdown_result["result"]["resultType"], "complete");
+
+    transport_task
+        .await
+        .expect("transport task join")
+        .expect("run_with_streams ok");
+}
+
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn stdio_subscription_validation_uses_runtime_protocol_policy() {
+    let mut transport =
+        StdioTransport::new(subscription_router()).protocol_support(ProtocolSupport::stable());
+    let (mut server_stdin_writer, server_stdin) = tokio::io::duplex(8192);
+    let (server_stdout, server_stdout_reader) = tokio::io::duplex(8192);
+    let handle = tokio::spawn(async move {
+        transport
+            .run_with_streams(server_stdin, server_stdout)
+            .await
+    });
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "subscriptions/listen",
+        "params": {
+            "_meta": final_meta(tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION),
+            "notifications": {"toolsListChanged": true}
+        }
+    });
+    server_stdin_writer
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .unwrap();
+    drop(server_stdin_writer);
+
+    let frames = read_n_frames(BufReader::new(server_stdout_reader), 1).await;
+    handle
+        .await
+        .expect("transport task join")
+        .expect("run_with_streams ok");
+    assert_eq!(frames[0]["id"], 9);
+    assert_eq!(frames[0]["error"]["code"], -32022);
+    assert_eq!(
+        frames[0]["error"]["data"]["requested"],
+        tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION
+    );
+}
+
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn stdio_subscription_requires_final_metadata_and_filter() {
+    let mut transport = StdioTransport::new(subscription_router());
+    let (mut server_stdin_writer, server_stdin) = tokio::io::duplex(8192);
+    let (server_stdout, server_stdout_reader) = tokio::io::duplex(8192);
+    let handle = tokio::spawn(async move {
+        transport
+            .run_with_streams(server_stdin, server_stdout)
+            .await
+    });
+    let version = tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION;
+    let missing_filter = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "subscriptions/listen",
+        "params": {"_meta": final_meta(version)}
+    });
+    let missing_capabilities = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 11,
+        "method": "subscriptions/listen",
+        "params": {
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": version
+            },
+            "notifications": {"toolsListChanged": true}
+        }
+    });
+    let legacy_shape = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 12,
+        "method": "subscriptions/listen",
+        "params": {"notifications": {"toolsListChanged": true}}
+    });
+    server_stdin_writer
+        .write_all(format!("{missing_filter}\n{missing_capabilities}\n{legacy_shape}\n").as_bytes())
+        .await
+        .unwrap();
+    drop(server_stdin_writer);
+
+    let frames = read_n_frames(BufReader::new(server_stdout_reader), 3).await;
+    handle
+        .await
+        .expect("transport task join")
+        .expect("run_with_streams ok");
+    assert_eq!(frames[0]["id"], 10);
+    assert_eq!(frames[0]["error"]["code"], -32602);
+    assert_eq!(frames[1]["id"], 11);
+    assert_eq!(frames[1]["error"]["code"], -32602);
+    assert_eq!(frames[2]["id"], 12);
+    assert_eq!(
+        frames[2]["error"]["code"], -32600,
+        "claimless listen must remain on the legacy lifecycle and fail before initialize"
+    );
+    assert!(
+        frames.iter().all(|frame| frame.get("method").is_none()),
+        "invalid listens must not be acknowledged: {frames:#?}"
+    );
+}
+
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn middleware_wrapped_stdio_preserves_subscription_routing() {
+    let mut transport =
+        StdioTransport::new(subscription_router()).layer(tower::layer::util::Identity::new());
+    let control = transport.handle();
+    let (mut server_stdin_writer, server_stdin) = tokio::io::duplex(8192);
+    let (server_stdout, server_stdout_reader) = tokio::io::duplex(8192);
+    let task = tokio::spawn(async move {
+        transport
+            .run_with_streams(server_stdin, server_stdout)
+            .await
+    });
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "layered",
+        "method": "subscriptions/listen",
+        "params": {
+            "_meta": final_meta(tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION),
+            "notifications": {"toolsListChanged": true}
+        }
+    });
+    server_stdin_writer
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .unwrap();
+    server_stdin_writer.flush().await.unwrap();
+    let mut reader = BufReader::new(server_stdout_reader);
+    let ack = timeout(Duration::from_secs(2), read_frame(&mut reader))
+        .await
+        .expect("layered subscription acknowledgment");
+    assert_eq!(
+        ack["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+        "layered"
+    );
+
+    control
+        .close_subscription(tower_mcp::RequestId::String("layered".to_string()))
+        .unwrap();
+    let complete = timeout(Duration::from_secs(2), read_frame(&mut reader))
+        .await
+        .expect("layered graceful result");
+    assert_eq!(complete["id"], "layered");
+    assert_eq!(complete["result"]["resultType"], "complete");
+    control.shutdown().unwrap();
+    task.await
+        .expect("transport task join")
+        .expect("run_with_streams ok");
+}
+
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn bidi_stdio_preserves_subscription_routing() {
+    let mut transport = BidirectionalStdioTransport::new(subscription_router());
+    let control = transport.handle();
+    let (mut server_stdin_writer, server_stdin) = tokio::io::duplex(8192);
+    let (server_stdout, server_stdout_reader) = tokio::io::duplex(8192);
+    let task = tokio::spawn(async move {
+        transport
+            .run_with_streams(server_stdin, server_stdout)
+            .await
+    });
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 71,
+        "method": "subscriptions/listen",
+        "params": {
+            "_meta": final_meta(tower_mcp::protocol::EXPERIMENTAL_PROTOCOL_VERSION),
+            "notifications": {"toolsListChanged": true}
+        }
+    });
+    server_stdin_writer
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .unwrap();
+    server_stdin_writer.flush().await.unwrap();
+    let mut reader = BufReader::new(server_stdout_reader);
+    let ack = timeout(Duration::from_secs(2), read_frame(&mut reader))
+        .await
+        .expect("bidirectional subscription acknowledgment");
+    assert_eq!(
+        ack["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+        71
+    );
+
+    control
+        .close_subscription(tower_mcp::RequestId::Number(71))
+        .unwrap();
+    let complete = timeout(Duration::from_secs(2), read_frame(&mut reader))
+        .await
+        .expect("bidirectional graceful result");
+    assert_eq!(complete["id"], 71);
+    assert_eq!(complete["result"]["resultType"], "complete");
+    control.shutdown().unwrap();
+    task.await
+        .expect("transport task join")
+        .expect("run_with_streams ok");
+}
+
+#[cfg(feature = "stateless")]
 #[tokio::test]
 async fn bidi_final_handlers_cannot_initiate_client_requests() {
     let mut transport = BidirectionalStdioTransport::new(modern_router());

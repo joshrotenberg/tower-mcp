@@ -8,6 +8,9 @@
 
 pub mod stdio;
 
+#[cfg(feature = "stateless")]
+mod subscriptions;
+
 #[cfg(feature = "http")]
 pub mod http;
 
@@ -27,7 +30,8 @@ pub mod service;
 
 pub use service::{CatchError, InjectAnnotations};
 pub use stdio::{
-    BidirectionalStdioTransport, GenericStdioTransport, StdioTransport, SyncStdioTransport,
+    BidirectionalStdioTransport, GenericStdioTransport, StdioTransport, StdioTransportHandle,
+    SyncStdioTransport,
 };
 
 #[cfg(feature = "http")]
