@@ -1250,6 +1250,7 @@ async fn discover_oauth_metadata_from_server_url(server_url: &str) -> Result<ser
     // 2025-03-26 endpoint fallback: construct endpoints directly from origin
     tracing::info!("Using 2025-03-26 endpoint fallback");
     Ok(serde_json::json!({
+        "issuer": origin,
         "authorization_endpoint": format!("{}/authorize", origin),
         "token_endpoint": format!("{}/token", origin),
         "registration_endpoint": format!("{}/register", origin),
