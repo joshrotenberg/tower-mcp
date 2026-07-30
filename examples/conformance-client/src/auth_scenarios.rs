@@ -6,9 +6,10 @@
 
 use anyhow::{Context, Result};
 use tower_mcp::{
-    HttpClientConfig, HttpClientTransport, OAuthAuthorizationServerMetadata,
+    HttpClientConfig, HttpClientTransport, OAuthAuthorizationServerMetadata, OAuthClientError,
     OAuthClientRegistration, OAuthClientRegistrationOptions, OAuthDynamicClientRegistration,
-    resolve_oauth_client_registration,
+    OAuthScopeEscalationConfig, OAuthScopeEscalationHandler, OAuthScopeEscalationRequest,
+    TokenProvider, resolve_oauth_client_registration,
 };
 
 use crate::handlers;
@@ -16,6 +17,56 @@ use crate::handlers;
 struct OAuthFlowResult {
     access_token: String,
     requested_scope: Option<String>,
+}
+
+struct ConformanceScopeTokenProvider {
+    token: tokio::sync::RwLock<String>,
+    server_url: String,
+    context: Option<serde_json::Value>,
+}
+
+#[async_trait::async_trait]
+impl TokenProvider for ConformanceScopeTokenProvider {
+    async fn get_token(&self) -> std::result::Result<String, OAuthClientError> {
+        Ok(self.token.read().await.clone())
+    }
+}
+
+#[async_trait::async_trait]
+impl OAuthScopeEscalationHandler for ConformanceScopeTokenProvider {
+    async fn reauthorize(
+        &self,
+        request: OAuthScopeEscalationRequest,
+    ) -> std::result::Result<(), OAuthClientError> {
+        let requested_scope = request.requested_scopes.join(" ");
+        let flow = perform_oauth_flow(&self.server_url, &self.context, Some(&requested_scope))
+            .await
+            .map_err(|error| OAuthClientError::ScopeEscalation(error.to_string()))?;
+        *self.token.write().await = flow.access_token;
+        Ok(())
+    }
+}
+
+fn scope_aware_transport(
+    server_url: &str,
+    context: &Option<serde_json::Value>,
+    flow: OAuthFlowResult,
+    max_attempts: usize,
+) -> HttpClientTransport {
+    let initial_scopes = flow
+        .requested_scope
+        .as_deref()
+        .into_iter()
+        .flat_map(str::split_ascii_whitespace);
+    let config = OAuthScopeEscalationConfig::new(initial_scopes).max_attempts(max_attempts);
+    HttpClientTransport::new(server_url).with_scope_aware_token_provider(
+        ConformanceScopeTokenProvider {
+            token: tokio::sync::RwLock::new(flow.access_token),
+            server_url: server_url.to_string(),
+            context: context.clone(),
+        },
+        config,
+    )
 }
 
 /// Standard OAuth authorization-code flow.
@@ -43,141 +94,55 @@ pub async fn authorization_server_migration(
     run_authed_client(server_url, &second.access_token).await
 }
 
-/// Scope step-up: connect, try tools, re-auth on failure, retry.
+/// Scope step-up through the reusable challenge-driven HTTP policy.
 pub async fn scope_step_up(server_url: &str, context: &Option<serde_json::Value>) -> Result<()> {
-    let initial_flow = perform_oauth_flow(server_url, context, None).await?;
-    let access_token = &initial_flow.access_token;
-
-    let transport = HttpClientTransport::new(server_url).bearer_token(access_token);
+    let flow = perform_oauth_flow(server_url, context, None).await?;
+    let transport = scope_aware_transport(server_url, context, flow, 2);
     let client = crate::core_scenarios::client_builder()?
         .connect(transport, handlers::BasicHandler)
         .await?;
 
     crate::core_scenarios::activate(&client).await?;
-
-    // Try listing/calling tools -- may fail with 403 at any point
-    let mut needs_reauth = false;
-
-    let tools_result = client.list_tools().await;
-    let tools = match tools_result {
-        Ok(t) => Some(t),
-        Err(e) => {
-            let err_str = e.to_string();
-
-            if err_str.contains("403") || err_str.contains("insufficient_scope") {
-                tracing::info!("Got 403/insufficient_scope on list_tools, will re-authenticate");
-                needs_reauth = true;
-                None
-            } else {
-                return Err(e.into());
-            }
-        }
-    };
-
-    if let Some(tools) = &tools {
+    let outcome: Result<()> = async {
+        let tools = client.list_tools().await?;
         for tool in &tools.tools {
             let args = crate::core_scenarios::build_tool_arguments(&tool.input_schema);
-            match client.call_tool(&tool.name, args).await {
-                Ok(_) => {}
-                Err(e) => {
-                    let err_str = e.to_string();
-                    if err_str.contains("403") || err_str.contains("insufficient_scope") {
-                        tracing::info!(
-                            "Got 403/insufficient_scope on call_tool, will re-authenticate"
-                        );
-                        needs_reauth = true;
-                        break;
-                    }
-                    return Err(e.into());
-                }
-            }
+            client.call_tool(&tool.name, args).await?;
         }
+        Ok(())
     }
-
-    client.shutdown().await?;
-
-    if needs_reauth {
-        // Probe the server with the old token to get the required scope from 403 WWW-Authenticate
-        let escalated_scope = probe_for_scope(server_url, access_token).await;
-        tracing::info!(scope = ?escalated_scope, "Escalated scope from 403 probe");
-
-        // Re-authenticate with escalated scope
-        let union_scope = union_scopes(
-            initial_flow.requested_scope.as_deref(),
-            escalated_scope.as_deref(),
-        );
-        let new_flow = perform_oauth_flow(server_url, context, union_scope.as_deref()).await?;
-        let transport = HttpClientTransport::new(server_url).bearer_token(&new_flow.access_token);
-        let client = crate::core_scenarios::client_builder()?
-            .connect(transport, handlers::BasicHandler)
-            .await?;
-
-        crate::core_scenarios::activate(&client).await?;
-
-        // Second attempt -- may still fail with 403 if server requires further escalation
-        match client.list_tools().await {
-            Ok(tools) => {
-                for tool in &tools.tools {
-                    let args = crate::core_scenarios::build_tool_arguments(&tool.input_schema);
-                    let _ = client.call_tool(&tool.name, args).await;
-                }
-            }
-            Err(e) => {
-                let err_str = e.to_string();
-                if !err_str.contains("403") && !err_str.contains("insufficient_scope") {
-                    client.shutdown().await?;
-                    return Err(e.into());
-                }
-                tracing::info!("Second attempt also got 403, step-up complete");
-            }
-        }
-        client.shutdown().await?;
-    }
-
+    .await;
+    let shutdown = client.shutdown().await;
+    outcome?;
+    shutdown?;
     Ok(())
 }
 
-/// Scope retry limit: retry up to 3 times on 403.
+/// Scope retry limit: at most three HTTP attempts for one challenged operation.
 pub async fn scope_retry_limit(
     server_url: &str,
     context: &Option<serde_json::Value>,
 ) -> Result<()> {
-    for attempt in 0..3 {
-        tracing::info!(attempt, "Auth attempt");
-        let flow = perform_oauth_flow(server_url, context, None).await?;
-        let transport = HttpClientTransport::new(server_url).bearer_token(&flow.access_token);
-        let client = crate::core_scenarios::client_builder()?
-            .connect(transport, handlers::BasicHandler)
-            .await?;
+    let flow = perform_oauth_flow(server_url, context, None).await?;
+    // Two challenged retries plus the original request give the conformance
+    // scenario its required three-attempt ceiling.
+    let transport = scope_aware_transport(server_url, context, flow, 2);
+    let client = crate::core_scenarios::client_builder()?
+        .connect(transport, handlers::BasicHandler)
+        .await?;
 
-        crate::core_scenarios::activate(&client).await?;
+    crate::core_scenarios::activate(&client).await?;
+    let outcome: Result<()> = async {
         let tools = client.list_tools().await?;
-
-        let mut success = true;
         for tool in &tools.tools {
             let args = crate::core_scenarios::build_tool_arguments(&tool.input_schema);
-            match client.call_tool(&tool.name, args).await {
-                Ok(_) => {}
-                Err(e) => {
-                    let err_str = e.to_string();
-                    if err_str.contains("403") || err_str.contains("insufficient_scope") {
-                        success = false;
-                        break;
-                    }
-                    client.shutdown().await?;
-                    return Err(e.into());
-                }
-            }
+            client.call_tool(&tool.name, args).await?;
         }
-
-        client.shutdown().await?;
-
-        if success {
-            return Ok(());
-        }
+        Ok(())
     }
-
-    anyhow::bail!("Failed after 3 auth attempts")
+    .await;
+    client.shutdown().await?;
+    outcome
 }
 
 /// Resource mismatch: server's PRM resource doesn't match, client should error.
@@ -1349,55 +1314,6 @@ fn validate_resource(server_url: &str, resource: &str) -> Result<()> {
 // ============================================================================
 // WWW-Authenticate parsing
 // ============================================================================
-
-/// Probe the server with a token to extract scope from 403 WWW-Authenticate.
-async fn probe_for_scope(server_url: &str, token: &str) -> Option<String> {
-    let http = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .ok()?;
-
-    let mut request = http
-        .post(server_url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json, text/event-stream")
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Mcp-Method", "tools/call")
-        .header("Mcp-Name", "test-tool");
-    let mut params = serde_json::json!({
-        "name": "test-tool",
-        "arguments": {}
-    });
-    if crate::core_scenarios::uses_final_protocol() {
-        request = request.header("MCP-Protocol-Version", "2026-07-28");
-        params["_meta"] = serde_json::json!({
-            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-            "io.modelcontextprotocol/clientCapabilities": {},
-            "io.modelcontextprotocol/clientInfo": {
-                "name": "conformance-client",
-                "version": "0.1.0"
-            }
-        });
-    }
-    let resp = request
-        .json(&serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": params
-        }))
-        .send()
-        .await
-        .ok()?;
-
-    let www_auth = resp
-        .headers()
-        .get("www-authenticate")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())?;
-
-    extract_www_auth_param(&www_auth, "scope")
-}
 
 /// Extract a parameter value from a WWW-Authenticate header.
 /// Handles: `param="value"` in comma-or-space-separated list.

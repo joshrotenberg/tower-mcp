@@ -68,7 +68,93 @@ struct CustomHeaderMapping {
 }
 
 #[cfg(feature = "oauth-client")]
-use super::oauth::TokenProvider;
+#[derive(Clone)]
+struct ScopeEscalationRuntime {
+    handler: Arc<dyn OAuthScopeEscalationHandler>,
+    state: Arc<tokio::sync::Mutex<ScopeEscalationState>>,
+    max_attempts: usize,
+}
+
+#[cfg(feature = "oauth-client")]
+struct ScopeEscalationState {
+    scopes: Vec<String>,
+    revision: usize,
+}
+
+#[cfg(feature = "oauth-client")]
+impl ScopeEscalationRuntime {
+    fn new<P>(handler: Arc<P>, config: OAuthScopeEscalationConfig) -> Self
+    where
+        P: OAuthScopeEscalationHandler,
+    {
+        Self {
+            handler,
+            state: Arc::new(tokio::sync::Mutex::new(ScopeEscalationState {
+                scopes: config.initial_scopes().to_vec(),
+                revision: 0,
+            })),
+            max_attempts: config.maximum_attempts(),
+        }
+    }
+
+    async fn respond_to_challenge(
+        &self,
+        challenge: OAuthScopeChallenge,
+        resource: &str,
+        operation: &str,
+        attempt: usize,
+        observed_revision: usize,
+    ) -> std::result::Result<ScopeEscalationDecision, OAuthClientError> {
+        // Serialize the complete reauthorization flow. A second operation
+        // challenged by the same scope can reuse the token produced by the
+        // first rather than opening a duplicate browser/headless flow.
+        let mut state = self.state.lock().await;
+        let previous_scopes = state.scopes.clone();
+        let mut requested_scopes = previous_scopes.clone();
+        for scope in &challenge.required_scopes {
+            if !requested_scopes.contains(scope) {
+                requested_scopes.push(scope.clone());
+            }
+        }
+
+        if requested_scopes == previous_scopes && state.revision > observed_revision {
+            return Ok(ScopeEscalationDecision {
+                revision: state.revision,
+            });
+        }
+        // The scope may have been requested previously without being granted,
+        // or the token may otherwise be stale. Reauthorize the same union
+        // again, but only within the caller's hard attempt limit.
+
+        self.handler
+            .reauthorize(OAuthScopeEscalationRequest {
+                resource: resource.to_string(),
+                operation: operation.to_string(),
+                challenge,
+                previous_scopes,
+                requested_scopes: requested_scopes.clone(),
+                attempt,
+            })
+            .await?;
+
+        state.scopes = requested_scopes;
+        state.revision += 1;
+        Ok(ScopeEscalationDecision {
+            revision: state.revision,
+        })
+    }
+}
+
+#[cfg(feature = "oauth-client")]
+struct ScopeEscalationDecision {
+    revision: usize,
+}
+
+#[cfg(feature = "oauth-client")]
+use super::oauth::{
+    OAuthClientError, OAuthScopeChallenge, OAuthScopeEscalationConfig, OAuthScopeEscalationHandler,
+    OAuthScopeEscalationRequest, TokenProvider,
+};
 
 /// Configuration for [`HttpClientTransport`].
 ///
@@ -263,6 +349,9 @@ pub struct HttpClientTransport {
     /// Dynamic token provider for OAuth or other token-based auth.
     #[cfg(feature = "oauth-client")]
     token_provider: Option<Arc<dyn TokenProvider>>,
+    /// Runtime policy for insufficient-scope challenges.
+    #[cfg(feature = "oauth-client")]
+    scope_escalation: Option<ScopeEscalationRuntime>,
 }
 
 impl HttpClientTransport {
@@ -316,6 +405,8 @@ impl HttpClientTransport {
             config,
             #[cfg(feature = "oauth-client")]
             token_provider: None,
+            #[cfg(feature = "oauth-client")]
+            scope_escalation: None,
         }
     }
 
@@ -355,6 +446,8 @@ impl HttpClientTransport {
             config,
             #[cfg(feature = "oauth-client")]
             token_provider: None,
+            #[cfg(feature = "oauth-client")]
+            scope_escalation: None,
         }
     }
 
@@ -498,6 +591,34 @@ impl HttpClientTransport {
     #[cfg(feature = "oauth-client")]
     pub fn with_token_provider(mut self, provider: impl TokenProvider) -> Self {
         self.token_provider = Some(Arc::new(provider));
+        self.scope_escalation = None;
+        self
+    }
+
+    /// Set a token provider with bounded runtime scope escalation.
+    ///
+    /// When an MCP operation receives an HTTP 403 Bearer challenge with
+    /// `error="insufficient_scope"`, the transport unions the challenged
+    /// scopes with the scopes already tracked by `config`, invokes
+    /// [`OAuthScopeEscalationHandler::reauthorize`], asks the provider for a
+    /// fresh token, and retries the same operation. Reauthorization is
+    /// serialized across concurrent requests, and each operation is bounded
+    /// by [`OAuthScopeEscalationConfig::maximum_attempts`].
+    ///
+    /// The provider and handler are the same value so the handler can update
+    /// the token returned by [`TokenProvider::get_token`].
+    #[cfg(feature = "oauth-client")]
+    pub fn with_scope_aware_token_provider<P>(
+        mut self,
+        provider: P,
+        config: OAuthScopeEscalationConfig,
+    ) -> Self
+    where
+        P: TokenProvider + OAuthScopeEscalationHandler,
+    {
+        let provider = Arc::new(provider);
+        self.token_provider = Some(provider.clone());
+        self.scope_escalation = Some(ScopeEscalationRuntime::new(provider, config));
         self
     }
 
@@ -753,10 +874,165 @@ fn encode_header_value(value: &str) -> String {
     }
 }
 
+#[cfg(feature = "oauth-client")]
+fn bearer_headers(token: &str) -> std::result::Result<reqwest::header::HeaderMap, String> {
+    let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+        .map_err(|_| "token provider returned an invalid bearer token".to_string())?;
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(reqwest::header::AUTHORIZATION, value);
+    // RequestBuilder::header appends, which can leave a stale Authorization
+    // value in front of the fresh token. Supplying a HeaderMap replaces the
+    // existing value instead.
+    Ok(headers)
+}
+
 fn is_jsonrpc_error_response(value: &serde_json::Value) -> bool {
     value.get("error").is_some_and(serde_json::Value::is_object)
         && value.pointer("/error/code").is_some()
         && value.pointer("/error/message").is_some()
+}
+
+struct HttpRequestSendError {
+    message: String,
+    connection_failed: bool,
+}
+
+impl HttpRequestSendError {
+    fn request(error: reqwest::Error) -> Self {
+        Self {
+            message: format!("HTTP request failed: {error}"),
+            connection_failed: true,
+        }
+    }
+
+    #[cfg(feature = "oauth-client")]
+    fn oauth(error: OAuthClientError) -> Self {
+        Self {
+            message: error.to_string(),
+            connection_failed: false,
+        }
+    }
+}
+
+async fn send_http_request(
+    mut request: reqwest::RequestBuilder,
+    resource: &str,
+    operation: &str,
+    #[cfg(feature = "oauth-client")] token_provider: Option<Arc<dyn TokenProvider>>,
+    #[cfg(feature = "oauth-client")] scope_escalation: Option<ScopeEscalationRuntime>,
+    #[cfg(feature = "oauth-client")] initial_scope_revision: usize,
+) -> std::result::Result<reqwest::Response, HttpRequestSendError> {
+    #[cfg(not(feature = "oauth-client"))]
+    let _ = (resource, operation);
+
+    #[cfg(feature = "oauth-client")]
+    let mut observed_revision = initial_scope_revision;
+    #[cfg(feature = "oauth-client")]
+    let mut attempts = 0;
+
+    loop {
+        #[cfg(feature = "oauth-client")]
+        let retry_request = request.try_clone();
+
+        let response = request
+            .send()
+            .await
+            .map_err(HttpRequestSendError::request)?;
+
+        #[cfg(feature = "oauth-client")]
+        {
+            let challenge = if response.status() == reqwest::StatusCode::FORBIDDEN {
+                scope_challenge(response.headers())
+            } else {
+                None
+            };
+            let Some(challenge) = challenge else {
+                return Ok(response);
+            };
+            let (Some(runtime), Some(provider), Some(mut retry_request)) = (
+                scope_escalation.as_ref(),
+                token_provider.as_ref(),
+                retry_request,
+            ) else {
+                return Ok(response);
+            };
+            if attempts >= runtime.max_attempts {
+                return Ok(response);
+            }
+
+            attempts += 1;
+            let decision = runtime
+                .respond_to_challenge(challenge, resource, operation, attempts, observed_revision)
+                .await
+                .map_err(HttpRequestSendError::oauth)?;
+            observed_revision = decision.revision;
+
+            let token = provider
+                .get_token()
+                .await
+                .map_err(HttpRequestSendError::oauth)?;
+            let headers = bearer_headers(&token).map_err(|message| {
+                HttpRequestSendError::oauth(OAuthClientError::ScopeEscalation(message))
+            })?;
+            retry_request = retry_request.headers(headers);
+            request = retry_request;
+        }
+
+        #[cfg(not(feature = "oauth-client"))]
+        return Ok(response);
+    }
+}
+
+#[cfg(feature = "oauth-client")]
+fn scope_challenge(headers: &reqwest::header::HeaderMap) -> Option<OAuthScopeChallenge> {
+    headers
+        .get_all(reqwest::header::WWW_AUTHENTICATE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(OAuthScopeChallenge::from_www_authenticate)
+}
+
+fn http_status_error(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap) -> String {
+    #[cfg(feature = "oauth-client")]
+    if let Some(challenge) = scope_challenge(headers) {
+        let mut message = format!(
+            "server returned HTTP {status}: insufficient_scope requires {}",
+            challenge.required_scopes.join(" ")
+        );
+        if let Some(resource_metadata) = challenge.resource_metadata {
+            message.push_str(&format!(" (resource metadata: {resource_metadata})"));
+        }
+        return message;
+    }
+
+    #[cfg(not(feature = "oauth-client"))]
+    let _ = headers;
+    format!("server returned HTTP {status}")
+}
+
+fn operation_label(parsed: Option<&serde_json::Value>) -> String {
+    let Some(method) = parsed
+        .and_then(|value| value.get("method"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return "unknown".to_string();
+    };
+    let target = match method {
+        "tools/call" | "prompts/get" => parsed
+            .and_then(|value| value.pointer("/params/name"))
+            .and_then(serde_json::Value::as_str),
+        "resources/read" => parsed
+            .and_then(|value| value.pointer("/params/uri"))
+            .and_then(serde_json::Value::as_str),
+        "tasks/get" | "tasks/update" | "tasks/cancel" => parsed
+            .and_then(|value| value.pointer("/params/taskId"))
+            .and_then(serde_json::Value::as_str),
+        _ => None,
+    };
+    match target {
+        Some(target) => format!("{method}:{target}"),
+        None => method.to_string(),
+    }
 }
 
 #[async_trait]
@@ -781,6 +1057,7 @@ impl ClientTransport for HttpClientTransport {
             .as_ref()
             .and_then(|value| value.get("method"))
             .and_then(serde_json::Value::as_str);
+        let operation = operation_label(parsed_message.as_ref());
         let outbound_version = parsed_message
             .as_ref()
             .and_then(|value| {
@@ -857,6 +1134,12 @@ impl ClientTransport for HttpClientTransport {
             request = request.header(key.as_str(), value.as_str());
         }
 
+        #[cfg(feature = "oauth-client")]
+        let initial_scope_revision = match &self.scope_escalation {
+            Some(runtime) => runtime.state.lock().await.revision,
+            None => 0,
+        };
+
         // Dynamic token provider overrides static Authorization header
         #[cfg(feature = "oauth-client")]
         if let Some(ref provider) = self.token_provider {
@@ -864,7 +1147,7 @@ impl ClientTransport for HttpClientTransport {
                 .get_token()
                 .await
                 .map_err(|e| Error::Transport(format!("Token provider error: {}", e)))?;
-            request = request.header("Authorization", format!("Bearer {}", token));
+            request = request.headers(bearer_headers(&token).map_err(Error::Transport)?);
         }
 
         let request = request.body(message.to_string());
@@ -899,21 +1182,36 @@ impl ClientTransport for HttpClientTransport {
             let sse_retry_delay = self.sse_retry_delay.clone();
             let sse_reconnect_signal = self.sse_reconnect_signal.clone();
             let max_sse_event_size = self.config.max_sse_event_size;
+            let request_resource = self.url.clone();
+            #[cfg(feature = "oauth-client")]
+            let token_provider = self.token_provider.clone();
+            #[cfg(feature = "oauth-client")]
+            let scope_escalation = self.scope_escalation.clone();
             self.request_tasks.retain(|_, task| !task.is_finished());
             let task = tokio::spawn(async move {
-                let response = match request.send().await {
+                let response_result = send_http_request(
+                    request,
+                    &request_resource,
+                    &operation,
+                    #[cfg(feature = "oauth-client")]
+                    token_provider,
+                    #[cfg(feature = "oauth-client")]
+                    scope_escalation,
+                    #[cfg(feature = "oauth-client")]
+                    initial_scope_revision,
+                )
+                .await;
+                let response = match response_result {
                     Ok(r) => r,
                     Err(e) => {
-                        tracing::error!(error = %e, "Background HTTP request failed");
+                        let connection_failed = e.connection_failed;
+                        tracing::error!(error = %e.message, "Background HTTP request failed");
                         if let Some(id) = &req_id {
-                            let _ = tx
-                                .send(transport_error_frame(
-                                    id,
-                                    &format!("HTTP request failed: {e}"),
-                                ))
-                                .await;
+                            let _ = tx.send(transport_error_frame(id, &e.message)).await;
                         }
-                        connected.store(false, Ordering::Release);
+                        if connection_failed {
+                            connected.store(false, Ordering::Release);
+                        }
                         return;
                     }
                 };
@@ -926,6 +1224,7 @@ impl ClientTransport for HttpClientTransport {
                 }
 
                 if !status.is_success() {
+                    let status_error = http_status_error(status, response.headers());
                     let body = response.text().await.unwrap_or_default();
 
                     // Forward a JSON-RPC error body so the message loop can
@@ -952,12 +1251,7 @@ impl ClientTransport for HttpClientTransport {
 
                     tracing::error!(status = %status, body = %body, "HTTP error from server");
                     if let Some(id) = &req_id {
-                        let _ = tx
-                            .send(transport_error_frame(
-                                id,
-                                &format!("server returned HTTP {status}"),
-                            ))
-                            .await;
+                        let _ = tx.send(transport_error_frame(id, &status_error)).await;
                     }
                     connected.store(false, Ordering::Release);
                     return;
@@ -1208,10 +1502,19 @@ impl ClientTransport for HttpClientTransport {
         // Pre-session (initialize) and notifications: handle synchronously.
         // For initialize this extracts session headers and starts the SSE
         // stream; for notifications the expected response is a bare 202.
-        let response = request
-            .send()
-            .await
-            .map_err(|e| Error::Transport(format!("HTTP request failed: {}", e)))?;
+        let response = send_http_request(
+            request,
+            &self.url,
+            &operation,
+            #[cfg(feature = "oauth-client")]
+            self.token_provider.clone(),
+            #[cfg(feature = "oauth-client")]
+            self.scope_escalation.clone(),
+            #[cfg(feature = "oauth-client")]
+            initial_scope_revision,
+        )
+        .await
+        .map_err(|e| Error::Transport(e.message))?;
 
         let status = response.status();
 
@@ -1240,6 +1543,8 @@ impl ClientTransport for HttpClientTransport {
         }
 
         if !status.is_success() {
+            #[cfg(feature = "oauth-client")]
+            let status_error = http_status_error(status, response.headers());
             let body = response.text().await.unwrap_or_default();
             if is_modern_request
                 && let Ok(mut error) = serde_json::from_str::<serde_json::Value>(&body)
@@ -1273,9 +1578,18 @@ impl ClientTransport for HttpClientTransport {
                     self.url
                 )));
             }
+            #[cfg(feature = "oauth-client")]
+            if status == reqwest::StatusCode::FORBIDDEN
+                && status_error.contains("insufficient_scope")
+            {
+                return Err(Error::Transport(if body.is_empty() {
+                    status_error
+                } else {
+                    format!("{status_error}: {body}")
+                }));
+            }
             return Err(Error::Transport(format!(
-                "HTTP {} from server: {}",
-                status, body
+                "HTTP {status} from server: {body}"
             )));
         }
 
@@ -1354,8 +1668,9 @@ impl ClientTransport for HttpClientTransport {
             #[cfg(feature = "oauth-client")]
             if let Some(ref provider) = self.token_provider
                 && let Ok(token) = provider.get_token().await
+                && let Ok(headers) = bearer_headers(&token)
             {
-                request = request.header("Authorization", format!("Bearer {}", token));
+                request = request.headers(headers);
             }
 
             let _ = request.send().await;
@@ -1467,9 +1782,13 @@ async fn sse_stream_loop(params: SseLoopParams) {
         #[cfg(feature = "oauth-client")]
         if let Some(ref provider) = token_provider {
             match provider.get_token().await {
-                Ok(token) => {
-                    request = request.header("Authorization", format!("Bearer {}", token));
-                }
+                Ok(token) => match bearer_headers(&token) {
+                    Ok(headers) => request = request.headers(headers),
+                    Err(error) => {
+                        tracing::warn!(%error, "Token provider failed for SSE connection");
+                        break;
+                    }
+                },
                 Err(e) => {
                     tracing::warn!(error = %e, "Token provider failed for SSE connection");
                     break;

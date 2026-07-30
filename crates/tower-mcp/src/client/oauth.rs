@@ -76,6 +76,243 @@ pub trait TokenProvider: Send + Sync + 'static {
     async fn get_token(&self) -> Result<String, OAuthClientError>;
 }
 
+/// An OAuth `insufficient_scope` Bearer challenge.
+///
+/// MCP authorization servers use this challenge on HTTP 403 responses to tell
+/// clients which additional scopes are required for the attempted operation.
+/// See [`OAuthScopeChallenge::from_www_authenticate`] for parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthScopeChallenge {
+    /// Scopes requested by the authorization server.
+    pub required_scopes: Vec<String>,
+    /// Protected resource metadata URL supplied by the server.
+    pub resource_metadata: Option<String>,
+    /// Human-readable description supplied by the server.
+    pub error_description: Option<String>,
+}
+
+impl OAuthScopeChallenge {
+    /// Parse an `insufficient_scope` Bearer challenge from a
+    /// `WWW-Authenticate` header value.
+    ///
+    /// Returns `None` for other authentication schemes, other OAuth errors,
+    /// or challenges that do not include at least one required scope.
+    pub fn from_www_authenticate(header: &str) -> Option<Self> {
+        let mut in_bearer_challenge = false;
+        let mut found_bearer_challenge = false;
+        let mut error = None;
+        let mut scope = None;
+        let mut resource_metadata = None;
+        let mut error_description = None;
+
+        for segment in split_quoted_commas(header) {
+            let segment = segment.trim();
+            let (parameter, starts_challenge) = if let Some((candidate_scheme, remainder)) =
+                segment.split_once(char::is_whitespace)
+            {
+                if !candidate_scheme.contains('=') {
+                    if found_bearer_challenge {
+                        break;
+                    }
+                    in_bearer_challenge = candidate_scheme.eq_ignore_ascii_case("Bearer");
+                    found_bearer_challenge = in_bearer_challenge;
+                    (remainder.trim(), true)
+                } else {
+                    (segment, false)
+                }
+            } else {
+                (segment, false)
+            };
+
+            if starts_challenge && !in_bearer_challenge {
+                continue;
+            }
+            if !in_bearer_challenge {
+                continue;
+            }
+
+            let Some((name, value)) = parameter.split_once('=') else {
+                continue;
+            };
+            let value = unquote_auth_param(value.trim())?;
+            match name.trim() {
+                name if name.eq_ignore_ascii_case("error") => error = Some(value),
+                name if name.eq_ignore_ascii_case("scope") => scope = Some(value),
+                name if name.eq_ignore_ascii_case("resource_metadata") => {
+                    resource_metadata = Some(value)
+                }
+                name if name.eq_ignore_ascii_case("error_description") => {
+                    error_description = Some(value)
+                }
+                _ => {}
+            }
+        }
+
+        if error.as_deref() != Some("insufficient_scope") {
+            return None;
+        }
+        let required_scopes = unique_scopes(scope?.split_ascii_whitespace());
+        if required_scopes.is_empty() {
+            return None;
+        }
+
+        Some(Self {
+            required_scopes,
+            resource_metadata,
+            error_description,
+        })
+    }
+}
+
+/// Context passed to an [`OAuthScopeEscalationHandler`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthScopeEscalationRequest {
+    /// MCP protected-resource URL that rejected the request.
+    pub resource: String,
+    /// MCP operation that was rejected, such as `tools/call:search`.
+    pub operation: String,
+    /// Parsed authorization-server challenge.
+    pub challenge: OAuthScopeChallenge,
+    /// Scopes held before this escalation.
+    pub previous_scopes: Vec<String>,
+    /// Stable-order union of previous and newly required scopes.
+    pub requested_scopes: Vec<String>,
+    /// One-based retry attempt for this resource operation.
+    pub attempt: usize,
+}
+
+/// Application hook for interactive or headless OAuth reauthorization.
+///
+/// Implementations should acquire a token for `request.requested_scopes` and
+/// update the [`TokenProvider`] installed with
+/// [`HttpClientTransport::with_scope_aware_token_provider`](crate::client::HttpClientTransport::with_scope_aware_token_provider).
+/// After this method succeeds, the transport asks that provider for a fresh
+/// token and retries the rejected MCP operation.
+#[async_trait]
+pub trait OAuthScopeEscalationHandler: Send + Sync + 'static {
+    /// Reauthorize for the stable-order scope union in `request`.
+    async fn reauthorize(
+        &self,
+        request: OAuthScopeEscalationRequest,
+    ) -> Result<(), OAuthClientError>;
+}
+
+/// Runtime scope-escalation policy for `HttpClientTransport`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthScopeEscalationConfig {
+    initial_scopes: Vec<String>,
+    max_attempts: usize,
+}
+
+impl Default for OAuthScopeEscalationConfig {
+    fn default() -> Self {
+        Self {
+            initial_scopes: Vec::new(),
+            max_attempts: 2,
+        }
+    }
+}
+
+impl OAuthScopeEscalationConfig {
+    /// Create a policy with the scopes requested for the initial token.
+    ///
+    /// Duplicate and blank scope values are removed while preserving order.
+    /// By default, at most two challenged retries are permitted per MCP
+    /// operation.
+    pub fn new(scopes: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            initial_scopes: unique_scopes(scopes.into_iter().map(Into::into).flat_map(
+                |scope: String| {
+                    scope
+                        .split_ascii_whitespace()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                },
+            )),
+            ..Self::default()
+        }
+    }
+
+    /// Set the maximum number of challenged retries for one MCP operation.
+    ///
+    /// Set this to zero to surface the first HTTP 403 without reauthorizing.
+    pub fn max_attempts(mut self, max_attempts: usize) -> Self {
+        self.max_attempts = max_attempts;
+        self
+    }
+
+    /// Initial scopes tracked by the policy.
+    pub fn initial_scopes(&self) -> &[String] {
+        &self.initial_scopes
+    }
+
+    /// Maximum challenged retries for one MCP operation.
+    pub fn maximum_attempts(&self) -> usize {
+        self.max_attempts
+    }
+}
+
+fn unique_scopes(scopes: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<String> {
+    let mut unique = Vec::new();
+    for scope in scopes {
+        let scope = scope.as_ref();
+        if !scope.is_empty() && !unique.iter().any(|existing| existing == scope) {
+            unique.push(scope.to_string());
+        }
+    }
+    unique
+}
+
+fn split_quoted_commas(header: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, character) in header.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                segments.push(&header[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    segments.push(&header[start..]);
+    segments
+}
+
+fn unquote_auth_param(value: &str) -> Option<String> {
+    if !value.starts_with('"') {
+        return Some(value.to_string());
+    }
+    if !value.ends_with('"') || value.len() < 2 {
+        return None;
+    }
+
+    let mut unquoted = String::new();
+    let mut escaped = false;
+    for character in value[1..value.len() - 1].chars() {
+        if escaped {
+            unquoted.push(character);
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else {
+            unquoted.push(character);
+        }
+    }
+    if escaped {
+        return None;
+    }
+    Some(unquoted)
+}
+
 /// Error type for OAuth client operations.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -86,6 +323,8 @@ pub enum OAuthClientError {
     TokenRequest(String),
     /// Failed to register an OAuth client.
     Registration(String),
+    /// Failed to reauthorize after an insufficient-scope challenge.
+    ScopeEscalation(String),
     /// The token response was invalid or missing required fields.
     InvalidResponse(String),
     /// Builder validation failed (missing required fields).
@@ -98,6 +337,7 @@ impl fmt::Display for OAuthClientError {
             Self::Discovery(msg) => write!(f, "OAuth discovery error: {}", msg),
             Self::TokenRequest(msg) => write!(f, "OAuth token request error: {}", msg),
             Self::Registration(msg) => write!(f, "OAuth client registration error: {}", msg),
+            Self::ScopeEscalation(msg) => write!(f, "OAuth scope escalation error: {}", msg),
             Self::InvalidResponse(msg) => write!(f, "OAuth invalid response: {}", msg),
             Self::BuildError(msg) => write!(f, "OAuth builder error: {}", msg),
         }
@@ -577,11 +817,72 @@ mod tests {
         let err = OAuthClientError::Registration("rejected".into());
         assert_eq!(err.to_string(), "OAuth client registration error: rejected");
 
+        let err = OAuthClientError::ScopeEscalation("denied".into());
+        assert_eq!(err.to_string(), "OAuth scope escalation error: denied");
+
         let err = OAuthClientError::InvalidResponse("bad json".into());
         assert_eq!(err.to_string(), "OAuth invalid response: bad json");
 
         let err = OAuthClientError::BuildError("missing field".into());
         assert_eq!(err.to_string(), "OAuth builder error: missing field");
+    }
+
+    #[test]
+    fn parses_insufficient_scope_challenge() {
+        let challenge = OAuthScopeChallenge::from_www_authenticate(
+            r#"Bearer error="insufficient_scope", scope="files.read files.write files.read", resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource", error_description="Need files, including \"shared\"""#,
+        )
+        .unwrap();
+
+        assert_eq!(challenge.required_scopes, vec!["files.read", "files.write"]);
+        assert_eq!(
+            challenge.resource_metadata.as_deref(),
+            Some("https://mcp.example.com/.well-known/oauth-protected-resource")
+        );
+        assert_eq!(
+            challenge.error_description.as_deref(),
+            Some(r#"Need files, including "shared""#)
+        );
+    }
+
+    #[test]
+    fn selects_bearer_from_multiple_authentication_challenges() {
+        let challenge = OAuthScopeChallenge::from_www_authenticate(
+            r#"Basic realm="legacy", Bearer realm="mcp", error="insufficient_scope", scope="tools.call""#,
+        )
+        .unwrap();
+
+        assert_eq!(challenge.required_scopes, vec!["tools.call"]);
+    }
+
+    #[test]
+    fn ignores_non_scope_authentication_challenges() {
+        assert!(
+            OAuthScopeChallenge::from_www_authenticate(
+                r#"Bearer error="invalid_token", scope="tools.call""#
+            )
+            .is_none()
+        );
+        assert!(
+            OAuthScopeChallenge::from_www_authenticate(
+                r#"Bearer error="insufficient_scope", scope="""#
+            )
+            .is_none()
+        );
+        assert!(OAuthScopeChallenge::from_www_authenticate(r#"Basic realm="mcp""#).is_none());
+    }
+
+    #[test]
+    fn scope_escalation_config_normalizes_scopes() {
+        let config =
+            OAuthScopeEscalationConfig::new(["openid profile", "profile", "", "tools.call"])
+                .max_attempts(3);
+
+        assert_eq!(
+            config.initial_scopes(),
+            &["openid", "profile", "tools.call"]
+        );
+        assert_eq!(config.maximum_attempts(), 3);
     }
 
     #[tokio::test]

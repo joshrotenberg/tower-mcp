@@ -526,8 +526,9 @@ pub use client::{HttpClientConfig, HttpClientTransport};
 pub use client::{
     OAuthApplicationType, OAuthAuthorizationServerMetadata, OAuthClientCredentials,
     OAuthClientError, OAuthClientRegistration, OAuthClientRegistrationMethod,
-    OAuthClientRegistrationOptions, OAuthDynamicClientRegistration, TokenProvider,
-    discover_oauth_authorization_server, resolve_oauth_client_registration,
+    OAuthClientRegistrationOptions, OAuthDynamicClientRegistration, OAuthScopeChallenge,
+    OAuthScopeEscalationConfig, OAuthScopeEscalationHandler, OAuthScopeEscalationRequest,
+    TokenProvider, discover_oauth_authorization_server, resolve_oauth_client_registration,
 };
 pub use context::{
     ChannelClientRequester, ClientRequester, ClientRequesterHandle, Extensions,

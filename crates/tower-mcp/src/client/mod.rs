@@ -48,7 +48,9 @@ pub use handler::{ClientHandler, NotificationHandler, ServerNotification};
 pub use http::{HttpClientConfig, HttpClientTransport};
 #[cfg(feature = "oauth-client")]
 pub use oauth::{
-    OAuthClientCredentials, OAuthClientCredentialsBuilder, OAuthClientError, TokenProvider,
+    OAuthClientCredentials, OAuthClientCredentialsBuilder, OAuthClientError, OAuthScopeChallenge,
+    OAuthScopeEscalationConfig, OAuthScopeEscalationHandler, OAuthScopeEscalationRequest,
+    TokenProvider,
 };
 #[cfg(feature = "oauth-client")]
 pub use oauth_authcode::{

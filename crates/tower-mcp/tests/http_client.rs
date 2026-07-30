@@ -1132,7 +1132,11 @@ async fn test_http_client_root_management() {
 #[cfg(feature = "oauth-client")]
 mod token_provider_tests {
     use super::*;
-    use tower_mcp::{OAuthClientError, TokenProvider};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tower_mcp::{
+        OAuthClientError, OAuthScopeEscalationConfig, OAuthScopeEscalationHandler,
+        OAuthScopeEscalationRequest, TokenProvider,
+    };
 
     struct StaticTokenProvider(String);
 
@@ -1141,6 +1145,91 @@ mod token_provider_tests {
         async fn get_token(&self) -> Result<String, OAuthClientError> {
             Ok(self.0.clone())
         }
+    }
+
+    struct EscalatingTokenProvider {
+        token: Arc<tokio::sync::RwLock<String>>,
+        requests: Arc<Mutex<Vec<OAuthScopeEscalationRequest>>>,
+        reauthorization_delay: Duration,
+    }
+
+    #[async_trait]
+    impl TokenProvider for EscalatingTokenProvider {
+        async fn get_token(&self) -> Result<String, OAuthClientError> {
+            Ok(self.token.read().await.clone())
+        }
+    }
+
+    #[async_trait]
+    impl OAuthScopeEscalationHandler for EscalatingTokenProvider {
+        async fn reauthorize(
+            &self,
+            request: OAuthScopeEscalationRequest,
+        ) -> Result<(), OAuthClientError> {
+            self.requests.lock().unwrap().push(request);
+            tokio::time::sleep(self.reauthorization_delay).await;
+            *self.token.write().await = "escalated-token".to_string();
+            Ok(())
+        }
+    }
+
+    async fn start_scope_challenge_server(
+        always_reject: bool,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        use axum::{
+            extract::Request,
+            http::{HeaderValue, StatusCode, header::WWW_AUTHENTICATE},
+            middleware,
+            response::IntoResponse,
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://127.0.0.1:{}", addr.port());
+        let challenge = format!(
+            r#"Bearer error="insufficient_scope", scope="tools.read", resource_metadata="{url}/.well-known/oauth-protected-resource", error_description="tools/list requires tools.read""#
+        );
+        let request_count = Arc::new(AtomicUsize::new(0));
+
+        let transport = HttpTransport::new(test_router()).disable_origin_validation();
+        let count = request_count.clone();
+        let app = transport.into_router().layer(middleware::from_fn(
+            move |request: Request, next: middleware::Next| {
+                let count = count.clone();
+                let challenge = challenge.clone();
+                async move {
+                    let method = request
+                        .headers()
+                        .get("mcp-method")
+                        .and_then(|value| value.to_str().ok());
+                    let is_tools_list = method == Some("tools/list");
+                    if is_tools_list {
+                        count.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let escalated = request
+                        .headers()
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        == Some("Bearer escalated-token");
+
+                    if is_tools_list && (always_reject || !escalated) {
+                        let mut response = StatusCode::FORBIDDEN.into_response();
+                        response
+                            .headers_mut()
+                            .insert(WWW_AUTHENTICATE, HeaderValue::from_str(&challenge).unwrap());
+                        response
+                    } else {
+                        next.run(request).await
+                    }
+                }
+            },
+        ));
+
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        (url, request_count, handle)
     }
 
     #[tokio::test]
@@ -1171,6 +1260,87 @@ mod token_provider_tests {
 
         let result = client.initialize("test-client", "1.0.0").await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn scope_challenge_reauthorizes_and_retries_operation() {
+        let (url, request_count, _server) = start_scope_challenge_server(false).await;
+        let token = Arc::new(tokio::sync::RwLock::new("initial-token".to_string()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = EscalatingTokenProvider {
+            token,
+            requests: requests.clone(),
+            reauthorization_delay: Duration::ZERO,
+        };
+        let transport = HttpClientTransport::new(&url)
+            .with_scope_aware_token_provider(provider, OAuthScopeEscalationConfig::new(["openid"]));
+        let client = McpClient::connect(transport).await.unwrap();
+
+        client.initialize("test-client", "1.0.0").await.unwrap();
+        let tools = client.list_tools().await.unwrap();
+        assert_eq!(tools.tools.len(), 2);
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+
+        {
+            let recorded = requests.lock().unwrap();
+            assert_eq!(recorded.len(), 1);
+            assert_eq!(recorded[0].resource, url);
+            assert_eq!(recorded[0].operation, "tools/list");
+            assert_eq!(recorded[0].previous_scopes, ["openid"]);
+            assert_eq!(recorded[0].requested_scopes, ["openid", "tools.read"]);
+            assert_eq!(recorded[0].challenge.required_scopes, ["tools.read"]);
+            assert!(recorded[0].challenge.resource_metadata.is_some());
+            assert_eq!(recorded[0].attempt, 1);
+        }
+
+        client.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn repeated_scope_challenge_stops_at_configured_retry_limit() {
+        let (url, request_count, _server) = start_scope_challenge_server(true).await;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = EscalatingTokenProvider {
+            token: Arc::new(tokio::sync::RwLock::new("initial-token".to_string())),
+            requests: requests.clone(),
+            reauthorization_delay: Duration::ZERO,
+        };
+        let transport = HttpClientTransport::new(&url).with_scope_aware_token_provider(
+            provider,
+            OAuthScopeEscalationConfig::new(["openid"]).max_attempts(3),
+        );
+        let client = McpClient::connect(transport).await.unwrap();
+
+        client.initialize("test-client", "1.0.0").await.unwrap();
+        let error = client.list_tools().await.unwrap_err().to_string();
+
+        assert!(error.contains("insufficient_scope"));
+        assert!(error.contains("tools.read"));
+        assert_eq!(request_count.load(Ordering::SeqCst), 4);
+        assert_eq!(requests.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn concurrent_scope_challenges_share_one_reauthorization() {
+        let (url, request_count, _server) = start_scope_challenge_server(false).await;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = EscalatingTokenProvider {
+            token: Arc::new(tokio::sync::RwLock::new("initial-token".to_string())),
+            requests: requests.clone(),
+            reauthorization_delay: Duration::from_millis(50),
+        };
+        let transport = HttpClientTransport::new(&url)
+            .with_scope_aware_token_provider(provider, OAuthScopeEscalationConfig::new(["openid"]));
+        let client = McpClient::connect(transport).await.unwrap();
+        client.initialize("test-client", "1.0.0").await.unwrap();
+
+        let (first, second) = tokio::join!(client.list_tools(), client.list_tools());
+
+        assert_eq!(first.unwrap().tools.len(), 2);
+        assert_eq!(second.unwrap().tools.len(), 2);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert!((3..=4).contains(&request_count.load(Ordering::SeqCst)));
+        client.shutdown().await.unwrap();
     }
 }
 
