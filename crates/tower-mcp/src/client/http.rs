@@ -581,6 +581,7 @@ impl HttpClientTransport {
     ///     .client_id("my-client")
     ///     .client_secret("my-secret")
     ///     .token_endpoint("https://auth.example.com/token")
+    ///     .resource("http://localhost:3000")
     ///     .build()?;
     ///
     /// let transport = HttpClientTransport::new("http://localhost:3000")

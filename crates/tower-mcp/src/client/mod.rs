@@ -48,17 +48,19 @@ pub use handler::{ClientHandler, NotificationHandler, ServerNotification};
 pub use http::{HttpClientConfig, HttpClientTransport};
 #[cfg(feature = "oauth-client")]
 pub use oauth::{
-    OAuthClientCredentials, OAuthClientCredentialsBuilder, OAuthClientError, OAuthScopeChallenge,
-    OAuthScopeEscalationConfig, OAuthScopeEscalationHandler, OAuthScopeEscalationRequest,
-    TokenProvider,
+    OAuthBearerChallenge, OAuthClientCredentials, OAuthClientCredentialsBuilder, OAuthClientError,
+    OAuthScopeChallenge, OAuthScopeEscalationConfig, OAuthScopeEscalationHandler,
+    OAuthScopeEscalationRequest, OAuthTokenEndpointAuthMethod, TokenProvider,
 };
 #[cfg(feature = "oauth-client")]
 pub use oauth_authcode::{
     MemoryOAuthClientRegistrationStore, OAuthApplicationType, OAuthAuthCodeConfig,
-    OAuthAuthorizationCode, OAuthAuthorizationServerMetadata, OAuthClientRegistration,
-    OAuthClientRegistrationMethod, OAuthClientRegistrationOptions, OAuthClientRegistrationStore,
-    OAuthDynamicClientRegistration, discover_oauth_authorization_server,
-    resolve_oauth_client_registration, resolve_oauth_client_registration_with_store,
+    OAuthAuthorizationCode, OAuthAuthorizationDiscovery, OAuthAuthorizationServerMetadata,
+    OAuthClientRegistration, OAuthClientRegistrationMethod, OAuthClientRegistrationOptions,
+    OAuthClientRegistrationStore, OAuthDynamicClientRegistration, OAuthProtectedResourceMetadata,
+    discover_oauth_authorization, discover_oauth_authorization_server,
+    probe_oauth_bearer_challenge, resolve_oauth_client_registration,
+    resolve_oauth_client_registration_with_store,
 };
 pub use response_cache::{ClientCacheConfig, DEFAULT_MAX_CACHE_TTL};
 pub use stdio::StdioClientTransport;

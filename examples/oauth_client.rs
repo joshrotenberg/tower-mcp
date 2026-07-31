@@ -90,6 +90,7 @@ async fn demo_client_credentials() -> Result<(), tower_mcp::BoxError> {
         .client_id(&client_id)
         .client_secret(&client_secret)
         .token_endpoint(&token_endpoint)
+        .resource(SERVER_URL)
         .scopes(["mcp:read", "mcp:write"])
         // Refresh tokens 60 seconds before expiry (default is 30s)
         .refresh_buffer(std::time::Duration::from_secs(60))

@@ -42,7 +42,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, RwLock, oneshot};
 
-use super::oauth::{OAuthClientError, TokenProvider};
+use super::oauth::{
+    OAuthBearerChallenge, OAuthClientError, OAuthTokenEndpointAuthMethod, TokenProvider,
+};
 
 // =============================================================================
 // PKCE (RFC 7636)
@@ -98,6 +100,57 @@ pub struct OAuthAuthorizationServerMetadata {
     /// branch of client-side validation.
     #[serde(default)]
     pub authorization_response_iss_parameter_supported: bool,
+    /// PKCE challenge methods supported by the authorization endpoint.
+    #[serde(default)]
+    pub code_challenge_methods_supported: Vec<String>,
+    /// Client authentication methods supported by the token endpoint.
+    #[serde(default)]
+    pub token_endpoint_auth_methods_supported: Vec<String>,
+    /// OAuth grant types supported by the authorization server.
+    #[serde(default)]
+    pub grant_types_supported: Vec<String>,
+    /// OAuth scopes advertised by the authorization server.
+    #[serde(default)]
+    pub scopes_supported: Vec<String>,
+}
+
+/// OAuth Protected Resource Metadata used for MCP authorization discovery.
+///
+/// See the [MCP authorization-server discovery specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/authorization-server-discovery)
+/// and [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct OAuthProtectedResourceMetadata {
+    /// Canonical resource identifier used in RFC 8707 `resource` parameters.
+    pub resource: String,
+    /// Authorization-server issuer identifiers accepted by the resource.
+    #[serde(default)]
+    pub authorization_servers: Vec<String>,
+    /// Scopes understood by the protected resource.
+    #[serde(default)]
+    pub scopes_supported: Vec<String>,
+}
+
+/// Complete, validated OAuth discovery result for an MCP protected resource.
+#[derive(Debug, Clone)]
+pub struct OAuthAuthorizationDiscovery {
+    /// Canonical MCP resource URL used for token audience binding.
+    pub resource: String,
+    /// Validated Protected Resource Metadata for the MCP server.
+    pub protected_resource_metadata: OAuthProtectedResourceMetadata,
+    /// Every advertised authorization server whose metadata was fetched and
+    /// whose issuer exactly matched its advertised identifier.
+    pub authorization_servers: Vec<OAuthAuthorizationServerMetadata>,
+    /// Bearer challenge returned by the MCP resource, when one was available.
+    pub challenge: Option<OAuthBearerChallenge>,
+}
+
+impl OAuthAuthorizationDiscovery {
+    /// Select a discovered authorization server by exact issuer identifier.
+    pub fn authorization_server(&self, issuer: &str) -> Option<&OAuthAuthorizationServerMetadata> {
+        self.authorization_servers
+            .iter()
+            .find(|metadata| metadata.issuer == issuer)
+    }
 }
 
 /// Discover the authorization server metadata from the MCP server's
@@ -106,68 +159,222 @@ pub async fn discover_oauth_authorization_server(
     server_url: &str,
     client: &reqwest::Client,
 ) -> Result<OAuthAuthorizationServerMetadata, OAuthClientError> {
-    let base = server_url.trim_end_matches('/');
-
-    // Try Protected Resource Metadata first (RFC 9728)
-    if let Some(metadata) = try_discover_via_prm(base, client).await? {
-        return Ok(metadata);
-    }
-
-    // Fallback: try well-known directly on the server URL
-    let meta_url = format!("{}/.well-known/oauth-authorization-server", base);
-    let metadata = client
-        .get(&meta_url)
-        .send()
-        .await
-        .map_err(|e| OAuthClientError::Discovery(e.to_string()))?
-        .error_for_status()
-        .map_err(|e| OAuthClientError::Discovery(e.to_string()))?
-        .json()
-        .await
-        .map_err(|e| OAuthClientError::Discovery(e.to_string()))?;
-    validate_metadata_issuer(&metadata, base)?;
-    Ok(metadata)
+    let discovery = discover_oauth_authorization(server_url, None, client).await?;
+    discovery
+        .authorization_servers
+        .into_iter()
+        .next()
+        .ok_or_else(|| OAuthClientError::Discovery("no authorization server discovered".into()))
 }
 
-/// Try to discover auth server via Protected Resource Metadata (RFC 9728).
-async fn try_discover_via_prm(
-    base: &str,
+/// Probe an MCP resource for its OAuth Bearer challenge.
+pub async fn probe_oauth_bearer_challenge(
+    resource_url: &str,
     client: &reqwest::Client,
-) -> Result<Option<OAuthAuthorizationServerMetadata>, OAuthClientError> {
-    let prm_url = format!("{}/.well-known/oauth-protected-resource", base);
-    let Ok(resp) = client.get(&prm_url).send().await else {
-        return Ok(None);
-    };
-    if !resp.status().is_success() {
-        return Ok(None);
-    }
-    let Ok(prm) = resp.json::<serde_json::Value>().await else {
-        return Ok(None);
-    };
-    let Some(auth_server) = prm["authorization_servers"]
-        .as_array()
-        .and_then(|servers| servers.first())
-        .and_then(serde_json::Value::as_str)
-    else {
-        return Ok(None);
-    };
-    let meta_url = format!(
-        "{}/.well-known/oauth-authorization-server",
-        auth_server.trim_end_matches('/')
-    );
-    let meta = client
-        .get(&meta_url)
+) -> Result<Option<OAuthBearerChallenge>, OAuthClientError> {
+    let response = client
+        .get(resource_url)
         .send()
         .await
-        .map_err(|e| OAuthClientError::Discovery(e.to_string()))?
-        .error_for_status()
         .map_err(|e| OAuthClientError::Discovery(e.to_string()))?;
-    let metadata = meta
+    Ok(response
+        .headers()
+        .get_all(reqwest::header::WWW_AUTHENTICATE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(OAuthBearerChallenge::from_www_authenticate))
+}
+
+/// Discover Protected Resource Metadata and all advertised authorization
+/// servers for an MCP resource.
+///
+/// A challenge-provided `resource_metadata` URL takes precedence. Otherwise
+/// discovery tries the final path-aware RFC 9728 location and then the origin
+/// root for compatibility. Authorization-server metadata discovery tries the
+/// RFC 8414 and OpenID Connect variants and validates exact issuer equality.
+pub async fn discover_oauth_authorization(
+    server_url: &str,
+    challenge: Option<OAuthBearerChallenge>,
+    client: &reqwest::Client,
+) -> Result<OAuthAuthorizationDiscovery, OAuthClientError> {
+    let challenge = match challenge {
+        Some(challenge) => Some(challenge),
+        None => probe_oauth_bearer_challenge(server_url, client).await?,
+    };
+
+    let challenge_metadata_url = challenge
+        .as_ref()
+        .and_then(|challenge| challenge.resource_metadata.as_ref())
+        .cloned();
+    let (metadata_url, protected_resource_metadata) = if let Some(url) = challenge_metadata_url {
+        let metadata = fetch_json::<OAuthProtectedResourceMetadata>(client, &url).await?;
+        (url, metadata)
+    } else {
+        let mut discovered = None;
+        for url in protected_resource_metadata_urls(server_url)? {
+            match fetch_json::<OAuthProtectedResourceMetadata>(client, &url).await {
+                Ok(metadata) => {
+                    discovered = Some((url, metadata));
+                    break;
+                }
+                Err(error) => {
+                    tracing::debug!(%url, %error, "OAuth protected-resource metadata candidate failed")
+                }
+            }
+        }
+        discovered.ok_or_else(|| {
+            OAuthClientError::Discovery(format!(
+                "could not discover Protected Resource Metadata for `{server_url}`"
+            ))
+        })?
+    };
+    validate_resource_identifier(server_url, &protected_resource_metadata.resource)?;
+    if protected_resource_metadata.authorization_servers.is_empty() {
+        return Err(OAuthClientError::Discovery(format!(
+            "protected resource metadata at `{metadata_url}` omitted authorization_servers"
+        )));
+    }
+
+    let resource = protected_resource_metadata.resource.clone();
+    let issuers = protected_resource_metadata.authorization_servers.clone();
+
+    let mut authorization_servers = Vec::new();
+    let mut last_error = None;
+    for issuer in issuers {
+        match discover_authorization_server_from_issuer(&issuer, client).await {
+            Ok(metadata) => authorization_servers.push(metadata),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if authorization_servers.is_empty() {
+        return Err(last_error.unwrap_or_else(|| {
+            OAuthClientError::Discovery(
+                "protected resource advertised no usable authorization server".into(),
+            )
+        }));
+    }
+
+    Ok(OAuthAuthorizationDiscovery {
+        resource,
+        protected_resource_metadata,
+        authorization_servers,
+        challenge,
+    })
+}
+
+async fn discover_authorization_server_from_issuer(
+    issuer: &str,
+    client: &reqwest::Client,
+) -> Result<OAuthAuthorizationServerMetadata, OAuthClientError> {
+    let mut last_error = None;
+    for url in authorization_server_metadata_urls(issuer)? {
+        match fetch_json::<OAuthAuthorizationServerMetadata>(client, &url).await {
+            Ok(metadata) => {
+                validate_metadata_issuer(&metadata, issuer)?;
+                return Ok(metadata);
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        OAuthClientError::Discovery(format!(
+            "could not discover authorization server metadata for `{issuer}`"
+        ))
+    }))
+}
+
+async fn fetch_json<T: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<T, OAuthClientError> {
+    client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| OAuthClientError::Discovery(error.to_string()))?
+        .error_for_status()
+        .map_err(|error| OAuthClientError::Discovery(error.to_string()))?
         .json()
         .await
-        .map_err(|e| OAuthClientError::Discovery(e.to_string()))?;
-    validate_metadata_issuer(&metadata, auth_server)?;
-    Ok(Some(metadata))
+        .map_err(|error| OAuthClientError::Discovery(error.to_string()))
+}
+
+fn protected_resource_metadata_urls(server_url: &str) -> Result<Vec<String>, OAuthClientError> {
+    let parsed = reqwest::Url::parse(server_url)
+        .map_err(|error| OAuthClientError::Discovery(error.to_string()))?;
+    let origin = parsed.origin().ascii_serialization();
+    let path = parsed.path().trim_end_matches('/');
+    let mut urls = Vec::new();
+    if !path.is_empty() {
+        push_unique(
+            &mut urls,
+            format!("{origin}/.well-known/oauth-protected-resource{path}"),
+        );
+    }
+    push_unique(
+        &mut urls,
+        format!("{origin}/.well-known/oauth-protected-resource"),
+    );
+    Ok(urls)
+}
+
+fn authorization_server_metadata_urls(issuer: &str) -> Result<Vec<String>, OAuthClientError> {
+    let parsed = reqwest::Url::parse(issuer)
+        .map_err(|error| OAuthClientError::Discovery(error.to_string()))?;
+    let origin = parsed.origin().ascii_serialization();
+    let path = parsed.path().trim_end_matches('/');
+    let trimmed = issuer.trim_end_matches('/');
+    let mut urls = Vec::new();
+    if !path.is_empty() {
+        push_unique(
+            &mut urls,
+            format!("{origin}/.well-known/oauth-authorization-server{path}"),
+        );
+        push_unique(
+            &mut urls,
+            format!("{origin}/.well-known/openid-configuration{path}"),
+        );
+        push_unique(
+            &mut urls,
+            format!("{trimmed}/.well-known/openid-configuration"),
+        );
+    } else {
+        push_unique(
+            &mut urls,
+            format!("{origin}/.well-known/oauth-authorization-server"),
+        );
+        push_unique(
+            &mut urls,
+            format!("{origin}/.well-known/openid-configuration"),
+        );
+    }
+    Ok(urls)
+}
+
+fn validate_resource_identifier(server_url: &str, resource: &str) -> Result<(), OAuthClientError> {
+    let server = reqwest::Url::parse(server_url)
+        .map_err(|error| OAuthClientError::Discovery(error.to_string()))?;
+    let metadata = reqwest::Url::parse(resource)
+        .map_err(|error| OAuthClientError::Discovery(error.to_string()))?;
+    let matches = metadata.fragment().is_none()
+        && server.scheme() == metadata.scheme()
+        && server.host_str() == metadata.host_str()
+        && server.port_or_known_default() == metadata.port_or_known_default()
+        && server.path() == metadata.path()
+        && server.query() == metadata.query();
+    if matches {
+        Ok(())
+    } else {
+        Err(OAuthClientError::Discovery(format!(
+            "protected resource metadata mismatch: expected `{server_url}`, got `{resource}`"
+        )))
+    }
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.contains(&value) {
+        values.push(value);
+    }
 }
 
 /// Validate the metadata issuer against the authorization-server identifier
@@ -711,6 +918,10 @@ struct OAuthAuthCodeInner {
     client_id: String,
     /// Client secret (if provided by registration).
     client_secret: Option<String>,
+    /// Authentication method selected from authorization-server metadata.
+    token_endpoint_auth_method: OAuthTokenEndpointAuthMethod,
+    /// Canonical protected-resource identifier (RFC 8707).
+    resource: String,
     /// PKCE code verifier (sent during token exchange).
     code_verifier: String,
     /// CSRF state parameter for validation.
@@ -776,12 +987,35 @@ impl OAuthAuthorizationCode {
     pub async fn start_with_config(
         server_url: &str,
         scopes: &[&str],
-        config: OAuthAuthCodeConfig,
+        mut config: OAuthAuthCodeConfig,
     ) -> Result<Self, OAuthClientError> {
-        let client = config.http_client.unwrap_or_default();
+        let client = config.http_client.take().unwrap_or_default();
 
-        // Discover auth server
-        let metadata = discover_oauth_authorization_server(server_url, &client).await?;
+        // Discover the protected resource and every advertised authorization
+        // server. Applications can pin an issuer when the PRM advertises more
+        // than one; otherwise the resource's preference order is retained.
+        let discovery =
+            discover_oauth_authorization(server_url, config.challenge.take(), &client).await?;
+        let metadata = match config.preferred_authorization_server.take() {
+            Some(issuer) => discovery
+                .authorization_server(&issuer)
+                .cloned()
+                .ok_or_else(|| {
+                    OAuthClientError::Discovery(format!(
+                        "preferred authorization server `{issuer}` was not advertised by the resource"
+                    ))
+                })?,
+            None => discovery
+                .authorization_servers
+                .first()
+                .cloned()
+                .ok_or_else(|| OAuthClientError::Discovery("no authorization server discovered".into()))?,
+        };
+        require_s256(&metadata)?;
+        let token_endpoint_auth_method = OAuthTokenEndpointAuthMethod::select(
+            &metadata.token_endpoint_auth_methods_supported,
+            config.client_secret.is_some(),
+        )?;
 
         // Generate PKCE
         let code_verifier = generate_code_verifier();
@@ -806,33 +1040,51 @@ impl OAuthAuthorizationCode {
         });
 
         // Build authorization URL
-        let scope_str = if scopes.is_empty() {
-            None
-        } else {
+        let scope_str = if !scopes.is_empty() {
             Some(scopes.join(" "))
+        } else if let Some(challenge) = &discovery.challenge
+            && !challenge.scopes.is_empty()
+        {
+            Some(challenge.scopes.join(" "))
+        } else {
+            (!discovery
+                .protected_resource_metadata
+                .scopes_supported
+                .is_empty())
+            .then(|| {
+                discovery
+                    .protected_resource_metadata
+                    .scopes_supported
+                    .join(" ")
+            })
         };
 
-        let mut auth_url = format!(
-            "{}?response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256",
-            metadata.authorization_endpoint,
-            urlencoding::encode(config.client_id.as_deref().unwrap_or("tower-mcp")),
-            urlencoding::encode(&redirect_uri),
-            urlencoding::encode(&state),
-            urlencoding::encode(&code_challenge),
-        );
-        if let Some(ref s) = scope_str {
-            auth_url.push_str("&scope=");
-            auth_url.push_str(&urlencoding::encode(s));
-        }
-
         let client_id = config.client_id.unwrap_or_else(|| "tower-mcp".to_string());
+        let mut auth_url = reqwest::Url::parse(&metadata.authorization_endpoint)
+            .map_err(|error| OAuthClientError::Discovery(error.to_string()))?;
+        {
+            let mut query = auth_url.query_pairs_mut();
+            query
+                .append_pair("response_type", "code")
+                .append_pair("client_id", &client_id)
+                .append_pair("redirect_uri", &redirect_uri)
+                .append_pair("state", &state)
+                .append_pair("code_challenge", &code_challenge)
+                .append_pair("code_challenge_method", "S256");
+            if let Some(scopes) = &scope_str {
+                query.append_pair("scope", scopes);
+            }
+            query.append_pair("resource", &discovery.resource);
+        }
 
         Ok(Self {
             inner: Arc::new(OAuthAuthCodeInner {
-                authorization_url: auth_url,
+                authorization_url: auth_url.into(),
                 token_endpoint: metadata.token_endpoint,
                 client_id,
                 client_secret: config.client_secret,
+                token_endpoint_auth_method,
+                resource: discovery.resource,
                 code_verifier,
                 state,
                 redirect_uri,
@@ -905,28 +1157,21 @@ impl OAuthAuthorizationCode {
 
     /// Exchange an authorization code for tokens.
     async fn exchange_code(&self, code: &str) -> Result<CachedAuthCodeToken, OAuthClientError> {
-        let mut body = format!(
-            "grant_type=authorization_code&code={}&redirect_uri={}&code_verifier={}&client_id={}",
-            urlencoding::encode(code),
-            urlencoding::encode(&self.inner.redirect_uri),
-            urlencoding::encode(&self.inner.code_verifier),
-            urlencoding::encode(&self.inner.client_id),
-        );
-
-        if let Some(ref secret) = self.inner.client_secret {
-            body.push_str("&client_secret=");
-            body.push_str(&urlencoding::encode(secret));
-        }
-
-        let response = self
-            .inner
-            .client
-            .post(&self.inner.token_endpoint)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| OAuthClientError::TokenRequest(e.to_string()))?;
+        let response = send_token_request(
+            &self.inner.client,
+            &self.inner.token_endpoint,
+            vec![
+                ("grant_type", "authorization_code".to_string()),
+                ("code", code.to_string()),
+                ("redirect_uri", self.inner.redirect_uri.clone()),
+                ("code_verifier", self.inner.code_verifier.clone()),
+                ("resource", self.inner.resource.clone()),
+            ],
+            self.inner.token_endpoint_auth_method,
+            &self.inner.client_id,
+            self.inner.client_secret.as_deref(),
+        )
+        .await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -950,31 +1195,25 @@ impl OAuthAuthorizationCode {
         &self,
         refresh_token: &str,
     ) -> Result<CachedAuthCodeToken, OAuthClientError> {
-        let mut body = format!(
-            "grant_type=refresh_token&refresh_token={}&client_id={}",
-            urlencoding::encode(refresh_token),
-            urlencoding::encode(&self.inner.client_id),
-        );
-
-        if let Some(ref secret) = self.inner.client_secret {
-            body.push_str("&client_secret=");
-            body.push_str(&urlencoding::encode(secret));
-        }
-
+        let mut params = vec![
+            ("grant_type", "refresh_token".to_string()),
+            ("refresh_token", refresh_token.to_string()),
+            ("resource", self.inner.resource.clone()),
+        ];
         if let Some(ref scopes) = self.inner.scopes {
-            body.push_str("&scope=");
-            body.push_str(&urlencoding::encode(scopes));
+            params.push(("scope", scopes.clone()));
         }
 
-        let response = self
-            .inner
-            .client
-            .post(&self.inner.token_endpoint)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| OAuthClientError::TokenRequest(format!("Refresh failed: {}", e)))?;
+        let response = send_token_request(
+            &self.inner.client,
+            &self.inner.token_endpoint,
+            params,
+            self.inner.token_endpoint_auth_method,
+            &self.inner.client_id,
+            self.inner.client_secret.as_deref(),
+        )
+        .await
+        .map_err(|error| OAuthClientError::TokenRequest(format!("Refresh failed: {error}")))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -997,6 +1236,59 @@ impl OAuthAuthorizationCode {
 
         Ok(to_cached_token(token_response))
     }
+}
+
+fn require_s256(metadata: &OAuthAuthorizationServerMetadata) -> Result<(), OAuthClientError> {
+    if metadata
+        .code_challenge_methods_supported
+        .iter()
+        .any(|method| method == "S256")
+    {
+        Ok(())
+    } else {
+        Err(OAuthClientError::Discovery(format!(
+            "authorization server `{}` does not advertise PKCE S256 support",
+            metadata.issuer
+        )))
+    }
+}
+
+async fn send_token_request(
+    client: &reqwest::Client,
+    token_endpoint: &str,
+    mut params: Vec<(&'static str, String)>,
+    method: OAuthTokenEndpointAuthMethod,
+    client_id: &str,
+    client_secret: Option<&str>,
+) -> Result<reqwest::Response, OAuthClientError> {
+    let mut request = client.post(token_endpoint);
+    match method {
+        OAuthTokenEndpointAuthMethod::None => {
+            params.push(("client_id", client_id.to_string()));
+        }
+        OAuthTokenEndpointAuthMethod::ClientSecretBasic => {
+            let secret = client_secret.ok_or_else(|| {
+                OAuthClientError::BuildError(
+                    "client_secret_basic requires a client secret".to_string(),
+                )
+            })?;
+            request = request.basic_auth(client_id, Some(secret));
+        }
+        OAuthTokenEndpointAuthMethod::ClientSecretPost => {
+            let secret = client_secret.ok_or_else(|| {
+                OAuthClientError::BuildError(
+                    "client_secret_post requires a client secret".to_string(),
+                )
+            })?;
+            params.push(("client_id", client_id.to_string()));
+            params.push(("client_secret", secret.to_string()));
+        }
+    }
+    request
+        .form(&params)
+        .send()
+        .await
+        .map_err(|error| OAuthClientError::TokenRequest(error.to_string()))
 }
 
 fn to_cached_token(response: TokenResponse) -> CachedAuthCodeToken {
@@ -1078,6 +1370,15 @@ pub struct OAuthAuthCodeConfig {
     pub refresh_buffer: Duration,
     /// Custom reqwest client.
     pub http_client: Option<reqwest::Client>,
+    /// Bearer challenge already obtained from the protected resource.
+    ///
+    /// When omitted, the client probes `server_url` before falling back to
+    /// well-known discovery.
+    pub challenge: Option<OAuthBearerChallenge>,
+    /// Exact issuer to select when Protected Resource Metadata advertises
+    /// multiple authorization servers. The first advertised server is used
+    /// when this is omitted.
+    pub preferred_authorization_server: Option<String>,
 }
 
 impl Default for OAuthAuthCodeConfig {
@@ -1088,6 +1389,8 @@ impl Default for OAuthAuthCodeConfig {
             callback_port: None,
             refresh_buffer: Duration::from_secs(30),
             http_client: None,
+            challenge: None,
+            preferred_authorization_server: None,
         }
     }
 }
@@ -1256,6 +1559,91 @@ fn validate_iss(
 mod tests {
     use super::*;
 
+    async fn spawn_discovery_server() -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server_base = base.clone();
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 1024];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert!(read > 0);
+                    bytes.extend_from_slice(&chunk[..read]);
+                    if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&bytes);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap()
+                    .to_string();
+                requests.push(path.clone());
+
+                let (status, extra_headers, body) = match path.as_str() {
+                    "/mcp" => (
+                        "401 Unauthorized",
+                        format!(
+                            "WWW-Authenticate: Bearer resource_metadata=\"{server_base}/metadata\", scope=\"challenge.scope\"\r\n"
+                        ),
+                        String::new(),
+                    ),
+                    "/metadata" => (
+                        "200 OK",
+                        String::new(),
+                        serde_json::json!({
+                            "resource": format!("{server_base}/mcp"),
+                            "authorization_servers": [
+                                format!("{server_base}/auth-a"),
+                                format!("{server_base}/auth-b")
+                            ],
+                            "scopes_supported": ["metadata.scope"]
+                        })
+                        .to_string(),
+                    ),
+                    "/.well-known/oauth-authorization-server/auth-a" => (
+                        "200 OK",
+                        String::new(),
+                        authorization_metadata_json(&server_base, "auth-a"),
+                    ),
+                    "/.well-known/oauth-authorization-server/auth-b" => (
+                        "200 OK",
+                        String::new(),
+                        authorization_metadata_json(&server_base, "auth-b"),
+                    ),
+                    other => panic!("unexpected request path: {other}"),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n{extra_headers}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        (base, task)
+    }
+
+    fn authorization_metadata_json(base: &str, name: &str) -> String {
+        let issuer = format!("{base}/{name}");
+        serde_json::json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{base}/{name}/authorize"),
+            "token_endpoint": format!("{base}/{name}/token"),
+            "code_challenge_methods_supported": ["S256"],
+            "token_endpoint_auth_methods_supported": ["none"]
+        })
+        .to_string()
+    }
+
     #[test]
     fn test_pkce_code_verifier_length() {
         let verifier = generate_code_verifier();
@@ -1290,6 +1678,156 @@ mod tests {
         let s1 = generate_state();
         let s2 = generate_state();
         assert_ne!(s1, s2);
+    }
+
+    #[test]
+    fn final_well_known_urls_are_path_aware() {
+        assert_eq!(
+            protected_resource_metadata_urls("https://mcp.example.com/team/mcp").unwrap(),
+            vec![
+                "https://mcp.example.com/.well-known/oauth-protected-resource/team/mcp",
+                "https://mcp.example.com/.well-known/oauth-protected-resource",
+            ]
+        );
+        let urls = authorization_server_metadata_urls("https://auth.example.com/tenant").unwrap();
+        assert_eq!(
+            urls[0],
+            "https://auth.example.com/.well-known/oauth-authorization-server/tenant"
+        );
+        assert_eq!(
+            urls[1],
+            "https://auth.example.com/.well-known/openid-configuration/tenant"
+        );
+        assert!(
+            urls.contains(
+                &"https://auth.example.com/tenant/.well-known/openid-configuration".into()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn public_discovery_honors_challenge_and_exposes_all_servers() {
+        let (base, server) = spawn_discovery_server().await;
+        let resource = format!("{base}/mcp");
+        let discovery = discover_oauth_authorization(&resource, None, &reqwest::Client::new())
+            .await
+            .unwrap();
+
+        assert_eq!(discovery.resource, resource);
+        assert_eq!(discovery.authorization_servers.len(), 2);
+        assert!(
+            discovery
+                .authorization_server(&format!("{base}/auth-b"))
+                .is_some()
+        );
+        assert_eq!(discovery.challenge.unwrap().scopes, vec!["challenge.scope"]);
+        assert_eq!(
+            server.await.unwrap(),
+            vec![
+                "/mcp",
+                "/metadata",
+                "/.well-known/oauth-authorization-server/auth-a",
+                "/.well-known/oauth-authorization-server/auth-b",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn authorization_flow_selects_issuer_and_binds_resource() {
+        let (base, server) = spawn_discovery_server().await;
+        let resource = format!("{base}/mcp");
+        let provider = OAuthAuthorizationCode::start_with_config(
+            &resource,
+            &[],
+            OAuthAuthCodeConfig {
+                client_id: Some("public-client".into()),
+                preferred_authorization_server: Some(format!("{base}/auth-b")),
+                ..OAuthAuthCodeConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let authorization_url = reqwest::Url::parse(provider.authorization_url()).unwrap();
+        assert_eq!(authorization_url.path(), "/auth-b/authorize");
+        let parameters: HashMap<_, _> = authorization_url.query_pairs().into_owned().collect();
+        assert_eq!(parameters.get("resource"), Some(&resource));
+        assert_eq!(
+            parameters.get("scope").map(String::as_str),
+            Some("challenge.scope")
+        );
+        assert_eq!(
+            parameters.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn token_request_uses_metadata_selected_basic_auth_and_resource() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let header_end = loop {
+                let mut chunk = [0_u8; 1024];
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0);
+                bytes.extend_from_slice(&chunk[..read]);
+                if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]).to_string();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            while bytes.len() < header_end + content_length {
+                let mut chunk = [0_u8; 1024];
+                let read = stream.read(&mut chunk).await.unwrap();
+                bytes.extend_from_slice(&chunk[..read]);
+            }
+            let body = String::from_utf8_lossy(&bytes[header_end..header_end + content_length])
+                .to_string();
+            let response_body = r#"{"access_token":"token","token_type":"Bearer"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            (headers, body)
+        });
+
+        let response = send_token_request(
+            &reqwest::Client::new(),
+            &endpoint,
+            vec![
+                ("grant_type", "authorization_code".into()),
+                ("resource", "https://mcp.example.com/team/mcp".into()),
+            ],
+            OAuthTokenEndpointAuthMethod::ClientSecretBasic,
+            "client id",
+            Some("client secret"),
+        )
+        .await
+        .unwrap();
+        assert!(response.status().is_success());
+        let (headers, body) = server.await.unwrap();
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("authorization: basic ")
+        );
+        assert!(body.contains("resource=https%3A%2F%2Fmcp.example.com%2Fteam%2Fmcp"));
+        assert!(!body.contains("client_secret"));
     }
 
     #[test]
@@ -1397,6 +1935,15 @@ mod tests {
         let metadata = authorization_server_metadata("https://auth.example.com/");
         let err = validate_metadata_issuer(&metadata, "https://auth.example.com").unwrap_err();
         assert!(err.to_string().contains("issuer mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn authorization_code_flow_requires_advertised_s256() {
+        let mut metadata = authorization_server_metadata("https://auth.example.com");
+        metadata.code_challenge_methods_supported.clear();
+
+        let error = require_s256(&metadata).unwrap_err();
+        assert!(error.to_string().contains("PKCE S256"));
     }
 
     #[tokio::test]
@@ -1719,6 +2266,10 @@ mod tests {
             registration_endpoint: None,
             client_id_metadata_document_supported: false,
             authorization_response_iss_parameter_supported: false,
+            code_challenge_methods_supported: vec!["S256".to_string()],
+            token_endpoint_auth_methods_supported: Vec::new(),
+            grant_types_supported: Vec::new(),
+            scopes_supported: Vec::new(),
         }
     }
 

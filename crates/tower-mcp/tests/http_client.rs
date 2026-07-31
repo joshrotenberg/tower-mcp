@@ -1596,6 +1596,7 @@ mod oauth_client_credentials_tests {
             .client_id("my-client")
             .client_secret("my-secret")
             .token_endpoint(format!("{}/token", token_url))
+            .resource(&mcp_url)
             .build()
             .unwrap();
 
@@ -1624,6 +1625,7 @@ mod oauth_client_credentials_tests {
             .client_id("my-client")
             .client_secret("wrong-secret")
             .token_endpoint(format!("{}/token", token_url))
+            .resource(&mcp_url)
             .build()
             .unwrap();
 

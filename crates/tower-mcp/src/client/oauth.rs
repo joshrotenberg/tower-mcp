@@ -15,6 +15,7 @@
 //!     .client_id("my-client")
 //!     .client_secret("my-secret")
 //!     .token_endpoint("https://auth.example.com/token")
+//!     .resource("https://mcp.example.com")
 //!     .scopes(["mcp:tools", "mcp:resources"])
 //!     .build()?;
 //!
@@ -31,7 +32,7 @@
 //!
 //! # async fn example() -> Result<(), tower_mcp::BoxError> {
 //! let provider = OAuthClientCredentials::discover(
-//!     "https://auth.example.com",
+//!     "https://mcp.example.com",
 //!     "my-client",
 //!     "my-secret",
 //! ).await?;
@@ -45,6 +46,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio::sync::RwLock;
+
+use super::oauth_authcode::discover_oauth_authorization;
 
 /// Trait for dynamic token providers.
 ///
@@ -76,27 +79,28 @@ pub trait TokenProvider: Send + Sync + 'static {
     async fn get_token(&self) -> Result<String, OAuthClientError>;
 }
 
-/// An OAuth `insufficient_scope` Bearer challenge.
+/// Parameters from an OAuth Bearer `WWW-Authenticate` challenge.
 ///
-/// MCP authorization servers use this challenge on HTTP 403 responses to tell
-/// clients which additional scopes are required for the attempted operation.
-/// See [`OAuthScopeChallenge::from_www_authenticate`] for parsing.
+/// MCP clients use the initial `401` challenge to locate Protected Resource
+/// Metadata and select initial scopes. The same representation also covers an
+/// `insufficient_scope` response received later in a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OAuthScopeChallenge {
-    /// Scopes requested by the authorization server.
-    pub required_scopes: Vec<String>,
-    /// Protected resource metadata URL supplied by the server.
+pub struct OAuthBearerChallenge {
+    /// OAuth error code, such as `invalid_token` or `insufficient_scope`.
+    pub error: Option<String>,
+    /// Space-delimited scopes supplied by the protected resource.
+    pub scopes: Vec<String>,
+    /// Protected Resource Metadata URL supplied by the server.
     pub resource_metadata: Option<String>,
     /// Human-readable description supplied by the server.
     pub error_description: Option<String>,
 }
 
-impl OAuthScopeChallenge {
-    /// Parse an `insufficient_scope` Bearer challenge from a
-    /// `WWW-Authenticate` header value.
+impl OAuthBearerChallenge {
+    /// Parse the first Bearer challenge from a `WWW-Authenticate` header.
     ///
-    /// Returns `None` for other authentication schemes, other OAuth errors,
-    /// or challenges that do not include at least one required scope.
+    /// The parser handles quoted commas and escaped quoted strings, and
+    /// ignores other authentication schemes in a combined header value.
     pub fn from_www_authenticate(header: &str) -> Option<Self> {
         let mut in_bearer_challenge = false;
         let mut found_bearer_challenge = false;
@@ -148,19 +152,104 @@ impl OAuthScopeChallenge {
             }
         }
 
-        if error.as_deref() != Some("insufficient_scope") {
+        found_bearer_challenge.then(|| Self {
+            error,
+            scopes: unique_scopes(
+                scope
+                    .iter()
+                    .flat_map(|value| value.split_ascii_whitespace()),
+            ),
+            resource_metadata,
+            error_description,
+        })
+    }
+}
+
+/// An OAuth `insufficient_scope` Bearer challenge.
+///
+/// MCP authorization servers use this challenge on HTTP 403 responses to tell
+/// clients which additional scopes are required for the attempted operation.
+/// See [`OAuthScopeChallenge::from_www_authenticate`] for parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthScopeChallenge {
+    /// Scopes requested by the authorization server.
+    pub required_scopes: Vec<String>,
+    /// Protected resource metadata URL supplied by the server.
+    pub resource_metadata: Option<String>,
+    /// Human-readable description supplied by the server.
+    pub error_description: Option<String>,
+}
+
+impl OAuthScopeChallenge {
+    /// Parse an `insufficient_scope` Bearer challenge from a
+    /// `WWW-Authenticate` header value.
+    ///
+    /// Returns `None` for other authentication schemes, other OAuth errors,
+    /// or challenges that do not include at least one required scope.
+    pub fn from_www_authenticate(header: &str) -> Option<Self> {
+        let challenge = OAuthBearerChallenge::from_www_authenticate(header)?;
+        if challenge.error.as_deref() != Some("insufficient_scope") {
             return None;
         }
-        let required_scopes = unique_scopes(scope?.split_ascii_whitespace());
-        if required_scopes.is_empty() {
+        if challenge.scopes.is_empty() {
             return None;
         }
 
         Some(Self {
-            required_scopes,
-            resource_metadata,
-            error_description,
+            required_scopes: challenge.scopes,
+            resource_metadata: challenge.resource_metadata,
+            error_description: challenge.error_description,
         })
+    }
+}
+
+/// Authentication method used at an OAuth token endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OAuthTokenEndpointAuthMethod {
+    /// Public client authentication: send only `client_id` in the form body.
+    None,
+    /// HTTP Basic authentication using the client ID and secret.
+    ClientSecretBasic,
+    /// Client ID and secret in the form body.
+    ClientSecretPost,
+}
+
+impl OAuthTokenEndpointAuthMethod {
+    pub(crate) fn select(
+        advertised: &[String],
+        has_client_secret: bool,
+    ) -> Result<Self, OAuthClientError> {
+        if advertised.is_empty() {
+            return Ok(if has_client_secret {
+                Self::ClientSecretBasic
+            } else {
+                Self::None
+            });
+        }
+
+        if has_client_secret
+            && advertised
+                .iter()
+                .any(|method| method == "client_secret_basic")
+        {
+            return Ok(Self::ClientSecretBasic);
+        }
+        if has_client_secret
+            && advertised
+                .iter()
+                .any(|method| method == "client_secret_post")
+        {
+            return Ok(Self::ClientSecretPost);
+        }
+        if advertised.iter().any(|method| method == "none") {
+            return Ok(Self::None);
+        }
+
+        Err(OAuthClientError::BuildError(format!(
+            "authorization server supports no compatible token endpoint authentication method: {}",
+            advertised.join(", ")
+        )))
     }
 }
 
@@ -368,17 +457,13 @@ struct TokenResponse {
     scope: Option<String>,
 }
 
-/// Authorization server metadata response (RFC 8414).
-#[derive(Debug, serde::Deserialize)]
-struct AuthServerMetadata {
-    token_endpoint: String,
-}
-
 /// Shared state for [`OAuthClientCredentials`].
 struct OAuthClientCredentialsInner {
     client_id: String,
     client_secret: String,
     token_endpoint: String,
+    token_endpoint_auth_method: OAuthTokenEndpointAuthMethod,
+    resource: String,
     scopes: Option<String>,
     refresh_buffer: Duration,
     client: reqwest::Client,
@@ -411,6 +496,7 @@ struct OAuthClientCredentialsInner {
 ///     .client_id("my-service")
 ///     .client_secret("s3cret")
 ///     .token_endpoint("https://auth.example.com/oauth/token")
+///     .resource("https://mcp.example.com")
 ///     .scopes(["mcp:tools"])
 ///     .refresh_buffer(Duration::from_secs(60))
 ///     .build()?;
@@ -427,6 +513,11 @@ impl fmt::Debug for OAuthClientCredentials {
         f.debug_struct("OAuthClientCredentials")
             .field("client_id", &self.inner.client_id)
             .field("token_endpoint", &self.inner.token_endpoint)
+            .field(
+                "token_endpoint_auth_method",
+                &self.inner.token_endpoint_auth_method,
+            )
+            .field("resource", &self.inner.resource)
             .field("scopes", &self.inner.scopes)
             .field("refresh_buffer", &self.inner.refresh_buffer)
             .finish()
@@ -439,40 +530,38 @@ impl OAuthClientCredentials {
         OAuthClientCredentialsBuilder::default()
     }
 
-    /// Discover the token endpoint from the authorization server metadata
-    /// and create a provider.
+    /// Discover an MCP resource's authorization server and create a provider.
     ///
-    /// Fetches `{issuer}/.well-known/oauth-authorization-server` to find
-    /// the `token_endpoint`, then creates the provider with default settings.
+    /// This performs challenge-driven and path-aware Protected Resource
+    /// Metadata discovery, validates authorization-server metadata, and binds
+    /// token requests to the discovered resource using RFC 8707.
     ///
     /// # Errors
     ///
     /// Returns [`OAuthClientError::Discovery`] if the metadata endpoint
     /// is unreachable or does not contain a `token_endpoint`.
     pub async fn discover(
-        issuer: &str,
+        resource_url: &str,
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
     ) -> Result<Self, OAuthClientError> {
         let client = reqwest::Client::new();
-        let url = format!(
-            "{}/.well-known/oauth-authorization-server",
-            issuer.trim_end_matches('/')
-        );
-
-        let metadata: AuthServerMetadata = client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| OAuthClientError::Discovery(e.to_string()))?
-            .json()
-            .await
-            .map_err(|e| OAuthClientError::Discovery(e.to_string()))?;
+        let discovery = discover_oauth_authorization(resource_url, None, &client).await?;
+        let metadata = discovery.authorization_servers.first().ok_or_else(|| {
+            OAuthClientError::Discovery("no authorization server discovered".into())
+        })?;
+        let auth_method = OAuthTokenEndpointAuthMethod::select(
+            &metadata.token_endpoint_auth_methods_supported,
+            true,
+        )?;
 
         Self::builder()
             .client_id(client_id)
             .client_secret(client_secret)
-            .token_endpoint(metadata.token_endpoint)
+            .token_endpoint(metadata.token_endpoint.clone())
+            .token_endpoint_auth_method(auth_method)
+            .resource(discovery.resource)
+            .http_client(client)
             .build()
             .map_err(|e| OAuthClientError::Discovery(e.to_string()))
     }
@@ -487,26 +576,31 @@ impl OAuthClientCredentials {
 
     /// Perform the token request to the authorization server.
     async fn fetch_token(&self) -> Result<CachedToken, OAuthClientError> {
-        use base64::Engine;
-
-        let credentials = base64::engine::general_purpose::STANDARD.encode(format!(
-            "{}:{}",
-            self.inner.client_id, self.inner.client_secret
-        ));
-
-        let mut body = "grant_type=client_credentials".to_string();
+        let mut params = vec![
+            ("grant_type", "client_credentials".to_string()),
+            ("resource", self.inner.resource.clone()),
+        ];
         if let Some(ref scopes) = self.inner.scopes {
-            body.push_str("&scope=");
-            body.push_str(scopes);
+            params.push(("scope", scopes.clone()));
         }
 
-        let response = self
-            .inner
-            .client
-            .post(&self.inner.token_endpoint)
-            .header("Authorization", format!("Basic {}", credentials))
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(body)
+        let mut request = self.inner.client.post(&self.inner.token_endpoint);
+        match self.inner.token_endpoint_auth_method {
+            OAuthTokenEndpointAuthMethod::None => {
+                params.push(("client_id", self.inner.client_id.clone()));
+            }
+            OAuthTokenEndpointAuthMethod::ClientSecretBasic => {
+                request =
+                    request.basic_auth(&self.inner.client_id, Some(&self.inner.client_secret));
+            }
+            OAuthTokenEndpointAuthMethod::ClientSecretPost => {
+                params.push(("client_id", self.inner.client_id.clone()));
+                params.push(("client_secret", self.inner.client_secret.clone()));
+            }
+        }
+
+        let response = request
+            .form(&params)
             .send()
             .await
             .map_err(|e| OAuthClientError::TokenRequest(e.to_string()))?;
@@ -574,6 +668,7 @@ impl TokenProvider for OAuthClientCredentials {
 /// - `client_id`
 /// - `client_secret`
 /// - `token_endpoint`
+/// - `resource`
 ///
 /// # Example
 ///
@@ -585,6 +680,7 @@ impl TokenProvider for OAuthClientCredentials {
 ///     .client_id("my-service")
 ///     .client_secret("s3cret")
 ///     .token_endpoint("https://auth.example.com/token")
+///     .resource("https://mcp.example.com")
 ///     .build()?;
 /// # Ok(())
 /// # }
@@ -594,6 +690,8 @@ pub struct OAuthClientCredentialsBuilder {
     client_id: Option<String>,
     client_secret: Option<String>,
     token_endpoint: Option<String>,
+    token_endpoint_auth_method: Option<OAuthTokenEndpointAuthMethod>,
+    resource: Option<String>,
     scopes: Option<String>,
     refresh_buffer: Option<Duration>,
     client: Option<reqwest::Client>,
@@ -615,6 +713,24 @@ impl OAuthClientCredentialsBuilder {
     /// Set the token endpoint URL.
     pub fn token_endpoint(mut self, url: impl Into<String>) -> Self {
         self.token_endpoint = Some(url.into());
+        self
+    }
+
+    /// Set the token endpoint authentication method.
+    ///
+    /// Direct configurations default to `client_secret_basic`. Discovery
+    /// selects a compatible method from authorization-server metadata.
+    pub fn token_endpoint_auth_method(mut self, method: OAuthTokenEndpointAuthMethod) -> Self {
+        self.token_endpoint_auth_method = Some(method);
+        self
+    }
+
+    /// Set the canonical MCP protected-resource URI.
+    ///
+    /// The provider includes this value as the RFC 8707 `resource` parameter
+    /// in every client-credentials token request.
+    pub fn resource(mut self, resource: impl Into<String>) -> Self {
+        self.resource = Some(resource.into());
         self
     }
 
@@ -652,7 +768,7 @@ impl OAuthClientCredentialsBuilder {
     /// # Errors
     ///
     /// Returns [`OAuthClientError::BuildError`] if `client_id`, `client_secret`,
-    /// or `token_endpoint` are not set.
+    /// `token_endpoint`, or `resource` are not set.
     pub fn build(self) -> Result<OAuthClientCredentials, OAuthClientError> {
         let client_id = self
             .client_id
@@ -663,11 +779,18 @@ impl OAuthClientCredentialsBuilder {
         let token_endpoint = self
             .token_endpoint
             .ok_or_else(|| OAuthClientError::BuildError("token_endpoint is required".into()))?;
+        let resource = self
+            .resource
+            .ok_or_else(|| OAuthClientError::BuildError("resource is required".into()))?;
 
         let inner = OAuthClientCredentialsInner {
             client_id,
             client_secret,
             token_endpoint,
+            token_endpoint_auth_method: self
+                .token_endpoint_auth_method
+                .unwrap_or(OAuthTokenEndpointAuthMethod::ClientSecretBasic),
+            resource,
             scopes: self.scopes,
             refresh_buffer: self.refresh_buffer.unwrap_or(Duration::from_secs(30)),
             client: self.client.unwrap_or_default(),
@@ -716,11 +839,23 @@ mod tests {
     }
 
     #[test]
+    fn test_builder_requires_resource_binding() {
+        let err = OAuthClientCredentials::builder()
+            .client_id("id")
+            .client_secret("secret")
+            .token_endpoint("https://auth.example.com/token")
+            .build()
+            .unwrap_err();
+        assert!(err.to_string().contains("resource"));
+    }
+
+    #[test]
     fn test_builder_success() {
         let provider = OAuthClientCredentials::builder()
             .client_id("my-client")
             .client_secret("my-secret")
             .token_endpoint("https://auth.example.com/token")
+            .resource("https://mcp.example.com")
             .build()
             .unwrap();
 
@@ -739,6 +874,7 @@ mod tests {
             .client_id("id")
             .client_secret("secret")
             .token_endpoint("https://auth.example.com/token")
+            .resource("https://mcp.example.com")
             .scopes(["mcp:tools", "mcp:resources"])
             .build()
             .unwrap();
@@ -755,6 +891,7 @@ mod tests {
             .client_id("id")
             .client_secret("secret")
             .token_endpoint("https://auth.example.com/token")
+            .resource("https://mcp.example.com")
             .refresh_buffer(Duration::from_secs(60))
             .build()
             .unwrap();
@@ -768,6 +905,7 @@ mod tests {
             .client_id("my-client")
             .client_secret("secret")
             .token_endpoint("https://auth.example.com/token")
+            .resource("https://mcp.example.com")
             .build()
             .unwrap();
 
@@ -852,6 +990,42 @@ mod tests {
     }
 
     #[test]
+    fn parses_initial_bearer_discovery_challenge() {
+        let challenge = OAuthBearerChallenge::from_www_authenticate(
+            r#"Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp", scope="tools.read resources.read""#,
+        )
+        .unwrap();
+
+        assert_eq!(challenge.error, None);
+        assert_eq!(challenge.scopes, vec!["tools.read", "resources.read"]);
+        assert_eq!(
+            challenge.resource_metadata.as_deref(),
+            Some("https://mcp.example.com/.well-known/oauth-protected-resource/mcp")
+        );
+    }
+
+    #[test]
+    fn token_auth_selection_follows_metadata_and_credentials() {
+        assert_eq!(
+            OAuthTokenEndpointAuthMethod::select(&[], true).unwrap(),
+            OAuthTokenEndpointAuthMethod::ClientSecretBasic
+        );
+        assert_eq!(
+            OAuthTokenEndpointAuthMethod::select(&["none".into()], false).unwrap(),
+            OAuthTokenEndpointAuthMethod::None
+        );
+        assert_eq!(
+            OAuthTokenEndpointAuthMethod::select(
+                &["client_secret_post".into(), "client_secret_basic".into()],
+                true,
+            )
+            .unwrap(),
+            OAuthTokenEndpointAuthMethod::ClientSecretBasic
+        );
+        assert!(OAuthTokenEndpointAuthMethod::select(&["private_key_jwt".into()], true).is_err());
+    }
+
+    #[test]
     fn selects_bearer_from_multiple_authentication_challenges() {
         let challenge = OAuthScopeChallenge::from_www_authenticate(
             r#"Basic realm="legacy", Bearer realm="mcp", error="insufficient_scope", scope="tools.call""#,
@@ -898,6 +1072,7 @@ mod tests {
             .client_id("id")
             .client_secret("secret")
             .token_endpoint("https://auth.example.com/token")
+            .resource("https://mcp.example.com")
             .build()
             .unwrap();
 
@@ -924,6 +1099,7 @@ mod tests {
             .client_id("id")
             .client_secret("secret")
             .token_endpoint("http://127.0.0.1:1/nonexistent")
+            .resource("https://mcp.example.com")
             .build()
             .unwrap();
 
@@ -939,6 +1115,69 @@ mod tests {
         // get_token should try to refresh and fail (unreachable endpoint)
         let err = provider.get_token().await.unwrap_err();
         assert!(matches!(err, OAuthClientError::TokenRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn client_credentials_posts_resource_and_selected_auth_method() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let header_end = loop {
+                let mut chunk = [0_u8; 1024];
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0);
+                bytes.extend_from_slice(&chunk[..read]);
+                if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            while bytes.len() < header_end + content_length {
+                let mut chunk = [0_u8; 1024];
+                let read = stream.read(&mut chunk).await.unwrap();
+                bytes.extend_from_slice(&chunk[..read]);
+            }
+            let body = String::from_utf8_lossy(&bytes[header_end..header_end + content_length])
+                .to_string();
+            let response_body =
+                r#"{"access_token":"service-token","token_type":"Bearer","expires_in":3600}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            body
+        });
+
+        let provider = OAuthClientCredentials::builder()
+            .client_id("service-client")
+            .client_secret("service-secret")
+            .token_endpoint(endpoint)
+            .token_endpoint_auth_method(OAuthTokenEndpointAuthMethod::ClientSecretPost)
+            .resource("https://mcp.example.com/mcp")
+            .scopes(["tools.call"])
+            .build()
+            .unwrap();
+        assert_eq!(provider.get_token().await.unwrap(), "service-token");
+
+        let body = server.await.unwrap();
+        assert!(body.contains("grant_type=client_credentials"));
+        assert!(body.contains("resource=https%3A%2F%2Fmcp.example.com%2Fmcp"));
+        assert!(body.contains("client_id=service-client"));
+        assert!(body.contains("client_secret=service-secret"));
+        assert!(body.contains("scope=tools.call"));
     }
 
     #[tokio::test]
@@ -971,6 +1210,7 @@ mod tests {
             .client_id("id")
             .client_secret("secret")
             .token_endpoint("https://auth.example.com/token")
+            .resource("https://mcp.example.com")
             .build()
             .unwrap();
 
