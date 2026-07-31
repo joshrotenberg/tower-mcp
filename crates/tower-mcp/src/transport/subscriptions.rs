@@ -103,3 +103,78 @@ pub(crate) fn subscription_complete_response(
         serde_json::to_value(result).expect("subscription result is serializable"),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tasks::{DetailedTask, TaskMetadata, TaskStatusNotificationParams};
+
+    fn task_notification(task_id: &str) -> ServerNotification {
+        ServerNotification::FinalTaskStatusChanged(TaskStatusNotificationParams {
+            task: DetailedTask::working(TaskMetadata::new(
+                task_id.to_string(),
+                "2026-07-28T00:00:00Z".to_string(),
+                "2026-07-28T00:00:01Z".to_string(),
+                Some(60_000),
+            )),
+            meta: None,
+        })
+    }
+
+    fn subscribed_to(task_ids: &[&str]) -> SubscriptionFilter {
+        SubscriptionFilter {
+            task_ids: Some(task_ids.iter().map(|id| id.to_string()).collect()),
+            ..SubscriptionFilter::default()
+        }
+    }
+
+    #[test]
+    fn task_notifications_match_only_the_named_task_ids() {
+        let filter = subscribed_to(&["task-a", "task-b"]);
+        assert!(subscription_matches(&task_notification("task-a"), &filter));
+        assert!(subscription_matches(&task_notification("task-b"), &filter));
+        assert!(!subscription_matches(&task_notification("task-c"), &filter));
+    }
+
+    #[test]
+    fn a_broad_subscription_still_excludes_unnamed_tasks() {
+        // Tasks are named individually rather than opted into as a class, so
+        // asking for every other notification type grants nothing here.
+        let filter = SubscriptionFilter {
+            tools_list_changed: Some(true),
+            prompts_list_changed: Some(true),
+            resources_list_changed: Some(true),
+            resource_subscriptions: Some(vec!["file:///everything".to_string()]),
+            task_ids: None,
+        };
+        assert!(!subscription_matches(&task_notification("task-a"), &filter));
+    }
+
+    #[test]
+    fn accepted_filter_declines_task_ids_when_the_server_has_no_tasks() {
+        let requested = subscribed_to(&["task-a"]);
+
+        let accepted = accepted_subscription_filter(requested.clone(), true);
+        assert_eq!(
+            accepted.task_ids.as_deref(),
+            Some(&["task-a".to_string()][..])
+        );
+
+        // The acknowledgement reports what the server agreed to honor, so a
+        // server without the extension must not echo the IDs back.
+        let declined = accepted_subscription_filter(requested, false);
+        assert!(declined.task_ids.is_none());
+    }
+
+    #[test]
+    fn task_notifications_serialize_as_notifications_tasks() {
+        let json = crate::transport::stdio::serialize_notification(&task_notification("task-a"))
+            .expect("task notification is serializable");
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["method"], "notifications/tasks");
+        // The DetailedTask is flattened into params rather than nested.
+        assert_eq!(value["params"]["taskId"], "task-a");
+        assert_eq!(value["params"]["status"], "working");
+        assert_eq!(value["params"]["ttlMs"], 60_000);
+    }
+}

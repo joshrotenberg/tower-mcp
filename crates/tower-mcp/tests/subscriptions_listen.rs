@@ -286,3 +286,270 @@ async fn subscriptions_listen_session_fallback_placeholder() {
         "headerless request on 2025-11-25 session must return Method Not Found"
     );
 }
+
+// =============================================================================
+// Task status notifications (SEP-2663)
+// =============================================================================
+
+#[cfg(feature = "stateless")]
+mod tasks {
+    use super::*;
+    use std::time::Duration;
+    use tower_mcp::TaskSupportMode;
+
+    const TASKS_EXTENSION: &str = "io.modelcontextprotocol/tasks";
+
+    fn task_router() -> McpRouter {
+        let slow = ToolBuilder::new("slow")
+            .description("Finish after a beat, so the task is observably working first")
+            .task_support(TaskSupportMode::Optional)
+            .handler(|_: serde_json::Value| async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok(CallToolResult::text("done"))
+            })
+            .build();
+        McpRouter::new()
+            .server_info("listen-test-server", "1.0.0")
+            .tool(slow)
+            .with_tasks()
+    }
+
+    fn final_request(id: &str, method: &str, params: serde_json::Value) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header("Mcp-Protocol-Version", "2026-07-28")
+            .header("Mcp-Method", method);
+        // SEP-2243 requires Mcp-Name to mirror params.name on tools/call.
+        if let Some(name) = params.get("name").and_then(serde_json::Value::as_str) {
+            builder = builder.header("Mcp-Name", name);
+        }
+        builder
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": method,
+                    "params": params,
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    }
+
+    fn meta(declares_tasks: bool) -> serde_json::Value {
+        let capabilities = if declares_tasks {
+            serde_json::json!({ "extensions": { TASKS_EXTENSION: {} } })
+        } else {
+            serde_json::json!({})
+        };
+        serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": capabilities,
+        })
+    }
+
+    async fn body_string(response: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// A task subscriber sees the terminal transition even though the
+    /// `tools/call` that created the task has already returned.
+    #[tokio::test]
+    async fn completing_a_task_reaches_a_subscribed_listen_stream() {
+        let (app, handle) = HttpTransport::new(task_router())
+            .disable_origin_validation()
+            .disable_host_validation()
+            .into_router_with_handle();
+
+        let create = app
+            .clone()
+            .oneshot(final_request(
+                "call-1",
+                "tools/call",
+                serde_json::json!({
+                    "_meta": meta(true),
+                    "name": "slow",
+                    "arguments": {},
+                    "task": { "ttl": 60000 },
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::OK);
+        let created: serde_json::Value = serde_json::from_str(&body_string(create).await).unwrap();
+        let task_id = created["result"]["taskId"]
+            .as_str()
+            .expect("final create result carries a flat taskId")
+            .to_string();
+
+        let listen = app
+            .oneshot(final_request(
+                "listen-1",
+                "subscriptions/listen",
+                serde_json::json!({
+                    "_meta": meta(true),
+                    "notifications": { "taskIds": [task_id, "some-other-task"] },
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(listen.status(), StatusCode::OK);
+        assert_eq!(handle.subscription_count(), 1);
+
+        // Outlive the handler's sleep, then drain so the body terminates.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(handle.close_subscriptions(), 1);
+
+        let body = body_string(listen).await;
+        assert!(
+            body.contains("notifications/subscriptions/acknowledged"),
+            "stream must begin with an acknowledgment: {body}"
+        );
+        assert!(
+            body.contains(&format!("\"taskIds\":[\"{task_id}\",\"some-other-task\"]")),
+            "the acknowledgment must echo the accepted task IDs: {body}"
+        );
+        assert!(
+            body.contains("notifications/tasks"),
+            "the completion must reach the stream: {body}"
+        );
+        assert!(
+            body.contains("\"status\":\"completed\""),
+            "the notification must carry the terminal status: {body}"
+        );
+        assert!(
+            body.contains(&format!("\"taskId\":\"{task_id}\"")),
+            "the notification must name the task: {body}"
+        );
+        assert!(
+            body.contains("\"io.modelcontextprotocol/subscriptionId\":\"listen-1\""),
+            "the notification must be tagged with the subscription: {body}"
+        );
+    }
+
+    /// A subscriber that named a different task hears nothing.
+    #[tokio::test]
+    async fn an_unnamed_task_never_reaches_a_stream() {
+        let (app, handle) = HttpTransport::new(task_router())
+            .disable_origin_validation()
+            .disable_host_validation()
+            .into_router_with_handle();
+
+        let create = app
+            .clone()
+            .oneshot(final_request(
+                "call-1",
+                "tools/call",
+                serde_json::json!({
+                    "_meta": meta(true),
+                    "name": "slow",
+                    "arguments": {},
+                    "task": { "ttl": 60000 },
+                }),
+            ))
+            .await
+            .unwrap();
+        let created: serde_json::Value = serde_json::from_str(&body_string(create).await).unwrap();
+        let task_id = created["result"]["taskId"].as_str().unwrap().to_string();
+
+        let listen = app
+            .oneshot(final_request(
+                "listen-1",
+                "subscriptions/listen",
+                serde_json::json!({
+                    "_meta": meta(true),
+                    "notifications": { "taskIds": ["a-task-this-client-does-not-own"] },
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(listen.status(), StatusCode::OK);
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        handle.close_subscriptions();
+
+        let body = body_string(listen).await;
+        assert!(
+            !body.contains("notifications/tasks"),
+            "a task the stream did not name must not appear: {body}"
+        );
+        assert!(
+            !body.contains(&task_id),
+            "the unrelated task ID must not leak: {body}"
+        );
+    }
+
+    /// SEP-2663: requesting task notifications without declaring the extension
+    /// is answered with the missing-capability error, not a silent drop.
+    #[tokio::test]
+    async fn task_ids_without_the_extension_are_rejected() {
+        let app = HttpTransport::new(task_router())
+            .disable_origin_validation()
+            .disable_host_validation()
+            .into_router();
+
+        let response = app
+            .oneshot(final_request(
+                "listen-1",
+                "subscriptions/listen",
+                serde_json::json!({
+                    "_meta": meta(false),
+                    "notifications": { "taskIds": ["task-a"] },
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["id"], "listen-1");
+        assert_eq!(body["error"]["code"], -32021);
+        assert!(
+            body["error"]["data"]["requiredCapabilities"]["extensions"][TASKS_EXTENSION]
+                .is_object(),
+            "the error must name the extension the client is missing: {body}"
+        );
+    }
+
+    /// A server without the extension acknowledges the rest of the filter and
+    /// declines the task IDs rather than promising notifications it will never
+    /// send.
+    #[tokio::test]
+    async fn a_server_without_tasks_declines_the_task_ids() {
+        let (app, handle) = HttpTransport::new(router())
+            .disable_origin_validation()
+            .disable_host_validation()
+            .into_router_with_handle();
+
+        let response = app
+            .oneshot(final_request(
+                "listen-1",
+                "subscriptions/listen",
+                serde_json::json!({
+                    "_meta": meta(true),
+                    "notifications": { "taskIds": ["task-a"], "toolsListChanged": true },
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        handle.close_subscriptions();
+
+        let body = body_string(response).await;
+        assert!(body.contains("notifications/subscriptions/acknowledged"));
+        assert!(
+            body.contains("\"toolsListChanged\":true"),
+            "the rest of the filter still stands: {body}"
+        );
+        assert!(
+            !body.contains("taskIds"),
+            "a server without the extension must not acknowledge task IDs: {body}"
+        );
+    }
+}

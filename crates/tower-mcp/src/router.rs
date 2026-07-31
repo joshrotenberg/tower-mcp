@@ -3819,6 +3819,7 @@ mod tests {
         extensions
     }
 
+    #[cfg(feature = "stateless")]
     fn tasks_client_extensions() -> Extensions {
         final_extensions(ClientCapabilities {
             extensions: Some(
@@ -3830,6 +3831,7 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "stateless")]
     #[tokio::test]
     async fn final_tasks_require_server_opt_in_and_client_declaration() {
         let tool = || {
@@ -3947,6 +3949,7 @@ mod tests {
         assert!(matches!(response, McpResponse::CallTool(_)));
     }
 
+    #[cfg(feature = "stateless")]
     #[tokio::test]
     async fn final_task_methods_serve_the_negotiated_wire_shapes() {
         let router = McpRouter::new()
@@ -4068,7 +4071,7 @@ mod tests {
         assert!(matches!(error, Error::JsonRpc(e) if e.code == -32601));
     }
 
-    #[cfg(feature = "oauth")]
+    #[cfg(all(feature = "oauth", feature = "stateless"))]
     #[tokio::test]
     async fn task_operations_are_bound_to_the_creating_principal() {
         fn as_principal(subject: &str) -> Extensions {

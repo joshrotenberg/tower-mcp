@@ -4009,9 +4009,6 @@ fn stateless_sse_with_notifications(
         .into_response()
 }
 
-/// Serve the final, sessionless `subscriptions/listen` protocol over its
-/// owning POST response.
-#[cfg(feature = "stateless")]
 /// Whether a `subscriptions/listen` request declared the Tasks extension.
 ///
 /// The listen handler runs ahead of the router, so it reads the per-request
@@ -4028,6 +4025,9 @@ fn listen_request_declares_tasks(parsed: &serde_json::Value) -> bool {
         })
 }
 
+/// Serve the final, sessionless `subscriptions/listen` protocol over its
+/// owning POST response.
+#[cfg(feature = "stateless")]
 async fn handle_modern_subscriptions_listen_sse(
     state: Arc<AppState>,
     parsed: &serde_json::Value,
