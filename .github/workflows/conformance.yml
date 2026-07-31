@@ -11,6 +11,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CONFORMANCE_VERSION: "0.2.0-alpha.10"
 
 jobs:
   server-conformance:
@@ -35,7 +36,7 @@ jobs:
 
       - name: Wait for server
         run: |
-          for i in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             if nc -z 127.0.0.1 3001 2>/dev/null; then
               echo "Server is ready"
               exit 0
@@ -47,7 +48,12 @@ jobs:
           exit 1
 
       - name: Run conformance suite
-        run: npx @modelcontextprotocol/conformance@0.1.16 server --url http://127.0.0.1:3001/mcp --expected-failures ./conformance-baseline.yml
+        run: |
+          npx -y "@modelcontextprotocol/conformance@${CONFORMANCE_VERSION}" server \
+            --url http://127.0.0.1:3001/mcp \
+            --suite all \
+            --spec-version 2025-11-25 \
+            --expected-failures ./conformance-baseline.yml
 
       - name: Show server logs on failure
         if: failure()
@@ -72,7 +78,7 @@ jobs:
 
       - name: Wait for server
         run: |
-          for i in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             if nc -z 127.0.0.1 3001 2>/dev/null; then
               echo "Server is ready"
               exit 0
@@ -226,8 +232,9 @@ jobs:
       - name: Run client conformance suite
         run: |
           # The empty baseline makes any regression fail immediately.
-          npx @modelcontextprotocol/conformance@0.1.16 client \
+          npx -y "@modelcontextprotocol/conformance@${CONFORMANCE_VERSION}" client \
             --suite all \
+            --spec-version 2025-11-25 \
             --command "cargo run --manifest-path examples/conformance-client/Cargo.toml --" \
             --expected-failures ./conformance-baseline-client.yml
 
@@ -253,7 +260,7 @@ jobs:
 
       - name: Wait for server
         run: |
-          for i in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             if nc -z 127.0.0.1 3001 2>/dev/null; then
               echo "Server is ready"
               exit 0
@@ -271,7 +278,7 @@ jobs:
           # including stateless requests, caching, header validation, and
           # the 14 MRTR input-required-result scenarios. The empty baseline
           # keeps CI strict if a regression appears.
-          npx @modelcontextprotocol/conformance@0.2.0-alpha.10 server \
+          npx -y "@modelcontextprotocol/conformance@${CONFORMANCE_VERSION}" server \
             --url http://127.0.0.1:3001/mcp \
             --spec-version 2026-07-28 \
             --suite all \
@@ -306,7 +313,7 @@ jobs:
           # Actions default bash already sets it; stated here because the
           # gating depends on it).
           set -o pipefail
-          npx @modelcontextprotocol/conformance@0.2.0-alpha.10 client \
+          npx -y "@modelcontextprotocol/conformance@${CONFORMANCE_VERSION}" client \
             --suite all \
             --spec-version 2026-07-28 \
             --command "cargo run --manifest-path examples/conformance-client/Cargo.toml --" \

@@ -39,5 +39,5 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for build commands, PR guidelines, and co
 - `crates/tower-mcp-macros/src/` - Optional proc macros
 - `examples/` - Example servers and clients (23 standalone `.rs` files)
   - `codegen-mcp/` - MCP server builder (generates tower-mcp code)
-  - `conformance-server/` - MCP spec conformance tests (39/39)
+  - `conformance-server/` - MCP spec conformance tests (48/48 stable; 114/114 final)
   - `conformance-client/` - MCP conformance client (265/265 checks)

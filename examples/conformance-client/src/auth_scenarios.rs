@@ -459,18 +459,15 @@ async fn send_initial_mcp_probe(
                 }
             }));
     } else {
+        // Initialization is intentionally unauthenticated, so it cannot expose
+        // the resource's WWW-Authenticate scope hints. Probe a protected MCP
+        // operation instead; the authorization flow needs those hints before
+        // selecting its initial scope set.
         request = request.json(&serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-11-25",
-                "capabilities": {},
-                "clientInfo": {
-                    "name": "conformance-client",
-                    "version": "0.1.0"
-                }
-            }
+            "method": "tools/list",
+            "params": {}
         }));
     }
 

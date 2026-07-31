@@ -1,7 +1,11 @@
 # MCP Conformance Suite -- Expected Failures Baseline
 #
-# All 39 tests currently pass. Add entries here if a conformance test
+# Applies to the 0.2.0-alpha.x suite run with
+# `server --spec-version 2025-11-25 --suite all`.
+#
+# All 48 checks currently pass. Add entries here if a conformance scenario
 # covers a feature that is intentionally unsupported or deferred.
 #
-# Format:
-#   - test_name: "reason for expected failure"
+# Format (0.2.x suite): plain scenario-name strings under the `server:` key.
+
+server: []

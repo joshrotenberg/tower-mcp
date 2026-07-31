@@ -4,8 +4,8 @@
 
 - **Version**: 0.16.x
 - **Spec version**: 2025-11-25 by default, plus the released 2026-07-28 protocol as an opt-in implementation behind `protocol-2026-07-28`
-- **Server conformance (2025-11-25)**: 39/39
-- **Client conformance (2025-11-25)**: 311/311 (empty baseline)
+- **Server conformance (2025-11-25)**: 48/48 (empty baseline)
+- **Client conformance (2025-11-25)**: 235/235 (empty baseline)
 - **Server conformance (2026-07-28)**: 114/114 (empty baseline)
 - **Client conformance (2026-07-28)**: 399/399 (empty baseline)
 - **MSRV**: 1.90 (Rust 2024 edition)
@@ -16,8 +16,8 @@ tower-mcp targets Tier 2 per the [MCP SDK Tiering System](https://modelcontextpr
 
 | # | Requirement | Status |
 |---|-------------|--------|
-| 1 | Server conformance >= 80% | 100% (39/39) |
-| 2 | Client conformance >= 80% | 311/311 stable; 399/399 final |
+| 1 | Server conformance >= 80% | 100% (48/48 stable; 114/114 final) |
+| 2 | Client conformance >= 80% | 235/235 stable; 399/399 final |
 | 3 | Issue triage within 1 month | Active |
 | 4 | P0 resolution within 2 weeks | 0 open |
 | 5 | Stable release >= 1.0.0 | 0.16.x -- pre-1.0 |
