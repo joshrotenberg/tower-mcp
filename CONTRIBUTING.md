@@ -4,10 +4,10 @@
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --lib --all-features
-cargo test --test '*' --all-features
-cargo test --doc --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets --all-features
+RUSTDOCFLAGS="-Dwarnings" cargo doc --workspace --all-features --no-deps
+cargo test --workspace --doc --all-features
 ```
 
 All of these must pass before submitting a PR.

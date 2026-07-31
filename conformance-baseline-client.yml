@@ -4,6 +4,6 @@
 # CI fails if any scenario regresses.
 #
 # Status at 0.1.16 after the authorization work: all 26 scenarios are green
-# (295 checks, zero failures or warnings).
+# (311 checks, zero failures or warnings).
 
 client: []

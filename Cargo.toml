@@ -4,6 +4,7 @@ members = [
     "crates/tower-mcp",
     "crates/tower-mcp-types",
     "crates/tower-mcp-macros",
+    "examples",
     "examples/conformance-server",
     "examples/conformance-client",
     "examples/codegen-mcp",

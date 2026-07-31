@@ -8,6 +8,10 @@ license.workspace = true
 repository.workspace = true
 description = "Proc macros for tower-mcp (optional convenience layer)"
 documentation = "https://docs.rs/tower-mcp-macros"
+homepage = "https://github.com/joshrotenberg/tower-mcp"
+readme = "README.md"
+keywords = ["mcp", "macros", "tower", "ai", "llm"]
+categories = ["development-tools::procedural-macro-helpers"]
 
 [lib]
 proc-macro = true

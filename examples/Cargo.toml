@@ -1,0 +1,210 @@
+[package]
+name = "tower-mcp-examples"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+axum.workspace = true
+futures.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tower = { workspace = true, features = ["timeout", "limit"] }
+tower-mcp.workspace = true
+tower-mcp-types.workspace = true
+tower-resilience = { workspace = true, default-features = false, features = ["coalesce", "ratelimiter", "circuitbreaker"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[features]
+default = []
+full = ["tower-mcp/full"]
+http = ["tower-mcp/http"]
+websocket = ["tower-mcp/websocket"]
+unix = ["tower-mcp/unix"]
+childproc = ["tower-mcp/childproc"]
+oauth = ["tower-mcp/oauth"]
+jwks = ["tower-mcp/jwks"]
+testing = ["tower-mcp/testing"]
+dynamic-tools = ["tower-mcp/dynamic-tools"]
+http-client = ["tower-mcp/http-client"]
+oauth-client = ["tower-mcp/oauth-client"]
+proxy = ["tower-mcp/proxy"]
+macros = ["tower-mcp/macros"]
+resilience = ["tower-mcp/resilience"]
+mcp-apps = ["tower-mcp/mcp-apps"]
+protocol-2026-07-28 = ["tower-mcp/protocol-2026-07-28"]
+stateless = ["tower-mcp/stateless"]
+
+# The examples are repository-only targets. Keeping them in this unpublished
+# package preserves `cargo run --example ...` while keeping release archives
+# focused on the library crates.
+
+# --- Getting started ---
+[[example]]
+name = "getting_started"
+path = "getting_started.rs"
+
+[[example]]
+name = "mcp_apps"
+path = "mcp_apps.rs"
+required-features = ["mcp-apps"]
+
+[[example]]
+name = "tasks"
+path = "tasks.rs"
+required-features = ["protocol-2026-07-28"]
+
+# --- Transports ---
+[[example]]
+name = "http_server"
+path = "http_server.rs"
+required-features = ["http"]
+
+[[example]]
+name = "websocket_server"
+path = "websocket_server.rs"
+required-features = ["websocket"]
+
+[[example]]
+name = "unix_socket_server"
+path = "unix_socket_server.rs"
+required-features = ["unix"]
+
+[[example]]
+name = "session_store"
+path = "session_store.rs"
+required-features = ["http"]
+
+[[example]]
+name = "event_store"
+path = "event_store.rs"
+required-features = ["http"]
+
+[[example]]
+name = "horizontal_scaling"
+path = "horizontal_scaling.rs"
+required-features = ["http"]
+
+[[example]]
+name = "external_notifications"
+path = "external_notifications.rs"
+required-features = ["http"]
+
+[[example]]
+name = "axum_embedding"
+path = "axum_embedding.rs"
+required-features = ["http"]
+
+# --- Middleware ---
+[[example]]
+name = "middleware"
+path = "middleware.rs"
+
+[[example]]
+name = "rate_limiting"
+path = "rate_limiting.rs"
+
+[[example]]
+name = "capability_filtering"
+path = "capability_filtering.rs"
+required-features = ["http"]
+
+[[example]]
+name = "tool_selection"
+path = "tool_selection.rs"
+
+# --- Authentication ---
+[[example]]
+name = "http_auth"
+path = "http_auth.rs"
+required-features = ["oauth"]
+
+[[example]]
+name = "oauth_client"
+path = "oauth_client.rs"
+required-features = ["oauth-client"]
+
+[[example]]
+name = "external_api_auth"
+path = "external_api_auth.rs"
+
+# --- Clients ---
+[[example]]
+name = "client_cli"
+path = "client_cli.rs"
+
+[[example]]
+name = "http_client"
+path = "http_client.rs"
+required-features = ["http-client"]
+
+[[example]]
+name = "http_sse_client"
+path = "http_sse_client.rs"
+required-features = ["http"]
+
+[[example]]
+name = "server_discover"
+path = "server_discover.rs"
+required-features = ["http", "stateless"]
+
+[[example]]
+name = "stateless_http_client"
+path = "stateless_http_client.rs"
+required-features = ["http", "http-client", "protocol-2026-07-28"]
+
+# --- Sampling and bidirectional ---
+[[example]]
+name = "sampling_server"
+path = "sampling_server.rs"
+
+[[example]]
+name = "client_handler"
+path = "client_handler.rs"
+
+# --- Dynamic capabilities ---
+[[example]]
+name = "dynamic_capabilities"
+path = "dynamic_capabilities.rs"
+required-features = ["dynamic-tools"]
+
+# --- Advanced patterns ---
+[[example]]
+name = "proxy"
+path = "proxy.rs"
+required-features = ["proxy"]
+
+[[example]]
+name = "resource_templates"
+path = "resource_templates.rs"
+
+[[example]]
+name = "structured_output"
+path = "structured_output.rs"
+
+[[example]]
+name = "error_handling"
+path = "error_handling.rs"
+
+[[example]]
+name = "testing"
+path = "testing.rs"
+required-features = ["testing"]
+
+[[example]]
+name = "weather_server"
+path = "weather_server.rs"
+
+# --- Macros ---
+[[example]]
+name = "tool_macro"
+path = "tool_macro.rs"
+required-features = ["macros"]

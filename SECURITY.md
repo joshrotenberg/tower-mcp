@@ -4,8 +4,8 @@
 
 | Version | Supported |
 |---------|-----------|
-| 0.9.x   | Yes       |
-| < 0.9   | No        |
+| 0.16.x  | Yes       |
+| < 0.16  | No        |
 
 ## Reporting a Vulnerability
 
@@ -21,4 +21,5 @@ This policy covers:
 
 - The `tower-mcp` crate
 - The `tower-mcp-types` crate
+- The `tower-mcp-macros` crate
 - Example servers in this repository (as reference implementations)

@@ -8,8 +8,8 @@ tower-mcp follows [Semantic Versioning 2.0.0](https://semver.org/). While below 
 
 The workspace maintains synchronized versions:
 
-- `tower-mcp` and `tower-mcp-types` share the same version number
-- Both crates are released together
+- `tower-mcp`, `tower-mcp-types`, and `tower-mcp-macros` share the same version number
+- All three crates are released together
 
 ## Minimum Supported Rust Version (MSRV)
 
@@ -20,7 +20,9 @@ The workspace maintains synchronized versions:
 ## MCP Specification Tracking
 
 - tower-mcp tracks the [Model Context Protocol specification](https://spec.modelcontextprotocol.io/)
-- Current spec version: **2025-11-25**
+- Default spec version: **2025-11-25**, with backward compatibility for **2025-03-26**
+- Released opt-in spec version: **2026-07-28**, enabled at compile time with
+  `protocol-2026-07-28` and selected per client or server with `ProtocolSupport`
 - Spec version changes that require breaking API changes will bump the minor version (pre-1.0) or major version (post-1.0)
 
 ## Feature Flags

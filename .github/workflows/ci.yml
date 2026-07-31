@@ -208,7 +208,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build all examples
         run: |
-          cargo build -p tower-mcp --examples --all-features
+          cargo build -p tower-mcp-examples --examples --all-features
       - name: Build workspace example crates
         run: |
           cargo build -p mcp-repl

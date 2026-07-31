@@ -2,7 +2,7 @@
 
 ## Current Status
 
-- **Version**: 0.14.x
+- **Version**: 0.16.x
 - **Spec version**: 2025-11-25 by default, plus the released 2026-07-28 protocol as an opt-in implementation behind `protocol-2026-07-28`
 - **Server conformance (2025-11-25)**: 39/39
 - **Client conformance (2025-11-25)**: 311/311 (empty baseline)
@@ -20,7 +20,7 @@ tower-mcp targets Tier 2 per the [MCP SDK Tiering System](https://modelcontextpr
 | 2 | Client conformance >= 80% | 311/311 stable; 399/399 final |
 | 3 | Issue triage within 1 month | Active |
 | 4 | P0 resolution within 2 weeks | 0 open |
-| 5 | Stable release >= 1.0.0 | 0.14.x -- pre-1.0 |
+| 5 | Stable release >= 1.0.0 | 0.16.x -- pre-1.0 |
 | 6 | Spec tracking within 6 months | Current (2026-07-28) |
 | 7 | Documentation coverage | In progress |
 | 8 | Dependency update policy | dependabot.yml |
@@ -61,10 +61,11 @@ Implemented final-revision areas include:
 - Final client lifecycle, subscriptions, authorization conformance, and schema recovery
 - Reusable OAuth registration, bounded scope escalation, and issuer-keyed credential persistence
 - Compile-time/runtime protocol selection across HTTP, STDIO, WebSocket, Unix-over-HTTP, and JSON-RPC services
-- Extension-key validation, explicit runtime negotiation, and safe withholding of incomplete Tasks advertisement
+- Extension-key validation, explicit runtime negotiation, and final Tasks extension advertisement
 - Feature-gated typed MCP Apps resources, tool linkage, visibility, CSP constraints, and text fallback
+- Final Tasks extension lifecycle, ownership, input requests, notifications, expiry, and client update APIs
 
-### In Progress
+### Recently Completed and Monitored
 
 | SEP | Title | Status | Issue |
 |-----|-------|--------|-------|
@@ -72,7 +73,7 @@ Implemented final-revision areas include:
 | 2322 | Multi Round-Trip Requests (MRTR) | Implemented; policy/composition follow-ups remain | #950 |
 | 2549 | Cache hints and response caching | Implemented | #1047, #1053 |
 | 2243 | Standard/custom HTTP headers | Implemented | #1049, #1051 |
-| 2133/1865 | Extensions and MCP Apps | Implemented; upstream conformance scenarios remain | #1060 |
+| 2133/1865 | Extensions and MCP Apps | Implemented; monitoring upstream conformance coverage | #1060 |
 
 ### Monitoring
 
@@ -82,6 +83,5 @@ Open SEPs are read from the [`SEP` label](https://github.com/modelcontextprotoco
 
 - **1.0.0 stable release**: API freeze and stability guarantees
 - **Default protocol transition**: keep 2025-11-25 as the non-breaking default while exposing released 2026-07-28 through explicit compile-time and runtime selection (#929).
-- **Tasks extension**: complete input-required task state, notifications, expiry, and client update APIs (#951).
-- **MCP Apps interoperability**: track and adopt upstream extension conformance scenarios as they land (#1060).
+- **Extension interoperability**: adopt upstream Tasks and MCP Apps conformance scenarios as they land.
 - **SEP-1763 interceptors**: tower middleware maps naturally to this proposal.

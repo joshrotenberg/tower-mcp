@@ -127,8 +127,8 @@ These are standalone crates in the workspace:
 
 | Crate | Purpose |
 |-------|---------|
-| [conformance-server](conformance-server/) | MCP conformance test suite server (39/39) |
-| [conformance-client](conformance-client/) | MCP conformance test suite client (265/265) |
+| [conformance-server](conformance-server/) | MCP conformance server (39/39 stable; 114/114 final) |
+| [conformance-client](conformance-client/) | MCP conformance client (311/311 stable; 399/399 final) |
 | [codegen-mcp](codegen-mcp/) | MCP server that helps build MCP servers |
 
 ## Full Application

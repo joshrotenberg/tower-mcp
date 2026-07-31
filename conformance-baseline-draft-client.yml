@@ -8,7 +8,7 @@
 # entry) or a non-baselined scenario fails.
 #
 # Status at 0.2.0-alpha.10 after the final client lifecycle and authorization
-# work: all 32 scenarios are green (382 checks, zero failures or warnings).
+# work: all 32 scenarios are green (399 checks, zero failures or warnings).
 #
 # Format (0.2.x suite): plain scenario-name strings under the `client:` key;
 # reasons live in these comments.

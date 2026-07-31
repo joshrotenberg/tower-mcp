@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/crates/l/tower-mcp.svg)](https://github.com/joshrotenberg/tower-mcp#license)
 [![MSRV](https://img.shields.io/crates/msrv/tower-mcp.svg)](https://github.com/joshrotenberg/tower-mcp)
 [![MCP](https://img.shields.io/badge/MCP-2025--11--25-blue)](https://modelcontextprotocol.io/specification/2025-11-25)
-[![Conformance](https://img.shields.io/badge/conformance-39%2F39_server_%7C_295_client_checks-brightgreen)](https://github.com/joshrotenberg/tower-mcp/actions/workflows/conformance.yml)
+[![Conformance](https://img.shields.io/badge/conformance-39%2F39_server_%7C_311_client_checks-brightgreen)](https://github.com/joshrotenberg/tower-mcp/actions/workflows/conformance.yml)
 
 Tower-native [Model Context Protocol](https://modelcontextprotocol.io) (MCP) implementation for Rust.
 
@@ -88,7 +88,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tower-mcp = "0.14"
+tower-mcp = "0.16"
 ```
 
 Tool input types use `schemars::JsonSchema`, and the derive must come from the
@@ -125,7 +125,7 @@ Example with features:
 
 ```toml
 [dependencies]
-tower-mcp = { version = "0.14", features = ["full"] }
+tower-mcp = { version = "0.16", features = ["full"] }
 ```
 
 ### Types Only
@@ -137,7 +137,7 @@ any context where you want to serialize/deserialize MCP messages without a runti
 
 ```toml
 [dependencies]
-tower-mcp-types = "0.14"
+tower-mcp-types = "0.16"
 ```
 
 `tower-mcp-types` provides all types from `tower_mcp::protocol` and `tower_mcp::error`
@@ -717,7 +717,7 @@ and cross-principal protections.
 - [x] [Completion (autocomplete)](https://modelcontextprotocol.io/specification/2025-11-25/server/utilities/completion)
 - [x] [Roots (filesystem discovery)](https://modelcontextprotocol.io/specification/2025-11-25/client/roots)
 - [x] [Sampling](https://modelcontextprotocol.io/specification/2025-11-25/client/sampling) (all transports)
-- [x] [Async tasks](https://modelcontextprotocol.io/specification/2025-11-25/server/utilities/async) (task ID, status tracking, TTL cleanup, per-tool task support mode)
+- [x] [Experimental tasks](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/tasks) (legacy 2025 lifecycle retained for compatibility)
 - [x] [SSE event IDs and stream resumption](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#resumability-and-redelivery) (SEP-1699)
 - [x] [`_meta` field on all protocol types](https://modelcontextprotocol.io/specification/2025-11-25)
 - [x] [Protocol extension declaration and runtime negotiation (SEP-2133)](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2133)
@@ -727,7 +727,7 @@ and cross-principal protections.
 - [x] [`subscriptions/listen` SSE endpoint -- client-initiated server-push stream (SEP-2567)](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2567) (requires `protocol-2026-07-28`)
 - [x] [Per-request `_meta` client capabilities -- `StatelessRequestMeta` (SEP-2575)](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2575) (requires `protocol-2026-07-28`)
 - [x] [Multi Round-Trip Requests for tools, prompts, and resources (SEP-2322)](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr) (requires `protocol-2026-07-28`)
-- [x] [Tasks extension -- `tasks/get`, `tasks/update`, `tasks/cancel`, `notifications/tasks`, task ownership (SEP-2663)](examples/tasks.rs) (requires `protocol-2026-07-28` and `McpRouter::with_tasks`)
+- [x] [Tasks extension](https://modelcontextprotocol.io/extensions/tasks/overview) -- `tasks/get`, `tasks/update`, `tasks/cancel`, `notifications/tasks`, and task ownership (SEP-2663; requires `protocol-2026-07-28` and `McpRouter::with_tasks`; see [`examples/tasks.rs`](examples/tasks.rs))
 
 We read SEPs upstream rather than mirroring them here. Browse the `SEP` label on [modelcontextprotocol/modelcontextprotocol](https://github.com/modelcontextprotocol/modelcontextprotocol/issues?q=label%3ASEP) when auditing spec coverage.
 
@@ -735,7 +735,7 @@ We read SEPs upstream rather than mirroring them here. Browse the `SEP` label on
 
 A full-featured MCP server for querying [crates.io](https://crates.io) is available as a standalone project: [cratesio-mcp](https://github.com/joshrotenberg/cratesio-mcp). A demo instance is deployed at **https://cratesio-mcp.fly.dev** -- connect with any MCP client that supports HTTP transport.
 
-The repo includes 31 examples; a selection organized by topic (the full set lives in [`examples/`](examples/)):
+The repo includes 33 examples; a selection organized by topic (the full set lives in [`examples/`](examples/)):
 
 | Category | Examples |
 |----------|----------|
@@ -764,8 +764,10 @@ cd tower-mcp
 ```bash
 # Format, lint, and test
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets --all-features
+RUSTDOCFLAGS="-Dwarnings" cargo doc --workspace --all-features --no-deps
+cargo test --workspace --doc --all-features
 ```
 
 ## License

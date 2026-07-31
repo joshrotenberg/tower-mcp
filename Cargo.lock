@@ -3188,6 +3188,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "tower-mcp-examples"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "futures",
+ "reqwest",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tower-mcp",
+ "tower-mcp-types",
+ "tower-resilience",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "tower-mcp-macros"
 version = "0.16.0"
 dependencies = [
