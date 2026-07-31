@@ -5,9 +5,40 @@
 //! to their required scopes.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::sync::Arc;
 
 use super::error::OAuthError;
 use super::token::TokenClaims;
+
+/// Determines whether a granted OAuth scope satisfies a required scope.
+///
+/// The default matcher uses exact string equality. Implement this trait (or
+/// pass a closure to [`ScopePolicy::scope_matcher`]) when an authorization
+/// server defines hierarchical scopes such as `mcp:*` implying `mcp:read`.
+pub trait ScopeMatcher: Send + Sync + 'static {
+    /// Return `true` when `granted` authorizes an operation requiring
+    /// `required`.
+    fn matches(&self, granted: &str, required: &str) -> bool;
+}
+
+impl<F> ScopeMatcher for F
+where
+    F: Fn(&str, &str) -> bool + Send + Sync + 'static,
+{
+    fn matches(&self, granted: &str, required: &str) -> bool {
+        self(granted, required)
+    }
+}
+
+#[derive(Debug, Default)]
+struct ExactScopeMatcher;
+
+impl ScopeMatcher for ExactScopeMatcher {
+    fn matches(&self, granted: &str, required: &str) -> bool {
+        granted == required
+    }
+}
 
 /// A set of required OAuth scopes for an operation.
 ///
@@ -50,12 +81,26 @@ impl ScopeRequirement {
     /// `Err(OAuthError::InsufficientScope)` with details about
     /// which scopes are missing.
     pub fn check(&self, claims: &TokenClaims) -> Result<(), OAuthError> {
+        self.check_with(claims, &ExactScopeMatcher)
+    }
+
+    /// Check the requirement using a custom scope matcher.
+    pub fn check_with(
+        &self,
+        claims: &TokenClaims,
+        matcher: &dyn ScopeMatcher,
+    ) -> Result<(), OAuthError> {
         if self.required.is_empty() {
             return Ok(());
         }
 
         let provided = claims.scopes();
-        if self.required.is_subset(&provided) {
+        let satisfied = self.required.iter().all(|required| {
+            provided
+                .iter()
+                .any(|granted| matcher.matches(granted, required))
+        });
+        if satisfied {
             Ok(())
         } else {
             Err(OAuthError::InsufficientScope {
@@ -91,18 +136,53 @@ impl ScopeRequirement {
 ///     .tool_scope("dangerous_tool", "mcp:admin")
 ///     .resource_scope("secret://data", "mcp:secret");
 /// ```
-#[derive(Debug, Clone, Default)]
+#[derive(Clone)]
 pub struct ScopePolicy {
     default_scopes: ScopeRequirement,
     tool_scopes: HashMap<String, ScopeRequirement>,
     resource_scopes: HashMap<String, ScopeRequirement>,
     prompt_scopes: HashMap<String, ScopeRequirement>,
+    matcher: Arc<dyn ScopeMatcher>,
+}
+
+impl Default for ScopePolicy {
+    fn default() -> Self {
+        Self {
+            default_scopes: ScopeRequirement::default(),
+            tool_scopes: HashMap::new(),
+            resource_scopes: HashMap::new(),
+            prompt_scopes: HashMap::new(),
+            matcher: Arc::new(ExactScopeMatcher),
+        }
+    }
+}
+
+impl fmt::Debug for ScopePolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ScopePolicy")
+            .field("default_scopes", &self.default_scopes)
+            .field("tool_scopes", &self.tool_scopes)
+            .field("resource_scopes", &self.resource_scopes)
+            .field("prompt_scopes", &self.prompt_scopes)
+            .field("matcher", &"<scope matcher>")
+            .finish()
+    }
 }
 
 impl ScopePolicy {
     /// Create an empty scope policy (no scopes required for anything).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Use a custom matcher for exact or hierarchical scope semantics.
+    ///
+    /// The matcher receives `(granted, required)` and should return `true`
+    /// when the granted scope authorizes the required scope.
+    pub fn scope_matcher(mut self, matcher: impl ScopeMatcher) -> Self {
+        self.matcher = Arc::new(matcher);
+        self
     }
 
     /// Set a default scope required for all operations.
@@ -163,16 +243,18 @@ impl ScopePolicy {
 
     /// Check if the given claims satisfy the default scope requirement.
     pub fn check_default(&self, claims: &TokenClaims) -> Result<(), OAuthError> {
-        self.default_scopes.check(claims)
+        self.default_scopes
+            .check_with(claims, self.matcher.as_ref())
     }
 
     /// Check if the given claims satisfy the scope requirement for a tool.
     ///
     /// Checks both default scopes and tool-specific scopes.
     pub fn check_tool(&self, tool_name: &str, claims: &TokenClaims) -> Result<(), OAuthError> {
-        self.default_scopes.check(claims)?;
+        self.default_scopes
+            .check_with(claims, self.matcher.as_ref())?;
         if let Some(req) = self.tool_scopes.get(tool_name) {
-            req.check(claims)?;
+            req.check_with(claims, self.matcher.as_ref())?;
         }
         Ok(())
     }
@@ -183,18 +265,20 @@ impl ScopePolicy {
         resource_uri: &str,
         claims: &TokenClaims,
     ) -> Result<(), OAuthError> {
-        self.default_scopes.check(claims)?;
+        self.default_scopes
+            .check_with(claims, self.matcher.as_ref())?;
         if let Some(req) = self.resource_scopes.get(resource_uri) {
-            req.check(claims)?;
+            req.check_with(claims, self.matcher.as_ref())?;
         }
         Ok(())
     }
 
     /// Check if the given claims satisfy the scope requirement for a prompt.
     pub fn check_prompt(&self, prompt_name: &str, claims: &TokenClaims) -> Result<(), OAuthError> {
-        self.default_scopes.check(claims)?;
+        self.default_scopes
+            .check_with(claims, self.matcher.as_ref())?;
         if let Some(req) = self.prompt_scopes.get(prompt_name) {
-            req.check(claims)?;
+            req.check_with(claims, self.matcher.as_ref())?;
         }
         Ok(())
     }
@@ -223,8 +307,9 @@ use crate::router::{RouterRequest, RouterResponse};
 /// per-operation scope checks (e.g., different scopes for different tools).
 ///
 /// The middleware extracts [`TokenClaims`] from [`RouterRequest::extensions`]. If
-/// no claims are present, the request is passed through unchanged -- this allows
-/// the middleware to compose gracefully without OAuth.
+/// no claims are present, the request is rejected. Use
+/// [`ScopeEnforcementLayer::permissive_without_claims`] only when a surrounding
+/// component intentionally supports unauthenticated requests.
 ///
 /// # Example
 ///
@@ -245,12 +330,27 @@ use crate::router::{RouterRequest, RouterResponse};
 #[derive(Debug, Clone)]
 pub struct ScopeEnforcementLayer {
     policy: ScopePolicy,
+    require_claims: bool,
 }
 
 impl ScopeEnforcementLayer {
     /// Create a new scope enforcement layer with the given policy.
     pub fn new(policy: ScopePolicy) -> Self {
-        Self { policy }
+        Self {
+            policy,
+            require_claims: true,
+        }
+    }
+
+    /// Create a layer that skips scope checks when authentication claims are absent.
+    ///
+    /// This is an explicit opt-out from fail-closed behavior. Prefer [`Self::new`]
+    /// for protected MCP endpoints.
+    pub fn permissive_without_claims(policy: ScopePolicy) -> Self {
+        Self {
+            policy,
+            require_claims: false,
+        }
     }
 }
 
@@ -261,6 +361,7 @@ impl<S> Layer<S> for ScopeEnforcementLayer {
         ScopeEnforcementService {
             inner,
             policy: self.policy.clone(),
+            require_claims: self.require_claims,
         }
     }
 }
@@ -270,7 +371,7 @@ impl<S> Layer<S> for ScopeEnforcementLayer {
 /// Created by [`ScopeEnforcementLayer`]. For each incoming `RouterRequest`:
 ///
 /// 1. Extracts [`TokenClaims`] from `req.extensions`
-/// 2. If no claims are present, passes the request through (composable without OAuth)
+/// 2. If no claims are present, rejects the request unless permissive mode was requested
 /// 3. Matches the request type (`CallTool`, `ReadResource`, `GetPrompt`, etc.)
 /// 4. Checks the appropriate scope requirement from the [`ScopePolicy`]
 /// 5. On failure, returns a `RouterResponse` with a JSON-RPC forbidden error
@@ -279,6 +380,7 @@ impl<S> Layer<S> for ScopeEnforcementLayer {
 pub struct ScopeEnforcementService<S> {
     inner: S,
     policy: ScopePolicy,
+    require_claims: bool,
 }
 
 impl<S> Service<RouterRequest> for ScopeEnforcementService<S>
@@ -298,13 +400,20 @@ where
     }
 
     fn call(&mut self, req: RouterRequest) -> Self::Future {
-        // Extract claims from extensions; if absent, pass through
+        // Extract claims from extensions; fail closed unless explicitly configured otherwise.
         let claims = req.extensions.get::<TokenClaims>().cloned();
 
         let Some(claims) = claims else {
-            // No OAuth context -- pass through
-            let fut = self.inner.call(req);
-            return Box::pin(fut);
+            if self.require_claims {
+                let response = RouterResponse {
+                    id: req.id,
+                    inner: Err(JsonRpcError::forbidden(
+                        "authenticated token claims are required",
+                    )),
+                };
+                return Box::pin(async move { Ok(response) });
+            }
+            return Box::pin(self.inner.call(req));
         };
 
         // Check scope based on request type
@@ -470,5 +579,27 @@ mod tests {
                 .is_ok()
         );
         assert!(policy.check_prompt("any", &claims_no_scopes()).is_ok());
+    }
+
+    #[test]
+    fn test_scope_policy_custom_hierarchy() {
+        let policy = ScopePolicy::new()
+            .default_scope("mcp:read")
+            .tool_scope("admin", "mcp:admin")
+            .scope_matcher(|granted: &str, required: &str| {
+                granted == required || granted == "mcp:*"
+            });
+        let claims = claims_with_scopes("mcp:*");
+
+        assert!(policy.check_default(&claims).is_ok());
+        assert!(policy.check_tool("admin", &claims).is_ok());
+    }
+
+    #[test]
+    fn test_scope_enforcement_is_fail_closed_by_default() {
+        assert!(ScopeEnforcementLayer::new(ScopePolicy::new()).require_claims);
+        assert!(
+            !ScopeEnforcementLayer::permissive_without_claims(ScopePolicy::new()).require_claims
+        );
     }
 }

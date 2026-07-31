@@ -61,7 +61,7 @@ websocket = ["dep:axum", "dep:uuid"]
 unix = ["http"]
 childproc = []
 # OAuth 2.1 resource server support
-oauth = ["dep:jsonwebtoken", "http"]
+oauth = ["dep:jsonwebtoken", "http", "dep:url"]
 # JWKS endpoint fetching for JWT validation (requires oauth)
 jwks = ["oauth", "dep:reqwest"]
 # Test utilities for MCP servers

@@ -1476,10 +1476,10 @@ mod scope_enforcement_tests {
     }
 
     #[tokio::test]
-    async fn test_scope_enforcement_pass_through_without_claims() {
+    async fn test_scope_enforcement_rejects_request_without_claims() {
         let router = create_test_router();
         let policy = ScopePolicy::new().tool_scope("echo", "mcp:admin");
-        // No claims -- should pass through
+        // No claims -- the protected scope layer fails closed.
         let mut service = make_service_with_scope(router.clone(), policy, None);
 
         initialize(&router, &mut service).await;
@@ -1491,12 +1491,8 @@ mod scope_enforcement_tests {
         let resp = service.call_single(call_req).await.unwrap();
 
         match resp {
-            JsonRpcResponse::Result(r) => {
-                let content = r.result.get("content").unwrap().as_array().unwrap();
-                let text = content[0].get("text").unwrap().as_str().unwrap();
-                assert_eq!(text, "no auth");
-            }
-            JsonRpcResponse::Error(e) => panic!("Expected pass-through, got error: {:?}", e),
+            JsonRpcResponse::Error(e) => assert_eq!(e.error.code, -32007),
+            JsonRpcResponse::Result(_) => panic!("Expected request without claims to be rejected"),
             _ => panic!("unexpected response variant"),
         }
     }

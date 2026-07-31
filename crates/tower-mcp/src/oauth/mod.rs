@@ -1,7 +1,7 @@
 //! OAuth 2.1 resource server support for MCP.
 //!
 //! This module implements the resource server side of OAuth 2.1 as specified
-//! in the MCP 2025-11-25 authentication specification. The MCP server acts as
+//! in the MCP authorization specification. The MCP server acts as
 //! a **resource server** -- it validates tokens issued by an external
 //! authorization server and serves Protected Resource Metadata for discovery.
 //!
@@ -27,7 +27,7 @@
 //! ```rust,no_run
 //! use tower_mcp::{McpRouter, HttpTransport, ToolBuilder, CallToolResult};
 //! use tower_mcp::oauth::{
-//!     ProtectedResourceMetadata, JwtValidator, OAuthLayer, ScopePolicy,
+//!     ProtectedResourceMetadata, JwtValidator, ScopePolicy,
 //! };
 //!
 //! #[tokio::main]
@@ -59,16 +59,11 @@
 //!     let policy = ScopePolicy::new()
 //!         .default_scope("mcp:read");
 //!
-//!     // Build OAuth middleware layer
-//!     let oauth = OAuthLayer::new(validator, metadata.clone())
-//!         .scope_policy(policy);
-//!
-//!     // Build transport with metadata endpoint
-//!     let transport = HttpTransport::new(router)
-//!         .oauth(metadata);
-//!
-//!     // Apply OAuth middleware to the axum router
-//!     let app = transport.into_router().layer(oauth);
+//!     // Build a complete, fail-closed resource server. This validates and
+//!     // serves metadata, checks bearer tokens and audience, and applies both
+//!     // default and per-operation scope policy.
+//!     let app = HttpTransport::new(router)
+//!         .into_oauth_router(validator, metadata, policy)?;
 //!
 //!     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
 //!     axum::serve(listener, app).await?;
@@ -76,11 +71,27 @@
 //! }
 //! ```
 //!
+//! # Middleware order and scope levels
+//!
+//! [`HttpTransport::into_oauth_router`](crate::HttpTransport::into_oauth_router)
+//! is the recommended setup because it fixes the security-sensitive order:
+//! [`OAuthLayer`] is the outer HTTP middleware, the transport bridges validated
+//! [`TokenClaims`] into MCP request extensions, and [`ScopeEnforcementLayer`]
+//! runs inside the MCP router. The HTTP layer's policy checks scopes that apply
+//! to every request; the router layer additionally selects tool-, resource-,
+//! and prompt-specific requirements from the same [`ScopePolicy`].
+//!
+//! For a custom composition, preserve that order and serve
+//! [`ProtectedResourceMetadata`] outside authentication. The scope layer is
+//! fail closed by default; its explicitly named permissive constructor is only
+//! for applications that intentionally mix authenticated and anonymous MCP
+//! operations.
+//!
 //! # Discovery Flow
 //!
 //! 1. Client requests MCP endpoint without a token
 //! 2. Server returns `401` with `WWW-Authenticate: Bearer resource_metadata="..."`
-//! 3. Client fetches `/.well-known/oauth-protected-resource` to discover auth server
+//! 3. Client fetches the resource's RFC 9728 well-known metadata URL
 //! 4. Client obtains token from the authorization server
 //! 5. Client retries with `Authorization: Bearer <token>`
 
@@ -92,9 +103,11 @@ pub mod token;
 
 // Re-exports
 pub use error::OAuthError;
-pub use metadata::ProtectedResourceMetadata;
+pub use metadata::{ProtectedResourceMetadata, ProtectedResourceMetadataError};
 pub use middleware::{OAuthLayer, OAuthService};
-pub use scope::{ScopeEnforcementLayer, ScopeEnforcementService, ScopePolicy, ScopeRequirement};
+pub use scope::{
+    ScopeEnforcementLayer, ScopeEnforcementService, ScopeMatcher, ScopePolicy, ScopeRequirement,
+};
 #[cfg(feature = "jwks")]
 pub use token::{JwksError, JwksValidator, JwksValidatorBuilder};
 pub use token::{JwtValidator, TokenAudience, TokenClaims, TokenValidator, ValidateAdapter};

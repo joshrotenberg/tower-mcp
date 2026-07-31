@@ -85,11 +85,13 @@ impl TokenClaims {
         self.scopes().contains(scope)
     }
 
-    /// Check if the audience matches the given resource identifier.
+    /// Check if the audience contains the given resource identifier.
+    ///
+    /// Returns `false` when the token has no audience claim.
     pub fn audience_matches(&self, resource: &str) -> bool {
         match &self.aud {
             Some(aud) => aud.contains(resource),
-            None => true, // No audience claim means no restriction
+            None => false,
         }
     }
 
@@ -144,6 +146,11 @@ pub trait TokenValidator: Clone + Send + Sync + 'static {
 /// Validates JWTs using pre-configured decoding keys. Supports RSA, HMAC,
 /// and EC algorithms via the `jsonwebtoken` crate.
 ///
+/// The validator is also useful outside MCP and therefore only checks an
+/// audience when [`JwtValidator::expected_audience`] is configured. MCP's
+/// [`OAuthLayer`](super::OAuthLayer) always performs an independent audience
+/// check against the protected resource identifier.
+///
 /// # Example
 ///
 /// ```rust
@@ -168,7 +175,8 @@ impl JwtValidator {
     /// [`expected_audience`](Self::expected_audience) is called.
     fn default_validation(algorithm: Algorithm) -> Validation {
         let mut validation = Validation::new(algorithm);
-        // Disable audience validation by default -- callers opt in via expected_audience()
+        // Generic validation opts in here; OAuthLayer independently enforces
+        // its protected resource audience for MCP requests.
         validation.validate_aud = false;
         // Don't require any specific claims by default. The jsonwebtoken crate
         // requires "exp" by default, but OAuth tokens may omit it.
@@ -945,8 +953,7 @@ mod tests {
             extra: HashMap::new(),
         };
 
-        // No audience claim means no restriction
-        assert!(claims.audience_matches("anything"));
+        assert!(!claims.audience_matches("anything"));
     }
 
     #[test]

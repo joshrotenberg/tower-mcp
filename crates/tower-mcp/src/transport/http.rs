@@ -1502,9 +1502,8 @@ impl Drop for ModernSubscriptionGuard {
 
 /// Configuration for OAuth 2.1 Protected Resource Metadata.
 ///
-/// When set on [`HttpTransport`], a `GET /.well-known/oauth-protected-resource`
-/// endpoint is added that returns the metadata JSON, enabling OAuth client
-/// discovery per RFC 9728.
+/// When set on [`HttpTransport`], a `GET` endpoint is added at the resource's
+/// path-aware RFC 9728 well-known location.
 #[cfg(feature = "oauth")]
 #[derive(Clone)]
 pub(crate) struct OAuthConfig {
@@ -2115,9 +2114,9 @@ impl HttpTransport {
 
     /// Configure OAuth 2.1 Protected Resource Metadata for this transport.
     ///
-    /// When set, adds a `GET /.well-known/oauth-protected-resource` endpoint
-    /// that returns the metadata JSON, enabling OAuth client discovery per
-    /// RFC 9728.
+    /// This lower-level method only serves metadata; it does not install token
+    /// or scope enforcement. Prefer [`Self::into_oauth_router`] for a complete,
+    /// fail-closed MCP resource-server setup.
     ///
     /// # Example
     ///
@@ -2137,6 +2136,96 @@ impl HttpTransport {
     pub fn oauth(mut self, metadata: crate::oauth::ProtectedResourceMetadata) -> Self {
         self.oauth_config = Some(OAuthConfig { metadata });
         self
+    }
+
+    /// Build a fully protected OAuth resource-server router.
+    ///
+    /// This validates the Protected Resource Metadata, serves it at the
+    /// path-aware RFC 9728 endpoint, validates bearer tokens, independently
+    /// enforces the token audience against `metadata.resource`, and installs
+    /// fail-closed per-operation scope enforcement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the resource metadata is not suitable for an MCP
+    /// resource server.
+    #[cfg(feature = "oauth")]
+    pub fn into_oauth_router<V>(
+        self,
+        validator: V,
+        metadata: crate::oauth::ProtectedResourceMetadata,
+        policy: crate::oauth::ScopePolicy,
+    ) -> std::result::Result<Router, crate::oauth::ProtectedResourceMetadataError>
+    where
+        V: crate::oauth::TokenValidator,
+    {
+        let (router, _) = self.into_oauth_router_with_handle(validator, metadata, policy)?;
+        Ok(router)
+    }
+
+    /// Build a fully protected OAuth router and return its session handle.
+    ///
+    /// This is the session-management variant of [`Self::into_oauth_router`].
+    #[cfg(feature = "oauth")]
+    pub fn into_oauth_router_with_handle<V>(
+        self,
+        validator: V,
+        metadata: crate::oauth::ProtectedResourceMetadata,
+        policy: crate::oauth::ScopePolicy,
+    ) -> std::result::Result<(Router, SessionHandle), crate::oauth::ProtectedResourceMetadataError>
+    where
+        V: crate::oauth::TokenValidator,
+    {
+        metadata.validate()?;
+        let oauth_layer =
+            crate::oauth::OAuthLayer::new(validator, metadata.clone()).scope_policy(policy.clone());
+        let transport = self
+            .layer(crate::oauth::ScopeEnforcementLayer::new(policy))
+            .oauth(metadata);
+        let (router, handle) = transport.into_router_with_handle();
+        Ok((router.layer(oauth_layer), handle))
+    }
+
+    /// Build a fully protected OAuth router mounted at `path`.
+    ///
+    /// The metadata route is derived from `metadata.resource`, not from the
+    /// local mount path, so it remains correct for path-based resource URLs.
+    #[cfg(feature = "oauth")]
+    pub fn into_oauth_router_at<V>(
+        self,
+        path: &str,
+        validator: V,
+        metadata: crate::oauth::ProtectedResourceMetadata,
+        policy: crate::oauth::ScopePolicy,
+    ) -> std::result::Result<Router, crate::oauth::ProtectedResourceMetadataError>
+    where
+        V: crate::oauth::TokenValidator,
+    {
+        let (router, _) =
+            self.into_oauth_router_at_with_handle(path, validator, metadata, policy)?;
+        Ok(router)
+    }
+
+    /// Build a path-mounted protected OAuth router and return its session handle.
+    #[cfg(feature = "oauth")]
+    pub fn into_oauth_router_at_with_handle<V>(
+        self,
+        path: &str,
+        validator: V,
+        metadata: crate::oauth::ProtectedResourceMetadata,
+        policy: crate::oauth::ScopePolicy,
+    ) -> std::result::Result<(Router, SessionHandle), crate::oauth::ProtectedResourceMetadataError>
+    where
+        V: crate::oauth::TokenValidator,
+    {
+        metadata.validate()?;
+        let oauth_layer =
+            crate::oauth::OAuthLayer::new(validator, metadata.clone()).scope_policy(policy.clone());
+        let transport = self
+            .layer(crate::oauth::ScopeEnforcementLayer::new(policy))
+            .oauth(metadata);
+        let (router, handle) = transport.into_router_at_with_handle(path);
+        Ok((router.layer(oauth_layer), handle))
     }
 
     /// Apply a tower middleware layer to MCP request processing.
@@ -2359,18 +2448,16 @@ impl HttpTransport {
 
     /// Add the OAuth Protected Resource Metadata well-known route if configured.
     #[cfg(feature = "oauth")]
-    fn add_oauth_route(&self, router: Router, base_path: &str) -> Router {
+    fn add_oauth_route(&self, router: Router, _base_path: &str) -> Router {
         if let Some(ref config) = self.oauth_config {
             let metadata = config.metadata.clone();
-            let well_known_path = if base_path.is_empty() {
-                crate::oauth::ProtectedResourceMetadata::well_known_path().to_string()
-            } else {
-                format!(
-                    "{}{}",
-                    base_path.trim_end_matches('/'),
-                    crate::oauth::ProtectedResourceMetadata::well_known_path()
+            let well_known_path =
+                crate::oauth::ProtectedResourceMetadata::well_known_path_for_resource(
+                    &metadata.resource,
                 )
-            };
+                .unwrap_or_else(|_| {
+                    crate::oauth::ProtectedResourceMetadata::well_known_path().to_string()
+                });
             router.route(
                 &well_known_path,
                 get(move || {
@@ -4418,6 +4505,120 @@ mod tests {
     use axum::http::Request;
     use proptest::prelude::*;
     use tower::ServiceExt;
+
+    #[cfg(feature = "oauth")]
+    fn oauth_test_token(audience: &str, scope: &str) -> String {
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &serde_json::json!({
+                "sub": "test-user",
+                "aud": audience,
+                "scope": scope,
+            }),
+            &jsonwebtoken::EncodingKey::from_secret(b"resource-server-test-secret"),
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn oauth_resource_server_setup_is_path_aware_and_audience_bound() {
+        let resource = "http://localhost:3000/tenant/mcp";
+        let metadata = crate::oauth::ProtectedResourceMetadata::new(resource)
+            .authorization_server("https://auth.example.com")
+            .scope("mcp:read");
+        let validator = crate::oauth::JwtValidator::from_secret(b"resource-server-test-secret")
+            .disable_exp_validation();
+        let app = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .disable_host_validation()
+            .into_oauth_router_at(
+                "/tenant/mcp",
+                validator,
+                metadata,
+                crate::oauth::ScopePolicy::new().default_scope("mcp:read"),
+            )
+            .unwrap();
+
+        let metadata_request = Request::builder()
+            .uri("/.well-known/oauth-protected-resource/tenant/mcp")
+            .body(Body::empty())
+            .unwrap();
+        let metadata_response = app.clone().oneshot(metadata_request).await.unwrap();
+        assert_eq!(metadata_response.status(), StatusCode::OK);
+
+        let unauthenticated = Request::builder()
+            .method("POST")
+            .uri("/tenant/mcp")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(unauthenticated).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            response
+                .headers()
+                .get("WWW-Authenticate")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("http://localhost:3000/.well-known/oauth-protected-resource/tenant/mcp")
+        );
+
+        let wrong_audience = oauth_test_token("http://localhost:3000/other", "mcp:read");
+        let request = Request::builder()
+            .method("POST")
+            .uri("/tenant/mcp")
+            .header("Authorization", format!("Bearer {wrong_audience}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let token = oauth_test_token(resource, "mcp:read");
+        let request = Request::builder()
+            .method("POST")
+            .uri("/tenant/mcp")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": { "name": "oauth-test", "version": "1.0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("result").is_some(), "unexpected response: {json}");
+    }
+
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn oauth_resource_server_setup_validates_metadata() {
+        let result = HttpTransport::new(create_test_router()).into_oauth_router(
+            crate::oauth::JwtValidator::from_secret(b"secret"),
+            crate::oauth::ProtectedResourceMetadata::new("https://mcp.example.com"),
+            crate::oauth::ScopePolicy::new(),
+        );
+        assert!(matches!(
+            result.unwrap_err(),
+            crate::oauth::ProtectedResourceMetadataError::MissingAuthorizationServer
+        ));
+    }
 
     fn arb_json() -> impl Strategy<Value = serde_json::Value> {
         let leaf = prop_oneof![

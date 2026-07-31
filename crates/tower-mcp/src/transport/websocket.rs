@@ -281,9 +281,9 @@ impl WebSocketTransport {
 
     /// Configure OAuth 2.1 Protected Resource Metadata for this transport.
     ///
-    /// When set, adds a `GET /.well-known/oauth-protected-resource` endpoint
-    /// that returns the metadata JSON, enabling OAuth client discovery per
-    /// RFC 9728.
+    /// When set, adds a `GET` endpoint at the resource's path-aware RFC 9728
+    /// well-known location. This method only serves metadata; prefer
+    /// [`Self::into_oauth_router`] for a complete protected setup.
     ///
     /// # Example
     ///
@@ -303,6 +303,53 @@ impl WebSocketTransport {
     pub fn oauth(mut self, metadata: crate::oauth::ProtectedResourceMetadata) -> Self {
         self.oauth_config = Some(metadata);
         self
+    }
+
+    /// Build a fully protected OAuth WebSocket resource-server router.
+    ///
+    /// This validates and serves Protected Resource Metadata, authenticates
+    /// WebSocket upgrades, enforces the canonical resource audience, and
+    /// installs fail-closed per-operation scope checks.
+    #[cfg(feature = "oauth")]
+    pub fn into_oauth_router<V>(
+        self,
+        validator: V,
+        metadata: crate::oauth::ProtectedResourceMetadata,
+        policy: crate::oauth::ScopePolicy,
+    ) -> std::result::Result<Router, crate::oauth::ProtectedResourceMetadataError>
+    where
+        V: crate::oauth::TokenValidator,
+    {
+        metadata.validate()?;
+        let oauth_layer =
+            crate::oauth::OAuthLayer::new(validator, metadata.clone()).scope_policy(policy.clone());
+        let router = self
+            .layer(crate::oauth::ScopeEnforcementLayer::new(policy))
+            .oauth(metadata)
+            .into_router();
+        Ok(router.layer(oauth_layer))
+    }
+
+    /// Build a path-mounted, fully protected OAuth WebSocket router.
+    #[cfg(feature = "oauth")]
+    pub fn into_oauth_router_at<V>(
+        self,
+        path: &str,
+        validator: V,
+        metadata: crate::oauth::ProtectedResourceMetadata,
+        policy: crate::oauth::ScopePolicy,
+    ) -> std::result::Result<Router, crate::oauth::ProtectedResourceMetadataError>
+    where
+        V: crate::oauth::TokenValidator,
+    {
+        metadata.validate()?;
+        let oauth_layer =
+            crate::oauth::OAuthLayer::new(validator, metadata.clone()).scope_policy(policy.clone());
+        let router = self
+            .layer(crate::oauth::ScopeEnforcementLayer::new(policy))
+            .oauth(metadata)
+            .into_router_at(path);
+        Ok(router.layer(oauth_layer))
     }
 
     /// Apply a tower middleware layer to MCP request processing.
@@ -421,20 +468,18 @@ impl WebSocketTransport {
 #[cfg(feature = "oauth")]
 fn add_oauth_route(
     router: Router,
-    base_path: &str,
+    _base_path: &str,
     metadata: Option<&crate::oauth::ProtectedResourceMetadata>,
 ) -> Router {
     if let Some(metadata) = metadata {
         let metadata = metadata.clone();
-        let well_known_path = if base_path.is_empty() {
-            crate::oauth::ProtectedResourceMetadata::well_known_path().to_string()
-        } else {
-            format!(
-                "{}{}",
-                base_path.trim_end_matches('/'),
-                crate::oauth::ProtectedResourceMetadata::well_known_path()
+        let well_known_path =
+            crate::oauth::ProtectedResourceMetadata::well_known_path_for_resource(
+                &metadata.resource,
             )
-        };
+            .unwrap_or_else(|_| {
+                crate::oauth::ProtectedResourceMetadata::well_known_path().to_string()
+            });
         router.route(
             &well_known_path,
             get(move || {
@@ -1016,6 +1061,28 @@ mod tests {
     async fn test_websocket_transport_at_path() {
         let transport = WebSocketTransport::new(create_test_router());
         let _router = transport.into_router_at("/mcp");
+    }
+
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn test_oauth_metadata_route_is_path_aware() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let metadata =
+            crate::oauth::ProtectedResourceMetadata::new("https://mcp.example.com/tenant/ws")
+                .authorization_server("https://auth.example.com");
+        let app = WebSocketTransport::new(create_test_router())
+            .oauth(metadata)
+            .into_router_at("/tenant/ws");
+        let request = Request::builder()
+            .uri("/.well-known/oauth-protected-resource/tenant/ws")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

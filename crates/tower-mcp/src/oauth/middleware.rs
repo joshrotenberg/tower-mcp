@@ -20,13 +20,14 @@ use super::token::TokenValidator;
 /// Tower layer that wraps services with OAuth 2.1 bearer token validation.
 ///
 /// Applies [`OAuthService`] middleware that extracts and validates bearer
-/// tokens from the `Authorization` header. On successful validation, injects
+/// tokens from the `Authorization` header and requires the token audience to
+/// contain the metadata resource identifier. On successful validation, injects
 /// [`TokenClaims`](super::token::TokenClaims) into request extensions for downstream handlers.
 ///
 /// # Example
 ///
 /// ```rust,no_run
-/// use tower_mcp::oauth::{OAuthLayer, JwtValidator, ProtectedResourceMetadata, ScopePolicy};
+/// use tower_mcp::oauth::{OAuthLayer, JwtValidator, ProtectedResourceMetadata};
 ///
 /// let validator = JwtValidator::from_secret(b"my-secret");
 /// let metadata = ProtectedResourceMetadata::new("https://mcp.example.com")
@@ -45,15 +46,21 @@ pub struct OAuthLayer<V: TokenValidator> {
 impl<V: TokenValidator> OAuthLayer<V> {
     /// Create a new OAuth layer with the given token validator and metadata.
     pub fn new(validator: V, metadata: ProtectedResourceMetadata) -> Self {
+        let metadata_path =
+            ProtectedResourceMetadata::well_known_path_for_resource(&metadata.resource)
+                .unwrap_or_else(|_| ProtectedResourceMetadata::well_known_path().to_string());
         Self {
             validator,
             metadata,
             scope_policy: ScopePolicy::new(),
-            public_paths: vec![ProtectedResourceMetadata::well_known_path().to_string()],
+            public_paths: vec![metadata_path],
         }
     }
 
-    /// Set the scope policy for per-operation scope enforcement.
+    /// Set the default HTTP-level scope policy.
+    ///
+    /// Use [`ScopeEnforcementLayer`](super::ScopeEnforcementLayer), or the
+    /// transport's `into_oauth_router` helper, for tool/resource/prompt scopes.
     pub fn scope_policy(mut self, policy: ScopePolicy) -> Self {
         self.scope_policy = policy;
         self
@@ -61,7 +68,8 @@ impl<V: TokenValidator> OAuthLayer<V> {
 
     /// Add a path that does not require authentication.
     ///
-    /// The `/.well-known/oauth-protected-resource` path is always public.
+    /// The resource's exact RFC 9728 metadata path is always public. Custom
+    /// public paths are also matched exactly, not as prefixes.
     pub fn public_path(mut self, path: impl Into<String>) -> Self {
         self.public_paths.push(path.into());
         self
@@ -89,9 +97,10 @@ impl<S, V: TokenValidator> Layer<S> for OAuthLayer<V> {
 /// 1. Checks if the request path is public (skips validation)
 /// 2. Extracts the `Authorization: Bearer <token>` header
 /// 3. Validates the token via [`TokenValidator`]
-/// 4. Checks default scope requirements via [`ScopePolicy`]
-/// 5. On success, injects [`TokenClaims`](super::token::TokenClaims) into request extensions
-/// 6. On failure, returns the appropriate HTTP error with `WWW-Authenticate`
+/// 4. Checks that the token audience contains the protected resource identifier
+/// 5. Checks default scope requirements via [`ScopePolicy`]
+/// 6. On success, injects [`TokenClaims`](super::token::TokenClaims) into request extensions
+/// 7. On failure, returns the appropriate HTTP error with `WWW-Authenticate`
 #[derive(Clone)]
 pub struct OAuthService<S, V: TokenValidator> {
     inner: S,
@@ -126,12 +135,7 @@ where
 
         Box::pin(async move {
             // Skip validation for public paths
-            if public_paths.iter().any(|p| path.starts_with(p.as_str())) {
-                return inner.oneshot(req).await;
-            }
-
-            // Also skip well-known paths that may be nested under a mount point
-            if path.contains("/.well-known/") {
+            if public_paths.contains(&path) {
                 return inner.oneshot(req).await;
             }
 
@@ -143,25 +147,42 @@ where
                 .and_then(|s| s.strip_prefix("Bearer "))
                 .map(|t| t.trim().to_string());
 
-            let resource_metadata_url =
-                format!("{}/.well-known/oauth-protected-resource", metadata.resource);
+            let resource_metadata_url = metadata.well_known_url().ok();
 
             let Some(token) = token else {
                 let error = OAuthError::MissingToken;
-                return Ok(oauth_error_response(&error, Some(&resource_metadata_url)));
+                return Ok(oauth_error_response(
+                    &error,
+                    resource_metadata_url.as_deref(),
+                ));
             };
 
             // Validate token
             let claims = match validator.validate_token(&token).await {
                 Ok(claims) => claims,
                 Err(error) => {
-                    return Ok(oauth_error_response(&error, Some(&resource_metadata_url)));
+                    return Ok(oauth_error_response(
+                        &error,
+                        resource_metadata_url.as_deref(),
+                    ));
                 }
             };
 
+            // Enforce the canonical MCP resource audience independently of
+            // the underlying JWT, introspection, or opaque-token validator.
+            if !claims.audience_matches(&metadata.resource) {
+                return Ok(oauth_error_response(
+                    &OAuthError::InvalidAudience,
+                    resource_metadata_url.as_deref(),
+                ));
+            }
+
             // Check default scope requirements
             if let Err(error) = scope_policy.check_default(&claims) {
-                return Ok(oauth_error_response(&error, Some(&resource_metadata_url)));
+                return Ok(oauth_error_response(
+                    &error,
+                    resource_metadata_url.as_deref(),
+                ));
             }
 
             // Inject claims into request extensions
@@ -246,6 +267,21 @@ mod tests {
     }
 
     fn make_token(claims: &serde_json::Value) -> String {
+        let mut claims = claims.clone();
+        claims
+            .as_object_mut()
+            .unwrap()
+            .entry("aud")
+            .or_insert_with(|| serde_json::json!("https://mcp.example.com"));
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(b"test-secret"),
+        )
+        .unwrap()
+    }
+
+    fn make_token_without_default_audience(claims: &serde_json::Value) -> String {
         jsonwebtoken::encode(
             &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
             claims,
@@ -325,6 +361,85 @@ mod tests {
 
         let resp = service.ready().await.unwrap().call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_public_paths_are_exact() {
+        let layer = OAuthLayer::new(test_validator(), test_metadata()).public_path("/health");
+        let mut service = layer.layer(OkService);
+
+        for path in ["/health/private", "/.well-known/not-oauth"] {
+            let req = Request::builder().uri(path).body(Body::empty()).unwrap();
+            let resp = service.ready().await.unwrap().call(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "path: {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_missing_or_wrong_audience_is_rejected() {
+        let layer = OAuthLayer::new(test_validator(), test_metadata());
+        let mut service = layer.layer(OkService);
+
+        for claims in [
+            serde_json::json!({"sub": "user"}),
+            serde_json::json!({"sub": "user", "aud": "https://other.example.com"}),
+        ] {
+            let token = make_token_without_default_audience(&claims);
+            let req = Request::builder()
+                .uri("/mcp")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            let resp = service.ready().await.unwrap().call(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_path_resource_uses_path_aware_metadata_url_and_public_route() {
+        let metadata = ProtectedResourceMetadata::new("https://mcp.example.com/tenant/mcp")
+            .authorization_server("https://auth.example.com");
+        let layer = OAuthLayer::new(test_validator(), metadata);
+        let mut service = layer.layer(OkService);
+
+        let public = Request::builder()
+            .uri("/.well-known/oauth-protected-resource/tenant/mcp")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            service
+                .ready()
+                .await
+                .unwrap()
+                .call(public)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        let protected = Request::builder()
+            .uri("/tenant/mcp")
+            .body(Body::empty())
+            .unwrap();
+        let response = service
+            .ready()
+            .await
+            .unwrap()
+            .call(protected)
+            .await
+            .unwrap();
+        let challenge = response
+            .headers()
+            .get("WWW-Authenticate")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            challenge.contains(
+                "https://mcp.example.com/.well-known/oauth-protected-resource/tenant/mcp"
+            )
+        );
     }
 
     #[tokio::test]

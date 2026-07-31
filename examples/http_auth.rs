@@ -198,18 +198,20 @@ mod apikey {
 
 mod oauth {
     use axum::Router;
-    use tower_mcp::oauth::{JwtValidator, OAuthLayer, ProtectedResourceMetadata, ScopePolicy};
+    use tower_mcp::HttpTransport;
+    use tower_mcp::oauth::{JwtValidator, ProtectedResourceMetadata, ScopePolicy};
 
-    pub fn wrap(mcp_router: Router, metadata: ProtectedResourceMetadata) -> Router {
+    pub fn wrap(
+        transport: HttpTransport,
+        metadata: ProtectedResourceMetadata,
+    ) -> Result<Router, tower_mcp::oauth::ProtectedResourceMetadataError> {
         // In production, use RSA/EC keys or JWKS endpoint instead of a shared secret
         let validator = JwtValidator::from_secret(b"demo-secret-do-not-use-in-production")
             .disable_exp_validation(); // For demo convenience only
 
         let scope_policy = ScopePolicy::new().default_scope("mcp:read");
 
-        let oauth_layer = OAuthLayer::new(validator, metadata).scope_policy(scope_policy);
-
-        mcp_router.layer(oauth_layer)
+        transport.into_oauth_router(validator, metadata, scope_policy)
     }
 }
 
@@ -254,15 +256,12 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
                 .scope("mcp:write")
                 .resource_documentation("https://github.com/joshrotenberg/tower-mcp");
 
-            let transport = HttpTransport::new(mcp_router)
-                .disable_origin_validation()
-                .oauth(metadata.clone());
-            let mcp_axum_router = transport.into_router();
+            let transport = HttpTransport::new(mcp_router).disable_origin_validation();
 
             tracing::info!(
                 "Protected Resource Metadata: http://127.0.0.1:3000/.well-known/oauth-protected-resource"
             );
-            oauth::wrap(mcp_axum_router, metadata)
+            oauth::wrap(transport, metadata)?
         }
         other => {
             eprintln!("Unknown auth mode: {other}. Use 'apikey' or 'oauth'.");

@@ -63,7 +63,7 @@ impl OAuthError {
 
         // Add resource_metadata parameter if available
         if let Some(url) = resource_metadata_url {
-            parts.push(format!("resource_metadata=\"{}\"", url));
+            parts.push(auth_parameter("resource_metadata", url));
         }
 
         match self {
@@ -77,13 +77,13 @@ impl OAuthError {
             }
             OAuthError::InvalidToken { description } => {
                 parts.push("error=\"invalid_token\"".to_string());
-                parts.push(format!("error_description=\"{}\"", description));
+                parts.push(auth_parameter("error_description", description));
                 format!("Bearer {}", parts.join(", "))
             }
             OAuthError::InsufficientScope { required, .. } => {
                 parts.push("error=\"insufficient_scope\"".to_string());
                 if !required.is_empty() {
-                    parts.push(format!("scope=\"{}\"", required.join(" ")));
+                    parts.push(auth_parameter("scope", &required.join(" ")));
                 }
                 format!("Bearer {}", parts.join(", "))
             }
@@ -102,6 +102,27 @@ impl OAuthError {
             }
         }
     }
+}
+
+/// Encode a quoted `WWW-Authenticate` parameter without permitting header
+/// injection. Quotes and backslashes are escaped; control and non-ASCII
+/// characters are replaced with a space or `?` so the result is always a
+/// valid HTTP header value.
+fn auth_parameter(name: &str, value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '"' | '\\' => {
+                escaped.push('\\');
+                escaped.push(character);
+            }
+            '\t' => escaped.push(' '),
+            character if character.is_ascii_control() => escaped.push(' '),
+            character if !character.is_ascii() => escaped.push('?'),
+            character => escaped.push(character),
+        }
+    }
+    format!("{name}=\"{escaped}\"")
 }
 
 impl fmt::Display for OAuthError {
@@ -196,5 +217,20 @@ mod tests {
             OAuthError::InvalidAudience.to_string(),
             "token audience does not match"
         );
+    }
+
+    #[test]
+    fn test_www_authenticate_escapes_untrusted_parameters() {
+        let err = OAuthError::InvalidToken {
+            description: "bad\"\\token\r\nX-Injected: yes".to_string(),
+        };
+        let header =
+            err.www_authenticate(Some("https://example.com/metadata\"\r\nX-Resource: yes"));
+
+        assert!(!header.contains('\r'));
+        assert!(!header.contains('\n'));
+        assert!(header.contains("metadata\\\"  X-Resource"));
+        assert!(header.contains("bad\\\"\\\\token  X-Injected"));
+        assert!(header.parse::<http::HeaderValue>().is_ok());
     }
 }
