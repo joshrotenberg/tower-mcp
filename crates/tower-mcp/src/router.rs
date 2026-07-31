@@ -2223,11 +2223,15 @@ impl McpRouter {
         extensions: &crate::context::Extensions,
         method: &str,
     ) -> Result<()> {
-        if self.final_tasks_enabled() && client_declares_tasks(extensions) {
-            Ok(())
-        } else {
-            Err(Error::JsonRpc(JsonRpcError::method_not_found(method)))
+        if !self.final_tasks_enabled() {
+            return Err(Error::JsonRpc(JsonRpcError::method_not_found(method)));
         }
+        if client_declares_tasks(extensions) {
+            return Ok(());
+        }
+        Err(Error::JsonRpc(
+            JsonRpcError::missing_required_client_capability(tasks_client_capabilities()),
+        ))
     }
 
     /// Verify the caller may act on this task.
@@ -4079,7 +4083,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, Error::JsonRpc(e) if e.code == -32602));
 
-        // Without the client declaration the methods remain absent.
+        // A server that advertises Tasks names the capability a client omitted.
         let error = router
             .handle(
                 RequestId::Number(6),
@@ -4091,7 +4095,14 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(error, Error::JsonRpc(e) if e.code == -32601));
+        let Error::JsonRpc(error) = error else {
+            panic!("expected a JSON-RPC error");
+        };
+        assert_eq!(error.code, -32021);
+        assert_eq!(
+            error.data.as_ref().unwrap()["requiredCapabilities"]["extensions"]["io.modelcontextprotocol/tasks"],
+            serde_json::json!({})
+        );
     }
 
     #[cfg(feature = "stateless")]
@@ -4727,8 +4738,31 @@ mod tests {
                 )
                 .await
                 .unwrap_err();
-            assert!(matches!(error, Error::JsonRpc(error) if error.code == -32601));
+            let Error::JsonRpc(error) = error else {
+                panic!("expected a JSON-RPC error");
+            };
+            assert_eq!(error.code, -32021);
+            assert_eq!(
+                error.data.as_ref().unwrap()["requiredCapabilities"]["extensions"]["io.modelcontextprotocol/tasks"],
+                serde_json::json!({})
+            );
         }
+
+        // If the server itself did not advertise the extension, the method is
+        // unavailable regardless of what the client declared.
+        let router_without_tasks = McpRouter::new();
+        let error = router_without_tasks
+            .handle(
+                RequestId::Number(7),
+                McpRequest::GetTaskInfo(GetTaskInfoParams {
+                    task_id: "task-unknown".to_string(),
+                    meta: None,
+                }),
+                final_extensions(tasks_client_capabilities()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::JsonRpc(error) if error.code == -32601));
     }
 
     #[cfg(feature = "stateless")]

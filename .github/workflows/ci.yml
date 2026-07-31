@@ -229,7 +229,7 @@ jobs:
           cargo build --manifest-path examples/codegen-mcp/Cargo.toml
 
   rmcp-compat:
-    name: rmcp 3.1 wire compatibility
+    name: rmcp 3.1 stable + final wire compatibility
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

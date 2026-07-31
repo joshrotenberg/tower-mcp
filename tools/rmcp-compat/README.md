@@ -6,16 +6,19 @@ each, and structurally compares the responses.
 
 ## What it does
 
-The harness runs three in-process servers:
+The harness runs five in-process servers:
 
-- **rmcp** via `StreamableHttpService`
-- **tower-mcp** in default (bare JSON) mode
-- **tower-mcp SSE** with `.sse_responses(true)` to match rmcp's SSE wrapping
+- **rmcp stable** via `StreamableHttpService`
+- **tower-mcp stable** in default (bare JSON) mode
+- **tower-mcp stable SSE** with `.sse_responses(true)` to match rmcp's SSE wrapping
+- **rmcp final** in stateless, final-only mode
+- **tower-mcp final** with runtime support narrowed to `2026-07-28`
 
 Each server binds a separately reserved OS-assigned loopback port. Multiple
 harness processes can run concurrently without fixed-port collisions.
 
-It then runs a series of checks across all four operation groups:
+The output separates the stable and final protocol revisions. Stable coverage
+checks the established session lifecycle and common method shapes:
 
 | Check | What is verified |
 |-------|-----------------|
@@ -30,6 +33,18 @@ It then runs a series of checks across all four operation groups:
 | `initialized-enforcement` | tower-mcp rejects requests before `notifications/initialized` with `-32600` (per #901); rmcp does not enforce this ordering, so the divergence is a KNOWN-DIFF |
 | `sse-response-mode` | With `.sse_responses(true)`, both return `text/event-stream` with valid JSON-RPC |
 
+Final `2026-07-28` coverage exercises the released stateless lifecycle and
+extension surfaces:
+
+| Check | What is verified |
+|-------|-----------------|
+| `server/discover` | HTTP 200 without a session; final version advertisement; `resultType`; required cache fields; server identity in result metadata |
+| `stateless tools` | Repeated independent `tools/list` requests, no legacy session ID, and matching `tools/call` results |
+| `headers and metadata validation` | Required `Mcp-Method`/`Mcp-Name`, required per-request metadata, and unsupported-version rejection |
+| `subscriptions/listen` | Stateless SSE stream plus the mandatory first acknowledgment, subscription ID, and accepted filter |
+| `MRTR` | Matching `input_required` result followed by a byte-exact `requestState` retry and completion |
+| `Tasks extension` | Per-request extension negotiation, task creation, `tasks/get`, cancellation acknowledgment, and observable cancelled state |
+
 ## How to run
 
 ```
@@ -40,11 +55,12 @@ The selected loopback ports are printed at startup.
 
 ## Output format
 
-Each check prints one of three prefixes:
+Each check prints one of four prefixes:
 
 - **`[PASS]`** -- behavior matches between rmcp and tower-mcp for this property
 - **`[FAIL]`** -- unexpected divergence; investigate before releasing
 - **`[KNOWN-DIFF]`** -- documented behavioral difference; not a bug (see below)
+- **`[ERROR]`** -- the harness could not execute or parse the check
 
 A final summary line shows counts. The process exits with code 0 if there are
 no FAIL or ERROR results; known diffs and passes do not count against the exit
@@ -53,6 +69,8 @@ code.
 Example output:
 
 ```
+=== Stable protocol (2025-11-25) ===
+
 === initialize ===
 [PASS] initialize: protocolVersion present and equal (2025-11-25)
 [PASS] initialize: capabilities is object on both
@@ -63,7 +81,13 @@ Example output:
 [PASS] method-not-found: error.message is string on both
 [KNOWN-DIFF] method-not-found: error.message phrasing differs (both use -32601): ...
 
-Results: 17/21 checks passed (0 failed, 4 known-diffs, 0 errors)
+=== Final protocol (2026-07-28) ===
+
+=== server/discover ===
+[PASS] final-discover: server/discover returns HTTP 200 on both
+...
+
+Results: 40/44 checks passed (0 failed, 4 known-diffs, 0 errors)
 ```
 
 ## Known diffs
@@ -137,9 +161,10 @@ Note the 1.x -> 2.x jump renamed `rmcp::model::Content` to
 `StreamableHttpService`, `LocalSessionManager`, `ServerHandler`, and the
 `#[tool]`/`#[tool_router]`/`#[tool_handler]` macro surfaces were unchanged.
 
-The 2.x -> 3.1 jump required no harness API changes: the harness does not use
-the surfaces that broke (Meta type split, `CallToolResult.structured_content`
-widening, `Annotations.last_modified`, or the removed experimental tasks API).
-The harness uses `StreamableHttpServerConfig::default()`, whose legacy-session
-mode serves the 2025-11-25 flow exercised here. Final-protocol interoperability
-is tracked separately in #1102.
+The 2.x -> 3.1 jump enabled the final-protocol half of the harness. The stable
+rmcp server keeps the default legacy-session configuration. The final rmcp
+server disables legacy sessions, requires per-request protocol metadata, uses
+JSON for synchronous responses, and shares its task manager across stateless
+request handler instances. `tower-mcp` is compiled with
+`protocol-2026-07-28` and narrowed to that revision at runtime for the final
+server.
