@@ -10,6 +10,9 @@
 
 use crate::state::{HandlerType, LayerType, ProjectState, ToolBuilderState, ToolDef, Transport};
 
+const TOWER_MCP_RELEASE_LINE: &str = "0.16";
+const REQWEST_RELEASE_LINE: &str = "0.13";
+
 /// Generate complete Rust code from the project state.
 pub fn generate_code(state: &ProjectState) -> Result<GeneratedCode, String> {
     if !state.initialized {
@@ -69,13 +72,14 @@ edition = "2024"
 description = "{description}"
 
 [dependencies]
-tower-mcp = {{ version = "0.2"{features_str} }}
+tower-mcp = {{ version = "{tower_mcp_release_line}"{features_str} }}
 tokio = {{ version = "1", features = ["full"] }}
 serde = {{ version = "1", features = ["derive"] }}
 schemars = "1.2"
 tracing = "0.1"
 tracing-subscriber = {{ version = "0.3", features = ["env-filter"] }}
-"#
+"#,
+        tower_mcp_release_line = TOWER_MCP_RELEASE_LINE,
     )
 }
 
@@ -166,7 +170,7 @@ The generated handlers return debug output. To add real functionality:
 
 **HTTP requests** - Add `reqwest` to Cargo.toml:
 ```toml
-reqwest = {{ version = "0.12", features = ["json"] }}
+reqwest = {{ version = "{reqwest_release_line}", features = ["json"] }}
 ```
 
 **Error handling:**
@@ -188,7 +192,8 @@ Ok(CallToolResult::text(data.to_string()))
 - [tower-mcp documentation](https://docs.rs/tower-mcp)
 - [MCP specification](https://modelcontextprotocol.io)
 - [Example servers](https://github.com/joshrotenberg/tower-mcp/tree/main/examples)
-"#
+"#,
+        reqwest_release_line = REQWEST_RELEASE_LINE,
     )
 }
 
@@ -917,5 +922,55 @@ fn generate_layer_code(layer: &crate::state::LayerConfig) -> String {
                 max
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn workspace_release_line() -> String {
+        let manifest = include_str!("../../../Cargo.toml");
+        let package_section = manifest
+            .split_once("[workspace.package]")
+            .expect("workspace package section")
+            .1;
+        let version = package_section
+            .lines()
+            .take_while(|line| !line.trim_start().starts_with('['))
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("version = \"")
+                    .and_then(|value| value.strip_suffix('"'))
+            })
+            .expect("workspace package version");
+        let mut components = version.split('.');
+        let major = components.next().expect("major version");
+        let minor = components.next().expect("minor version");
+        format!("{major}.{minor}")
+    }
+
+    #[test]
+    fn generated_dependency_versions_track_release_hygiene() {
+        assert_eq!(TOWER_MCP_RELEASE_LINE, workspace_release_line());
+
+        let state = ProjectState {
+            initialized: true,
+            name: Some("generated-server".to_string()),
+            ..ProjectState::default()
+        };
+        let generated = generate_code(&state).expect("initialized project should generate");
+
+        assert!(generated.cargo_toml.contains(&format!(
+            "tower-mcp = {{ version = \"{TOWER_MCP_RELEASE_LINE}\" }}"
+        )));
+        assert!(generated.readme_md.contains(&format!(
+            "reqwest = {{ version = \"{REQWEST_RELEASE_LINE}\", features = [\"json\"] }}"
+        )));
+
+        let macro_docs = include_str!("../../../crates/tower-mcp-macros/src/lib.rs");
+        assert!(macro_docs.contains(&format!(
+            "tower-mcp = {{ version = \"{TOWER_MCP_RELEASE_LINE}\", features = [\"macros\"] }}"
+        )));
     }
 }
