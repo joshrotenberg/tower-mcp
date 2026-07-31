@@ -789,6 +789,79 @@ fn infer_algorithm_from_key_type(jwk: &jsonwebtoken::jwk::Jwk) -> Option<Algorit
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    fn malformed_jwt() -> BoxedStrategy<String> {
+        let no_dots = prop::collection::vec(any::<char>(), 0..4096)
+            .prop_map(|chars| chars.into_iter().filter(|c| *c != '.').collect::<String>());
+        prop_oneof![
+            8 => no_dots,
+            1 => ("[A-Za-z0-9_-]{0,512}", "[A-Za-z0-9_-]{0,512}")
+                .prop_map(|(a, b)| format!("{a}.{b}")),
+            1 => Just("x".repeat(16 * 1024)),
+        ]
+        .boxed()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// Malformed attacker-controlled JWTs must never panic and must never
+        /// authenticate. The generator guarantees fewer than the two dots a
+        /// compact JWT requires.
+        #[test]
+        fn malformed_jwt_fails_cleanly(token in malformed_jwt()) {
+            let validator = JwtValidator::from_secret(b"property-test-secret");
+            let result = futures::executor::block_on(validator.validate_token(&token));
+            let rejected_as_invalid = matches!(result, Err(OAuthError::InvalidToken { .. }));
+            prop_assert!(rejected_as_invalid);
+        }
+    }
+
+    #[cfg(feature = "jwks")]
+    mod jwks_property_tests {
+        use super::*;
+
+        fn arb_json() -> impl Strategy<Value = serde_json::Value> {
+            let leaf = prop_oneof![
+                Just(serde_json::Value::Null),
+                any::<bool>().prop_map(serde_json::Value::Bool),
+                any::<i64>().prop_map(|number| serde_json::json!(number)),
+                prop::collection::vec(any::<char>(), 0..256)
+                    .prop_map(|chars| serde_json::Value::String(chars.into_iter().collect())),
+            ];
+            leaf.prop_recursive(6, 128, 10, |inner| {
+                prop_oneof![
+                    prop::collection::vec(inner.clone(), 0..10).prop_map(serde_json::Value::Array),
+                    prop::collection::hash_map("[a-zA-Z0-9_]{0,24}", inner, 0..10)
+                        .prop_map(|map| serde_json::Value::Object(map.into_iter().collect())),
+                ]
+            })
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(512))]
+
+            /// Raw malformed documents must be rejected without panicking.
+            #[test]
+            fn arbitrary_jwks_bytes_fail_cleanly(
+                bytes in prop::collection::vec(any::<u8>(), 0..4096)
+            ) {
+                if let Ok(jwks) = serde_json::from_slice::<jsonwebtoken::jwk::JwkSet>(&bytes) {
+                    let _ = parse_jwk_set(&jwks);
+                }
+            }
+
+            /// Exercise both serde's JWKS shape parser and our key conversion
+            /// with deeply nested, wrong-typed, and malformed key fields.
+            #[test]
+            fn arbitrary_jwks_json_never_panics(value in arb_json()) {
+                if let Ok(jwks) = serde_json::from_value::<jsonwebtoken::jwk::JwkSet>(value) {
+                    let _ = parse_jwk_set(&jwks);
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_token_audience_single() {

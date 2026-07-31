@@ -4416,7 +4416,55 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+    use proptest::prelude::*;
     use tower::ServiceExt;
+
+    fn arb_json() -> impl Strategy<Value = serde_json::Value> {
+        let leaf = prop_oneof![
+            Just(serde_json::Value::Null),
+            any::<bool>().prop_map(serde_json::Value::Bool),
+            any::<i64>().prop_map(|number| serde_json::json!(number)),
+            prop::collection::vec(any::<char>(), 0..256)
+                .prop_map(|chars| serde_json::Value::String(chars.into_iter().collect())),
+        ];
+        leaf.prop_recursive(6, 128, 10, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..10).prop_map(serde_json::Value::Array),
+                prop::collection::hash_map("[a-zA-Z0-9_]{0,24}", inner, 0..10)
+                    .prop_map(|map| serde_json::Value::Object(map.into_iter().collect())),
+            ]
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// Request-ID extraction runs on untrusted JSON before dispatch and
+        /// must reject surprising shapes without panicking.
+        #[test]
+        fn extract_request_id_never_panics(value in arb_json()) {
+            let _ = extract_request_id(&value);
+        }
+
+        #[test]
+        fn extract_request_id_accepts_all_i64_values(id in any::<i64>()) {
+            prop_assert_eq!(
+                extract_request_id(&serde_json::json!({ "id": id })),
+                Some(RequestId::Number(id))
+            );
+        }
+
+        #[test]
+        fn extract_request_id_accepts_arbitrary_strings(
+            chars in prop::collection::vec(any::<char>(), 0..1024)
+        ) {
+            let id: String = chars.into_iter().collect();
+            prop_assert_eq!(
+                extract_request_id(&serde_json::json!({ "id": id })),
+                Some(RequestId::String(id))
+            );
+        }
+    }
 
     fn create_test_router() -> McpRouter {
         McpRouter::new().server_info("test-server", "1.0.0")

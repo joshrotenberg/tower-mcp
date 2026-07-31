@@ -1,0 +1,25 @@
+name: Fuzz
+
+on:
+  schedule:
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  jsonrpc-message:
+    name: JSON-RPC message parser
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "fuzz -> target"
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz arbitrary wire bytes
+        run: cargo fuzz run jsonrpc_message -- -max_total_time=300 -rss_limit_mb=2048

@@ -325,6 +325,57 @@ impl StatelessRequestMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    fn arb_json() -> impl Strategy<Value = serde_json::Value> {
+        let leaf = prop_oneof![
+            Just(serde_json::Value::Null),
+            any::<bool>().prop_map(serde_json::Value::Bool),
+            any::<i64>().prop_map(|number| serde_json::json!(number)),
+            prop::collection::vec(any::<char>(), 0..256)
+                .prop_map(|chars| serde_json::Value::String(chars.into_iter().collect())),
+        ];
+        leaf.prop_recursive(6, 128, 10, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..10).prop_map(serde_json::Value::Array),
+                prop::collection::hash_map("[a-zA-Z0-9_]{0,24}", inner, 0..10)
+                    .prop_map(|map| serde_json::Value::Object(map.into_iter().collect())),
+            ]
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// `_meta` extraction sees arbitrary request params and must be a
+        /// total parser: malformed or surprising shapes return `None`.
+        #[test]
+        fn from_params_never_panics(params in arb_json()) {
+            let _ = StatelessRequestMeta::from_params(&params);
+        }
+
+        /// Metadata emitted by the typed model survives the same extraction
+        /// path used for incoming final-protocol requests.
+        #[test]
+        fn from_params_round_trips_typed_meta(
+            version_chars in prop::collection::vec(any::<char>(), 0..256)
+        ) {
+            let version: String = version_chars.into_iter().collect();
+            let expected = StatelessRequestMeta {
+                protocol_version: Some(version.clone()),
+                client_capabilities: Some(ClientCapabilities::default()),
+                log_level: Some(LogLevel::Debug),
+                ..StatelessRequestMeta::default()
+            };
+            let params = serde_json::json!({
+                "_meta": serde_json::to_value(expected).unwrap()
+            });
+            let parsed = StatelessRequestMeta::from_params(&params).unwrap();
+            prop_assert_eq!(parsed.protocol_version.as_deref(), Some(version.as_str()));
+            prop_assert!(parsed.client_capabilities.is_some());
+            prop_assert_eq!(parsed.log_level, Some(LogLevel::Debug));
+        }
+    }
 
     #[test]
     fn meta_serializes_with_spec_keys() {
@@ -513,10 +564,22 @@ mod version_property_tests {
     use crate::protocol::SUPPORTED_PROTOCOL_VERSIONS;
     use proptest::prelude::*;
 
+    fn arb_version_text() -> BoxedStrategy<String> {
+        prop_oneof![
+            8 => prop::collection::vec(any::<char>(), 0..512)
+                .prop_map(|chars| chars.into_iter().collect()),
+            1 => Just("\0\r\n\t\u{001b}\u{007f}".repeat(64)),
+            1 => Just("2".repeat(16 * 1024)),
+        ]
+        .boxed()
+    }
+
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
         /// Validating an arbitrary version string never panics.
         #[test]
-        fn validate_never_panics(v in ".*") {
+        fn validate_never_panics(v in arb_version_text()) {
             let _ = validate_protocol_version(&v);
         }
 
@@ -528,7 +591,7 @@ mod version_property_tests {
 
         /// Anything not in the supported set is rejected.
         #[test]
-        fn unsupported_versions_reject(v in ".*") {
+        fn unsupported_versions_reject(v in arb_version_text()) {
             prop_assume!(!SUPPORTED_PROTOCOL_VERSIONS.contains(&v.as_str()));
             prop_assert!(validate_protocol_version(&v).is_err());
         }

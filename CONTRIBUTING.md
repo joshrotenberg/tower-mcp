@@ -12,6 +12,16 @@ cargo test --doc --all-features
 
 All of these must pass before submitting a PR.
 
+## Fuzzing
+
+The JSON-RPC wire parser has a `cargo-fuzz` target that also runs on a weekly
+schedule. Run a bounded local campaign with a nightly toolchain:
+
+```bash
+cargo install cargo-fuzz --locked
+cargo +nightly fuzz run jsonrpc_message -- -max_total_time=60
+```
+
 ## Submitting Changes
 
 - **Open an issue first** for anything beyond a straightforward bug fix. This lets us discuss scope and approach before you invest the effort.

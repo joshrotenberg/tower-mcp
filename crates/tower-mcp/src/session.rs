@@ -208,6 +208,78 @@ impl SessionState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    #[derive(Clone, Debug)]
+    enum LifecycleOperation {
+        MarkInitializing,
+        MarkInitialized,
+        CheckRequest(String),
+    }
+
+    fn lifecycle_operation() -> impl Strategy<Value = LifecycleOperation> {
+        prop_oneof![
+            Just(LifecycleOperation::MarkInitializing),
+            Just(LifecycleOperation::MarkInitialized),
+            prop_oneof![
+                Just("initialize".to_string()),
+                Just("ping".to_string()),
+                Just("server/discover".to_string()),
+                Just("tools/list".to_string()),
+                "[a-z/_.-]{0,64}",
+            ]
+            .prop_map(LifecycleOperation::CheckRequest),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// Model random lifecycle sequences and assert that the atomic state
+        /// machine never permits an illegal transition or pre-init request.
+        #[test]
+        fn lifecycle_matches_model(
+            operations in prop::collection::vec(lifecycle_operation(), 0..256)
+        ) {
+            let session = SessionState::new();
+            let mut expected_phase = SessionPhase::Uninitialized;
+
+            for operation in operations {
+                match operation {
+                    LifecycleOperation::MarkInitializing => {
+                        let expected_success = expected_phase == SessionPhase::Uninitialized;
+                        prop_assert_eq!(session.mark_initializing(), expected_success);
+                        if expected_success {
+                            expected_phase = SessionPhase::Initializing;
+                        }
+                    }
+                    LifecycleOperation::MarkInitialized => {
+                        let expected_success = expected_phase != SessionPhase::Initialized;
+                        prop_assert_eq!(session.mark_initialized(), expected_success);
+                        if expected_success {
+                            expected_phase = SessionPhase::Initialized;
+                        }
+                    }
+                    LifecycleOperation::CheckRequest(method) => {
+                        let expected_allowed = expected_phase != SessionPhase::Uninitialized
+                            || matches!(method.as_str(), "initialize" | "ping" | "server/discover");
+                        prop_assert_eq!(
+                            session.is_request_allowed(&method),
+                            expected_allowed,
+                            "phase={:?}, method={:?}",
+                            expected_phase,
+                            method
+                        );
+                    }
+                }
+                prop_assert_eq!(session.phase(), expected_phase);
+                prop_assert_eq!(
+                    session.is_initialized(),
+                    expected_phase == SessionPhase::Initialized
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_session_lifecycle() {

@@ -1,0 +1,23 @@
+[package]
+name = "tower-mcp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+tower-mcp-types = { path = "../crates/tower-mcp-types" }
+
+[[bin]]
+name = "jsonrpc_message"
+path = "fuzz_targets/jsonrpc_message.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = []
