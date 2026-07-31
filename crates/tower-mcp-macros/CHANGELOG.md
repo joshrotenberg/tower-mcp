@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.16.1] - 2026-07-31
+
+### Miscellaneous Tasks
+
+- Prepare release hygiene ([#1098](https://github.com/joshrotenberg/tower-mcp/pull/1098))
+
+
+
 ## [0.16.0] - 2026-07-31
 
 
