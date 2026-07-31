@@ -7622,6 +7622,7 @@ mod tests {
     }
 
     /// A stateless 2026-07-28 request body helper for the serverInfo tests below.
+    #[cfg(feature = "stateless")]
     fn stateless_tools_call_request() -> Request<Body> {
         Request::builder()
             .method("POST")
@@ -7653,6 +7654,7 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(feature = "stateless")]
     fn echo_router() -> McpRouter {
         use crate::{CallToolResult, ToolBuilder};
         McpRouter::new().server_info("t", "1.0.0").tool(
@@ -7668,6 +7670,7 @@ mod tests {
     /// SEP-2575: 2026-07-28 stateless responses carry server identity in
     /// `_meta["io.modelcontextprotocol/serverInfo"]` by default.
     #[tokio::test]
+    #[cfg(feature = "stateless")]
     async fn stateless_v2026_response_stamps_server_info_by_default() {
         let transport = HttpTransport::new(echo_router()).disable_origin_validation();
         let app = transport.into_router();
@@ -7689,6 +7692,7 @@ mod tests {
 
     /// `.stamp_server_info(false)` opts out of the SEP-2575 `_meta` stamp.
     #[tokio::test]
+    #[cfg(feature = "stateless")]
     async fn stateless_v2026_response_omits_server_info_when_disabled() {
         let transport = HttpTransport::new(echo_router())
             .disable_origin_validation()

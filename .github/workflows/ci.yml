@@ -26,6 +26,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets --all-features
 
+  feature-combinations:
+    name: Feature combinations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check default and each public feature
+        run: |
+          cargo check -p tower-mcp --all-targets
+          for feature in \
+            http websocket unix childproc oauth jwks testing dynamic-tools \
+            http-client oauth-client proxy macros resilience mcp-apps \
+            protocol-2026-07-28 stateless
+          do
+            cargo check -p tower-mcp --all-targets --features "$feature"
+          done
+
   wasm-types:
     name: WASM (tower-mcp-types)
     runs-on: ubuntu-latest
