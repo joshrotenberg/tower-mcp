@@ -154,7 +154,7 @@ required-features = ["http"]
 [[example]]
 name = "server_discover"
 path = "server_discover.rs"
-required-features = ["http", "stateless"]
+required-features = ["http", "protocol-2026-07-28"]
 
 [[example]]
 name = "stateless_http_client"

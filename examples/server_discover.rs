@@ -20,8 +20,8 @@
 //!
 //! ## What this example does
 //!
-//! 1. Starts an `HttpTransport` server in-process with `stateless` enabled so
-//!    the 2026-07-28 code path is active.
+//! 1. Starts a dual-era `HttpTransport` server in-process with the
+//!    `protocol-2026-07-28` implementation compiled and enabled.
 //! 2. Calls `server/discover` with `MCP-Protocol-Version: 2026-07-28` and
 //!    `Mcp-Method: server/discover` (both required in 2026-07-28 strict mode).
 //! 3. Prints the discover response: supported versions, capabilities, server info.
@@ -31,7 +31,7 @@
 //!    session-based path still works alongside stateless clients.
 //!
 //! Run with:
-//!   cargo run --example server_discover --features "http,stateless"
+//!   cargo run --example server_discover --features "http,protocol-2026-07-28"
 
 use std::time::Duration;
 
@@ -101,12 +101,6 @@ fn build_router() -> McpRouter {
 
 /// Start an in-process server and return its URL.
 async fn start_server() -> (String, tokio::task::JoinHandle<()>) {
-    #[cfg(feature = "stateless")]
-    let transport = HttpTransport::new(build_router())
-        .disable_origin_validation()
-        .stateless(tower_mcp::stateless::StatelessConfig::new());
-
-    #[cfg(not(feature = "stateless"))]
     let transport = HttpTransport::new(build_router()).disable_origin_validation();
 
     let axum_router = transport.into_router();
@@ -154,7 +148,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .json(&serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "server/discover"
+            "method": "server/discover",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientInfo": {
+                        "name": "server-discover-example",
+                        "version": "1.0.0"
+                    },
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
         }))
         .send()
         .await?;
@@ -175,6 +179,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     let discover_body: serde_json::Value = discover_resp.json().await?;
+    if !status.is_success() {
+        return Err(format!("server/discover failed: {discover_body}").into());
+    }
 
     // The result uses supportedVersions (plural), NOT protocolVersion (singular).
     // That is the key structural difference from initialize.
@@ -220,10 +227,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // -------------------------------------------------------------------------
     let chosen_version = supported
         .iter()
-        .find(|v| v.as_str() == Some("2025-11-25"))
+        .find(|v| v.as_str() == Some("2026-07-28"))
         .or_else(|| supported.first())
         .and_then(|v| v.as_str())
-        .unwrap_or("2025-11-25");
+        .unwrap_or("2026-07-28");
 
     println!(
         "=== tools/list (stateless, using version '{}' from discover) ===",
@@ -235,18 +242,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .post(&url)
         .header("Content-Type", "application/json")
         .header("Accept", "application/json")
-        .header("MCP-Protocol-Version", "2026-07-28")
+        .header("MCP-Protocol-Version", chosen_version)
         .header("Mcp-Method", "tools/list")
         .json(&serde_json::json!({
             "jsonrpc": "2.0",
             "id": 2,
-            "method": "tools/list"
+            "method": "tools/list",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": chosen_version,
+                    "io.modelcontextprotocol/clientInfo": {
+                        "name": "server-discover-example",
+                        "version": "1.0.0"
+                    },
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
         }))
         .send()
         .await?;
 
-    println!("HTTP status: {}", tools_resp.status());
+    let tools_status = tools_resp.status();
+    println!("HTTP status: {tools_status}");
     let tools_body: serde_json::Value = tools_resp.json().await?;
+    if !tools_status.is_success() {
+        return Err(format!("tools/list failed: {tools_body}").into());
+    }
     let tools = tools_body["result"]["tools"]
         .as_array()
         .expect("tools must be an array");

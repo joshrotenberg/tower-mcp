@@ -8,6 +8,11 @@ If you are dropping tower-mcp into an existing axum application,
 `HttpTransport::into_router()` composes with your own routes, state, and
 tower middleware.
 
+For a guided path, see [client usage](../docs/client.md),
+[HTTP deployment](../docs/deployment.md),
+[protocol versions](../docs/protocol-versions.md), and
+[OAuth authorization](../docs/oauth.md).
+
 ## Running Examples
 
 ```bash
@@ -32,6 +37,10 @@ cargo run --example websocket_server --features websocket
 cargo run --example http_client --features http-client
 cargo run --example http_sse_client --features http
 cargo run --example stateless_http_client --features "http,http-client,protocol-2026-07-28"
+
+# Released 2026-07-28 discovery and Tasks extension
+cargo run --example server_discover --features "http,protocol-2026-07-28"
+cargo run --example tasks --features protocol-2026-07-28
 
 # OAuth resource server and clients (see ../docs/oauth.md for configuration)
 cargo run --example http_auth --features jwks -- --auth jwks
@@ -95,6 +104,7 @@ production checklist.
 | [client_cli](client_cli.rs) | Stdio client connecting to subprocess servers |
 | [http_client](http_client.rs) | HTTP client with McpClient API |
 | [http_sse_client](http_sse_client.rs) | SSE stream resumption (Last-Event-ID) |
+| [server_discover](server_discover.rs) | Minimal 2026-07-28 `server/discover` server and response shape |
 | [stateless_http_client](stateless_http_client.rs) | 2026-07-28 stateless protocol: server/discover, tools/list, tools/call, subscriptions/listen -- no session ID |
 
 ### Bidirectional Communication
@@ -122,6 +132,7 @@ production checklist.
 | [event_store](event_store.rs) | Custom `EventStore` for persistent SSE event buffering and cross-instance resumption |
 | [session_store](session_store.rs) | Custom `SessionStore` for persistent session metadata |
 | [testing](testing.rs) | In-process testing with TestClient |
+| [tasks](tasks.rs) | 2026-07-28 Tasks extension lifecycle, notifications, cancellation, and ownership |
 | [weather_server](weather_server.rs) | External API integration (NWS) |
 
 ### Macros

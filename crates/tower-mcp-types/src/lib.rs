@@ -90,7 +90,7 @@
 //! requires only a dependency change -- no import paths need to change:
 //!
 //! ```toml
-//! tower-mcp = { version = "0.10", features = ["http"] }
+//! tower-mcp = { version = "0.16", features = ["http"] }
 //! ```
 //!
 //! # WASM support

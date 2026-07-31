@@ -8,7 +8,7 @@
 //!
 //! ### Automatic version-gated path (2026-07-28)
 //!
-//! When the `stateless` feature is compiled in, JSON-RPC transports
+//! When the `protocol-2026-07-28` feature is compiled in, JSON-RPC transports
 //! automatically dispatch requests whose per-request `_meta` selects the exact
 //! 2026-07-28 protocol without an initialize handshake. HTTP additionally
 //! requires a matching `MCP-Protocol-Version` header. Client identity and
@@ -17,8 +17,8 @@
 //!
 //! **This path is always active when the feature is compiled in, regardless of
 //! whether [`StatelessConfig`] was provided to the transport.** Adding
-//! `features = ["stateless"]` to your `Cargo.toml` is sufficient; you do not
-//! need to call `HttpTransport::stateless()`.
+//! `features = ["protocol-2026-07-28"]` to your `Cargo.toml` is sufficient;
+//! you do not need to call `HttpTransport::stateless()`.
 //!
 //! ### Legacy SEP-1442 opt-in path
 //!
@@ -30,10 +30,11 @@
 //!
 //! ## Feature flag
 //!
-//! This module is gated behind the `stateless` feature flag:
+//! This module is gated behind `protocol-2026-07-28`. The former `stateless`
+//! feature remains as a compatibility alias:
 //!
 //! ```toml
-//! tower-mcp = { version = "0.10", features = ["stateless"] }
+//! tower-mcp = { version = "0.16", features = ["protocol-2026-07-28"] }
 //! ```
 //!
 //! ## Key properties of stateless mode

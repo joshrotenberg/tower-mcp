@@ -178,6 +178,19 @@
 //! and a production checklist, see the
 //! [OAuth authorization guide](https://github.com/joshrotenberg/tower-mcp/blob/main/docs/oauth.md).
 //!
+//! ## Task-oriented Guides
+//!
+//! - [Client usage](https://github.com/joshrotenberg/tower-mcp/blob/main/docs/client.md) —
+//!   transport selection, lifecycle, callbacks, requests, caching, retries, and shutdown.
+//! - [HTTP deployment](https://github.com/joshrotenberg/tower-mcp/blob/main/docs/deployment.md) —
+//!   mounting, reverse proxies, origin/host validation, sessions, scaling, timeouts,
+//!   middleware order, health, and graceful shutdown.
+//! - [Protocol versions](https://github.com/joshrotenberg/tower-mcp/blob/main/docs/protocol-versions.md) —
+//!   compile-time availability, runtime allowlists, lifecycle differences,
+//!   interoperability, and upgrades.
+//! - [Examples index](https://github.com/joshrotenberg/tower-mcp/blob/main/examples/README.md) —
+//!   runnable server, client, transport, middleware, OAuth, and extension patterns.
+//!
 //! ## Middleware Placement Guide
 //!
 //! tower-mcp supports Tower middleware at multiple levels. Choose based on scope:

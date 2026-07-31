@@ -7,11 +7,14 @@
 //!
 //! # Overview
 //!
-//! MCP is session-oriented. The `mcp-session-id` header established during
-//! `initialize` ties subsequent requests together, and `HttpTransport`
-//! keeps live state per session (broadcast channel for SSE notifications,
-//! pending sampling requests, service instance). Two deployment shapes
-//! cover most cases:
+//! The legacy 2025-11-25 lifecycle may be session-oriented. The
+//! `mcp-session-id` header established during `initialize` ties subsequent
+//! requests together, and `HttpTransport` keeps live state per session
+//! (broadcast channel for SSE notifications, pending sampling requests,
+//! service instance). The 2026-07-28 lifecycle is sessionless; ordinary
+//! requests can be distributed independently, although application state and
+//! long-lived subscription streams may still influence routing. Two shapes
+//! cover most legacy or mixed-version deployments:
 //!
 //! 1. **Session affinity.** A load balancer routes all requests for a
 //!    given session back to the same server instance. Any in-memory
@@ -334,6 +337,10 @@
 //!
 //! # See Also
 //!
+//! - The repository's
+//!   [HTTP deployment guide](https://github.com/joshrotenberg/tower-mcp/blob/main/docs/deployment.md)
+//!   is the task-oriented starting point for endpoint mounting, proxy headers,
+//!   protocol policy, timeouts, and production checklists.
 //! - [`session_store`] for the `SessionStore` trait and implementations.
 //! - [`event_store`] for the `EventStore` trait and SSE event persistence.
 //! - The `session_store` and `event_store` examples in the repo show

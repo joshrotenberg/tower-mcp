@@ -55,6 +55,9 @@ If you've used [axum](https://docs.rs/axum), tower-mcp's API will feel familiar:
 
 | Guide | Use it when |
 |---|---|
+| [Client usage](docs/client.md) | Choosing a transport, connecting, handling callbacks, making requests, configuring caching, or defining retry policy |
+| [HTTP deployment](docs/deployment.md) | Mounting an endpoint, configuring proxies and origins, choosing session/scaling policy, or placing middleware and timeouts |
+| [Protocol versions](docs/protocol-versions.md) | Selecting compile-time and runtime support, comparing lifecycle behavior, planning interoperability, or upgrading revisions |
 | [OAuth authorization](docs/oauth.md) | Protecting an MCP resource server, building an interactive or service client, choosing registration/storage policy, or preparing an OAuth deployment |
 | [MCP Apps](docs/mcp-apps.md) | Returning typed app resources from tools with negotiation and safe fallback |
 | [Examples index](examples/README.md) | Looking for a runnable server, client, transport, middleware, or extension pattern |
@@ -619,6 +622,10 @@ let router = McpRouter::new()
 
 tower-mcp targets the [MCP specification 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) with backward compatibility for `2025-03-26`. The [official MCP conformance test suite](https://github.com/modelcontextprotocol/conformance) runs in CI on every PR via [`conformance.yml`](https://github.com/joshrotenberg/tower-mcp/actions/workflows/conformance.yml), currently passing:
 
+For application-facing guidance on the stable default, opt-in 2026-07-28
+implementation, compile-time features, runtime allowlists, interoperability,
+and upgrade policy, start with the [protocol-version guide](docs/protocol-versions.md).
+
 - **Server (2025-11-25):** 48/48 checks (`conformance@0.2.0-alpha.10`, `--suite all`); the server baseline is empty
 - **Client (2025-11-25):** all 18 scenarios green, 235 checks (`conformance@0.2.0-alpha.10`, `--suite all`); the client baseline is empty
 - **Server (2026-07-28):** 114/114 checks (`conformance@0.2.0-alpha.10`, `--suite all`); the server baseline is empty
@@ -626,105 +633,17 @@ tower-mcp targets the [MCP specification 2025-11-25](https://modelcontextprotoco
 
 Both protocol revisions run on the same harness pin so the results are directly comparable with each other and with rmcp's current conformance workflow. Because the suite is upstream-maintained and grows with the spec, these counts shift as scenarios are added or version-gated -- treat the green CI badge as the source of truth, not any single snapshot. The empty baselines make any new failure immediately visible.
 
-The `protocol-2026-07-28` feature enables the released, opt-in 2026-07-28
-protocol implementation (version-gated, behind
-`MCP-Protocol-Version: 2026-07-28`) covering `server/discover`, `subscriptions/listen`, per-request
-`_meta` capabilities, and SEP-2322 Multi Round-Trip Requests. It is not enabled by default and is
-intentionally not included in `SUPPORTED_PROTOCOL_VERSIONS`; compile-time availability and per-transport
-runtime enablement are reported separately.
+The released 2026-07-28 implementation is available through the opt-in
+`protocol-2026-07-28` feature. It covers sessionless dispatch,
+`server/discover`, `subscriptions/listen`, per-request metadata, response-cache
+hints, Multi Round-Trip Requests, and the final Tasks extension. The default
+runtime remains 2025-11-25, including for clients built with `full`.
 
-`PROTOCOL_VERSION_2026_07_28` is the canonical constant for the released wire
-revision. The former status-bearing names `EXPERIMENTAL_PROTOCOL_VERSION` and
-`UPCOMING_PROTOCOL_VERSION` remain deprecated aliases. `LATEST_PROTOCOL_VERSION`
-and `SUPPORTED_PROTOCOL_VERSIONS` continue to describe the non-breaking default
-compatibility set, not every published protocol. Use
-`COMPILED_PROTOCOL_VERSIONS` and `ProtocolSupport` to inspect and select the
-implementations available to a particular build and runtime.
-
-Clients opt in independently at runtime, then use the discover-based lifecycle.
-Every later request receives the required `_meta`, HTTP headers are generated
-from the JSON-RPC frame, and MRTR results are followed through the configured
-client handler with a bounded round count:
-
-```rust,no_run
-use std::time::Duration;
-use tower_mcp::{HttpClientTransport, ProtocolSupport};
-use tower_mcp::client::{ClientCacheConfig, McpClient};
-
-# async fn connect() -> Result<(), tower_mcp::BoxError> {
-let support = ProtocolSupport::try_new(["2026-07-28"])?;
-let cache = ClientCacheConfig::default()
-    .with_partition("user-123")
-    .with_max_ttl(Duration::from_secs(60 * 60));
-let transport = HttpClientTransport::new("https://example.com/mcp");
-let client = McpClient::builder()
-    .protocol_support(support)
-    .max_mrtr_rounds(8)
-    .response_cache(cache)
-    .connect_simple(transport)
-    .await?;
-
-let discovery = client.discover("my-client", "1.0.0").await?;
-println!("server versions: {:?}", discovery.supported_versions);
-# Ok(())
-# }
-```
-
-On the final lifecycle, `server/discover`, paginated list operations, and
-`resources/read` honor `ttlMs` and `cacheScope`. Private entries use the
-configured authorization-context partition; list/resource notifications
-invalidate matching entries. The cache is bounded, caps server TTLs at 24
-hours by default, never stores MRTR retries, and can be disabled or configured
-to serve stale data after refresh errors.
-
-MRTR-aware tool, prompt, resource, and resource-template handlers return
-`RequestOutcome<T>`. Retry values are exposed on `RequestContext`, while
-`RequestStateCodec` provides versioned, expiring, HMAC-SHA256 state tokens:
-
-```rust
-use tower_mcp::{
-    CallToolResult, InputRequest, InputRequiredResult, InputRequests, ListRootsParams,
-    NoParams, RequestOutcome, ToolBuilder,
-};
-
-let tool = ToolBuilder::new("workspace_summary")
-    .mrtr_handler::<NoParams, _, _>(|ctx, _| async move {
-        if ctx.input_responses().is_some_and(|r| r.contains_key("roots")) {
-            return Ok(RequestOutcome::Complete(CallToolResult::text("ready")));
-        }
-
-        let requests: InputRequests = [(
-            "roots".into(),
-            InputRequest::ListRoots(ListRootsParams::default()),
-        )]
-        .into_iter()
-        .collect();
-        Ok(RequestOutcome::input_required(
-            InputRequiredResult::with_requests(requests),
-        ))
-    })
-    .build();
-```
-
-Each MRTR retry is an independent MCP request. Router/transport middleware
-therefore runs once per round, and MRTR tool, prompt, and static-resource
-builders support the same per-handler `.layer()` composition as complete
-handlers. Tool `.guard()` checks also run on every round. Resource templates
-use router/transport middleware for both complete and MRTR handlers because
-they do not have a separate per-template Tower service.
-
-The server does not own a continuation loop, so there is no server-global
-round counter to configure. Clients bound automatic retries with
-`McpClientBuilder::max_mrtr_rounds`; a server workflow that needs its own cap
-should encode and verify a round counter inside `requestState`.
-
-`RequestStateCodec` intentionally leaves authenticated-principal binding under
-application control: HTTP/custom-service authentication can place any
-application-defined identity in request extensions. If continuation state can
-affect authorization, resource access, or business logic, use `encode_for` and
-`decode_for` with that stable principal identifier on every round. This keeps
-the codec transport-neutral while following the final specification's replay
-and cross-principal protections.
+Compile-time availability and runtime allowlists are separate. The
+[protocol-version guide](docs/protocol-versions.md) explains the constants,
+feature policy, lifecycle differences, interoperability, and upgrade path;
+the [client guide](docs/client.md) covers final discovery, caching, MRTR,
+retries, and shutdown with runnable examples.
 
 [SEP-2484](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2484) (accepted) makes merged conformance scenarios a prerequisite for standards-track SEPs reaching `final`, which elevates the conformance suite from a nice-to-have to spec-gating infrastructure. We run it on every PR to catch regressions early and to stay ahead of new scenarios as the spec evolves.
 
