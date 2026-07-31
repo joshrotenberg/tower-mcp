@@ -132,7 +132,9 @@ pub enum AddBackendError {
     DuplicateNamespace(String),
     /// The namespace would create an ambiguous prefix with an existing backend.
     AmbiguousPrefix {
+        /// Namespace requested for the backend being added.
         new_namespace: String,
+        /// Existing namespace whose prefix would conflict.
         existing_namespace: String,
     },
     /// Failed to connect the transport.

@@ -157,12 +157,14 @@ pub enum McpErrorCode {
 }
 
 impl McpErrorCode {
+    /// Return this MCP-specific error code as its JSON-RPC integer value.
     pub fn code(self) -> i32 {
         self as i32
     }
 }
 
 impl ErrorCode {
+    /// Return this standard JSON-RPC error code as its integer value.
     pub fn code(self) -> i32 {
         self as i32
     }
@@ -171,13 +173,17 @@ impl ErrorCode {
 /// JSON-RPC error object
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcError {
+    /// Numeric JSON-RPC error code.
     pub code: i32,
+    /// Human-readable summary of the error.
     pub message: String,
+    /// Optional structured details supplied by the error producer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
 }
 
 impl JsonRpcError {
+    /// Create an error with a standard JSON-RPC code and no structured data.
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             code: code.code(),
@@ -186,19 +192,23 @@ impl JsonRpcError {
         }
     }
 
+    /// Attach structured application-specific data to this error.
     pub fn with_data(mut self, data: serde_json::Value) -> Self {
         self.data = Some(data);
         self
     }
 
+    /// Create a JSON-RPC parse error (`-32700`).
     pub fn parse_error(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::ParseError, message)
     }
 
+    /// Create a JSON-RPC invalid-request error (`-32600`).
     pub fn invalid_request(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::InvalidRequest, message)
     }
 
+    /// Create a JSON-RPC method-not-found error (`-32601`) for `method`.
     pub fn method_not_found(method: &str) -> Self {
         Self::new(
             ErrorCode::MethodNotFound,
@@ -206,10 +216,12 @@ impl JsonRpcError {
         )
     }
 
+    /// Create a JSON-RPC invalid-parameters error (`-32602`).
     pub fn invalid_params(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::InvalidParams, message)
     }
 
+    /// Create a JSON-RPC internal error (`-32603`).
     pub fn internal_error(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::InternalError, message)
     }
@@ -456,9 +468,11 @@ impl ToolError {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// A protocol-level JSON-RPC error returned by a peer or handler.
     #[error("JSON-RPC error: {0:?}")]
     JsonRpc(JsonRpcError),
 
+    /// JSON encoding or decoding failed.
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 
@@ -470,6 +484,7 @@ pub enum Error {
     #[error("{0}")]
     Tool(#[from] ToolError),
 
+    /// The underlying transport failed or returned an unusable response.
     #[error("Transport error: {0}")]
     Transport(String),
 
@@ -495,6 +510,7 @@ pub enum Error {
         limit: usize,
     },
 
+    /// An internal library or server failure not represented by another variant.
     #[error("Internal error: {0}")]
     Internal(String),
 }

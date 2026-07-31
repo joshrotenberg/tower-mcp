@@ -129,13 +129,21 @@ pub struct StatelessRequestMeta {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
+    /// Diagnostic information useful while debugging.
     Debug,
+    /// General informational messages.
     Info,
+    /// Normal but significant events.
     Notice,
+    /// Conditions that may require attention.
     Warning,
+    /// Error conditions.
     Error,
+    /// Critical conditions.
     Critical,
+    /// Conditions requiring immediate action.
     Alert,
+    /// The system is unusable.
     Emergency,
 }
 

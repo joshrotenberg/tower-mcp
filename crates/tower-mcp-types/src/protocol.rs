@@ -396,13 +396,17 @@ impl JsonRpcResponseMessage {
 /// JSON-RPC 2.0 notification (no response expected)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcNotification {
+    /// JSON-RPC version marker; constructors set this to [`JSONRPC_VERSION`].
     pub jsonrpc: String,
+    /// Notification method name.
     pub method: String,
+    /// Optional method parameters, omitted when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Value>,
 }
 
 impl JsonRpcNotification {
+    /// Create a notification without parameters.
     pub fn new(method: impl Into<String>) -> Self {
         Self {
             jsonrpc: JSONRPC_VERSION.to_string(),
@@ -411,6 +415,7 @@ impl JsonRpcNotification {
         }
     }
 
+    /// Attach method parameters to this notification.
     pub fn with_params(mut self, params: Value) -> Self {
         self.params = Some(params);
         self
@@ -551,7 +556,9 @@ pub struct SetLogLevelParams {
 #[serde(untagged)]
 #[non_exhaustive]
 pub enum RequestId {
+    /// A string request identifier.
     String(String),
+    /// An integer request identifier.
     Number(i64),
 }
 
@@ -636,7 +643,9 @@ pub enum McpRequest {
     SubscriptionsListen(SubscriptionsListenParams),
     /// Unknown method
     Unknown {
+        /// Unrecognized JSON-RPC method name.
         method: String,
+        /// Raw parameters, if the request supplied them.
         params: Option<Value>,
     },
 }
@@ -682,7 +691,9 @@ pub enum McpNotification {
     RootsListChanged,
     /// Unknown notification
     Unknown {
+        /// Unrecognized notification method name.
         method: String,
+        /// Raw parameters, if the notification supplied them.
         params: Option<Value>,
     },
 }
@@ -752,7 +763,9 @@ pub struct ProgressParams {
 #[serde(untagged)]
 #[non_exhaustive]
 pub enum ProgressToken {
+    /// A string progress token.
     String(String),
+    /// An integer progress token.
     Number(i64),
 }
 
@@ -828,18 +841,28 @@ impl RequestMeta {
 #[serde(untagged)]
 #[non_exhaustive]
 pub enum McpResponse {
+    /// Successful `initialize` response.
     Initialize(InitializeResult),
+    /// Successful `tools/list` response.
     ListTools(ListToolsResult),
+    /// Successful `tools/call` response.
     CallTool(CallToolResult),
     /// SEP-2322 response indicating that the original request needs one or
     /// more client inputs before it can complete.
     InputRequired(InputRequiredResult),
+    /// Successful `resources/list` response.
     ListResources(ListResourcesResult),
+    /// Successful `resources/templates/list` response.
     ListResourceTemplates(ListResourceTemplatesResult),
+    /// Successful `resources/read` response.
     ReadResource(ReadResourceResult),
+    /// Empty acknowledgement for `resources/subscribe`.
     SubscribeResource(EmptyResult),
+    /// Empty acknowledgement for `resources/unsubscribe`.
     UnsubscribeResource(EmptyResult),
+    /// Successful `prompts/list` response.
     ListPrompts(ListPromptsResult),
+    /// Successful `prompts/get` response.
     GetPrompt(GetPromptResult),
     // The final Tasks extension variants are declared before their legacy
     // counterparts on purpose. This enum is `untagged`, so deserialization
@@ -861,7 +884,9 @@ pub enum McpResponse {
     /// results; two untagged variants that cannot be distinguished would be
     /// worse than one that says so.
     FinalTaskAck(crate::tasks::TaskAcknowledgement),
+    /// Legacy task-creation result used by the 2025-11-25 task shape.
     CreateTask(CreateTaskResult),
+    /// Legacy task status result used by the 2025-11-25 task shape.
     GetTaskInfo(TaskObject),
     /// Ack-only response for `tasks/update` (SEP-2663).
     UpdateTask(EmptyResult),
@@ -870,8 +895,11 @@ pub enum McpResponse {
     /// SEP-2663 (final) requires an empty ack; the observable task status is
     /// polled via `tasks/get` and may remain non-terminal after the ack.
     CancelTask(EmptyResult),
+    /// Empty acknowledgement for `logging/setLevel`.
     SetLoggingLevel(EmptyResult),
+    /// Successful `completion/complete` response.
     Complete(CompleteResult),
+    /// Empty response to `ping`.
     Pong(EmptyResult),
     /// SEP-2575 `server/discover` response.
     Discover(DiscoverResult),
@@ -882,6 +910,7 @@ pub enum McpResponse {
     /// for potential future transport implementations that want a typed
     /// result.
     SubscriptionsListen(SubscriptionsListenResult),
+    /// Generic empty response for methods without a result body.
     Empty(EmptyResult),
     /// Raw JSON value for experimental/extension methods.
     Raw(Value),
@@ -891,11 +920,18 @@ pub enum McpResponse {
 // Initialize
 // =============================================================================
 
+/// Parameters sent by a client during the legacy `initialize` handshake.
+///
+/// Protocol 2026-07-28 replaces this handshake with per-request metadata;
+/// this type remains the wire shape for earlier negotiated versions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InitializeParams {
+    /// Latest protocol version the client supports.
     pub protocol_version: String,
+    /// Features the client can provide to the server.
     pub capabilities: ClientCapabilities,
+    /// Client implementation name, version, and optional presentation data.
     pub client_info: Implementation,
     /// Optional protocol-level metadata
     #[serde(
@@ -907,14 +943,23 @@ pub struct InitializeParams {
     pub meta: Option<Value>,
 }
 
+/// Features a client can provide or accept.
+///
+/// For protocol 2026-07-28 this value is carried in request `_meta`; earlier
+/// versions send it once in [`InitializeParams`]. An absent capability means
+/// the client does not advertise support for that feature.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClientCapabilities {
+    /// Support for server requests that list filesystem roots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roots: Option<RootsCapability>,
+    /// Support for server-initiated model sampling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sampling: Option<SamplingCapability>,
+    /// Support for server-initiated user elicitation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elicitation: Option<ElicitationCapability>,
+    /// Support for the legacy client-side task capability shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tasks: Option<ClientTasksCapability>,
     /// Experimental, non-standard capabilities
@@ -1138,6 +1183,10 @@ pub struct ListRootsResult {
     pub meta: Option<Value>,
 }
 
+/// Client support for server-initiated sampling requests.
+///
+/// Sampling is deprecated in protocol 2026-07-28 by SEP-2577 but remains
+/// available during its compatibility window.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SamplingCapability {
     /// Support for tool use within sampling
@@ -1925,11 +1974,15 @@ pub struct Implementation {
     pub meta: Option<Value>,
 }
 
+/// Server response to the legacy `initialize` handshake.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InitializeResult {
+    /// Protocol version selected by the server.
     pub protocol_version: String,
+    /// Features the server advertises for the negotiated session.
     pub capabilities: ServerCapabilities,
+    /// Server implementation name, version, and optional presentation data.
     pub server_info: Implementation,
     /// Optional instructions describing how to use this server.
     /// These hints help LLMs understand the server's features.
@@ -2084,18 +2137,27 @@ pub struct SubscriptionsListenResultMeta {
     pub server_info: Option<Implementation>,
 }
 
+/// Features exposed by an MCP server.
+///
+/// An absent capability means the server does not advertise the corresponding
+/// operation. Protocol 2026-07-28 returns this from `server/discover`; earlier
+/// versions return it from `initialize`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerCapabilities {
+    /// Tool listing and invocation support.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<ToolsCapability>,
+    /// Resource listing, reading, and optional subscription support.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ResourcesCapability>,
+    /// Prompt listing and retrieval support.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompts: Option<PromptsCapability>,
     /// Logging capability - servers that emit log notifications declare this
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logging: Option<LoggingCapability>,
+    /// Legacy Tasks capability advertised by pre-final protocol versions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tasks: Option<TasksCapability>,
     /// Completion capability - server provides autocomplete suggestions
@@ -2171,25 +2233,32 @@ pub struct TasksToolsRequestsCapability {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TasksToolsCallCapability {}
 
+/// Options advertised for the server's tool capability.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolsCapability {
+    /// Whether the server may emit `notifications/tools/list_changed`.
     #[serde(default)]
     pub list_changed: bool,
 }
 
+/// Options advertised for the server's resource capability.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourcesCapability {
+    /// Whether `resources/subscribe` and `resources/unsubscribe` are supported.
     #[serde(default)]
     pub subscribe: bool,
+    /// Whether the server may emit `notifications/resources/list_changed`.
     #[serde(default)]
     pub list_changed: bool,
 }
 
+/// Options advertised for the server's prompt capability.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PromptsCapability {
+    /// Whether the server may emit `notifications/prompts/list_changed`.
     #[serde(default)]
     pub list_changed: bool,
 }
@@ -2256,8 +2325,10 @@ pub struct DeprecationInfo {
 // Tools
 // =============================================================================
 
+/// Pagination and metadata for a `tools/list` request.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListToolsParams {
+    /// Opaque cursor returned by the preceding page, or `None` for page one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
     /// Optional protocol-level metadata
@@ -2270,10 +2341,13 @@ pub struct ListToolsParams {
     pub meta: Option<RequestMeta>,
 }
 
+/// One page returned by `tools/list`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListToolsResult {
+    /// Tools available on this page.
     pub tools: Vec<ToolDefinition>,
+    /// Opaque cursor for the next page; absence means this is the last page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
     /// SEP-2549: client-cache TTL in milliseconds for this list response.
@@ -2298,12 +2372,15 @@ pub struct ListToolsResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolDefinition {
+    /// Programmatic tool name supplied to `tools/call`.
     pub name: String,
     /// Human-readable title for display purposes
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Optional human-readable explanation of the tool's purpose.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// JSON Schema describing accepted tool arguments.
     pub input_schema: Value,
     /// Optional JSON Schema defining expected output structure
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2452,9 +2529,12 @@ fn is_true(v: &bool) -> bool {
     *v
 }
 
+/// Parameters for invoking a tool through `tools/call`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallToolParams {
+    /// Programmatic name of the tool to invoke.
     pub name: String,
+    /// Arguments validated against the tool's input schema; defaults to JSON null.
     #[serde(default)]
     pub arguments: Value,
     /// SEP-2322: responses to the server's [`InputRequests`] from a prior
@@ -2968,6 +3048,7 @@ pub enum Content {
         /// Optional icons for display in user interfaces
         #[serde(default, skip_serializing_if = "Option::is_none")]
         icons: Option<Vec<ToolIcon>>,
+        /// Audience, priority, and modification hints for the embedded resource.
         #[serde(skip_serializing_if = "Option::is_none")]
         annotations: Option<ContentAnnotations>,
         /// Optional protocol-level metadata
@@ -3093,8 +3174,10 @@ pub struct ResourceContent {
 // Resources
 // =============================================================================
 
+/// Pagination and metadata for a `resources/list` request.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListResourcesParams {
+    /// Opaque cursor returned by the preceding page, or `None` for page one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
     /// Optional protocol-level metadata
@@ -3107,10 +3190,13 @@ pub struct ListResourcesParams {
     pub meta: Option<RequestMeta>,
 }
 
+/// One page returned by `resources/list`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListResourcesResult {
+    /// Resources available on this page.
     pub resources: Vec<ResourceDefinition>,
+    /// Opaque cursor for the next page; absence means this is the last page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
     /// SEP-2549: client-cache TTL in milliseconds for this list response.
@@ -3129,16 +3215,21 @@ pub struct ListResourcesResult {
     pub meta: Option<Value>,
 }
 
+/// Resource metadata returned by `resources/list`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceDefinition {
+    /// URI used to identify and read the resource.
     pub uri: String,
+    /// Programmatic or display name of the resource.
     pub name: String,
     /// Human-readable title for display purposes
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Optional human-readable explanation of the resource.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Optional MIME type of the resource contents.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
     /// Optional icons for display in user interfaces
@@ -3160,8 +3251,10 @@ pub struct ResourceDefinition {
     pub meta: Option<Value>,
 }
 
+/// Parameters for a `resources/read` request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadResourceParams {
+    /// URI of the resource to read.
     pub uri: String,
     /// SEP-2322: responses to the server's [`InputRequests`] from a prior
     /// `input_required` result, sent on retry of the original request.
@@ -3189,8 +3282,10 @@ pub struct ReadResourceParams {
     pub meta: Option<RequestMeta>,
 }
 
+/// Contents returned by `resources/read`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReadResourceResult {
+    /// Text or binary content blocks produced for the requested resource.
     pub contents: Vec<ResourceContent>,
     /// SEP-2549: client-cache TTL in milliseconds for this read response.
     /// The 2026-07-28 draft requires caching hints on `resources/read`
@@ -3440,8 +3535,10 @@ impl ReadResourceResult {
     }
 }
 
+/// Parameters for a `resources/subscribe` request.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SubscribeResourceParams {
+    /// URI whose updates the client wants to receive.
     pub uri: String,
     /// Optional protocol-level metadata
     #[serde(
@@ -3453,8 +3550,10 @@ pub struct SubscribeResourceParams {
     pub meta: Option<RequestMeta>,
 }
 
+/// Parameters for a `resources/unsubscribe` request.
 #[derive(Debug, Clone, Deserialize)]
 pub struct UnsubscribeResourceParams {
+    /// URI whose updates the client no longer wants to receive.
     pub uri: String,
     /// Optional protocol-level metadata
     #[serde(
@@ -3561,8 +3660,10 @@ pub struct ResourceTemplateDefinition {
 // Prompts
 // =============================================================================
 
+/// Pagination and metadata for a `prompts/list` request.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListPromptsParams {
+    /// Opaque cursor returned by the preceding page, or `None` for page one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
     /// Optional protocol-level metadata
@@ -3575,10 +3676,13 @@ pub struct ListPromptsParams {
     pub meta: Option<RequestMeta>,
 }
 
+/// One page returned by `prompts/list`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListPromptsResult {
+    /// Prompt definitions available on this page.
     pub prompts: Vec<PromptDefinition>,
+    /// Opaque cursor for the next page; absence means this is the last page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
     /// SEP-2549: client-cache TTL in milliseconds for this list response.
@@ -3597,17 +3701,21 @@ pub struct ListPromptsResult {
     pub meta: Option<Value>,
 }
 
+/// Prompt metadata returned by `prompts/list`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptDefinition {
+    /// Programmatic prompt name supplied to `prompts/get`.
     pub name: String,
     /// Human-readable title for display purposes
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Optional human-readable explanation of the prompt.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Optional icons for display in user interfaces
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icons: Option<Vec<ToolIcon>>,
+    /// Arguments accepted when rendering this prompt.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub arguments: Vec<PromptArgument>,
     /// Optional protocol-level metadata
@@ -3620,18 +3728,25 @@ pub struct PromptDefinition {
     pub meta: Option<Value>,
 }
 
+/// One named argument accepted by a prompt template.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptArgument {
+    /// Argument name supplied as a key in [`GetPromptParams::arguments`].
     pub name: String,
+    /// Optional human-readable explanation of the argument.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Whether clients must supply this argument.
     #[serde(default)]
     pub required: bool,
 }
 
+/// Parameters for rendering a prompt through `prompts/get`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetPromptParams {
+    /// Programmatic name of the prompt to render.
     pub name: String,
+    /// String arguments substituted into the prompt template.
     #[serde(default)]
     pub arguments: std::collections::HashMap<String, String>,
     /// SEP-2322: responses to the server's [`InputRequests`] from a prior
@@ -3726,8 +3841,10 @@ pub struct GetPromptParams {
 /// assert_eq!(result.messages.len(), 1);
 /// ```
 pub struct GetPromptResult {
+    /// Optional human-readable description of the rendered prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Ordered conversation messages produced by the prompt.
     pub messages: Vec<PromptMessage>,
     /// Optional protocol-level metadata
     #[serde(
@@ -3954,9 +4071,12 @@ impl GetPromptResultBuilder {
     }
 }
 
+/// A role-tagged content block in a rendered prompt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptMessage {
+    /// Whether the message is addressed as the user or assistant.
     pub role: PromptRole,
+    /// Text, image, audio, or embedded-resource content of the message.
     pub content: Content,
     /// Optional protocol-level metadata
     #[serde(
@@ -3968,11 +4088,14 @@ pub struct PromptMessage {
     pub meta: Option<Value>,
 }
 
+/// Conversation role assigned to a rendered prompt message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum PromptRole {
+    /// A message originating from or addressed as the user.
     User,
+    /// A message originating from or addressed as the assistant.
     Assistant,
 }
 
@@ -4447,7 +4570,9 @@ pub struct ElicitUrlParams {
 #[serde(untagged)]
 #[non_exhaustive]
 pub enum ElicitRequestParams {
+    /// In-band structured form elicitation.
     Form(ElicitFormParams),
+    /// Out-of-band interaction reached through a URL.
     Url(ElicitUrlParams),
 }
 
@@ -4792,20 +4917,25 @@ pub enum PrimitiveSchemaDefinition {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StringSchema {
+    /// JSON Schema type marker; must be `"string"`.
     #[serde(rename = "type")]
     pub schema_type: String,
     /// Human-readable title for this field
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Optional human-readable help text for the field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Optional semantic format hint such as `email` or `uri`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
     /// Regex pattern for validation
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pattern: Option<String>,
+    /// Minimum permitted string length.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_length: Option<u64>,
+    /// Maximum permitted string length.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_length: Option<u64>,
     /// Default value for this field
@@ -4817,15 +4947,19 @@ pub struct StringSchema {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IntegerSchema {
+    /// JSON Schema type marker; must be `"integer"`.
     #[serde(rename = "type")]
     pub schema_type: String,
     /// Human-readable title for this field
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Optional human-readable help text for the field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Inclusive minimum accepted value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub minimum: Option<i64>,
+    /// Inclusive maximum accepted value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub maximum: Option<i64>,
     /// Default value for this field
@@ -4837,15 +4971,19 @@ pub struct IntegerSchema {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NumberSchema {
+    /// JSON Schema type marker; must be `"number"`.
     #[serde(rename = "type")]
     pub schema_type: String,
     /// Human-readable title for this field
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Optional human-readable help text for the field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Inclusive minimum accepted value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub minimum: Option<f64>,
+    /// Inclusive maximum accepted value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub maximum: Option<f64>,
     /// Default value for this field
@@ -4857,11 +4995,13 @@ pub struct NumberSchema {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BooleanSchema {
+    /// JSON Schema type marker; must be `"boolean"`.
     #[serde(rename = "type")]
     pub schema_type: String,
     /// Human-readable title for this field
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Optional human-readable help text for the field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Default value for this field
@@ -4873,13 +5013,16 @@ pub struct BooleanSchema {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SingleSelectEnumSchema {
+    /// JSON Schema type marker; must be `"string"`.
     #[serde(rename = "type")]
     pub schema_type: String,
     /// Human-readable title for this field
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Optional human-readable help text for the field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Exact string values the user may select.
     #[serde(rename = "enum")]
     pub enum_values: Vec<String>,
     /// Default value for this field
@@ -4891,14 +5034,18 @@ pub struct SingleSelectEnumSchema {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MultiSelectEnumSchema {
+    /// JSON Schema type marker; must be `"array"`.
     #[serde(rename = "type")]
     pub schema_type: String,
     /// Human-readable title for this field
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Optional human-readable help text for the field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Schema constraining each selected array item.
     pub items: MultiSelectEnumItems,
+    /// Whether duplicate selections are forbidden.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unique_items: Option<bool>,
     /// Default value for this field
@@ -4909,8 +5056,10 @@ pub struct MultiSelectEnumSchema {
 /// Items definition for multi-select enum
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MultiSelectEnumItems {
+    /// JSON Schema type marker for each item; must be `"string"`.
     #[serde(rename = "type")]
     pub schema_type: String,
+    /// Exact string values permitted in the selection array.
     #[serde(rename = "enum")]
     pub enum_values: Vec<String>,
 }
@@ -4980,10 +5129,15 @@ impl ElicitResult {
 #[serde(untagged)]
 #[non_exhaustive]
 pub enum ElicitFieldValue {
+    /// A string response.
     String(String),
+    /// A floating-point numeric response.
     Number(f64),
+    /// An integer response.
     Integer(i64),
+    /// A boolean response.
     Boolean(bool),
+    /// A multi-select response containing the selected string values.
     StringArray(Vec<String>),
 }
 
@@ -5020,6 +5174,7 @@ pub struct ElicitationCompleteParams {
 // Common
 // =============================================================================
 
+/// Empty successful result object (`{}`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EmptyResult {}
 
