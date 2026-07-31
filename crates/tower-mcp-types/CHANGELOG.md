@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.17.0] - 2026-07-31
+
+### Miscellaneous Tasks
+
+- **conformance:** Align stable suites on current harness ([#1105](https://github.com/joshrotenberg/tower-mcp/pull/1105))
+
+
+
 ## [0.16.1] - 2026-07-31
 
 ### Miscellaneous Tasks

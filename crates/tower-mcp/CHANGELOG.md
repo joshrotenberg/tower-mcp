@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.17.0] - 2026-07-31
+
+### Bug Fixes
+
+- **oauth:** Conform reusable client flows to final spec ([#1121](https://github.com/joshrotenberg/tower-mcp/pull/1121))
+
+### Miscellaneous Tasks
+
+- **conformance:** Align stable suites on current harness ([#1105](https://github.com/joshrotenberg/tower-mcp/pull/1105))
+
+### Testing
+
+- **interop:** Cover final protocol against rmcp ([#1109](https://github.com/joshrotenberg/tower-mcp/pull/1109))
+
+
+
 ## [0.16.1] - 2026-07-31
 
 ### Miscellaneous Tasks
