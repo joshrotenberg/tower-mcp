@@ -1,15 +1,18 @@
 //! HTTP authentication examples
 //!
-//! Demonstrates two approaches to securing an HTTP MCP server:
+//! Demonstrates three approaches to securing an HTTP MCP server:
 //!
 //!   1. **API key** -- Custom axum middleware validating keys from
 //!      Authorization or X-API-Key headers
 //!   2. **OAuth 2.1** -- JWT bearer token validation via `OAuthLayer`
 //!      with Protected Resource Metadata (RFC 9728)
+//!   3. **OAuth 2.1 + JWKS** -- production-style remote key discovery with
+//!      issuer, audience, and operation-level scope enforcement
 //!
 //! Run with:
 //!   API key: cargo run --example http_auth --features oauth -- --auth apikey
 //!   OAuth:   cargo run --example http_auth --features oauth -- --auth oauth
+//!   JWKS:    cargo run --example http_auth --features jwks -- --auth jwks
 //!
 //! Test API key auth:
 //! ```bash
@@ -37,7 +40,8 @@
 //!
 //! # Generate a test JWT at https://jwt.io with:
 //! #   Header:  {"alg":"HS256","typ":"JWT"}
-//! #   Payload: {"sub":"demo-user","scope":"mcp:read mcp:write"}
+//! #   Payload: {"sub":"demo-user","aud":"http://127.0.0.1:3000",
+//! #             "scope":"mcp:read mcp:write"}
 //! #   Secret:  demo-secret-do-not-use-in-production
 //! ```
 //!
@@ -199,17 +203,16 @@ mod apikey {
 mod oauth {
     use axum::Router;
     use tower_mcp::HttpTransport;
-    use tower_mcp::oauth::{JwtValidator, ProtectedResourceMetadata, ScopePolicy};
+    use tower_mcp::oauth::{ProtectedResourceMetadata, ScopePolicy, TokenValidator};
 
-    pub fn wrap(
+    pub fn wrap<V: TokenValidator>(
         transport: HttpTransport,
         metadata: ProtectedResourceMetadata,
+        validator: V,
     ) -> Result<Router, tower_mcp::oauth::ProtectedResourceMetadataError> {
-        // In production, use RSA/EC keys or JWKS endpoint instead of a shared secret
-        let validator = JwtValidator::from_secret(b"demo-secret-do-not-use-in-production")
-            .disable_exp_validation(); // For demo convenience only
-
-        let scope_policy = ScopePolicy::new().default_scope("mcp:read");
+        let scope_policy = ScopePolicy::new()
+            .default_scope("mcp:read")
+            .tool_scope("add", "mcp:write");
 
         transport.into_oauth_router(validator, metadata, scope_policy)
     }
@@ -248,23 +251,50 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
             apikey::wrap(mcp_axum_router)
         }
         "oauth" => {
-            use tower_mcp::oauth::ProtectedResourceMetadata;
+            use tower_mcp::oauth::{JwtValidator, ProtectedResourceMetadata};
 
-            let metadata = ProtectedResourceMetadata::new("http://localhost:3000")
+            let metadata = ProtectedResourceMetadata::new("http://127.0.0.1:3000")
                 .authorization_server("https://auth.example.com")
                 .scope("mcp:read")
                 .scope("mcp:write")
                 .resource_documentation("https://github.com/joshrotenberg/tower-mcp");
+            // The shared secret and disabled expiry check are only for local
+            // experimentation. Use the `jwks` mode for a real deployment.
+            let validator = JwtValidator::from_secret(b"demo-secret-do-not-use-in-production")
+                .disable_exp_validation();
 
             let transport = HttpTransport::new(mcp_router).disable_origin_validation();
 
             tracing::info!(
                 "Protected Resource Metadata: http://127.0.0.1:3000/.well-known/oauth-protected-resource"
             );
-            oauth::wrap(transport, metadata)?
+            oauth::wrap(transport, metadata, validator)?
+        }
+        #[cfg(feature = "jwks")]
+        "jwks" => {
+            use tower_mcp::oauth::{JwksValidator, ProtectedResourceMetadata};
+
+            let resource = std::env::var("MCP_RESOURCE")
+                .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
+            let issuer = std::env::var("OAUTH_ISSUER")?;
+            let jwks_url = std::env::var("OAUTH_JWKS_URL")?;
+            let validator = JwksValidator::builder(jwks_url)
+                .expected_audience(&resource)
+                .expected_issuer(&issuer)
+                .build()
+                .await?;
+            let metadata = ProtectedResourceMetadata::new(&resource)
+                .authorization_server(&issuer)
+                .scope("mcp:read")
+                .scope("mcp:write")
+                .resource_documentation(
+                    "https://github.com/joshrotenberg/tower-mcp/blob/main/docs/oauth.md",
+                );
+            let transport = HttpTransport::new(mcp_router).disable_origin_validation();
+            oauth::wrap(transport, metadata, validator)?
         }
         other => {
-            eprintln!("Unknown auth mode: {other}. Use 'apikey' or 'oauth'.");
+            eprintln!("Unknown auth mode: {other}. Use 'apikey', 'oauth', or 'jwks'.");
             std::process::exit(1);
         }
     };

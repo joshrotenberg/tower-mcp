@@ -1,12 +1,14 @@
 //! OAuth client example -- authenticated HTTP MCP client
 //!
-//! Demonstrates three approaches to authenticating an MCP client
+//! Demonstrates four approaches to authenticating an MCP client
 //! against a server that requires OAuth/bearer tokens:
 //!
 //! 1. **Static bearer token** -- simplest, for pre-issued tokens
 //! 2. **OAuthClientCredentials** -- client credentials grant with
 //!    automatic token caching and refresh
-//! 3. **Custom TokenProvider** -- implement your own token logic
+//! 3. **OAuthAuthorizationFlow** -- interactive authorization code with PKCE,
+//!    loopback redirect validation, refresh, and bounded scope escalation
+//! 4. **Custom TokenProvider** -- implement your own token logic
 //!
 //! Run the server first:
 //!   cargo run --example http_auth --features oauth -- --auth oauth
@@ -17,11 +19,18 @@
 //! Or pick an approach:
 //!   cargo run --example oauth_client --features oauth-client -- --mode static
 //!   cargo run --example oauth_client --features oauth-client -- --mode credentials
+//!   cargo run --example oauth_client --features oauth-client -- --mode authorization-code
 //!   cargo run --example oauth_client --features oauth-client -- --mode custom
+//!
+//! The authorization-code mode expects a real OAuth authorization server. See
+//! `docs/oauth.md` for its environment variables and an end-to-end setup.
 
 use async_trait::async_trait;
 use tower_mcp::client::{
-    HttpClientTransport, McpClient, OAuthClientCredentials, OAuthClientError, TokenProvider,
+    HttpClientTransport, McpClient, OAuthAuthorizationAction, OAuthAuthorizationFlow,
+    OAuthAuthorizationHandler, OAuthAuthorizationRequest, OAuthClientCredentials, OAuthClientError,
+    OAuthClientRegistrationOptions, OAuthDynamicClientRegistration, OAuthRedirectPolicy,
+    OAuthScopeEscalationConfig, TokenProvider,
 };
 
 const SERVER_URL: &str = "http://127.0.0.1:3000";
@@ -38,14 +47,15 @@ async fn demo_static_token() -> Result<(), tower_mcp::BoxError> {
     // In production, this would come from an environment variable or secret store.
     // This JWT is signed with the demo secret from the http_auth example:
     //   Header:  {"alg":"HS256","typ":"JWT"}
-    //   Payload: {"sub":"demo-user","scope":"mcp:read mcp:write"}
+    //   Payload: {"sub":"demo-user","aud":"http://127.0.0.1:3000",
+    //             "scope":"mcp:read mcp:write"}
     //   Secret:  demo-secret-do-not-use-in-production
     let token = std::env::var("MCP_TOKEN").unwrap_or_else(|_| {
         println!("  (No MCP_TOKEN env var set, using demo JWT)");
         // Pre-generated JWT for the http_auth example's demo secret
         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.\
-         eyJzdWIiOiJkZW1vLXVzZXIiLCJzY29wZSI6Im1jcDpyZWFkIG1jcDp3cml0ZSJ9.\
-         demo-signature-replace-with-real-jwt"
+         eyJzdWIiOiJkZW1vLXVzZXIiLCJhdWQiOiJodHRwOi8vMTI3LjAuMC4xOjMwMDAiLCJzY29wZSI6Im1jcDpyZWFkIG1jcDp3cml0ZSJ9.\
+         6Vm0-1zRgtItdXxpbRGFREIkzHLZt44tK5qcnSRh-Dk"
             .to_string()
     });
 
@@ -125,7 +135,101 @@ async fn demo_client_credentials() -> Result<(), tower_mcp::BoxError> {
 }
 
 // =============================================================================
-// Approach 3: Custom TokenProvider
+// Approach 3: interactive authorization code
+// =============================================================================
+
+const CALLBACK_PORT: u16 = 53_682;
+const CALLBACK_PATH: &str = "/oauth/callback";
+
+/// Presents the authorization URL to the user, then lets the flow's loopback
+/// listener validate and consume the browser redirect.
+struct ConsoleAuthorizationHandler;
+
+#[async_trait]
+impl OAuthAuthorizationHandler for ConsoleAuthorizationHandler {
+    async fn authorize(
+        &self,
+        request: OAuthAuthorizationRequest,
+    ) -> Result<OAuthAuthorizationAction, OAuthClientError> {
+        println!(
+            "Open this URL in a browser:\n\n  {}\n",
+            request.authorization_url
+        );
+        println!(
+            "Waiting for the authorization server to redirect to {} ...\n",
+            request.redirect_uri
+        );
+        Ok(OAuthAuthorizationAction::AwaitLoopback)
+    }
+}
+
+/// Interactive authorization-code authentication for a native/CLI client.
+///
+/// Registration priority follows MCP: pre-registered credentials (when
+/// `OAUTH_CLIENT_ID` is set), then an optional Client ID Metadata Document,
+/// then Dynamic Client Registration as a compatibility fallback.
+async fn demo_authorization_code() -> Result<(), tower_mcp::BoxError> {
+    println!("--- Approach 3: OAuthAuthorizationFlow ---\n");
+
+    let server_url = std::env::var("MCP_SERVER_URL").unwrap_or_else(|_| SERVER_URL.to_string());
+    let redirect_uri = format!("http://127.0.0.1:{CALLBACK_PORT}{CALLBACK_PATH}");
+
+    let mut registration = OAuthClientRegistrationOptions::new().with_dynamic_registration(
+        OAuthDynamicClientRegistration::native("tower-mcp OAuth example", [&redirect_uri])
+            .grant_types(["authorization_code", "refresh_token"]),
+    );
+    if let Ok(client_id_metadata_document) = std::env::var("OAUTH_CLIENT_ID_METADATA_DOCUMENT") {
+        registration = registration.with_client_id_metadata_document(client_id_metadata_document);
+    }
+
+    let mut builder = OAuthAuthorizationFlow::builder(&server_url)
+        .registration_options(registration)
+        .redirect_policy(OAuthRedirectPolicy::loopback_at(
+            CALLBACK_PORT,
+            CALLBACK_PATH,
+        ))
+        .authorization_handler(ConsoleAuthorizationHandler);
+
+    if let Ok(client_id) = std::env::var("OAUTH_CLIENT_ID") {
+        builder =
+            builder.pre_registered_client(client_id, std::env::var("OAUTH_CLIENT_SECRET").ok());
+    }
+
+    let flow = builder.build()?;
+    // Leave OAUTH_SCOPES unset to follow the MCP selection order: the initial
+    // WWW-Authenticate challenge first, then PRM scopes_supported. Set it only
+    // when the application has an explicit, narrower operation plan.
+    let initial_scopes = std::env::var("OAUTH_SCOPES")
+        .unwrap_or_default()
+        .split_ascii_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    flow.authorize(&initial_scopes).await?;
+    let granted_scopes = flow
+        .authorized_scopes()
+        .await
+        .unwrap_or_else(|| initial_scopes.clone());
+
+    let transport = HttpClientTransport::new(&server_url).with_scope_aware_token_provider(
+        flow,
+        OAuthScopeEscalationConfig::new(granted_scopes).max_attempts(2),
+    );
+    let client = McpClient::connect(transport).await?;
+    let info = client
+        .initialize("oauth-client-authorization-code", "1.0.0")
+        .await?;
+    println!(
+        "  Connected to: {} v{}\n",
+        info.server_info.name, info.server_info.version
+    );
+    exercise_server(&client).await?;
+    client.shutdown().await?;
+    Ok(())
+}
+
+// =============================================================================
+// Approach 4: Custom TokenProvider
 // =============================================================================
 
 /// A custom token provider that rotates between tokens or implements
@@ -261,14 +365,19 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     match mode.as_str() {
         "static" => demo_static_token().await?,
         "credentials" => demo_client_credentials().await?,
+        "authorization-code" | "auth-code" => demo_authorization_code().await?,
         "custom" => demo_custom_provider().await?,
         "all" => {
             demo_static_token().await.ok();
             demo_client_credentials().await.ok();
+            println!("  Skipping interactive authorization-code mode in --mode all.\n");
             demo_custom_provider().await.ok();
         }
         other => {
-            eprintln!("Unknown mode: {other}. Use 'static', 'credentials', 'custom', or 'all'.");
+            eprintln!(
+                "Unknown mode: {other}. Use 'static', 'credentials', \
+                 'authorization-code', 'custom', or 'all'."
+            );
             std::process::exit(1);
         }
     }

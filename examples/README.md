@@ -33,6 +33,11 @@ cargo run --example http_client --features http-client
 cargo run --example http_sse_client --features http
 cargo run --example stateless_http_client --features "http,http-client,protocol-2026-07-28"
 
+# OAuth resource server and clients (see ../docs/oauth.md for configuration)
+cargo run --example http_auth --features jwks -- --auth jwks
+cargo run --example oauth_client --features oauth-client -- --mode authorization-code
+cargo run --example oauth_client --features oauth-client -- --mode credentials
+
 # Dynamic capabilities
 cargo run --example dynamic_capabilities --features dynamic-tools
 
@@ -75,9 +80,13 @@ cargo run --example tool_macro --features macros
 
 | Example | What it shows |
 |---------|---------------|
-| [http_auth](http_auth.rs) | API key and OAuth/JWT server-side auth |
-| [oauth_client](oauth_client.rs) | Client-side OAuth token acquisition |
+| [http_auth](http_auth.rs) | API key, local JWT, and production JWKS resource-server auth with operation scopes |
+| [oauth_client](oauth_client.rs) | Static tokens, client credentials, interactive authorization code with PKCE/scope escalation, and custom providers |
 | [external_api_auth](external_api_auth.rs) | Downstream API authentication patterns |
+
+See the [OAuth authorization guide](../docs/oauth.md) for end-to-end setup,
+registration and storage policy, identity-provider integration, and the
+production checklist.
 
 ### Clients
 

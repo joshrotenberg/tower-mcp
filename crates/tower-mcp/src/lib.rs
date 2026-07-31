@@ -161,7 +161,9 @@
 //!   [`DynamicResourceTemplateRegistry`]
 //! - `proxy` - Multi-server aggregation proxy ([`McpProxy`](proxy::McpProxy))
 //! - `http-client` - HTTP client transport for connecting to remote MCP servers
-//! - `oauth-client` - OAuth 2.0 client-side token acquisition via client credentials grant (requires `http-client`)
+//! - `oauth-client` - OAuth client support: authorization code with PKCE,
+//!   registration, refresh and scope escalation; client credentials; discovery;
+//!   and custom token providers (requires `http-client`)
 //! - `macros` - Optional proc macros (`#[tool_fn]`, `#[prompt_fn]`, `#[resource_fn]`, `#[resource_template_fn]`)
 //! - `mcp-apps` - Typed server support for the stable MCP Apps extension. Runtime
 //!   advertisement remains explicit through [`McpRouter::with_mcp_apps`].
@@ -171,6 +173,10 @@
 //!   [`stateless::StatelessRequestMeta`], `subscriptions/listen`, SEP-2322 MRTR handlers,
 //!   and the discover-based [`McpClient`] path.
 //! - `stateless` - Compatibility alias for the former 2026 protocol feature name.
+//!
+//! For complete server and client setup, registration and persistence policy,
+//! and a production checklist, see the
+//! [OAuth authorization guide](https://github.com/joshrotenberg/tower-mcp/blob/main/docs/oauth.md).
 //!
 //! ## Middleware Placement Guide
 //!

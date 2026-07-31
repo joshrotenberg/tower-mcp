@@ -51,6 +51,14 @@ If you've used [axum](https://docs.rs/axum), tower-mcp's API will feel familiar:
 - **Requires Tower/Service familiarity.** The `.layer()` composition model is powerful but has a learning curve if you haven't used Tower before.
 - **Heavier dependency tree** than minimal single-transport implementations, especially with `features = ["full"]`.
 
+## Guides
+
+| Guide | Use it when |
+|---|---|
+| [OAuth authorization](docs/oauth.md) | Protecting an MCP resource server, building an interactive or service client, choosing registration/storage policy, or preparing an OAuth deployment |
+| [MCP Apps](docs/mcp-apps.md) | Returning typed app resources from tools with negotiation and safe fallback |
+| [Examples index](examples/README.md) | Looking for a runnable server, client, transport, middleware, or extension pattern |
+
 ## Quick Start
 
 ```rust
@@ -111,7 +119,7 @@ use tower_mcp::schemars::JsonSchema;
 | `oauth` | OAuth 2.1 resource server support -- JWT validation, protected resource metadata (requires `http`) |
 | `jwks` | JWKS endpoint fetching for remote key sets (requires `oauth`) |
 | `http-client` | HTTP client transport for connecting to remote MCP servers |
-| `oauth-client` | OAuth 2.0 client-side token acquisition -- client credentials grant, auto-discovery, token caching (requires `http-client`) |
+| `oauth-client` | OAuth client support -- authorization code with PKCE/registration/refresh/scope escalation, client credentials, discovery, and token providers (requires `http-client`) |
 | `testing` | Test utilities (`TestClient`) for in-process testing |
 | `dynamic-tools` | Runtime registration/deregistration of tools, prompts, and resources |
 | `proxy` | Multi-server aggregation proxy (`McpProxy`) |
@@ -463,16 +471,40 @@ let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
 axum::serve(listener, app).await?;
 ```
 
-### With Authentication Middleware
+### OAuth-Protected HTTP
+
+Use the cohesive resource-server builder so metadata publication, bearer-token
+validation, audience binding, and operation-level scopes are installed in the
+safe order:
 
 ```rust
-use tower_mcp::auth::extract_api_key;
-use axum::middleware;
+use tower_mcp::{HttpTransport, McpRouter};
+use tower_mcp::oauth::{JwtValidator, ProtectedResourceMetadata, ScopePolicy};
 
-// Add auth layer to the HTTP transport
-let app = transport.into_router()
-    .layer(middleware::from_fn(auth_middleware));
+fn protect(router: McpRouter) -> Result<axum::Router, tower_mcp::BoxError> {
+let resource = "https://mcp.example.com/mcp";
+let metadata = ProtectedResourceMetadata::new(resource)
+    .authorization_server("https://auth.example.com")
+    .scope("mcp:read")
+    .scope("mcp:write");
+let validator = JwtValidator::from_rsa_pem(include_bytes!("public-key.pem"))?
+    .expected_issuer("https://auth.example.com")
+    .expected_audience(resource);
+let scopes = ScopePolicy::new()
+    .default_scope("mcp:read")
+    .tool_scope("publish", "mcp:write");
+
+let app = HttpTransport::new(router)
+    .into_oauth_router_at("/mcp", validator, metadata, scopes)?;
+Ok(app)
+}
 ```
+
+See the [OAuth authorization guide](docs/oauth.md) for JWKS validation,
+interactive authorization code, registration choices, persistence, scope
+step-up, service credentials, and the production checklist. The
+[`http_auth`](examples/http_auth.rs) and
+[`oauth_client`](examples/oauth_client.rs) examples are runnable counterparts.
 
 ## MCP Middleware
 
@@ -742,7 +774,7 @@ The repo includes 33 examples; a selection organized by topic (the full set live
 | **Getting started** | [`getting_started`](examples/getting_started.rs) -- tools, resources, prompts, stdio transport |
 | **Transports** | [`http_server`](examples/http_server.rs), [`websocket_server`](examples/websocket_server.rs), [`axum_embedding`](examples/axum_embedding.rs) -- mount MCP under `/mcp` inside an existing axum app |
 | **Middleware** | [`middleware`](examples/middleware.rs) (transport, per-tool, per-resource, per-prompt, guards), [`rate_limiting`](examples/rate_limiting.rs), [`capability_filtering`](examples/capability_filtering.rs), [`tool_selection`](examples/tool_selection.rs) |
-| **Authentication** | [`http_auth`](examples/http_auth.rs), [`oauth_client`](examples/oauth_client.rs), [`external_api_auth`](examples/external_api_auth.rs) |
+| **Authentication** | [`http_auth`](examples/http_auth.rs) -- API key, local JWT, and production JWKS resource server; [`oauth_client`](examples/oauth_client.rs) -- static tokens, client credentials, interactive authorization code, and custom providers; [`external_api_auth`](examples/external_api_auth.rs) |
 | **Clients** | [`client_cli`](examples/client_cli.rs), [`http_client`](examples/http_client.rs), [`http_sse_client`](examples/http_sse_client.rs) |
 | **Bidirectional** | [`sampling_server`](examples/sampling_server.rs), [`client_handler`](examples/client_handler.rs) |
 | **Dynamic** | [`dynamic_capabilities`](examples/dynamic_capabilities.rs) -- runtime tool/prompt/resource registration |
