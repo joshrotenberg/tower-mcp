@@ -538,13 +538,19 @@ pub use client::{
 pub use client::{HttpClientConfig, HttpClientTransport};
 #[cfg(feature = "oauth-client")]
 pub use client::{
-    MemoryOAuthClientRegistrationStore, OAuthApplicationType, OAuthAuthorizationServerMetadata,
-    OAuthClientCredentials, OAuthClientError, OAuthClientRegistration,
-    OAuthClientRegistrationMethod, OAuthClientRegistrationOptions, OAuthClientRegistrationStore,
-    OAuthDynamicClientRegistration, OAuthScopeChallenge, OAuthScopeEscalationConfig,
-    OAuthScopeEscalationHandler, OAuthScopeEscalationRequest, TokenProvider,
-    discover_oauth_authorization_server, resolve_oauth_client_registration,
-    resolve_oauth_client_registration_with_store,
+    MemoryOAuthAuthorizationStateStore, MemoryOAuthClientRegistrationStore, MemoryOAuthTokenStore,
+    OAuthApplicationType, OAuthAuthorizationAction, OAuthAuthorizationFlow,
+    OAuthAuthorizationFlowBuilder, OAuthAuthorizationHandler, OAuthAuthorizationRequest,
+    OAuthAuthorizationServerMetadata, OAuthAuthorizationStart, OAuthAuthorizationStateStore,
+    OAuthClientAssertionRequest, OAuthClientAssertionSigner, OAuthClientCredentials,
+    OAuthClientError, OAuthClientRegistration, OAuthClientRegistrationMethod,
+    OAuthClientRegistrationOptions, OAuthClientRegistrationStore, OAuthDynamicClientRegistration,
+    OAuthHttpBody, OAuthHttpClient, OAuthHttpMethod, OAuthHttpRequest, OAuthHttpResponse,
+    OAuthPendingAuthorization, OAuthPendingAuthorizationState, OAuthRedirectPolicy,
+    OAuthScopeChallenge, OAuthScopeEscalationConfig, OAuthScopeEscalationHandler,
+    OAuthScopeEscalationRequest, OAuthStoredToken, OAuthTokenBinding, OAuthTokenStore,
+    ReqwestOAuthHttpClient, TokenProvider, discover_oauth_authorization_server,
+    resolve_oauth_client_registration, resolve_oauth_client_registration_with_store,
 };
 pub use context::{
     ChannelClientRequester, ClientRequester, ClientRequesterHandle, Extensions,

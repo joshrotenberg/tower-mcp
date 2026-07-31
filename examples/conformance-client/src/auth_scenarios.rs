@@ -7,10 +7,9 @@
 use anyhow::{Context, Result};
 use tower_mcp::{
     HttpClientConfig, HttpClientTransport, MemoryOAuthClientRegistrationStore,
-    OAuthAuthorizationServerMetadata, OAuthClientError, OAuthClientRegistration,
-    OAuthClientRegistrationOptions, OAuthClientRegistrationStore, OAuthDynamicClientRegistration,
-    OAuthScopeEscalationConfig, OAuthScopeEscalationHandler, OAuthScopeEscalationRequest,
-    TokenProvider, resolve_oauth_client_registration, resolve_oauth_client_registration_with_store,
+    OAuthAuthorizationAction, OAuthAuthorizationFlow, OAuthAuthorizationHandler,
+    OAuthAuthorizationRequest, OAuthClientError, OAuthClientRegistrationOptions,
+    OAuthDynamicClientRegistration, OAuthRedirectPolicy, OAuthScopeEscalationConfig, TokenProvider,
 };
 
 use crate::handlers;
@@ -18,39 +17,57 @@ use crate::handlers;
 struct OAuthFlowResult {
     access_token: String,
     requested_scope: Option<String>,
+    flow: OAuthAuthorizationFlow,
 }
 
-struct ConformanceScopeTokenProvider {
-    token: tokio::sync::RwLock<String>,
-    server_url: String,
-    context: Option<serde_json::Value>,
+#[derive(Clone)]
+struct ConformanceAuthorizationHandler {
+    http: reqwest::Client,
 }
 
-#[async_trait::async_trait]
-impl TokenProvider for ConformanceScopeTokenProvider {
-    async fn get_token(&self) -> std::result::Result<String, OAuthClientError> {
-        Ok(self.token.read().await.clone())
+impl ConformanceAuthorizationHandler {
+    fn new() -> Result<Self, OAuthClientError> {
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| OAuthClientError::Http(error.to_string()))?;
+        Ok(Self { http })
     }
 }
 
 #[async_trait::async_trait]
-impl OAuthScopeEscalationHandler for ConformanceScopeTokenProvider {
-    async fn reauthorize(
+impl OAuthAuthorizationHandler for ConformanceAuthorizationHandler {
+    async fn authorize(
         &self,
-        request: OAuthScopeEscalationRequest,
-    ) -> std::result::Result<(), OAuthClientError> {
-        let requested_scope = request.requested_scopes.join(" ");
-        let flow = perform_oauth_flow(&self.server_url, &self.context, Some(&requested_scope))
+        request: OAuthAuthorizationRequest,
+    ) -> Result<OAuthAuthorizationAction, OAuthClientError> {
+        let response = self
+            .http
+            .get(&request.authorization_url)
+            .send()
             .await
-            .map_err(|error| OAuthClientError::ScopeEscalation(error.to_string()))?;
-        *self.token.write().await = flow.access_token;
-        Ok(())
+            .map_err(|error| OAuthClientError::Http(error.to_string()))?;
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| {
+                OAuthClientError::InvalidResponse(
+                    "authorization response omitted the Location header".to_string(),
+                )
+            })?;
+        let callback_url = url::Url::parse(location).or_else(|_| {
+            url::Url::parse(&request.redirect_uri).and_then(|base| base.join(location))
+        });
+        let callback_url = callback_url
+            .map_err(|error| OAuthClientError::Redirect(error.to_string()))?
+            .to_string();
+        Ok(OAuthAuthorizationAction::CallbackUrl(callback_url))
     }
 }
 
 fn scope_aware_transport(
     server_url: &str,
-    context: &Option<serde_json::Value>,
     flow: OAuthFlowResult,
     max_attempts: usize,
 ) -> HttpClientTransport {
@@ -60,14 +77,7 @@ fn scope_aware_transport(
         .into_iter()
         .flat_map(str::split_ascii_whitespace);
     let config = OAuthScopeEscalationConfig::new(initial_scopes).max_attempts(max_attempts);
-    HttpClientTransport::new(server_url).with_scope_aware_token_provider(
-        ConformanceScopeTokenProvider {
-            token: tokio::sync::RwLock::new(flow.access_token),
-            server_url: server_url.to_string(),
-            context: context.clone(),
-        },
-        config,
-    )
+    HttpClientTransport::new(server_url).with_scope_aware_token_provider(flow.flow, config)
 }
 
 /// Standard OAuth authorization-code flow.
@@ -86,7 +96,8 @@ pub async fn authorization_server_migration(
 ) -> Result<()> {
     let registrations = MemoryOAuthClientRegistrationStore::new();
     let first =
-        perform_oauth_flow_with_store(server_url, context, None, Some(&registrations)).await?;
+        perform_oauth_flow_with_store(server_url, context, None, Some(registrations.clone()))
+            .await?;
     let first_result = run_authed_client(server_url, &first.access_token).await;
     anyhow::ensure!(
         first_result.is_err(),
@@ -94,14 +105,14 @@ pub async fn authorization_server_migration(
     );
 
     let second =
-        perform_oauth_flow_with_store(server_url, context, None, Some(&registrations)).await?;
+        perform_oauth_flow_with_store(server_url, context, None, Some(registrations)).await?;
     run_authed_client(server_url, &second.access_token).await
 }
 
 /// Scope step-up through the reusable challenge-driven HTTP policy.
 pub async fn scope_step_up(server_url: &str, context: &Option<serde_json::Value>) -> Result<()> {
     let flow = perform_oauth_flow(server_url, context, None).await?;
-    let transport = scope_aware_transport(server_url, context, flow, 2);
+    let transport = scope_aware_transport(server_url, flow, 2);
     let client = crate::core_scenarios::client_builder()?
         .connect(transport, handlers::BasicHandler)
         .await?;
@@ -130,7 +141,7 @@ pub async fn scope_retry_limit(
     let flow = perform_oauth_flow(server_url, context, None).await?;
     // Two challenged retries plus the original request give the conformance
     // scenario its required three-attempt ceiling.
-    let transport = scope_aware_transport(server_url, context, flow, 2);
+    let transport = scope_aware_transport(server_url, flow, 2);
     let client = crate::core_scenarios::client_builder()?
         .connect(transport, handlers::BasicHandler)
         .await?;
@@ -474,20 +485,6 @@ async fn send_initial_mcp_probe(
     Ok(request.send().await?)
 }
 
-fn union_scopes(left: Option<&str>, right: Option<&str>) -> Option<String> {
-    let mut scopes = Vec::new();
-    for scope in left
-        .into_iter()
-        .chain(right)
-        .flat_map(str::split_whitespace)
-    {
-        if !scopes.contains(&scope) {
-            scopes.push(scope);
-        }
-    }
-    (!scopes.is_empty()).then(|| scopes.join(" "))
-}
-
 /// Result of probing the server for auth requirements.
 struct ProbeResult {
     #[allow(dead_code)]
@@ -645,420 +642,59 @@ async fn perform_oauth_flow_with_store(
     server_url: &str,
     _context: &Option<serde_json::Value>,
     scope_override: Option<&str>,
-    registration_store: Option<&dyn OAuthClientRegistrationStore>,
+    registration_store: Option<MemoryOAuthClientRegistrationStore>,
 ) -> Result<OAuthFlowResult> {
-    let http = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
-
-    // Step 1: Try MCP endpoint, expect 401 with resource metadata URL
-    let initial_resp = send_initial_mcp_probe(&http, server_url).await?;
-
-    let status = initial_resp.status();
-    tracing::info!(status = %status, "Initial MCP request status");
-
-    // Extract hints from WWW-Authenticate
-    let www_auth = initial_resp
-        .headers()
-        .get("www-authenticate")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-
-    let scope = www_auth
-        .as_ref()
-        .and_then(|wa| extract_www_auth_param(wa, "scope"));
-    let resource_metadata_url = www_auth
-        .as_ref()
-        .and_then(|wa| extract_www_auth_param(wa, "resource_metadata"));
-
-    // Step 2: Discover PRM and get resource + authorization servers
-    let http_plain = reqwest::Client::new();
-    let (prm, resource) = if let Some(ref rm_url) = resource_metadata_url {
-        // Use the URL from WWW-Authenticate
-        let rm_resp = http_plain.get(rm_url).send().await?;
-        let rm: serde_json::Value = rm_resp.json().await?;
-        tracing::info!("Fetched resource metadata from {}", rm_url);
-        let res = rm
-            .get("resource")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        (Some(rm), res)
-    } else {
-        // Fallback: try PRM well-known path
-        match discover_prm_from_server_url(server_url).await {
-            Ok(rm) => {
-                let res = rm
-                    .get("resource")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                (Some(rm), res)
-            }
-            Err(_) => (None, None),
-        }
-    };
-
-    // Validate resource matches server URL (resource-mismatch check)
-    if let Some(ref res) = resource {
-        validate_resource(server_url, res)?;
-    }
-
-    // Step 3: Discover OAuth AS metadata
-    let metadata = if let Some(ref rm) = prm {
-        let auth_servers = rm
-            .get("authorization_servers")
-            .and_then(|v| v.as_array())
-            .context("No authorization_servers in resource metadata")?;
-        let auth_server_url = auth_servers
-            .first()
-            .and_then(|v| v.as_str())
-            .context("Empty authorization_servers")?;
-        discover_oauth_metadata_from_issuer(auth_server_url).await?
-    } else {
-        // No PRM at all -- try AS well-known paths directly
-        discover_oauth_metadata_from_server_url(server_url).await?
-    };
-
-    let authorization_endpoint = metadata
-        .get("authorization_endpoint")
-        .and_then(|v| v.as_str())
-        .context("No authorization_endpoint in metadata")?;
-    let token_endpoint = metadata
-        .get("token_endpoint")
-        .and_then(|v| v.as_str())
-        .context("No token_endpoint in metadata")?;
-    let expected_issuer = metadata.get("issuer").and_then(|v| v.as_str());
-    let iss_required = metadata
-        .get("authorization_response_iss_parameter_supported")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let refresh_supported = metadata
-        .get("grant_types_supported")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|values| values.iter().any(|value| value == "refresh_token"));
-    let offline_access_supported = metadata
-        .get("scopes_supported")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|values| values.iter().any(|value| value == "offline_access"));
-
-    // Determine token endpoint auth method from metadata
-    let auth_method = get_token_auth_method(&metadata);
-
-    // Scope precedence is: an explicit re-authorization union, then the
-    // challenge, then the protected-resource/authorization-server metadata.
-    let supported_scope = prm
-        .as_ref()
-        .and_then(|value| value.get("scopes_supported"))
-        .or_else(|| metadata.get("scopes_supported"))
-        .and_then(serde_json::Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .filter(|value| !value.is_empty());
-    let mut selected_scope = scope_override
-        .map(str::to_string)
-        .or(scope)
-        .or(supported_scope);
-    if refresh_supported && offline_access_supported {
-        selected_scope = union_scopes(selected_scope.as_deref(), Some("offline_access"));
-    }
-
-    // Step 4: Select pre-registration, CIMD, or DCR using the reusable
-    // authorization-code client policy. This flow has no pre-registered
-    // credentials, so it offers CIMD and native-application DCR.
-    let registration_metadata: OAuthAuthorizationServerMetadata =
-        serde_json::from_value(metadata.clone())
-            .context("Invalid authorization server registration metadata")?;
-    let grant_types = if refresh_supported {
-        vec!["authorization_code", "refresh_token"]
-    } else {
-        vec!["authorization_code"]
-    };
-    let dynamic_registration = OAuthDynamicClientRegistration::native(
-        "conformance-client",
-        ["http://localhost:23456/callback"],
-    )
-    .grant_types(grant_types)
-    .token_endpoint_auth_method(auth_method.clone());
-    let registration_options = OAuthClientRegistrationOptions::new()
+    let options = OAuthClientRegistrationOptions::new()
         .with_client_id_metadata_document("https://conformance-test.local/client-metadata.json")
-        .with_dynamic_registration(dynamic_registration);
-    let registration = if let Some(store) = registration_store {
-        resolve_oauth_client_registration_with_store(
-            &http_plain,
-            &registration_metadata,
-            &registration_options,
-            store,
-        )
-        .await?
-    } else {
-        resolve_oauth_client_registration(
-            &http_plain,
-            &registration_metadata,
-            &registration_options,
-        )
-        .await?
-    };
-    let client_id = registration.client_id().to_string();
-    let client_secret = registration.client_secret().map(str::to_string);
-
-    // Step 5: Build authorization URL with PKCE
-    let code_verifier = generate_code_verifier();
-    let code_challenge = generate_code_challenge(&code_verifier);
-    let state = generate_random_string();
-
-    let mut auth_url = format!(
-        "{}?response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256",
-        authorization_endpoint,
-        urlencoded(&client_id),
-        urlencoded("http://localhost:23456/callback"),
-        urlencoded(&state),
-        urlencoded(&code_challenge),
-    );
-
-    if let Some(ref s) = selected_scope {
-        auth_url.push_str(&format!("&scope={}", urlencoded(s)));
+        .with_dynamic_registration(OAuthDynamicClientRegistration::native(
+            "conformance-client",
+            std::iter::empty::<String>(),
+        ));
+    let mut builder = OAuthAuthorizationFlow::builder(server_url)
+        .registration_options(options)
+        .redirect_policy(OAuthRedirectPolicy::fixed(
+            "http://localhost:23456/callback",
+        ))
+        .authorization_handler(ConformanceAuthorizationHandler::new()?);
+    if let Some(store) = registration_store {
+        builder = builder.registration_store(store);
     }
-
-    // Add resource parameter (RFC 8707)
-    if let Some(ref res) = resource {
-        auth_url.push_str(&format!("&resource={}", urlencoded(res)));
-    }
-
-    // Step 6: Fetch auth URL (auto-approved, get redirect)
-    let auth_resp = http.get(&auth_url).send().await?;
-    let location = auth_resp
-        .headers()
-        .get("location")
-        .and_then(|v| v.to_str().ok())
-        .context("No Location header in auth response")?
-        .to_string();
-
-    // Extract code from redirect URL
-    let redirect_url = url::Url::parse(&location)
-        .or_else(|_| url::Url::parse(&format!("http://localhost:23456{}", location)))?;
-    let response_issuer = redirect_url
-        .query_pairs()
-        .find(|(key, _)| key == "iss")
-        .map(|(_, value)| value.to_string());
-    match (response_issuer.as_deref(), expected_issuer) {
-        (Some(actual), Some(expected)) if actual != expected => {
-            anyhow::bail!(
-                "authorization response issuer mismatch: expected {expected:?}, got {actual:?}"
-            );
-        }
-        (Some(_), None) => {
-            anyhow::bail!("authorization response included iss but metadata omitted issuer");
-        }
-        (None, _) if iss_required => {
-            anyhow::bail!(
-                "authorization server advertised iss response support but omitted the parameter"
-            );
-        }
-        _ => {}
-    }
-    let code = redirect_url
-        .query_pairs()
-        .find(|(k, _)| k == "code")
-        .map(|(_, v)| v.to_string())
-        .context("No code in redirect")?;
-
-    // Step 7: Exchange code for token
-    let mut token_params = vec![
-        ("grant_type", "authorization_code".to_string()),
-        ("code", code),
-        (
-            "redirect_uri",
-            "http://localhost:23456/callback".to_string(),
-        ),
-        ("code_verifier", code_verifier),
-    ];
-
-    // Add resource parameter (RFC 8707)
-    if let Some(ref res) = resource {
-        token_params.push(("resource", res.clone()));
-    }
-
-    // Build token request based on auth method
-    let token_resp = send_token_request(
-        &http_plain,
-        token_endpoint,
-        &token_params,
-        &auth_method,
-        &client_id,
-        client_secret.as_deref(),
-    )
-    .await?;
-
-    let token_body: serde_json::Value = token_resp.json().await?;
-    let access_token = token_body
-        .get("access_token")
-        .and_then(|v| v.as_str())
-        .context("No access_token in token response")?;
+    let flow = builder.build()?;
+    let scopes = scope_override
+        .into_iter()
+        .flat_map(str::split_ascii_whitespace);
+    flow.authorize(scopes).await?;
+    let access_token = flow.get_token().await?;
+    let requested_scope = flow
+        .authorized_scopes()
+        .await
+        .map(|scopes| scopes.join(" "))
+        .filter(|scopes| !scopes.is_empty());
 
     tracing::info!("OAuth flow completed successfully");
     Ok(OAuthFlowResult {
-        access_token: access_token.to_string(),
-        requested_scope: selected_scope,
+        access_token,
+        requested_scope,
+        flow,
     })
 }
 
 /// OAuth flow with pre-registered credentials (no DCR).
-/// Uses Basic auth for token endpoint per spec.
 async fn perform_oauth_flow_with_credentials(
     server_url: &str,
     client_id: &str,
     client_secret: &str,
 ) -> Result<String> {
-    let http = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
+    let flow = OAuthAuthorizationFlow::builder(server_url)
+        .pre_registered_client(client_id, Some(client_secret.to_string()))
+        .redirect_policy(OAuthRedirectPolicy::fixed(
+            "http://localhost:23456/callback",
+        ))
+        .authorization_handler(ConformanceAuthorizationHandler::new()?)
         .build()?;
-
-    // Try MCP endpoint first to get metadata hints
-    let initial_resp = send_initial_mcp_probe(&http, server_url).await?;
-
-    let www_auth = initial_resp
-        .headers()
-        .get("www-authenticate")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-
-    let resource_metadata_url = www_auth
-        .as_ref()
-        .and_then(|wa| extract_www_auth_param(wa, "resource_metadata"));
-
-    let http_plain = reqwest::Client::new();
-
-    let (metadata, resource) = if let Some(ref rm_url) = resource_metadata_url {
-        let rm_resp = http_plain.get(rm_url).send().await?;
-        let rm: serde_json::Value = rm_resp.json().await?;
-        let res = rm
-            .get("resource")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let auth_server_url = rm
-            .get("authorization_servers")
-            .and_then(|v| v.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|v| v.as_str())
-            .context("No authorization_servers in resource metadata")?;
-        let md = discover_oauth_metadata_from_issuer(auth_server_url).await?;
-        (md, res)
-    } else {
-        // Try PRM well-known
-        match discover_prm_from_server_url(server_url).await {
-            Ok(rm) => {
-                let res = rm
-                    .get("resource")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let auth_server_url = rm
-                    .get("authorization_servers")
-                    .and_then(|v| v.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|v| v.as_str())
-                    .context("No authorization_servers in PRM")?;
-                let md = discover_oauth_metadata_from_issuer(auth_server_url).await?;
-                (md, res)
-            }
-            Err(_) => {
-                let md = discover_oauth_metadata_from_server_url(server_url).await?;
-                (md, None)
-            }
-        }
-    };
-
-    let authorization_endpoint = metadata
-        .get("authorization_endpoint")
-        .and_then(|v| v.as_str())
-        .context("No authorization_endpoint")?;
-    let token_endpoint = metadata
-        .get("token_endpoint")
-        .and_then(|v| v.as_str())
-        .context("No token_endpoint")?;
-    let registration_metadata: OAuthAuthorizationServerMetadata =
-        serde_json::from_value(metadata.clone())
-            .context("Invalid authorization server registration metadata")?;
-    let pre_registered = OAuthClientRegistration::pre_registered(
-        registration_metadata.issuer.clone(),
-        client_id,
-        Some(client_secret.to_string()),
-    );
-    let registration = resolve_oauth_client_registration(
-        &http_plain,
-        &registration_metadata,
-        &OAuthClientRegistrationOptions::new().with_pre_registered(pre_registered),
-    )
-    .await?;
-    let client_id = registration.client_id().to_string();
-    let client_secret = registration
-        .client_secret()
-        .context("Pre-registered client secret was not retained")?
-        .to_string();
-
-    let code_verifier = generate_code_verifier();
-    let code_challenge = generate_code_challenge(&code_verifier);
-    let state = generate_random_string();
-
-    let mut auth_url = format!(
-        "{}?response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256",
-        authorization_endpoint,
-        urlencoded(&client_id),
-        urlencoded("http://localhost:23456/callback"),
-        urlencoded(&state),
-        urlencoded(&code_challenge),
-    );
-
-    if let Some(ref res) = resource {
-        auth_url.push_str(&format!("&resource={}", urlencoded(res)));
-    }
-
-    let auth_resp = http.get(&auth_url).send().await?;
-    let location = auth_resp
-        .headers()
-        .get("location")
-        .and_then(|v| v.to_str().ok())
-        .context("No Location header")?
-        .to_string();
-
-    let redirect_url = url::Url::parse(&location)
-        .or_else(|_| url::Url::parse(&format!("http://localhost:23456{}", location)))?;
-    let code = redirect_url
-        .query_pairs()
-        .find(|(k, _)| k == "code")
-        .map(|(_, v)| v.to_string())
-        .context("No code in redirect")?;
-
-    // Use Basic auth for pre-registered credentials
-    let mut token_params = vec![
-        ("grant_type", "authorization_code"),
-        ("code", &code),
-        ("redirect_uri", "http://localhost:23456/callback"),
-        ("code_verifier", &code_verifier),
-    ];
-    if let Some(ref res) = resource {
-        token_params.push(("resource", res));
-    }
-
-    let token_resp = http_plain
-        .post(token_endpoint)
-        .basic_auth(&client_id, Some(&client_secret))
-        .form(&token_params)
-        .send()
-        .await?;
-
-    let token_body: serde_json::Value = token_resp.json().await?;
-    let access_token = token_body
-        .get("access_token")
-        .and_then(|v| v.as_str())
-        .context("No access_token")?;
-
-    Ok(access_token.to_string())
+    flow.authorize(std::iter::empty::<&str>()).await?;
+    Ok(flow.get_token().await?)
 }
-
 /// Connect and run a basic client with a bearer token.
 async fn run_authed_client(server_url: &str, access_token: &str) -> Result<()> {
     let config = HttpClientConfig {
@@ -1243,95 +879,6 @@ async fn discover_oauth_metadata_from_server_url(server_url: &str) -> Result<ser
 }
 
 // ============================================================================
-// Auth method helpers
-// ============================================================================
-
-/// Get the preferred token endpoint auth method from AS metadata.
-fn get_token_auth_method(metadata: &serde_json::Value) -> String {
-    metadata
-        .get("token_endpoint_auth_methods_supported")
-        .and_then(|v| v.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|v| v.as_str())
-        .unwrap_or("client_secret_post")
-        .to_string()
-}
-
-/// Send a token request with the appropriate auth method.
-async fn send_token_request(
-    http: &reqwest::Client,
-    token_endpoint: &str,
-    params: &[(&str, String)],
-    auth_method: &str,
-    client_id: &str,
-    client_secret: Option<&str>,
-) -> Result<reqwest::Response> {
-    match auth_method {
-        "client_secret_basic" => {
-            // Use HTTP Basic auth header
-            let resp = http
-                .post(token_endpoint)
-                .basic_auth(client_id, client_secret)
-                .form(params)
-                .send()
-                .await?;
-            Ok(resp)
-        }
-        "none" => {
-            // Only include client_id, no secret
-            let mut full_params: Vec<(&str, String)> = params.to_vec();
-            full_params.push(("client_id", client_id.to_string()));
-            let resp = http.post(token_endpoint).form(&full_params).send().await?;
-            Ok(resp)
-        }
-        _ => {
-            // client_secret_post (default): include credentials in form body
-            let mut full_params: Vec<(&str, String)> = params.to_vec();
-            full_params.push(("client_id", client_id.to_string()));
-            if let Some(secret) = client_secret {
-                full_params.push(("client_secret", secret.to_string()));
-            }
-            let resp = http.post(token_endpoint).form(&full_params).send().await?;
-            Ok(resp)
-        }
-    }
-}
-
-/// Validate that the PRM resource matches the server URL.
-fn validate_resource(server_url: &str, resource: &str) -> Result<()> {
-    // Parse both URLs for comparison
-    let server = url::Url::parse(server_url);
-    let res = url::Url::parse(resource);
-
-    match (server, res) {
-        (Ok(s), Ok(r)) => {
-            // Resource must have same origin and path prefix
-            if s.scheme() != r.scheme() || s.host_str() != r.host_str() || s.port() != r.port() {
-                anyhow::bail!(
-                    "Resource mismatch: server origin {}://{} does not match resource origin {}://{}",
-                    s.scheme(),
-                    s.authority(),
-                    r.scheme(),
-                    r.authority()
-                );
-            }
-            Ok(())
-        }
-        _ => {
-            // If we can't parse, just check string prefix
-            if !server_url.starts_with(resource) && !resource.starts_with(server_url) {
-                anyhow::bail!(
-                    "Resource mismatch: {} does not match {}",
-                    server_url,
-                    resource
-                );
-            }
-            Ok(())
-        }
-    }
-}
-
-// ============================================================================
 // WWW-Authenticate parsing
 // ============================================================================
 
@@ -1395,34 +942,10 @@ fn build_jwt_assertion(client_id: &str, audience: &str, private_key_pem: &str) -
 // Utilities
 // ============================================================================
 
-fn generate_code_verifier() -> String {
-    use base64::Engine;
-    let bytes: Vec<u8> = (0..32).map(|_| rand_byte()).collect();
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes)
-}
-
-fn generate_code_challenge(verifier: &str) -> String {
-    use base64::Engine;
-    use std::io::Write;
-    let mut hasher = Sha256::new();
-    hasher.write_all(verifier.as_bytes()).unwrap();
-    let hash = hasher.finalize();
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash)
-}
-
 fn generate_random_string() -> String {
     use base64::Engine;
     let bytes: Vec<u8> = (0..16).map(|_| rand_byte()).collect();
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes)
-}
-
-fn urlencoded(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-            _ => format!("%{:02X}", c as u32),
-        })
-        .collect()
 }
 
 /// Simple pseudo-random byte using system time (good enough for PKCE/state).
@@ -1435,127 +958,4 @@ fn rand_byte() -> u8 {
         .unwrap()
         .as_nanos() as u64;
     ((time.wrapping_mul(6364136223846793005).wrapping_add(count)) >> 33) as u8
-}
-
-/// Minimal SHA-256 implementation (avoids adding a crypto dep just for PKCE).
-struct Sha256 {
-    data: Vec<u8>,
-}
-
-impl Sha256 {
-    fn new() -> Self {
-        Self { data: Vec::new() }
-    }
-
-    fn finalize(self) -> [u8; 32] {
-        sha256_hash(&self.data)
-    }
-}
-
-impl std::io::Write for Sha256 {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.data.extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// SHA-256 hash function.
-fn sha256_hash(data: &[u8]) -> [u8; 32] {
-    let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
-
-    let k: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-        0xc67178f2,
-    ];
-
-    // Pre-processing: pad message
-    let bit_len = (data.len() as u64) * 8;
-    let mut msg = data.to_vec();
-    msg.push(0x80);
-    while (msg.len() % 64) != 56 {
-        msg.push(0);
-    }
-    msg.extend_from_slice(&bit_len.to_be_bytes());
-
-    // Process each 512-bit block
-    for chunk in msg.chunks(64) {
-        let mut w = [0u32; 64];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes([
-                chunk[i * 4],
-                chunk[i * 4 + 1],
-                chunk[i * 4 + 2],
-                chunk[i * 4 + 3],
-            ]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
-        }
-
-        let mut a = h[0];
-        let mut b = h[1];
-        let mut c = h[2];
-        let mut d = h[3];
-        let mut e = h[4];
-        let mut f = h[5];
-        let mut g = h[6];
-        let mut hh = h[7];
-
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let temp1 = hh
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(k[i])
-                .wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = s0.wrapping_add(maj);
-
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-        h[5] = h[5].wrapping_add(f);
-        h[6] = h[6].wrapping_add(g);
-        h[7] = h[7].wrapping_add(hh);
-    }
-
-    let mut result = [0u8; 32];
-    for (i, &val) in h.iter().enumerate() {
-        result[i * 4..i * 4 + 4].copy_from_slice(&val.to_be_bytes());
-    }
-    result
 }

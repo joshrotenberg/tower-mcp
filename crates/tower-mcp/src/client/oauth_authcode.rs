@@ -480,6 +480,16 @@ impl OAuthClientRegistration {
         }
     }
 
+    /// Create a portable Client ID Metadata Document registration.
+    pub fn client_id_metadata_document(client_id: impl Into<String>) -> Self {
+        Self {
+            client_id: client_id.into(),
+            client_secret: None,
+            method: OAuthClientRegistrationMethod::ClientIdMetadataDocument,
+            bound_issuer: None,
+        }
+    }
+
     /// OAuth client ID.
     pub fn client_id(&self) -> &str {
         &self.client_id
@@ -1282,6 +1292,12 @@ async fn send_token_request(
             })?;
             params.push(("client_id", client_id.to_string()));
             params.push(("client_secret", secret.to_string()));
+        }
+        OAuthTokenEndpointAuthMethod::PrivateKeyJwt => {
+            return Err(OAuthClientError::BuildError(
+                "private_key_jwt requires OAuthAuthorizationFlow with a client assertion signer"
+                    .to_string(),
+            ));
         }
     }
     request

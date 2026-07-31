@@ -38,6 +38,8 @@ mod http;
 mod oauth;
 #[cfg(feature = "oauth-client")]
 mod oauth_authcode;
+#[cfg(feature = "oauth-client")]
+mod oauth_flow;
 mod response_cache;
 mod stdio;
 mod transport;
@@ -61,6 +63,16 @@ pub use oauth_authcode::{
     discover_oauth_authorization, discover_oauth_authorization_server,
     probe_oauth_bearer_challenge, resolve_oauth_client_registration,
     resolve_oauth_client_registration_with_store,
+};
+#[cfg(feature = "oauth-client")]
+pub use oauth_flow::{
+    MemoryOAuthAuthorizationStateStore, MemoryOAuthTokenStore, OAuthAuthorizationAction,
+    OAuthAuthorizationFlow, OAuthAuthorizationFlowBuilder, OAuthAuthorizationHandler,
+    OAuthAuthorizationRequest, OAuthAuthorizationStart, OAuthAuthorizationStateStore,
+    OAuthClientAssertionRequest, OAuthClientAssertionSigner, OAuthHttpBody, OAuthHttpClient,
+    OAuthHttpMethod, OAuthHttpRequest, OAuthHttpResponse, OAuthPendingAuthorization,
+    OAuthPendingAuthorizationState, OAuthRedirectPolicy, OAuthStoredToken, OAuthTokenBinding,
+    OAuthTokenStore, ReqwestOAuthHttpClient,
 };
 pub use response_cache::{ClientCacheConfig, DEFAULT_MAX_CACHE_TTL};
 pub use stdio::StdioClientTransport;

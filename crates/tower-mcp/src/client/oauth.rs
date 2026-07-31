@@ -204,7 +204,8 @@ impl OAuthScopeChallenge {
 }
 
 /// Authentication method used at an OAuth token endpoint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum OAuthTokenEndpointAuthMethod {
     /// Public client authentication: send only `client_id` in the form body.
@@ -213,6 +214,8 @@ pub enum OAuthTokenEndpointAuthMethod {
     ClientSecretBasic,
     /// Client ID and secret in the form body.
     ClientSecretPost,
+    /// JWT client assertion signed with the client's private key.
+    PrivateKeyJwt,
 }
 
 impl OAuthTokenEndpointAuthMethod {
@@ -250,6 +253,17 @@ impl OAuthTokenEndpointAuthMethod {
             "authorization server supports no compatible token endpoint authentication method: {}",
             advertised.join(", ")
         )))
+    }
+
+    pub(crate) fn select_with_private_key(
+        advertised: &[String],
+        has_client_secret: bool,
+        has_private_key_signer: bool,
+    ) -> Result<Self, OAuthClientError> {
+        if has_private_key_signer && advertised.iter().any(|method| method == "private_key_jwt") {
+            return Ok(Self::PrivateKeyJwt);
+        }
+        Self::select(advertised, has_client_secret)
     }
 }
 
@@ -406,6 +420,8 @@ fn unquote_auth_param(value: &str) -> Option<String> {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum OAuthClientError {
+    /// OAuth protocol HTTP request failed.
+    Http(String),
     /// Failed to discover the authorization server metadata.
     Discovery(String),
     /// Failed to request a token from the token endpoint.
@@ -414,6 +430,12 @@ pub enum OAuthClientError {
     Registration(String),
     /// Failed to load, save, or remove persisted OAuth client credentials.
     CredentialStore(String),
+    /// Failed to load, save, or remove persisted OAuth tokens.
+    TokenStore(String),
+    /// Failed to load, save, or remove persisted PKCE/CSRF state.
+    StateStore(String),
+    /// Authorization redirect handling failed.
+    Redirect(String),
     /// Failed to reauthorize after an insufficient-scope challenge.
     ScopeEscalation(String),
     /// The token response was invalid or missing required fields.
@@ -425,10 +447,14 @@ pub enum OAuthClientError {
 impl fmt::Display for OAuthClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Http(msg) => write!(f, "OAuth HTTP error: {}", msg),
             Self::Discovery(msg) => write!(f, "OAuth discovery error: {}", msg),
             Self::TokenRequest(msg) => write!(f, "OAuth token request error: {}", msg),
             Self::Registration(msg) => write!(f, "OAuth client registration error: {}", msg),
             Self::CredentialStore(msg) => write!(f, "OAuth credential store error: {}", msg),
+            Self::TokenStore(msg) => write!(f, "OAuth token store error: {}", msg),
+            Self::StateStore(msg) => write!(f, "OAuth state store error: {}", msg),
+            Self::Redirect(msg) => write!(f, "OAuth redirect error: {}", msg),
             Self::ScopeEscalation(msg) => write!(f, "OAuth scope escalation error: {}", msg),
             Self::InvalidResponse(msg) => write!(f, "OAuth invalid response: {}", msg),
             Self::BuildError(msg) => write!(f, "OAuth builder error: {}", msg),
@@ -596,6 +622,12 @@ impl OAuthClientCredentials {
             OAuthTokenEndpointAuthMethod::ClientSecretPost => {
                 params.push(("client_id", self.inner.client_id.clone()));
                 params.push(("client_secret", self.inner.client_secret.clone()));
+            }
+            OAuthTokenEndpointAuthMethod::PrivateKeyJwt => {
+                return Err(OAuthClientError::BuildError(
+                    "private_key_jwt requires OAuthAuthorizationFlow with a client assertion signer"
+                        .to_string(),
+                ));
             }
         }
 
