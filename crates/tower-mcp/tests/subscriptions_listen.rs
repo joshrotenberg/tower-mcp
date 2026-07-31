@@ -304,7 +304,7 @@ mod tasks {
             .description("Finish after a beat, so the task is observably working first")
             .task_support(TaskSupportMode::Optional)
             .handler(|_: serde_json::Value| async move {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
                 Ok(CallToolResult::text("done"))
             })
             .build();
@@ -376,7 +376,6 @@ mod tasks {
                     "_meta": meta(true),
                     "name": "slow",
                     "arguments": {},
-                    "task": { "ttl": 60000 },
                 }),
             ))
             .await
@@ -403,7 +402,7 @@ mod tasks {
         assert_eq!(handle.subscription_count(), 1);
 
         // Outlive the handler's sleep, then drain so the body terminates.
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
         assert_eq!(handle.close_subscriptions(), 1);
 
         let body = body_string(listen).await;
@@ -450,7 +449,6 @@ mod tasks {
                     "_meta": meta(true),
                     "name": "slow",
                     "arguments": {},
-                    "task": { "ttl": 60000 },
                 }),
             ))
             .await
@@ -471,7 +469,7 @@ mod tasks {
             .unwrap();
         assert_eq!(listen.status(), StatusCode::OK);
 
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
         handle.close_subscriptions();
 
         let body = body_string(listen).await;

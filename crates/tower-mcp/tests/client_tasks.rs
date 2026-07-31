@@ -203,3 +203,63 @@ async fn task_update_sends_typed_responses_and_tolerates_stale_keys() {
         .expect_err("unknown task id must error");
     assert!(err.to_string().contains("not found"), "got: {err}");
 }
+
+/// Final task creation is server-directed: an ordinary tools/call produces a
+/// task, and the high-level client transparently drives it to completion.
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn final_call_tool_transparently_completes_server_created_task() {
+    let client = McpClient::builder()
+        .protocol_support(tower_mcp::ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+        .with_tasks()
+        .connect_simple(ChannelTransport::new(task_router().with_tasks()))
+        .await
+        .expect("connect");
+    client.discover("test", "1.0.0").await.expect("discover");
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.call_tool("compute", serde_json::json!({})),
+    )
+    .await
+    .expect("call_tool timed out")
+    .expect("call_tool");
+    assert_eq!(result.first_text(), Some("the answer is 42"));
+}
+
+/// Callers can retain the exact final task handle instead of asking the
+/// high-level client to poll it automatically.
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn final_task_aware_call_exposes_direct_lifecycle() {
+    use tower_mcp::client::TaskAwareCallToolOutcome;
+
+    let client = McpClient::builder()
+        .protocol_support(tower_mcp::ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+        .with_tasks()
+        .connect_simple(ChannelTransport::new(task_router().with_tasks()))
+        .await
+        .expect("connect");
+    client.discover("test", "1.0.0").await.expect("discover");
+
+    let outcome = client
+        .call_tool_once_task_aware("compute", serde_json::json!({}), None, None)
+        .await
+        .expect("tools/call");
+    let TaskAwareCallToolOutcome::Task(created) = outcome else {
+        panic!("expected server-created task")
+    };
+
+    let done = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.task_wait(&created.task.metadata.task_id),
+    )
+    .await
+    .expect("task_wait timed out")
+    .expect("task_wait");
+    assert_eq!(done.status, TaskStatus::Completed);
+    assert_eq!(
+        done.result.as_ref().and_then(CallToolResult::first_text),
+        Some("the answer is 42")
+    );
+}

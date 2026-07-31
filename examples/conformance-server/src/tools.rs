@@ -63,7 +63,8 @@ pub fn build_tools() -> Vec<Tool> {
         build_elicitation_sep1034_defaults(),
         build_elicitation_sep1330_enums(),
         build_per_request_meta(),
-        // Stable task fixture. Final advertisement is withheld until #951 is complete.
+        // Stable task fixture. Final Tasks remains an explicit server opt-in,
+        // which this general-purpose conformance server does not enable.
         build_create_task(),
         // Fixtures for the official 2026-07-28 conformance suite (#948)
         build_json_schema_2020_12(),

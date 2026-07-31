@@ -1,8 +1,9 @@
 //! Async task management for long-running MCP operations
 //!
 //! This module provides task lifecycle management for operations that may take
-//! longer than a typical request/response cycle. Tasks can be created via
-//! task-augmented `tools/call` requests, tracked, polled for status, and cancelled.
+//! longer than a typical request/response cycle. Legacy clients request task
+//! augmentation explicitly; final-protocol servers elect tasks after extension
+//! negotiation. Tasks can be tracked, polled, updated with input, and cancelled.
 //!
 //! Task state lives behind the pluggable [`TaskStore`] trait, mirroring the
 //! shape of [`crate::session_store`] and [`crate::event_store`]: a trait, an
@@ -812,9 +813,9 @@ impl crate::McpRouter {
     ///
     /// Compiling the task APIs does not advertise them. A server opts in here,
     /// and only then does the final protocol path advertise
-    /// `io.modelcontextprotocol/tasks`, accept task-augmented `tools/call`
-    /// requests, or serve the final task methods. Legacy 2025-11-25 task
-    /// behavior is unaffected either way.
+    /// `io.modelcontextprotocol/tasks`, elect to return tasks from ordinary
+    /// `tools/call` requests, or serve the final task methods. Legacy
+    /// 2025-11-25 task behavior is unaffected either way.
     pub fn with_tasks(self) -> Self {
         self.with_protocol_extension(tasks_extension())
     }

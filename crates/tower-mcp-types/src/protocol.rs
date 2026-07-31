@@ -952,7 +952,7 @@ pub struct ElicitationFormCapability {}
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ElicitationUrlCapability {}
 
-/// Client capability for async task management
+/// Legacy 2025-11-25 client capability for async task management.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientTasksCapability {
@@ -962,7 +962,7 @@ pub struct ClientTasksCapability {
     /// Support for cancelling tasks
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel: Option<ClientTasksCancelCapability>,
-    /// Which request types support task-augmented requests
+    /// Legacy task-augmented request support.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requests: Option<ClientTasksRequestsCapability>,
 }
@@ -975,7 +975,7 @@ pub struct ClientTasksListCapability {}
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClientTasksCancelCapability {}
 
-/// Capability declaring which request types support task-augmented requests on the client
+/// Legacy client capability declaring task-augmented request support.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientTasksRequestsCapability {
@@ -987,7 +987,7 @@ pub struct ClientTasksRequestsCapability {
     pub elicitation: Option<ClientTasksElicitationCapability>,
 }
 
-/// Nested capability for task-augmented sampling requests
+/// Legacy capability for task-augmented sampling requests.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientTasksSamplingCapability {
@@ -996,11 +996,11 @@ pub struct ClientTasksSamplingCapability {
     pub create_message: Option<ClientTasksSamplingCreateMessageCapability>,
 }
 
-/// Marker capability for task-augmented sampling/createMessage support
+/// Legacy task-augmented sampling marker.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClientTasksSamplingCreateMessageCapability {}
 
-/// Nested capability for task-augmented elicitation requests
+/// Legacy capability for task-augmented elicitation requests.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientTasksElicitationCapability {
@@ -1009,7 +1009,7 @@ pub struct ClientTasksElicitationCapability {
     pub create: Option<ClientTasksElicitationCreateCapability>,
 }
 
-/// Marker capability for task-augmented elicitation/create support
+/// Legacy task-augmented elicitation marker.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClientTasksElicitationCreateCapability {}
 
@@ -1761,7 +1761,9 @@ pub struct CreateMessageParams {
     /// Tool choice mode (SEP-1577)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
-    /// Task parameters for async execution
+    /// Legacy 2025-11-25 task parameters for async execution.
+    ///
+    /// This field is invalid on the 2026-07-28 protocol.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskRequestParams>,
     /// Optional protocol-level metadata
@@ -2124,7 +2126,7 @@ pub struct LoggingCapability {
     pub deprecated: Option<DeprecationInfo>,
 }
 
-/// Capability for async task management
+/// Legacy 2025-11-25 server capability for async task management.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TasksCapability {
@@ -2134,7 +2136,7 @@ pub struct TasksCapability {
     /// Support for cancelling tasks
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel: Option<TasksCancelCapability>,
-    /// Which request types support task-augmented requests
+    /// Legacy task-augmented request support.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requests: Option<TasksRequestsCapability>,
 }
@@ -2147,7 +2149,7 @@ pub struct TasksListCapability {}
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TasksCancelCapability {}
 
-/// Capability declaring which request types support task-augmented requests
+/// Legacy server capability declaring task-augmented request support.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TasksRequestsCapability {
@@ -2156,7 +2158,7 @@ pub struct TasksRequestsCapability {
     pub tools: Option<TasksToolsRequestsCapability>,
 }
 
-/// Nested capability for task-augmented tool requests
+/// Legacy capability for task-augmented tool requests.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TasksToolsRequestsCapability {
@@ -2165,7 +2167,7 @@ pub struct TasksToolsRequestsCapability {
     pub call: Option<TasksToolsCallCapability>,
 }
 
-/// Marker capability for task-augmented tools/call support
+/// Legacy task-augmented tools/call marker.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TasksToolsCallCapability {}
 
@@ -2479,7 +2481,9 @@ pub struct CallToolParams {
         with = "crate::protocol::meta_object_serde"
     )]
     pub meta: Option<RequestMeta>,
-    /// Task parameters for async execution
+    /// Legacy 2025-11-25 task parameters for async execution.
+    ///
+    /// This field is invalid on the 2026-07-28 protocol.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskRequestParams>,
 }
@@ -3996,25 +4000,36 @@ pub const RESULT_TYPE_TASK: &str = "task";
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum TaskSupportMode {
-    /// Task execution is required (tool MUST be called with task params)
+    /// Task execution is required.
+    ///
+    /// Legacy clients must include task parameters. On the final protocol the
+    /// server creates a task whenever the extension is negotiated, and rejects
+    /// clients that did not declare it.
     Required,
-    /// Task execution is optional (tool MAY be called with or without task params)
+    /// Task execution is optional.
+    ///
+    /// Legacy clients choose by including task parameters. On the final
+    /// protocol this is server policy: the router creates a task when both
+    /// peers negotiated the extension and otherwise completes synchronously.
     Optional,
-    /// Task execution is forbidden (tool MUST NOT be called with task params)
+    /// Task execution is forbidden; the tool always completes synchronously.
     #[default]
     Forbidden,
 }
 
-/// Execution metadata for a tool definition
+/// Legacy 2025-11-25 task execution metadata for a tool definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolExecution {
-    /// Whether the tool supports task-augmented requests (defaults to "forbidden")
+    /// Whether the legacy tool supports task-augmented requests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_support: Option<TaskSupportMode>,
 }
 
-/// Parameters for task-augmented requests (the `task` field in CallToolParams)
+/// Legacy 2025-11-25 task-augmentation parameters.
+///
+/// The final Tasks extension has no `task` field on `tools/call`; task creation
+/// is server-directed after extension negotiation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskRequestParams {
@@ -4105,12 +4120,12 @@ pub struct TaskObject {
 #[deprecated(note = "Use TaskObject instead")]
 pub type TaskInfo = TaskObject;
 
-/// Result of creating a task (returned when `tools/call` is task-augmented).
+/// Backwards-compatible task-creation result used by the 2025-11-25 API.
 ///
-/// Per SEP-2663, `CreateTaskResult = Result & Task`: the task fields are
-/// inlined at the top of the result and `resultType` is set to `"task"` so
-/// clients can distinguish a task handle from a normal `CallToolResult` on
-/// the same RPC.
+/// This compatibility type accepts both the historical nested object and the
+/// final flat fields so the pre-final high-level client API can keep its return
+/// type. The 2026-07-28 runtime never emits it on the wire; it uses the exact
+/// [`crate::tasks::CreateTaskResult`] instead.
 ///
 /// Serialization layout:
 /// ```jsonc
@@ -4122,17 +4137,14 @@ pub type TaskInfo = TaskObject;
 ///   "lastUpdatedAt": "...",
 ///   "ttl": null,
 ///   "pollInterval": 5000,
-///   // The nested `task` field is emitted purely for back-compat with the
-///   // 2025-11-25 experimental wire format. New clients should read the
-///   // top-level fields and ignore `task`. This nested mirror will be
-///   // removed in a future release.
+///   // The nested `task` field preserves the 2025-11-25 wire format.
 ///   "task": { "taskId": ..., "status": ..., ... }
 /// }
 /// ```
 #[derive(Debug, Clone)]
 pub struct CreateTaskResult {
-    /// The created task object. Serialized both inline (per SEP-2663) and
-    /// under the legacy `task` key for back-compat.
+    /// The created task object. This compatibility serializer emits both the
+    /// flat fields and the legacy nested mirror.
     pub task: TaskObject,
     /// Optional protocol-level metadata
     pub meta: Option<Value>,
@@ -4142,8 +4154,7 @@ impl CreateTaskResult {
     /// Wire-spec discriminator value (always `"task"`).
     pub const RESULT_TYPE: &'static str = RESULT_TYPE_TASK;
 
-    /// Build a result from a [`TaskObject`], with the SEP-2663 discriminator
-    /// pre-populated when serialized.
+    /// Build a compatibility result from a [`TaskObject`].
     pub fn new(task: TaskObject) -> Self {
         Self { task, meta: None }
     }
@@ -4154,8 +4165,8 @@ impl Serialize for CreateTaskResult {
     where
         S: serde::Serializer,
     {
-        // Serialize the TaskObject to a JSON object, then inject the
-        // SEP-2663 discriminator and the nested `task` mirror for back-compat.
+        // Serialize the compatibility object with both the flat discriminator
+        // and the legacy nested task mirror.
         let mut value = serde_json::to_value(&self.task)
             .map_err(|e| serde::ser::Error::custom(format!("task serialize: {e}")))?;
         let obj = value

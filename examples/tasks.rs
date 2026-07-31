@@ -30,10 +30,10 @@ struct ReportInput {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // `Optional` lets one tool serve both worlds: a client that negotiated the
-    // extension may ask for a task, and everyone else gets the synchronous
-    // result. `Required` instead refuses callers that cannot take a task,
-    // answering with -32021 and naming the extension they need to declare.
+    // `Optional` lets one tool serve both worlds: the server returns a task
+    // when the extension is negotiated, while other clients get the
+    // synchronous result. `Required` instead refuses callers that cannot take
+    // a task, answering with -32021 and naming the extension they must declare.
     let build_report = ToolBuilder::new("build_report")
         .description("Crunch records into a report. Slow enough to be worth a task.")
         .task_support(TaskSupportMode::Optional)

@@ -92,6 +92,25 @@ use crate::protocol::{
 use response_cache::{CacheLookup, ClientResponseCache};
 use tower_mcp_types::JsonRpcError;
 
+/// One response to a final-protocol `tools/call` request.
+///
+/// Task creation is server-directed in SEP-2663, so a client that declares
+/// the Tasks extension must be prepared for an ordinary tool call to return a
+/// task handle. [`McpClient::call_tool`] drives that task transparently;
+/// [`McpClient::call_tool_once_task_aware`] exposes this enum for callers that
+/// want direct control of the lifecycle.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(untagged)]
+#[non_exhaustive]
+pub enum TaskAwareCallToolOutcome {
+    /// The server elected to create a task.
+    Task(crate::tasks::CreateTaskResult),
+    /// The request completed synchronously.
+    Complete(CallToolResult),
+    /// The request needs one or more client inputs before it can complete.
+    InputRequired(crate::protocol::InputRequiredResult),
+}
+
 trait CacheableResponse:
     Clone + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static
 {
@@ -785,11 +804,19 @@ impl McpClient {
                 task: None,
             };
             let outcome = self
-                .send_tool_request_with_schema_retry(&params, &mut schema_retry_available)
+                .send_task_aware_tool_request_with_schema_retry(
+                    &params,
+                    &mut schema_retry_available,
+                )
                 .await?;
             match outcome {
-                RequestOutcome::Complete(result) => return Ok(result),
-                RequestOutcome::InputRequired(required) => {
+                TaskAwareCallToolOutcome::Complete(result) => return Ok(result),
+                TaskAwareCallToolOutcome::Task(created) => {
+                    return self
+                        .complete_final_task(&created.task.metadata.task_id)
+                        .await;
+                }
+                TaskAwareCallToolOutcome::InputRequired(required) => {
                     if round == self.max_mrtr_rounds {
                         return Err(Error::Transport(format!(
                             "MRTR round limit ({}) exceeded for tools/call",
@@ -818,6 +845,33 @@ impl McpClient {
         input_responses: Option<InputResponses>,
         request_state: Option<String>,
     ) -> Result<RequestOutcome<CallToolResult>> {
+        match self
+            .call_tool_once_task_aware(name, arguments, input_responses, request_state)
+            .await?
+        {
+            TaskAwareCallToolOutcome::Complete(result) => Ok(RequestOutcome::Complete(result)),
+            TaskAwareCallToolOutcome::InputRequired(required) => {
+                Ok(RequestOutcome::InputRequired(required))
+            }
+            TaskAwareCallToolOutcome::Task(created) => Err(Error::Transport(format!(
+                "tools/call returned task '{}'; use call_tool_once_task_aware for direct task lifecycle control",
+                created.task.metadata.task_id
+            ))),
+        }
+    }
+
+    /// Send one `tools/call` attempt and preserve a server-created task.
+    ///
+    /// Unlike [`call_tool`](Self::call_tool), this does not poll a task or
+    /// automatically fulfil input requests. Final-protocol callers can use it
+    /// to retain the exact task handle returned from the ordinary request.
+    pub async fn call_tool_once_task_aware(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+        input_responses: Option<InputResponses>,
+        request_state: Option<String>,
+    ) -> Result<TaskAwareCallToolOutcome> {
         self.ensure_initialized()?;
         let params = CallToolParams {
             name: name.to_string(),
@@ -827,10 +881,12 @@ impl McpClient {
             meta: None,
             task: None,
         };
-        self.send_request("tools/call", &params).await
+        let mut schema_retry_available = self.uses_final_protocol().await;
+        self.send_task_aware_tool_request_with_schema_retry(&params, &mut schema_retry_available)
+            .await
     }
 
-    /// Make a task-augmented tool call (SEP-2663).
+    /// Request direct control of a tool task lifecycle.
     ///
     /// Instead of blocking until the tool finishes, the server creates a
     /// task and immediately returns a [`CreateTaskResult`] carrying the task
@@ -839,10 +895,10 @@ impl McpClient {
     /// carries the [`CallToolResult`] the synchronous call would have
     /// returned.
     ///
-    /// `ttl_ms` is the requested task time-to-live in milliseconds; `None`
-    /// lets the server choose. The tool must support task execution
-    /// (advertised via the server's tasks capability); servers reject
-    /// task-augmented calls to unsupported tools.
+    /// On 2025-11-25, `ttl_ms` is sent in the legacy task-augmentation field.
+    /// On 2026-07-28, task creation is server-directed: this sends an ordinary
+    /// request and requires the server to elect a task. A final client cannot
+    /// request a TTL, so a non-`None` `ttl_ms` is rejected on that lifecycle.
     pub async fn call_tool_as_task(
         &self,
         name: &str,
@@ -850,6 +906,41 @@ impl McpClient {
         ttl_ms: Option<u64>,
     ) -> Result<CreateTaskResult> {
         self.ensure_initialized()?;
+        if self.uses_final_protocol().await {
+            if ttl_ms.is_some() {
+                return Err(Error::Transport(
+                    "ttl_ms is server-selected by the final Tasks extension".to_string(),
+                ));
+            }
+            let params = CallToolParams {
+                name: name.to_string(),
+                arguments,
+                input_responses: None,
+                request_state: None,
+                meta: None,
+                task: None,
+            };
+            let mut schema_retry_available = true;
+            return match self
+                .send_task_aware_tool_request_with_schema_retry(
+                    &params,
+                    &mut schema_retry_available,
+                )
+                .await?
+            {
+                TaskAwareCallToolOutcome::Task(created) => {
+                    Ok(Self::legacy_create_task_from_final(created))
+                }
+                TaskAwareCallToolOutcome::Complete(_) => Err(Error::Transport(
+                    "server completed tools/call synchronously; final task creation is server-directed"
+                        .to_string(),
+                )),
+                TaskAwareCallToolOutcome::InputRequired(_) => Err(Error::Transport(
+                    "server requested input instead of creating a task".to_string(),
+                )),
+            };
+        }
+
         let params = CallToolParams {
             name: name.to_string(),
             arguments,
@@ -871,7 +962,29 @@ impl McpClient {
     /// an invalid-params error from the server.
     pub async fn task_get(&self, task_id: &str) -> Result<TaskObject> {
         self.ensure_initialized()?;
+        if self.uses_final_protocol().await {
+            return Self::legacy_task_from_final(self.task_get_detailed(task_id).await?);
+        }
         let params = GetTaskInfoParams {
+            task_id: task_id.to_string(),
+            meta: None,
+        };
+        self.send_request("tasks/get", &params).await
+    }
+
+    /// Fetch the exact final-protocol `tasks/get` result.
+    ///
+    /// This preserves status-specific payloads, including all outstanding
+    /// `inputRequests`. It is available only after selecting the 2026-07-28
+    /// lifecycle; legacy callers should use [`task_get`](Self::task_get).
+    pub async fn task_get_detailed(&self, task_id: &str) -> Result<crate::tasks::GetTaskResult> {
+        self.ensure_initialized()?;
+        if !self.uses_final_protocol().await {
+            return Err(Error::Transport(
+                "task_get_detailed requires the 2026-07-28 client lifecycle".to_string(),
+            ));
+        }
+        let params = crate::tasks::GetTaskParams {
             task_id: task_id.to_string(),
             meta: None,
         };
@@ -883,10 +996,20 @@ impl McpClient {
     /// Cancellation is cooperative: the acknowledgment is an empty result
     /// and the observable status may remain non-terminal for a while after
     /// the ack; poll [`task_get`](Self::task_get) to observe the terminal
-    /// state. The ack body is discarded, so legacy peers that return the
+    /// state. `reason` is a legacy-only field and is omitted on the final
+    /// protocol. The ack body is discarded, so legacy peers that return the
     /// task object are also tolerated.
     pub async fn task_cancel(&self, task_id: &str, reason: Option<String>) -> Result<()> {
         self.ensure_initialized()?;
+        if self.uses_final_protocol().await {
+            let params = crate::tasks::CancelTaskParams {
+                task_id: task_id.to_string(),
+                meta: None,
+            };
+            let _ack: crate::tasks::CancelTaskResult =
+                self.send_request("tasks/cancel", &params).await?;
+            return Ok(());
+        }
         let params = CancelTaskParams {
             task_id: task_id.to_string(),
             reason,
@@ -899,9 +1022,9 @@ impl McpClient {
     /// Answer a task's outstanding input requests via `tasks/update`
     /// (SEP-2663).
     ///
-    /// Responses are matched to outstanding requests by key. Read the keys
-    /// from the `inputRequests` of an `input_required` task returned by
-    /// [`task_get`](Self::task_get).
+    /// Responses are matched to outstanding requests by key. Final-protocol
+    /// callers read the keys from the `inputRequests` of an `input_required`
+    /// task returned by [`task_get_detailed`](Self::task_get_detailed).
     ///
     /// A partial map is valid and expected: requests left unanswered stay
     /// outstanding and the task remains `input_required` until every one is
@@ -913,6 +1036,16 @@ impl McpClient {
     /// [`task_get`](Self::task_get) to observe the resulting state.
     pub async fn task_update(&self, task_id: &str, input_responses: InputResponses) -> Result<()> {
         self.ensure_initialized()?;
+        if self.uses_final_protocol().await {
+            let params = crate::tasks::UpdateTaskParams {
+                task_id: task_id.to_string(),
+                input_responses,
+                meta: None,
+            };
+            let _ack: crate::tasks::UpdateTaskResult =
+                self.send_request("tasks/update", &params).await?;
+            return Ok(());
+        }
         let input_responses = input_responses
             .into_iter()
             .map(|(key, response)| serde_json::to_value(response).map(|value| (key, value)))
@@ -928,11 +1061,17 @@ impl McpClient {
 
     /// Poll `tasks/get` until the task reaches a terminal state.
     ///
-    /// Honors the server's suggested `pollInterval` (default 1000 ms,
-    /// clamped to 50 ms..30 s). A task purged after its TTL surfaces as the
-    /// server's task-not-found error. Wrap in
+    /// Honors the server's suggested polling interval (default 1000 ms,
+    /// clamped to 50 ms..30 s). On the final protocol it also fulfils
+    /// `input_required` requests through the registered client handlers. A
+    /// task purged after its TTL surfaces as the server's task-not-found
+    /// error. Wrap in
     /// [`tokio::time::timeout`] to bound the overall wait.
     pub async fn task_wait(&self, task_id: &str) -> Result<TaskObject> {
+        if self.uses_final_protocol().await {
+            let result = self.wait_for_final_task(task_id).await?;
+            return Self::legacy_task_from_final(result);
+        }
         loop {
             let task = self.task_get(task_id).await?;
             if task.status.is_terminal() {
@@ -1485,6 +1624,134 @@ impl McpClient {
     }
 
     // --- Internal helpers ---
+
+    async fn send_task_aware_tool_request_with_schema_retry(
+        &self,
+        params: &CallToolParams,
+        retry_available: &mut bool,
+    ) -> Result<TaskAwareCallToolOutcome> {
+        self.send_tool_request_with_schema_retry(params, retry_available)
+            .await
+    }
+
+    async fn wait_for_final_task(&self, task_id: &str) -> Result<crate::tasks::GetTaskResult> {
+        loop {
+            let task = self.task_get_detailed(task_id).await?;
+            match task.task.status() {
+                crate::protocol::TaskStatus::Completed
+                | crate::protocol::TaskStatus::Failed
+                | crate::protocol::TaskStatus::Cancelled => return Ok(task),
+                crate::protocol::TaskStatus::InputRequired => {
+                    let requests = task.task.input_requests().cloned().ok_or_else(|| {
+                        Error::Transport(format!(
+                            "task '{task_id}' is input_required without inputRequests"
+                        ))
+                    })?;
+                    if requests.is_empty() {
+                        return Err(Error::Transport(format!(
+                            "task '{task_id}' is input_required without inputRequests"
+                        )));
+                    }
+                    let responses = self.resolve_input_requests(requests).await?;
+                    self.task_update(task_id, responses).await?;
+                }
+                crate::protocol::TaskStatus::Working => {
+                    let interval_ms = task
+                        .task
+                        .metadata()
+                        .poll_interval_ms
+                        .unwrap_or(1000)
+                        .clamp(50, 30_000);
+                    tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
+                }
+                _ => {
+                    return Err(Error::Transport(format!(
+                        "task '{task_id}' returned an unsupported status"
+                    )));
+                }
+            }
+        }
+    }
+
+    async fn complete_final_task(&self, task_id: &str) -> Result<CallToolResult> {
+        let task = self.wait_for_final_task(task_id).await?;
+        match task.task.status() {
+            crate::protocol::TaskStatus::Completed => {
+                let result = task.task.result().cloned().ok_or_else(|| {
+                    Error::Transport(format!(
+                        "completed task '{task_id}' did not contain a result"
+                    ))
+                })?;
+                serde_json::from_value(serde_json::Value::Object(result)).map_err(|error| {
+                    Error::Transport(format!(
+                        "failed to deserialize completed task '{task_id}' result: {error}"
+                    ))
+                })
+            }
+            crate::protocol::TaskStatus::Failed => {
+                let error = task.task.error().cloned().unwrap_or_else(|| {
+                    JsonRpcError::internal_error(format!(
+                        "task '{task_id}' failed without an error payload"
+                    ))
+                });
+                Err(Error::JsonRpc(error))
+            }
+            crate::protocol::TaskStatus::Cancelled => {
+                Err(Error::Transport(format!("task '{task_id}' was cancelled")))
+            }
+            _ => Err(Error::Transport(format!(
+                "task '{task_id}' did not reach a terminal state"
+            ))),
+        }
+    }
+
+    fn legacy_create_task_from_final(created: crate::tasks::CreateTaskResult) -> CreateTaskResult {
+        let metadata = created.task.metadata;
+        CreateTaskResult {
+            task: TaskObject {
+                task_id: metadata.task_id,
+                status: created.task.status,
+                status_message: metadata.status_message,
+                created_at: metadata.created_at,
+                last_updated_at: metadata.last_updated_at,
+                ttl: metadata.ttl_ms,
+                poll_interval: metadata.poll_interval_ms,
+                result: None,
+                error: None,
+                meta: None,
+            },
+            meta: created.meta.map(serde_json::Value::Object),
+        }
+    }
+
+    fn legacy_task_from_final(result: crate::tasks::GetTaskResult) -> Result<TaskObject> {
+        let task = &result.task;
+        let metadata = task.metadata();
+        let completed = task
+            .result()
+            .cloned()
+            .map(serde_json::Value::Object)
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| {
+                Error::Transport(format!(
+                    "failed to deserialize task '{}' result: {error}",
+                    metadata.task_id
+                ))
+            })?;
+        Ok(TaskObject {
+            task_id: metadata.task_id.clone(),
+            status: task.status(),
+            status_message: metadata.status_message.clone(),
+            created_at: metadata.created_at.clone(),
+            last_updated_at: metadata.last_updated_at.clone(),
+            ttl: metadata.ttl_ms,
+            poll_interval: metadata.poll_interval_ms,
+            result: completed,
+            error: task.error().cloned(),
+            meta: result.meta.map(serde_json::Value::Object),
+        })
+    }
 
     async fn send_tool_request_with_schema_retry<R>(
         &self,
@@ -3325,6 +3592,50 @@ mod tests {
                 "tools/list",
                 "tools/call"
             ]
+        );
+    }
+
+    #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+    #[tokio::test]
+    async fn final_call_tool_as_task_sends_no_legacy_task_parameter() {
+        let transport = MockTransport::with_responses(vec![
+            final_discover_result(),
+            serde_json::json!({
+                "resultType": "task",
+                "taskId": "task-final",
+                "status": "working",
+                "createdAt": "2026-07-31T00:00:00Z",
+                "lastUpdatedAt": "2026-07-31T00:00:00Z",
+                "ttlMs": null,
+                "pollIntervalMs": 50
+            }),
+        ]);
+        let outgoing = transport.outgoing.clone();
+        let client = McpClient::builder()
+            .protocol_support(ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+            .with_tasks()
+            .connect_simple(transport)
+            .await
+            .unwrap();
+        client.discover("test-client", "1.0.0").await.unwrap();
+
+        let created = client
+            .call_tool_as_task("long-tool", serde_json::json!({}), None)
+            .await
+            .unwrap();
+        assert_eq!(created.task.task_id, "task-final");
+
+        let messages = outgoing.lock().unwrap();
+        let call: serde_json::Value = serde_json::from_str(&messages[1]).unwrap();
+        assert_eq!(call["method"], "tools/call");
+        assert!(
+            call["params"].get("task").is_none(),
+            "final tools/call leaked the legacy task parameter: {call}"
+        );
+        assert!(
+            call["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
+                .get(crate::protocol::TASKS_EXTENSION_ID)
+                .is_some()
         );
     }
 

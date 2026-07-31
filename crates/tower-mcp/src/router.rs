@@ -67,9 +67,8 @@ fn task_store_error(e: TaskStoreError) -> Error {
 
 /// Whether this request is using the final, stateless 2026-07-28 lifecycle.
 ///
-/// Tasks support is intentionally withheld on that path until the complete
-/// SEP-2663 contract is implemented. Stable sessionful requests retain the
-/// crate's existing experimental task behavior.
+/// Stable sessionful requests retain the crate's legacy task behavior; final
+/// requests use extension negotiation and server-directed task creation.
 #[cfg(feature = "stateless")]
 fn is_final_protocol_request(extensions: &crate::context::Extensions) -> bool {
     extensions
@@ -2309,7 +2308,7 @@ impl McpRouter {
             TaskStatus::Completed => {
                 // The exact object the synchronous call would have returned,
                 // including `isError: true` results.
-                let object = result
+                let mut object = result
                     .map(serde_json::to_value)
                     .transpose()
                     .map_err(|e| {
@@ -2319,6 +2318,13 @@ impl McpRouter {
                     })?
                     .and_then(|value| value.as_object().cloned())
                     .unwrap_or_default();
+                // This object is nested inside tasks/get, so it does not pass
+                // through the JSON-RPC response stamper that adds the final
+                // protocol's required complete discriminator.
+                object.insert(
+                    "resultType".to_string(),
+                    serde_json::Value::String("complete".to_string()),
+                );
                 crate::tasks::DetailedTask::completed(metadata, object)
             }
             TaskStatus::Failed => crate::tasks::DetailedTask::failed(
@@ -2533,11 +2539,16 @@ impl McpRouter {
 
             McpRequest::ListTools(params) => {
                 let final_protocol = is_final_protocol_request(&extensions);
+                let final_tasks_negotiated = final_protocol
+                    && self.final_tasks_enabled()
+                    && client_declares_tasks(&extensions);
                 let filter = self.inner.tool_filter.as_ref();
                 let disabled = self.inner.disabled_tools.read().unwrap().clone();
                 let is_visible = |t: &Tool| {
                     !disabled.contains(&t.name)
-                        && !(final_protocol && matches!(t.task_support, TaskSupportMode::Required))
+                        && !(final_protocol
+                            && matches!(t.task_support, TaskSupportMode::Required)
+                            && !final_tasks_negotiated)
                         && filter
                             .map(|f| f.is_visible(&self.session, t))
                             .unwrap_or(true)
@@ -2639,31 +2650,59 @@ impl McpRouter {
                     return Err(filter.denial_error(&params.name));
                 }
 
-                // On the final path, task behavior follows negotiation rather
-                // than protocol version. A client that did not declare the
-                // extension must never receive a task.
-                if is_final_protocol_request(&extensions) {
-                    let tasks_negotiated =
-                        self.final_tasks_enabled() && client_declares_tasks(&extensions);
+                // Task creation is client-directed on the legacy protocol and
+                // server-directed on the final protocol. `Some(None)` means
+                // create a task using the server-selected TTL.
+                let final_protocol = is_final_protocol_request(&extensions);
+                let task_ttl = if final_protocol {
+                    if params.task.is_some() {
+                        return Err(Error::JsonRpc(JsonRpcError::invalid_params(
+                            "The final Tasks extension does not allow a 'task' request parameter",
+                        )));
+                    }
 
-                    if !tasks_negotiated {
-                        if matches!(tool.task_support, TaskSupportMode::Required) {
-                            // The server cannot service this tool without a
-                            // task, so say which capability is missing instead
-                            // of hiding the tool.
+                    let server_enabled = self.final_tasks_enabled();
+                    let tasks_negotiated = server_enabled && client_declares_tasks(&extensions);
+                    match tool.task_support {
+                        TaskSupportMode::Required if !server_enabled => {
+                            // Match tools/list: a final-only task tool is not
+                            // part of this server's surface until it opts in.
+                            return Err(Error::JsonRpc(JsonRpcError::method_not_found(
+                                &params.name,
+                            )));
+                        }
+                        TaskSupportMode::Required if !tasks_negotiated => {
                             return Err(Error::JsonRpc(
                                 JsonRpcError::missing_required_client_capability(
                                     tasks_client_capabilities(),
                                 ),
                             ));
                         }
-                        if params.task.is_some() {
-                            return Err(Error::JsonRpc(JsonRpcError::invalid_params(
-                                "The Tasks extension was not negotiated for this request",
-                            )));
+                        TaskSupportMode::Required | TaskSupportMode::Optional
+                            if tasks_negotiated =>
+                        {
+                            Some(None)
                         }
+                        _ => None,
                     }
-                }
+                } else {
+                    match (&params.task, tool.task_support) {
+                        (Some(_), TaskSupportMode::Forbidden) => {
+                            return Err(Error::JsonRpc(JsonRpcError::invalid_params(format!(
+                                "Tool '{}' does not support async tasks",
+                                params.name
+                            ))));
+                        }
+                        (None, TaskSupportMode::Required) => {
+                            return Err(Error::JsonRpc(JsonRpcError::invalid_params(format!(
+                                "Tool '{}' requires async task execution (include 'task' in params)",
+                                params.name
+                            ))));
+                        }
+                        (Some(task), _) => Some(task.ttl),
+                        (None, _) => None,
+                    }
+                };
 
                 // Final 2026-07-28 requests declare client capabilities on
                 // every request. Reject a tool before any handler work begins
@@ -2683,15 +2722,7 @@ impl McpRouter {
                     ));
                 }
 
-                if let Some(task_params) = params.task {
-                    // Task-augmented request: validate task_support != Forbidden
-                    if matches!(tool.task_support, TaskSupportMode::Forbidden) {
-                        return Err(Error::JsonRpc(JsonRpcError::invalid_params(format!(
-                            "Tool '{}' does not support async tasks",
-                            params.name
-                        ))));
-                    }
-
+                if let Some(task_ttl) = task_ttl {
                     // Create the task
                     let (task_id, cancellation_token) = self
                         .inner
@@ -2699,7 +2730,7 @@ impl McpRouter {
                         .create_task(
                             &params.name,
                             params.arguments.clone(),
-                            task_params.ttl,
+                            task_ttl,
                             request_principal(&extensions),
                         )
                         .await
@@ -2798,14 +2829,6 @@ impl McpRouter {
                     }
                     Ok(McpResponse::CreateTask(CreateTaskResult::new(task)))
                 } else {
-                    // Synchronous request: validate task_support != Required
-                    if matches!(tool.task_support, TaskSupportMode::Required) {
-                        return Err(Error::JsonRpc(JsonRpcError::invalid_params(format!(
-                            "Tool '{}' requires async task execution (include 'task' in params)",
-                            params.name
-                        ))));
-                    }
-
                     // Extract progress token from request metadata
                     let progress_token = params.meta.and_then(|m| m.progress_token);
                     let ctx = self.create_context_with_extensions(
@@ -3909,25 +3932,24 @@ mod tests {
             "the legacy capability shape is never advertised on the final path"
         );
 
-        // A client that did not declare the extension still gets no task.
-        let error = router
+        // A client that did not declare the extension gets the synchronous
+        // form of an optional tool.
+        let response = router
             .handle(
                 RequestId::Number(4),
-                McpRequest::CallTool(task_params(Some(TaskRequestParams { ttl: None }))),
+                McpRequest::CallTool(task_params(None)),
                 final_extensions(ClientCapabilities::default()),
             )
             .await
-            .unwrap_err();
-        assert!(
-            matches!(error, Error::JsonRpc(e) if e.code == -32602),
-            "server opt-in alone must not be enough"
-        );
+            .unwrap();
+        assert!(matches!(response, McpResponse::CallTool(_)));
 
-        // Both sides declared: the augmentation is accepted.
+        // Both sides declared: the server elects a task from an ordinary
+        // tools/call request.
         let response = router
             .handle(
                 RequestId::Number(5),
-                McpRequest::CallTool(task_params(Some(TaskRequestParams { ttl: None }))),
+                McpRequest::CallTool(task_params(None)),
                 tasks_client_extensions(),
             )
             .await
@@ -3937,16 +3959,17 @@ mod tests {
             "a negotiated request must receive a task, got {response:?}"
         );
 
-        // An unaugmented call on the same tool stays synchronous.
-        let response = router
+        // The removed legacy request flag is invalid even when the extension
+        // was negotiated.
+        let error = router
             .handle(
                 RequestId::Number(6),
-                McpRequest::CallTool(task_params(None)),
+                McpRequest::CallTool(task_params(Some(TaskRequestParams { ttl: None }))),
                 tasks_client_extensions(),
             )
             .await
-            .unwrap();
-        assert!(matches!(response, McpResponse::CallTool(_)));
+            .unwrap_err();
+        assert!(matches!(error, Error::JsonRpc(e) if e.code == -32602));
     }
 
     #[cfg(feature = "stateless")]
@@ -3972,7 +3995,7 @@ mod tests {
                     input_responses: None,
                     request_state: None,
                     meta: None,
-                    task: Some(TaskRequestParams { ttl: None }),
+                    task: None,
                 }),
                 tasks_client_extensions(),
             )
@@ -4071,6 +4094,76 @@ mod tests {
         assert!(matches!(error, Error::JsonRpc(e) if e.code == -32601));
     }
 
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn final_required_task_tools_follow_per_request_capabilities() {
+        let router = McpRouter::new()
+            .tool(
+                ToolBuilder::new("required_task")
+                    .task_support(TaskSupportMode::Required)
+                    .handler(|input: AddInput| async move {
+                        Ok(CallToolResult::text(format!("{}", input.a + input.b)))
+                    })
+                    .build(),
+            )
+            .with_tasks();
+        let params = || CallToolParams {
+            name: "required_task".to_string(),
+            arguments: serde_json::json!({"a": 1, "b": 2}),
+            input_responses: None,
+            request_state: None,
+            meta: None,
+            task: None,
+        };
+
+        let McpResponse::ListTools(without_tasks) = router
+            .handle(
+                RequestId::Number(1),
+                McpRequest::ListTools(ListToolsParams::default()),
+                final_extensions(ClientCapabilities::default()),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected tools/list")
+        };
+        assert!(without_tasks.tools.is_empty());
+
+        let McpResponse::ListTools(with_tasks) = router
+            .handle(
+                RequestId::Number(2),
+                McpRequest::ListTools(ListToolsParams::default()),
+                tasks_client_extensions(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected tools/list")
+        };
+        assert_eq!(with_tasks.tools.len(), 1);
+        assert!(with_tasks.tools[0].execution.is_none());
+
+        let error = router
+            .handle(
+                RequestId::Number(3),
+                McpRequest::CallTool(params()),
+                final_extensions(ClientCapabilities::default()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::JsonRpc(error) if error.code == -32021));
+
+        let response = router
+            .handle(
+                RequestId::Number(4),
+                McpRequest::CallTool(params()),
+                tasks_client_extensions(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(response, McpResponse::FinalCreateTask(_)));
+    }
+
     #[cfg(all(feature = "oauth", feature = "stateless"))]
     #[tokio::test]
     async fn task_operations_are_bound_to_the_creating_principal() {
@@ -4108,7 +4201,7 @@ mod tests {
                     input_responses: None,
                     request_state: None,
                     meta: None,
-                    task: Some(TaskRequestParams { ttl: None }),
+                    task: None,
                 }),
                 as_principal("alice"),
             )
@@ -4199,6 +4292,144 @@ mod tests {
                 .is_ok(),
             "a refused cancel must not have cancelled the task"
         );
+    }
+
+    #[cfg(all(feature = "oauth", feature = "stateless"))]
+    #[tokio::test]
+    async fn final_tasks_work_across_independent_routers_with_a_shared_store() {
+        fn as_principal(subject: &str) -> Extensions {
+            let mut extensions = tasks_client_extensions();
+            extensions.insert(crate::oauth::token::TokenClaims {
+                sub: Some(subject.to_string()),
+                iss: None,
+                aud: None,
+                exp: None,
+                scope: None,
+                client_id: None,
+                extra: HashMap::new(),
+            });
+            extensions
+        }
+
+        fn router_with_store(store: Arc<dyn TaskStore>) -> McpRouter {
+            McpRouter::new()
+                .tool(
+                    ToolBuilder::new("shared_task")
+                        .task_support(TaskSupportMode::Optional)
+                        .handler(|_input: serde_json::Value| async move {
+                            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                            Ok(CallToolResult::text("done"))
+                        })
+                        .build(),
+                )
+                .task_store(store)
+                .with_tasks()
+        }
+
+        let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+        let router_a = router_with_store(store.clone());
+        let router_b = router_with_store(store);
+
+        let McpResponse::FinalCreateTask(created) = router_a
+            .handle(
+                RequestId::Number(1),
+                McpRequest::CallTool(CallToolParams {
+                    name: "shared_task".to_string(),
+                    arguments: serde_json::json!({}),
+                    input_responses: None,
+                    request_state: None,
+                    meta: None,
+                    task: None,
+                }),
+                as_principal("alice"),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("router A did not create a final task")
+        };
+        let task_id = created.task.metadata.task_id;
+
+        // A separate router instance can read the shared task for its owner.
+        assert!(
+            router_b
+                .handle(
+                    RequestId::Number(2),
+                    McpRequest::GetTaskInfo(GetTaskInfoParams {
+                        task_id: task_id.clone(),
+                        meta: None,
+                    }),
+                    as_principal("alice"),
+                )
+                .await
+                .is_ok()
+        );
+
+        // Another principal sees the same response as an unknown ID.
+        let denied = router_b
+            .handle(
+                RequestId::Number(3),
+                McpRequest::GetTaskInfo(GetTaskInfoParams {
+                    task_id: task_id.clone(),
+                    meta: None,
+                }),
+                as_principal("bob"),
+            )
+            .await
+            .unwrap_err();
+        let unknown = router_b
+            .handle(
+                RequestId::Number(4),
+                McpRequest::GetTaskInfo(GetTaskInfoParams {
+                    task_id: "unknown-task".to_string(),
+                    meta: None,
+                }),
+                as_principal("bob"),
+            )
+            .await
+            .unwrap_err();
+        let (Error::JsonRpc(denied), Error::JsonRpc(unknown)) = (denied, unknown) else {
+            panic!("expected JSON-RPC task denials")
+        };
+        assert_eq!(denied.code, unknown.code);
+        assert_eq!(
+            denied.message.replace(&task_id, "<task-id>"),
+            unknown.message.replace("unknown-task", "<task-id>")
+        );
+        assert_eq!(denied.data, unknown.data);
+
+        // Router B mutates the shared task, and router A immediately observes
+        // the terminal state through the same backend.
+        assert!(matches!(
+            router_b
+                .handle(
+                    RequestId::Number(5),
+                    McpRequest::CancelTask(CancelTaskParams {
+                        task_id: task_id.clone(),
+                        reason: None,
+                        meta: None,
+                    }),
+                    as_principal("alice"),
+                )
+                .await
+                .unwrap(),
+            McpResponse::FinalTaskAck(_)
+        ));
+        let McpResponse::FinalGetTask(fetched) = router_a
+            .handle(
+                RequestId::Number(6),
+                McpRequest::GetTaskInfo(GetTaskInfoParams {
+                    task_id,
+                    meta: None,
+                }),
+                as_principal("alice"),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("router A did not read the shared task")
+        };
+        assert_eq!(fetched.task.status(), TaskStatus::Cancelled);
     }
 
     #[test]
@@ -4391,7 +4622,7 @@ mod tests {
 
     #[cfg(feature = "stateless")]
     #[tokio::test]
-    async fn final_protocol_rejects_incomplete_tasks_dispatch() {
+    async fn final_protocol_enforces_tasks_negotiation() {
         let optional = ToolBuilder::new("optional_task")
             .task_support(TaskSupportMode::Optional)
             .handler(|input: AddInput| async move {
@@ -4404,7 +4635,7 @@ mod tests {
                 Ok(CallToolResult::text(format!("{}", input.a + input.b)))
             })
             .build();
-        let mut router = McpRouter::new().tool(optional).tool(required);
+        let mut router = McpRouter::new().tool(optional).tool(required).with_tasks();
         init_router(&mut router).await;
 
         // The optional tool remains synchronously callable on the final path.
@@ -4425,7 +4656,7 @@ mod tests {
             .unwrap();
         assert!(matches!(response, McpResponse::CallTool(_)));
 
-        // Task augmentation is invalid while the final extension is withheld.
+        // The removed legacy task augmentation is invalid on the final wire.
         let error = router
             .handle(
                 RequestId::Number(2),
