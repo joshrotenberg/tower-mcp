@@ -154,6 +154,8 @@ jobs:
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
+    env:
+      COVERAGE_MIN_LINES: "80"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -168,6 +170,7 @@ jobs:
           cargo llvm-cov report --lcov --output-path lcov.info
           cargo llvm-cov report --json --summary-only --output-path coverage-summary.json
           cargo llvm-cov report > coverage.txt
+          cargo llvm-cov report --html --output-dir coverage-html
       - name: Write job summary
         run: |
           jq -r '
@@ -180,8 +183,8 @@ jobs:
           ' coverage-summary.json >> "$GITHUB_STEP_SUMMARY"
           {
             echo ""
-            echo "No threshold is enforced. \`lcov.info\` is attached to the run"
-            echo "as the \`coverage\` artifact."
+            echo "Line coverage must remain at or above ${COVERAGE_MIN_LINES}%."
+            echo "Detailed reports are attached to the run as the \`coverage\` artifact."
             echo ""
             echo "<details><summary>Per-file coverage</summary>"
             echo ""
@@ -192,12 +195,22 @@ jobs:
             echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
+        if: always()
         with:
           name: coverage
           path: |
             lcov.info
             coverage-summary.json
             coverage.txt
+            coverage-html/
+      - name: Enforce line coverage floor
+        run: |
+          measured="$(jq -r '.data[0].totals.lines.percent' coverage-summary.json)"
+          echo "Measured line coverage: ${measured}% (required: ${COVERAGE_MIN_LINES}%)"
+          if ! cargo llvm-cov report --fail-under-lines "${COVERAGE_MIN_LINES}"; then
+            echo "::error title=Line coverage below ${COVERAGE_MIN_LINES}%::Measured line coverage ${measured}% is below the required ${COVERAGE_MIN_LINES}% floor."
+            exit 1
+          fi
 
   examples:
     name: Examples

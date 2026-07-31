@@ -12,6 +12,22 @@ cargo test --workspace --doc --all-features
 
 All of these must pass before submitting a PR.
 
+## Coverage
+
+CI enforces an 80% workspace line-coverage floor. Install the required stable
+toolchain components and
+[`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov), then reproduce
+the gate locally with the same test and feature scope:
+
+```bash
+rustup component add llvm-tools-preview
+cargo install cargo-llvm-cov --locked
+cargo llvm-cov --workspace --all-features --fail-under-lines 80
+```
+
+Region and function coverage remain informational. CI also publishes LCOV,
+JSON summary, text, and HTML reports in the `coverage` artifact.
+
 ## Fuzzing
 
 The JSON-RPC wire parser has a `cargo-fuzz` target that also runs on a weekly
