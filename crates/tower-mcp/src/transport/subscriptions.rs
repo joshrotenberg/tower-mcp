@@ -7,12 +7,23 @@ use crate::protocol::{
     SubscriptionsListenResultMeta, notifications,
 };
 
-pub(crate) fn accepted_subscription_filter(requested: SubscriptionFilter) -> SubscriptionFilter {
+/// Narrow a requested filter to what this server will actually honor.
+///
+/// The acknowledgement reports this filter back to the client, so anything
+/// dropped here is a promise the server declines to make. `tasks_enabled`
+/// reflects whether the server opted into the Tasks extension: without it
+/// there is nothing to notify about, so the task IDs are dropped rather than
+/// acknowledged and then silently ignored.
+pub(crate) fn accepted_subscription_filter(
+    requested: SubscriptionFilter,
+    tasks_enabled: bool,
+) -> SubscriptionFilter {
     SubscriptionFilter {
         tools_list_changed: requested.tools_list_changed.filter(|enabled| *enabled),
         prompts_list_changed: requested.prompts_list_changed.filter(|enabled| *enabled),
         resources_list_changed: requested.resources_list_changed.filter(|enabled| *enabled),
         resource_subscriptions: requested.resource_subscriptions,
+        task_ids: requested.task_ids.filter(|_| tasks_enabled),
     }
 }
 
@@ -28,6 +39,13 @@ pub(crate) fn subscription_matches(
             .resource_subscriptions
             .as_ref()
             .is_some_and(|subscriptions| subscriptions.iter().any(|item| item == uri)),
+        // A task is named individually rather than opted into as a class, so
+        // an unlisted task ID never matches even a subscriber that asked for
+        // every other notification type.
+        ServerNotification::FinalTaskStatusChanged(params) => filter
+            .task_ids
+            .as_ref()
+            .is_some_and(|ids| ids.iter().any(|id| id == params.task.task_id())),
         _ => false,
     }
 }

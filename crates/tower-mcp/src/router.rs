@@ -148,7 +148,7 @@ fn unknown_task_error(task_id: &str) -> JsonRpcError {
 
 /// The client capability shape a server names in a `-32021` when it cannot
 /// service a request without the Tasks extension.
-fn tasks_client_capabilities() -> crate::protocol::ClientCapabilities {
+pub(crate) fn tasks_client_capabilities() -> crate::protocol::ClientCapabilities {
     crate::protocol::ClientCapabilities {
         extensions: Some(
             [(
@@ -1920,6 +1920,24 @@ impl McpRouter {
         sent
     }
 
+    /// Push a task's current state to subscribed `subscriptions/listen`
+    /// streams as a `notifications/tasks` notification.
+    ///
+    /// The router already announces the transitions it drives: completion,
+    /// failure, cancellation, and the resumption that follows a
+    /// `tasks/update`. Call this after driving a transition yourself, most
+    /// commonly [`TaskStore::require_input`], which a tool handler invokes on
+    /// the store directly.
+    ///
+    /// Announcing task creation is deliberately left out. A client learns the
+    /// task ID from the `tools/call` result, so it cannot have subscribed to a
+    /// task before that result reaches it.
+    ///
+    /// [`TaskStore::require_input`]: crate::async_task::TaskStore::require_input
+    pub async fn notify_task_status_changed(&self, task_id: &str) {
+        self.notify_task_state(task_id).await;
+    }
+
     /// Notify clients that the list of available resources has changed
     ///
     /// Returns `true` if the notification was sent.
@@ -2245,6 +2263,18 @@ impl McpRouter {
 
     /// Serve a final `tasks/get` as a status-discriminated `DetailedTask`.
     async fn final_get_task(&self, task_id: &str) -> Result<McpResponse> {
+        let detailed = self.detailed_task(task_id).await?;
+        Ok(McpResponse::FinalGetTask(crate::tasks::GetTaskResult::new(
+            detailed,
+        )))
+    }
+
+    /// Build the complete status-discriminated view of a task.
+    ///
+    /// Both `tasks/get` and `notifications/tasks` render a task through this
+    /// one path, which is what makes a pushed notification identical to the
+    /// poll response a client would have received at that moment.
+    async fn detailed_task(&self, task_id: &str) -> Result<crate::tasks::DetailedTask> {
         let (task, result, error) = self
             .inner
             .task_store
@@ -2262,7 +2292,7 @@ impl McpRouter {
         metadata.status_message = task.status_message.clone();
         metadata.poll_interval_ms = task.poll_interval;
 
-        let detailed = match task.status {
+        Ok(match task.status {
             TaskStatus::Working => crate::tasks::DetailedTask::working(metadata),
             TaskStatus::InputRequired => {
                 // Every request still awaiting a response, not just the most
@@ -2299,11 +2329,57 @@ impl McpRouter {
             // `TaskStatus` is non_exhaustive. Report an unrecognized status as
             // working rather than inventing a terminal state.
             _ => crate::tasks::DetailedTask::working(metadata),
+        })
+    }
+
+    /// Push the current state of a task to subscribed listen streams.
+    ///
+    /// Best effort by design. A task outlives the request that created it, so
+    /// there may be no subscriber at all, and SEP-2663 keeps `tasks/get`
+    /// authoritative precisely so a dropped notification costs a client
+    /// nothing beyond a slower poll. A failure to read the task back is
+    /// therefore logged rather than propagated: the caller has already
+    /// committed the state change this announces.
+    async fn notify_task_state(&self, task_id: &str) {
+        if !self.final_tasks_enabled() {
+            return;
+        }
+
+        let detailed = match self.detailed_task(task_id).await {
+            Ok(detailed) => detailed,
+            Err(error) => {
+                tracing::debug!(
+                    target: "mcp::tasks",
+                    task_id = %task_id,
+                    %error,
+                    "skipping task notification: task state unavailable"
+                );
+                return;
+            }
         };
 
-        Ok(McpResponse::FinalGetTask(crate::tasks::GetTaskResult::new(
-            detailed,
-        )))
+        let notification = ServerNotification::FinalTaskStatusChanged(
+            crate::tasks::TaskStatusNotificationParams {
+                task: detailed,
+                meta: None,
+            },
+        );
+
+        // Delivery goes through the transport-lifetime sink rather than the
+        // originating request's sender: the `tools/call` that created the task
+        // has usually completed by the time a terminal transition happens, and
+        // its stream is gone.
+        #[cfg(all(feature = "http", feature = "stateless"))]
+        if let Ok(active) = self.inner.modern_notification_sink.read()
+            && let Some(sink) = active.as_ref()
+        {
+            sink(&notification);
+            return;
+        }
+
+        if let Some(tx) = &self.inner.notification_tx {
+            let _ = tx.try_send(notification);
+        }
     }
 
     /// Effective SEP-2549 cache scope to emit alongside a TTL hint.
@@ -2646,10 +2722,12 @@ impl McpRouter {
                     let task_id_clone = task_id.clone();
 
                     let tool_name = params.name.clone();
+                    let notifier = self.clone();
                     tokio::spawn(async move {
                         // Check for cancellation before starting
                         if cancellation_token.is_cancelled() {
                             tracing::debug!(task_id = %task_id_clone, "Task cancelled before execution");
+                            notifier.notify_task_state(&task_id_clone).await;
                             return;
                         }
 
@@ -2660,6 +2738,7 @@ impl McpRouter {
 
                         if cancellation_token.is_cancelled() {
                             tracing::debug!(task_id = %task_id_clone, "Task cancelled during execution");
+                            notifier.notify_task_state(&task_id_clone).await;
                         } else {
                             // A tool result carrying `isError: true` completes
                             // the task: the tool ran and produced a domain
@@ -2682,6 +2761,7 @@ impl McpRouter {
                                 error = error_msg.as_deref().unwrap_or_default(),
                                 "tool call completed"
                             );
+                            notifier.notify_task_state(&task_id_clone).await;
                         }
                     });
 
@@ -3275,6 +3355,10 @@ impl McpRouter {
                         .await
                         .map_err(task_store_error)?
                         .ok_or_else(|| Error::JsonRpc(unknown_task_error(&params.task_id)))?;
+                    // Answering the last outstanding request resumes the task,
+                    // so the status a subscriber sees changes here even though
+                    // the ack itself is empty.
+                    self.notify_task_state(&params.task_id).await;
                     return Ok(McpResponse::FinalTaskAck(
                         crate::tasks::TaskAcknowledgement::new(),
                     ));
@@ -3317,6 +3401,7 @@ impl McpRouter {
                         .await
                         .map_err(task_store_error)?
                         .ok_or_else(|| Error::JsonRpc(unknown_task_error(&params.task_id)))?;
+                    self.notify_task_state(&params.task_id).await;
                     return Ok(McpResponse::FinalTaskAck(
                         crate::tasks::TaskAcknowledgement::new(),
                     ));

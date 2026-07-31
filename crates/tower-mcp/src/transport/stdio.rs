@@ -112,6 +112,23 @@ struct StdioSubscriptions {
     active: HashMap<RequestId, SubscriptionFilter>,
     modern_mode: bool,
     server_info: Option<Implementation>,
+    /// Whether the served router opted into the Tasks extension. Captured at
+    /// startup because the listen handler only sees the generic service.
+    tasks_enabled: bool,
+}
+
+/// Whether a stdio `subscriptions/listen` request declared the Tasks
+/// extension in its per-request `_meta`.
+#[cfg(feature = "stateless")]
+fn stdio_request_declares_tasks(parsed: &serde_json::Value) -> bool {
+    parsed
+        .get("params")
+        .and_then(crate::stateless::StatelessRequestMeta::from_params)
+        .and_then(|meta| meta.client_capabilities)
+        .and_then(|capabilities| capabilities.extensions)
+        .is_some_and(|declared| {
+            declared.contains_key(tower_mcp_types::protocol::TASKS_EXTENSION_ID)
+        })
 }
 
 #[cfg(feature = "stateless")]
@@ -218,7 +235,22 @@ impl StdioSubscriptions {
             ]));
         }
 
-        let accepted = accepted_subscription_filter(requested);
+        // SEP-2663: asking for task notifications without declaring the
+        // extension is answered with the missing-capability error, the same
+        // way the three task methods answer it.
+        if requested.task_ids.is_some() && !stdio_request_declares_tasks(parsed) {
+            let response = JsonRpcResponse::error(
+                Some(request_id),
+                crate::error::JsonRpcError::missing_required_client_capability(
+                    crate::router::tasks_client_capabilities(),
+                ),
+            );
+            return Ok(StdioSubscriptionInput::Handled(vec![
+                serde_json::to_string(&response)?,
+            ]));
+        }
+
+        let accepted = accepted_subscription_filter(requested, self.tasks_enabled);
         let acknowledgment = subscription_acknowledgment(request_id.clone(), accepted.clone());
         let acknowledgment = serde_json::to_string(&acknowledgment)?;
         self.modern_mode = true;
@@ -236,6 +268,7 @@ impl StdioSubscriptions {
                     | ServerNotification::ResourcesListChanged
                     | ServerNotification::ToolsListChanged
                     | ServerNotification::PromptsListChanged
+                    | ServerNotification::FinalTaskStatusChanged(_)
             )
         {
             return None;
@@ -353,6 +386,11 @@ pub(crate) fn serialize_notification(notification: &ServerNotification) -> Optio
         ServerNotification::TaskStatusChanged(params) => {
             let notif = JsonRpcNotification::new(notifications::TASK_STATUS_CHANGED)
                 .with_params(serde_json::to_value(params).unwrap_or_default());
+            serde_json::to_string(&notif).ok()
+        }
+        ServerNotification::FinalTaskStatusChanged(params) => {
+            let notif = JsonRpcNotification::new(notifications::TASK_STATUS_CHANGED)
+                .with_params(serde_json::to_value(params).ok()?);
             serde_json::to_string(&notif).ok()
         }
     }
@@ -539,6 +577,7 @@ impl StdioTransport {
         #[cfg(feature = "stateless")]
         let mut subscriptions = StdioSubscriptions {
             server_info: Some(self.router.implementation()),
+            tasks_enabled: self.router.final_tasks_enabled(),
             ..StdioSubscriptions::default()
         };
 
@@ -1267,6 +1306,7 @@ impl BidirectionalStdioTransport {
         #[cfg(feature = "stateless")]
         let mut subscriptions = StdioSubscriptions {
             server_info: Some(self.router.implementation()),
+            tasks_enabled: self.router.final_tasks_enabled(),
             ..StdioSubscriptions::default()
         };
 

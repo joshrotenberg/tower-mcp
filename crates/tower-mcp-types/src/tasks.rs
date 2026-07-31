@@ -185,6 +185,11 @@ impl DetailedTask {
         }
     }
 
+    /// Server-generated identifier of the task this describes.
+    pub fn task_id(&self) -> &str {
+        &self.metadata().task_id
+    }
+
     /// Shared task metadata.
     pub fn metadata(&self) -> &TaskMetadata {
         match self {

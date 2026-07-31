@@ -146,8 +146,14 @@ pub enum ServerNotification {
     ToolsListChanged,
     /// The list of available prompts has changed
     PromptsListChanged,
-    /// Task status has changed
+    /// Task status has changed, in the legacy flat shape.
     TaskStatusChanged(crate::protocol::TaskStatusParams),
+    /// Task status has changed, in the final SEP-2663 shape.
+    ///
+    /// Carries the complete status-discriminated task, identical to what
+    /// `tasks/get` would have returned at that moment. Delivered only on
+    /// `subscriptions/listen` streams that named this task ID.
+    FinalTaskStatusChanged(crate::tasks::TaskStatusNotificationParams),
 }
 
 /// Sender for server notifications

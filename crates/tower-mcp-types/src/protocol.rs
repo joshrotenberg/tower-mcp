@@ -5523,6 +5523,13 @@ pub struct SubscriptionFilter {
     /// Replaces the former `resources/subscribe` RPC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_subscriptions: Option<Vec<String>>,
+    /// Task IDs to receive `notifications/tasks` for (SEP-2663). Unlike the
+    /// list-changed flags this names individual tasks, so a client observes
+    /// only the tasks it created. A client that sets this without declaring
+    /// the `io.modelcontextprotocol/tasks` extension is answered with
+    /// `-32021`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_ids: Option<Vec<String>>,
 }
 
 /// Parameters for a `notifications/subscriptions/acknowledged` notification:

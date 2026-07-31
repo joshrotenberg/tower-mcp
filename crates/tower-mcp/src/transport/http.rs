@@ -1299,6 +1299,21 @@ impl SessionHandle {
     }
 }
 
+#[cfg(feature = "stateless")]
+impl AppState {
+    /// Whether the served router opted into the Tasks extension.
+    ///
+    /// A boxed service is opaque here, so it reads as not enabled: the
+    /// acknowledgement then declines the task IDs rather than promising
+    /// notifications this transport cannot confirm anyone will send.
+    fn tasks_extension_enabled(&self) -> bool {
+        match &self.service_source {
+            ServiceSource::Router { router, .. } => router.final_tasks_enabled(),
+            ServiceSource::Service(_) => false,
+        }
+    }
+}
+
 /// The source of the MCP service for session creation.
 #[derive(Clone)]
 enum ServiceSource {
@@ -1410,6 +1425,7 @@ impl ModernSubscriptionRegistry {
                 | ServerNotification::ResourcesListChanged
                 | ServerNotification::ToolsListChanged
                 | ServerNotification::PromptsListChanged
+                | ServerNotification::FinalTaskStatusChanged(_)
         );
         if !subscription_scoped {
             return false;
@@ -3996,6 +4012,22 @@ fn stateless_sse_with_notifications(
 /// Serve the final, sessionless `subscriptions/listen` protocol over its
 /// owning POST response.
 #[cfg(feature = "stateless")]
+/// Whether a `subscriptions/listen` request declared the Tasks extension.
+///
+/// The listen handler runs ahead of the router, so it reads the per-request
+/// capabilities straight out of `_meta` rather than from request extensions.
+#[cfg(feature = "stateless")]
+fn listen_request_declares_tasks(parsed: &serde_json::Value) -> bool {
+    parsed
+        .get("params")
+        .and_then(crate::stateless::StatelessRequestMeta::from_params)
+        .and_then(|meta| meta.client_capabilities)
+        .and_then(|capabilities| capabilities.extensions)
+        .is_some_and(|declared| {
+            declared.contains_key(tower_mcp_types::protocol::TASKS_EXTENSION_ID)
+        })
+}
+
 async fn handle_modern_subscriptions_listen_sse(
     state: Arc<AppState>,
     parsed: &serde_json::Value,
@@ -4028,7 +4060,19 @@ async fn handle_modern_subscriptions_listen_sse(
             StatusCode::BAD_REQUEST,
         );
     };
-    let accepted = accepted_subscription_filter(requested);
+    // SEP-2663: a client asking for task notifications must have declared the
+    // extension, on this request like every other final-protocol request.
+    if requested.task_ids.is_some() && !listen_request_declares_tasks(parsed) {
+        return json_rpc_error_response_with_status(
+            id,
+            JsonRpcError::missing_required_client_capability(
+                crate::router::tasks_client_capabilities(),
+            ),
+            StatusCode::BAD_REQUEST,
+        );
+    }
+
+    let accepted = accepted_subscription_filter(requested, state.tasks_extension_enabled());
     let (rx, guard) = state
         .modern_subscriptions
         .register(subscription_id.clone(), accepted.clone());
