@@ -80,6 +80,23 @@
 //! Expiry follows the same rule: [`Task::is_expired`] runs from creation, and
 //! an expired task reads as absent rather than as expired, so a retention
 //! window cannot be probed either.
+//!
+//! # Status notifications
+//!
+//! A client may watch a task instead of polling it, by naming its ID in the
+//! `taskIds` filter of a `subscriptions/listen` stream. Each
+//! `notifications/tasks` carries the complete task, identical to the
+//! `tasks/get` response at that moment, so a client that hears about a
+//! completion already holds the result.
+//!
+//! The router announces the transitions it drives. A server that drives one
+//! itself, most commonly [`TaskStore::require_input`], announces it with
+//! [`McpRouter::notify_task_status_changed`](crate::McpRouter::notify_task_status_changed).
+//!
+//! Notifications are best effort and `tasks/get` stays authoritative: a task
+//! outlives the request that created it, so there may be no subscriber at the
+//! moment a transition happens, and a client that missed one loses nothing but
+//! time.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;

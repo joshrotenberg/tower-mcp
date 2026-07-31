@@ -727,8 +727,9 @@ and cross-principal protections.
 - [x] [`subscriptions/listen` SSE endpoint -- client-initiated server-push stream (SEP-2567)](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2567) (requires `protocol-2026-07-28`)
 - [x] [Per-request `_meta` client capabilities -- `StatelessRequestMeta` (SEP-2575)](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2575) (requires `protocol-2026-07-28`)
 - [x] [Multi Round-Trip Requests for tools, prompts, and resources (SEP-2322)](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr) (requires `protocol-2026-07-28`)
+- [x] [Tasks extension -- `tasks/get`, `tasks/update`, `tasks/cancel`, `notifications/tasks`, task ownership (SEP-2663)](examples/tasks.rs) (requires `protocol-2026-07-28` and `McpRouter::with_tasks`)
 
-We track all MCP Specification Enhancement Proposals (SEPs) as [GitHub issues](https://github.com/joshrotenberg/tower-mcp/issues?q=label%3Asep). A weekly workflow syncs status from the upstream spec repository.
+We read SEPs upstream rather than mirroring them here. Browse the `SEP` label on [modelcontextprotocol/modelcontextprotocol](https://github.com/modelcontextprotocol/modelcontextprotocol/issues?q=label%3ASEP) when auditing spec coverage.
 
 ## Examples
 

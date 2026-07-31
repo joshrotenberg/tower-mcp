@@ -91,6 +91,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 // `http_auth.rs`, and ownership begins to bind automatically. Nothing here
 // needs to change: the router reads the principal from the request context.
 //
+// # Watching a task instead of polling
+//
+// A client can poll `tasks/get`, or it can ask to be told. It opens a
+// `subscriptions/listen` stream naming the task IDs it cares about:
+//
+// ```json
+// {"jsonrpc":"2.0","id":"listen-1","method":"subscriptions/listen","params":{
+//   "_meta":{
+//     "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+//     "io.modelcontextprotocol/clientCapabilities":{
+//       "extensions":{"io.modelcontextprotocol/tasks":{}}}},
+//   "notifications":{"taskIds":["<the id from tools/call>"]}}}
+// ```
+//
+// Tasks are named one at a time rather than opted into as a class, so a
+// subscriber that asked for every other notification type still hears nothing
+// about a task it did not name. Requesting task IDs without declaring the
+// extension is answered with -32021, the same as issuing a task method
+// without it. The acknowledgement echoes the task IDs the server agreed to;
+// a server that never called `with_tasks()` echoes none.
+//
+// Each `notifications/tasks` carries the complete task, identical to the
+// `tasks/get` response at that moment, so a client that hears about a
+// completion already has the result and never needs the follow-up poll. The
+// router announces the transitions it drives: completion, failure,
+// cancellation, and the resumption that follows a `tasks/update`. Creation is
+// not announced, since a client cannot subscribe to an ID it has not received
+// yet. A server that drives a transition itself, most commonly
+// `TaskStore::require_input`, calls `McpRouter::notify_task_status_changed`.
+//
+// Notifications are best effort. `tasks/get` stays authoritative, so a client
+// that misses one because it was not listening yet loses nothing but time.
+//
+// # Denials
+//
 // A denied request returns exactly what an unknown task returns: -32602 with
 // "Task not found". SEP-2663 mandates -32602 for an unknown or expired task
 // but leaves the authorization failure to the server, so this is tower-mcp
