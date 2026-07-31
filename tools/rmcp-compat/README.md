@@ -8,9 +8,12 @@ each, and structurally compares the responses.
 
 The harness runs three in-process servers:
 
-- **rmcp** on port 4001 via `StreamableHttpService`
-- **tower-mcp** on port 4002 in default (bare JSON) mode
-- **tower-mcp SSE** on port 4003 with `.sse_responses(true)` to match rmcp's SSE wrapping
+- **rmcp** via `StreamableHttpService`
+- **tower-mcp** in default (bare JSON) mode
+- **tower-mcp SSE** with `.sse_responses(true)` to match rmcp's SSE wrapping
+
+Each server binds a separately reserved OS-assigned loopback port. Multiple
+harness processes can run concurrently without fixed-port collisions.
 
 It then runs a series of checks across all four operation groups:
 
@@ -33,8 +36,7 @@ It then runs a series of checks across all four operation groups:
 cargo run -p rmcp-compat
 ```
 
-The tool binds ports 4001, 4002, and 4003 on localhost. Make sure those ports
-are free before running.
+The selected loopback ports are printed at startup.
 
 ## Output format
 
@@ -69,7 +71,7 @@ Results: 17/21 checks passed (0 failed, 4 known-diffs, 0 errors)
 Known diffs are documented divergences that are intentional or explained. They
 appear as `[KNOWN-DIFF]` and do not cause a non-zero exit code.
 
-Current known diffs (against rmcp 3.0.0-beta.1):
+Current known diffs (verified against rmcp 3.1.0):
 
 **`error.message` phrasing for method-not-found:**
 rmcp returns just the method name (e.g. `"nonexistent/method"`); tower-mcp
@@ -92,7 +94,7 @@ A `tools/list` sent before `notifications/initialized` is rejected by tower-mcp
 with `-32600` (InvalidRequest) per #901. rmcp does not enforce this ordering and
 returns the tools list. tower-mcp is the stricter, more spec-compliant side, so
 this is a documented divergence rather than a tower-mcp bug. (With rmcp 1.7.0
-this surfaced as a FAIL; rmcp 2.1.0 and 3.0.0-beta.1 did not change the
+this surfaced as a FAIL; rmcp 2.1.0 and 3.1.0 did not change the
 behavior, so it is classified as a KNOWN-DIFF.)
 
 **SSE response wrapping (default mode):**
@@ -125,7 +127,7 @@ validates that the opt-in SSE mode matches rmcp's behavior exactly.
 Change the version constraint in `tools/rmcp-compat/Cargo.toml`:
 
 ```toml
-rmcp = { version = "3.0.0-beta.1", features = [...] }
+rmcp = { version = "=3.1.0", features = [...] }
 ```
 
 Then run the harness and update any KNOWN-DIFF entries that have changed.
@@ -135,13 +137,9 @@ Note the 1.x -> 2.x jump renamed `rmcp::model::Content` to
 `StreamableHttpService`, `LocalSessionManager`, `ServerHandler`, and the
 `#[tool]`/`#[tool_router]`/`#[tool_handler]` macro surfaces were unchanged.
 
-The 2.x -> 3.x jump (3.0.0-beta.1 implements the 2026-07-28 SEP batch)
-required no harness code changes: the harness does not use the surfaces that
-broke (Meta type split, `CallToolResult.structured_content` widening,
-`Annotations.last_modified`, the removed experimental tasks API). The
-`StreamableHttpServerConfig.stateful_mode` field was renamed
-`legacy_session_mode`; the harness uses `StreamableHttpServerConfig::default()`
-and the default remains `legacy_session_mode: true`, so rmcp still serves the
-2025-11-25 session-based flow that the harness exercises. rmcp 3.x dispatches
-the 2026-07-28 stateless protocol per-request, so requests negotiating
-`2025-11-25` behave as before.
+The 2.x -> 3.1 jump required no harness API changes: the harness does not use
+the surfaces that broke (Meta type split, `CallToolResult.structured_content`
+widening, `Annotations.last_modified`, or the removed experimental tasks API).
+The harness uses `StreamableHttpServerConfig::default()`, whose legacy-session
+mode serves the 2025-11-25 flow exercised here. Final-protocol interoperability
+is tracked separately in #1102.

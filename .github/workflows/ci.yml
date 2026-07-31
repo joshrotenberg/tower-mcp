@@ -214,3 +214,14 @@ jobs:
           cargo build -p mcp-repl
           cargo build --manifest-path examples/conformance-server/Cargo.toml
           cargo build --manifest-path examples/codegen-mcp/Cargo.toml
+
+  rmcp-compat:
+    name: rmcp 3.1 wire compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run differential compatibility harness
+        run: cargo run --locked -p rmcp-compat

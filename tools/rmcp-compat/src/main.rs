@@ -3,9 +3,8 @@
 //! Starts both servers in-process as tokio tasks, fires identical MCP JSON-RPC
 //! requests at each, and structurally compares the responses.
 //!
-//! rmcp server: port 4001 (path: /mcp/)
-//! tower-mcp server: port 4002 (path: /)
-//! tower-mcp SSE mode server: port 4003 (path: /)
+//! Each server binds an OS-assigned loopback port so concurrent local and CI
+//! runs cannot collide.
 //!
 //! Run with:
 //!   cargo run -p rmcp-compat
@@ -13,6 +12,7 @@
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
+use std::sync::atomic::{AtomicU16, Ordering};
 use tower_mcp::{CallToolResult, HttpTransport, McpRouter, ToolBuilder};
 
 // ============================================================
@@ -24,7 +24,7 @@ struct EchoInput {
     message: String,
 }
 
-async fn start_tower_mcp_server(port: u16) {
+async fn start_tower_mcp_server(listener: tokio::net::TcpListener) {
     let echo = ToolBuilder::new("echo")
         .description("Echo a message back")
         .handler(|input: EchoInput| async move { Ok(CallToolResult::text(input.message)) })
@@ -34,10 +34,9 @@ async fn start_tower_mcp_server(port: u16) {
         .server_info("tower-mcp-compat-test", "0.1.0")
         .tool(echo);
 
-    let addr = format!("127.0.0.1:{port}");
     let transport = HttpTransport::new(router).disable_origin_validation();
 
-    if let Err(e) = transport.serve(&addr).await {
+    if let Err(e) = axum::serve(listener, transport.into_router()).await {
         eprintln!("tower-mcp server error: {e}");
     }
 }
@@ -46,7 +45,7 @@ async fn start_tower_mcp_server(port: u16) {
 // tower-mcp server (SSE mode -- mirrors rmcp's SSE wrapping)
 // ============================================================
 
-async fn start_tower_mcp_sse_server(port: u16) {
+async fn start_tower_mcp_sse_server(listener: tokio::net::TcpListener) {
     let echo = ToolBuilder::new("echo")
         .description("Echo a message back")
         .handler(|input: EchoInput| async move { Ok(CallToolResult::text(input.message)) })
@@ -56,12 +55,11 @@ async fn start_tower_mcp_sse_server(port: u16) {
         .server_info("tower-mcp-compat-test-sse", "0.1.0")
         .tool(echo);
 
-    let addr = format!("127.0.0.1:{port}");
     let transport = HttpTransport::new(router)
         .disable_origin_validation()
         .sse_responses(true);
 
-    if let Err(e) = transport.serve(&addr).await {
+    if let Err(e) = axum::serve(listener, transport.into_router()).await {
         eprintln!("tower-mcp SSE server error: {e}");
     }
 }
@@ -118,7 +116,7 @@ mod rmcp_server {
     }
 }
 
-async fn start_rmcp_server(port: u16) {
+async fn start_rmcp_server(listener: tokio::net::TcpListener) {
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     };
@@ -130,8 +128,6 @@ async fn start_rmcp_server(port: u16) {
     );
 
     let axum_router = axum::Router::new().nest_service("/mcp", service);
-    let addr = format!("127.0.0.1:{port}");
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     if let Err(e) = axum::serve(listener, axum_router).await {
         eprintln!("rmcp server error: {e}");
     }
@@ -143,35 +139,43 @@ async fn start_rmcp_server(port: u16) {
 
 struct ServerConfig {
     name: &'static str,
-    port: u16,
+    port: &'static AtomicU16,
     path: &'static str,
 }
 
 impl ServerConfig {
+    fn port(&self) -> u16 {
+        self.port.load(Ordering::Relaxed)
+    }
+
     fn url(&self) -> String {
-        format!("http://127.0.0.1:{}{}", self.port, self.path)
+        format!("http://127.0.0.1:{}{}", self.port(), self.path)
     }
 
     fn display_name(&self) -> String {
-        format!("{} (port {})", self.name, self.port)
+        format!("{} (port {})", self.name, self.port())
     }
 }
 
+static RMCP_PORT: AtomicU16 = AtomicU16::new(0);
+static TOWER_MCP_PORT: AtomicU16 = AtomicU16::new(0);
+static TOWER_MCP_SSE_PORT: AtomicU16 = AtomicU16::new(0);
+
 const RMCP: ServerConfig = ServerConfig {
     name: "rmcp",
-    port: 4001,
+    port: &RMCP_PORT,
     path: "/mcp/",
 };
 
 const TOWER_MCP: ServerConfig = ServerConfig {
     name: "tower-mcp",
-    port: 4002,
+    port: &TOWER_MCP_PORT,
     path: "/",
 };
 
 const TOWER_MCP_SSE: ServerConfig = ServerConfig {
     name: "tower-mcp-sse",
-    port: 4003,
+    port: &TOWER_MCP_SSE_PORT,
     path: "/",
 };
 
@@ -1167,7 +1171,7 @@ async fn check_invalid_params(
 /// Send tools/list WITHOUT the notifications/initialized step. tower-mcp rejects
 /// this with -32600 (InvalidRequest) per #901. rmcp does not enforce the ordering
 /// and returns the tools list, so this is a KNOWN-DIFF (tower-mcp is the stricter,
-/// more spec-compliant side), verified current as of rmcp 3.0.0-beta.1.
+/// more spec-compliant side), verified current as of rmcp 3.1.0.
 async fn check_initialized_enforcement(client: &reqwest::Client) -> Vec<CheckResult> {
     // Start fresh sessions without sending notifications/initialized
     let init_body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"compat-enforcement-test","version":"0.1.0"}}}"#;
@@ -1403,9 +1407,17 @@ async fn check_sse_response_mode(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tokio::spawn(start_tower_mcp_server(4002));
-    tokio::spawn(start_tower_mcp_sse_server(4003));
-    tokio::spawn(start_rmcp_server(4001));
+    let rmcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let tower_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let tower_sse_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+
+    RMCP_PORT.store(rmcp_listener.local_addr()?.port(), Ordering::Relaxed);
+    TOWER_MCP_PORT.store(tower_listener.local_addr()?.port(), Ordering::Relaxed);
+    TOWER_MCP_SSE_PORT.store(tower_sse_listener.local_addr()?.port(), Ordering::Relaxed);
+
+    tokio::spawn(start_rmcp_server(rmcp_listener));
+    tokio::spawn(start_tower_mcp_server(tower_listener));
+    tokio::spawn(start_tower_mcp_sse_server(tower_sse_listener));
 
     println!(
         "Waiting for servers: {}, {}, and {}...",
@@ -1419,15 +1431,18 @@ async fn main() -> Result<()> {
     let tower_sse_ready = wait_for_ready(&TOWER_MCP_SSE).await;
 
     if !rmcp_ready {
-        eprintln!("ERROR: rmcp server did not start on port 4001");
+        eprintln!("ERROR: {} did not become ready", RMCP.display_name());
         std::process::exit(1);
     }
     if !tower_ready {
-        eprintln!("ERROR: tower-mcp server did not start on port 4002");
+        eprintln!("ERROR: {} did not become ready", TOWER_MCP.display_name());
         std::process::exit(1);
     }
     if !tower_sse_ready {
-        eprintln!("ERROR: tower-mcp SSE server did not start on port 4003");
+        eprintln!(
+            "ERROR: {} did not become ready",
+            TOWER_MCP_SSE.display_name()
+        );
         std::process::exit(1);
     }
 
