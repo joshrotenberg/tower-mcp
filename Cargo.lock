@@ -1572,7 +1572,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "mcp-repl"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "clap",
@@ -3150,7 +3150,7 @@ checksum = "121c2a6cda46980bb0fcd1647ffaf6cd3fc79a013de288782836f6df9c48780e"
 
 [[package]]
 name = "tower-mcp"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3189,7 +3189,7 @@ dependencies = [
 
 [[package]]
 name = "tower-mcp-macros"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3198,7 +3198,7 @@ dependencies = [
 
 [[package]]
 name = "tower-mcp-types"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "base64 0.23.0",
  "proptest",

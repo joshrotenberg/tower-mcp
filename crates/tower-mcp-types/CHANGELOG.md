@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.16.0] - 2026-07-31
+
+### Bug Fixes
+
+- **tasks:** Make final task creation server-directed ([#1095](https://github.com/joshrotenberg/tower-mcp/pull/1095))
+
+### Documentation
+
+- **tasks:** Document the task authorization model ([#1090](https://github.com/joshrotenberg/tower-mcp/pull/1090))
+
+### Features
+
+- **tasks:** Dispatch the final task methods ([#1088](https://github.com/joshrotenberg/tower-mcp/pull/1088))
+- **tasks:** Push notifications/tasks on state transitions ([#1092](https://github.com/joshrotenberg/tower-mcp/pull/1092))
+
+
+
 ## [0.15.0] - 2026-07-30
 
 ### Documentation

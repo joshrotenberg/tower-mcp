@@ -2,6 +2,36 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.16.0] - 2026-07-31
+
+### Bug Fixes
+
+- **tasks:** Make final task creation server-directed ([#1095](https://github.com/joshrotenberg/tower-mcp/pull/1095))
+
+### Documentation
+
+- **tasks:** Document the task authorization model ([#1090](https://github.com/joshrotenberg/tower-mcp/pull/1090))
+
+### Features
+
+- **tasks:** Durable task state and input flow ([#1076](https://github.com/joshrotenberg/tower-mcp/pull/1076))
+- **tasks:** Negotiate the final tasks extension ([#1078](https://github.com/joshrotenberg/tower-mcp/pull/1078))
+- **tasks:** Dispatch the final task methods ([#1088](https://github.com/joshrotenberg/tower-mcp/pull/1088))
+- **tasks:** Bind task operations to the authenticated principal ([#1089](https://github.com/joshrotenberg/tower-mcp/pull/1089))
+- **client:** Add typed tasks/update API ([#1091](https://github.com/joshrotenberg/tower-mcp/pull/1091))
+- **tasks:** Push notifications/tasks on state transitions ([#1092](https://github.com/joshrotenberg/tower-mcp/pull/1092))
+
+### Testing
+
+- Add coverage for the unix socket transport ([#1073](https://github.com/joshrotenberg/tower-mcp/pull/1073))
+- Check each public feature combination ([#1094](https://github.com/joshrotenberg/tower-mcp/pull/1094))
+
+### Build
+
+- **deps:** Bump jsonwebtoken from 10.3.0 to 11.0.0 ([#1086](https://github.com/joshrotenberg/tower-mcp/pull/1086))
+
+
+
 ## [0.15.0] - 2026-07-30
 
 ### Bug Fixes
