@@ -1,0 +1,3 @@
+python/.venv/
+python/__pycache__/
+typescript/node_modules/

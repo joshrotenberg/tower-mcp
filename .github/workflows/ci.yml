@@ -238,3 +238,27 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run differential compatibility harness
         run: cargo run --locked -p rmcp-compat
+
+  sdk-interop:
+    name: Official SDK interop (TypeScript + Python)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: tools/sdk-interop/typescript/package-lock.json
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.11.32"
+          enable-cache: true
+          cache-dependency-glob: tools/sdk-interop/python/uv.lock
+      - name: Run official SDK interoperability matrix
+        run: python3 tools/sdk-interop/run.py

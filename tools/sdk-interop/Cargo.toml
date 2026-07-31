@@ -1,0 +1,23 @@
+[package]
+name = "sdk-interop"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Official MCP TypeScript and Python SDK interoperability harness"
+
+[[bin]]
+name = "sdk-interop"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tower-mcp = { path = "../../crates/tower-mcp", features = [
+    "http",
+    "http-client",
+    "protocol-2026-07-28",
+] }
