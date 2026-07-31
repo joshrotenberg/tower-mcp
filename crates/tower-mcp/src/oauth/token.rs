@@ -529,21 +529,23 @@ impl JwksValidator {
     /// `jwks_url` is the URL of the JWKS endpoint (e.g.,
     /// `https://auth.example.com/.well-known/jwks.json`).
     pub fn builder(jwks_url: impl Into<String>) -> JwksValidatorBuilder {
-        let mut validation = Validation::default();
-        // Allow all algorithms -- the per-key algorithm from JWKS will be used
-        validation.algorithms = vec![
-            Algorithm::RS256,
-            Algorithm::RS384,
-            Algorithm::RS512,
-            Algorithm::ES256,
-            Algorithm::ES384,
-            Algorithm::PS256,
-            Algorithm::PS384,
-            Algorithm::PS512,
-            Algorithm::EdDSA,
-        ];
-        validation.validate_aud = false;
-        validation.required_spec_claims.clear();
+        let validation = Validation {
+            // Allow all algorithms -- the per-key algorithm from JWKS will be used.
+            algorithms: vec![
+                Algorithm::RS256,
+                Algorithm::RS384,
+                Algorithm::RS512,
+                Algorithm::ES256,
+                Algorithm::ES384,
+                Algorithm::PS256,
+                Algorithm::PS384,
+                Algorithm::PS512,
+                Algorithm::EdDSA,
+            ],
+            validate_aud: false,
+            required_spec_claims: Default::default(),
+            ..Default::default()
+        };
 
         JwksValidatorBuilder {
             jwks_url: jwks_url.into(),
