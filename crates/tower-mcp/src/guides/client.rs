@@ -1,3 +1,4 @@
+#![doc = r####"
 # Client guide
 
 This guide covers the choices an application makes when using tower-mcp as an
@@ -11,7 +12,7 @@ specification rather than this guide:
 - [2026-07-28 discovery](https://modelcontextprotocol.io/specification/2026-07-28/server/discover)
 
 For authorization-code, client-credentials, and custom token-provider setup,
-continue with the [OAuth authorization guide](oauth.md).
+continue with the [OAuth authorization guide](crate::guides::oauth).
 
 ## Choose a transport
 
@@ -93,7 +94,7 @@ async fn main() -> Result<(), BoxError> {
 
 For a static bearer token, API key, or basic credentials, configure the
 `HttpClientTransport` before connecting. For token acquisition and refresh,
-use a token provider from the [OAuth guide](oauth.md); avoid copying tokens
+use a token provider from the [OAuth guide](crate::guides::oauth); avoid copying tokens
 into custom headers yourself.
 
 ### Released 2026-07-28 lifecycle
@@ -132,7 +133,7 @@ async fn main() -> Result<(), BoxError> {
 
 Do not call `initialize` on this path. `discover` selects a mutually supported
 modern version, and the client then adds the required per-request `_meta` and
-HTTP headers. See the [protocol-version guide](protocol-versions.md) for
+HTTP headers. See the [protocol-version guide](crate::guides::protocol_versions) for
 stable-only, final-only, and dual-era policies.
 
 ## Handle callbacks and server requests
@@ -144,7 +145,7 @@ advertises.
 
 For notification callbacks:
 
-```rust
+```rust,no_run
 use tower_mcp::BoxError;
 use tower_mcp::client::{
     McpClient, NotificationHandler, StdioClientTransport,
@@ -173,7 +174,7 @@ elicitation. Pair the implementation with the matching builder call:
 - `with_sampling()` must be paired with `handle_create_message`.
 - `with_elicitation()` must be paired with `handle_elicit` and a real consent UI.
 
-The [client handler example](../examples/client_handler.rs) contains a complete
+The [client handler example](https://github.com/joshrotenberg/tower-mcp/blob/main/examples/client_handler.rs) contains a complete
 implementation. On the 2026-07-28 path, the same handler resolves embedded
 Multi Round-Trip Request inputs; `max_mrtr_rounds` bounds the automatic loop
 and defaults to eight.
@@ -285,7 +286,7 @@ For final-protocol notifications, keep the returned `SubscriptionHandle`, wait
 for `acknowledged()`, and call `cancel()` when finished. Dropping the handle
 requests best-effort cancellation; explicit cancellation confirms the stream
 closed. The runnable flow is in
-[`stateless_http_client.rs`](../examples/stateless_http_client.rs).
+[`stateless_http_client.rs`](https://github.com/joshrotenberg/tower-mcp/blob/main/examples/stateless_http_client.rs).
 
 ## Runnable examples
 
@@ -305,5 +306,6 @@ cargo run --example stateless_http_client \
   --features "http,http-client,protocol-2026-07-28"
 ```
 
-See the [examples index](../examples/README.md) for OAuth, task, subscription,
-and conformance clients.
+See the [examples index](https://github.com/joshrotenberg/tower-mcp/blob/main/examples/README.md)
+for OAuth, task, subscription, and conformance clients.
+"####]

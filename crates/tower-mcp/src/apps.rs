@@ -13,6 +13,9 @@
 //! `text/html;profile=mcp-app` MIME type. External CSP sources are restricted
 //! to origins: credentials, paths, queries, fragments, and unsupported schemes
 //! are rejected.
+//!
+//! See [`crate::guides::mcp_apps`] for the task-oriented setup, security
+//! boundary, CSP and permissions policy, and visibility guidance.
 
 use std::collections::HashSet;
 use std::fmt;

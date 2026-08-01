@@ -5,6 +5,9 @@
 //! handles request/response correlation, server-initiated requests
 //! (sampling, elicitation, roots), and notifications.
 //!
+//! See [`crate::guides::client`] for transport selection, lifecycle setup,
+//! callbacks, common requests, caching, retry policy, and shutdown guidance.
+//!
 //! # Example
 //!
 //! ```rust,no_run

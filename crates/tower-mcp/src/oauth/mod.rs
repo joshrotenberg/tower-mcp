@@ -94,6 +94,10 @@
 //! 3. Client fetches the resource's RFC 9728 well-known metadata URL
 //! 4. Client obtains token from the authorization server
 //! 5. Client retries with `Authorization: Bearer <token>`
+//!
+//! See [`crate::guides::oauth`] for complete resource-server and client setup,
+//! registration and persistence policy, identity-provider integration, and a
+//! production checklist.
 
 pub mod error;
 pub mod metadata;

@@ -1,3 +1,4 @@
+#![doc = r####"
 # OAuth authorization with tower-mcp
 
 This guide explains how to assemble tower-mcp's OAuth resource-server and
@@ -437,3 +438,4 @@ security boundaries rather than identity-provider details.
 [rfc9700]: https://www.rfc-editor.org/rfc/rfc9700
 [rfc9728]: https://www.rfc-editor.org/rfc/rfc9728
 [cimd]: https://datatracker.ietf.org/doc/draft-ietf-oauth-client-id-metadata-document/
+"####]

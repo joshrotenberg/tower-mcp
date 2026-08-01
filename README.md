@@ -55,11 +55,11 @@ If you've used [axum](https://docs.rs/axum), tower-mcp's API will feel familiar:
 
 | Guide | Use it when |
 |---|---|
-| [Client usage](docs/client.md) | Choosing a transport, connecting, handling callbacks, making requests, configuring caching, or defining retry policy |
-| [HTTP deployment](docs/deployment.md) | Mounting an endpoint, configuring proxies and origins, choosing session/scaling policy, or placing middleware and timeouts |
-| [Protocol versions](docs/protocol-versions.md) | Selecting compile-time and runtime support, comparing lifecycle behavior, planning interoperability, or upgrading revisions |
-| [OAuth authorization](docs/oauth.md) | Protecting an MCP resource server, building an interactive or service client, choosing registration/storage policy, or preparing an OAuth deployment |
-| [MCP Apps](docs/mcp-apps.md) | Returning typed app resources from tools with negotiation and safe fallback |
+| [Client usage](https://docs.rs/tower-mcp/latest/tower_mcp/guides/client/) | Choosing a transport, connecting, handling callbacks, making requests, configuring caching, or defining retry policy |
+| [HTTP deployment](https://docs.rs/tower-mcp/latest/tower_mcp/guides/deployment/) | Mounting an endpoint, configuring proxies and origins, choosing session/scaling policy, or placing middleware and timeouts |
+| [Protocol versions](https://docs.rs/tower-mcp/latest/tower_mcp/guides/protocol_versions/) | Selecting compile-time and runtime support, comparing lifecycle behavior, planning interoperability, or upgrading revisions |
+| [OAuth authorization](https://docs.rs/tower-mcp/latest/tower_mcp/guides/oauth/) | Protecting an MCP resource server, building an interactive or service client, choosing registration/storage policy, or preparing an OAuth deployment |
+| [MCP Apps](https://docs.rs/tower-mcp/latest/tower_mcp/guides/mcp_apps/) | Returning typed app resources from tools with negotiation and safe fallback |
 | [Examples index](examples/README.md) | Looking for a runnable server, client, transport, middleware, or extension pattern |
 
 ## Quick Start
@@ -503,7 +503,7 @@ Ok(app)
 }
 ```
 
-See the [OAuth authorization guide](docs/oauth.md) for JWKS validation,
+See the [OAuth authorization guide](https://docs.rs/tower-mcp/latest/tower_mcp/guides/oauth/) for JWKS validation,
 interactive authorization code, registration choices, persistence, scope
 step-up, service credentials, and the production checklist. The
 [`http_auth`](examples/http_auth.rs) and
@@ -624,7 +624,7 @@ tower-mcp targets the [MCP specification 2025-11-25](https://modelcontextprotoco
 
 For application-facing guidance on the stable default, opt-in 2026-07-28
 implementation, compile-time features, runtime allowlists, interoperability,
-and upgrade policy, start with the [protocol-version guide](docs/protocol-versions.md).
+and upgrade policy, start with the [protocol-version guide](https://docs.rs/tower-mcp/latest/tower_mcp/guides/protocol_versions/).
 
 - **Server (2025-11-25):** 48/48 checks (`conformance@0.2.0-alpha.10`, `--suite all`); the server baseline is empty
 - **Client (2025-11-25):** all 18 scenarios green, 235 checks (`conformance@0.2.0-alpha.10`, `--suite all`); the client baseline is empty
@@ -640,9 +640,9 @@ hints, Multi Round-Trip Requests, and the final Tasks extension. The default
 runtime remains 2025-11-25, including for clients built with `full`.
 
 Compile-time availability and runtime allowlists are separate. The
-[protocol-version guide](docs/protocol-versions.md) explains the constants,
+[protocol-version guide](https://docs.rs/tower-mcp/latest/tower_mcp/guides/protocol_versions/) explains the constants,
 feature policy, lifecycle differences, interoperability, and upgrade path;
-the [client guide](docs/client.md) covers final discovery, caching, MRTR,
+the [client guide](https://docs.rs/tower-mcp/latest/tower_mcp/guides/client/) covers final discovery, caching, MRTR,
 retries, and shutdown with runnable examples.
 
 [SEP-2484](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2484) (accepted) makes merged conformance scenarios a prerequisite for standards-track SEPs reaching `final`, which elevates the conformance suite from a nice-to-have to spec-gating infrastructure. We run it on every PR to catch regressions early and to stay ahead of new scenarios as the spec evolves.
@@ -672,7 +672,7 @@ retries, and shutdown with runnable examples.
 - [x] [SSE event IDs and stream resumption](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#resumability-and-redelivery) (SEP-1699)
 - [x] [`_meta` field on all protocol types](https://modelcontextprotocol.io/specification/2025-11-25)
 - [x] [Protocol extension declaration and runtime negotiation (SEP-2133)](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2133)
-- [x] [Typed MCP Apps server resources and tool linkage (SEP-1865)](docs/mcp-apps.md) (requires `mcp-apps`; runtime opt-in remains explicit)
+- [x] [Typed MCP Apps server resources and tool linkage (SEP-1865)](https://docs.rs/tower-mcp/latest/tower_mcp/guides/mcp_apps/) (requires `mcp-apps`; runtime opt-in remains explicit)
 - [x] [Strict HTTP headers: `Mcp-Method`, `Mcp-Name`, `MCP-Protocol-Version` (SEP-2243)](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2243) (final)
 - [x] [`server/discover` RPC -- stateless capability discovery (SEP-2575)](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2575) (requires `protocol-2026-07-28`)
 - [x] [`subscriptions/listen` SSE endpoint -- client-initiated server-push stream (SEP-2567)](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2567) (requires `protocol-2026-07-28`)

@@ -1,3 +1,4 @@
+#![doc = r####"
 # Protocol-version guide
 
 tower-mcp separates three questions that are easy to conflate:
@@ -200,7 +201,7 @@ client/transport for fallback, and call `initialize` only after classifying the
 server as legacy. Reusing a partially probed connection risks mixing lifecycle
 state.
 
-See the [client guide](client.md) for complete setup and request patterns.
+See the [client guide](crate::guides::client) for complete setup and request patterns.
 
 ## Behavioral differences applications must account for
 
@@ -296,5 +297,6 @@ cargo run --example stateless_http_client \
 cargo run --example tasks --features protocol-2026-07-28
 ```
 
-The [examples index](../examples/README.md) also links the stable HTTP and
-conformance implementations.
+The [examples index](https://github.com/joshrotenberg/tower-mcp/blob/main/examples/README.md)
+also links the stable HTTP and conformance implementations.
+"####]

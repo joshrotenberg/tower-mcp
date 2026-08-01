@@ -1,3 +1,4 @@
+#![doc = r####"
 # HTTP deployment guide
 
 This guide covers mounting and operating tower-mcp's Streamable HTTP server.
@@ -8,7 +9,7 @@ requirements live in the MCP specifications:
 - [2026-07-28 specification](https://modelcontextprotocol.io/specification/2026-07-28)
 - [2026-07-28 key changes](https://modelcontextprotocol.io/specification/2026-07-28/changelog)
 
-Read the [OAuth authorization guide](oauth.md) before exposing an MCP endpoint
+Read the [OAuth authorization guide](crate::guides::oauth) before exposing an MCP endpoint
 outside a trusted network.
 
 ## Install the server transport
@@ -22,7 +23,7 @@ axum = "0.8"
 
 Add `protocol-2026-07-28` when this deployment should accept the released
 sessionless protocol. Compile-time availability and runtime selection are
-separate; see the [protocol-version guide](protocol-versions.md).
+separate; see the [protocol-version guide](crate::guides::protocol_versions).
 
 ## Standalone or mounted
 
@@ -71,7 +72,7 @@ async fn main() -> Result<(), BoxError> {
 The MCP endpoint is now `/mcp` and its built-in health route is
 `/mcp/health`. Use `into_router_at_with_handle` when an admin endpoint needs a
 `SessionHandle` for session count, inspection, or termination. The
-[`axum_embedding` example](../examples/axum_embedding.rs) is the canonical
+[`axum_embedding` example](https://github.com/joshrotenberg/tower-mcp/blob/main/examples/axum_embedding.rs) is the canonical
 shared-router pattern.
 
 When OAuth is enabled, prefer `into_oauth_router_at` rather than nesting an
@@ -201,9 +202,9 @@ let transport = HttpTransport::new(McpRouter::new())
 
 The snippet shows the trait wiring; replace both memory implementations with
 an external backend for a real multi-instance deployment. See
-[`horizontal_scaling.rs`](../examples/horizontal_scaling.rs),
-[`session_store.rs`](../examples/session_store.rs), and
-[`event_store.rs`](../examples/event_store.rs).
+[`horizontal_scaling.rs`](https://github.com/joshrotenberg/tower-mcp/blob/main/examples/horizontal_scaling.rs),
+[`session_store.rs`](https://github.com/joshrotenberg/tower-mcp/blob/main/examples/session_store.rs), and
+[`event_store.rs`](https://github.com/joshrotenberg/tower-mcp/blob/main/examples/event_store.rs).
 
 ## Reverse proxies and SSE
 
@@ -293,7 +294,7 @@ dependencies should gate traffic.
 
 Own the axum server lifecycle when you need graceful shutdown:
 
-```rust
+```rust,no_run
 use tower_mcp::{BoxError, HttpTransport, McpRouter};
 
 #[tokio::main]
@@ -351,5 +352,7 @@ cargo run --example stateless_http_client \
   --features "http,http-client,protocol-2026-07-28"
 ```
 
-The rustdoc [`deployment` module](https://docs.rs/tower-mcp/latest/tower_mcp/deployment/)
-contains additional systemd, proxy, and capacity-planning notes.
+The feature-gated
+[`tower_mcp::deployment`](https://docs.rs/tower-mcp/latest/tower_mcp/deployment/)
+reference contains additional systemd, proxy, and capacity-planning notes.
+"####]

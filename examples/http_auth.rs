@@ -287,9 +287,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
                 .authorization_server(&issuer)
                 .scope("mcp:read")
                 .scope("mcp:write")
-                .resource_documentation(
-                    "https://github.com/joshrotenberg/tower-mcp/blob/main/docs/oauth.md",
-                );
+                .resource_documentation("https://docs.rs/tower-mcp/latest/tower_mcp/guides/oauth/");
             let transport = HttpTransport::new(mcp_router).disable_origin_validation();
             oauth::wrap(transport, metadata, validator)?
         }

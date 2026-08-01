@@ -8,10 +8,11 @@ If you are dropping tower-mcp into an existing axum application,
 `HttpTransport::into_router()` composes with your own routes, state, and
 tower middleware.
 
-For a guided path, see [client usage](../docs/client.md),
-[HTTP deployment](../docs/deployment.md),
-[protocol versions](../docs/protocol-versions.md), and
-[OAuth authorization](../docs/oauth.md).
+For a guided path, see
+[client usage](https://docs.rs/tower-mcp/latest/tower_mcp/guides/client/),
+[HTTP deployment](https://docs.rs/tower-mcp/latest/tower_mcp/guides/deployment/),
+[protocol versions](https://docs.rs/tower-mcp/latest/tower_mcp/guides/protocol_versions/), and
+[OAuth authorization](https://docs.rs/tower-mcp/latest/tower_mcp/guides/oauth/).
 
 ## Running Examples
 
@@ -42,7 +43,7 @@ cargo run --example stateless_http_client --features "http,http-client,protocol-
 cargo run --example server_discover --features "http,protocol-2026-07-28"
 cargo run --example tasks --features protocol-2026-07-28
 
-# OAuth resource server and clients (see ../docs/oauth.md for configuration)
+# OAuth resource server and clients (see the published OAuth guide for configuration)
 cargo run --example http_auth --features jwks -- --auth jwks
 cargo run --example oauth_client --features oauth-client -- --mode authorization-code
 cargo run --example oauth_client --features oauth-client -- --mode credentials
@@ -93,7 +94,8 @@ cargo run --example tool_macro --features macros
 | [oauth_client](oauth_client.rs) | Static tokens, client credentials, interactive authorization code with PKCE/scope escalation, and custom providers |
 | [external_api_auth](external_api_auth.rs) | Downstream API authentication patterns |
 
-See the [OAuth authorization guide](../docs/oauth.md) for end-to-end setup,
+See the [OAuth authorization guide](https://docs.rs/tower-mcp/latest/tower_mcp/guides/oauth/)
+for end-to-end setup,
 registration and storage policy, identity-provider integration, and the
 production checklist.
 

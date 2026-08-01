@@ -1,3 +1,4 @@
+#![doc = r####"
 # MCP Apps server support
 
 tower-mcp provides an opt-in, typed server surface for the stable
@@ -51,7 +52,8 @@ let router = McpRouter::new()
 ```
 
 See the complete runnable
-[`mcp_apps`](../examples/mcp_apps.rs) example.
+[`mcp_apps`](https://github.com/joshrotenberg/tower-mcp/blob/main/examples/mcp_apps.rs)
+example.
 
 ## What the typed API guarantees
 
@@ -131,3 +133,4 @@ App-originated calls. Cross-server App calls remain a host policy violation.
 Visibility metadata is not server-side authorization. Apply normal Tower
 authentication, authorization, rate limits, and audit middleware to every
 tool, including App-only tools.
+"####]

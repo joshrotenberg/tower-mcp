@@ -337,10 +337,9 @@
 //!
 //! # See Also
 //!
-//! - The repository's
-//!   [HTTP deployment guide](https://github.com/joshrotenberg/tower-mcp/blob/main/docs/deployment.md)
-//!   is the task-oriented starting point for endpoint mounting, proxy headers,
-//!   protocol policy, timeouts, and production checklists.
+//! - [`crate::guides::deployment`] is the task-oriented starting point for
+//!   endpoint mounting, proxy headers, protocol policy, timeouts, and
+//!   production checklists.
 //! - [`session_store`] for the `SessionStore` trait and implementations.
 //! - [`event_store`] for the `EventStore` trait and SSE event persistence.
 //! - The `session_store` and `event_store` examples in the repo show

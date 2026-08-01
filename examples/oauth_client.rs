@@ -23,7 +23,7 @@
 //!   cargo run --example oauth_client --features oauth-client -- --mode custom
 //!
 //! The authorization-code mode expects a real OAuth authorization server. See
-//! `docs/oauth.md` for its environment variables and an end-to-end setup.
+//! [`tower_mcp::guides::oauth`] for its environment variables and an end-to-end setup.
 
 use async_trait::async_trait;
 use tower_mcp::client::{
