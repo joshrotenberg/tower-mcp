@@ -1,8 +1,8 @@
 //! Standalone MCP protocol and error types -- zero runtime dependencies.
 //!
-//! `tower-mcp-types` ships all [Model Context Protocol](https://modelcontextprotocol.io)
-//! (MCP 2025-11-25) types and JSON-RPC 2.0 primitives as a self-contained
-//! crate. It has **no dependency on Tower, Tokio, axum, or any async
+//! `tower-mcp-types` ships [Model Context Protocol](https://modelcontextprotocol.io)
+//! types and JSON-RPC 2.0 primitives as a self-contained crate. It has **no
+//! dependency on Tower, Tokio, axum, or any async
 //! runtime** -- only `serde`, `serde_json`, `thiserror`, and `base64`.
 //!
 //! This makes it suitable for:
@@ -15,7 +15,10 @@
 //!
 //! The [`inspection`] module provides strict, transport-free classification of
 //! JSON-RPC requests, notifications, success responses, error responses, and
-//! batches for intermediaries that observe both sides of a connection.
+//! batches for intermediaries that observe both sides of a connection. Its
+//! [`inspection::McpInspector`] layers exact-revision MCP method, direction,
+//! batching, and typed parameter checks on top without selecting a revision
+//! implicitly or changing an application's runtime allowlist.
 //!
 //! # Stateless protocol support (2026-07-28)
 //!

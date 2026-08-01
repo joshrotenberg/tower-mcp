@@ -228,8 +228,12 @@ pub const PROTOCOL_VERSION_2026_07_28: &str = "2026-07-28";
 ///
 /// "Known" means the crate can represent at least part of the version's wire
 /// format. It does not mean a runtime implementation was compiled or enabled.
-pub const KNOWN_PROTOCOL_VERSIONS: &[&str] =
-    &[PROTOCOL_VERSION_2026_07_28, "2025-11-25", "2025-03-26"];
+pub const KNOWN_PROTOCOL_VERSIONS: &[&str] = &[
+    PROTOCOL_VERSION_2026_07_28,
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+];
 
 /// Deprecated implementation-status name for [`PROTOCOL_VERSION_2026_07_28`].
 #[deprecated(
@@ -5845,6 +5849,8 @@ mod tests {
     fn released_version_is_known_and_not_enabled_by_default() {
         assert_eq!(PROTOCOL_VERSION_2026_07_28, "2026-07-28");
         assert!(KNOWN_PROTOCOL_VERSIONS.contains(&PROTOCOL_VERSION_2026_07_28));
+        assert!(KNOWN_PROTOCOL_VERSIONS.contains(&"2025-06-18"));
+        assert!(!SUPPORTED_PROTOCOL_VERSIONS.contains(&"2025-06-18"));
         assert!(
             !SUPPORTED_PROTOCOL_VERSIONS.contains(&PROTOCOL_VERSION_2026_07_28),
             "the released 2026-07-28 implementation remains explicitly \

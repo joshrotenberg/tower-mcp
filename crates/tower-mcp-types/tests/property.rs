@@ -5,7 +5,9 @@
 //! must classify and round-trip correctly.
 
 use proptest::prelude::*;
-use tower_mcp_types::inspection::JsonRpcPayload;
+use tower_mcp_types::inspection::{
+    JsonRpcPayload, MCP_INSPECTION_PROFILES, McpDirection, McpInspector,
+};
 use tower_mcp_types::protocol::{ClientCapabilities, InitializeParams, JsonRpcMessage};
 
 /// Strings that include Unicode/control characters and occasionally force a
@@ -51,6 +53,18 @@ proptest! {
     #[test]
     fn inspect_arbitrary_json_never_panics(v in arb_json()) {
         let _ = JsonRpcPayload::inspect(&v);
+    }
+
+    /// Exact-revision inspection is also total for every supported profile
+    /// and optional direction.
+    #[test]
+    fn inspect_arbitrary_json_against_every_mcp_profile_never_panics(v in arb_json()) {
+        for revision in MCP_INSPECTION_PROFILES {
+            let inspector = McpInspector::new(revision).unwrap();
+            let _ = inspector.inspect(&v, None);
+            let _ = inspector.inspect(&v, Some(McpDirection::ClientToServer));
+            let _ = inspector.inspect(&v, Some(McpDirection::ServerToClient));
+        }
     }
 
     /// Classifying arbitrary text never panics.

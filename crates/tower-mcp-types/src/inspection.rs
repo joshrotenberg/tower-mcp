@@ -6,6 +6,11 @@
 //! classifies that complete surface without depending on a transport or async
 //! runtime.
 //!
+//! After structural classification, [`McpInspector`] can apply one exact
+//! date-based MCP profile. It distinguishes methods available in that
+//! revision, methods known from another revision, and extension methods while
+//! validating available method parameters and optional peer direction.
+//!
 //! # Example
 //!
 //! ```rust
@@ -45,6 +50,14 @@ use serde_json::{Map, Value};
 use crate::protocol::{
     JSONRPC_VERSION, JsonRpcErrorResponse, JsonRpcNotification, JsonRpcRequest,
     JsonRpcResultResponse,
+};
+
+mod mcp;
+
+pub use mcp::{
+    MCP_INSPECTION_PROFILES, McpCallKind, McpDirection, McpInspection, McpInspectionError,
+    McpInspectionErrorKind, McpInspector, McpMethodClassification, McpMethodInspection,
+    McpProtocolRevision,
 };
 
 /// The semantic kind of one JSON-RPC envelope.
