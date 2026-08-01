@@ -4985,7 +4985,9 @@ mod tests {
             .build();
 
         let router = McpRouter::new().tool(add_tool);
-        let mut service = JsonRpcService::new(router.clone());
+        let mut service = JsonRpcService::new(router.clone())
+            .protocol_versions(["2025-03-26"])
+            .unwrap();
 
         // Initialize session first
         init_jsonrpc_service(&mut service, &router).await;
@@ -5175,7 +5177,9 @@ mod tests {
             .build();
 
         let router = McpRouter::new().tool(add_tool);
-        let mut service = JsonRpcService::new(router.clone());
+        let mut service = JsonRpcService::new(router.clone())
+            .protocol_versions(["2025-03-26"])
+            .unwrap();
 
         init_jsonrpc_service(&mut service, &router).await;
 

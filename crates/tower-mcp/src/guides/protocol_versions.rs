@@ -223,6 +223,14 @@ tower-mcp version-gates these paths. It also keeps deprecated legacy features
 available where their protocol revision requires them. Do not branch on server
 display name or version; use negotiated protocol and capabilities.
 
+Top-level JSON-RPC arrays need a finer distinction than “legacy.” Request
+batches are accepted only for the exact `2025-03-26` revision. Batching was
+removed in `2025-06-18`, so `2025-11-25` and `2026-07-28` reject arrays before
+dispatch. `JsonRpcService` records the legacy revision returned by
+`initialize`; HTTP uses the session's negotiated revision, while final
+requests use their per-request metadata. A multi-version `ProtocolSupport`
+allowlist is never treated as enough context to guess batch policy.
+
 ## Interoperability policy
 
 For broad interoperability:

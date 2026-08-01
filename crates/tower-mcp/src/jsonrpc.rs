@@ -7,18 +7,23 @@
 //!
 //! The service handles:
 //! - Single request processing
-//! - Batch request processing (concurrent execution)
+//! - Exact-revision batch policy and concurrent request-batch execution
 //! - JSON-RPC version validation
 //! - Error conversion to JSON-RPC error responses
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 
 use tower::{Layer, ServiceExt};
 use tower_service::Service;
 
 use crate::error::{Error, JsonRpcError, Result};
+use crate::inspection::{
+    McpDirection, McpInspection, McpInspectionError, McpInspectionErrorKind, McpInspector,
+    McpProtocolRevision,
+};
 use crate::protocol::{
     JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, JsonRpcResponseMessage, McpRequest, ResultType,
 };
@@ -66,7 +71,9 @@ impl<S> Layer<S> for JsonRpcLayer {
 /// Service that handles JSON-RPC framing.
 ///
 /// Wraps an MCP service and handles JSON-RPC request/response conversion.
-/// Supports both single requests and batch requests.
+/// Supports single requests for every implemented revision. Request batches
+/// are accepted only after the exact runtime revision is known to be
+/// `2025-03-26`; later MCP revisions removed top-level JSON-RPC batching.
 ///
 /// Can be created directly via [`JsonRpcService::new`] or through the
 /// [`JsonRpcLayer`] for [`ServiceBuilder`](tower::ServiceBuilder) composition.
@@ -83,6 +90,7 @@ pub struct JsonRpcService<S> {
     inner: S,
     extensions: Extensions,
     protocol_support: ProtocolSupport,
+    negotiated_revision: Arc<RwLock<Option<McpProtocolRevision>>>,
 }
 
 impl<S> JsonRpcService<S> {
@@ -92,6 +100,7 @@ impl<S> JsonRpcService<S> {
             inner,
             extensions: Extensions::new(),
             protocol_support: ProtocolSupport::default(),
+            negotiated_revision: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -116,19 +125,148 @@ impl<S> JsonRpcService<S> {
 
     /// Construct and set an exact runtime protocol-version allow-list.
     pub fn protocol_versions<I, V>(
-        mut self,
+        self,
         versions: I,
     ) -> std::result::Result<Self, ProtocolSupportError>
     where
         I: IntoIterator<Item = V>,
         V: Into<String>,
     {
-        self.protocol_support = ProtocolSupport::try_new(versions)?;
-        Ok(self)
+        Ok(self.protocol_support(ProtocolSupport::try_new(versions)?))
     }
 
     pub(crate) fn configured_protocol_support(&self) -> &ProtocolSupport {
         &self.protocol_support
+    }
+
+    /// Validate a decoded inbound value using the exact runtime revision.
+    ///
+    /// Per-request metadata wins for the final protocol. Legacy traffic uses
+    /// the revision captured from a successful `initialize` response. A
+    /// single-version runtime policy is also exact; an allowlist with several
+    /// versions is never used to guess batch semantics.
+    pub(crate) fn inspect_incoming_value(
+        &self,
+        value: &serde_json::Value,
+        direction: McpDirection,
+    ) -> std::result::Result<McpInspection, JsonRpcError> {
+        let protocol_support = self
+            .extensions
+            .get::<ProtocolSupport>()
+            .unwrap_or(&self.protocol_support);
+        let revision = self.resolve_revision(value, protocol_support)?;
+        inspect_runtime_value(value, revision, protocol_support, direction)
+    }
+
+    /// Pin an already-negotiated revision supplied by a transport session.
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
+    pub(crate) fn with_negotiated_protocol_version(self, version: &str) -> Self {
+        if let Ok(revision) = version.parse()
+            && let Ok(mut selected) = self.negotiated_revision.write()
+        {
+            *selected = Some(revision);
+        }
+        self
+    }
+
+    fn resolve_revision(
+        &self,
+        value: &serde_json::Value,
+        protocol_support: &ProtocolSupport,
+    ) -> std::result::Result<McpProtocolRevision, JsonRpcError> {
+        if let Some(items) = value.as_array() {
+            let mut declared = items.iter().filter_map(|item| {
+                item.pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
+                    .and_then(serde_json::Value::as_str)
+            });
+            if let Some(version) = declared.next() {
+                if declared.any(|candidate| candidate != version) {
+                    return Err(JsonRpcError::invalid_request(
+                        "A JSON-RPC batch cannot mix MCP protocol revisions",
+                    ));
+                }
+                return allowed_revision(version, protocol_support);
+            }
+        }
+
+        if let Some(version) = value
+            .pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
+            .and_then(serde_json::Value::as_str)
+        {
+            return allowed_revision(version, protocol_support);
+        }
+
+        if value.get("method").and_then(serde_json::Value::as_str) == Some("initialize") {
+            let requested = value
+                .pointer("/params/protocolVersion")
+                .and_then(serde_json::Value::as_str);
+            let selected = requested
+                .filter(|version| {
+                    crate::protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(version)
+                        && protocol_support.contains(version)
+                })
+                .or_else(|| {
+                    protocol_support.versions().iter().find_map(|version| {
+                        crate::protocol::SUPPORTED_PROTOCOL_VERSIONS
+                            .contains(&version.as_str())
+                            .then_some(version.as_str())
+                    })
+                })
+                .ok_or_else(|| {
+                    JsonRpcError::unsupported_protocol_version(
+                        requested.unwrap_or("unknown"),
+                        protocol_support.versions().iter().map(String::as_str),
+                    )
+                })?;
+            return allowed_revision(selected, protocol_support);
+        }
+
+        if let Some(revision) = self
+            .extensions
+            .get::<McpProtocolRevision>()
+            .copied()
+            .or_else(|| {
+                self.negotiated_revision
+                    .read()
+                    .ok()
+                    .and_then(|revision| *revision)
+            })
+        {
+            if protocol_support.contains(revision.as_str()) {
+                return Ok(revision);
+            }
+            return Err(JsonRpcError::unsupported_protocol_version(
+                revision.as_str(),
+                protocol_support.versions().iter().map(String::as_str),
+            ));
+        }
+
+        if protocol_support.versions().len() == 1 {
+            return allowed_revision(protocol_support.preferred(), protocol_support);
+        }
+
+        if value.is_array() {
+            return Err(JsonRpcError::invalid_request(
+                "Cannot determine the exact MCP revision for a batch before protocol negotiation",
+            ));
+        }
+
+        // Before legacy initialization only version-invariant single calls
+        // such as `ping` are meaningful. Use the most-preferred enabled
+        // legacy implementation for their semantic profile; initialization
+        // itself is handled above and records the actual negotiated revision.
+        let provisional = protocol_support
+            .versions()
+            .iter()
+            .find(|version| {
+                crate::protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&version.as_str())
+            })
+            .ok_or_else(|| {
+                JsonRpcError::invalid_request(
+                    "Request does not declare an MCP revision and no legacy revision is enabled",
+                )
+            })?;
+        allowed_revision(provisional, protocol_support)
     }
 
     /// Validate the lifecycle metadata on a request without dispatching it.
@@ -144,6 +282,9 @@ impl<S> JsonRpcService<S> {
         req: &JsonRpcRequest,
     ) -> std::result::Result<Option<String>, JsonRpcError> {
         req.validate()?;
+        let value = serde_json::to_value(req)
+            .map_err(|error| JsonRpcError::invalid_request(error.to_string()))?;
+        self.inspect_incoming_value(&value, McpDirection::ClientToServer)?;
         let mut extensions = self.extensions.clone();
         let protocol_support = extensions
             .get::<ProtocolSupport>()
@@ -166,11 +307,16 @@ impl<S> JsonRpcService<S> {
             req,
             self.extensions.clone(),
             self.protocol_support.clone(),
+            self.negotiated_revision.clone(),
         )
         .await
     }
 
-    /// Process a batch of JSON-RPC requests concurrently
+    /// Process a `2025-03-26` batch of JSON-RPC requests concurrently.
+    ///
+    /// The exact revision must have been negotiated by `initialize`, supplied
+    /// by a transport session, or be the sole entry in [`ProtocolSupport`].
+    /// Later revisions return an invalid-request error.
     pub async fn call_batch(
         &mut self,
         requests: Vec<JsonRpcRequest>,
@@ -188,6 +334,11 @@ impl<S> JsonRpcService<S> {
             )));
         }
 
+        let value = serde_json::to_value(JsonRpcMessage::Batch(requests.clone()))
+            .map_err(Error::Serialization)?;
+        self.inspect_incoming_value(&value, McpDirection::ClientToServer)
+            .map_err(Error::JsonRpc)?;
+
         // Process all requests concurrently
         let futures: Vec<_> = requests
             .into_iter()
@@ -195,9 +346,18 @@ impl<S> JsonRpcService<S> {
                 let inner = self.inner.clone();
                 let extensions = self.extensions.clone();
                 let protocol_support = self.protocol_support.clone();
+                let negotiated_revision = self.negotiated_revision.clone();
                 let req_id = req.id.clone();
                 async move {
-                    match process_single_request(inner, req, extensions, protocol_support).await {
+                    match process_single_request(
+                        inner,
+                        req,
+                        extensions,
+                        protocol_support,
+                        negotiated_revision,
+                    )
+                    .await
+                    {
                         Ok(resp) => resp,
                         Err(e) => {
                             // Convert errors to error responses instead of dropping
@@ -231,10 +391,13 @@ impl<S> JsonRpcService<S> {
                 let response = self.call_single(req).await?;
                 Ok(JsonRpcResponseMessage::Single(response))
             }
-            JsonRpcMessage::Batch(requests) => {
-                let responses = self.call_batch(requests).await?;
-                Ok(JsonRpcResponseMessage::Batch(responses))
-            }
+            JsonRpcMessage::Batch(requests) => match self.call_batch(requests).await {
+                Ok(responses) => Ok(JsonRpcResponseMessage::Batch(responses)),
+                Err(Error::JsonRpc(error)) => Ok(JsonRpcResponseMessage::Single(
+                    JsonRpcResponse::error(None, error),
+                )),
+                Err(error) => Err(error),
+            },
             _ => Ok(JsonRpcResponseMessage::Single(JsonRpcResponse::error(
                 None,
                 JsonRpcError::invalid_request("Unsupported message type"),
@@ -252,6 +415,7 @@ where
             inner: self.inner.clone(),
             extensions: self.extensions.clone(),
             protocol_support: self.protocol_support.clone(),
+            negotiated_revision: self.negotiated_revision.clone(),
         }
     }
 }
@@ -274,15 +438,8 @@ where
     }
 
     fn call(&mut self, req: JsonRpcRequest) -> Self::Future {
-        let inner = self.inner.clone();
-        let extensions = self.extensions.clone();
-        let protocol_support = self.protocol_support.clone();
-        Box::pin(process_single_request(
-            inner,
-            req,
-            extensions,
-            protocol_support,
-        ))
+        let mut service = self.clone();
+        Box::pin(async move { service.call_single(req).await })
     }
 }
 
@@ -305,73 +462,8 @@ where
     }
 
     fn call(&mut self, msg: JsonRpcMessage) -> Self::Future {
-        let inner = self.inner.clone();
-        let extensions = self.extensions.clone();
-        let protocol_support = self.protocol_support.clone();
-        Box::pin(async move {
-            match msg {
-                JsonRpcMessage::Single(req) => {
-                    let response =
-                        process_single_request(inner, req, extensions, protocol_support).await?;
-                    Ok(JsonRpcResponseMessage::Single(response))
-                }
-                JsonRpcMessage::Batch(requests) => {
-                    if requests.is_empty() {
-                        // Empty batch is an invalid request per JSON-RPC spec
-                        return Ok(JsonRpcResponseMessage::Single(JsonRpcResponse::error(
-                            None,
-                            JsonRpcError::invalid_request("Empty batch request"),
-                        )));
-                    }
-
-                    // Process all requests concurrently
-                    let futures: Vec<_> = requests
-                        .into_iter()
-                        .map(|req| {
-                            let inner = inner.clone();
-                            let extensions = extensions.clone();
-                            let protocol_support = protocol_support.clone();
-                            let req_id = req.id.clone();
-                            async move {
-                                match process_single_request(
-                                    inner,
-                                    req,
-                                    extensions,
-                                    protocol_support,
-                                )
-                                .await
-                                {
-                                    Ok(resp) => resp,
-                                    Err(e) => {
-                                        // Convert errors to error responses instead of dropping
-                                        JsonRpcResponse::error(
-                                            Some(req_id),
-                                            JsonRpcError::internal_error(e.to_string()),
-                                        )
-                                    }
-                                }
-                            }
-                        })
-                        .collect();
-
-                    let results: Vec<JsonRpcResponse> = futures::future::join_all(futures).await;
-
-                    // Empty results only possible if input was empty (already handled above)
-                    if results.is_empty() {
-                        return Ok(JsonRpcResponseMessage::Single(JsonRpcResponse::error(
-                            None,
-                            JsonRpcError::internal_error("All batch requests failed"),
-                        )));
-                    }
-
-                    Ok(JsonRpcResponseMessage::Batch(results))
-                }
-                _ => Ok(JsonRpcResponseMessage::Single(JsonRpcResponse::error(
-                    None,
-                    JsonRpcError::invalid_request("Unsupported message type"),
-                ))),
-            }
-        })
+        let mut service = self.clone();
+        Box::pin(async move { service.call_message(msg).await })
     }
 }
 
@@ -381,9 +473,11 @@ async fn process_single_request<S>(
     req: JsonRpcRequest,
     mut extensions: Extensions,
     configured_protocol_support: ProtocolSupport,
+    negotiated_revision: Arc<RwLock<Option<McpProtocolRevision>>>,
 ) -> std::result::Result<JsonRpcResponse, Error>
 where
     S: Service<RouterRequest, Response = RouterResponse, Error = std::convert::Infallible>
+        + Clone
         + Send
         + 'static,
     S::Future: Send,
@@ -401,6 +495,19 @@ where
         .cloned()
         .unwrap_or(configured_protocol_support);
     extensions.insert(protocol_support.clone());
+
+    let inspection_service = JsonRpcService {
+        inner: inner.clone(),
+        extensions: extensions.clone(),
+        protocol_support: protocol_support.clone(),
+        negotiated_revision: negotiated_revision.clone(),
+    };
+    let request_value = serde_json::to_value(&req).map_err(Error::Serialization)?;
+    if let Err(error) =
+        inspection_service.inspect_incoming_value(&request_value, McpDirection::ClientToServer)
+    {
+        return Ok(JsonRpcResponse::error(Some(req.id), error));
+    }
 
     #[cfg(feature = "stateless")]
     let protocol_version = match prepare_modern_request(&req, &mut extensions, &protocol_support) {
@@ -433,10 +540,79 @@ where
 
     // Convert to JSON-RPC response
     let mut response = response.into_jsonrpc();
+    if method == "initialize"
+        && let JsonRpcResponse::Result(result) = &response
+        && let Some(version) = result
+            .result
+            .get("protocolVersion")
+            .and_then(serde_json::Value::as_str)
+        && protocol_support.contains(version)
+        && let Ok(revision) = version.parse::<McpProtocolRevision>()
+        && let Ok(mut selected) = negotiated_revision.write()
+    {
+        *selected = Some(revision);
+    }
     if let Some(version) = protocol_version.as_deref() {
         apply_protocol_result_fields(&mut response, &method, version);
     }
     Ok(response)
+}
+
+fn allowed_revision(
+    version: &str,
+    protocol_support: &ProtocolSupport,
+) -> std::result::Result<McpProtocolRevision, JsonRpcError> {
+    if !protocol_support.contains(version) {
+        return Err(JsonRpcError::unsupported_protocol_version(
+            version,
+            protocol_support.versions().iter().map(String::as_str),
+        ));
+    }
+    version.parse().map_err(|_| {
+        JsonRpcError::unsupported_protocol_version(
+            version,
+            protocol_support.versions().iter().map(String::as_str),
+        )
+    })
+}
+
+/// Apply the shared types-only MCP profile after runtime policy has selected
+/// one exact revision.
+pub(crate) fn inspect_runtime_value(
+    value: &serde_json::Value,
+    revision: McpProtocolRevision,
+    protocol_support: &ProtocolSupport,
+    direction: McpDirection,
+) -> std::result::Result<McpInspection, JsonRpcError> {
+    if !protocol_support.contains(revision.as_str()) {
+        return Err(JsonRpcError::unsupported_protocol_version(
+            revision.as_str(),
+            protocol_support.versions().iter().map(String::as_str),
+        ));
+    }
+    McpInspector::for_revision(revision)
+        .inspect(value, Some(direction))
+        .map_err(inspection_error_to_json_rpc)
+}
+
+fn inspection_error_to_json_rpc(error: McpInspectionError) -> JsonRpcError {
+    match error.kind() {
+        McpInspectionErrorKind::MissingParams | McpInspectionErrorKind::InvalidParams => {
+            JsonRpcError::invalid_params(error.to_string())
+        }
+        McpInspectionErrorKind::UnsupportedProfile => JsonRpcError::unsupported_protocol_version(
+            error.revision().unwrap_or("unknown"),
+            crate::inspection::MCP_INSPECTION_PROFILES.iter().copied(),
+        ),
+        McpInspectionErrorKind::JsonRpc
+        | McpInspectionErrorKind::BatchUnavailable
+        | McpInspectionErrorKind::InitializeInBatch
+        | McpInspectionErrorKind::MessageKindMismatch
+        | McpInspectionErrorKind::DirectionMismatch => {
+            JsonRpcError::invalid_request(error.to_string())
+        }
+        _ => JsonRpcError::invalid_request(error.to_string()),
+    }
 }
 
 /// Validate a request using the final per-request metadata lifecycle.
@@ -636,7 +812,7 @@ mod tests {
 
         // Initialize first
         let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
-            "protocolVersion": "2025-11-25",
+            "protocolVersion": "2025-03-26",
             "capabilities": {},
             "clientInfo": { "name": "test", "version": "1.0" }
         }));
@@ -658,7 +834,7 @@ mod tests {
 
     #[cfg(feature = "stateless")]
     #[tokio::test]
-    async fn modern_batch_metadata_is_isolated_per_request() {
+    async fn modern_batch_is_rejected_by_exact_profile() {
         let router = create_test_router();
         let mut service = JsonRpcService::new(router);
         let final_request = JsonRpcRequest::new(1, "tools/list").with_params(serde_json::json!({
@@ -671,19 +847,19 @@ mod tests {
         let legacy_request =
             JsonRpcRequest::new(2, "tools/list").with_params(serde_json::json!({}));
 
-        let responses = service
+        let error = service
             .call_batch(vec![final_request, legacy_request])
             .await
-            .unwrap();
-        let JsonRpcResponse::Result(final_response) = &responses[0] else {
-            panic!("final request should bypass legacy session state");
+            .unwrap_err();
+        let Error::JsonRpc(error) = error else {
+            panic!("final batch should fail with a JSON-RPC error");
         };
-        assert_eq!(final_response.result["resultType"], "complete");
-
-        let JsonRpcResponse::Error(legacy_response) = &responses[1] else {
-            panic!("legacy request must not inherit final request metadata");
-        };
-        assert_eq!(legacy_response.error.code, -32600);
+        assert_eq!(error.code, -32600);
+        assert!(
+            error
+                .message
+                .contains("does not permit top-level JSON-RPC batches")
+        );
     }
 
     #[cfg(feature = "stateless")]
@@ -753,7 +929,7 @@ mod tests {
 
         // Initialize
         let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
-            "protocolVersion": "2025-11-25",
+            "protocolVersion": "2025-03-26",
             "capabilities": {},
             "clientInfo": { "name": "test", "version": "1.0" }
         }));
@@ -867,6 +1043,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_profile_rejects_malformed_present_params() {
+        let router = create_test_router();
+        let mut service = JsonRpcService::new(router.clone());
+        let initialize = JsonRpcRequest::new(0, "initialize").with_params(serde_json::json!({
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "1.0"}
+        }));
+        service.call_single(initialize).await.unwrap();
+        router.handle_notification(crate::protocol::McpNotification::Initialized);
+
+        let request = JsonRpcRequest::new(1, "tools/list")
+            .with_params(serde_json::json!(["not", "an", "object"]));
+        let response = service.call_single(request).await.unwrap();
+        let JsonRpcResponse::Error(error) = response else {
+            panic!("malformed present params should be rejected");
+        };
+        assert_eq!(error.error.code, -32602);
+        assert!(error.error.message.contains("`tools/list` params"));
+    }
+
+    #[tokio::test]
     async fn test_request_before_initialize() {
         let router = create_test_router();
         let mut service = JsonRpcService::new(router);
@@ -910,7 +1108,7 @@ mod tests {
 
         // Initialize
         let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
-            "protocolVersion": "2025-11-25",
+            "protocolVersion": "2025-03-26",
             "capabilities": {},
             "clientInfo": { "name": "test", "version": "1.0" }
         }));
@@ -931,14 +1129,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn negotiated_2025_11_rejects_batch() {
+        let router = create_test_router();
+        let mut service = JsonRpcService::new(router.clone());
+        let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": { "name": "test", "version": "1.0" }
+        }));
+        service.call_single(init_req).await.unwrap();
+        router.handle_notification(crate::protocol::McpNotification::Initialized);
+
+        let message = JsonRpcMessage::Batch(vec![JsonRpcRequest::new(2, "ping")]);
+        let response = service.call_message(message).await.unwrap();
+        let JsonRpcResponseMessage::Single(JsonRpcResponse::Error(error)) = response else {
+            panic!("2025-11-25 batch should produce one JSON-RPC error");
+        };
+        assert_eq!(error.error.code, -32600);
+        assert!(
+            error
+                .error
+                .message
+                .contains("does not permit top-level JSON-RPC batches")
+        );
+    }
+
+    #[tokio::test]
     async fn test_call_message_empty_batch() {
         let router = create_test_router();
         let mut service = JsonRpcService::new(router);
 
-        // call_message delegates to call_batch which returns Err for empty batch
+        // Message dispatch turns a top-level batch failure into one JSON-RPC
+        // error response because there are no member IDs to attach it to.
         let msg = JsonRpcMessage::Batch(vec![]);
-        let result = service.call_message(msg).await;
-        assert!(result.is_err());
+        let result = service.call_message(msg).await.unwrap();
+        let JsonRpcResponseMessage::Single(JsonRpcResponse::Error(error)) = result else {
+            panic!("empty batch should produce one JSON-RPC error response");
+        };
+        assert_eq!(error.error.code, -32600);
     }
 
     #[tokio::test]
@@ -967,7 +1195,7 @@ mod tests {
 
         // Initialize
         let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
-            "protocolVersion": "2025-11-25",
+            "protocolVersion": "2025-03-26",
             "capabilities": {},
             "clientInfo": { "name": "test", "version": "1.0" }
         }));

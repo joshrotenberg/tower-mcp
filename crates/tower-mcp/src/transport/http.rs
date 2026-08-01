@@ -272,10 +272,12 @@ use crate::context::{
 use crate::error::{Error, JsonRpcError, Result};
 #[cfg(feature = "stateless")]
 use crate::error::{ErrorCode, McpErrorCode};
-use crate::jsonrpc::{JsonRpcService, apply_protocol_result_fields};
+use crate::inspection::{McpDirection, McpProtocolRevision};
+use crate::jsonrpc::{JsonRpcService, apply_protocol_result_fields, inspect_runtime_value};
 use crate::protocol::{
-    ClientCapabilities, Implementation, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    LATEST_PROTOCOL_VERSION, McpNotification, PROTOCOL_VERSION_2026_07_28, RequestId,
+    ClientCapabilities, Implementation, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
+    JsonRpcResponse, LATEST_PROTOCOL_VERSION, McpNotification, PROTOCOL_VERSION_2026_07_28,
+    RequestId,
 };
 #[cfg(feature = "stateless")]
 use crate::protocol::{SubscriptionFilter, SubscriptionsListenParams};
@@ -2862,6 +2864,39 @@ async fn handle_post(
         }
     };
 
+    // A version header supplies enough exact context to reject a batch before
+    // any object-only HTTP classification runs. Legacy batches without a
+    // header are validated against their session revision after lookup below.
+    if parsed.is_array()
+        && let Some(version) = get_protocol_version(&headers)
+    {
+        let revision = match version.parse::<McpProtocolRevision>() {
+            Ok(revision) => revision,
+            Err(_) => {
+                return json_rpc_error_response(
+                    None,
+                    JsonRpcError::unsupported_protocol_version(
+                        version,
+                        state.protocol_support.versions().iter().map(String::as_str),
+                    ),
+                );
+            }
+        };
+        if let Err(error) = inspect_runtime_value(
+            &parsed,
+            revision,
+            &state.protocol_support,
+            McpDirection::ClientToServer,
+        ) {
+            let status = if revision == McpProtocolRevision::V2026_07_28 {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::OK
+            };
+            return json_rpc_error_response_with_status(None, error, status);
+        }
+    }
+
     // Check if this is an initialize request (creates new session)
     let is_init = is_initialize_request(&parsed);
     let request_method = parsed
@@ -2913,6 +2948,28 @@ async fn handle_post(
                 ),
                 StatusCode::BAD_REQUEST,
             );
+        }
+
+        let revision = match body_version.parse::<McpProtocolRevision>() {
+            Ok(revision) => revision,
+            Err(_) => {
+                return json_rpc_error_response_with_status(
+                    id,
+                    JsonRpcError::unsupported_protocol_version(
+                        body_version,
+                        state.protocol_support.versions().iter().map(String::as_str),
+                    ),
+                    StatusCode::BAD_REQUEST,
+                );
+            }
+        };
+        if let Err(error) = inspect_runtime_value(
+            &parsed,
+            revision,
+            &state.protocol_support,
+            McpDirection::ClientToServer,
+        ) {
+            return json_rpc_error_response_with_status(id, error, StatusCode::BAD_REQUEST);
         }
 
         let sep_2243_mode = super::http_headers::mode_for_version(&body_version);
@@ -3289,6 +3346,27 @@ async fn handle_post(
         return handle_modern_subscriptions_listen_sse(state, &parsed).await;
     }
 
+    // Runtime allowlist enforcement precedes semantic profile validation.
+    // This is especially important for optional-session traffic: an unknown
+    // header must not be interpreted under a fallback revision.
+    if !is_init
+        && let Some(version) = get_protocol_version(&headers)
+        && !state.protocol_support.contains(&version)
+    {
+        return json_rpc_error_response(
+            extract_request_id(&parsed),
+            JsonRpcError::unsupported_protocol_version(
+                version,
+                state.protocol_support.versions().iter().map(String::as_str),
+            ),
+        );
+    }
+
+    let uses_transient_session = !is_init
+        && !modern_request
+        && get_session_id(&headers).is_none()
+        && state.optional_sessions;
+
     // Get or create session
     let session = if is_init {
         // Create new session for initialize
@@ -3363,6 +3441,102 @@ async fn handle_post(
         return json_rpc_error_response(None, JsonRpcError::session_required());
     };
 
+    // Session lookup establishes the exact legacy revision. Validate the raw
+    // envelope before object-only notification/response routing, then let the
+    // existing request dispatcher consume the typed shape.
+    let session_protocol_version = if uses_transient_session {
+        let version = state
+            .protocol_support
+            .versions()
+            .iter()
+            .find(|version| {
+                crate::protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&version.as_str())
+            })
+            .map_or_else(
+                || state.protocol_support.preferred().to_string(),
+                Clone::clone,
+            );
+        *session.protocol_version.write().await = version.clone();
+        version
+    } else {
+        session.protocol_version.read().await.clone()
+    };
+    let session_revision = match session_protocol_version.parse::<McpProtocolRevision>() {
+        Ok(revision) => revision,
+        Err(_) => {
+            return json_rpc_error_response(
+                extract_request_id(&parsed),
+                JsonRpcError::unsupported_protocol_version(
+                    session_protocol_version,
+                    state.protocol_support.versions().iter().map(String::as_str),
+                ),
+            );
+        }
+    };
+    if !is_init
+        && let Err(error) = inspect_runtime_value(
+            &parsed,
+            session_revision,
+            &state.protocol_support,
+            McpDirection::ClientToServer,
+        )
+    {
+        return json_rpc_error_response(extract_request_id(&parsed), error);
+    }
+
+    if parsed.is_array() {
+        if state.strict_initialization
+            && !session
+                .initialized_notification_received
+                .load(Ordering::Acquire)
+        {
+            return json_rpc_error_response(
+                None,
+                JsonRpcError::invalid_request(
+                    "Client must send notifications/initialized before making requests",
+                ),
+            );
+        }
+
+        let message: JsonRpcMessage = match serde_json::from_value(parsed) {
+            Ok(message) => message,
+            Err(error) => {
+                return json_rpc_error_response(
+                    None,
+                    JsonRpcError::invalid_request(format!("Invalid request batch: {error}")),
+                );
+            }
+        };
+
+        let mut extensions = crate::router::Extensions::new();
+        extensions.insert(state.protocol_support.clone());
+        extensions.insert(session_revision);
+        #[cfg(feature = "oauth")]
+        if let Some(claims) = http_extensions.get::<crate::oauth::token::TokenClaims>() {
+            extensions.insert(claims.clone());
+        }
+
+        let mut service = JsonRpcService::new(session.make_service())
+            .with_extensions(extensions)
+            .protocol_support(state.protocol_support.clone())
+            .with_negotiated_protocol_version(&session_protocol_version);
+        let response = match service.call_message(message).await {
+            Ok(response) => response,
+            Err(error) => {
+                return json_rpc_error_response(
+                    None,
+                    JsonRpcError::internal_error(error.to_string()),
+                );
+            }
+        };
+        let mut response = axum::Json(response).into_response();
+        response.headers_mut().insert(
+            MCP_PROTOCOL_VERSION_HEADER,
+            HeaderValue::from_str(&session_protocol_version).unwrap(),
+        );
+        return response;
+    }
+
     // SEP-2575 / SEP-2567: intercept `subscriptions/listen` before the standard
     // version validation. `subscriptions/listen` is only available when the
     // effective protocol version is >= 2026-07-28; otherwise we return a
@@ -3392,23 +3566,6 @@ async fn handle_post(
                 );
             }
         }
-    }
-
-    // Validate protocol version (if present and not init request).
-    // Per SEP-2575, unsupported versions get a JSON-RPC error with code
-    // -32022 and `{ supported, requested }` data, not a plain-text 400.
-    if !is_init
-        && let Some(version) = get_protocol_version(&headers)
-        && !state.protocol_support.contains(&version)
-    {
-        let id = extract_request_id(&parsed);
-        return json_rpc_error_response(
-            id,
-            JsonRpcError::unsupported_protocol_version(
-                version,
-                state.protocol_support.versions().iter().map(String::as_str),
-            ),
-        );
     }
 
     // SEP-2243: validate the standardized HTTP headers (Mcp-Method,
@@ -3568,6 +3725,7 @@ async fn handle_post(
     #[allow(unused_mut)]
     let mut ext = crate::router::Extensions::new();
     ext.insert(state.protocol_support.clone());
+    ext.insert(session_revision);
     #[cfg(feature = "oauth")]
     if let Some(claims) = http_extensions.get::<crate::oauth::token::TokenClaims>() {
         ext.insert(claims.clone());
@@ -8420,6 +8578,10 @@ mod tests {
 
     /// Helper: do the `initialize` handshake and return the session ID.
     async fn do_initialize(app: &axum::Router) -> String {
+        do_initialize_for_revision(app, "2025-11-25").await
+    }
+
+    async fn do_initialize_for_revision(app: &axum::Router, revision: &str) -> String {
         let init_request = Request::builder()
             .method("POST")
             .uri("/")
@@ -8431,7 +8593,7 @@ mod tests {
                     "id": 1,
                     "method": "initialize",
                     "params": {
-                        "protocolVersion": "2025-11-25",
+                        "protocolVersion": revision,
                         "capabilities": {},
                         "clientInfo": { "name": "test-client", "version": "1.0.0" }
                     }
@@ -8448,6 +8610,117 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string()
+    }
+
+    async fn send_initialized(app: &axum::Router, session_id: &str) {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header(MCP_SESSION_ID_HEADER, session_id)
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    async fn post_legacy_batch(app: &axum::Router, session_id: &str) -> serde_json::Value {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header(MCP_SESSION_ID_HEADER, session_id)
+            .body(Body::from(
+                serde_json::json!([
+                    {"jsonrpc": "2.0", "id": 2, "method": "ping"},
+                    {"jsonrpc": "2.0", "id": 3, "method": "tools/list"}
+                ])
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn http_batch_policy_uses_exact_session_revision() {
+        let march_app = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .protocol_versions(["2025-03-26"])
+            .unwrap()
+            .into_router();
+        let march_session = do_initialize_for_revision(&march_app, "2025-03-26").await;
+        send_initialized(&march_app, &march_session).await;
+        let march_response = post_legacy_batch(&march_app, &march_session).await;
+        assert_eq!(march_response.as_array().map(Vec::len), Some(2));
+
+        let november_app = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .into_router();
+        let november_session = do_initialize(&november_app).await;
+        send_initialized(&november_app, &november_session).await;
+        let november_response = post_legacy_batch(&november_app, &november_session).await;
+        assert_eq!(november_response["error"]["code"], -32600);
+        assert!(
+            november_response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("does not permit top-level JSON-RPC batches")
+        );
+    }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn http_final_batch_is_rejected_before_object_routing() {
+        let app = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .into_router();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header(MCP_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION_2026_07_28)
+            .body(Body::from(
+                serde_json::json!([{
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list",
+                    "params": {
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {}
+                        }
+                    }
+                }])
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response["error"]["code"], -32600);
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("does not permit top-level JSON-RPC batches")
+        );
     }
 
     #[tokio::test]

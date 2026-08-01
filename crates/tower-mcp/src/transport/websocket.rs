@@ -575,6 +575,11 @@ async fn handle_websocket(
     if let Some(ref token) = subprotocols.auth_token {
         mcp_extensions.insert(WebSocketAuthToken(token.clone()));
     }
+    if let Some(ref version) = subprotocols.protocol_version
+        && let Ok(revision) = version.parse::<crate::inspection::McpProtocolRevision>()
+    {
+        mcp_extensions.insert(revision);
+    }
 
     // Perform the WebSocket upgrade from request parts
     let ws: WebSocketUpgrade = match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
@@ -877,6 +882,21 @@ where
 {
     let parsed: serde_json::Value = serde_json::from_str(text)?;
 
+    if let Err(error) =
+        service.inspect_incoming_value(&parsed, crate::inspection::McpDirection::ClientToServer)
+    {
+        let response = JsonRpcResponse::error(None, error);
+        let response = serde_json::to_string(&response)
+            .map_err(|error| Error::Transport(format!("Failed to serialize response: {error}")))?;
+        sender
+            .lock()
+            .await
+            .send(Message::Text(response.into()))
+            .await
+            .map_err(|error| Error::Transport(format!("Failed to send response: {error}")))?;
+        return Ok(());
+    }
+
     // Check if this is a response to one of our pending requests
     if parsed.get("method").is_none()
         && (parsed.get("result").is_some() || parsed.get("error").is_some())
@@ -885,7 +905,7 @@ where
     }
 
     // Check if it's a notification (no id field)
-    if parsed.get("id").is_none() {
+    if !parsed.is_array() && parsed.get("id").is_none() {
         if let Ok(notification) = serde_json::from_str::<JsonRpcNotification>(text) {
             let mcp_notification = McpNotification::from_jsonrpc(&notification)?;
             router.handle_notification(mcp_notification);
@@ -1029,7 +1049,15 @@ async fn process_message(
 ) -> Result<Option<crate::protocol::JsonRpcResponseMessage>> {
     // Check if it's a notification (no id field)
     let parsed: serde_json::Value = serde_json::from_str(text)?;
-    if parsed.get("id").is_none()
+    if let Err(error) =
+        service.inspect_incoming_value(&parsed, crate::inspection::McpDirection::ClientToServer)
+    {
+        return Ok(Some(crate::protocol::JsonRpcResponseMessage::Single(
+            JsonRpcResponse::error(None, error),
+        )));
+    }
+    if !parsed.is_array()
+        && parsed.get("id").is_none()
         && let Ok(notification) = serde_json::from_str::<JsonRpcNotification>(text)
     {
         let mcp_notification = McpNotification::from_jsonrpc(&notification)?;
@@ -1246,6 +1274,54 @@ mod tests {
         assert_eq!(response["result"]["ttlMs"], 0);
         assert_eq!(response["result"]["cacheScope"], "private");
         assert_eq!(response["result"]["supportedVersions"][0], "2026-07-28");
+    }
+
+    async fn websocket_batch_response(revision: &str) -> serde_json::Value {
+        let router = create_test_router();
+        let service = identity_factory()(router.clone());
+        let mut service = JsonRpcService::new(service);
+        let initialize = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": revision,
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "1.0"}
+            }
+        });
+        process_message(&mut service, &router, &initialize.to_string())
+            .await
+            .unwrap();
+        router.handle_notification(McpNotification::Initialized);
+
+        let batch = serde_json::json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
+        ]);
+        let response = process_message(&mut service, &router, &batch.to_string())
+            .await
+            .unwrap()
+            .expect("batch response");
+        serde_json::to_value(response).unwrap()
+    }
+
+    #[tokio::test]
+    async fn websocket_accepts_batch_for_2025_03() {
+        let response = websocket_batch_response("2025-03-26").await;
+        assert_eq!(response.as_array().map(Vec::len), Some(2));
+    }
+
+    #[tokio::test]
+    async fn websocket_rejects_batch_for_2025_11() {
+        let response = websocket_batch_response("2025-11-25").await;
+        assert_eq!(response["error"]["code"], -32600);
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("does not permit top-level JSON-RPC batches")
+        );
     }
 
     #[tokio::test]

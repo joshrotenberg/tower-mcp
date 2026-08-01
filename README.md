@@ -653,7 +653,7 @@ retries, and shutdown with runnable examples.
 - [x] [Initialize/initialized lifecycle](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle)
 - [x] [tools/list and tools/call](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)
 - [x] [Tool annotations](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)
-- [x] [Batch requests](https://modelcontextprotocol.io/specification/2025-11-25/basic#batching)
+- [x] [Request batches](https://modelcontextprotocol.io/specification/2025-03-26/changelog) (`2025-03-26` only; batching was [removed in `2025-06-18`](https://modelcontextprotocol.io/specification/2025-06-18/changelog), so `2025-11-25` and `2026-07-28` reject top-level arrays)
 - [x] [resources/list, resources/read, resources/subscribe](https://modelcontextprotocol.io/specification/2025-11-25/server/resources)
 - [x] [resources/templates/list](https://modelcontextprotocol.io/specification/2025-11-25/server/resources#resource-templates)
 - [x] [prompts/list, prompts/get](https://modelcontextprotocol.io/specification/2025-11-25/server/prompts)

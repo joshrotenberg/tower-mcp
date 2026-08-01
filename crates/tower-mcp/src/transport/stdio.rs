@@ -333,7 +333,15 @@ async fn process_line(
 ) -> Result<Option<JsonRpcResponseMessage>> {
     // Check if it's a notification (no id field)
     let parsed: serde_json::Value = serde_json::from_str(line)?;
-    if parsed.get("id").is_none()
+    if let Err(error) =
+        service.inspect_incoming_value(&parsed, crate::inspection::McpDirection::ClientToServer)
+    {
+        return Ok(Some(JsonRpcResponseMessage::Single(
+            JsonRpcResponse::error(None, error),
+        )));
+    }
+    if !parsed.is_array()
+        && parsed.get("id").is_none()
         && let Ok(notification) = serde_json::from_str::<JsonRpcNotification>(line)
     {
         handle_notification(router, notification)?;
@@ -423,7 +431,9 @@ where
 /// Stdio transport for MCP servers
 ///
 /// Reads JSON-RPC messages from stdin and writes responses to stdout.
-/// Supports both single requests and batch requests.
+/// Supports single requests for every implemented revision and request
+/// batches only for an exact negotiated `2025-03-26` connection. Later MCP
+/// revisions reject top-level JSON-RPC arrays.
 ///
 /// Server notifications (progress, logging, resource/tool/prompt list changes)
 /// are automatically forwarded to stdout as JSON-RPC notifications.
@@ -963,7 +973,15 @@ where
         #[cfg(not(feature = "stateless"))]
         let _ = subscriptions_enabled;
 
-        if parsed.get("id").is_none() {
+        if let Err(error) =
+            service.inspect_incoming_value(&parsed, crate::inspection::McpDirection::ClientToServer)
+        {
+            let response = JsonRpcResponse::error(None, error);
+            write_line_to_stdout(writer, &serde_json::to_string(&response)?).await?;
+            return Ok(());
+        }
+
+        if !parsed.is_array() && parsed.get("id").is_none() {
             // Notification - log and ignore since we don't have router access
             tracing::debug!(
                 method = parsed.get("method").and_then(|m| m.as_str()),
@@ -1407,6 +1425,16 @@ impl BidirectionalStdioTransport {
             }
         };
 
+        if let Err(error) = self
+            .service
+            .inspect_incoming_value(&parsed, crate::inspection::McpDirection::ClientToServer)
+        {
+            let response = JsonRpcResponse::error(None, error);
+            return self
+                .write_line(&serde_json::to_string(&response)?, writer)
+                .await;
+        }
+
         // Check if this is a response to one of our pending requests
         if parsed.get("method").is_none()
             && (parsed.get("result").is_some() || parsed.get("error").is_some())
@@ -1425,7 +1453,7 @@ impl BidirectionalStdioTransport {
         }
 
         // Check if it's a notification (no id field)
-        if parsed.get("id").is_none() {
+        if !parsed.is_array() && parsed.get("id").is_none() {
             if let Ok(notification) = serde_json::from_str::<JsonRpcNotification>(line) {
                 handle_notification(&self.router, notification)?;
             }
@@ -1763,6 +1791,13 @@ mod tests {
     }
 
     async fn init_service(router: &McpRouter) -> JsonRpcService<McpRouter> {
+        init_service_for_revision(router, "2025-11-25").await
+    }
+
+    async fn init_service_for_revision(
+        router: &McpRouter,
+        revision: &str,
+    ) -> JsonRpcService<McpRouter> {
         let mut service = JsonRpcService::new(router.clone());
 
         // Initialize the session
@@ -1771,7 +1806,7 @@ mod tests {
             "id": 0,
             "method": "initialize",
             "params": {
-                "protocolVersion": "2025-11-25",
+                "protocolVersion": revision,
                 "capabilities": {},
                 "clientInfo": { "name": "test-client", "version": "1.0.0" }
             }
@@ -1811,6 +1846,46 @@ mod tests {
         let result = process_line(&mut service, &router, line).await;
 
         assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn stdio_accepts_batch_for_2025_03() {
+        let router = make_router();
+        let mut service = init_service_for_revision(&router, "2025-03-26").await;
+        let line = serde_json::json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
+        ])
+        .to_string();
+
+        let response = process_line(&mut service, &router, &line)
+            .await
+            .unwrap()
+            .unwrap();
+        let JsonRpcResponseMessage::Batch(responses) = response else {
+            panic!("2025-03-26 stdio batch should return a batch");
+        };
+        assert_eq!(responses.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn stdio_rejects_batch_for_2025_11() {
+        let router = make_router();
+        let mut service = init_service(&router).await;
+        let line = serde_json::json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
+        ])
+        .to_string();
+
+        let response = process_line(&mut service, &router, &line)
+            .await
+            .unwrap()
+            .unwrap();
+        let JsonRpcResponseMessage::Single(JsonRpcResponse::Error(error)) = response else {
+            panic!("2025-11-25 stdio batch should return one error");
+        };
+        assert_eq!(error.error.code, -32600);
     }
 
     #[tokio::test]
