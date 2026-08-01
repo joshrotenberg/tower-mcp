@@ -34,7 +34,7 @@
 //! feature remains as a compatibility alias:
 //!
 //! ```toml
-//! tower-mcp = { version = "0.16", features = ["protocol-2026-07-28"] }
+//! tower-mcp = { version = "0.17", features = ["protocol-2026-07-28"] }
 //! ```
 //!
 //! ## Key properties of stateless mode

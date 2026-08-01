@@ -99,7 +99,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tower-mcp = "0.16"
+tower-mcp = "0.17"
 ```
 
 Tool input types use `schemars::JsonSchema`, and the derive must come from the
@@ -136,7 +136,7 @@ Example with features:
 
 ```toml
 [dependencies]
-tower-mcp = { version = "0.16", features = ["full"] }
+tower-mcp = { version = "0.17", features = ["full"] }
 ```
 
 ### Types Only
@@ -148,7 +148,7 @@ any context where you want to serialize/deserialize MCP messages without a runti
 
 ```toml
 [dependencies]
-tower-mcp-types = "0.16"
+tower-mcp-types = "0.17"
 ```
 
 `tower-mcp-types` provides all types from `tower_mcp::protocol` and `tower_mcp::error`

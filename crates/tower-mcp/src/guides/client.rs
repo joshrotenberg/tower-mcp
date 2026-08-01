@@ -29,7 +29,7 @@ Minimal dependencies for a remote client:
 
 ```toml
 [dependencies]
-tower-mcp = { version = "0.16", features = ["http-client"] }
+tower-mcp = { version = "0.17", features = ["http-client"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde_json = "1"
 ```
@@ -102,7 +102,7 @@ into custom headers yourself.
 Compile the implementation and select it independently at runtime:
 
 ```toml
-tower-mcp = { version = "0.16", features = [
+tower-mcp = { version = "0.17", features = [
   "http-client",
   "protocol-2026-07-28",
 ] }
