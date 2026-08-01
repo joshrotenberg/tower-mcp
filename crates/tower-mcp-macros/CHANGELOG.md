@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.17.0] - 2026-08-01
+
+### Documentation
+
+- Align generated dependency versions ([#1112](https://github.com/joshrotenberg/tower-mcp/pull/1112))
+
+
+
 ## [0.16.1] - 2026-07-31
 
 ### Miscellaneous Tasks

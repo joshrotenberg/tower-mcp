@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.17.0] - 2026-08-01
+
+### Bug Fixes
+
+- **oauth:** Conform reusable client flows to final spec ([#1121](https://github.com/joshrotenberg/tower-mcp/pull/1121))
+- **oauth:** Harden resource server setup ([#1122](https://github.com/joshrotenberg/tower-mcp/pull/1122))
+
+### Documentation
+
+- **oauth:** Add end-to-end authorization guide ([#1125](https://github.com/joshrotenberg/tower-mcp/pull/1125))
+- Complete public API rustdoc ([#1126](https://github.com/joshrotenberg/tower-mcp/pull/1126))
+- Add task-oriented usage guides ([#1127](https://github.com/joshrotenberg/tower-mcp/pull/1127))
+- Publish guides in rustdoc ([#1128](https://github.com/joshrotenberg/tower-mcp/pull/1128))
+
+### Features
+
+- **oauth:** Add cohesive authorization flow ([#1124](https://github.com/joshrotenberg/tower-mcp/pull/1124))
+
+### Miscellaneous Tasks
+
+- **conformance:** Align stable suites on current harness ([#1105](https://github.com/joshrotenberg/tower-mcp/pull/1105))
+
+### Testing
+
+- **interop:** Cover final protocol against rmcp ([#1109](https://github.com/joshrotenberg/tower-mcp/pull/1109))
+
+
+
 ## [0.16.1] - 2026-07-31
 
 ### Miscellaneous Tasks
