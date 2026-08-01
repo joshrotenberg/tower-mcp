@@ -493,6 +493,7 @@ pub mod extension;
 pub mod extract;
 pub mod filter;
 pub mod guides;
+pub mod inspection;
 pub mod jsonrpc;
 pub mod middleware;
 #[cfg(feature = "stateless")]

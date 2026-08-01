@@ -5,6 +5,7 @@
 //! must classify and round-trip correctly.
 
 use proptest::prelude::*;
+use tower_mcp_types::inspection::JsonRpcPayload;
 use tower_mcp_types::protocol::{ClientCapabilities, InitializeParams, JsonRpcMessage};
 
 /// Strings that include Unicode/control characters and occasionally force a
@@ -44,6 +45,12 @@ proptest! {
     #[test]
     fn classify_arbitrary_json_never_panics(v in arb_json()) {
         let _ = serde_json::from_value::<JsonRpcMessage>(v);
+    }
+
+    /// Semantic inspection is total for arbitrary decoded JSON values.
+    #[test]
+    fn inspect_arbitrary_json_never_panics(v in arb_json()) {
+        let _ = JsonRpcPayload::inspect(&v);
     }
 
     /// Classifying arbitrary text never panics.

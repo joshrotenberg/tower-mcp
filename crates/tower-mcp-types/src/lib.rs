@@ -13,6 +13,10 @@
 //!   format without running a full server
 //! - Testing libraries that want MCP types without pulling in a server stack
 //!
+//! The [`inspection`] module provides strict, transport-free classification of
+//! JSON-RPC requests, notifications, success responses, error responses, and
+//! batches for intermediaries that observe both sides of a connection.
+//!
 //! # Stateless protocol support (2026-07-28)
 //!
 //! This crate also represents the released `2026-07-28` protocol, which adds
@@ -105,6 +109,7 @@
 //! for progress on client-side WASM support in the full crate.
 
 pub mod error;
+pub mod inspection;
 pub mod protocol;
 pub mod tasks;
 
