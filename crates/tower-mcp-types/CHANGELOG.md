@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.17.1] - 2026-08-01
+
+### Features
+
+- **types:** Add JSON-RPC structural inspection ([#1130](https://github.com/joshrotenberg/tower-mcp/pull/1130))
+- **types:** Add exact-revision MCP inspection ([#1132](https://github.com/joshrotenberg/tower-mcp/pull/1132))
+- **runtime:** Enforce exact MCP inspection profiles ([#1133](https://github.com/joshrotenberg/tower-mcp/pull/1133))
+
+
+
 ## [0.17.0] - 2026-08-01
 
 ### Documentation
