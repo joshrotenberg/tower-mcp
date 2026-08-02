@@ -192,6 +192,20 @@ getting-started> prompt greet name=World   # prompt args tab-complete via comple
 getting-started> info                      # replay the startup banner (identity, instructions, counts) + capabilities
 ```
 
+Single or double quotes group whitespace into one argument, and the REPL
+removes those grouping quotes before schema coercion. A backslash escapes the
+next character outside single quotes. JSON object and array arguments retain
+their JSON quotes and spaces exactly, including when passed through `call`:
+
+```text
+getting-started> echo message="hello world"
+getting-started> call echo {"message": "hello world"}
+```
+
+An unmatched quote, trailing escape, or unclosed JSON argument is reported
+locally without calling the server. A quoted or escaped `&` is ordinary input;
+only a plain trailing `&` requests task-augmented execution.
+
 `resources` lists concrete resources and `templates` lists parameterized
 (`{variable}`) ones; each points at the other so a server that splits its
 resources across the two MCP lists is not confusing.

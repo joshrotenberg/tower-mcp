@@ -30,6 +30,7 @@
 
 mod alias;
 mod bench;
+mod command;
 mod config;
 mod editor;
 mod elicit;
@@ -1281,11 +1282,20 @@ async fn handle_line(
     };
     let line = command.as_str();
     let client = session.client();
-    let mut tokens: Vec<&str> = line.split_whitespace().collect();
-    let background = tokens.last() == Some(&"&");
-    if background {
-        tokens.pop();
-    }
+    let parsed = match command::parse(line) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            note_error();
+            if json_output() {
+                println!("{}", error_json(&e));
+            } else {
+                println!("{}: {e}", style::error_prefix());
+            }
+            return false;
+        }
+    };
+    let background = parsed.background;
+    let tokens: Vec<&str> = parsed.words.iter().map(String::as_str).collect();
     if tokens.is_empty() {
         return false;
     }
@@ -2608,6 +2618,31 @@ mod tests {
     fn error_json_is_a_valid_object() {
         let v: serde_json::Value = serde_json::from_str(&error_json("boom: it broke")).unwrap();
         assert_eq!(v["error"], "boom: it broke");
+    }
+
+    #[test]
+    fn quoted_task_arguments_reach_schema_coercion_intact() {
+        let parsed = command::parse(
+            r#"run.start instruction="Reply with exactly hello" mode=interactive &"#,
+        )
+        .unwrap();
+        let tokens: Vec<&str> = parsed.words[1..].iter().map(String::as_str).collect();
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "instruction": { "type": "string" },
+                "mode": { "type": "string" }
+            }
+        });
+
+        assert!(parsed.background);
+        assert_eq!(
+            parse_kv_args(&schema, &tokens),
+            serde_json::json!({
+                "instruction": "Reply with exactly hello",
+                "mode": "interactive"
+            })
+        );
     }
 
     // The persistent-history path relies on FileBackedHistory buffering saves

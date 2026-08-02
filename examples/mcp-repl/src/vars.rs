@@ -62,11 +62,74 @@ pub fn route(line: &str) -> (Output, &str) {
         Some((name, rest)) => (Some(name.to_string()), rest),
         None => (None, line),
     };
-    let (command, filter) = match rest.split_once(" | ") {
+    let (command, filter) = match split_pipe(rest) {
         Some((cmd, path)) => (cmd.trim_end(), Some(path.trim().to_string())),
         None => (rest, None),
     };
     (Output { capture, filter }, command)
+}
+
+/// Find a routing pipe only at the command language's top level. Pipes inside
+/// quoted strings or JSON object/array arguments belong to the tool input.
+fn split_pipe(line: &str) -> Option<(&str, &str)> {
+    let bytes = line.as_bytes();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut json_depth = 0usize;
+    let mut json_string = false;
+    let mut json_escaped = false;
+
+    for (index, &byte) in bytes.iter().enumerate() {
+        if json_depth > 0 {
+            if json_string {
+                if json_escaped {
+                    json_escaped = false;
+                } else if byte == b'\\' {
+                    json_escaped = true;
+                } else if byte == b'"' {
+                    json_string = false;
+                }
+            } else {
+                match byte {
+                    b'"' => json_string = true,
+                    b'{' | b'[' => json_depth += 1,
+                    b'}' | b']' => json_depth -= 1,
+                    _ => {}
+                }
+            }
+            continue;
+        }
+
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some(b'\'') => {
+                if byte == b'\'' {
+                    quote = None;
+                }
+            }
+            Some(b'"') => match byte {
+                b'\\' => escaped = true,
+                b'"' => quote = None,
+                _ => {}
+            },
+            Some(_) => unreachable!("only quote bytes are stored"),
+            None => match byte {
+                b'\\' => escaped = true,
+                b'\'' | b'"' => quote = Some(byte),
+                b'{' | b'[' => json_depth = 1,
+                b'|' if bytes.get(index.wrapping_sub(1)) == Some(&b' ')
+                    && bytes.get(index + 1) == Some(&b' ') =>
+                {
+                    return Some((&line[..index - 1], &line[index + 2..]));
+                }
+                _ => {}
+            },
+        }
+    }
+    None
 }
 
 /// `name = rest` where `name` is an identifier, distinguishing capture from
@@ -207,6 +270,17 @@ mod tests {
         // k=v args and alias definitions are not captures.
         assert!(route("get_crate name=serde").0.is_plain());
         assert!(route("query=serde").0.capture.is_none());
+    }
+
+    #[test]
+    fn route_ignores_pipes_inside_arguments() {
+        let (o, cmd) = route(r#"echo message="left | right""#);
+        assert!(o.is_plain());
+        assert_eq!(cmd, r#"echo message="left | right""#);
+
+        let (o, cmd) = route(r#"call echo {"message":"left | right"} | .content"#);
+        assert_eq!(o.filter.as_deref(), Some(".content"));
+        assert_eq!(cmd, r#"call echo {"message":"left | right"}"#);
     }
 
     #[test]
