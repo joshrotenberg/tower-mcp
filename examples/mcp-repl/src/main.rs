@@ -35,6 +35,7 @@ mod config;
 mod editor;
 mod elicit;
 mod find;
+mod jobs;
 mod output;
 mod sampling;
 mod session;
@@ -59,12 +60,14 @@ use tower_mcp::client::{
 };
 use tower_mcp::protocol::{
     Content, DiscoverResult, Implementation, InitializeResult, LogLevel, PromptDefinition,
-    ResourceDefinition, ResourceTemplateDefinition, ServerCapabilities, TaskObject, ToolDefinition,
+    ResourceDefinition, ResourceTemplateDefinition, ServerCapabilities, SubscriptionFilter,
+    TaskObject, ToolDefinition,
 };
 use tower_mcp::{ProtocolSupport, ProtocolSupportError};
 
 use alias::Aliases;
 use elicit::ReplClientHandler;
+use jobs::Jobs;
 use output::AsyncOutput;
 use session::{Connector, Session, is_not_initialized, is_session_lost};
 use style::{json_pretty, paint, tag, task_status_style};
@@ -197,6 +200,10 @@ fn json_output() -> bool {
 
 fn note_error() {
     HAD_ERROR.store(true, Ordering::Relaxed);
+}
+
+fn automatic_task_updates(one_shot: bool, json: bool) -> bool {
+    !one_shot && !json
 }
 
 /// A one-line JSON error object for `--json` mode.
@@ -411,10 +418,14 @@ async fn establish_connection(
 }
 
 fn client_builder(protocol: ProtocolMode) -> Result<McpClientBuilder, ProtocolSupportError> {
-    Ok(McpClient::builder()
+    let builder = McpClient::builder()
         .protocol_support(protocol.support()?)
         .with_elicitation()
-        .with_sampling())
+        .with_sampling();
+    Ok(match protocol {
+        ProtocolMode::Stable => builder,
+        ProtocolMode::Final => builder.with_tasks(),
+    })
 }
 
 /// The connection banner: server identity, negotiated protocol, and any
@@ -730,6 +741,7 @@ fn demo_router() -> tower_mcp::McpRouter {
 
     tower_mcp::McpRouter::new()
         .server_info("mcp-repl-demo", env!("CARGO_PKG_VERSION"))
+        .with_tasks()
         .prompt(
             PromptBuilder::new("greet")
                 .description("Generate a greeting (name tab-completes via the server)")
@@ -840,6 +852,7 @@ fn demo_router() -> tower_mcp::McpRouter {
 fn notification_handler(
     refresh_tx: tokio::sync::mpsc::UnboundedSender<()>,
     output: AsyncOutput,
+    jobs: Arc<Jobs>,
 ) -> NotificationHandler {
     let t = refresh_tx.clone();
     let r = refresh_tx.clone();
@@ -854,6 +867,11 @@ fn notification_handler(
         .on_prompts_changed(move || {
             let _ = p.send(());
         })
+        .on_task_status_changed({
+            let jobs = jobs.clone();
+            move |params| jobs.observe_legacy(params)
+        })
+        .on_final_task_status_changed(move |params| jobs.observe_final(params))
         .on_progress({
             let output = output.clone();
             move |p| {
@@ -907,6 +925,69 @@ fn forward_child_stderr(stderr: tokio::process::ChildStderr, output: AsyncOutput
                 Err(error) => {
                     output.line(format!("warning: reading server stderr failed: {error}"));
                     break;
+                }
+            }
+        }
+    });
+}
+
+/// Watch one task until it reaches a terminal state. Final clients open a
+/// task-scoped `subscriptions/listen` stream for immediate notifications; the
+/// bounded polling loop remains authoritative for stable servers and for a
+/// final notification that is unavailable or dropped.
+fn watch_task(session: Arc<Session>, jobs: Arc<Jobs>, task_id: String, poll_interval: Option<u64>) {
+    if !jobs.automatic_updates_enabled() || jobs.is_terminal(&task_id) {
+        return;
+    }
+    tokio::spawn(async move {
+        let client = session.client();
+        let _subscription =
+            if client.selected_protocol_version().await.as_deref() == Some("2026-07-28") {
+                match client
+                    .listen_subscriptions(SubscriptionFilter {
+                        task_ids: Some(vec![task_id.clone()]),
+                        ..Default::default()
+                    })
+                    .await
+                {
+                    Ok(mut handle) => match handle.acknowledged().await {
+                        Ok(accepted)
+                            if accepted
+                                .task_ids
+                                .as_ref()
+                                .is_some_and(|ids| ids.iter().any(|id| id == &task_id)) =>
+                        {
+                            Some(handle)
+                        }
+                        _ => None,
+                    },
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+        let mut interval_ms = poll_interval.unwrap_or(1000).clamp(50, 30_000);
+        let mut consecutive_errors = 0;
+        loop {
+            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+            if jobs.is_terminal(&task_id) {
+                break;
+            }
+            match session.client().task_get(&task_id).await {
+                Ok(task) => {
+                    consecutive_errors = 0;
+                    interval_ms = task.poll_interval.unwrap_or(1000).clamp(50, 30_000);
+                    let terminal = task.status.is_terminal();
+                    jobs.observe_task(&task);
+                    if terminal {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    consecutive_errors += 1;
+                    if consecutive_errors >= 3 {
+                        break;
+                    }
                 }
             }
         }
@@ -1049,6 +1130,13 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     // fighting over raw-mode stdin.
     let at_prompt = Arc::new(AtomicBool::new(false));
     let async_output = AsyncOutput::new(at_prompt.clone(), !one_shot);
+    // Automatic task transitions are an interactive convenience. `--exec`
+    // and `--json` retain deterministic output; their manual task commands
+    // remain authoritative.
+    let jobs = Arc::new(Jobs::new(
+        async_output.clone(),
+        automatic_task_updates(one_shot, args.json),
+    ));
 
     // Notifications print inline and trigger surface refreshes.
     let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
@@ -1059,9 +1147,10 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         let refresh_tx = refresh_tx.clone();
         let at_prompt = at_prompt.clone();
         let async_output = async_output.clone();
+        let jobs = jobs.clone();
         Arc::new(move || {
             ReplClientHandler::new(
-                notification_handler(refresh_tx.clone(), async_output.clone()),
+                notification_handler(refresh_tx.clone(), async_output.clone(), jobs.clone()),
                 at_prompt.clone(),
             )
         })
@@ -1220,9 +1309,8 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     // One-shot: run each --exec command in order, then exit non-zero if any
     // errored. No editor, no event loop.
     if one_shot {
-        let mut jobs: Vec<(String, String)> = Vec::new();
         for cmd in &args.exec {
-            if handle_line(&session, &surface, &aliases, &mut jobs, cmd.trim()).await {
+            if handle_line(&session, &surface, &aliases, &jobs, cmd.trim()).await {
                 break;
             }
         }
@@ -1251,8 +1339,6 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         !args.no_history,
     );
 
-    let mut jobs: Vec<(String, String)> = Vec::new();
-
     loop {
         tokio::select! {
             Some(()) = refresh_rx.recv() => {
@@ -1264,7 +1350,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
             }
             maybe_line = line_rx.recv() => {
                 let Some(line) = maybe_line else { break };
-                let quit = handle_line(&session, &surface, &aliases, &mut jobs, line.trim()).await;
+                let quit = handle_line(&session, &surface, &aliases, &jobs, line.trim()).await;
                 let _ = ack_tx.send(());
                 if quit {
                     break;
@@ -1279,7 +1365,7 @@ async fn handle_line(
     session: &Arc<Session>,
     surface: &Arc<RwLock<Surface>>,
     aliases: &Arc<RwLock<Aliases>>,
-    jobs: &mut Vec<(String, String)>,
+    jobs: &Arc<Jobs>,
     line: &str,
 ) -> bool {
     if line.is_empty() {
@@ -1642,13 +1728,18 @@ async fn handle_line(
             if jobs.is_empty() {
                 println!("no background tasks");
             }
-            for (id, tool) in jobs.iter() {
-                match client.task_get(id).await {
-                    Ok(task) => println!(
-                        "{id}  {tool}  {}",
-                        paint(task_status_style(task.status), &task.status.to_string())
-                    ),
-                    Err(_) => println!("{id}  {tool}  (gone)"),
+            for job in jobs.list() {
+                match client.task_get(&job.task_id).await {
+                    Ok(task) => {
+                        jobs.sync(&job.task_id, task.status, task.status_message.clone());
+                        println!(
+                            "{}  {}  {}",
+                            job.task_id,
+                            job.tool,
+                            paint(task_status_style(task.status), &task.status.to_string())
+                        );
+                    }
+                    Err(_) => println!("{}  {}  (gone)", job.task_id, job.tool),
                 }
             }
         }
@@ -1673,12 +1764,16 @@ async fn handle_line(
             };
             match outcome {
                 Ok(task) if json_output() => {
+                    jobs.sync(id, task.status, task.status_message.clone());
                     println!(
                         "{}",
                         json_pretty(&serde_json::to_value(&task).unwrap_or_default())
                     );
                 }
-                Ok(task) => render_task(&task),
+                Ok(task) => {
+                    jobs.sync(id, task.status, task.status_message.clone());
+                    render_task(&task);
+                }
                 Err(e) => {
                     note_error();
                     if json_output() {
@@ -2255,7 +2350,7 @@ fn describe(surface: &Surface, name: &str) {
 async fn run_tool(
     session: &Arc<Session>,
     surface: &Arc<RwLock<Surface>>,
-    jobs: &mut Vec<(String, String)>,
+    jobs: &Arc<Jobs>,
     name: &str,
     arguments: serde_json::Value,
     background: bool,
@@ -2269,6 +2364,8 @@ async fn run_tool(
         .await
         {
             Ok(created) => {
+                let task_id = created.task.task_id.clone();
+                let poll_interval = created.task.poll_interval;
                 if json_output() {
                     println!(
                         "{}",
@@ -2283,7 +2380,13 @@ async fn run_tool(
                         )
                     );
                 }
-                jobs.push((created.task.task_id, name.to_string()));
+                jobs.register(
+                    created.task.task_id,
+                    name.to_string(),
+                    created.task.status,
+                    created.task.status_message,
+                );
+                watch_task(session.clone(), jobs.clone(), task_id, poll_interval);
             }
             Err(e) => {
                 note_error();
@@ -2556,6 +2659,11 @@ mod tests {
         assert!(
             sent[0]["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"].is_object()
         );
+        assert!(
+            sent[0]["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
+                [tower_mcp::protocol::TASKS_EXTENSION_ID]
+                .is_object()
+        );
         assert_eq!(
             sent[0]["params"]["_meta"]["io.modelcontextprotocol/clientInfo"]["name"],
             "mcp-repl"
@@ -2663,6 +2771,14 @@ mod tests {
     }
 
     #[test]
+    fn automatic_task_updates_are_interactive_text_only() {
+        assert!(automatic_task_updates(false, false));
+        assert!(!automatic_task_updates(true, false));
+        assert!(!automatic_task_updates(true, true));
+        assert!(!automatic_task_updates(false, true));
+    }
+
+    #[test]
     fn quoted_task_arguments_reach_schema_coercion_intact() {
         let parsed = command::parse(
             r#"run.start instruction="Reply with exactly hello" mode=interactive &"#,
@@ -2719,6 +2835,43 @@ mod tests {
             .unwrap();
         client.initialize("mcp-repl-test", "0").await.unwrap();
         client
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bundled_slow_task_announces_completion_without_manual_polling() {
+        let session = Arc::new(Session::new(demo_client().await, None));
+        let surface = Arc::new(RwLock::new(Surface::default()));
+        let output = AsyncOutput::new(Arc::new(AtomicBool::new(true)), true);
+        let printer = output.external_printer().unwrap();
+        let jobs = Arc::new(Jobs::new(output, true));
+
+        run_tool(
+            &session,
+            &surface,
+            &jobs,
+            "slow_add",
+            serde_json::json!({ "a": 2, "b": 3 }),
+            true,
+            &vars::Output::default(),
+        )
+        .await;
+
+        let line = tokio::time::timeout(Duration::from_secs(6), async {
+            loop {
+                if let Some(line) = printer.get_line() {
+                    break line;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the task watcher should observe slow_add completion");
+
+        assert!(line.contains("completed"), "{line}");
+        assert_eq!(
+            jobs.list()[0].status,
+            tower_mcp::protocol::TaskStatus::Completed
+        );
     }
 
     /// A session whose connector builds a fresh demo client, counting how

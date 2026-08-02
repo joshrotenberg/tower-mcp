@@ -215,12 +215,23 @@ Task-capable tools support shell-style backgrounding (SEP-2663):
 ```text
 demo> slow_add a=2 b=3 &
 [task task-1] started
-demo> jobs
-task-1  slow_add  working
-demo> wait task-1
+[task task-1] completed  run `task task-1` for details
+demo> task task-1
 task task-1  status=completed
 5
 ```
+
+The REPL tracks only tasks it started and consumes both legacy and final typed
+task-status notifications, deduplicating repeated transitions. A final client
+opens a task-scoped `subscriptions/listen` stream; a bounded per-task poller
+remains authoritative for stable servers and for unavailable or dropped final
+notifications. It honors the server's suggested interval, ends at a terminal
+state, and gives up after three consecutive read failures. `jobs`, `task`,
+`wait`, and `cancel` remain the authoritative manual controls.
+
+Automatic transition lines are interactive-only. `--exec` and `--json`
+suppress them for deterministic scripted output; explicit task commands still
+return their normal text or JSON results.
 
 Progress and log notifications print inline as they arrive, and
 `list_changed` notifications refresh the command table mid-session, so

@@ -59,7 +59,9 @@ use async_trait::async_trait;
 use crate::protocol::{
     CreateMessageParams, CreateMessageResult, ElicitRequestParams, ElicitResult, ListRootsResult,
     LogLevel, LoggingMessageParams, ProgressParams, RequestId, SubscriptionFilter,
+    TaskStatusParams,
 };
+use crate::tasks::TaskStatusNotificationParams;
 use tower_mcp_types::JsonRpcError;
 
 /// Notification sent from the server to the client.
@@ -84,6 +86,10 @@ pub enum ServerNotification {
     ToolsListChanged,
     /// The list of available prompts has changed.
     PromptsListChanged,
+    /// A legacy task changed status (`notifications/tasks`).
+    TaskStatusChanged(TaskStatusParams),
+    /// A final-protocol task changed status (`notifications/tasks`).
+    FinalTaskStatusChanged(TaskStatusNotificationParams),
     /// The server acknowledged a `subscriptions/listen` stream.
     SubscriptionAcknowledged {
         /// JSON-RPC request ID that identifies the subscription.
@@ -181,6 +187,8 @@ impl ClientHandler for () {}
 type ProgressCallback = Box<dyn Fn(ProgressParams) + Send + Sync>;
 type LogMessageCallback = Box<dyn Fn(LoggingMessageParams) + Send + Sync>;
 type ResourceUpdatedCallback = Box<dyn Fn(String) + Send + Sync>;
+type TaskStatusCallback = Box<dyn Fn(TaskStatusParams) + Send + Sync>;
+type FinalTaskStatusCallback = Box<dyn Fn(TaskStatusNotificationParams) + Send + Sync>;
 type SimpleCallback = Box<dyn Fn() + Send + Sync>;
 
 /// Callback-based handler for server notifications.
@@ -210,6 +218,8 @@ pub struct NotificationHandler {
     on_resources_changed: Option<SimpleCallback>,
     on_tools_changed: Option<SimpleCallback>,
     on_prompts_changed: Option<SimpleCallback>,
+    on_task_status_changed: Option<TaskStatusCallback>,
+    on_final_task_status_changed: Option<FinalTaskStatusCallback>,
 }
 
 impl NotificationHandler {
@@ -222,6 +232,8 @@ impl NotificationHandler {
             on_resources_changed: None,
             on_tools_changed: None,
             on_prompts_changed: None,
+            on_task_status_changed: None,
+            on_final_task_status_changed: None,
         }
     }
 
@@ -297,6 +309,24 @@ impl NotificationHandler {
         self
     }
 
+    /// Register a callback for legacy task status notifications.
+    pub fn on_task_status_changed(
+        mut self,
+        f: impl Fn(TaskStatusParams) + Send + Sync + 'static,
+    ) -> Self {
+        self.on_task_status_changed = Some(Box::new(f));
+        self
+    }
+
+    /// Register a callback for final-protocol task status notifications.
+    pub fn on_final_task_status_changed(
+        mut self,
+        f: impl Fn(TaskStatusNotificationParams) + Send + Sync + 'static,
+    ) -> Self {
+        self.on_final_task_status_changed = Some(Box::new(f));
+        self
+    }
+
     fn dispatch_notification(&self, notification: ServerNotification) {
         match notification {
             ServerNotification::Progress(params) => {
@@ -329,6 +359,16 @@ impl NotificationHandler {
                     cb();
                 }
             }
+            ServerNotification::TaskStatusChanged(params) => {
+                if let Some(cb) = &self.on_task_status_changed {
+                    cb(params);
+                }
+            }
+            ServerNotification::FinalTaskStatusChanged(params) => {
+                if let Some(cb) = &self.on_final_task_status_changed {
+                    cb(params);
+                }
+            }
             // Preserve the existing callback API for subscription-delivered
             // events while custom ClientHandler implementations can inspect
             // the wrapper and correlate concurrent streams.
@@ -357,6 +397,14 @@ impl std::fmt::Debug for NotificationHandler {
             .field("on_resources_changed", &self.on_resources_changed.is_some())
             .field("on_tools_changed", &self.on_tools_changed.is_some())
             .field("on_prompts_changed", &self.on_prompts_changed.is_some())
+            .field(
+                "on_task_status_changed",
+                &self.on_task_status_changed.is_some(),
+            )
+            .field(
+                "on_final_task_status_changed",
+                &self.on_final_task_status_changed.is_some(),
+            )
             .finish()
     }
 }
@@ -469,6 +517,52 @@ mod tests {
         assert_eq!(tools_count.load(Ordering::SeqCst), 1);
         assert_eq!(resources_count.load(Ordering::SeqCst), 1);
         assert_eq!(prompts_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_notification_handler_task_status_changed() {
+        let legacy_count = Arc::new(AtomicUsize::new(0));
+        let final_count = Arc::new(AtomicUsize::new(0));
+        let legacy = legacy_count.clone();
+        let final_ = final_count.clone();
+        let handler = NotificationHandler::new()
+            .on_task_status_changed(move |params| {
+                assert_eq!(params.task_id, "legacy-task");
+                legacy.fetch_add(1, Ordering::SeqCst);
+            })
+            .on_final_task_status_changed(move |params| {
+                assert_eq!(params.task.task_id(), "final-task");
+                final_.fetch_add(1, Ordering::SeqCst);
+            });
+
+        handler
+            .on_notification(ServerNotification::TaskStatusChanged(TaskStatusParams {
+                task_id: "legacy-task".into(),
+                status: crate::protocol::TaskStatus::Completed,
+                status_message: None,
+                created_at: "2026-08-02T00:00:00Z".into(),
+                last_updated_at: "2026-08-02T00:00:01Z".into(),
+                ttl: None,
+                poll_interval: None,
+                meta: None,
+            }))
+            .await;
+        handler
+            .on_notification(ServerNotification::FinalTaskStatusChanged(
+                TaskStatusNotificationParams {
+                    task: crate::tasks::DetailedTask::cancelled(crate::tasks::TaskMetadata::new(
+                        "final-task",
+                        "2026-08-02T00:00:00Z",
+                        "2026-08-02T00:00:01Z",
+                        None,
+                    )),
+                    meta: None,
+                },
+            ))
+            .await;
+
+        assert_eq!(legacy_count.load(Ordering::SeqCst), 1);
+        assert_eq!(final_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

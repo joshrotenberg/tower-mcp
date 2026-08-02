@@ -104,7 +104,7 @@ use crate::protocol::{
     RequestOutcome, ResourceDefinition, ResourceTemplateDefinition, Root, RootsCapability,
     SamplingCapability, SubscriptionFilter, SubscriptionsAcknowledgedParams,
     SubscriptionsListenParams, SubscriptionsListenResult, TaskObject, TaskRequestParams,
-    ToolDefinition, UpdateTaskParams, notifications,
+    TaskStatusParams, ToolDefinition, UpdateTaskParams, notifications,
 };
 use response_cache::{CacheLookup, ClientResponseCache};
 use tower_mcp_types::JsonRpcError;
@@ -2827,6 +2827,38 @@ fn parse_server_notification(
         notifications::RESOURCES_LIST_CHANGED => ServerNotification::ResourcesListChanged,
         notifications::TOOLS_LIST_CHANGED => ServerNotification::ToolsListChanged,
         notifications::PROMPTS_LIST_CHANGED => ServerNotification::PromptsListChanged,
+        notifications::TASK_STATUS_CHANGED => {
+            let is_final = params
+                .as_ref()
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|params| params.contains_key("ttlMs"));
+            match (is_final, params.clone()) {
+                (true, Some(params)) => {
+                    match serde_json::from_value::<crate::tasks::TaskStatusNotificationParams>(
+                        params.clone(),
+                    ) {
+                        Ok(params) => ServerNotification::FinalTaskStatusChanged(params),
+                        Err(_) => ServerNotification::Unknown {
+                            method: method.to_string(),
+                            params: Some(params),
+                        },
+                    }
+                }
+                (false, Some(params)) => {
+                    match serde_json::from_value::<TaskStatusParams>(params.clone()) {
+                        Ok(params) => ServerNotification::TaskStatusChanged(params),
+                        Err(_) => ServerNotification::Unknown {
+                            method: method.to_string(),
+                            params: Some(params),
+                        },
+                    }
+                }
+                (_, None) => ServerNotification::Unknown {
+                    method: method.to_string(),
+                    params: None,
+                },
+            }
+        }
         _ => ServerNotification::Unknown {
             method: method.to_string(),
             params: params.clone(),
@@ -4308,6 +4340,52 @@ mod tests {
                 subscription_id: RequestId::Number(7),
                 reason: Some(reason),
             } if reason == "done"
+        ));
+
+        let notification = parse_server_notification(
+            notifications::TASK_STATUS_CHANGED,
+            Some(serde_json::json!({
+                "taskId": "legacy-task",
+                "status": "completed",
+                "createdAt": "2026-08-02T00:00:00Z",
+                "lastUpdatedAt": "2026-08-02T00:00:01Z",
+                "ttl": null
+            })),
+        );
+        assert!(matches!(
+            notification,
+            ServerNotification::TaskStatusChanged(TaskStatusParams {
+                task_id,
+                status: crate::protocol::TaskStatus::Completed,
+                ..
+            }) if task_id == "legacy-task"
+        ));
+
+        let notification = parse_server_notification(
+            notifications::TASK_STATUS_CHANGED,
+            Some(serde_json::json!({
+                "taskId": "final-task",
+                "status": "cancelled",
+                "createdAt": "2026-08-02T00:00:00Z",
+                "lastUpdatedAt": "2026-08-02T00:00:01Z",
+                "ttlMs": null,
+                "_meta": {
+                    "io.modelcontextprotocol/subscriptionId": "task-stream"
+                }
+            })),
+        );
+        assert!(matches!(
+            notification,
+            ServerNotification::Subscription {
+                subscription_id: RequestId::String(id),
+                notification,
+            } if id == "task-stream"
+                && matches!(
+                    notification.as_ref(),
+                    ServerNotification::FinalTaskStatusChanged(params)
+                        if params.task.task_id() == "final-task"
+                            && params.task.status() == crate::protocol::TaskStatus::Cancelled
+                )
         ));
     }
 

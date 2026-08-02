@@ -161,6 +161,9 @@ async fn main() -> Result<(), BoxError> {
         .on_progress(|progress| {
             eprintln!("{}", progress.message.as_deref().unwrap_or("working"));
         })
+        .on_task_status_changed(|task| {
+            eprintln!("task {} is {}", task.task_id, task.status);
+        })
         .on_tools_changed(|| eprintln!("tool list changed"));
 
     let transport = StdioClientTransport::spawn("my-mcp-server", &[]).await?;
@@ -170,6 +173,11 @@ async fn main() -> Result<(), BoxError> {
     Ok(())
 }
 ```
+
+`on_task_status_changed` receives the legacy 2025-11-25 task shape;
+`on_final_task_status_changed` receives the status-specific final Tasks
+extension shape. Custom `ClientHandler` implementations can instead match the
+corresponding `ServerNotification` variants directly.
 
 Implement `ClientHandler` when the server may request roots, sampling, or
 elicitation. Pair the implementation with the matching builder call:
