@@ -68,7 +68,11 @@ async fn main() -> Result<(), BoxError> {
 ```
 
 Use `spawn_command` when you need environment variables, a working directory,
-or piped process settings. `spawn` is the compact convenience API.
+or redirected process settings. `spawn_command` always pipes stdin and stdout,
+but preserves your stderr configuration; call
+[`StdioClientTransport::take_stderr`](crate::client::StdioClientTransport::take_stderr)
+after requesting `Stdio::piped()` when your application needs to consume server
+diagnostics itself. `spawn` is the compact convenience API and inherits stderr.
 
 ### Stable lifecycle over HTTP
 

@@ -35,6 +35,7 @@ mod config;
 mod editor;
 mod elicit;
 mod find;
+mod output;
 mod sampling;
 mod session;
 mod style;
@@ -51,6 +52,7 @@ use std::time::Duration;
 use clap::{Parser, ValueEnum};
 use nu_ansi_term::{Color, Style};
 
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tower_mcp::client::{
     ChannelTransport, HttpClientConfig, HttpClientTransport, McpClient, McpClientBuilder,
     NotificationHandler, StdioClientTransport,
@@ -63,6 +65,7 @@ use tower_mcp::{ProtocolSupport, ProtocolSupportError};
 
 use alias::Aliases;
 use elicit::ReplClientHandler;
+use output::AsyncOutput;
 use session::{Connector, Session, is_not_initialized, is_session_lost};
 use style::{json_pretty, paint, tag, task_status_style};
 use wire::{TracingTransport, wire};
@@ -834,7 +837,10 @@ fn demo_router() -> tower_mcp::McpRouter {
 /// The notification callbacks: log and progress messages print inline,
 /// `list_changed` notifications nudge the event loop to refresh the surface.
 /// Built per client, since a reconnect installs a new one.
-fn notification_handler(refresh_tx: tokio::sync::mpsc::UnboundedSender<()>) -> NotificationHandler {
+fn notification_handler(
+    refresh_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    output: AsyncOutput,
+) -> NotificationHandler {
     let t = refresh_tx.clone();
     let r = refresh_tx.clone();
     let p = refresh_tx;
@@ -848,40 +854,63 @@ fn notification_handler(refresh_tx: tokio::sync::mpsc::UnboundedSender<()>) -> N
         .on_prompts_changed(move || {
             let _ = p.send(());
         })
-        .on_progress(|p| {
-            let pct = match (p.progress, p.total) {
-                (done, Some(total)) if total > 0.0 => {
-                    format!(" {:.0}%", 100.0 * done / total)
-                }
-                _ => String::new(),
-            };
-            println!(
-                "{} {}",
-                tag(Style::new().fg(Color::Cyan), &format!("progress{pct}")),
-                p.message.as_deref().unwrap_or("")
-            );
+        .on_progress({
+            let output = output.clone();
+            move |p| {
+                let pct = match (p.progress, p.total) {
+                    (done, Some(total)) if total > 0.0 => {
+                        format!(" {:.0}%", 100.0 * done / total)
+                    }
+                    _ => String::new(),
+                };
+                output.line(format!(
+                    "{} {}",
+                    tag(Style::new().fg(Color::Cyan), &format!("progress{pct}")),
+                    p.message.as_deref().unwrap_or("")
+                ));
+            }
         })
         // A subscribed resource changed. Printed inline like progress and log
         // lines; the content is not re-read, since a `read` may be expensive and
         // the point is to know it moved.
-        .on_resource_updated(|uri| {
-            let known = if subscribe::contains(&uri) {
-                String::new()
-            } else {
-                format!(" {}", paint(Style::new().dimmed(), "(not subscribed here)"))
-            };
-            println!(
-                "{} {uri}{known}",
-                tag(Style::new().fg(Color::Cyan), "resource updated")
-            );
+        .on_resource_updated({
+            let output = output.clone();
+            move |uri| {
+                let known = if subscribe::contains(&uri) {
+                    String::new()
+                } else {
+                    format!(" {}", paint(Style::new().dimmed(), "(not subscribed here)"))
+                };
+                output.line(format!(
+                    "{} {uri}{known}",
+                    tag(Style::new().fg(Color::Cyan), "resource updated")
+                ));
+            }
         })
-        .on_log_message(|m| {
-            println!(
+        .on_log_message(move |m| {
+            output.line(format!(
                 "{} {}",
                 tag(log_level_style(m.level), &format!("log {}", m.level)),
                 m.data
-            );
+            ));
         })
+}
+
+/// Forward complete child stderr lines through the prompt-safe output sink.
+fn forward_child_stderr(stderr: tokio::process::ChildStderr, output: AsyncOutput) {
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => output.line(line),
+                Ok(None) => break,
+                Err(error) => {
+                    output.line(format!("warning: reading server stderr failed: {error}"));
+                    break;
+                }
+            }
+        }
+    });
 }
 
 /// The recipe for rebuilding an `--http` connection: a brand new transport
@@ -1019,6 +1048,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     // handler declines form requests during that window instead of
     // fighting over raw-mode stdin.
     let at_prompt = Arc::new(AtomicBool::new(false));
+    let async_output = AsyncOutput::new(at_prompt.clone(), !one_shot);
 
     // Notifications print inline and trigger surface refreshes.
     let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
@@ -1028,8 +1058,12 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     let make_handler: Arc<dyn Fn() -> ReplClientHandler + Send + Sync> = {
         let refresh_tx = refresh_tx.clone();
         let at_prompt = at_prompt.clone();
+        let async_output = async_output.clone();
         Arc::new(move || {
-            ReplClientHandler::new(notification_handler(refresh_tx.clone()), at_prompt.clone())
+            ReplClientHandler::new(
+                notification_handler(refresh_tx.clone(), async_output.clone()),
+                at_prompt.clone(),
+            )
         })
     };
     drop(refresh_tx);
@@ -1139,8 +1173,13 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
                     .await?
             }
             Some(config::Connection::Stdio { command }) => {
-                let cmd_args: Vec<&str> = command[1..].iter().map(|s| s.as_str()).collect();
-                let transport = StdioClientTransport::spawn(&command[0], &cmd_args).await?;
+                let mut cmd = tokio::process::Command::new(&command[0]);
+                cmd.args(&command[1..]);
+                cmd.stderr(std::process::Stdio::piped());
+                let mut transport = StdioClientTransport::spawn_command(&mut cmd).await?;
+                if let Some(stderr) = transport.take_stderr() {
+                    forward_child_stderr(stderr, async_output.clone());
+                }
                 builder
                     .connect(TracingTransport::new(transport), make_handler())
                     .await?
@@ -1206,6 +1245,9 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         line_tx,
         ack_rx,
         at_prompt,
+        async_output
+            .external_printer()
+            .expect("interactive sessions have an external printer"),
         !args.no_history,
     );
 
@@ -1215,9 +1257,9 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         tokio::select! {
             Some(()) = refresh_rx.recv() => {
                 let fresh = fetch_surface(&session.client()).await;
-                println!("{} {} tools, {} prompts, {} resources",
+                async_output.line(format!("{} {} tools, {} prompts, {} resources",
                     tag(Style::new().fg(Color::Cyan), "surface changed"),
-                    fresh.tools.len(), fresh.prompts.len(), fresh.resources.len());
+                    fresh.tools.len(), fresh.prompts.len(), fresh.resources.len()));
                 *surface.write().unwrap() = fresh;
             }
             maybe_line = line_rx.recv() => {

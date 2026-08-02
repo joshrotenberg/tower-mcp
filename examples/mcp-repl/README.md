@@ -227,6 +227,12 @@ Progress and log notifications print inline as they arrive, and
 dynamic servers (see the `dynamic_capabilities` example) grow and shrink the
 REPL's vocabulary live.
 
+For a spawned stdio server, child diagnostics remain visible but are read from
+the child's stderr and passed through reedline's external printer. Logs that
+arrive while you are typing therefore appear above a cleanly redrawn prompt
+instead of splitting the current input. In `--exec` mode they remain on stderr,
+so `--json` stdout contains only command results.
+
 ## bench
 
 The `[142ms]` annotation answers "how slow was that call". `bench` answers

@@ -27,8 +27,9 @@ use crate::error::{Error, Result};
 /// Client transport that communicates with a subprocess via stdio.
 ///
 /// Spawns a child process and communicates using line-delimited JSON-RPC
-/// messages over stdin (write) and stdout (read). Stderr is inherited so
-/// server debug output appears in the client's terminal.
+/// messages over stdin (write) and stdout (read). By default stderr is
+/// inherited so server debug output appears in the client's terminal. A
+/// caller using [`Self::spawn_command`] may redirect or pipe it instead.
 pub struct StdioClientTransport {
     child: Option<Child>,
     stdin: Option<tokio::process::ChildStdin>,
@@ -53,8 +54,8 @@ impl StdioClientTransport {
     /// This allows setting environment variables, working directory, and
     /// other process configuration before spawning.
     ///
-    /// Stdin and stdout are automatically set to piped. Stderr is set to
-    /// inherited unless already configured.
+    /// Stdin and stdout are automatically set to piped. Stderr keeps the
+    /// [`Command`] configuration; its default is inherited.
     ///
     /// # Example
     ///
@@ -71,9 +72,7 @@ impl StdioClientTransport {
     /// # }
     /// ```
     pub async fn spawn_command(cmd: &mut Command) -> Result<Self> {
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
 
         let mut child = cmd
             .spawn()
@@ -95,6 +94,15 @@ impl StdioClientTransport {
             stdin: Some(stdin),
             stdout: BufReader::new(stdout),
         })
+    }
+
+    /// Take the child's piped stderr handle, if the command configured one.
+    ///
+    /// This returns `None` when stderr is inherited, redirected elsewhere, or
+    /// has already been taken. It is useful for clients that need to integrate
+    /// server diagnostics with their own terminal or logging UI.
+    pub fn take_stderr(&mut self) -> Option<tokio::process::ChildStderr> {
+        self.child.as_mut()?.stderr.take()
     }
 
     /// Create from an existing child process.
@@ -250,6 +258,24 @@ mod tests {
 
         let received = transport.recv().await.unwrap();
         assert_eq!(received.as_deref(), Some("hello_from_test"));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_command_preserves_piped_stderr() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo diagnostic >&2"]);
+        cmd.stderr(Stdio::piped());
+
+        let mut transport = StdioClientTransport::spawn_command(&mut cmd).await.unwrap();
+        let stderr = transport
+            .take_stderr()
+            .expect("spawn_command must not replace piped stderr");
+        let mut stderr = BufReader::new(stderr);
+        let mut line = String::new();
+        stderr.read_line(&mut line).await.unwrap();
+
+        assert_eq!(line.trim(), "diagnostic");
+        assert!(transport.take_stderr().is_none());
     }
 
     #[tokio::test]

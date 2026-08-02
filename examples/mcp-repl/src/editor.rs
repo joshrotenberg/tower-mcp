@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use nu_ansi_term::{Color, Style};
 use reedline::{
-    ColumnarMenu, Completer, DefaultHinter, Emacs, FileBackedHistory, Highlighter, KeyCode,
-    KeyModifiers, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch,
+    ColumnarMenu, Completer, DefaultHinter, Emacs, ExternalPrinter, FileBackedHistory, Highlighter,
+    KeyCode, KeyModifiers, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch,
     PromptHistorySearchStatus, Reedline, ReedlineEvent, ReedlineMenu, Signal, Span, StyledText,
     Suggestion, default_emacs_keybindings,
 };
@@ -582,6 +582,7 @@ pub fn spawn_readline_thread(
     line_tx: tokio::sync::mpsc::Sender<String>,
     ack_rx: std::sync::mpsc::Receiver<()>,
     at_prompt: Arc<AtomicBool>,
+    external_printer: ExternalPrinter<String>,
     persist_history: bool,
 ) {
     std::thread::spawn(move || {
@@ -598,6 +599,7 @@ pub fn spawn_readline_thread(
             &line_tx,
             &ack_rx,
             at_prompt,
+            external_printer,
             persist_history,
         );
     });
@@ -651,6 +653,7 @@ fn run_interactive(
     line_tx: &tokio::sync::mpsc::Sender<String>,
     ack_rx: &std::sync::mpsc::Receiver<()>,
     at_prompt: Arc<AtomicBool>,
+    external_printer: ExternalPrinter<String>,
     persist_history: bool,
 ) {
     let completer = ReplCompleter::new(surface.clone(), session, aliases.clone(), runtime);
@@ -675,6 +678,7 @@ fn run_interactive(
         .with_hinter(Box::new(
             DefaultHinter::default().with_style(Style::new().fg(Color::DarkGray)),
         ))
+        .with_external_printer(external_printer)
         .with_ansi_colors(style::colors_enabled());
 
     // Persist history across sessions (up to 1000 entries) so up-arrow recalls
