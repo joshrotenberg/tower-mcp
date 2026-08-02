@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.17.2] - 2026-08-02
+
+### Bug Fixes
+
+- **mcp-repl:** Redraw around child stderr ([#1139](https://github.com/joshrotenberg/tower-mcp/pull/1139))
+
+### Features
+
+- **mcp-repl:** Surface task status transitions ([#1140](https://github.com/joshrotenberg/tower-mcp/pull/1140))
+
+
+
 ## [0.17.1] - 2026-08-01
 
 ### Features

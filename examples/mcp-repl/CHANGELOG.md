@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.7] - 2026-08-02
+
+### Bug Fixes
+
+- **mcp-repl:** Preserve quoted tool arguments ([#1138](https://github.com/joshrotenberg/tower-mcp/pull/1138))
+- **mcp-repl:** Redraw around child stderr ([#1139](https://github.com/joshrotenberg/tower-mcp/pull/1139))
+
+### Features
+
+- **mcp-repl:** Surface task status transitions ([#1140](https://github.com/joshrotenberg/tower-mcp/pull/1140))
+
+
+
 ## [0.1.6] - 2026-08-01
 
 ### Miscellaneous Tasks
