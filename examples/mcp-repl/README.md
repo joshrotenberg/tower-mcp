@@ -506,6 +506,14 @@ Capture and filtering currently act on tool-call results.
   mcp-probe is a debugging platform you inspect a server with; mcp-repl is a
   shell you drive one from.
 
+## Testing
+
+`cargo test -p mcp-repl` includes a black-box process suite in addition to the
+unit tests. It builds a repository-only MCP fixture, launches the published
+`mcp-repl` binary, and covers stdio and ephemeral localhost HTTP with both the
+stable and exact `2026-07-28` lifecycles. The cases are network-independent,
+bounded by per-process and suite timeouts, and assert fixture cleanup.
+
 ## Notes
 
 - Tab completion for prompt argument values and resource template variables

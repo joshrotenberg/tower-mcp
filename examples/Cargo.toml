@@ -161,6 +161,14 @@ name = "stateless_http_client"
 path = "stateless_http_client.rs"
 required-features = ["http", "http-client", "protocol-2026-07-28"]
 
+# Repository-only process fixture used by mcp-repl's black-box tests. It is
+# kept in this unpublished package so the published CLI does not gain a test
+# binary or fixture source.
+[[example]]
+name = "mcp_repl_fixture"
+path = "mcp_repl_fixture.rs"
+required-features = ["http", "protocol-2026-07-28"]
+
 # --- Sampling and bidirectional ---
 [[example]]
 name = "sampling_server"
