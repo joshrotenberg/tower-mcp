@@ -55,6 +55,7 @@ async fn build_fixture() -> PathBuf {
         "mcp_repl_fixture",
         "--features",
         "http,protocol-2026-07-28",
+        "--message-format=json-render-diagnostics",
     ]);
     // Coverage and beta jobs may need to compile the repository-only fixture
     // with a distinct target configuration. Keep that budget independent of
@@ -62,14 +63,20 @@ async fn build_fixture() -> PathBuf {
     let output = run(command, "fixture build", BUILD_TIMEOUT).await;
     assert_success(&output, "fixture build");
 
-    let test_binary = std::env::current_exe().expect("current test executable");
-    let profile_dir = test_binary
-        .parent()
-        .and_then(Path::parent)
-        .expect("target profile directory");
-    let fixture = profile_dir
-        .join("examples")
-        .join(format!("mcp_repl_fixture{}", std::env::consts::EXE_SUFFIX));
+    // The outer test runner may select a different target directory (notably
+    // cargo-llvm-cov). Cargo's artifact record is authoritative; deriving the
+    // fixture path from the integration-test executable only works when both
+    // Cargo invocations happen to share a target directory.
+    let fixture = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find_map(|message| {
+            (message["reason"] == "compiler-artifact"
+                && message["target"]["name"] == "mcp_repl_fixture")
+                .then(|| message["executable"].as_str().map(PathBuf::from))
+                .flatten()
+        })
+        .expect("Cargo did not report the mcp_repl_fixture executable");
     assert!(
         fixture.is_file(),
         "fixture was not built at {}",
