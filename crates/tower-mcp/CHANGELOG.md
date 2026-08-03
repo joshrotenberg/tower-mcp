@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.18.0] - 2026-08-03
+
+### Features
+
+- **prompts:** Initialize dynamic catalogs lazily ([#1146](https://github.com/joshrotenberg/tower-mcp/pull/1146))
+- **channel:** Support final subscriptions ([#1145](https://github.com/joshrotenberg/tower-mcp/pull/1145))
+- **tasks:** Prepare task state before execution ([#1144](https://github.com/joshrotenberg/tower-mcp/pull/1144))
+
+
+
 ## [0.17.2] - 2026-08-02
 
 ### Bug Fixes
