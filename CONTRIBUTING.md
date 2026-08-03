@@ -12,6 +12,15 @@ cargo test --workspace --doc --all-features
 
 All of these must pass before submitting a PR.
 
+## Release Pull Requests
+
+When release-plz proposes a new `0.x` minor line, align the user-facing
+dependency snippets and support-policy references with the new workspace
+major/minor version. The `generated_dependency_versions_track_release_hygiene`
+test intentionally fails until the code generator and macro installation docs
+have been updated; also review the README, rustdoc guides, ROADMAP, and SECURITY
+policy before merging the release PR.
+
 ## Coverage
 
 CI enforces an 80% workspace line-coverage floor. Install the required stable
