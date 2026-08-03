@@ -9,6 +9,11 @@ use tower_mcp::context::{ServerNotification, notification_channel};
 use tower_mcp::extract::RawArgs;
 use tower_mcp::{CallToolResult, McpRouter, ToolBuilder};
 
+#[cfg(feature = "dynamic-tools")]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "dynamic-tools")]
+use tower_mcp::PromptBuilder;
+
 fn slow_tool(name: &str, delay_ms: u64) -> tower_mcp::Tool {
     ToolBuilder::new(name)
         .description("Sleeps, then answers")
@@ -118,6 +123,39 @@ async fn concurrent_requests_do_not_serialize() {
         slow_elapsed >= Duration::from_millis(500),
         "slow call should actually be slow, took {slow_elapsed:?}"
     );
+}
+
+#[cfg(feature = "dynamic-tools")]
+#[tokio::test]
+async fn dynamic_prompt_initializer_runs_only_when_prompts_are_accessed() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let (router, prompts) = McpRouter::new()
+        .server_info("lazy-prompts", "1.0.0")
+        .with_dynamic_prompts();
+    let initializer_calls = calls.clone();
+    let router = router.dynamic_prompt_initializer(move || {
+        initializer_calls.fetch_add(1, Ordering::SeqCst);
+        if !prompts.contains("lazy") {
+            prompts.register(PromptBuilder::new("lazy").user_message("loaded"));
+        }
+        Ok(())
+    });
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let client = McpClient::connect(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.initialize("test", "1.0.0").await.unwrap();
+    client.list_tools().await.unwrap();
+    client.list_resources().await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let listed = client.list_prompts().await.unwrap();
+    assert_eq!(listed.prompts[0].name, "lazy");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let loaded = client.get_prompt("lazy", None).await.unwrap();
+    assert_eq!(loaded.messages.len(), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 /// The default constructor also delivers router-emitted notifications (the

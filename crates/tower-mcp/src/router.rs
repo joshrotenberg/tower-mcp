@@ -399,6 +399,9 @@ struct AutoInstructionsConfig {
 #[cfg(all(feature = "http", feature = "stateless"))]
 type ModernNotificationSink = Arc<dyn Fn(&ServerNotification) -> bool + Send + Sync + 'static>;
 
+#[cfg(feature = "dynamic-tools")]
+type PromptInitializer = Arc<dyn Fn() -> Result<()> + Send + Sync + 'static>;
+
 /// Inner configuration that is shared across clones
 #[derive(Clone)]
 struct McpRouterInner {
@@ -479,6 +482,9 @@ struct McpRouterInner {
     /// Dynamic prompts registry for runtime prompt (de)registration
     #[cfg(feature = "dynamic-tools")]
     dynamic_prompts: Option<Arc<DynamicPromptsInner>>,
+    /// Lazily populates the dynamic prompt registry before list/get access.
+    #[cfg(feature = "dynamic-tools")]
+    prompt_initializer: Option<PromptInitializer>,
     /// Dynamic resources registry for runtime resource (de)registration
     #[cfg(feature = "dynamic-tools")]
     dynamic_resources: Option<Arc<DynamicResourcesInner>>,
@@ -613,6 +619,8 @@ impl McpRouter {
                 dynamic_tools: None,
                 #[cfg(feature = "dynamic-tools")]
                 dynamic_prompts: None,
+                #[cfg(feature = "dynamic-tools")]
+                prompt_initializer: None,
                 #[cfg(feature = "dynamic-tools")]
                 dynamic_resources: None,
                 #[cfg(feature = "dynamic-tools")]
@@ -758,6 +766,20 @@ impl McpRouter {
         let inner_dyn = Arc::new(DynamicPromptsInner::new());
         Arc::make_mut(&mut self.inner).dynamic_prompts = Some(inner_dyn.clone());
         (self, DynamicPromptRegistry::new(inner_dyn))
+    }
+
+    /// Run an initializer before each `prompts/list` or `prompts/get` access.
+    ///
+    /// This supports prompt definitions backed by an application-owned lazy
+    /// catalog. The initializer should populate the registry returned by
+    /// [`Self::with_dynamic_prompts`] and implement its own caching.
+    #[cfg(feature = "dynamic-tools")]
+    pub fn dynamic_prompt_initializer<F>(mut self, initializer: F) -> Self
+    where
+        F: Fn() -> Result<()> + Send + Sync + 'static,
+    {
+        Arc::make_mut(&mut self.inner).prompt_initializer = Some(Arc::new(initializer));
+        self
     }
 
     /// Enable dynamic resource registration and return a registry handle.
@@ -3204,6 +3226,10 @@ impl McpRouter {
             }
 
             McpRequest::ListPrompts(params) => {
+                #[cfg(feature = "dynamic-tools")]
+                if let Some(initializer) = &self.inner.prompt_initializer {
+                    initializer()?;
+                }
                 let disabled = self.inner.disabled_prompts.read().unwrap().clone();
                 let is_visible = |p: &Prompt| -> bool {
                     !disabled.contains(&p.name)
@@ -3250,6 +3276,10 @@ impl McpRouter {
             }
 
             McpRequest::GetPrompt(params) => {
+                #[cfg(feature = "dynamic-tools")]
+                if let Some(initializer) = &self.inner.prompt_initializer {
+                    initializer()?;
+                }
                 // Disabled prompts are reported as if they don't exist.
                 if self
                     .inner
