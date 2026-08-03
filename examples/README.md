@@ -152,6 +152,8 @@ These are standalone crates in the workspace:
 | [conformance-server](conformance-server/) | MCP conformance server (48/48 stable; 114/114 final) |
 | [conformance-client](conformance-client/) | MCP conformance client (235/235 stable; 399/399 final) |
 | [codegen-mcp](codegen-mcp/) | MCP server that helps build MCP servers |
+| [mcp-repl](mcp-repl/) | Interactive client that turns an MCP server surface into commands |
+| [mcp2md](mcp2md/) | Generate deterministic Markdown documentation and a documentation-coverage assessment from an MCP server |
 
 ## Full Application
 

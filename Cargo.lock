@@ -1969,6 +1969,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcp2md"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower-mcp",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
