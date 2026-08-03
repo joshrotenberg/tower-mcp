@@ -43,7 +43,7 @@ use pin_project_lite::pin_project;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::Value;
+use serde_json::{Map, Value};
 #[cfg(feature = "stateless")]
 use tower::ServiceExt;
 use tower::util::BoxCloneService;
@@ -52,7 +52,7 @@ use tower_service::Service;
 #[cfg(feature = "stateless")]
 use tokio::sync::Mutex;
 
-use crate::context::RequestContext;
+use crate::context::{Extensions, RequestContext};
 use crate::error::{Error, Result, ResultExt};
 use crate::protocol::{
     CallToolResult, ClientCapabilities, RequestOutcome, TaskSupportMode, ToolAnnotations,
@@ -458,6 +458,100 @@ pub(crate) fn ensure_object_schema(mut schema: Value) -> Value {
 /// A boxed future for tool handlers
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Identity allocated for one task-backed tool execution.
+///
+/// The same value is supplied to task preparation and inserted into the
+/// background handler's request extensions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskContext {
+    task_id: String,
+}
+
+impl TaskContext {
+    pub(crate) fn new(task_id: String) -> Self {
+        Self { task_id }
+    }
+
+    /// The server-generated task identifier.
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+}
+
+/// Metadata and application state produced before task execution begins.
+#[derive(Debug, Clone, Default)]
+pub struct TaskPreparation {
+    pub(crate) meta: Option<Map<String, Value>>,
+    pub(crate) extensions: Extensions,
+}
+
+impl TaskPreparation {
+    /// Create an empty preparation result.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Attach protocol `_meta` to every view of this task.
+    pub fn with_meta(mut self, meta: Map<String, Value>) -> Self {
+        self.meta = Some(meta);
+        self
+    }
+
+    /// Make application state available to the background handler through
+    /// [`crate::extract::Extension`].
+    pub fn with_extension<T: Send + Sync + 'static>(mut self, value: T) -> Self {
+        self.extensions.insert(value);
+        self
+    }
+}
+
+pub(crate) trait TaskPreparer: Send + Sync {
+    fn prepare(
+        &self,
+        context: TaskContext,
+        arguments: Value,
+    ) -> BoxFuture<'_, Result<TaskPreparation>>;
+}
+
+impl<F, Fut> TaskPreparer for F
+where
+    F: Fn(TaskContext, Value) -> Fut + Send + Sync,
+    Fut: Future<Output = Result<TaskPreparation>> + Send + 'static,
+{
+    fn prepare(
+        &self,
+        context: TaskContext,
+        arguments: Value,
+    ) -> BoxFuture<'_, Result<TaskPreparation>> {
+        Box::pin((self)(context, arguments))
+    }
+}
+
+struct TypedTaskPreparer<I, F> {
+    prepare: F,
+    _phantom: std::marker::PhantomData<I>,
+}
+
+impl<I, F, Fut> TaskPreparer for TypedTaskPreparer<I, F>
+where
+    I: DeserializeOwned + Send + Sync + 'static,
+    F: Fn(TaskContext, I) -> Fut + Send + Sync,
+    Fut: Future<Output = Result<TaskPreparation>> + Send + 'static,
+{
+    fn prepare(
+        &self,
+        context: TaskContext,
+        arguments: Value,
+    ) -> BoxFuture<'_, Result<TaskPreparation>> {
+        let input = serde_json::from_value(arguments)
+            .map_err(|error| Error::invalid_params(format!("Invalid input: {error}")));
+        match input {
+            Ok(input) => Box::pin((self.prepare)(context, input)),
+            Err(error) => Box::pin(async move { Err(error) }),
+        }
+    }
+}
+
 /// Tool handler trait - the core abstraction for tool execution
 pub trait ToolHandler: Send + Sync {
     /// Execute the tool with the given arguments
@@ -675,6 +769,8 @@ pub struct Tool {
     /// Client capabilities required to invoke this tool in the modern
     /// per-request protocol.
     pub(crate) required_client_capabilities: Option<ClientCapabilities>,
+    /// Optional callback run after task allocation and before task execution.
+    pub(crate) task_preparer: Option<Arc<dyn TaskPreparer>>,
     /// The boxed service that executes the tool
     pub(crate) service: Option<BoxToolService>,
     #[cfg(feature = "stateless")]
@@ -719,6 +815,7 @@ impl Clone for Tool {
             meta: self.meta.clone(),
             task_support: self.task_support,
             required_client_capabilities: self.required_client_capabilities.clone(),
+            task_preparer: self.task_preparer.clone(),
             service: self.service.clone(),
             #[cfg(feature = "stateless")]
             mrtr_handler: self.mrtr_handler.clone(),
@@ -848,6 +945,44 @@ impl Tool {
         self.required_client_capabilities.as_ref()
     }
 
+    /// Add a preparation callback for task-backed invocations.
+    ///
+    /// The callback runs exactly once after task ID allocation and before the
+    /// initial task response. It is skipped for synchronous calls.
+    pub fn with_task_preparation<F, Fut>(mut self, prepare: F) -> Self
+    where
+        F: Fn(TaskContext, Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<TaskPreparation>> + Send + 'static,
+    {
+        self.task_preparer = Some(Arc::new(prepare));
+        self
+    }
+
+    /// Add a typed preparation callback to an already-built tool.
+    pub fn with_typed_task_preparation<I, F, Fut>(mut self, prepare: F) -> Self
+    where
+        I: DeserializeOwned + Send + Sync + 'static,
+        F: Fn(TaskContext, I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<TaskPreparation>> + Send + 'static,
+    {
+        self.task_preparer = Some(Arc::new(TypedTaskPreparer {
+            prepare,
+            _phantom: std::marker::PhantomData,
+        }));
+        self
+    }
+
+    pub(crate) async fn prepare_task(
+        &self,
+        context: TaskContext,
+        arguments: Value,
+    ) -> Result<TaskPreparation> {
+        match self.task_preparer.as_ref() {
+            Some(prepare) => prepare.prepare(context, arguments).await,
+            None => Ok(TaskPreparation::default()),
+        }
+    }
+
     /// Apply a guard to this built tool.
     ///
     /// The guard runs before the handler and can short-circuit with an error.
@@ -938,6 +1073,7 @@ impl Tool {
             meta: self.meta.clone(),
             task_support: self.task_support,
             required_client_capabilities: self.required_client_capabilities.clone(),
+            task_preparer: self.task_preparer.clone(),
             service: self.service.clone(),
             #[cfg(feature = "stateless")]
             mrtr_handler: self.mrtr_handler.clone(),
@@ -974,6 +1110,7 @@ impl Tool {
             meta: None,
             task_support,
             required_client_capabilities: None,
+            task_preparer: None,
             service: Some(service),
             #[cfg(feature = "stateless")]
             mrtr_handler: None,
@@ -1006,6 +1143,7 @@ impl Tool {
             meta: None,
             task_support,
             required_client_capabilities: None,
+            task_preparer: None,
             service: None,
             mrtr_handler: Some(Arc::new(handler)),
             input_schema,
@@ -1368,6 +1506,7 @@ impl ToolBuilder {
             icons: self.icons,
             annotations: self.annotations,
             task_support: self.task_support,
+            task_preparer: None,
             handler,
             _phantom: std::marker::PhantomData,
         }
@@ -1619,6 +1758,7 @@ pub struct ToolBuilderWithHandler<I, F> {
     icons: Option<Vec<ToolIcon>>,
     annotations: Option<ToolAnnotations>,
     task_support: TaskSupportMode,
+    task_preparer: Option<Arc<dyn TaskPreparer>>,
     handler: F,
     _phantom: std::marker::PhantomData<I>,
 }
@@ -1772,6 +1912,7 @@ where
             meta: None,
             task_support: self.task_support,
             required_client_capabilities: None,
+            task_preparer: None,
             service: Some(service),
             #[cfg(feature = "stateless")]
             mrtr_handler: None,
@@ -1820,7 +1961,7 @@ where
 {
     /// Build the tool.
     pub fn build(self) -> Tool {
-        Tool::from_handler(
+        let mut tool = Tool::from_handler(
             self.name,
             self.title,
             self.description,
@@ -1833,7 +1974,22 @@ where
                 handler: self.handler,
                 _phantom: std::marker::PhantomData,
             },
-        )
+        );
+        tool.task_preparer = self.task_preparer;
+        tool
+    }
+
+    /// Add a typed preparation step for task-backed invocations.
+    pub fn task_preparation<P, PrepareFuture>(mut self, prepare: P) -> Self
+    where
+        P: Fn(TaskContext, I) -> PrepareFuture + Send + Sync + 'static,
+        PrepareFuture: Future<Output = Result<TaskPreparation>> + Send + 'static,
+    {
+        self.task_preparer = Some(Arc::new(TypedTaskPreparer {
+            prepare,
+            _phantom: std::marker::PhantomData,
+        }));
+        self
     }
 
     /// Apply a Tower layer (middleware) to this tool.
@@ -1871,6 +2027,7 @@ where
             icons: self.icons,
             annotations: self.annotations,
             task_support: self.task_support,
+            task_preparer: self.task_preparer,
             handler: self.handler,
             layer,
             _phantom: std::marker::PhantomData,
@@ -1983,6 +2140,7 @@ where
             meta: None,
             task_support: self.task_support,
             required_client_capabilities: None,
+            task_preparer: None,
             service: None,
             mrtr_handler: Some(Arc::new(ServiceMrtrToolHandler {
                 service: Mutex::new(service),
@@ -2037,6 +2195,7 @@ pub struct ToolBuilderWithLayer<I, F, L> {
     icons: Option<Vec<ToolIcon>>,
     annotations: Option<ToolAnnotations>,
     task_support: TaskSupportMode,
+    task_preparer: Option<Arc<dyn TaskPreparer>>,
     handler: F,
     layer: L,
     _phantom: std::marker::PhantomData<I>,
@@ -2082,6 +2241,7 @@ where
             meta: None,
             task_support: self.task_support,
             required_client_capabilities: None,
+            task_preparer: self.task_preparer,
             service: Some(service),
             #[cfg(feature = "stateless")]
             mrtr_handler: None,
@@ -2106,6 +2266,7 @@ where
             icons: self.icons,
             annotations: self.annotations,
             task_support: self.task_support,
+            task_preparer: self.task_preparer,
             handler: self.handler,
             layer: tower::layer::util::Stack::new(layer, self.layer),
             _phantom: std::marker::PhantomData,

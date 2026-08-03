@@ -648,7 +648,10 @@ pub use router::{McpRouter, RouterRequest, RouterResponse, ToolAnnotationsMap};
 pub use session::{SessionPhase, SessionState};
 #[cfg(feature = "stateless")]
 pub use tool::MrtrToolHandler;
-pub use tool::{BoxToolService, GuardLayer, NoParams, Tool, ToolBuilder, ToolHandler, ToolRequest};
+pub use tool::{
+    BoxToolService, GuardLayer, NoParams, TaskContext, TaskPreparation, Tool, ToolBuilder,
+    ToolHandler, ToolRequest,
+};
 pub use transport::{
     BidirectionalStdioTransport, CatchError, GenericStdioTransport, StdioTransport,
     SyncStdioTransport,

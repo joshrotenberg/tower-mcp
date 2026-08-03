@@ -142,6 +142,8 @@ pub struct Task {
     pub poll_interval: u64,
     /// Human-readable status message
     pub status_message: Option<String>,
+    /// Protocol metadata retained across every task view.
+    pub meta: Option<serde_json::Value>,
     /// The result of the tool call (when completed)
     pub result: Option<CallToolResult>,
     /// Structured execution error (when failed).
@@ -192,6 +194,7 @@ impl Task {
             ttl: ttl.unwrap_or(DEFAULT_TTL_MS),
             poll_interval: DEFAULT_POLL_INTERVAL_MS,
             status_message: Some("Task started".to_string()),
+            meta: None,
             result: None,
             error: None,
             owner,
@@ -216,7 +219,7 @@ impl Task {
             poll_interval: Some(self.poll_interval),
             result: None,
             error: None,
-            meta: None,
+            meta: self.meta.clone(),
         }
     }
 
@@ -401,6 +404,24 @@ pub trait TaskStore: Send + Sync + 'static {
     /// Get task object by ID. Returns `None` if unknown.
     async fn get_task(&self, task_id: &str) -> Result<Option<TaskObject>>;
 
+    /// Persist protocol `_meta` for a task.
+    ///
+    /// The default preserves source compatibility for external stores. Stores
+    /// that want to support task preparation metadata must override it.
+    async fn set_task_meta(&self, task_id: &str, meta: serde_json::Value) -> Result<bool> {
+        let _ = (task_id, meta);
+        Ok(false)
+    }
+
+    /// Remove a task that could not finish initialization.
+    ///
+    /// The default preserves source compatibility for external stores. Stores
+    /// used with preparation callbacks should override it.
+    async fn discard_task(&self, task_id: &str) -> Result<bool> {
+        let _ = task_id;
+        Ok(false)
+    }
+
     /// Get a task's full snapshot (task object, result, error) by ID.
     async fn get_task_result(&self, task_id: &str) -> Result<Option<TaskSnapshot>>;
 
@@ -567,6 +588,26 @@ impl TaskStore for MemoryTaskStore {
         } else {
             None
         })
+    }
+
+    async fn set_task_meta(&self, task_id: &str, meta: serde_json::Value) -> Result<bool> {
+        let Ok(mut tasks) = self.tasks.write() else {
+            return Ok(false);
+        };
+        let Some(task) = tasks.get_mut(task_id).filter(|task| !task.is_expired()) else {
+            return Ok(false);
+        };
+        task.meta = Some(meta);
+        Ok(true)
+    }
+
+    async fn discard_task(&self, task_id: &str) -> Result<bool> {
+        Ok(self
+            .tasks
+            .write()
+            .ok()
+            .and_then(|mut tasks| tasks.remove(task_id))
+            .is_some())
     }
 
     async fn task_owner(&self, task_id: &str) -> Result<Option<TaskOwner>> {

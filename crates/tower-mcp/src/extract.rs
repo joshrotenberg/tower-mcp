@@ -1063,6 +1063,7 @@ where
             meta: None,
             task_support: self.task_support,
             required_client_capabilities: None,
+            task_preparer: None,
             service: Some(service),
             #[cfg(feature = "stateless")]
             mrtr_handler: None,
@@ -1191,6 +1192,7 @@ where
             meta: None,
             task_support: self.task_support,
             required_client_capabilities: None,
+            task_preparer: None,
             service: Some(service),
             #[cfg(feature = "stateless")]
             mrtr_handler: None,
@@ -1299,6 +1301,7 @@ where
             meta: None,
             task_support: self.task_support,
             required_client_capabilities: None,
+            task_preparer: None,
             service: Some(service),
             #[cfg(feature = "stateless")]
             mrtr_handler: None,

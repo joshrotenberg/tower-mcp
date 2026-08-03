@@ -65,6 +65,14 @@ fn task_store_error(e: TaskStoreError) -> Error {
     )))
 }
 
+async fn discard_unprepared_task(store: &Arc<dyn TaskStore>, task_id: &str) {
+    if !matches!(store.discard_task(task_id).await, Ok(true)) {
+        let _ = store
+            .cancel_task(task_id, Some("task preparation failed"))
+            .await;
+    }
+}
+
 /// Whether this request is using the final, stateless 2026-07-28 lifecycle.
 ///
 /// Stable sessionful requests retain the crate's legacy task behavior; final
@@ -2266,10 +2274,10 @@ impl McpRouter {
 
     /// Serve a final `tasks/get` as a status-discriminated `DetailedTask`.
     async fn final_get_task(&self, task_id: &str) -> Result<McpResponse> {
-        let detailed = self.detailed_task(task_id).await?;
-        Ok(McpResponse::FinalGetTask(crate::tasks::GetTaskResult::new(
-            detailed,
-        )))
+        let (detailed, meta) = self.detailed_task(task_id).await?;
+        let mut result = crate::tasks::GetTaskResult::new(detailed);
+        result.meta = meta;
+        Ok(McpResponse::FinalGetTask(result))
     }
 
     /// Build the complete status-discriminated view of a task.
@@ -2277,7 +2285,13 @@ impl McpRouter {
     /// Both `tasks/get` and `notifications/tasks` render a task through this
     /// one path, which is what makes a pushed notification identical to the
     /// poll response a client would have received at that moment.
-    async fn detailed_task(&self, task_id: &str) -> Result<crate::tasks::DetailedTask> {
+    async fn detailed_task(
+        &self,
+        task_id: &str,
+    ) -> Result<(
+        crate::tasks::DetailedTask,
+        Option<serde_json::Map<String, serde_json::Value>>,
+    )> {
         let (task, result, error) = self
             .inner
             .task_store
@@ -2295,7 +2309,8 @@ impl McpRouter {
         metadata.status_message = task.status_message.clone();
         metadata.poll_interval_ms = task.poll_interval;
 
-        Ok(match task.status {
+        let meta = task.meta.and_then(|value| value.as_object().cloned());
+        let detailed = match task.status {
             TaskStatus::Working => crate::tasks::DetailedTask::working(metadata),
             TaskStatus::InputRequired => {
                 // Every request still awaiting a response, not just the most
@@ -2339,7 +2354,8 @@ impl McpRouter {
             // `TaskStatus` is non_exhaustive. Report an unrecognized status as
             // working rather than inventing a terminal state.
             _ => crate::tasks::DetailedTask::working(metadata),
-        })
+        };
+        Ok((detailed, meta))
     }
 
     /// Push the current state of a task to subscribed listen streams.
@@ -2355,7 +2371,7 @@ impl McpRouter {
             return;
         }
 
-        let detailed = match self.detailed_task(task_id).await {
+        let (detailed, meta) = match self.detailed_task(task_id).await {
             Ok(detailed) => detailed,
             Err(error) => {
                 tracing::debug!(
@@ -2371,7 +2387,7 @@ impl McpRouter {
         let notification = ServerNotification::FinalTaskStatusChanged(
             crate::tasks::TaskStatusNotificationParams {
                 task: detailed,
-                meta: None,
+                meta,
             },
         );
 
@@ -2750,8 +2766,45 @@ impl McpRouter {
                         &extensions,
                     );
 
-                    // Spawn the task execution in the background
                     let task_store = self.inner.task_store.clone();
+                    let task_context = crate::tool::TaskContext::new(task_id.clone());
+                    let mut ctx = ctx;
+                    ctx.extensions_mut().insert(task_context.clone());
+                    let preparation = match tool
+                        .prepare_task(task_context, params.arguments.clone())
+                        .await
+                    {
+                        Ok(preparation) => preparation,
+                        Err(error) => {
+                            discard_unprepared_task(&task_store, &task_id).await;
+                            return Err(error);
+                        }
+                    };
+                    if let Some(meta) = preparation.meta {
+                        let value = serde_json::Value::Object(meta);
+                        if let Err(error) = crate::protocol::validate_meta_object(&value) {
+                            discard_unprepared_task(&task_store, &task_id).await;
+                            return Err(Error::invalid_params(format!(
+                                "Invalid task metadata: {error}"
+                            )));
+                        }
+                        let persisted = match task_store.set_task_meta(&task_id, value).await {
+                            Ok(persisted) => persisted,
+                            Err(error) => {
+                                discard_unprepared_task(&task_store, &task_id).await;
+                                return Err(task_store_error(error));
+                            }
+                        };
+                        if !persisted {
+                            discard_unprepared_task(&task_store, &task_id).await;
+                            return Err(Error::JsonRpc(JsonRpcError::internal_error(
+                                "Task store could not persist preparation metadata",
+                            )));
+                        }
+                    }
+                    ctx.extensions_mut().merge(&preparation.extensions);
+
+                    // Spawn the task execution in the background
                     let tool = tool.clone();
                     let arguments = params.arguments;
                     let task_id_clone = task_id.clone();
@@ -2824,12 +2877,11 @@ impl McpRouter {
                         );
                         metadata.status_message = task.status_message.clone();
                         metadata.poll_interval_ms = task.poll_interval;
-                        return Ok(McpResponse::FinalCreateTask(
-                            crate::tasks::CreateTaskResult::new(crate::tasks::Task::new(
-                                metadata,
-                                task.status,
-                            )),
-                        ));
+                        let mut result = crate::tasks::CreateTaskResult::new(
+                            crate::tasks::Task::new(metadata, task.status),
+                        );
+                        result.meta = task.meta.and_then(|value| value.as_object().cloned());
+                        return Ok(McpResponse::FinalCreateTask(result));
                     }
                     Ok(McpResponse::CreateTask(CreateTaskResult::new(task)))
                 } else {
@@ -3986,6 +4038,14 @@ mod tests {
                     .handler(|input: AddInput| async move {
                         Ok(CallToolResult::text(format!("{}", input.a + input.b)))
                     })
+                    .task_preparation(|task, _input| async move {
+                        let mut meta = serde_json::Map::new();
+                        meta.insert(
+                            "dev.tower-mcp/owner-test".to_string(),
+                            serde_json::json!({"taskId": task.task_id()}),
+                        );
+                        Ok(crate::TaskPreparation::new().with_meta(meta))
+                    })
                     .build(),
             )
             .with_tasks();
@@ -4016,6 +4076,10 @@ mod tests {
         assert!(wire["ttlMs"].is_number() || wire["ttlMs"].is_null());
         assert!(wire.get("ttl").is_none(), "legacy field name leaked");
         let task_id = created.task.metadata.task_id.clone();
+        assert_eq!(
+            created.meta.as_ref().unwrap()["dev.tower-mcp/owner-test"]["taskId"],
+            task_id
+        );
 
         // tasks/get returns a status-discriminated DetailedTask.
         let McpResponse::FinalGetTask(fetched) = router

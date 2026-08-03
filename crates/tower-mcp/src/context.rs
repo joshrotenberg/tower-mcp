@@ -695,6 +695,20 @@ impl RequestContext {
         })
     }
 
+    /// Notify the client that a final-protocol task changed status.
+    ///
+    /// This is useful when a handler drives a task transition through a custom
+    /// [`crate::TaskStore`] path rather than through the router directly.
+    pub fn notify_task_status_changed(
+        &self,
+        params: crate::tasks::TaskStatusNotificationParams,
+    ) -> bool {
+        self.notification_tx.as_ref().is_some_and(|tx| {
+            tx.try_send(ServerNotification::FinalTaskStatusChanged(params))
+                .is_ok()
+        })
+    }
+
     /// Send a log message notification to the client
     ///
     /// This is a no-op if no notification sender is configured.
