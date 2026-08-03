@@ -34,6 +34,7 @@ mod command;
 mod config;
 mod editor;
 mod elicit;
+mod exit_status;
 mod find;
 mod jobs;
 mod output;
@@ -68,6 +69,7 @@ use tower_mcp::{ProtocolSupport, ProtocolSupportError};
 
 use alias::Aliases;
 use elicit::ReplClientHandler;
+use exit_status::ExitStatus;
 use jobs::Jobs;
 use output::AsyncOutput;
 use session::{Connector, Session, is_not_initialized, is_session_lost};
@@ -148,19 +150,19 @@ struct Args {
     headers: Vec<String>,
 
     /// Run a command and exit instead of starting the interactive prompt.
-    /// Repeatable; commands run in order against the same session. Exit status
-    /// is non-zero if any command errors. Combine with --http/--demo or a
-    /// stdio child.
+    /// Repeatable; commands run in order against the same session, including
+    /// after a failure. The final status is the most severe command outcome.
+    /// Combine with --http/--demo or a stdio child.
     #[arg(short = 'e', long = "exec", value_name = "COMMAND")]
     exec: Vec<String>,
 
-    /// In --exec mode, emit raw JSON results instead of the pretty renderer,
-    /// for piping to tools like jq.
+    /// In --exec mode, emit one compact JSON value per command (NDJSON), for
+    /// piping to tools like jq.
     #[arg(long)]
     json: bool,
 
-    /// In --exec mode, still print the startup banner and surface listing
-    /// (suppressed by default so only command output is emitted).
+    /// In human --exec mode, still print the startup banner and surface
+    /// listing. JSON stdout is always machine-only.
     #[arg(long)]
     verbose: bool,
 
@@ -192,24 +194,55 @@ struct Args {
 
 /// Set in `--exec` mode by `--json`: render raw JSON instead of pretty output.
 static JSON_OUTPUT: AtomicBool = AtomicBool::new(false);
-/// Set whenever a command errors, so `--exec` can exit non-zero.
-static HAD_ERROR: AtomicBool = AtomicBool::new(false);
 
 fn json_output() -> bool {
     JSON_OUTPUT.load(Ordering::Relaxed)
 }
 
-fn note_error() {
-    HAD_ERROR.store(true, Ordering::Relaxed);
+fn note_error(status: ExitStatus) {
+    exit_status::record(status);
 }
 
 fn automatic_task_updates(one_shot: bool, json: bool) -> bool {
     !one_shot && !json
 }
 
-/// A one-line JSON error object for `--json` mode.
-fn error_json(message: &str) -> String {
-    serde_json::json!({ "error": message }).to_string()
+/// Emit one compact JSON value. Repeated `--exec` commands are therefore
+/// newline-delimited JSON (NDJSON), with one independently parseable line per
+/// command.
+fn print_json(value: &serde_json::Value) {
+    println!("{value}");
+}
+
+/// A stable one-line JSON error object for `--json` mode.
+fn error_json(status: ExitStatus, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "error": message,
+        "kind": status.label(),
+        "exitStatus": status.code(),
+    })
+}
+
+fn report_error(status: ExitStatus, message: &str) {
+    note_error(status);
+    if json_output() {
+        print_json(&error_json(status, message));
+    } else {
+        println!("{}: {message}", style::error_prefix());
+    }
+}
+
+fn report_mcp_error(error: &tower_mcp::Error) {
+    report_error(ExitStatus::from_mcp_error(error), &error.to_string());
+}
+
+fn exit_with_error(status: ExitStatus, message: &str) -> ! {
+    if json_output() {
+        print_json(&error_json(status, message));
+    } else {
+        eprintln!("error: {message}");
+    }
+    std::process::exit(status.code());
 }
 
 /// The server surface the REPL turns into commands. Refreshed on connect
@@ -506,13 +539,16 @@ fn print_find(surface: &Surface, query: &str) {
                 })
             })
             .collect();
-        println!("{}", json_pretty(&serde_json::Value::Array(v)));
+        if v.is_empty() {
+            note_error(ExitStatus::NoMatch);
+        }
+        print_json(&serde_json::Value::Array(v));
         return;
     }
     if hits.is_empty() {
         // grep's convention: a search that matched nothing exits non-zero, so
         // `mcp-repl -e "find x"` can be tested in a script.
-        note_error();
+        note_error(ExitStatus::NoMatch);
         println!("no match for {}", paint(Style::new().fg(Color::Red), query));
         return;
     }
@@ -1033,8 +1069,7 @@ fn load_config(explicit: Option<&str>) -> config::Config {
     match config::Config::load(&path, explicit) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(2);
+            exit_with_error(ExitStatus::Usage, &e);
         }
     }
 }
@@ -1070,8 +1105,7 @@ fn resolve_profile(args: &Args, config: &config::Config) -> Option<(String, conf
     let profile = match config.profile(&name) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(2);
+            exit_with_error(ExitStatus::Usage, &e);
         }
     };
     if profile.bearer.is_some() {
@@ -1083,8 +1117,7 @@ fn resolve_profile(args: &Args, config: &config::Config) -> Option<(String, conf
     match profile.resolve_with(|var| std::env::var(var).ok()) {
         Ok(connection) => Some((name, connection)),
         Err(e) => {
-            eprintln!("error: server profile {name:?}: {e}");
-            std::process::exit(2);
+            exit_with_error(ExitStatus::Usage, &format!("server profile {name:?}: {e}"));
         }
     }
 }
@@ -1101,8 +1134,9 @@ fn log_level_style(level: LogLevel) -> Style {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), tower_mcp::BoxError> {
+async fn main() {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
         )
@@ -1112,6 +1146,12 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     wire::init(args.trace);
     JSON_OUTPUT.store(args.json, Ordering::Relaxed);
 
+    if let Err(error) = run(args).await {
+        exit_with_error(ExitStatus::from_mcp_error(&error), &error.to_string());
+    }
+}
+
+async fn run(args: Args) -> tower_mcp::Result<()> {
     // Server profiles are read up front: both --list-servers and profile
     // resolution need them before anything connects.
     let config_file = config::config_path(args.config.as_deref()).map(|(path, _)| path);
@@ -1124,7 +1164,9 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     // --exec runs commands and exits; suppress the banner and surface listing
     // unless --verbose, so scripted output is only the command results.
     let one_shot = !args.exec.is_empty();
-    let quiet = one_shot && !args.verbose;
+    // JSON stdout is a machine-readable stream. Even `--verbose` must not
+    // inject a human banner into it.
+    let quiet = one_shot && (!args.verbose || args.json);
 
     // True while the reedline editor owns the terminal; the elicitation
     // handler declines form requests during that window instead of
@@ -1226,7 +1268,8 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     // refuse an individual request, and a server can only ask when the
     // capability is declared, so `--sampling decline` still exercises the
     // server's rejection path.
-    let builder = client_builder(args.protocol)?;
+    let builder = client_builder(args.protocol)
+        .unwrap_or_else(|error| exit_with_error(ExitStatus::Usage, &error.to_string()));
     // Only `--http` can be resurrected. A stdio child that dies takes its
     // stdin and stdout with it (respawning it is a separate concern), and the
     // in-process demo router cannot lose a session at all.
@@ -1246,7 +1289,8 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
                 headers,
             }) => {
                 let config =
-                    build_http_config(args.bearer.clone(), &args.headers, bearer, &headers)?;
+                    build_http_config(args.bearer.clone(), &args.headers, bearer, &headers)
+                        .unwrap_or_else(|error| exit_with_error(ExitStatus::Usage, &error));
                 if !args.no_reconnect {
                     connector = Some(http_connector(
                         url.clone(),
@@ -1275,10 +1319,11 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
                     .await?
             }
             None => {
-                eprintln!(
-                    "usage: mcp-repl <server command...> | --http <url> | --server <name> | --demo"
+                exit_with_error(
+                    ExitStatus::Usage,
+                    "usage: mcp-repl <server command...> | --http <url> | \
+                     --server <name> | --demo",
                 );
-                std::process::exit(2);
             }
         }
     };
@@ -1315,11 +1360,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
                 break;
             }
         }
-        std::process::exit(if HAD_ERROR.load(Ordering::Relaxed) {
-            1
-        } else {
-            0
-        });
+        std::process::exit(exit_status::current().code());
     }
 
     // Final list-change notifications are subscription-scoped. Start the
@@ -1378,6 +1419,9 @@ async fn handle_line(
     line: &str,
 ) -> bool {
     if line.is_empty() {
+        if json_output() {
+            report_error(ExitStatus::Usage, "empty command");
+        }
         return false;
     }
     // Aliases expand before anything else looks at the line, so an expansion
@@ -1391,12 +1435,7 @@ async fn handle_line(
             expanded.trim()
         }
         Err(e) => {
-            note_error();
-            if json_output() {
-                println!("{}", error_json(&e));
-            } else {
-                println!("{}: {e}", style::error_prefix());
-            }
+            report_error(ExitStatus::Usage, &e);
             return false;
         }
     };
@@ -1408,12 +1447,7 @@ async fn handle_line(
     let command = match vars::substitute(routed) {
         Ok(c) => c,
         Err(e) => {
-            note_error();
-            if json_output() {
-                println!("{}", error_json(&e));
-            } else {
-                println!("{}: {e}", style::error_prefix());
-            }
+            report_error(ExitStatus::Usage, &e);
             return false;
         }
     };
@@ -1422,26 +1456,43 @@ async fn handle_line(
     let parsed = match command::parse(line) {
         Ok(parsed) => parsed,
         Err(e) => {
-            note_error();
-            if json_output() {
-                println!("{}", error_json(&e));
-            } else {
-                println!("{}: {e}", style::error_prefix());
-            }
+            report_error(ExitStatus::Usage, &e);
             return false;
         }
     };
     let background = parsed.background;
     let tokens: Vec<&str> = parsed.words.iter().map(String::as_str).collect();
     if tokens.is_empty() {
+        if json_output() {
+            report_error(ExitStatus::Usage, "empty command");
+        }
         return false;
     }
     let cmd = tokens[0];
     let rest = &tokens[1..];
 
     match cmd {
-        "quit" | "exit" => return true,
+        "quit" | "exit" => {
+            if json_output() {
+                print_json(&serde_json::json!({ "exit": true }));
+            }
+            return true;
+        }
         "help" => {
+            if json_output() {
+                let s = surface.read().unwrap();
+                print_json(&serde_json::json!({
+                    "builtins": BUILTINS
+                        .iter()
+                        .map(|(name, description)| serde_json::json!({
+                            "name": name,
+                            "description": description,
+                        }))
+                        .collect::<Vec<_>>(),
+                    "tools": s.tools,
+                }));
+                return false;
+            }
             println!("built-ins:");
             println!("  tools | prompts | resources | templates   list the server surface");
             println!("  find <keyword>                            search the surface");
@@ -1488,7 +1539,7 @@ async fn handle_line(
                     _ => serde_json::to_value(&s.templates),
                 }
                 .unwrap_or_default();
-                println!("{}", json_pretty(&v));
+                print_json(&v);
                 return false;
             }
             match cmd {
@@ -1573,21 +1624,32 @@ async fn handle_line(
             // (`find crate info`) is not silently truncated to its first word.
             let query = rest.join(" ");
             if query.is_empty() {
-                println!("usage: find <keyword>");
+                command_error("usage: find <keyword>");
                 return false;
             }
             print_find(&surface.read().unwrap(), &query);
         }
         "describe" => {
             let Some(name) = rest.first() else {
-                println!("usage: describe <tool|prompt|resource|template>");
+                command_error("usage: describe <tool|prompt|resource|template>");
                 return false;
             };
-            describe(&surface.read().unwrap(), name);
+            let surface = surface.read().unwrap();
+            if json_output() {
+                match describe_value(&surface, name) {
+                    Some(value) => print_json(&value),
+                    None => report_error(
+                        ExitStatus::NoMatch,
+                        &format!("nothing on the surface named `{name}`"),
+                    ),
+                }
+            } else {
+                describe(&surface, name);
+            }
         }
         "read" => {
             let Some(uri) = rest.first() else {
-                println!("usage: read <uri>");
+                command_error("usage: read <uri>");
                 return false;
             };
             let started = std::time::Instant::now();
@@ -1599,10 +1661,7 @@ async fn handle_line(
             .await
             {
                 Ok(result) if json_output() => {
-                    println!(
-                        "{}",
-                        json_pretty(&serde_json::to_value(&result).unwrap_or_default())
-                    );
+                    print_json(&serde_json::to_value(&result).unwrap_or_default())
                 }
                 Ok(result) => {
                     for c in result.contents {
@@ -1625,14 +1684,7 @@ async fn handle_line(
                         }
                     }
                 }
-                Err(e) => {
-                    note_error();
-                    if json_output() {
-                        println!("{}", error_json(&e.to_string()));
-                    } else {
-                        println!("{}: {e}", style::error_prefix());
-                    }
-                }
+                Err(e) => report_mcp_error(&e),
             }
             if !json_output() {
                 println!("{}", timing(started.elapsed()));
@@ -1640,7 +1692,7 @@ async fn handle_line(
         }
         "subscribe" | "unsubscribe" => {
             let Some(uri) = rest.first() else {
-                println!("usage: {cmd} <uri>");
+                command_error(&format!("usage: {cmd} <uri>"));
                 return false;
             };
             handle_subscription(&client, cmd, uri).await;
@@ -1648,7 +1700,7 @@ async fn handle_line(
         "subscriptions" => {
             let active = subscribe::list();
             if json_output() {
-                println!("{}", json_pretty(&serde_json::json!(active)));
+                print_json(&serde_json::json!(active));
                 return false;
             }
             if active.is_empty() {
@@ -1661,7 +1713,7 @@ async fn handle_line(
         }
         "prompt" => {
             let Some(name) = rest.first() else {
-                println!("usage: prompt <name> [k=v...]");
+                command_error("usage: prompt <name> [k=v...]");
                 return false;
             };
             let mut prompt_args = HashMap::new();
@@ -1678,10 +1730,7 @@ async fn handle_line(
             .await
             {
                 Ok(result) if json_output() => {
-                    println!(
-                        "{}",
-                        json_pretty(&serde_json::to_value(&result).unwrap_or_default())
-                    );
+                    print_json(&serde_json::to_value(&result).unwrap_or_default())
                 }
                 Ok(result) => {
                     for m in result.messages {
@@ -1697,14 +1746,7 @@ async fn handle_line(
                         println!("{} {}", tag(Style::new().fg(Color::Cyan), role), text);
                     }
                 }
-                Err(e) => {
-                    note_error();
-                    if json_output() {
-                        println!("{}", error_json(&e.to_string()));
-                    } else {
-                        println!("{}: {e}", style::error_prefix());
-                    }
-                }
+                Err(e) => report_mcp_error(&e),
             }
             if !json_output() {
                 println!("{}", timing(started.elapsed()));
@@ -1712,19 +1754,14 @@ async fn handle_line(
         }
         "call" => {
             let Some(name) = rest.first() else {
-                println!("usage: call <tool> <json>");
+                command_error("usage: call <tool> <json>");
                 return false;
             };
             let json = rest[1..].join(" ");
             let arguments: serde_json::Value = match serde_json::from_str(&json) {
                 Ok(v) => v,
                 Err(e) => {
-                    note_error();
-                    if json_output() {
-                        println!("{}", error_json(&format!("invalid JSON: {e}")));
-                    } else {
-                        println!("invalid JSON: {e}");
-                    }
+                    report_error(ExitStatus::Usage, &format!("invalid JSON: {e}"));
                     return false;
                 }
             };
@@ -1734,6 +1771,34 @@ async fn handle_line(
             handle_bench(&client, surface, rest, background).await;
         }
         "jobs" => {
+            if json_output() {
+                let mut rendered = Vec::new();
+                for job in jobs.list() {
+                    match client.task_get(&job.task_id).await {
+                        Ok(task) => {
+                            jobs.sync(&job.task_id, task.status, task.status_message.clone());
+                            rendered.push(serde_json::json!({
+                                "taskId": job.task_id,
+                                "tool": job.tool,
+                                "task": task,
+                            }));
+                        }
+                        Err(error) => {
+                            let status = ExitStatus::from_mcp_error(&error);
+                            note_error(status);
+                            rendered.push(serde_json::json!({
+                                "taskId": job.task_id,
+                                "tool": job.tool,
+                                "error": error.to_string(),
+                                "kind": status.label(),
+                                "exitStatus": status.code(),
+                            }));
+                        }
+                    }
+                }
+                print_json(&serde_json::Value::Array(rendered));
+                return false;
+            }
             if jobs.is_empty() {
                 println!("no background tasks");
             }
@@ -1748,7 +1813,10 @@ async fn handle_line(
                             paint(task_status_style(task.status), &task.status.to_string())
                         );
                     }
-                    Err(_) => println!("{}  {}  (gone)", job.task_id, job.tool),
+                    Err(error) => {
+                        note_error(ExitStatus::from_mcp_error(&error));
+                        println!("{}  {}  (gone)", job.task_id, job.tool);
+                    }
                 }
             }
         }
@@ -1757,7 +1825,7 @@ async fn handle_line(
         // "(gone)" from `jobs` is the honest answer there.
         "task" | "wait" | "cancel" => {
             let Some(id) = rest.first() else {
-                println!("usage: {cmd} <task-id>");
+                command_error(&format!("usage: {cmd} <task-id>"));
                 return false;
             };
             let outcome = match cmd {
@@ -1765,7 +1833,9 @@ async fn handle_line(
                 "wait" => client.task_wait(id).await,
                 _ => match client.task_cancel(id, None).await {
                     Ok(()) => {
-                        println!("cancel acknowledged");
+                        if !json_output() {
+                            println!("cancel acknowledged");
+                        }
                         client.task_get(id).await
                     }
                     Err(e) => Err(e),
@@ -1774,23 +1844,13 @@ async fn handle_line(
             match outcome {
                 Ok(task) if json_output() => {
                     jobs.sync(id, task.status, task.status_message.clone());
-                    println!(
-                        "{}",
-                        json_pretty(&serde_json::to_value(&task).unwrap_or_default())
-                    );
+                    print_json(&serde_json::to_value(&task).unwrap_or_default());
                 }
                 Ok(task) => {
                     jobs.sync(id, task.status, task.status_message.clone());
                     render_task(&task);
                 }
-                Err(e) => {
-                    note_error();
-                    if json_output() {
-                        println!("{}", error_json(&e.to_string()));
-                    } else {
-                        println!("{}: {e}", style::error_prefix());
-                    }
-                }
+                Err(e) => report_mcp_error(&e),
             }
         }
         "alias" | "unalias" => {
@@ -1799,40 +1859,42 @@ async fn handle_line(
             let raw = line.strip_prefix(cmd).unwrap_or("").trim();
             handle_alias(aliases, surface, cmd, raw);
         }
-        "wire" => match rest.first().copied() {
-            Some("on") => {
-                wire().set_trace(true);
-                println!("wire tracing on (frames print to stderr)");
+        "wire" => {
+            match rest.first().copied() {
+                Some("on") => wire().set_trace(true),
+                Some("off") => wire().set_trace(false),
+                None => {}
+                Some(other) => {
+                    command_error(&format!("usage: wire [on|off] (got `{other}`)"));
+                    return false;
+                }
             }
-            Some("off") => {
-                wire().set_trace(false);
+            let enabled = wire().trace_enabled();
+            if json_output() {
+                print_json(&serde_json::json!({ "wire": enabled }));
+            } else if enabled {
+                println!("wire tracing on (frames print to stderr)");
+            } else {
                 println!("wire tracing off");
             }
-            None => println!(
-                "wire tracing is {}",
-                if wire().trace_enabled() { "on" } else { "off" }
-            ),
-            Some(other) => println!("usage: wire [on|off] (got `{other}`)"),
-        },
+        }
         // Deliberately independent of the trace toggle: frames are recorded
         // either way, so the exchange you did not think to trace is still there.
         "last" => match wire().last_exchange() {
             None => {
+                note_error(ExitStatus::NoMatch);
                 if json_output() {
-                    println!("{}", error_json("no exchange yet"));
+                    print_json(&error_json(ExitStatus::NoMatch, "no exchange yet"));
                 } else {
                     println!("no request has been sent yet");
                 }
             }
             Some((request, response)) => {
                 if json_output() {
-                    println!(
-                        "{}",
-                        json_pretty(&serde_json::json!({
-                            "request": request.json,
-                            "response": response.map(|r| r.json),
-                        }))
-                    );
+                    print_json(&serde_json::json!({
+                        "request": request.json,
+                        "response": response.map(|r| r.json),
+                    }));
                 } else {
                     println!("{}", wire::render(wire::Direction::Sent, &request));
                     match response {
@@ -1846,17 +1908,36 @@ async fn handle_line(
         },
         "refresh" => {
             let fresh = refresh_surface(session).await;
-            println!(
-                "{} tools, {} prompts, {} resources, {} templates",
-                fresh.tools.len(),
-                fresh.prompts.len(),
-                fresh.resources.len(),
-                fresh.templates.len()
-            );
+            if json_output() {
+                print_json(&serde_json::json!({
+                    "tools": fresh.tools.len(),
+                    "prompts": fresh.prompts.len(),
+                    "resources": fresh.resources.len(),
+                    "templates": fresh.templates.len(),
+                }));
+            } else {
+                println!(
+                    "{} tools, {} prompts, {} resources, {} templates",
+                    fresh.tools.len(),
+                    fresh.prompts.len(),
+                    fresh.resources.len(),
+                    fresh.templates.len()
+                );
+            }
             *surface.write().unwrap() = fresh;
         }
         "info" => match connection_info(&client).await {
             Some(info) => {
+                if json_output() {
+                    print_json(&serde_json::json!({
+                        "protocolVersion": info.protocol_version,
+                        "serverInfo": info.server_info,
+                        "capabilities": info.capabilities,
+                        "instructions": info.instructions,
+                        "sampling": sampling::mode().as_str(),
+                    }));
+                    return false;
+                }
                 // Replay the full startup banner, then add capabilities.
                 print_banner(&info);
                 print_counts(&surface.read().unwrap());
@@ -1871,13 +1952,13 @@ async fn handle_line(
                     )
                 );
             }
-            None => println!("not initialized"),
+            None => report_error(ExitStatus::Transport, "not initialized"),
         },
         "vars" => {
             let all = vars::list();
             if json_output() {
                 let map: serde_json::Map<String, serde_json::Value> = all.into_iter().collect();
-                println!("{}", json_pretty(&serde_json::Value::Object(map)));
+                print_json(&serde_json::Value::Object(map));
             } else if all.is_empty() {
                 println!("{}", paint(Style::new().dimmed(), "no variables"));
             } else {
@@ -1893,11 +1974,12 @@ async fn handle_line(
         "unset" => match rest.first() {
             Some(name) => {
                 if vars::unset(name) {
-                    if !json_output() {
+                    if json_output() {
+                        print_json(&serde_json::json!({ "unset": name }));
+                    } else {
                         println!("unset ${name}");
                     }
                 } else {
-                    note_error();
                     command_error(&format!("no such variable `${name}`"));
                 }
             }
@@ -1912,21 +1994,15 @@ async fn handle_line(
                     .map(|t| t.input_schema.clone())
             };
             let Some(schema) = schema else {
-                note_error();
+                note_error(ExitStatus::Usage);
                 let suggestion = find::did_you_mean(&surface.read().unwrap(), tool_name);
                 if json_output() {
-                    match &suggestion {
-                        Some(near) => println!(
-                            "{}",
-                            serde_json::json!({
-                                "error": format!("unknown command: {tool_name}"),
-                                "didYouMean": near,
-                            })
-                        ),
-                        None => {
-                            println!("{}", error_json(&format!("unknown command: {tool_name}")))
-                        }
+                    let mut value =
+                        error_json(ExitStatus::Usage, &format!("unknown command: {tool_name}"));
+                    if let Some(near) = &suggestion {
+                        value["didYouMean"] = serde_json::json!(near);
                     }
+                    print_json(&value);
                 } else {
                     let name = paint(Style::new().fg(Color::Red), tool_name);
                     match suggestion {
@@ -1990,10 +2066,10 @@ async fn handle_bench(
     // A run with failures in it exits non-zero, like any other failing
     // command, so `-e "bench ..."` works as a health check.
     if outcome.errors > 0 {
-        note_error();
+        note_error(ExitStatus::Server);
     }
     if json_output() {
-        println!("{}", json_pretty(&bench::render_json(&plan, &outcome)));
+        print_json(&bench::render_json(&plan, &outcome));
         return;
     }
     println!("{}", bench::render(&plan, &outcome));
@@ -2039,10 +2115,10 @@ async fn handle_subscription(client: &Arc<McpClient>, cmd: &str, uri: &str) {
                 subscribe::remove(uri)
             };
             if json_output() {
-                println!(
-                    "{}",
-                    serde_json::json!({ cmd: uri, "alreadyInEffect": !changed })
-                );
+                print_json(&serde_json::json!({
+                    cmd: uri,
+                    "alreadyInEffect": !changed,
+                }));
             } else {
                 let note = if changed {
                     String::new()
@@ -2052,14 +2128,7 @@ async fn handle_subscription(client: &Arc<McpClient>, cmd: &str, uri: &str) {
                 println!("{cmd}d {}{note}", paint(Style::new().fg(Color::Green), uri));
             }
         }
-        Err(e) => {
-            note_error();
-            if json_output() {
-                println!("{}", error_json(&e.to_string()));
-            } else {
-                println!("{}: {e}", style::error_prefix());
-            }
-        }
+        Err(e) => report_mcp_error(&e),
     }
     if !json_output() {
         println!("{}", timing(started.elapsed()));
@@ -2087,21 +2156,18 @@ fn handle_alias(
 
     if cmd == "unalias" {
         if rest.is_empty() || rest.contains(char::is_whitespace) {
-            println!("usage: unalias [--global] <name>");
+            command_error("usage: unalias [--global] <name>");
             return;
         }
         match aliases.write().unwrap().remove(rest, global) {
             Ok(applied) => {
                 report_alias_warning(applied.warning.as_deref());
                 if json_output() {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "removed": rest,
-                            "expansion": applied.previous,
-                            "scope": applied.scope.label(),
-                        })
-                    );
+                    print_json(&serde_json::json!({
+                        "removed": rest,
+                        "expansion": applied.previous,
+                        "scope": applied.scope.label(),
+                    }));
                 } else {
                     println!(
                         "removed {} {}",
@@ -2133,7 +2199,7 @@ fn handle_alias(
                     })
                 })
                 .collect();
-            println!("{}", json_pretty(&serde_json::Value::Array(rendered)));
+            print_json(&serde_json::Value::Array(rendered));
             return;
         }
         if entries.is_empty() {
@@ -2156,14 +2222,11 @@ fn handle_alias(
     let Some((name, expansion)) = rest.split_once('=') else {
         let aliases = aliases.read().unwrap();
         match aliases.lookup(rest) {
-            Some((expansion, scope)) if json_output() => println!(
-                "{}",
-                serde_json::json!({
-                    "name": rest,
-                    "expansion": expansion,
-                    "scope": scope.label(),
-                })
-            ),
+            Some((expansion, scope)) if json_output() => print_json(&serde_json::json!({
+                "name": rest,
+                "expansion": expansion,
+                "scope": scope.label(),
+            })),
             Some((expansion, scope)) => println!(
                 "{} = {}  {}",
                 paint(Style::new().fg(Color::Cyan), rest),
@@ -2185,15 +2248,12 @@ fn handle_alias(
         Ok(applied) => {
             report_alias_warning(applied.warning.as_deref());
             if json_output() {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "name": name,
-                        "expansion": expansion.trim(),
-                        "scope": applied.scope.label(),
-                        "replaced": applied.previous,
-                    })
-                );
+                print_json(&serde_json::json!({
+                    "name": name,
+                    "expansion": expansion.trim(),
+                    "scope": applied.scope.label(),
+                    "replaced": applied.previous,
+                }));
                 return;
             }
             println!(
@@ -2230,12 +2290,56 @@ fn report_alias_warning(warning: Option<&str>) {
 }
 
 fn command_error(message: &str) {
-    note_error();
-    if json_output() {
-        println!("{}", error_json(message));
-    } else {
-        println!("{}: {message}", style::error_prefix());
-    }
+    report_error(ExitStatus::Usage, message);
+}
+
+fn describe_value(surface: &Surface, name: &str) -> Option<serde_json::Value> {
+    surface
+        .tools
+        .iter()
+        .find(|definition| definition.name == name)
+        .map(|definition| {
+            serde_json::json!({
+                "kind": "tool",
+                "definition": definition,
+            })
+        })
+        .or_else(|| {
+            surface
+                .prompts
+                .iter()
+                .find(|definition| definition.name == name)
+                .map(|definition| {
+                    serde_json::json!({
+                        "kind": "prompt",
+                        "definition": definition,
+                    })
+                })
+        })
+        .or_else(|| {
+            surface
+                .resources
+                .iter()
+                .find(|definition| definition.name == name || definition.uri == name)
+                .map(|definition| {
+                    serde_json::json!({
+                        "kind": "resource",
+                        "definition": definition,
+                    })
+                })
+        })
+        .or_else(|| {
+            surface
+                .templates
+                .iter()
+                .find(|definition| definition.name == name || definition.uri_template == name)
+                .map(|definition| {
+                    serde_json::json!({
+                        "kind": "resourceTemplate",
+                        "definition": definition,
+                    })
+                })
+        })
 }
 
 /// The `describe` built-in: schemas for a tool, the argument table for a
@@ -2353,6 +2457,7 @@ fn describe(surface: &Surface, name: &str) {
         }
         return;
     }
+    note_error(ExitStatus::NoMatch);
     println!("nothing on the surface named `{name}` (try `tools`, `prompts`, `resources`)");
 }
 
@@ -2376,10 +2481,7 @@ async fn run_tool(
                 let task_id = created.task.task_id.clone();
                 let poll_interval = created.task.poll_interval;
                 if json_output() {
-                    println!(
-                        "{}",
-                        json_pretty(&serde_json::to_value(&created).unwrap_or_default())
-                    );
+                    print_json(&serde_json::to_value(&created).unwrap_or_default());
                 } else {
                     println!(
                         "{} started",
@@ -2397,14 +2499,7 @@ async fn run_tool(
                 );
                 watch_task(session.clone(), jobs.clone(), task_id, poll_interval);
             }
-            Err(e) => {
-                note_error();
-                if json_output() {
-                    println!("{}", error_json(&e.to_string()));
-                } else {
-                    println!("{}: {e}", style::error_prefix());
-                }
-            }
+            Err(e) => report_mcp_error(&e),
         }
         return;
     }
@@ -2417,14 +2512,11 @@ async fn run_tool(
     {
         Ok(result) => {
             if result.is_error {
-                note_error();
+                note_error(ExitStatus::Server);
             }
             if output.is_plain() {
                 if json_output() {
-                    println!(
-                        "{}",
-                        json_pretty(&serde_json::to_value(&result).unwrap_or_default())
-                    );
+                    print_json(&serde_json::to_value(&result).unwrap_or_default());
                 } else {
                     if result.is_error {
                         println!("{}", tag(Style::new().fg(Color::Red), "tool error"));
@@ -2435,14 +2527,7 @@ async fn run_tool(
                 emit_result(result_value(&result), output);
             }
         }
-        Err(e) => {
-            note_error();
-            if json_output() {
-                println!("{}", error_json(&e.to_string()));
-            } else {
-                println!("{}: {e}", style::error_prefix());
-            }
-        }
+        Err(e) => report_mcp_error(&e),
     }
     if !json_output() {
         println!("{}", timing(started.elapsed()));
@@ -2469,7 +2554,6 @@ fn emit_result(mut value: serde_json::Value, output: &vars::Output) {
         match vars::get_path(&value, path) {
             Some(selected) => value = selected,
             None => {
-                note_error();
                 command_error(&format!("path `{path}` not found in result"));
                 return;
             }
@@ -2478,7 +2562,7 @@ fn emit_result(mut value: serde_json::Value, output: &vars::Output) {
     if let Some(name) = &output.capture {
         vars::set(name, value.clone());
         if json_output() {
-            println!("{}", json_pretty(&value));
+            print_json(&value);
         } else {
             println!(
                 "{} {}",
@@ -2487,7 +2571,7 @@ fn emit_result(mut value: serde_json::Value, output: &vars::Output) {
             );
         }
     } else if json_output() {
-        println!("{}", json_pretty(&value));
+        print_json(&value);
     } else {
         render_value(&value);
     }
@@ -2775,8 +2859,10 @@ mod tests {
 
     #[test]
     fn error_json_is_a_valid_object() {
-        let v: serde_json::Value = serde_json::from_str(&error_json("boom: it broke")).unwrap();
+        let v = error_json(ExitStatus::Usage, "boom: it broke");
         assert_eq!(v["error"], "boom: it broke");
+        assert_eq!(v["kind"], "usage");
+        assert_eq!(v["exitStatus"], 2);
     }
 
     #[test]

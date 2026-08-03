@@ -447,23 +447,59 @@ declined rather than fighting the editor for stdin.
 ## One-shot / scripting
 
 `-e/--exec <COMMAND>` runs a command and exits instead of opening the prompt.
-Repeatable; commands run in order against the same session. The exit status is
-non-zero if any command errored, so it drops into scripts and CI.
+Repeatable; commands run in order against the same session, including after a
+failure, so later cleanup or inspection commands still run. The final status
+is the highest-severity outcome seen across the sequence.
 
 ```bash
 # One call, pretty output:
 mcp-repl --http https://example/mcp -e "get_crate_info name=serde"
 
-# Raw JSON for piping to jq (--json also silences the banner and timings):
+# One JSON result for piping to jq (--json also silences the banner and timings):
 mcp-repl --http https://example/mcp -e "search_crates query=serde" --json | jq '.content'
 
-# Several commands in one session:
+# Several commands in one session; JSON output is NDJSON, one value per line:
+mcp-repl --demo --json -e "tools" -e "echo message=hi" | jq -c .
+
+# Human output from several commands:
 mcp-repl --demo -e "echo message=hi" -e "about"
 ```
 
-The banner and surface listing are suppressed in `--exec` mode (pass
-`--verbose` to keep them). `--json` applies to tool calls, `read`, `prompt`,
-`tools`/`prompts`/`resources`/`templates`, and errors (`{"error": "..."}`).
+In human `--exec` mode the banner and surface listing are suppressed by
+default; pass `--verbose` to keep them. Under `--json`, stdout is always a
+machine-only [NDJSON](https://github.com/ndjson/ndjson-spec) stream: every
+executed command emits exactly one compact, independently parseable value on
+one line. `--verbose` never adds a banner there. Timings, tracing, progress,
+notifications, reconnect notices, spawned-child diagnostics, and warnings go
+to stderr.
+
+Successful protocol operations preserve their MCP result shape: foreground
+tool calls return `CallToolResult`, `read` returns `ReadResourceResult`,
+`prompt` returns `GetPromptResult`, task commands return `TaskObject`, and a
+task-augmented tool call returns its task-creation result. Surface list commands
+return convenience arrays of their protocol definitions (without pagination
+wrappers). REPL-only commands use documented convenience values or envelopes:
+`find` and `subscriptions` return arrays; `describe` returns
+`{"kind": ..., "definition": ...}`; and `help`, `bench`, `jobs`, aliases,
+`wire`, `last`, `refresh`, `info`, `vars`, `unset`, and `quit` return objects.
+
+JSON errors also stay on stdout so they occupy that command's one output line:
+
+```json
+{"error":"unknown command: nope","kind":"usage","exitStatus":2}
+```
+
+Diagnostics explaining the failure may still appear on stderr. Human mode
+keeps readable text output. Process statuses are stable:
+
+| Status | Meaning |
+| ---: | --- |
+| 0 | success |
+| 1 | no-match/check-style result (for example, `find` found nothing) |
+| 2 | local invocation or command usage error |
+| 3 | server rejection or tool error result |
+| 4 | transport or protocol connection failure |
+| 5 | authentication or authorization failure |
 
 ## Capture and filtering
 

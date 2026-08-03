@@ -5,7 +5,7 @@ use std::process::Output;
 use std::time::Duration;
 
 use tempfile::TempDir;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 
 const CASE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -42,6 +42,32 @@ fn assert_success(output: &Output, label: &str) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn assert_status(output: &Output, expected: i32, label: &str) {
+    assert_eq!(
+        output.status.code(),
+        Some(expected),
+        "{label} had unexpected status {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn json_lines(output: &Output, label: &str) -> Vec<serde_json::Value> {
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .enumerate()
+        .map(|(index, line)| {
+            serde_json::from_str(line).unwrap_or_else(|error| {
+                panic!(
+                    "{label} stdout line {} is not JSON: {error}: {line}",
+                    index + 1
+                )
+            })
+        })
+        .collect()
 }
 
 async fn build_fixture() -> PathBuf {
@@ -173,6 +199,153 @@ async fn run_http(url: &str, case: &str, repl_args: &[&str]) -> Output {
     let mut command = repl_command();
     command.args(repl_args).args(["--http", url]);
     run(command, case, CASE_TIMEOUT).await
+}
+
+async fn auth_failure_server() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind auth failure server");
+    let url = format!(
+        "http://{}/",
+        listener.local_addr().expect("auth server address")
+    );
+    let task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0_u8; 8 * 1024];
+                let _ = stream.read(&mut request).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 401 Unauthorized\r\n\
+                          Content-Length: 0\r\n\
+                          WWW-Authenticate: Bearer\r\n\
+                          Connection: close\r\n\r\n",
+                    )
+                    .await;
+            });
+        }
+    });
+    (url, task)
+}
+
+async fn exercise_json_contract(fixture: &Path, temp: &TempDir) {
+    let multiple = run_stdio(
+        fixture,
+        temp,
+        "json-multiple",
+        &[
+            "--json",
+            "--verbose",
+            "--trace",
+            "--exec",
+            "tools",
+            "--exec",
+            "add a=20 b=22",
+            "--exec",
+            "announce",
+        ],
+    )
+    .await;
+    assert_success(&multiple, "multiple JSON commands");
+    let values = json_lines(&multiple, "multiple JSON commands");
+    assert_eq!(values.len(), 3, "one JSON line must be emitted per command");
+    assert!(
+        values[0].is_array(),
+        "tools returns the raw MCP list: {values:?}"
+    );
+    assert_eq!(
+        values[1].pointer("/content/0/text"),
+        Some(&serde_json::json!("42"))
+    );
+    assert_eq!(
+        values[2].pointer("/content/0/text"),
+        Some(&serde_json::json!("announced"))
+    );
+    assert!(
+        !String::from_utf8_lossy(&multiple.stdout).contains("connected:"),
+        "--verbose must not contaminate JSON stdout"
+    );
+    let stderr = String::from_utf8_lossy(&multiple.stderr);
+    assert!(stderr.contains("fixture announcement"), "{stderr}");
+    assert!(
+        stderr.contains("tools/list"),
+        "wire tracing stayed off: {stderr}"
+    );
+
+    let no_match = run_stdio(
+        fixture,
+        temp,
+        "json-no-match",
+        &["--json", "--exec", "find definitely-not-on-the-surface"],
+    )
+    .await;
+    assert_status(&no_match, 1, "no-match outcome");
+    assert_eq!(
+        json_lines(&no_match, "no-match outcome"),
+        [serde_json::json!([])]
+    );
+
+    let continued = run_stdio(
+        fixture,
+        temp,
+        "json-continued",
+        &[
+            "--json",
+            "--exec",
+            "no_such_command",
+            "--exec",
+            "add a=20 b=22",
+        ],
+    )
+    .await;
+    assert_status(&continued, 2, "usage error");
+    let values = json_lines(&continued, "continued JSON commands");
+    assert_eq!(values.len(), 2, "later commands must run after a failure");
+    assert_eq!(values[0]["kind"], "usage");
+    assert_eq!(values[0]["exitStatus"], 2);
+    assert_eq!(
+        values[1].pointer("/content/0/text"),
+        Some(&serde_json::json!("42"))
+    );
+
+    let server_error = run_stdio(
+        fixture,
+        temp,
+        "json-server-error",
+        &["--json", "--exec", "fail"],
+    )
+    .await;
+    assert_status(&server_error, 3, "tool error");
+    let values = json_lines(&server_error, "tool error");
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0]["isError"], true);
+
+    let unavailable = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("reserve unavailable endpoint");
+    let unavailable_url = format!(
+        "http://{}/",
+        unavailable.local_addr().expect("unavailable address")
+    );
+    drop(unavailable);
+    let transport_error = run_http(
+        &unavailable_url,
+        "JSON transport error",
+        &["--json", "--exec", "tools"],
+    )
+    .await;
+    assert_status(&transport_error, 4, "transport error");
+    let values = json_lines(&transport_error, "transport error");
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0]["kind"], "transport");
+
+    let (auth_url, auth_server) = auth_failure_server().await;
+    let auth_error = run_http(&auth_url, "JSON auth error", &["--json", "--exec", "tools"]).await;
+    auth_server.abort();
+    assert_status(&auth_error, 5, "authentication error");
+    let values = json_lines(&auth_error, "authentication error");
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0]["kind"], "auth");
 }
 
 async fn exercise_stdio(fixture: &Path, temp: &TempDir) {
@@ -329,6 +502,7 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
     tokio::time::timeout(SUITE_TIMEOUT, async {
         let temp = TempDir::new().expect("temporary fixture directory");
         let fixture = build_fixture().await;
+        exercise_json_contract(&fixture, &temp).await;
         exercise_stdio(&fixture, &temp).await;
         exercise_http(&fixture, &temp).await;
     })

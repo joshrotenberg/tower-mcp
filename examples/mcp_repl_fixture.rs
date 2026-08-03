@@ -63,6 +63,14 @@ fn fixture_router() -> McpRouter {
                 })
                 .build(),
         )
+        .tool(
+            ToolBuilder::new("fail")
+                .description("Return a deterministic MCP tool error")
+                .extractor_handler((), |_ctx: Context, RawArgs(_): RawArgs| async move {
+                    Ok(CallToolResult::error("fixture tool failure"))
+                })
+                .build(),
+        )
         .resource(
             ResourceBuilder::new("fixture://guide")
                 .name("Fixture Guide")
