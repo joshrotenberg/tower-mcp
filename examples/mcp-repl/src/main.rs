@@ -41,6 +41,7 @@ mod sampling;
 mod session;
 mod style;
 mod subscribe;
+mod surface_subscription;
 mod vars;
 mod wire;
 
@@ -1320,6 +1321,14 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
             0
         });
     }
+
+    // Final list-change notifications are subscription-scoped. Start the
+    // long-lived stream only for an interactive final connection, after the
+    // initial surface fetch; stable notifications already arrive directly,
+    // and one-shot output must remain deterministic.
+    let _surface_subscription = (args.protocol == ProtocolMode::Final).then(|| {
+        surface_subscription::SurfaceSubscription::start(session.clone(), async_output.clone())
+    });
 
     // Readline runs on its own thread; lines cross into async via channels.
     let (line_tx, mut line_rx) = tokio::sync::mpsc::channel::<String>(1);

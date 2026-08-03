@@ -41,6 +41,10 @@ pub struct Session {
     /// and finds N+1 after taking the lock knows someone else already
     /// reconnected and skips its own attempt.
     generation: AtomicU64,
+    /// Wakes long-lived work tied to the current client so it can move to the
+    /// replacement immediately. Polling the atomic would leave an old final
+    /// subscription alive until its transport happened to close.
+    generation_tx: tokio::sync::watch::Sender<u64>,
 }
 
 impl Session {
@@ -48,11 +52,13 @@ impl Session {
     /// for stdio children and the in-process demo router: there, a dropped
     /// session means the server itself is gone.
     pub fn new(client: McpClient, connector: Option<Connector>) -> Self {
+        let (generation_tx, _) = tokio::sync::watch::channel(0);
         Self {
             client: RwLock::new(Arc::new(client)),
             connector,
             reconnecting: tokio::sync::Mutex::new(()),
             generation: AtomicU64::new(0),
+            generation_tx,
         }
     }
 
@@ -68,6 +74,12 @@ impl Session {
 
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
+    }
+
+    /// Observe successful reconnects. Long-lived requests should reopen on
+    /// the client corresponding to each new generation.
+    pub fn subscribe_generation(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.generation_tx.subscribe()
     }
 
     /// Rebuild the connection, unless another caller already did so since
@@ -88,7 +100,8 @@ impl Session {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         let fresh = connector().await?;
         *self.client.write().unwrap() = Arc::new(fresh);
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.generation_tx.send_replace(generation);
         Ok(())
     }
 }

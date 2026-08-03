@@ -236,7 +236,13 @@ return their normal text or JSON results.
 Progress and log notifications print inline as they arrive, and
 `list_changed` notifications refresh the command table mid-session, so
 dynamic servers (see the `dynamic_capabilities` example) grow and shrink the
-REPL's vocabulary live.
+REPL's vocabulary live. Stable connections receive those notifications on
+their ordinary transport. An interactive final connection opens one
+`subscriptions/listen` stream for tool, prompt, and resource list changes
+after its initial surface fetch, validates the server's acknowledged subset,
+and reopens the stream after a reconnect or unexpected ending with bounded
+backoff. `--exec` never opens this background stream, preserving deterministic
+one-shot output.
 
 For a spawned stdio server, child diagnostics remain visible but are read from
 the child's stderr and passed through reedline's external printer. Logs that
