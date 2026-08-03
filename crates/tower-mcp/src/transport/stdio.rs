@@ -108,7 +108,7 @@ fn stdio_control_channel() -> (
 
 #[cfg(feature = "stateless")]
 #[derive(Default)]
-struct StdioSubscriptions {
+pub(crate) struct StdioSubscriptions {
     active: HashMap<RequestId, SubscriptionFilter>,
     modern_mode: bool,
     server_info: Option<Implementation>,
@@ -132,14 +132,22 @@ fn stdio_request_declares_tasks(parsed: &serde_json::Value) -> bool {
 }
 
 #[cfg(feature = "stateless")]
-enum StdioSubscriptionInput {
+pub(crate) enum StdioSubscriptionInput {
     NotHandled,
     Handled(Vec<String>),
 }
 
 #[cfg(feature = "stateless")]
 impl StdioSubscriptions {
-    fn handle_input<S>(
+    pub(crate) fn new(server_info: Option<Implementation>, tasks_enabled: bool) -> Self {
+        Self {
+            server_info,
+            tasks_enabled,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn handle_input<S>(
         &mut self,
         service: &JsonRpcService<S>,
         parsed: &serde_json::Value,
@@ -260,7 +268,10 @@ impl StdioSubscriptions {
 
     /// Route a subscription-scoped notification and suppress its untagged
     /// form whenever at least one final subscription is active.
-    fn route_notification(&self, notification: &ServerNotification) -> Option<Vec<String>> {
+    pub(crate) fn route_notification(
+        &self,
+        notification: &ServerNotification,
+    ) -> Option<Vec<String>> {
         if !self.modern_mode
             || !matches!(
                 notification,

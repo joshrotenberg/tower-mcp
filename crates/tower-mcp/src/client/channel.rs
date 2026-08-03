@@ -60,11 +60,16 @@
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
+#[cfg(feature = "stateless")]
+use std::sync::{Arc, Mutex as StdMutex};
+
 use crate::context::{NotificationReceiver, notification_channel};
 use crate::error::Result;
 use crate::jsonrpc::JsonRpcService;
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse, McpNotification};
 use crate::router::McpRouter;
+#[cfg(feature = "stateless")]
+use crate::transport::stdio::{StdioSubscriptionInput, StdioSubscriptions};
 
 use super::transport::ClientTransport;
 
@@ -121,11 +126,34 @@ impl ChannelTransport {
         let (request_tx, mut request_rx) = mpsc::channel::<String>(64);
         let (response_tx, response_rx) = mpsc::channel::<String>(64);
 
+        #[cfg(feature = "stateless")]
+        let subscriptions = Arc::new(StdMutex::new(StdioSubscriptions::new(
+            Some(router.implementation()),
+            router.final_tasks_enabled(),
+        )));
+
         // Notification pump: serialize ServerNotifications into JSON-RPC
         // notification frames on the shared response stream.
         let notification_out = response_tx.clone();
+        #[cfg(feature = "stateless")]
+        let notification_subscriptions = subscriptions.clone();
         tokio::spawn(async move {
             while let Some(notification) = notification_rx.recv().await {
+                #[cfg(feature = "stateless")]
+                {
+                    let frames = notification_subscriptions
+                        .lock()
+                        .ok()
+                        .and_then(|subscriptions| subscriptions.route_notification(&notification));
+                    if let Some(frames) = frames {
+                        for frame in frames {
+                            if notification_out.send(frame).await.is_err() {
+                                return;
+                            }
+                        }
+                        continue;
+                    }
+                }
                 if let Some(json) = crate::transport::stdio::serialize_notification(&notification)
                     && notification_out.send(json).await.is_err()
                 {
@@ -148,6 +176,21 @@ impl ChannelTransport {
                         continue;
                     }
                 };
+                #[cfg(feature = "stateless")]
+                {
+                    let handled = subscriptions
+                        .lock()
+                        .ok()
+                        .map(|mut subscriptions| subscriptions.handle_input(&service, &parsed));
+                    if let Some(Ok(StdioSubscriptionInput::Handled(frames))) = handled {
+                        for frame in frames {
+                            if response_tx.send(frame).await.is_err() {
+                                return;
+                            }
+                        }
+                        continue;
+                    }
+                }
                 if parsed.get("id").is_none() {
                     if parsed.get("method").and_then(|m| m.as_str())
                         == Some("notifications/initialized")

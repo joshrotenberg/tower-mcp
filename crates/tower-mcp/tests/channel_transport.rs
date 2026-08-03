@@ -165,3 +165,58 @@ async fn default_constructor_delivers_router_notifications() {
         .expect("handler channel closed");
     assert!(msg.contains("hello from the tool"), "got: {msg}");
 }
+
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn final_subscription_listen_filters_channel_transport_notifications() {
+    use tower_mcp::ProtocolSupport;
+    use tower_mcp::protocol::SubscriptionFilter;
+
+    let (notification_tx, notification_rx) = notification_channel(64);
+    let router = McpRouter::new()
+        .server_info("channel-test", "1.0.0")
+        .with_notification_sender(notification_tx.clone());
+    let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+    let handler = NotificationHandler::new().on_resource_updated(move |uri| {
+        let _ = seen_tx.send(uri);
+    });
+    let client = McpClient::builder()
+        .protocol_support(ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+        .connect(
+            ChannelTransport::with_notifications(router, notification_rx),
+            handler,
+        )
+        .await
+        .expect("connect");
+    client
+        .discover("channel-subscription-test", "1.0.0")
+        .await
+        .expect("discover");
+
+    let mut subscription = client
+        .listen_subscriptions(SubscriptionFilter {
+            resource_subscriptions: Some(vec!["test://watched".to_string()]),
+            ..Default::default()
+        })
+        .await
+        .expect("subscriptions/listen");
+    let accepted = subscription.acknowledged().await.expect("acknowledgment");
+    assert_eq!(
+        accepted.resource_subscriptions,
+        Some(vec!["test://watched".to_string()])
+    );
+
+    notification_tx
+        .send(ServerNotification::ResourceUpdated {
+            uri: "test://watched".to_string(),
+        })
+        .await
+        .expect("notification send");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), seen_rx.recv())
+            .await
+            .expect("notification timeout"),
+        Some("test://watched".to_string())
+    );
+    subscription.cancel().await.expect("subscription cancel");
+}
