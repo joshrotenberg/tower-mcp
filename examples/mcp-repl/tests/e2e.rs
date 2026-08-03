@@ -9,7 +9,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
 
 const CASE_TIMEOUT: Duration = Duration::from_secs(20);
-const SUITE_TIMEOUT: Duration = Duration::from_secs(90);
+const BUILD_TIMEOUT: Duration = Duration::from_secs(180);
+const SUITE_TIMEOUT: Duration = Duration::from_secs(300);
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -55,7 +56,10 @@ async fn build_fixture() -> PathBuf {
         "--features",
         "http,protocol-2026-07-28",
     ]);
-    let output = run(command, "fixture build", Duration::from_secs(60)).await;
+    // Coverage and beta jobs may need to compile the repository-only fixture
+    // with a distinct target configuration. Keep that budget independent of
+    // the much tighter timeout used to detect hung mcp-repl processes.
+    let output = run(command, "fixture build", BUILD_TIMEOUT).await;
     assert_success(&output, "fixture build");
 
     let test_binary = std::env::current_exe().expect("current test executable");

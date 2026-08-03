@@ -94,7 +94,11 @@ fn env_path(name: &str) -> Option<PathBuf> {
 
 fn write_marker(name: &str, contents: impl AsRef<[u8]>) {
     if let Some(path) = env_path(name) {
-        std::fs::write(path, contents).expect("write fixture marker");
+        // Publish markers atomically so the test never observes the empty
+        // file between create/truncate and the content write on a busy host.
+        let pending = path.with_extension("pending");
+        std::fs::write(&pending, contents).expect("write pending fixture marker");
+        std::fs::rename(pending, path).expect("publish fixture marker");
     }
 }
 
