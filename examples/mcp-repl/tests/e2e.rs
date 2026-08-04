@@ -434,6 +434,135 @@ async fn exercise_imported_stdio_config(fixture: &Path, temp: &TempDir) {
     );
 }
 
+async fn exercise_schema_contracts(fixture: &Path, temp: &TempDir) {
+    let snapshot_path = temp.path().join("add.schema.json");
+    let snapshot_command = format!("snapshot add '{}'", snapshot_path.display());
+    let exported = run_stdio(
+        fixture,
+        temp,
+        "schema-export",
+        &["--json", "--exec", &snapshot_command],
+    )
+    .await;
+    assert_success(&exported, "schema snapshot export");
+    let snapshot: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&snapshot_path).expect("read exported schema snapshot"),
+    )
+    .expect("exported schema snapshot JSON");
+    assert_eq!(snapshot["formatVersion"], 1);
+    assert_eq!(snapshot["kind"], "tool");
+    assert_eq!(snapshot["name"], "add");
+
+    let validate_command = format!("validate '{}' strict", snapshot_path.display());
+    let validated = run_stdio(
+        fixture,
+        temp,
+        "schema-validate",
+        &["--json", "--exec", &validate_command],
+    )
+    .await;
+    assert_success(&validated, "strict schema validation");
+    let values = json_lines(&validated, "strict schema validation");
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0]["compatible"], true);
+    assert_eq!(values[0]["mode"], "strict");
+
+    let mut incompatible = snapshot;
+    incompatible["inputSchema"]["properties"]["a"]["type"] = serde_json::json!("string");
+    std::fs::write(
+        &snapshot_path,
+        serde_json::to_string_pretty(&incompatible).unwrap(),
+    )
+    .expect("write incompatible schema snapshot");
+    let snapshot_path = snapshot_path.to_string_lossy().into_owned();
+    let blocked = run_stdio(
+        fixture,
+        temp,
+        "schema-preflight",
+        &[
+            "--json",
+            "--schema-contract",
+            &snapshot_path,
+            "--exec",
+            "add a=20 b=22",
+        ],
+    )
+    .await;
+    assert_status(&blocked, 1, "incompatible schema preflight");
+    let values = json_lines(&blocked, "incompatible schema preflight");
+    assert_eq!(values.len(), 1, "the blocked tool must not emit a result");
+    assert_eq!(values[0]["compatible"], false);
+    assert!(
+        values[0]["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["code"] == "schema_retyped")
+    );
+
+    let human_validate = format!("validate '{}' compatible", snapshot_path);
+    let explained = run_stdio(
+        fixture,
+        temp,
+        "schema-human-report",
+        &["--exec", &human_validate],
+    )
+    .await;
+    assert_status(&explained, 1, "human schema validation");
+    let stdout = String::from_utf8_lossy(&explained.stdout);
+    assert!(stdout.contains("incompatible"), "{stdout}");
+    assert!(stdout.contains("schema_retyped"), "{stdout}");
+    assert!(
+        stdout.contains("$.inputSchema.properties.a.type"),
+        "{stdout}"
+    );
+
+    let prompt_path = temp.path().join("greet.schema.json");
+    let snapshot_prompt = format!("snapshot prompt:greet '{}'", prompt_path.display());
+    let exported = run_stdio(
+        fixture,
+        temp,
+        "prompt-schema-export",
+        &["--json", "--exec", &snapshot_prompt],
+    )
+    .await;
+    assert_success(&exported, "prompt schema snapshot export");
+    let mut prompt_snapshot: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&prompt_path).expect("read prompt schema snapshot"),
+    )
+    .expect("prompt schema snapshot JSON");
+    prompt_snapshot["arguments"][0]["required"] = serde_json::json!(false);
+    std::fs::write(
+        &prompt_path,
+        serde_json::to_string_pretty(&prompt_snapshot).unwrap(),
+    )
+    .expect("write incompatible prompt snapshot");
+    let prompt_path = prompt_path.to_string_lossy().into_owned();
+    let blocked = run_stdio(
+        fixture,
+        temp,
+        "prompt-schema-preflight",
+        &[
+            "--json",
+            "--schema-contract",
+            &prompt_path,
+            "--exec",
+            "prompt greet name=Ada",
+        ],
+    )
+    .await;
+    assert_status(&blocked, 1, "incompatible prompt schema preflight");
+    let values = json_lines(&blocked, "incompatible prompt schema preflight");
+    assert_eq!(values.len(), 1, "the blocked prompt must not emit a result");
+    assert!(
+        values[0]["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["code"] == "argument_newly_required")
+    );
+}
+
 async fn exercise_imported_http_config(http: &HttpFixture, temp: &TempDir) {
     let config = temp.path().join("vscode-mcp.json");
     std::fs::write(
@@ -626,6 +755,7 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         let temp = TempDir::new().expect("temporary fixture directory");
         let fixture = build_fixture().await;
         exercise_json_contract(&fixture, &temp).await;
+        exercise_schema_contracts(&fixture, &temp).await;
         exercise_imported_stdio_config(&fixture, &temp).await;
         exercise_stdio(&fixture, &temp).await;
         exercise_http(&fixture, &temp).await;

@@ -369,7 +369,7 @@ impl Completer for ReplCompleter {
                     }
                 }
             }
-            "describe" => {
+            "describe" | "snapshot" => {
                 out.extend(Self::complete_describe_word(&surface, word, span));
             }
             "unalias" => {

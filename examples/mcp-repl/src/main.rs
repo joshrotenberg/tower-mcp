@@ -40,6 +40,7 @@ mod import_config;
 mod jobs;
 mod output;
 mod sampling;
+mod schema_contract;
 mod session;
 mod style;
 mod subscribe;
@@ -168,6 +169,15 @@ struct Args {
     #[arg(long)]
     verbose: bool,
 
+    /// Validate matching tools and prompts before invocation using this saved
+    /// schema snapshot (repeatable).
+    #[arg(long = "schema-contract", value_name = "PATH")]
+    schema_contracts: Vec<std::path::PathBuf>,
+
+    /// Enforcement used by --schema-contract snapshots.
+    #[arg(long, value_enum, default_value = "compatible")]
+    schema_mode: schema_contract::ValidationMode,
+
     /// How to answer a server's `sampling/createMessage` request: `prompt`
     /// shows it and reads the assistant message on stdin, `canned` answers
     /// with a fixed placeholder, `decline` refuses. Defaults to `prompt`
@@ -267,6 +277,8 @@ pub const BUILTINS: &[(&str, &str)] = &[
     ("templates", "list resource templates"),
     ("find", "search the surface by keyword"),
     ("describe", "show schemas and metadata for a name"),
+    ("snapshot", "export a tool or prompt schema contract"),
+    ("validate", "compare the surface with a schema snapshot"),
     ("read", "read a resource"),
     ("subscribe", "watch a resource for updates"),
     ("unsubscribe", "stop watching a resource"),
@@ -1203,6 +1215,9 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
         print_servers(&profiles);
         return Ok(());
     }
+    let schema_contracts =
+        schema_contract::ContractSet::load(&args.schema_contracts, args.schema_mode)
+            .unwrap_or_else(|error| exit_with_error(ExitStatus::Usage, &error));
     let imported = resolve_import(&args);
     let profile = if imported.is_none() {
         resolve_profile(&args, &profiles)
@@ -1418,7 +1433,16 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
     // errored. No editor, no event loop.
     if one_shot {
         for cmd in &args.exec {
-            if handle_line(&session, &surface, &aliases, &jobs, cmd.trim()).await {
+            if handle_line(
+                &session,
+                &surface,
+                &aliases,
+                &jobs,
+                &schema_contracts,
+                cmd.trim(),
+            )
+            .await
+            {
                 break;
             }
         }
@@ -1468,7 +1492,15 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
             }
             maybe_line = line_rx.recv() => {
                 let Some(line) = maybe_line else { break };
-                let quit = handle_line(&session, &surface, &aliases, &jobs, line.trim()).await;
+                let quit = handle_line(
+                    &session,
+                    &surface,
+                    &aliases,
+                    &jobs,
+                    &schema_contracts,
+                    line.trim(),
+                )
+                .await;
                 let _ = ack_tx.send(());
                 if quit {
                     break;
@@ -1484,6 +1516,7 @@ async fn handle_line(
     surface: &Arc<RwLock<Surface>>,
     aliases: &Arc<RwLock<Aliases>>,
     jobs: &Arc<Jobs>,
+    schema_contracts: &schema_contract::ContractSet,
     line: &str,
 ) -> bool {
     if line.is_empty() {
@@ -1565,6 +1598,8 @@ async fn handle_line(
             println!("  tools | prompts | resources | templates   list the server surface");
             println!("  find <keyword>                            search the surface");
             println!("  describe <name>                           schemas and metadata");
+            println!("  snapshot <name> [path]                    export a schema contract");
+            println!("  validate <path> [mode]                    check a schema contract");
             println!("  read <uri>                                read a resource");
             println!("  subscribe <uri> | unsubscribe <uri>       watch a resource for updates");
             println!("  subscriptions                             list active subscriptions");
@@ -1715,6 +1750,90 @@ async fn handle_line(
                 describe(&surface, name);
             }
         }
+        "snapshot" => {
+            let Some(name) = rest.first() else {
+                command_error("usage: snapshot <tool|prompt> [path]");
+                return false;
+            };
+            if rest.len() > 2 {
+                command_error("usage: snapshot <tool|prompt> [path]");
+                return false;
+            }
+            let snapshot = {
+                let surface = surface.read().unwrap();
+                schema_contract::Snapshot::from_surface(&surface.tools, &surface.prompts, name)
+            };
+            let snapshot = match snapshot {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    report_error(ExitStatus::Usage, &error);
+                    return false;
+                }
+            };
+            let Some(snapshot) = snapshot else {
+                report_error(
+                    ExitStatus::NoMatch,
+                    &format!("no tool or prompt named `{name}`"),
+                );
+                return false;
+            };
+            if let Some(path) = rest.get(1) {
+                let path = std::path::Path::new(path);
+                match snapshot.write(path) {
+                    Ok(()) if json_output() => print_json(&serde_json::json!({
+                        "kind": snapshot.kind,
+                        "name": snapshot.name,
+                        "path": path,
+                    })),
+                    Ok(()) => println!(
+                        "saved {} {:?} schema snapshot to {}",
+                        snapshot.kind,
+                        snapshot.name,
+                        path.display()
+                    ),
+                    Err(error) => report_error(ExitStatus::Usage, &error),
+                }
+            } else if json_output() {
+                print_json(&snapshot.canonical_value());
+            } else {
+                print!("{}", snapshot.to_pretty_json());
+            }
+        }
+        "validate" => {
+            let Some(path) = rest.first() else {
+                command_error("usage: validate <snapshot-path> [strict|compatible|ignore]");
+                return false;
+            };
+            if rest.len() > 2 {
+                command_error("usage: validate <snapshot-path> [strict|compatible|ignore]");
+                return false;
+            }
+            let mode = match rest.get(1) {
+                Some(mode) => match schema_contract::ValidationMode::from_str(mode, true) {
+                    Ok(mode) => mode,
+                    Err(_) => {
+                        command_error(
+                            "validation mode must be `strict`, `compatible`, or `ignore`",
+                        );
+                        return false;
+                    }
+                },
+                None => schema_contracts.mode(),
+            };
+            let snapshot = match schema_contract::Snapshot::load(std::path::Path::new(path)) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    report_error(ExitStatus::Usage, &error);
+                    return false;
+                }
+            };
+            let current = {
+                let surface = surface.read().unwrap();
+                snapshot.matching_surface(&surface.tools, &surface.prompts)
+            };
+            let report = schema_contract::validate(&snapshot, current.as_ref(), mode);
+            render_validation_report(&report, true);
+        }
         "read" => {
             let Some(uri) = rest.first() else {
                 command_error("usage: read <uri>");
@@ -1784,6 +1903,9 @@ async fn handle_line(
                 command_error("usage: prompt <name> [k=v...]");
                 return false;
             };
+            if !enforce_prompt_contract(schema_contracts, surface, name) {
+                return false;
+            }
             let mut prompt_args = HashMap::new();
             for t in &rest[1..] {
                 if let Some((k, v)) = t.split_once('=') {
@@ -1833,10 +1955,20 @@ async fn handle_line(
                     return false;
                 }
             };
-            run_tool(session, surface, jobs, name, arguments, background, &output).await;
+            run_tool(
+                session,
+                surface,
+                jobs,
+                schema_contracts,
+                name,
+                arguments,
+                background,
+                &output,
+            )
+            .await;
         }
         "bench" => {
-            handle_bench(&client, surface, rest, background).await;
+            handle_bench(&client, surface, schema_contracts, rest, background).await;
         }
         "jobs" => {
             if json_output() {
@@ -2085,7 +2217,14 @@ async fn handle_line(
             };
             let arguments = parse_kv_args(&schema, rest);
             run_tool(
-                session, surface, jobs, tool_name, arguments, background, &output,
+                session,
+                surface,
+                jobs,
+                schema_contracts,
+                tool_name,
+                arguments,
+                background,
+                &output,
             )
             .await;
         }
@@ -2100,6 +2239,7 @@ async fn handle_line(
 async fn handle_bench(
     client: &Arc<McpClient>,
     surface: &Arc<RwLock<Surface>>,
+    schema_contracts: &schema_contract::ContractSet,
     rest: &[&str],
     background: bool,
 ) {
@@ -2127,6 +2267,9 @@ async fn handle_bench(
         command_error(&format!("no tool named `{}` (try `tools`)", plan.tool));
         return;
     };
+    if !enforce_tool_contract(schema_contracts, surface, &plan.tool) {
+        return;
+    }
     let arg_tokens: Vec<&str> = plan.args.iter().map(String::as_str).collect();
     let arguments = parse_kv_args(&schema, &arg_tokens);
 
@@ -2361,6 +2504,73 @@ fn command_error(message: &str) {
     report_error(ExitStatus::Usage, message);
 }
 
+/// Render a compatibility report. Pre-invocation checks stay silent on
+/// success so one JSON command still emits exactly one JSON value.
+fn render_validation_report(
+    report: &schema_contract::ValidationReport,
+    render_success: bool,
+) -> bool {
+    if report.compatible && !render_success {
+        return true;
+    }
+    if !report.compatible {
+        note_error(ExitStatus::NoMatch);
+    }
+    if json_output() {
+        print_json(&serde_json::to_value(report).unwrap_or_default());
+    } else if report.compatible {
+        println!(
+            "{} {:?} is compatible under {} validation",
+            report.kind, report.name, report.mode
+        );
+    } else {
+        println!(
+            "{} {:?} is incompatible under {} validation:",
+            report.kind, report.name, report.mode
+        );
+        for issue in &report.issues {
+            println!("  {} [{}] {}", issue.path, issue.code, issue.message);
+        }
+    }
+    report.compatible
+}
+
+fn enforce_tool_contract(
+    contracts: &schema_contract::ContractSet,
+    surface: &Arc<RwLock<Surface>>,
+    name: &str,
+) -> bool {
+    let report = {
+        let surface = surface.read().unwrap();
+        surface
+            .tools
+            .iter()
+            .find(|definition| definition.name == name)
+            .and_then(|definition| contracts.check_tool(definition))
+    };
+    report
+        .as_ref()
+        .is_none_or(|report| render_validation_report(report, false))
+}
+
+fn enforce_prompt_contract(
+    contracts: &schema_contract::ContractSet,
+    surface: &Arc<RwLock<Surface>>,
+    name: &str,
+) -> bool {
+    let report = {
+        let surface = surface.read().unwrap();
+        surface
+            .prompts
+            .iter()
+            .find(|definition| definition.name == name)
+            .and_then(|definition| contracts.check_prompt(definition))
+    };
+    report
+        .as_ref()
+        .is_none_or(|report| render_validation_report(report, false))
+}
+
 fn describe_value(surface: &Surface, name: &str) -> Option<serde_json::Value> {
     surface
         .tools
@@ -2529,15 +2739,20 @@ fn describe(surface: &Surface, name: &str) {
     println!("nothing on the surface named `{name}` (try `tools`, `prompts`, `resources`)");
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_tool(
     session: &Arc<Session>,
     surface: &Arc<RwLock<Surface>>,
     jobs: &Arc<Jobs>,
+    schema_contracts: &schema_contract::ContractSet,
     name: &str,
     arguments: serde_json::Value,
     background: bool,
     output: &vars::Output,
 ) {
+    if !enforce_tool_contract(schema_contracts, surface, name) {
+        return;
+    }
     if background {
         match with_reconnect(session, surface, |c| {
             let arguments = arguments.clone();
@@ -3037,11 +3252,13 @@ mod tests {
         let output = AsyncOutput::new(Arc::new(AtomicBool::new(true)), true);
         let printer = output.external_printer().unwrap();
         let jobs = Arc::new(Jobs::new(output, true));
+        let schema_contracts = schema_contract::ContractSet::default();
 
         run_tool(
             &session,
             &surface,
             &jobs,
+            &schema_contracts,
             "slow_add",
             serde_json::json!({ "a": 2, "b": 3 }),
             true,

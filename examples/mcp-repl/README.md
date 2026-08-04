@@ -486,6 +486,53 @@ enough, the message points at `help` as before.
 - Prompts: the argument table (name, required/optional, description).
 - Resources and templates: URI, name, MIME type, size, and description.
 
+## Schema snapshots and compatibility checks
+
+Tool and prompt definitions can be saved as versioned, canonical JSON
+contracts. Snapshots intentionally omit descriptions, icons, annotations, and
+other presentation metadata: a documentation edit should not break a caller.
+
+```text
+demo> snapshot add add.schema.json
+saved tool "add" schema snapshot to add.schema.json
+demo> validate add.schema.json compatible
+tool "add" is compatible under compatible validation
+```
+
+Without a path, `snapshot <name>` prints the canonical JSON. Use
+`snapshot tool:<name>` or `snapshot prompt:<name>` when both namespaces expose
+the same name. `validate <path> [strict|compatible|ignore]` reads a snapshot
+and compares it with the advertised surface without invoking anything:
+
+- `strict` requires the entire canonical contract to match.
+- `compatible` protects existing callers: removed or retyped inputs, newly
+  required inputs, removed or retyped expected outputs, and prompt argument
+  breaks fail. Additive optional inputs/arguments and additive outputs pass;
+  input widening and output narrowing (for example, integer output replacing
+  number output) also pass.
+- `ignore` loads the snapshot but deliberately skips enforcement, which is
+  useful while rolling out contracts in automation.
+
+Nested object/array schemas and local JSON Schema references such as
+`#/$defs/filter` are followed recursively. External references are rejected
+because validation is offline and must not fetch code or schemas implicitly.
+Changes to complex `anyOf`, `oneOf`, `allOf`, or `not` compositions are treated
+conservatively as incompatible.
+
+Repeat `--schema-contract <path>` to enforce snapshots before matching tool
+calls, task-augmented calls, benchmarks, or prompt retrievals. The default is
+compatible mode; `--schema-mode strict|compatible|ignore` changes it:
+
+```bash
+mcp-repl --schema-contract add.schema.json \
+  --schema-mode compatible --http https://example/mcp
+```
+
+A successful preflight is silent. An incompatible preflight sends no MCP
+request, returns status 1, and explains every finding. Under `--json` the
+validation report is the command's single NDJSON value, so the scripting
+framing contract is preserved.
+
 ## Output rendering
 
 - JSON output (schema dumps, `info` capabilities, non-text content) is
@@ -547,8 +594,10 @@ task-augmented tool call returns its task-creation result. Surface list commands
 return convenience arrays of their protocol definitions (without pagination
 wrappers). REPL-only commands use documented convenience values or envelopes:
 `find` and `subscriptions` return arrays; `describe` returns
-`{"kind": ..., "definition": ...}`; and `help`, `bench`, `jobs`, aliases,
-`wire`, `last`, `refresh`, `info`, `vars`, `unset`, and `quit` return objects.
+`{"kind": ..., "definition": ...}`; `snapshot` returns its canonical contract
+or a file acknowledgement; `validate` returns its compatibility report; and
+`help`, `bench`, `jobs`, aliases, `wire`, `last`, `refresh`, `info`, `vars`,
+`unset`, and `quit` return objects.
 
 JSON errors also stay on stdout so they occupy that command's one output line:
 
