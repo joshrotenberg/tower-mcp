@@ -906,6 +906,187 @@ mod proxy_tests {
         }
     }
 
+    /// Records which layers a request passed through, in order.
+    #[derive(Clone)]
+    struct MarkerLayer {
+        tag: &'static str,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    #[derive(Clone)]
+    struct MarkerService<S> {
+        inner: S,
+        tag: &'static str,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl<S> Layer<S> for MarkerLayer {
+        type Service = MarkerService<S>;
+
+        fn layer(&self, inner: S) -> Self::Service {
+            MarkerService {
+                inner,
+                tag: self.tag,
+                calls: self.calls.clone(),
+            }
+        }
+    }
+
+    impl<S> Service<RouterRequest> for MarkerService<S>
+    where
+        S: Service<RouterRequest>,
+    {
+        type Response = S::Response;
+        type Error = S::Error;
+        type Future = S::Future;
+
+        fn poll_ready(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            self.inner.poll_ready(cx)
+        }
+
+        fn call(&mut self, request: RouterRequest) -> Self::Future {
+            self.calls.lock().unwrap().push(self.tag);
+            self.inner.call(request)
+        }
+    }
+
+    /// Repeated `backend_layer` calls must stack rather than each replacing
+    /// the previous composition (#1173).
+    #[tokio::test]
+    async fn test_backend_layer_calls_stack() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let math_transport = ChannelTransport::new(math_router());
+
+        let mut proxy = McpProxy::builder("stack-proxy", "1.0.0")
+            .backend("math", math_transport)
+            .await
+            .backend_layer(MarkerLayer {
+                tag: "first",
+                calls: calls.clone(),
+            })
+            .backend_layer(MarkerLayer {
+                tag: "second",
+                calls: calls.clone(),
+            })
+            .build_strict()
+            .await
+            .expect("proxy should build");
+
+        let resp = call_proxy(
+            &mut proxy,
+            McpRequest::CallTool(crate::protocol::CallToolParams {
+                input_responses: None,
+                request_state: None,
+                name: "math_add".to_string(),
+                arguments: json!({"a": 2, "b": 3}),
+                meta: None,
+                task: None,
+            }),
+        )
+        .await
+        .expect("layered call should succeed");
+
+        match resp {
+            McpResponse::CallTool(result) => assert_eq!(result.all_text(), "5"),
+            other => panic!("expected CallTool response, got: {:?}", other),
+        }
+
+        // Both layers fired, and the layer added last saw the request first.
+        assert_eq!(*calls.lock().unwrap(), vec!["second", "first"]);
+    }
+
+    /// Delays every call before delegating, standing in for the latency
+    /// injection that exposed #1173 downstream.
+    #[derive(Clone)]
+    struct DelayLayer(Duration);
+
+    #[derive(Clone)]
+    struct DelayService<S> {
+        inner: S,
+        delay: Duration,
+    }
+
+    impl<S> Layer<S> for DelayLayer {
+        type Service = DelayService<S>;
+
+        fn layer(&self, inner: S) -> Self::Service {
+            DelayService {
+                inner,
+                delay: self.0,
+            }
+        }
+    }
+
+    impl<S> Service<RouterRequest> for DelayService<S>
+    where
+        S: Service<RouterRequest> + Clone + Send + 'static,
+        S::Future: Send,
+        RouterRequest: Send,
+    {
+        type Response = S::Response;
+        type Error = S::Error;
+        type Future = std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<S::Response, S::Error>> + Send>,
+        >;
+
+        fn poll_ready(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            self.inner.poll_ready(cx)
+        }
+
+        fn call(&mut self, request: RouterRequest) -> Self::Future {
+            let delay = self.delay;
+            let mut inner = self.inner.clone();
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                inner.call(request).await
+            })
+        }
+    }
+
+    /// A timeout added after a latency layer must observe that latency: with
+    /// the pre-#1173 behavior the timeout replaced the delay and a stacked
+    /// 10ms budget let a 100ms path succeed.
+    #[tokio::test]
+    async fn test_backend_layer_timeout_observes_earlier_layer() {
+        let math_transport = ChannelTransport::new(math_router());
+
+        let mut proxy = McpProxy::builder("delay-timeout-proxy", "1.0.0")
+            .backend("math", math_transport)
+            .await
+            .backend_layer(DelayLayer(Duration::from_millis(100)))
+            .backend_layer(TimeoutLayer::new(Duration::from_millis(10)))
+            .build_strict()
+            .await
+            .expect("proxy should build");
+
+        let result = call_proxy(
+            &mut proxy,
+            McpRequest::CallTool(crate::protocol::CallToolParams {
+                input_responses: None,
+                request_state: None,
+                name: "math_add".to_string(),
+                arguments: json!({"a": 2, "b": 3}),
+                meta: None,
+                task: None,
+            }),
+        )
+        .await;
+
+        let err = result.expect_err("the timeout must observe the injected delay");
+        assert!(
+            err.message.to_lowercase().contains("timed out")
+                || err.message.to_lowercase().contains("timeout"),
+            "error should mention timeout, got: {}",
+            err.message
+        );
+    }
+
     #[tokio::test]
     async fn test_backend_layer_only_affects_target_backend() {
         let math_transport = ChannelTransport::new(math_router());

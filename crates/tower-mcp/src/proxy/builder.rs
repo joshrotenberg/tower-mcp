@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::router::{RouterRequest, RouterResponse};
 use crate::transport::CatchError;
 
-use super::backend::{Backend, BackendService, ListChanged};
+use super::backend::{Backend, ListChanged};
 use super::service::{BackendEntry, McpProxy};
 
 /// A backend that was skipped during proxy construction.
@@ -279,6 +279,12 @@ impl McpProxyBuilder {
     /// Tower middleware (timeout, rate limit, concurrency limit, etc.) to
     /// be applied per-backend.
     ///
+    /// Repeated calls stack: each layer wraps the service composed so far,
+    /// so the layer added last sees a request first. In the example below a
+    /// request passes the timeout, then the rate limiter, then reaches the
+    /// backend, and a `ServiceBuilder` composing the same middleware in one
+    /// call remains equivalent.
+    ///
     /// Layers that produce errors (e.g., `TimeoutLayer`) are automatically
     /// wrapped with [`CatchError`] to convert errors into JSON-RPC error
     /// responses, maintaining the `Error = Infallible` contract.
@@ -287,10 +293,12 @@ impl McpProxyBuilder {
     ///
     /// ```rust,ignore
     /// use std::time::Duration;
+    /// use tower::limit::RateLimitLayer;
     /// use tower::timeout::TimeoutLayer;
     ///
     /// let proxy = McpProxy::builder("proxy", "1.0.0")
     ///     .backend("slow", transport).await
+    ///     .backend_layer(RateLimitLayer::new(50, Duration::from_secs(1)))
     ///     .backend_layer(TimeoutLayer::new(Duration::from_secs(30)))
     ///     .build()
     ///     .await?;
@@ -301,7 +309,7 @@ impl McpProxyBuilder {
     /// Panics if no backend has been added yet.
     pub fn backend_layer<L>(mut self, layer: L) -> Self
     where
-        L: Layer<BackendService> + Send + 'static,
+        L: Layer<BoxCloneService<RouterRequest, RouterResponse, Infallible>> + Send + 'static,
         L::Service: tower_service::Service<RouterRequest, Response = RouterResponse>
             + Clone
             + Send
@@ -314,9 +322,14 @@ impl McpProxyBuilder {
             .last_mut()
             .expect("backend_layer called before adding a backend");
 
-        // Get the base BackendService and apply the layer
-        let base = pending.backend.service();
-        let layered = layer.layer(base);
+        // Wrap the service composed so far, not the raw backend: starting
+        // from the base on every call silently discarded all but the most
+        // recent layer (#1173).
+        let current = pending
+            .custom_service
+            .take()
+            .unwrap_or_else(|| BoxCloneService::new(pending.backend.service()));
+        let layered = layer.layer(current);
         // Wrap with CatchError to convert middleware errors to JSON-RPC errors
         let caught = CatchError::new(layered);
         pending.custom_service = Some(BoxCloneService::new(caught));
