@@ -71,6 +71,21 @@ fn fixture_router() -> McpRouter {
                 })
                 .build(),
         )
+        .tool(
+            ToolBuilder::new("process_info")
+                .description("Report deterministic process environment for import tests")
+                .extractor_handler((), |_ctx: Context, RawArgs(_): RawArgs| async move {
+                    let cwd = std::env::current_dir()
+                        .expect("fixture current directory")
+                        .to_string_lossy()
+                        .into_owned();
+                    let imported = std::env::var("MCP_REPL_IMPORTED_VALUE").ok();
+                    Ok(CallToolResult::text(
+                        serde_json::json!({ "cwd": cwd, "imported": imported }).to_string(),
+                    ))
+                })
+                .build(),
+        )
         .resource(
             ResourceBuilder::new("fixture://guide")
                 .name("Fixture Guide")

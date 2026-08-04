@@ -350,6 +350,93 @@ async fn exercise_json_contract(fixture: &Path, temp: &TempDir) {
     assert_eq!(values[0]["kind"], "auth");
 }
 
+async fn exercise_imported_stdio_config(fixture: &Path, temp: &TempDir) {
+    let workspace = temp.path().join("import-workspace");
+    let cwd = workspace.join("work");
+    std::fs::create_dir_all(&cwd).expect("create imported fixture cwd");
+    let config = workspace.join(".mcp.json");
+    std::fs::write(
+        &config,
+        serde_json::json!({
+            "mcpServers": {
+                "fixture": {
+                    "command": fixture,
+                    "env": {
+                        "MCP_REPL_IMPORTED_VALUE": "${env:MCP_REPL_HOST_VALUE}"
+                    },
+                    "cwd": "${workspaceFolder}/work"
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write imported stdio config");
+    let exit_file = temp.path().join("import-stdio.exit");
+    let selector = format!("{}:fixture", config.display());
+    let mut command = repl_command();
+    command
+        .args(["--json", "--exec", "process_info", &selector])
+        .env("MCP_REPL_HOST_VALUE", "from-host")
+        .env("MCP_REPL_FIXTURE_EXIT_FILE", &exit_file);
+    let output = run(command, "imported stdio config", CASE_TIMEOUT).await;
+    assert_success(&output, "imported stdio config");
+    assert_eq!(
+        wait_for_file(&exit_file, "imported stdio fixture shutdown").await,
+        "clean"
+    );
+    let values = json_lines(&output, "imported stdio config");
+    assert_eq!(values.len(), 1);
+    let process: serde_json::Value = serde_json::from_str(
+        values[0]
+            .pointer("/content/0/text")
+            .and_then(serde_json::Value::as_str)
+            .expect("process_info text result"),
+    )
+    .expect("process_info JSON");
+    assert_eq!(process["imported"], "from-host");
+    assert_eq!(
+        PathBuf::from(process["cwd"].as_str().expect("process cwd"))
+            .canonicalize()
+            .expect("canonical process cwd"),
+        cwd.canonicalize().expect("canonical expected cwd")
+    );
+}
+
+async fn exercise_imported_http_config(http: &HttpFixture, temp: &TempDir) {
+    let config = temp.path().join("vscode-mcp.json");
+    std::fs::write(
+        &config,
+        serde_json::json!({
+            "servers": {
+                "fixture": {
+                    "type": "http",
+                    "url": "http://127.0.0.1:1/"
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write imported HTTP config");
+    let selector = format!("{}:fixture", config.display());
+    let mut command = repl_command();
+    command.args([
+        "--json",
+        "--exec",
+        "add a=20 b=22",
+        "--http",
+        &http.url,
+        &selector,
+    ]);
+    let output = run(command, "imported HTTP config", CASE_TIMEOUT).await;
+    assert_success(&output, "imported HTTP config");
+    let values = json_lines(&output, "imported HTTP config");
+    assert_eq!(values.len(), 1);
+    assert_eq!(
+        values[0].pointer("/content/0/text"),
+        Some(&serde_json::json!("42"))
+    );
+}
+
 async fn exercise_stdio(fixture: &Path, temp: &TempDir) {
     let stable = run_stdio(
         fixture,
@@ -455,6 +542,8 @@ async fn exercise_interactive_final_task(http: &HttpFixture) {
 async fn exercise_http(fixture: &Path, temp: &TempDir) {
     let http = HttpFixture::start(fixture, temp).await;
 
+    exercise_imported_http_config(&http, temp).await;
+
     let stable = run_http(
         &http.url,
         "stable HTTP",
@@ -505,6 +594,7 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         let temp = TempDir::new().expect("temporary fixture directory");
         let fixture = build_fixture().await;
         exercise_json_contract(&fixture, &temp).await;
+        exercise_imported_stdio_config(&fixture, &temp).await;
         exercise_stdio(&fixture, &temp).await;
         exercise_http(&fixture, &temp).await;
     })

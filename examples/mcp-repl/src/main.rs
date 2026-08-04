@@ -36,6 +36,7 @@ mod editor;
 mod elicit;
 mod exit_status;
 mod find;
+mod import_config;
 mod jobs;
 mod output;
 mod sampling;
@@ -119,8 +120,9 @@ struct Args {
     #[arg(long, conflicts_with_all = ["http", "command", "server"])]
     demo: bool,
 
-    /// Connect using the named `[servers.<name>]` profile from the config
-    /// file. A bare positional that matches a profile name works too.
+    /// Connect using a native profile name, or import `PATH.json:ENTRY` from a
+    /// standard MCP JSON config. Either selector also works as a lone
+    /// positional.
     #[arg(long, value_name = "NAME")]
     server: Option<String>,
 
@@ -745,14 +747,34 @@ fn build_http_config(
     profile_bearer: Option<String>,
     profile_headers: &[(String, String)],
 ) -> Result<HttpClientConfig, String> {
+    build_http_config_with_env(
+        bearer,
+        headers,
+        profile_bearer,
+        profile_headers,
+        std::env::var("MCP_BEARER").ok(),
+    )
+}
+
+fn build_http_config_with_env(
+    bearer: Option<String>,
+    headers: &[String],
+    profile_bearer: Option<String>,
+    profile_headers: &[(String, String)],
+    env_bearer: Option<String>,
+) -> Result<HttpClientConfig, String> {
     let mut config = HttpClientConfig::default();
     for (name, value) in profile_headers {
         config = config.header(name.as_str(), value.as_str());
     }
-    if let Some(token) = bearer
-        .or(profile_bearer)
-        .or_else(|| std::env::var("MCP_BEARER").ok())
-    {
+    let selected_has_authorization = profile_headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("authorization"));
+    if let Some(token) = bearer.or(profile_bearer).or_else(|| {
+        (!selected_has_authorization)
+            .then_some(env_bearer)
+            .flatten()
+    }) {
         config = config.bearer_token(token);
     }
     for raw in headers {
@@ -1122,6 +1144,27 @@ fn resolve_profile(args: &Args, config: &config::Config) -> Option<(String, conf
     }
 }
 
+/// Resolve an explicit `PATH:ENTRY` selector from `--server` or a lone
+/// positional. Imported JSON is intentionally opt-in; ordinary commands and
+/// native profile names retain their existing interpretation.
+fn resolve_import(args: &Args) -> Option<import_config::ImportedConnection> {
+    let candidate = match args.server.as_deref() {
+        Some(server) => server,
+        None => match args.command.as_slice() {
+            [only] => only,
+            _ => return None,
+        },
+    };
+    let selector = match import_config::parse_selector(candidate)? {
+        Ok(selector) => selector,
+        Err(error) => exit_with_error(ExitStatus::Usage, &error),
+    };
+    Some(
+        import_config::load_with(selector, |variable| std::env::var(variable).ok())
+            .unwrap_or_else(|error| exit_with_error(ExitStatus::Usage, &error)),
+    )
+}
+
 fn log_level_style(level: LogLevel) -> Style {
     match level {
         LogLevel::Emergency | LogLevel::Alert | LogLevel::Critical | LogLevel::Error => {
@@ -1160,7 +1203,12 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
         print_servers(&profiles);
         return Ok(());
     }
-    let profile = resolve_profile(&args, &profiles);
+    let imported = resolve_import(&args);
+    let profile = if imported.is_none() {
+        resolve_profile(&args, &profiles)
+    } else {
+        None
+    };
     // --exec runs commands and exits; suppress the banner and surface listing
     // unless --verbose, so scripted output is only the command results.
     let one_shot = !args.exec.is_empty();
@@ -1204,12 +1252,13 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
     // otherwise.
     sampling::init(sampling::resolve(args.sampling, one_shot));
 
-    // Explicit flags override profile fields: --http retargets a profile's URL
-    // while keeping its auth, and --bearer/--header are layered on in
-    // build_http_config.
-    let (profile_name, connection) = match profile {
-        Some((name, c)) => (Some(name), Some(c)),
-        None => (None, None),
+    // Explicit flags override imported or native profile fields: --http
+    // retargets the URL while keeping HTTP auth, and --bearer/--header are
+    // layered on in build_http_config.
+    let (profile_name, import_label, connection) = match (imported, profile) {
+        (Some(imported), _) => (None, Some(imported.label()), Some(imported.connection)),
+        (None, Some((name, connection))) => (Some(name), None, Some(connection)),
+        (None, None) => (None, None, None),
     };
 
     // Aliases come from the same file as the profiles: the global table plus
@@ -1244,6 +1293,8 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
         (None, Some(c)) => Some(c),
         (None, None) if !args.command.is_empty() => Some(config::Connection::Stdio {
             command: args.command.clone(),
+            env: std::collections::BTreeMap::new(),
+            cwd: None,
         }),
         (None, None) => None,
     };
@@ -1258,6 +1309,13 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
         println!(
             "{}",
             tag(Style::new().fg(Color::Cyan), &format!("profile {name}"))
+        );
+    } else if let Some(label) = &import_label
+        && !quiet
+    {
+        println!(
+            "{}",
+            tag(Style::new().fg(Color::Cyan), &format!("import {label}"))
         );
     }
 
@@ -1306,9 +1364,13 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
                     )
                     .await?
             }
-            Some(config::Connection::Stdio { command }) => {
+            Some(config::Connection::Stdio { command, env, cwd }) => {
                 let mut cmd = tokio::process::Command::new(&command[0]);
                 cmd.args(&command[1..]);
+                cmd.envs(env);
+                if let Some(cwd) = cwd {
+                    cmd.current_dir(cwd);
+                }
                 cmd.stderr(std::process::Stdio::piped());
                 let mut transport = StdioClientTransport::spawn_command(&mut cmd).await?;
                 if let Some(stderr) = transport.take_stderr() {
@@ -2820,6 +2882,36 @@ mod tests {
         assert_eq!(
             cfg.headers.get("X-Kept").map(String::as_str),
             Some("profile")
+        );
+    }
+
+    #[test]
+    fn selected_authorization_header_beats_environment_bearer() {
+        let selected_headers = [("authorization".to_string(), "Basic selected".to_string())];
+        let cfg = build_http_config_with_env(
+            None,
+            &[],
+            None,
+            &selected_headers,
+            Some("ambient-token".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.headers.get("authorization").map(String::as_str),
+            Some("Basic selected")
+        );
+
+        let cfg = build_http_config_with_env(
+            Some("explicit-token".into()),
+            &[],
+            None,
+            &selected_headers,
+            Some("ambient-token".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.headers.get("Authorization").map(String::as_str),
+            Some("Bearer explicit-token")
         );
     }
 

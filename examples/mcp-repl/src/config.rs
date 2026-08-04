@@ -89,6 +89,8 @@ pub enum Connection {
     },
     Stdio {
         command: Vec<String>,
+        env: BTreeMap<String, String>,
+        cwd: Option<PathBuf>,
     },
 }
 
@@ -194,6 +196,8 @@ impl Profile {
                 }
                 Ok(Connection::Stdio {
                     command: self.command.clone(),
+                    env: BTreeMap::new(),
+                    cwd: None,
                 })
             }
         }
@@ -293,6 +297,8 @@ command = ["cargo", "run", "--example", "getting_started"]
                     "--example".to_string(),
                     "getting_started".to_string(),
                 ],
+                env: BTreeMap::new(),
+                cwd: None,
             }
         );
     }

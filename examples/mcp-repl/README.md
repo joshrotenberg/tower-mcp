@@ -22,6 +22,9 @@ cargo run -p mcp-repl -- cargo run --example getting_started
 # Connect to a streamable HTTP server:
 cargo run -p mcp-repl -- --http http://127.0.0.1:3001/mcp
 
+# Import one named server from a repository or client JSON config:
+cargo run -p mcp-repl -- path/to/.mcp.json:server-name
+
 # Opt into the final, sessionless 2026-07-28 lifecycle:
 cargo run -p mcp-repl -- --protocol 2026-07-28 --http http://127.0.0.1:3001/mcp
 ```
@@ -107,6 +110,70 @@ mcp-repl cratesio                  # a bare name works too
 - An unknown profile name errors with the list of known names, and a missing
   `--config` file is an error. A missing file at the default location is not:
   profiles are opt-in.
+
+### Importing standard MCP configs
+
+An explicit `PATH:ENTRY` selector imports a named server from the common JSON
+format used by repository `.mcp.json` files, VS Code, Claude, Cursor, and other
+MCP clients. Both `mcpServers` and `servers` roots are accepted; automatic
+file discovery is deliberately deferred so the selected source is always
+visible in the command:
+
+```bash
+mcp-repl .mcp.json:local
+mcp-repl .vscode/mcp.json:remote
+mcp-repl --server "$HOME/Library/Application Support/Claude/claude_desktop_config.json:github"
+```
+
+```json
+{
+  "mcpServers": {
+    "local": {
+      "command": "cargo",
+      "args": ["run", "--manifest-path", "${workspaceFolder}/server/Cargo.toml"],
+      "env": { "API_TOKEN": "${env:HOST_API_TOKEN}" },
+      "cwd": "${workspaceFolder}"
+    }
+  },
+  "servers": {
+    "remote": {
+      "type": "http",
+      "url": "${env:MCP_URL}",
+      "headers": { "Authorization": "Bearer ${env:MCP_TOKEN}" }
+    }
+  }
+}
+```
+
+- `stdio` entries preserve `command`, ordered `args`, `env`, and `cwd`.
+  Relative working directories resolve from the config's workspace directory
+  (the parent of `.vscode` for `.vscode/mcp.json`, otherwise the file's
+  directory). The child inherits the current environment, with imported `env`
+  values overriding matching keys.
+- `http` and `streamable-http` entries preserve `url` and `headers`. Legacy
+  `sse` entries are rejected because mcp-repl connects with Streamable HTTP.
+- `${env:NAME}` and `${NAME}` read the launching environment;
+  `${workspaceFolder}`, `${workspaceFolderBasename}`, and `${userHome}` are
+  also supported. A missing variable is an error. `${input:...}` is rejected
+  with guidance because an imported interactive input has no portable value
+  outside the client that defined it.
+- Precedence is explicit flags first, then the imported entry, then native
+  profiles when no import was selected. `--http` can retarget an imported HTTP
+  entry while retaining its headers; `--bearer` and repeated `--header` values
+  override imported authentication. `MCP_BEARER` remains the final bearer
+  fallback when no selected configuration or flag supplies one.
+- Unknown entries list available names in sorted order. Entries with both a
+  command and URL, conflicting transport declarations, missing required
+  fields, or transport-specific fields on the wrong transport are refused.
+- **Trust boundary:** selecting an imported `stdio` entry executes its command
+  directly with the declared arguments, environment, and working directory.
+  Treat the JSON file as executable code and review files from repositories or
+  people you do not trust. mcp-repl never invokes a shell for the entry and
+  does not print imported environment or header values, but literal secrets in
+  the source file are still secrets at rest.
+- Native global aliases remain available for imported connections. Imported
+  files do not define mcp-repl aliases, so aliases created while using one are
+  global.
 
 ### Reconnecting
 
