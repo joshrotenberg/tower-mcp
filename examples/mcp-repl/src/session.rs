@@ -82,6 +82,22 @@ impl Session {
         self.generation_tx.subscribe()
     }
 
+    /// Close the live client and its transport once the session is no longer
+    /// shared by command work. One-shot mode uses this before applying its
+    /// process exit status so stdio children see EOF and are reaped cleanly.
+    pub async fn shutdown(self) -> Result<(), tower_mcp::Error> {
+        let client = self
+            .client
+            .into_inner()
+            .expect("session client lock poisoned");
+        let client = Arc::try_unwrap(client).map_err(|_| {
+            tower_mcp::Error::Transport(
+                "cannot shut down an MCP session while its client is still in use".to_string(),
+            )
+        })?;
+        client.shutdown().await
+    }
+
     /// Rebuild the connection, unless another caller already did so since
     /// `seen` was read. Returns `Ok(())` either way; the caller should
     /// re-read [`Session::client`] afterwards.

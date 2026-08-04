@@ -1422,7 +1422,13 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
                 break;
             }
         }
-        std::process::exit(exit_status::current().code());
+        let status = exit_status::current().code();
+        drop(client);
+        let session = Arc::try_unwrap(session).unwrap_or_else(|_| {
+            panic!("one-shot MCP session is still shared after all commands completed")
+        });
+        session.shutdown().await?;
+        std::process::exit(status);
     }
 
     // Final list-change notifications are subscription-scoped. Start the
