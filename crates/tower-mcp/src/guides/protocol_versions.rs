@@ -19,7 +19,7 @@ authoritative for protocol behavior:
 
 | Wire revision | Status in tower-mcp 0.18 | Compile-time switch | Lifecycle |
 |---|---|---|---|
-| `2026-07-28` | released, opt-in | `protocol-2026-07-28` | sessionless, per-request metadata, optional `server/discover` first |
+| `2026-07-28` | released, enabled when compiled | `protocol-2026-07-28` | sessionless, per-request metadata, optional `server/discover` first |
 | `2025-11-25` | stable default | always available | `initialize` session lifecycle |
 | `2025-03-26` | backward compatibility | always available | `initialize` session lifecycle |
 
@@ -82,15 +82,17 @@ fn main() -> Result<(), BoxError> {
 ```
 
 `ProtocolSupport::compiled()` enables the whole compiled set.
-`ProtocolSupport::stable()` excludes opt-in implementations even if they were
-compiled. `ProtocolSupport::default()` is the compiled set.
+`ProtocolSupport::stable()` narrows a build to the session protocols even
+when `protocol-2026-07-28` was compiled. `ProtocolSupport::default()` is the
+compiled set, for clients and servers alike.
 
 Two older constants have narrower meaning:
 
-- `LATEST_PROTOCOL_VERSION` is the preferred non-breaking default
+- `LATEST_PROTOCOL_VERSION` is the preferred session default
   (`2025-11-25`), not the newest published date.
-- `SUPPORTED_PROTOCOL_VERSIONS` is the stable compatibility set, not every
-  implementation that can be compiled.
+- `SUPPORTED_PROTOCOL_VERSIONS` is the session-negotiable set, the versions
+  `initialize` can produce. `2026-07-28` removed `initialize`, so it is
+  never in this list regardless of features.
 
 Use `COMPILED_PROTOCOL_VERSIONS` and `ProtocolSupport` for deployment policy.
 
@@ -163,8 +165,11 @@ the feature and runtime policy allow it; do not call the historical
 
 ## Configure a client
 
-Clients are stable by default, even in a build using `full`. This avoids a
-Cargo feature changing an application's first wire request.
+Clients default to every compiled implementation, matching servers. The entry
+point still selects the era: `initialize` starts a legacy session and
+`discover` starts the final lifecycle, so compiling a feature never changes an
+application's first wire request; it only removes the extra configuration step
+before `discover`.
 
 ### Stable client
 
@@ -178,6 +183,14 @@ client.initialize("my-client", "1.0.0").await?;
 version and session ID for later requests.
 
 ### Final client
+
+```rust,ignore
+let client = McpClient::connect(transport).await?;
+client.discover("my-client", "1.0.0").await?;
+```
+
+With `protocol-2026-07-28` compiled, no configuration is needed. To *refuse*
+the session protocols entirely, narrow the client instead:
 
 ```rust,ignore
 let support = ProtocolSupport::try_new(["2026-07-28"])?;

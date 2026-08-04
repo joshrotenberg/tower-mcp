@@ -390,9 +390,12 @@ impl McpClientBuilder {
         Self {
             capabilities: ClientCapabilities::default(),
             roots: Vec::new(),
-            // Merely compiling an opt-in implementation must not move an existing
-            // client off the established initialize/session path.
-            protocol_support: ProtocolSupport::stable(),
+            // Every compiled implementation, matching servers (#1179). The
+            // entry point still selects the era: nothing calls `discover`
+            // implicitly, so compiling a feature never changes an existing
+            // client's wire behavior, it only removes the configuration step
+            // before `discover`.
+            protocol_support: ProtocolSupport::default(),
             max_mrtr_rounds: 8,
             cache_config: ClientCacheConfig::default(),
         }
@@ -432,9 +435,12 @@ impl McpClientBuilder {
 
     /// Set the exact ordered protocol versions enabled for this client.
     ///
-    /// The default is [`ProtocolSupport::stable`], even when the opt-in final
-    /// protocol implementation was compiled. Applications select
-    /// 2026-07-28 explicitly and then call `McpClient::discover`.
+    /// The default is [`ProtocolSupport::default`], every implementation
+    /// compiled into this build: with `protocol-2026-07-28` enabled the
+    /// client can call `McpClient::discover` without further configuration,
+    /// and without the feature only the stable session protocols exist.
+    /// Pass [`ProtocolSupport::stable`] to keep a feature-enabled build on
+    /// the session protocols only.
     pub fn protocol_support(mut self, support: ProtocolSupport) -> Self {
         self.protocol_support = support;
         self

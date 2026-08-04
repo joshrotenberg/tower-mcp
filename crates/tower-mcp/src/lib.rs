@@ -397,10 +397,10 @@
 //!     .stateless(StatelessConfig::new());
 //! ```
 //!
-//! The 2026-07-28 implementation is opt-in. Enable the
-//! `protocol-2026-07-28` Cargo feature to compile it, then use
-//! [`ProtocolSupport`] to narrow the versions enabled by an individual
-//! transport at runtime.
+//! The 2026-07-28 implementation is compiled in by the
+//! `protocol-2026-07-28` Cargo feature and enabled by default once compiled.
+//! Use [`ProtocolSupport`] to narrow the versions enabled by an individual
+//! client or transport at runtime.
 //!
 //! ### Router Composition
 //!
@@ -463,8 +463,9 @@
 //!
 //! ## MCP Specification
 //!
-//! This crate implements MCP 2025-11-25 by default and provides an opt-in
-//! implementation of the released 2026-07-28 specification:
+//! Every build implements the MCP 2025-11-25 and 2025-03-26 session
+//! protocols; the `protocol-2026-07-28` feature adds the released 2026-07-28
+//! specification, enabled by default once compiled:
 //! <https://modelcontextprotocol.io/specification/2026-07-28>
 //!
 //! Enable it with `protocol-2026-07-28`; the legacy `stateless` feature name

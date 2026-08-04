@@ -12,7 +12,7 @@ use crate::protocol::SUPPORTED_PROTOCOL_VERSIONS;
 
 /// Protocol versions compiled into this build, in preference order.
 ///
-/// Enabling `protocol-2026-07-28` adds the released, opt-in implementation.
+/// Enabling `protocol-2026-07-28` adds the released implementation.
 /// The former `stateless` feature remains a compatibility alias and produces
 /// the same compiled set.
 #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
@@ -81,8 +81,8 @@ impl ProtocolSupport {
 
     /// Enable only the stable-by-default compatibility set.
     ///
-    /// This excludes opt-in protocol implementations even when their Cargo
-    /// features are compiled.
+    /// This narrows a build to the `initialize`-negotiable session protocols,
+    /// excluding 2026-07-28 even when its Cargo feature is compiled.
     pub fn stable() -> Self {
         Self {
             versions: SUPPORTED_PROTOCOL_VERSIONS

@@ -5,7 +5,7 @@
 [![CI](https://github.com/joshrotenberg/tower-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/joshrotenberg/tower-mcp/actions/workflows/ci.yml)
 [![License](https://img.shields.io/crates/l/tower-mcp.svg)](https://github.com/joshrotenberg/tower-mcp#license)
 [![MSRV](https://img.shields.io/crates/msrv/tower-mcp.svg)](https://github.com/joshrotenberg/tower-mcp)
-[![MCP](https://img.shields.io/badge/MCP-2025--11--25-blue)](https://modelcontextprotocol.io/specification/2025-11-25)
+[![MCP](https://img.shields.io/badge/MCP-2026--07--28_%7C_2025--11--25-blue)](https://modelcontextprotocol.io/specification/2026-07-28)
 [![Conformance](https://img.shields.io/badge/conformance-48%2F48_server_%7C_235_client_checks-brightgreen)](https://github.com/joshrotenberg/tower-mcp/actions/workflows/conformance.yml)
 
 Tower-native [Model Context Protocol](https://modelcontextprotocol.io) (MCP) implementation for Rust.
@@ -620,11 +620,11 @@ let router = McpRouter::new()
 
 ## Protocol Compliance
 
-tower-mcp targets the [MCP specification 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) with backward compatibility for `2025-03-26`. The [official MCP conformance test suite](https://github.com/modelcontextprotocol/conformance) runs in CI on every PR via [`conformance.yml`](https://github.com/joshrotenberg/tower-mcp/actions/workflows/conformance.yml), currently passing:
+tower-mcp implements the [MCP specification 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28) behind the `protocol-2026-07-28` feature, alongside the session protocols [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) and `2025-03-26` that every build carries. The [official MCP conformance test suite](https://github.com/modelcontextprotocol/conformance) runs in CI on every PR via [`conformance.yml`](https://github.com/joshrotenberg/tower-mcp/actions/workflows/conformance.yml), currently passing:
 
-For application-facing guidance on the stable default, opt-in 2026-07-28
-implementation, compile-time features, runtime allowlists, interoperability,
-and upgrade policy, start with the [protocol-version guide](https://docs.rs/tower-mcp/latest/tower_mcp/guides/protocol_versions/).
+For application-facing guidance on the 2026-07-28 implementation,
+compile-time features, runtime allowlists, interoperability, and upgrade
+policy, start with the [protocol-version guide](https://docs.rs/tower-mcp/latest/tower_mcp/guides/protocol_versions/).
 
 - **Server (2025-11-25):** 48/48 checks (`conformance@0.2.0-alpha.10`, `--suite all`); the server baseline is empty
 - **Client (2025-11-25):** all 18 scenarios green, 235 checks (`conformance@0.2.0-alpha.10`, `--suite all`); the client baseline is empty
@@ -633,11 +633,12 @@ and upgrade policy, start with the [protocol-version guide](https://docs.rs/towe
 
 Both protocol revisions run on the same harness pin so the results are directly comparable with each other and with rmcp's current conformance workflow. Because the suite is upstream-maintained and grows with the spec, these counts shift as scenarios are added or version-gated -- treat the green CI badge as the source of truth, not any single snapshot. The empty baselines make any new failure immediately visible.
 
-The released 2026-07-28 implementation is available through the opt-in
-`protocol-2026-07-28` feature. It covers sessionless dispatch,
-`server/discover`, `subscriptions/listen`, per-request metadata, response-cache
-hints, Multi Round-Trip Requests, and the final Tasks extension. The default
-runtime remains 2025-11-25, including for clients built with `full`.
+The 2026-07-28 implementation is compiled in by the `protocol-2026-07-28`
+feature and enabled by default once compiled, for servers and clients alike.
+It covers sessionless dispatch, `server/discover`, `subscriptions/listen`,
+per-request metadata, response-cache hints, Multi Round-Trip Requests, and the
+final Tasks extension. A feature-enabled build that should keep serving only
+the session protocols narrows itself with `ProtocolSupport::stable()`.
 
 Compile-time availability and runtime allowlists are separate. The
 [protocol-version guide](https://docs.rs/tower-mcp/latest/tower_mcp/guides/protocol_versions/) explains the constants,

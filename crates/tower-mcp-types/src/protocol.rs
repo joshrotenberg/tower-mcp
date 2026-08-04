@@ -202,17 +202,24 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// The latest protocol version enabled by default.
 pub const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 
-/// Protocol versions enabled by default (newest first).
+/// Session protocol versions negotiable through `initialize` (newest first).
 ///
 /// During initialization, the server negotiates the protocol version with the
 /// client. The server picks the newest version that both sides support.
 /// If no common version exists, the connection is rejected.
+///
+/// `2026-07-28` is deliberately not in this list even though it is stable:
+/// it removed the `initialize` handshake, so it is never a valid outcome of
+/// session negotiation. Builds that compile it (the `protocol-2026-07-28`
+/// feature in `tower-mcp`) enable it through `ProtocolSupport`, which both
+/// clients and servers default to the full compiled set.
 ///
 /// ```rust
 /// use tower_mcp_types::protocol::{LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS};
 ///
 /// assert_eq!(LATEST_PROTOCOL_VERSION, "2025-11-25");
 /// assert!(SUPPORTED_PROTOCOL_VERSIONS.contains(&"2025-03-26"));
+/// assert!(!SUPPORTED_PROTOCOL_VERSIONS.contains(&"2026-07-28"));
 /// ```
 pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-03-26"];
 
