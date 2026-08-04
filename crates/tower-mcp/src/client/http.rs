@@ -914,26 +914,29 @@ impl HttpRequestSendError {
     }
 }
 
+#[cfg(not(feature = "oauth-client"))]
 async fn send_http_request(
     request: reqwest::RequestBuilder,
     resource: &str,
     operation: &str,
-    #[cfg(feature = "oauth-client")] token_provider: Option<Arc<dyn TokenProvider>>,
-    #[cfg(feature = "oauth-client")] scope_escalation: Option<ScopeEscalationRuntime>,
-    #[cfg(feature = "oauth-client")] initial_scope_revision: usize,
 ) -> std::result::Result<reqwest::Response, HttpRequestSendError> {
-    #[cfg(feature = "oauth-client")]
-    let mut request = request;
-    #[cfg(not(feature = "oauth-client"))]
     let _ = (resource, operation);
+    request.send().await.map_err(HttpRequestSendError::request)
+}
 
-    #[cfg(feature = "oauth-client")]
+#[cfg(feature = "oauth-client")]
+async fn send_http_request(
+    mut request: reqwest::RequestBuilder,
+    resource: &str,
+    operation: &str,
+    token_provider: Option<Arc<dyn TokenProvider>>,
+    scope_escalation: Option<ScopeEscalationRuntime>,
+    initial_scope_revision: usize,
+) -> std::result::Result<reqwest::Response, HttpRequestSendError> {
     let mut observed_revision = initial_scope_revision;
-    #[cfg(feature = "oauth-client")]
     let mut attempts = 0;
 
     loop {
-        #[cfg(feature = "oauth-client")]
         let retry_request = request.try_clone();
 
         let response = request
@@ -941,47 +944,41 @@ async fn send_http_request(
             .await
             .map_err(HttpRequestSendError::request)?;
 
-        #[cfg(feature = "oauth-client")]
-        {
-            let challenge = if response.status() == reqwest::StatusCode::FORBIDDEN {
-                scope_challenge(response.headers())
-            } else {
-                None
-            };
-            let Some(challenge) = challenge else {
-                return Ok(response);
-            };
-            let (Some(runtime), Some(provider), Some(mut retry_request)) = (
-                scope_escalation.as_ref(),
-                token_provider.as_ref(),
-                retry_request,
-            ) else {
-                return Ok(response);
-            };
-            if attempts >= runtime.max_attempts {
-                return Ok(response);
-            }
-
-            attempts += 1;
-            let decision = runtime
-                .respond_to_challenge(challenge, resource, operation, attempts, observed_revision)
-                .await
-                .map_err(HttpRequestSendError::oauth)?;
-            observed_revision = decision.revision;
-
-            let token = provider
-                .get_token()
-                .await
-                .map_err(HttpRequestSendError::oauth)?;
-            let headers = bearer_headers(&token).map_err(|message| {
-                HttpRequestSendError::oauth(OAuthClientError::ScopeEscalation(message))
-            })?;
-            retry_request = retry_request.headers(headers);
-            request = retry_request;
+        let challenge = if response.status() == reqwest::StatusCode::FORBIDDEN {
+            scope_challenge(response.headers())
+        } else {
+            None
+        };
+        let Some(challenge) = challenge else {
+            return Ok(response);
+        };
+        let (Some(runtime), Some(provider), Some(mut retry_request)) = (
+            scope_escalation.as_ref(),
+            token_provider.as_ref(),
+            retry_request,
+        ) else {
+            return Ok(response);
+        };
+        if attempts >= runtime.max_attempts {
+            return Ok(response);
         }
 
-        #[cfg(not(feature = "oauth-client"))]
-        return Ok(response);
+        attempts += 1;
+        let decision = runtime
+            .respond_to_challenge(challenge, resource, operation, attempts, observed_revision)
+            .await
+            .map_err(HttpRequestSendError::oauth)?;
+        observed_revision = decision.revision;
+
+        let token = provider
+            .get_token()
+            .await
+            .map_err(HttpRequestSendError::oauth)?;
+        let headers = bearer_headers(&token).map_err(|message| {
+            HttpRequestSendError::oauth(OAuthClientError::ScopeEscalation(message))
+        })?;
+        retry_request = retry_request.headers(headers);
+        request = retry_request;
     }
 }
 
