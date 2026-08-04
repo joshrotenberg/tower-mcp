@@ -45,7 +45,7 @@ use tower_service::Service;
 use crate::error::{Error, Result};
 use crate::jsonrpc::JsonRpcService;
 #[cfg(feature = "stateless")]
-use crate::protocol::{Implementation, SubscriptionFilter, SubscriptionsListenParams};
+use crate::protocol::{Implementation, SubscriptionFilter};
 use crate::protocol::{
     JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, JsonRpcResponseMessage,
     McpNotification, RequestId, notifications,
@@ -54,8 +54,8 @@ use crate::router::{McpRouter, RouterRequest, RouterResponse};
 use crate::transport::service::{CatchError, InjectAnnotations};
 #[cfg(feature = "stateless")]
 use crate::transport::subscriptions::{
-    accepted_subscription_filter, subscription_acknowledgment, subscription_complete_response,
-    subscription_matches, tagged_subscription_notification,
+    subscription_acknowledgment, subscription_complete_response, subscription_matches,
+    tagged_subscription_notification,
 };
 use crate::{ProtocolSupport, ProtocolSupportError};
 
@@ -112,37 +112,24 @@ pub(crate) struct StdioSubscriptions {
     active: HashMap<RequestId, SubscriptionFilter>,
     modern_mode: bool,
     server_info: Option<Implementation>,
-    /// Whether the served router opted into the Tasks extension. Captured at
-    /// startup because the listen handler only sees the generic service.
-    tasks_enabled: bool,
-}
-
-/// Whether a stdio `subscriptions/listen` request declared the Tasks
-/// extension in its per-request `_meta`.
-#[cfg(feature = "stateless")]
-fn stdio_request_declares_tasks(parsed: &serde_json::Value) -> bool {
-    parsed
-        .get("params")
-        .and_then(crate::stateless::StatelessRequestMeta::from_params)
-        .and_then(|meta| meta.client_capabilities)
-        .and_then(|capabilities| capabilities.extensions)
-        .is_some_and(|declared| {
-            declared.contains_key(tower_mcp_types::protocol::TASKS_EXTENSION_ID)
-        })
 }
 
 #[cfg(feature = "stateless")]
 pub(crate) enum StdioSubscriptionInput {
     NotHandled,
     Handled(Vec<String>),
+    /// A modern listen request that passed the transport-owned checks.
+    /// Dispatch it through the JSON-RPC service (so middleware observes it
+    /// and the router validates and negotiates the filter), then hand the
+    /// response to [`StdioSubscriptions::complete_listen`].
+    Dispatch(Box<JsonRpcRequest>),
 }
 
 #[cfg(feature = "stateless")]
 impl StdioSubscriptions {
-    pub(crate) fn new(server_info: Option<Implementation>, tasks_enabled: bool) -> Self {
+    pub(crate) fn new(server_info: Option<Implementation>) -> Self {
         Self {
             server_info,
-            tasks_enabled,
             ..Self::default()
         }
     }
@@ -201,36 +188,12 @@ impl StdioSubscriptions {
             ]));
         }
 
-        let params = request
-            .params
-            .clone()
-            .ok_or_else(|| {
-                crate::error::JsonRpcError::invalid_params("subscriptions/listen requires params")
-            })
-            .and_then(|value| {
-                serde_json::from_value::<SubscriptionsListenParams>(value)
-                    .map_err(|error| crate::error::JsonRpcError::invalid_params(error.to_string()))
-            });
-        let params = match params {
-            Ok(params) => params,
-            Err(error) => {
-                let response = JsonRpcResponse::error(Some(request_id), error);
-                return Ok(StdioSubscriptionInput::Handled(vec![
-                    serde_json::to_string(&response)?,
-                ]));
-            }
-        };
-        let Some(requested) = params.notifications else {
-            let response = JsonRpcResponse::error(
-                Some(request_id),
-                crate::error::JsonRpcError::invalid_params(
-                    "subscriptions/listen requires a notifications filter",
-                ),
-            );
-            return Ok(StdioSubscriptionInput::Handled(vec![
-                serde_json::to_string(&response)?,
-            ]));
-        };
+        // Duplicate request ids are stream-registry state only this
+        // transport can see, so the check stays here, ahead of the service
+        // dispatch. Everything else about the request (params shape, the
+        // required filter, the SEP-2663 capability gate, filter negotiation)
+        // is the router's job, reached through the service so middleware
+        // observes the request (#1182).
         if self.active.contains_key(&request_id) {
             let response = JsonRpcResponse::error(
                 Some(request_id),
@@ -243,27 +206,47 @@ impl StdioSubscriptions {
             ]));
         }
 
-        // SEP-2663: asking for task notifications without declaring the
-        // extension is answered with the missing-capability error, the same
-        // way the three task methods answer it.
-        if requested.task_ids.is_some() && !stdio_request_declares_tasks(parsed) {
+        Ok(StdioSubscriptionInput::Dispatch(Box::new(request)))
+    }
+
+    /// Complete a listen request the caller dispatched through the service.
+    ///
+    /// An error response is emitted verbatim: middleware already observed
+    /// the rejection and the wire shape must match what the transport-owned
+    /// validation produced before #1182. A success response carries the
+    /// accepted filter, which registers the stream and becomes the
+    /// `notifications/subscriptions/acknowledged` frame.
+    pub(crate) fn complete_listen(
+        &mut self,
+        request_id: RequestId,
+        response: &JsonRpcResponse,
+    ) -> Result<Vec<String>> {
+        // `JsonRpcResponse` is non_exhaustive; anything that is not a
+        // success result is passed through verbatim like an error.
+        let JsonRpcResponse::Result(result) = response else {
+            return Ok(vec![serde_json::to_string(response)?]);
+        };
+        let result = &result.result;
+        let accepted = result
+            .get("notifications")
+            .cloned()
+            .map(serde_json::from_value::<SubscriptionFilter>)
+            .and_then(std::result::Result::ok);
+        let Some(accepted) = accepted else {
             let response = JsonRpcResponse::error(
                 Some(request_id),
-                crate::error::JsonRpcError::missing_required_client_capability(
-                    crate::router::tasks_client_capabilities(),
+                crate::error::JsonRpcError::internal_error(
+                    "subscriptions/listen produced an unrecognized service result",
                 ),
             );
-            return Ok(StdioSubscriptionInput::Handled(vec![
-                serde_json::to_string(&response)?,
-            ]));
-        }
+            return Ok(vec![serde_json::to_string(&response)?]);
+        };
 
-        let accepted = accepted_subscription_filter(requested, self.tasks_enabled);
         let acknowledgment = subscription_acknowledgment(request_id.clone(), accepted.clone());
         let acknowledgment = serde_json::to_string(&acknowledgment)?;
         self.modern_mode = true;
         self.active.insert(request_id, accepted);
-        Ok(StdioSubscriptionInput::Handled(vec![acknowledgment]))
+        Ok(vec![acknowledgment])
     }
 
     /// Route a subscription-scoped notification and suppress its untagged
@@ -373,6 +356,34 @@ fn handle_notification(router: &McpRouter, notification: JsonRpcNotification) ->
 }
 
 /// Serialize a server notification to a JSON-RPC notification string.
+/// Dispatch a validated `subscriptions/listen` request through the JSON-RPC
+/// service, converting a service-level failure into a JSON-RPC error response
+/// so [`StdioSubscriptions::complete_listen`] always receives an answer.
+#[cfg(feature = "stateless")]
+pub(crate) async fn dispatch_listen_request<S>(
+    service: &mut JsonRpcService<S>,
+    request: JsonRpcRequest,
+    request_id: crate::protocol::RequestId,
+) -> JsonRpcResponse
+where
+    S: tower_service::Service<
+            crate::router::RouterRequest,
+            Response = crate::router::RouterResponse,
+            Error = std::convert::Infallible,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send,
+{
+    match service.call_single(request).await {
+        Ok(response) => response,
+        Err(error) => JsonRpcResponse::error(
+            Some(request_id),
+            crate::error::JsonRpcError::internal_error(error.to_string()),
+        ),
+    }
+}
+
 pub(crate) fn serialize_notification(notification: &ServerNotification) -> Option<String> {
     match notification {
         ServerNotification::Progress(params) => {
@@ -602,7 +613,6 @@ impl StdioTransport {
         #[cfg(feature = "stateless")]
         let mut subscriptions = StdioSubscriptions {
             server_info: Some(self.router.implementation()),
-            tasks_enabled: self.router.final_tasks_enabled(),
             ..StdioSubscriptions::default()
         };
 
@@ -634,13 +644,29 @@ impl StdioTransport {
                             Ok(parsed) => parsed,
                             Err(_) => serde_json::Value::Null,
                         };
-                        if let StdioSubscriptionInput::Handled(frames) =
-                            subscriptions.handle_input(&self.service, &parsed)?
-                        {
-                            for frame in frames {
-                                write_line_to_stdout(&mut writer, &frame).await?;
+                        match subscriptions.handle_input(&self.service, &parsed)? {
+                            StdioSubscriptionInput::Handled(frames) => {
+                                for frame in frames {
+                                    write_line_to_stdout(&mut writer, &frame).await?;
+                                }
+                                continue;
                             }
-                            continue;
+                            StdioSubscriptionInput::Dispatch(request) => {
+                                let request_id = request.id.clone();
+                                let response = dispatch_listen_request(
+                                    &mut self.service,
+                                    *request,
+                                    request_id.clone(),
+                                )
+                                .await;
+                                for frame in
+                                    subscriptions.complete_listen(request_id, &response)?
+                                {
+                                    write_line_to_stdout(&mut writer, &frame).await?;
+                                }
+                                continue;
+                            }
+                            StdioSubscriptionInput::NotHandled => {}
                         }
                     }
 
@@ -970,14 +996,25 @@ where
         };
 
         #[cfg(feature = "stateless")]
-        if subscriptions_enabled
-            && let StdioSubscriptionInput::Handled(frames) =
-                subscriptions.handle_input(service, &parsed)?
-        {
-            for frame in frames {
-                write_line_to_stdout(writer, &frame).await?;
+        if subscriptions_enabled {
+            match subscriptions.handle_input(service, &parsed)? {
+                StdioSubscriptionInput::Handled(frames) => {
+                    for frame in frames {
+                        write_line_to_stdout(writer, &frame).await?;
+                    }
+                    return Ok(());
+                }
+                StdioSubscriptionInput::Dispatch(request) => {
+                    let request_id = request.id.clone();
+                    let response =
+                        dispatch_listen_request(service, *request, request_id.clone()).await;
+                    for frame in subscriptions.complete_listen(request_id, &response)? {
+                        write_line_to_stdout(writer, &frame).await?;
+                    }
+                    return Ok(());
+                }
+                StdioSubscriptionInput::NotHandled => {}
             }
-            return Ok(());
         }
         #[cfg(not(feature = "stateless"))]
         let _ = subscriptions_enabled;
@@ -1333,7 +1370,6 @@ impl BidirectionalStdioTransport {
         #[cfg(feature = "stateless")]
         let mut subscriptions = StdioSubscriptions {
             server_info: Some(self.router.implementation()),
-            tasks_enabled: self.router.final_tasks_enabled(),
             ..StdioSubscriptions::default()
         };
 
@@ -1449,13 +1485,23 @@ impl BidirectionalStdioTransport {
         }
 
         #[cfg(feature = "stateless")]
-        if let StdioSubscriptionInput::Handled(frames) =
-            subscriptions.handle_input(&self.service, &parsed)?
-        {
-            for frame in frames {
-                self.write_line(&frame, writer.clone()).await?;
+        match subscriptions.handle_input(&self.service, &parsed)? {
+            StdioSubscriptionInput::Handled(frames) => {
+                for frame in frames {
+                    self.write_line(&frame, writer.clone()).await?;
+                }
+                return Ok(());
             }
-            return Ok(());
+            StdioSubscriptionInput::Dispatch(request) => {
+                let request_id = request.id.clone();
+                let response =
+                    dispatch_listen_request(&mut self.service, *request, request_id.clone()).await;
+                for frame in subscriptions.complete_listen(request_id, &response)? {
+                    self.write_line(&frame, writer.clone()).await?;
+                }
+                return Ok(());
+            }
+            StdioSubscriptionInput::NotHandled => {}
         }
 
         // Check if it's a notification (no id field)

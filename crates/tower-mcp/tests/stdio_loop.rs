@@ -1200,3 +1200,168 @@ async fn bidi_transport_elicitation_round_trip() {
         .expect("elicitation round-trip over bidirectional stdio timed out (deadlock)");
     let _ = timeout(Duration::from_secs(2), handle).await;
 }
+
+// =============================================================================
+// Middleware observation of subscriptions/listen (#1182)
+// =============================================================================
+
+#[cfg(feature = "stateless")]
+mod listen_observation {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context as TaskContext, Poll};
+
+    use tower_mcp::router::{RouterRequest, RouterResponse};
+
+    #[derive(Clone)]
+    struct RecordingLayer {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[derive(Clone)]
+    struct RecordingService<S> {
+        inner: S,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl<S> tower::Layer<S> for RecordingLayer {
+        type Service = RecordingService<S>;
+
+        fn layer(&self, inner: S) -> Self::Service {
+            RecordingService {
+                inner,
+                seen: self.seen.clone(),
+            }
+        }
+    }
+
+    impl<S> tower_service::Service<RouterRequest> for RecordingService<S>
+    where
+        S: tower_service::Service<RouterRequest, Response = RouterResponse>,
+    {
+        type Response = S::Response;
+        type Error = S::Error;
+        type Future = S::Future;
+
+        fn poll_ready(&mut self, cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
+            self.inner.poll_ready(cx)
+        }
+
+        fn call(&mut self, request: RouterRequest) -> Self::Future {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(request.inner.method_name().to_string());
+            self.inner.call(request)
+        }
+    }
+
+    async fn run_listen_exchange(request: serde_json::Value) -> (Vec<String>, serde_json::Value) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut transport =
+            StdioTransport::new(subscription_router()).layer(RecordingLayer { seen: seen.clone() });
+        let control = transport.handle();
+        let (mut server_stdin_writer, server_stdin) = tokio::io::duplex(8192);
+        let (server_stdout, server_stdout_reader) = tokio::io::duplex(8192);
+        let task = tokio::spawn(async move {
+            transport
+                .run_with_streams(server_stdin, server_stdout)
+                .await
+        });
+        server_stdin_writer
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+        server_stdin_writer.flush().await.unwrap();
+        let mut reader = BufReader::new(server_stdout_reader);
+        let frame = timeout(Duration::from_secs(2), read_frame(&mut reader))
+            .await
+            .expect("listen exchange reply");
+        control.shutdown().unwrap();
+        let _ = task.await;
+        let observed = seen.lock().unwrap().clone();
+        (observed, frame)
+    }
+
+    /// Before #1182 the transport intercepted `subscriptions/listen` ahead of
+    /// the service, so a layer advertised as covering all MCP requests never
+    /// saw subscription starts. Now the accepted listen passes through it.
+    #[tokio::test]
+    async fn middleware_observes_an_accepted_listen() {
+        let (observed, frame) = run_listen_exchange(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "observed",
+            "method": "subscriptions/listen",
+            "params": {
+                "_meta": final_meta(tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28),
+                "notifications": {"toolsListChanged": true}
+            }
+        }))
+        .await;
+
+        assert_eq!(observed, vec!["subscriptions/listen"]);
+        // The wire behavior is unchanged: the acknowledgment still arrives.
+        assert_eq!(frame["method"], "notifications/subscriptions/acknowledged");
+        assert_eq!(
+            frame["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+            "observed"
+        );
+        assert_eq!(frame["params"]["notifications"]["toolsListChanged"], true);
+    }
+
+    /// A rejected listen also passes through the layer, and the rejection
+    /// wire shape matches what the transport-owned validation produced
+    /// before: -32021 with the required extension named.
+    #[tokio::test]
+    async fn middleware_observes_a_rejected_listen() {
+        let (observed, frame) = run_listen_exchange(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "rejected",
+            "method": "subscriptions/listen",
+            "params": {
+                "_meta": final_meta(tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28),
+                "notifications": {"taskIds": ["task-1"]}
+            }
+        }))
+        .await;
+
+        assert_eq!(observed, vec!["subscriptions/listen"]);
+        assert_eq!(frame["id"], "rejected");
+        assert_eq!(frame["error"]["code"], -32021);
+        assert!(
+            frame["error"]["data"]["requiredCapabilities"]["extensions"]
+                ["io.modelcontextprotocol/tasks"]
+                .is_object(),
+            "the rejection must name the missing extension: {frame}"
+        );
+    }
+
+    /// A listen violating the wire schema (the required `notifications`
+    /// field missing) is rejected by protocol inspection inside the service,
+    /// before the middleware boundary. That matches every other method:
+    /// schema-invalid requests never become a `RouterRequest`, so middleware
+    /// does not observe them; semantic rejections (like -32021 above) do.
+    #[tokio::test]
+    async fn schema_rejections_stay_ahead_of_the_middleware_boundary() {
+        let (observed, frame) = run_listen_exchange(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "no-filter",
+            "method": "subscriptions/listen",
+            "params": {
+                "_meta": final_meta(tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28)
+            }
+        }))
+        .await;
+
+        assert!(observed.is_empty(), "schema rejections precede middleware");
+        assert_eq!(frame["id"], "no-filter");
+        assert_eq!(frame["error"]["code"], -32602);
+        assert!(
+            frame["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("required `notifications` field is missing"),
+            "the rejection must explain the missing filter: {frame}"
+        );
+    }
+}

@@ -9,7 +9,7 @@
 pub mod stdio;
 
 #[cfg(feature = "stateless")]
-mod subscriptions;
+pub(crate) mod subscriptions;
 
 #[cfg(feature = "http")]
 pub mod http;

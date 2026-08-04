@@ -194,10 +194,9 @@ impl ChannelTransport {
         let (response_tx, response_rx) = mpsc::channel::<String>(64);
 
         #[cfg(feature = "stateless")]
-        let subscriptions = Arc::new(StdMutex::new(StdioSubscriptions::new(
-            Some(router.implementation()),
-            router.final_tasks_enabled(),
-        )));
+        let subscriptions = Arc::new(StdMutex::new(StdioSubscriptions::new(Some(
+            router.implementation(),
+        ))));
 
         // Notification pump: serialize ServerNotifications into JSON-RPC
         // notification frames on the shared response stream.
@@ -243,17 +242,43 @@ impl ChannelTransport {
                 };
                 #[cfg(feature = "stateless")]
                 {
+                    // The registry lock is never held across an await: the
+                    // dispatch through the service happens between the
+                    // handle_input and complete_listen critical sections.
                     let handled = subscriptions
                         .lock()
                         .ok()
                         .map(|mut subscriptions| subscriptions.handle_input(&service, &parsed));
-                    if let Some(Ok(StdioSubscriptionInput::Handled(frames))) = handled {
-                        for frame in frames {
-                            if response_tx.send(frame).await.is_err() {
-                                return;
+                    match handled {
+                        Some(Ok(StdioSubscriptionInput::Handled(frames))) => {
+                            for frame in frames {
+                                if response_tx.send(frame).await.is_err() {
+                                    return;
+                                }
                             }
+                            continue;
                         }
-                        continue;
+                        Some(Ok(StdioSubscriptionInput::Dispatch(request))) => {
+                            let request_id = request.id.clone();
+                            let response = crate::transport::stdio::dispatch_listen_request(
+                                &mut service.clone(),
+                                *request,
+                                request_id.clone(),
+                            )
+                            .await;
+                            let frames = subscriptions.lock().ok().map(|mut subscriptions| {
+                                subscriptions.complete_listen(request_id, &response)
+                            });
+                            if let Some(Ok(frames)) = frames {
+                                for frame in frames {
+                                    if response_tx.send(frame).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        _ => {}
                     }
                 }
                 if parsed.get("id").is_none() {

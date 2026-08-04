@@ -3582,6 +3582,44 @@ impl McpRouter {
                 }
             }
 
+            #[cfg(feature = "stateless")]
+            McpRequest::SubscriptionsListen(params) => {
+                // The stream itself is transport-owned: transports dispatch
+                // the request here before upgrading the connection, so
+                // `Service<RouterRequest>` middleware observes accepted and
+                // rejected listens and the validation lives in one place
+                // (#1182). The response is consumed by the transport, never
+                // written to the wire.
+                if !is_final_protocol_request(&extensions) {
+                    // A legacy peer gets exactly what the old catch-all
+                    // produced for this method.
+                    return Err(Error::JsonRpc(JsonRpcError::method_not_found(
+                        "subscriptions/listen",
+                    )));
+                }
+                let Some(requested) = params.notifications else {
+                    return Err(Error::JsonRpc(JsonRpcError::invalid_params(
+                        "subscriptions/listen requires a notifications filter",
+                    )));
+                };
+                // SEP-2663: task status notifications require the declared
+                // extension, the same answer the three task methods give.
+                if requested.task_ids.is_some() && !client_declares_tasks(&extensions) {
+                    return Err(Error::JsonRpc(
+                        JsonRpcError::missing_required_client_capability(
+                            tasks_client_capabilities(),
+                        ),
+                    ));
+                }
+                let notifications = crate::transport::subscriptions::accepted_subscription_filter(
+                    requested,
+                    self.final_tasks_enabled(),
+                );
+                Ok(McpResponse::SubscriptionsAccepted(
+                    crate::protocol::SubscriptionsAcceptedResult { notifications },
+                ))
+            }
+
             McpRequest::Unknown { method, .. } => {
                 Err(Error::JsonRpc(JsonRpcError::method_not_found(&method)))
             }

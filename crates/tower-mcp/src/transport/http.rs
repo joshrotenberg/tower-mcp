@@ -274,21 +274,20 @@ use crate::error::{Error, JsonRpcError, Result};
 use crate::error::{ErrorCode, McpErrorCode};
 use crate::inspection::{McpDirection, McpProtocolRevision};
 use crate::jsonrpc::{JsonRpcService, apply_protocol_result_fields, inspect_runtime_value};
+#[cfg(feature = "stateless")]
+use crate::protocol::SubscriptionFilter;
 use crate::protocol::{
     ClientCapabilities, Implementation, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
     JsonRpcResponse, LATEST_PROTOCOL_VERSION, McpNotification, PROTOCOL_VERSION_2026_07_28,
     RequestId,
 };
-#[cfg(feature = "stateless")]
-use crate::protocol::{SubscriptionFilter, SubscriptionsListenParams};
 use crate::router::{McpRouter, RouterRequest, RouterResponse};
 use crate::transport::service::{
     CatchError, InjectAnnotations, McpBoxService, ServiceFactory, identity_factory,
 };
 #[cfg(feature = "stateless")]
 use crate::transport::subscriptions::{
-    accepted_subscription_filter, subscription_complete_response, subscription_matches,
-    tagged_subscription_notification,
+    subscription_complete_response, subscription_matches, tagged_subscription_notification,
 };
 use crate::{ProtocolSupport, ProtocolSupportError};
 use tower::util::BoxCloneService;
@@ -1298,21 +1297,6 @@ impl SessionHandle {
     #[cfg(feature = "stateless")]
     pub fn close_subscriptions(&self) -> usize {
         self.modern_subscriptions.close_all()
-    }
-}
-
-#[cfg(feature = "stateless")]
-impl AppState {
-    /// Whether the served router opted into the Tasks extension.
-    ///
-    /// A boxed service is opaque here, so it reads as not enabled: the
-    /// acknowledgement then declines the task IDs rather than promising
-    /// notifications this transport cannot confirm anyone will send.
-    fn tasks_extension_enabled(&self) -> bool {
-        match &self.service_source {
-            ServiceSource::Router { router, .. } => router.final_tasks_enabled(),
-            ServiceSource::Service(_) => false,
-        }
     }
 }
 
@@ -4254,22 +4238,6 @@ fn stateless_sse_with_notifications(
         .into_response()
 }
 
-/// Whether a `subscriptions/listen` request declared the Tasks extension.
-///
-/// The listen handler runs ahead of the router, so it reads the per-request
-/// capabilities straight out of `_meta` rather than from request extensions.
-#[cfg(feature = "stateless")]
-fn listen_request_declares_tasks(parsed: &serde_json::Value) -> bool {
-    parsed
-        .get("params")
-        .and_then(crate::stateless::StatelessRequestMeta::from_params)
-        .and_then(|meta| meta.client_capabilities)
-        .and_then(|capabilities| capabilities.extensions)
-        .is_some_and(|declared| {
-            declared.contains_key(tower_mcp_types::protocol::TASKS_EXTENSION_ID)
-        })
-}
-
 /// Serve the final, sessionless `subscriptions/listen` protocol over its
 /// owning POST response.
 #[cfg(feature = "stateless")]
@@ -4285,39 +4253,85 @@ async fn handle_modern_subscriptions_listen_sse(
             StatusCode::BAD_REQUEST,
         );
     };
-    let params = match parsed
-        .get("params")
-        .cloned()
-        .ok_or_else(|| JsonRpcError::invalid_params("subscriptions/listen requires params"))
-        .and_then(|value| {
-            serde_json::from_value::<SubscriptionsListenParams>(value)
-                .map_err(|error| JsonRpcError::invalid_params(error.to_string()))
-        }) {
-        Ok(params) => params,
+    let request: JsonRpcRequest = match serde_json::from_value(parsed.clone()) {
+        Ok(request) => request,
         Err(error) => {
-            return json_rpc_error_response_with_status(id, error, StatusCode::BAD_REQUEST);
+            return json_rpc_error_response_with_status(
+                id,
+                JsonRpcError::invalid_request(format!("Invalid request: {error}")),
+                StatusCode::BAD_REQUEST,
+            );
         }
     };
-    let Some(requested) = params.notifications else {
-        return json_rpc_error_response_with_status(
-            id,
-            JsonRpcError::invalid_params("subscriptions/listen requires a notifications filter"),
-            StatusCode::BAD_REQUEST,
-        );
-    };
-    // SEP-2663: a client asking for task notifications must have declared the
-    // extension, on this request like every other final-protocol request.
-    if requested.task_ids.is_some() && !listen_request_declares_tasks(parsed) {
-        return json_rpc_error_response_with_status(
-            id,
-            JsonRpcError::missing_required_client_capability(
-                crate::router::tasks_client_capabilities(),
-            ),
-            StatusCode::BAD_REQUEST,
-        );
-    }
 
-    let accepted = accepted_subscription_filter(requested, state.tasks_extension_enabled());
+    // Dispatch the request through the per-request service before upgrading,
+    // so `Service<RouterRequest>` middleware observes accepted and rejected
+    // listens and the router owns validation and filter negotiation (#1182).
+    // The service response never reaches the wire: an error is returned as
+    // the reply, and a success carries the accepted filter this handler
+    // consumes to register the stream. The stream lifetime stays entirely
+    // transport-owned.
+    let service = match &state.service_source {
+        ServiceSource::Router { router, factory } => {
+            let ephemeral = router.with_fresh_session();
+            ephemeral.session().mark_initialized();
+            JsonRpcService::new(factory(ephemeral))
+        }
+        ServiceSource::Service(mutex) => JsonRpcService::new(mutex.lock().unwrap().clone()),
+    };
+    let mut ext = crate::router::Extensions::new();
+    ext.insert(state.protocol_support.clone());
+    stash_per_request_meta(&request, &mut ext);
+    if ext
+        .get::<crate::stateless::StatelessRequestMeta>()
+        .is_none()
+    {
+        // This handler is only reached for effective-final requests, but the
+        // version can arrive via the HTTP header with no per-request `_meta`.
+        // Seed the meta so the router classifies the request correctly.
+        ext.insert(crate::stateless::StatelessRequestMeta {
+            protocol_version: Some(crate::protocol::PROTOCOL_VERSION_2026_07_28.to_string()),
+            ..Default::default()
+        });
+    }
+    let mut service = service.with_extensions(ext);
+
+    let response = match service.call_single(request).await {
+        Ok(response) => response,
+        Err(error) => {
+            return json_rpc_error_response_with_status(
+                id,
+                JsonRpcError::internal_error(error.to_string()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
+        }
+    };
+    let accepted = match &response {
+        JsonRpcResponse::Result(result) => match result
+            .result
+            .get("notifications")
+            .cloned()
+            .map(serde_json::from_value::<SubscriptionFilter>)
+        {
+            Some(Ok(accepted)) => accepted,
+            _ => {
+                return json_rpc_error_response_with_status(
+                    id,
+                    JsonRpcError::internal_error(
+                        "subscriptions/listen produced an unrecognized service result",
+                    ),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                );
+            }
+        },
+        _ => {
+            // Rejected: middleware already observed the error; reply with it.
+            let mut resp = axum::Json(&response).into_response();
+            *resp.status_mut() = StatusCode::BAD_REQUEST;
+            return resp;
+        }
+    };
+
     let (rx, guard) = state
         .modern_subscriptions
         .register(subscription_id.clone(), accepted.clone());

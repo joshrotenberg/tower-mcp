@@ -914,6 +914,10 @@ pub enum McpResponse {
     Pong(EmptyResult),
     /// SEP-2575 `server/discover` response.
     Discover(DiscoverResult),
+    /// Accepted filter from the pre-upgrade service pass of
+    /// `subscriptions/listen`; consumed by the owning transport, never
+    /// serialized as the request's wire response.
+    SubscriptionsAccepted(SubscriptionsAcceptedResult),
     /// SEP-2575 / SEP-2567 `subscriptions/listen` response.
     ///
     /// In practice the HTTP transport returns an SSE stream for this method
@@ -2113,6 +2117,22 @@ pub struct SubscriptionsListenParams {
         with = "crate::protocol::meta_object_serde"
     )]
     pub meta: Option<Value>,
+}
+
+/// Accepted-filter result of the pre-upgrade service pass for
+/// `subscriptions/listen` (SEP-2575).
+///
+/// This is not a wire result. Transports dispatch the listen request through
+/// the JSON-RPC service before upgrading the connection into a stream, so
+/// `Service<RouterRequest>` middleware observes accepted and rejected listens
+/// like any other request; the transport then consumes this result to
+/// register the stream and emit `notifications/subscriptions/acknowledged`.
+/// The request's eventual wire response remains the graceful-close
+/// [`SubscriptionsListenResult`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscriptionsAcceptedResult {
+    /// The notification types and task IDs the server agreed to honor.
+    pub notifications: SubscriptionFilter,
 }
 
 /// Graceful final result of the `subscriptions/listen` RPC.
