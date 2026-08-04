@@ -50,6 +50,7 @@ mod exit_status;
 mod find;
 pub mod import_config;
 mod jobs;
+pub mod lifecycle;
 pub mod oauth_profile;
 mod output;
 mod sampling;

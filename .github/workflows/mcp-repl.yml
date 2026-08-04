@@ -1,0 +1,64 @@
+name: mcp-repl
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/mcp-repl.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/tower-mcp/**"
+      - "crates/tower-mcp-types/**"
+      - "examples/Cargo.toml"
+      - "examples/mcp-repl/**"
+      - "examples/mcp_repl_fixture.rs"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/mcp-repl.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/tower-mcp/**"
+      - "crates/tower-mcp-types/**"
+      - "examples/Cargo.toml"
+      - "examples/mcp-repl/**"
+      - "examples/mcp_repl_fixture.rs"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  current-main:
+    name: Current tower-mcp
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt -p mcp-repl -- --check
+      - name: Lint
+        run: cargo clippy -p mcp-repl --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test -p mcp-repl --all-targets --all-features
+      - name: Documentation
+        run: cargo doc -p mcp-repl --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+
+  released-tower-mcp:
+    name: Released tower-mcp package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify publishable package
+        run: cargo package -p mcp-repl
