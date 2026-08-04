@@ -12,6 +12,14 @@
 //! bearer_env = "CRATESIO_TOKEN"
 //! headers = { "X-Api-Key" = "..." }
 //!
+//! [oauth.work]
+//! url = "https://mcp.example.com/mcp"
+//! scopes = ["openid", "offline_access"]
+//!
+//! [servers.work]
+//! transport = "http"
+//! oauth = "work"
+//!
 //! [servers.local]
 //! transport = "stdio"
 //! command = ["cargo", "run", "--example", "getting_started"]
@@ -39,6 +47,10 @@ use serde::Deserialize;
 pub struct Config {
     #[serde(default)]
     pub servers: BTreeMap<String, Profile>,
+    /// Non-secret metadata for named OAuth credential profiles. Tokens and
+    /// registered client secrets live in the operating-system credential store.
+    #[serde(default)]
+    pub oauth: BTreeMap<String, OAuthProfile>,
     /// Command aliases in effect against every server. See [`crate::alias`].
     #[serde(default)]
     pub aliases: BTreeMap<String, String>,
@@ -56,6 +68,8 @@ pub struct Profile {
     pub bearer: Option<String>,
     /// Name of the environment variable holding the bearer token.
     pub bearer_env: Option<String>,
+    /// Named entry in the top-level `[oauth]` table.
+    pub oauth: Option<String>,
     /// Extra headers sent with every request of an `http` profile.
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
@@ -66,6 +80,21 @@ pub struct Profile {
     /// file-level `[aliases]` of the same name.
     #[serde(default)]
     pub aliases: BTreeMap<String, String>,
+}
+
+/// Non-secret OAuth metadata stored under `[oauth.<name>]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OAuthProfile {
+    /// MCP protected-resource URL used when this profile was authorized.
+    pub url: String,
+    /// Initial scopes requested during login and tracked for escalation.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// Optional HTTPS Client ID Metadata Document URL (CIMD).
+    pub client_id_metadata_document: Option<String>,
+    /// Preferred authorization-server issuer when discovery advertises several.
+    pub authorization_server: Option<String>,
 }
 
 /// The transports a profile can name. `ws` and stateless HTTP are not
@@ -86,6 +115,7 @@ pub enum Connection {
         url: String,
         bearer: Option<String>,
         headers: Vec<(String, String)>,
+        oauth: Option<String>,
     },
     Stdio {
         command: Vec<String>,
@@ -130,13 +160,40 @@ impl Config {
     pub fn names(&self) -> Vec<&str> {
         self.servers.keys().map(String::as_str).collect()
     }
+
+    /// Resolve a named server, allowing an OAuth-only server profile to reuse
+    /// the protected-resource URL saved with its credential profile.
+    pub fn resolve_profile_with(
+        &self,
+        name: &str,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<Connection, String> {
+        let profile = self.profile(name)?;
+        let oauth_url = profile
+            .oauth
+            .as_deref()
+            .map(|oauth| {
+                self.oauth
+                    .get(oauth)
+                    .map(|metadata| metadata.url.as_str())
+                    .ok_or_else(|| {
+                        format!("server profile references unknown OAuth profile {oauth:?}")
+                    })
+            })
+            .transpose()?;
+        profile.resolve_with_oauth_url(lookup, oauth_url)
+    }
 }
 
 impl Profile {
     /// The transport this profile connects over: the declared one, else
     /// inferred from whichever of `url`/`command` is present.
     pub fn transport(&self) -> Result<Transport, String> {
-        match (self.transport, self.url.is_some(), !self.command.is_empty()) {
+        match (
+            self.transport,
+            self.url.is_some() || self.oauth.is_some(),
+            !self.command.is_empty(),
+        ) {
             (Some(t), _, _) => Ok(t),
             (None, true, false) => Ok(Transport::Http),
             (None, false, true) => Ok(Transport::Stdio),
@@ -170,15 +227,39 @@ impl Profile {
 
     /// Resolve into a [`Connection`], validating that the transport has the
     /// fields it needs.
+    #[cfg(test)]
     pub fn resolve_with(
         &self,
         lookup: impl Fn(&str) -> Option<String>,
     ) -> Result<Connection, String> {
+        self.resolve_with_oauth_url(lookup, None)
+    }
+
+    fn resolve_with_oauth_url(
+        &self,
+        lookup: impl Fn(&str) -> Option<String>,
+        oauth_url: Option<&str>,
+    ) -> Result<Connection, String> {
         match self.transport()? {
             Transport::Http => {
+                if self.oauth.is_some()
+                    && (self.bearer.is_some()
+                        || self.bearer_env.is_some()
+                        || self
+                            .headers
+                            .keys()
+                            .any(|name| name.eq_ignore_ascii_case("authorization")))
+                {
+                    return Err(
+                        "HTTP profile cannot combine `oauth` with `bearer`, `bearer_env`, or an \
+                         Authorization header"
+                            .to_string(),
+                    );
+                }
                 let url = self
                     .url
                     .clone()
+                    .or_else(|| oauth_url.map(str::to_string))
                     .ok_or("profile has `transport = \"http\"` but no `url`")?;
                 Ok(Connection::Http {
                     url,
@@ -188,6 +269,7 @@ impl Profile {
                         .iter()
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect(),
+                    oauth: self.oauth.clone(),
                 })
             }
             Transport::Stdio => {
@@ -206,7 +288,13 @@ impl Profile {
     /// A one-line summary for `--list-servers`.
     pub fn summary(&self) -> String {
         match self.transport() {
-            Ok(Transport::Http) => format!("http   {}", self.url.as_deref().unwrap_or("(no url)")),
+            Ok(Transport::Http) => format!(
+                "http   {}",
+                self.url
+                    .as_deref()
+                    .or(self.oauth.as_deref())
+                    .unwrap_or("(no url)")
+            ),
             Ok(Transport::Stdio) => format!("stdio  {}", self.command.join(" ")),
             Err(e) => format!("(invalid: {e})"),
         }
@@ -276,8 +364,68 @@ command = ["cargo", "run", "--example", "getting_started"]
                 url: "https://cratesio-mcp.fly.dev/".to_string(),
                 bearer: Some("secret".to_string()),
                 headers: vec![("X-Api-Key".to_string(), "abc".to_string())],
+                oauth: None,
             }
         );
+    }
+
+    #[test]
+    fn oauth_metadata_and_server_selection_are_non_secret() {
+        let config = Config::parse(
+            r#"
+[oauth.work]
+url = "https://mcp.example/mcp"
+scopes = ["openid", "offline_access"]
+client_id_metadata_document = "https://client.example/metadata.json"
+authorization_server = "https://auth.example"
+
+[servers.work]
+oauth = "work"
+headers = { "X-Tenant" = "acme" }
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.oauth["work"].scopes, ["openid", "offline_access"]);
+        assert_eq!(
+            config.resolve_profile_with("work", env(&[])).unwrap(),
+            Connection::Http {
+                url: "https://mcp.example/mcp".to_string(),
+                bearer: None,
+                headers: vec![("X-Tenant".to_string(), "acme".to_string())],
+                oauth: Some("work".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_oauth_reference_is_an_actionable_error() {
+        let config = Config::parse("[servers.work]\noauth = \"missing\"\n").unwrap();
+        let error = config.resolve_profile_with("work", env(&[])).unwrap_err();
+        assert!(
+            error.contains("unknown OAuth profile \"missing\""),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn oauth_server_profile_rejects_ambiguous_static_auth() {
+        for auth in [
+            "bearer = \"secret\"",
+            "bearer_env = \"TOKEN\"",
+            "headers = { Authorization = \"Bearer secret\" }",
+        ] {
+            let source = format!(
+                "[servers.work]\nurl = \"https://mcp.example/mcp\"\noauth = \"work\"\n{auth}\n"
+            );
+            let error = Config::parse(&source)
+                .unwrap()
+                .profile("work")
+                .unwrap()
+                .resolve_with(env(&[("TOKEN", "secret")]))
+                .unwrap_err();
+            assert!(error.contains("cannot combine `oauth`"), "{error}");
+        }
     }
 
     #[test]

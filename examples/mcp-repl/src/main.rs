@@ -16,6 +16,10 @@
 //! # Connect to a streamable HTTP server:
 //! cargo run -p mcp-repl -- --http http://127.0.0.1:3001/mcp
 //!
+//! # Authorize once, then reuse a secure OAuth profile:
+//! cargo run -p mcp-repl -- --login work --http https://mcp.example.com/mcp
+//! cargo run -p mcp-repl -- --oauth work --http https://mcp.example.com/mcp
+//!
 //! # Connect to a named profile from ~/.config/mcp-repl/config.toml:
 //! cargo run -p mcp-repl -- --server cratesio
 //! ```
@@ -38,6 +42,7 @@ mod exit_status;
 mod find;
 mod import_config;
 mod jobs;
+mod oauth_profile;
 mod output;
 mod sampling;
 mod schema_contract;
@@ -60,7 +65,8 @@ use nu_ansi_term::{Color, Style};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tower_mcp::client::{
     ChannelTransport, HttpClientConfig, HttpClientTransport, McpClient, McpClientBuilder,
-    NotificationHandler, StdioClientTransport,
+    NotificationHandler, OAuthAuthorizationFlow, OAuthAuthorizationStart, OAuthClientError,
+    OAuthScopeEscalationConfig, StdioClientTransport,
 };
 use tower_mcp::protocol::{
     Content, DiscoverResult, Implementation, InitializeResult, LogLevel, PromptDefinition,
@@ -151,6 +157,40 @@ struct Args {
     /// (repeatable). Split on the first colon.
     #[arg(long = "header", value_name = "NAME: VALUE")]
     headers: Vec<String>,
+
+    /// Use a named OAuth credential profile for this HTTP connection.
+    #[arg(long, value_name = "NAME")]
+    oauth: Option<String>,
+
+    /// Authorize and securely save a named OAuth profile, then exit without
+    /// opening an MCP session. Supply --http for a new profile.
+    #[arg(long, value_name = "NAME", conflicts_with = "logout")]
+    login: Option<String>,
+
+    /// Remove a named OAuth profile and its credentials, then exit without
+    /// opening an MCP session.
+    #[arg(long, value_name = "NAME", conflicts_with = "login")]
+    logout: Option<String>,
+
+    /// Initial OAuth scope to request during --login (repeatable). Existing
+    /// profile scopes are retained when this is omitted.
+    #[arg(long = "oauth-scope", value_name = "SCOPE")]
+    oauth_scopes: Vec<String>,
+
+    /// HTTPS Client ID Metadata Document URL to try before Dynamic Client
+    /// Registration during --login.
+    #[arg(long, value_name = "URL")]
+    oauth_client_id_metadata_document: Option<String>,
+
+    /// Exact authorization-server issuer to select when discovery advertises
+    /// more than one during --login.
+    #[arg(long, value_name = "ISSUER")]
+    oauth_authorization_server: Option<String>,
+
+    /// Print the authorization URL instead of launching a browser. The
+    /// loopback callback is still used.
+    #[arg(long)]
+    no_browser: bool,
 
     /// Run a command and exit instead of starting the interactive prompt.
     /// Repeatable; commands run in order against the same session, including
@@ -798,6 +838,23 @@ fn build_http_config_with_env(
     Ok(config)
 }
 
+fn selected_oauth_profile(
+    cli_oauth: Option<&str>,
+    profile_oauth: Option<&str>,
+    cli_bearer: bool,
+    cli_headers: &[String],
+) -> Option<String> {
+    let explicit_authorization = cli_bearer
+        || cli_headers.iter().any(|header| {
+            header
+                .split_once(':')
+                .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("authorization"))
+        });
+    (!explicit_authorization)
+        .then(|| cli_oauth.or(profile_oauth).map(str::to_string))
+        .flatten()
+}
+
 fn demo_router() -> tower_mcp::McpRouter {
     use tower_mcp::extract::RawArgs;
     use tower_mcp::protocol::{CompleteResult, CompletionReference, ReadResourceResult};
@@ -1072,19 +1129,42 @@ fn watch_task(session: Arc<Session>, jobs: Arc<Jobs>, task_id: String, poll_inte
 /// keep reporting frames after a reconnect, and it declares the same
 /// capabilities as the startup client: a reconnect must not quietly leave the
 /// session less capable than it began.
+#[derive(Clone)]
+struct OAuthRuntime {
+    flow: OAuthAuthorizationFlow,
+    scopes: Vec<String>,
+}
+
+fn http_transport(
+    url: String,
+    config: HttpClientConfig,
+    oauth: Option<OAuthRuntime>,
+) -> HttpClientTransport {
+    let transport = HttpClientTransport::with_config(url, config);
+    match oauth {
+        Some(oauth) => transport.with_scope_aware_token_provider(
+            oauth.flow,
+            OAuthScopeEscalationConfig::new(oauth.scopes).max_attempts(2),
+        ),
+        None => transport,
+    }
+}
+
 fn http_connector(
     url: String,
     config: HttpClientConfig,
+    oauth: Option<OAuthRuntime>,
     make_handler: Arc<dyn Fn() -> ReplClientHandler + Send + Sync>,
     protocol: ProtocolMode,
 ) -> Connector {
     Box::new(move || {
-        let (url, config, handler) = (url.clone(), config.clone(), make_handler());
+        let (url, config, oauth, handler) =
+            (url.clone(), config.clone(), oauth.clone(), make_handler());
         Box::pin(async move {
             let client = client_builder(protocol)
                 .map_err(|error| tower_mcp::Error::Transport(error.to_string()))?
                 .connect(
-                    TracingTransport::new(HttpClientTransport::with_config(url, config)),
+                    TracingTransport::new(http_transport(url, config, oauth)),
                     handler,
                 )
                 .await?;
@@ -1106,6 +1186,158 @@ fn load_config(explicit: Option<&str>) -> config::Config {
             exit_with_error(ExitStatus::Usage, &e);
         }
     }
+}
+
+async fn handle_oauth_profile_action(
+    args: &Args,
+    profiles: &config::Config,
+    config_file: Option<&std::path::Path>,
+) -> bool {
+    let Some(name) = args.login.as_deref().or(args.logout.as_deref()) else {
+        if !args.oauth_scopes.is_empty()
+            || args.oauth_client_id_metadata_document.is_some()
+            || args.oauth_authorization_server.is_some()
+        {
+            exit_with_error(
+                ExitStatus::Usage,
+                "--oauth-scope, --oauth-client-id-metadata-document, and \
+                 --oauth-authorization-server apply only to --login",
+            );
+        }
+        return false;
+    };
+    oauth_profile::validate_name(name)
+        .unwrap_or_else(|error| exit_with_error(ExitStatus::Usage, &error));
+    if args.demo
+        || !args.command.is_empty()
+        || !args.exec.is_empty()
+        || args.json
+        || args.list_servers
+        || args.bearer.is_some()
+        || !args.headers.is_empty()
+        || args.oauth.is_some()
+    {
+        exit_with_error(
+            ExitStatus::Usage,
+            "--login/--logout are standalone credential operations; do not combine them with \
+             a command, --demo, --exec/--json, --list-servers, --bearer, --header, or --oauth",
+        );
+    }
+    let path = config_file.unwrap_or_else(|| {
+        exit_with_error(
+            ExitStatus::Usage,
+            "no config file location is available; set HOME/XDG_CONFIG_HOME or pass --config",
+        )
+    });
+
+    if args.logout.is_some() {
+        let store = oauth_profile::CredentialStore::keyring(name)
+            .unwrap_or_else(|error| exit_with_error(ExitStatus::Auth, &error));
+        store
+            .clear()
+            .await
+            .unwrap_or_else(|error| exit_with_error(ExitStatus::Auth, &error));
+        oauth_profile::remove_metadata(path, name)
+            .unwrap_or_else(|error| exit_with_error(ExitStatus::Usage, &error));
+        println!("removed OAuth profile {name:?} and its stored credentials");
+        return true;
+    }
+
+    let existing = profiles.oauth.get(name).cloned().unwrap_or_default();
+    let server_url = args.server.as_deref().map(|server_name| {
+        let profile = profiles
+            .profile(server_name)
+            .unwrap_or_else(|error| exit_with_error(ExitStatus::Usage, &error));
+        match profile.transport() {
+            Ok(config::Transport::Http) => profile
+                .url
+                .clone()
+                .or_else(|| {
+                    profile
+                        .oauth
+                        .as_deref()
+                        .and_then(|oauth| profiles.oauth.get(oauth))
+                        .map(|metadata| metadata.url.clone())
+                })
+                .unwrap_or_else(|| {
+                    exit_with_error(
+                        ExitStatus::Usage,
+                        &format!("server profile {server_name:?} has no HTTP URL"),
+                    )
+                }),
+            Ok(config::Transport::Stdio) => exit_with_error(
+                ExitStatus::Usage,
+                &format!("server profile {server_name:?} is stdio; OAuth requires HTTP"),
+            ),
+            Err(error) => exit_with_error(ExitStatus::Usage, &error),
+        }
+    });
+    let url = args
+        .http
+        .clone()
+        .or(server_url)
+        .or_else(|| (!existing.url.is_empty()).then(|| existing.url.clone()))
+        .unwrap_or_else(|| {
+            exit_with_error(
+                ExitStatus::Usage,
+                "a new OAuth profile needs --http URL (or --server with an HTTP profile)",
+            )
+        });
+    let scopes = if args.oauth_scopes.is_empty() {
+        existing.scopes
+    } else {
+        args.oauth_scopes
+            .iter()
+            .flat_map(|scope| scope.split_ascii_whitespace())
+            .map(str::to_string)
+            .fold(Vec::new(), |mut scopes, scope| {
+                if !scope.is_empty() && !scopes.contains(&scope) {
+                    scopes.push(scope);
+                }
+                scopes
+            })
+    };
+    let metadata = config::OAuthProfile {
+        url: url.clone(),
+        scopes,
+        client_id_metadata_document: args
+            .oauth_client_id_metadata_document
+            .clone()
+            .or(existing.client_id_metadata_document),
+        authorization_server: args
+            .oauth_authorization_server
+            .clone()
+            .or(existing.authorization_server),
+    };
+    let (flow, store) = oauth_profile::build_flow(name, &url, &metadata, true, !args.no_browser)
+        .unwrap_or_else(|error| exit_with_error(ExitStatus::Auth, &error));
+    if let Err(error) = flow.authorize(metadata.scopes.clone()).await {
+        if matches!(error, OAuthClientError::TokenRequest(_)) {
+            store
+                .clear_tokens()
+                .await
+                .unwrap_or_else(|store_error| exit_with_error(ExitStatus::Auth, &store_error));
+            let (retry, _) =
+                oauth_profile::build_flow(name, &url, &metadata, true, !args.no_browser)
+                    .unwrap_or_else(|build_error| exit_with_error(ExitStatus::Auth, &build_error));
+            retry
+                .authorize(metadata.scopes.clone())
+                .await
+                .unwrap_or_else(|retry_error| {
+                    exit_with_error(ExitStatus::Auth, &retry_error.to_string())
+                });
+        } else {
+            exit_with_error(ExitStatus::Auth, &error.to_string());
+        }
+    }
+    if let Err(error) = oauth_profile::save_metadata(path, name, &metadata) {
+        let _ = store.clear().await;
+        exit_with_error(ExitStatus::Usage, &error);
+    }
+    println!(
+        "saved OAuth profile {name:?}; credentials are in the operating-system credential store"
+    );
+    true
 }
 
 /// `--list-servers`: the configured profiles, one per line.
@@ -1148,7 +1380,7 @@ fn resolve_profile(args: &Args, config: &config::Config) -> Option<(String, conf
              `bearer_env = \"VAR\"` so the token is not kept in the config file"
         );
     }
-    match profile.resolve_with(|var| std::env::var(var).ok()) {
+    match config.resolve_profile_with(&name, |var| std::env::var(var).ok()) {
         Ok(connection) => Some((name, connection)),
         Err(e) => {
             exit_with_error(ExitStatus::Usage, &format!("server profile {name:?}: {e}"));
@@ -1210,7 +1442,20 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
     // Server profiles are read up front: both --list-servers and profile
     // resolution need them before anything connects.
     let config_file = config::config_path(args.config.as_deref()).map(|(path, _)| path);
-    let profiles = load_config(args.config.as_deref());
+    let profiles = if args.login.is_some() || args.logout.is_some() {
+        config_file
+            .as_deref()
+            .map(|path| {
+                config::Config::load(path, false)
+                    .unwrap_or_else(|error| exit_with_error(ExitStatus::Usage, &error))
+            })
+            .unwrap_or_default()
+    } else {
+        load_config(args.config.as_deref())
+    };
+    if handle_oauth_profile_action(&args, &profiles, config_file.as_deref()).await {
+        return Ok(());
+    }
     if args.list_servers {
         print_servers(&profiles);
         return Ok(());
@@ -1293,19 +1538,39 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
         (
             Some(url),
             Some(config::Connection::Http {
-                bearer, headers, ..
+                bearer,
+                headers,
+                oauth,
+                ..
             }),
         ) => Some(config::Connection::Http {
             url,
             bearer,
             headers,
+            oauth,
         }),
         (Some(url), _) => Some(config::Connection::Http {
             url,
             bearer: None,
             headers: Vec::new(),
+            oauth: None,
         }),
         (None, Some(c)) => Some(c),
+        (None, None) if args.command.is_empty() && args.oauth.is_some() => {
+            let name = args.oauth.as_deref().expect("guarded above");
+            let metadata = profiles.oauth.get(name).unwrap_or_else(|| {
+                exit_with_error(
+                    ExitStatus::Usage,
+                    &format!("no OAuth profile named {name:?}; create it with --login"),
+                )
+            });
+            Some(config::Connection::Http {
+                url: metadata.url.clone(),
+                bearer: None,
+                headers: Vec::new(),
+                oauth: Some(name.to_string()),
+            })
+        }
         (None, None) if !args.command.is_empty() => Some(config::Connection::Stdio {
             command: args.command.clone(),
             env: std::collections::BTreeMap::new(),
@@ -1317,6 +1582,9 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
     let over_http = matches!(connection, Some(config::Connection::Http { .. }));
     if !over_http && (args.bearer.is_some() || !args.headers.is_empty()) {
         eprintln!("warning: --bearer/--header apply only to HTTP servers; ignoring them here");
+    }
+    if !over_http && args.oauth.is_some() {
+        exit_with_error(ExitStatus::Usage, "--oauth applies only to HTTP servers");
     }
     if let Some(name) = &profile_name
         && !quiet
@@ -1360,21 +1628,126 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
                 url,
                 bearer,
                 headers,
+                oauth: profile_oauth,
             }) => {
-                let config =
-                    build_http_config(args.bearer.clone(), &args.headers, bearer, &headers)
-                        .unwrap_or_else(|error| exit_with_error(ExitStatus::Usage, &error));
+                let oauth_name = selected_oauth_profile(
+                    args.oauth.as_deref(),
+                    profile_oauth.as_deref(),
+                    args.bearer.is_some(),
+                    &args.headers,
+                );
+                let cli_authorization = oauth_name.is_none()
+                    && (args.bearer.is_some()
+                        || args.headers.iter().any(|header| {
+                            header.split_once(':').is_some_and(|(name, _)| {
+                                name.trim().eq_ignore_ascii_case("authorization")
+                            })
+                        }));
+                if cli_authorization && (args.oauth.is_some() || profile_oauth.is_some()) && !quiet
+                {
+                    eprintln!(
+                        "warning: explicit --bearer/--header Authorization takes precedence over OAuth"
+                    );
+                }
+                let profile_headers = if oauth_name.is_some() {
+                    headers
+                        .into_iter()
+                        .filter(|(name, _)| !name.eq_ignore_ascii_case("authorization"))
+                        .collect::<Vec<_>>()
+                } else {
+                    headers
+                };
+                let config = if oauth_name.is_some() {
+                    build_http_config_with_env(
+                        args.bearer.clone(),
+                        &args.headers,
+                        None,
+                        &profile_headers,
+                        None,
+                    )
+                } else {
+                    build_http_config(args.bearer.clone(), &args.headers, bearer, &profile_headers)
+                }
+                .unwrap_or_else(|error| exit_with_error(ExitStatus::Usage, &error));
+                let oauth = if let Some(name) = oauth_name {
+                    let metadata = profiles.oauth.get(&name).unwrap_or_else(|| {
+                        exit_with_error(
+                            ExitStatus::Usage,
+                            &format!(
+                                "no OAuth profile named {name:?}; create it with \
+                                 `mcp-repl --login {name} --http {url}`"
+                            ),
+                        )
+                    });
+                    let interactive = !one_shot && !args.json;
+                    let (flow, store) = oauth_profile::build_flow(
+                        &name,
+                        &url,
+                        metadata,
+                        interactive,
+                        interactive && !args.no_browser,
+                    )
+                    .unwrap_or_else(|error| exit_with_error(ExitStatus::Auth, &error));
+                    if interactive {
+                        flow.authorize(metadata.scopes.clone())
+                            .await
+                            .map_err(|error| {
+                                tower_mcp::Error::Transport(format!(
+                                    "OAuth authorization failed for profile {name:?}: {error}. \
+                                     Run `mcp-repl --login {name} --http {url}` to reauthorize"
+                                ))
+                            })?;
+                    } else {
+                        if !store.has_tokens().await.map_err(|error| {
+                            tower_mcp::Error::Transport(format!(
+                                "OAuth credential restore failed for profile {name:?}: {error}"
+                            ))
+                        })? {
+                            return Err(tower_mcp::Error::Transport(format!(
+                                "OAuth login required for profile {name:?}; run \
+                                 `mcp-repl --login {name} --http {url}` before using --exec/--json"
+                            )));
+                        }
+                        match flow.begin(metadata.scopes.clone()).await.map_err(|error| {
+                            tower_mcp::Error::Transport(format!(
+                                "OAuth credential restore failed for profile {name:?}: {error}. \
+                                 Run `mcp-repl --login {name} --http {url}` to reauthorize"
+                            ))
+                        })? {
+                            OAuthAuthorizationStart::Authorized { .. } => {}
+                            OAuthAuthorizationStart::Pending(_) => {
+                                return Err(tower_mcp::Error::Transport(format!(
+                                    "OAuth login required for profile {name:?}; run \
+                                     `mcp-repl --login {name} --http {url}` before using --exec/--json"
+                                )));
+                            }
+                            _ => {
+                                return Err(tower_mcp::Error::Transport(format!(
+                                    "OAuth login required for profile {name:?}; run \
+                                     `mcp-repl --login {name} --http {url}` before using --exec/--json"
+                                )));
+                            }
+                        }
+                    }
+                    Some(OAuthRuntime {
+                        flow,
+                        scopes: metadata.scopes.clone(),
+                    })
+                } else {
+                    None
+                };
                 if !args.no_reconnect {
                     connector = Some(http_connector(
                         url.clone(),
                         config.clone(),
+                        oauth.clone(),
                         make_handler.clone(),
                         args.protocol,
                     ));
                 }
                 builder
                     .connect(
-                        TracingTransport::new(HttpClientTransport::with_config(url, config)),
+                        TracingTransport::new(http_transport(url, config, oauth)),
                         make_handler(),
                     )
                     .await?
@@ -2976,6 +3349,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn oauth_cli_parses_standalone_and_connection_workflows() {
+        let login = Args::try_parse_from([
+            "mcp-repl",
+            "--login",
+            "work",
+            "--http",
+            "https://mcp.example/mcp",
+            "--oauth-scope",
+            "openid",
+            "--oauth-scope",
+            "offline_access",
+            "--no-browser",
+        ])
+        .unwrap();
+        assert_eq!(login.login.as_deref(), Some("work"));
+        assert_eq!(login.oauth_scopes, ["openid", "offline_access"]);
+        assert!(login.no_browser);
+
+        let connection = Args::try_parse_from([
+            "mcp-repl",
+            "--oauth",
+            "work",
+            "--http",
+            "https://mcp.example/mcp",
+            "--exec",
+            "tools",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(connection.oauth.as_deref(), Some("work"));
+        assert_eq!(connection.exec, ["tools"]);
+
+        assert!(Args::try_parse_from(["mcp-repl", "--login", "work", "--logout", "work"]).is_err());
+    }
+
     #[tokio::test]
     async fn stable_selection_uses_initialize() {
         let client = client_builder(ProtocolMode::Stable)
@@ -3107,6 +3516,40 @@ mod tests {
     }
 
     #[test]
+    fn oauth_precedence_is_explicit_static_then_cli_then_server_profile() {
+        assert_eq!(
+            selected_oauth_profile(Some("cli"), Some("server"), false, &[]),
+            Some("cli".to_string())
+        );
+        assert_eq!(
+            selected_oauth_profile(None, Some("server"), false, &[]),
+            Some("server".to_string())
+        );
+        assert_eq!(
+            selected_oauth_profile(Some("cli"), Some("server"), true, &[]),
+            None
+        );
+        assert_eq!(
+            selected_oauth_profile(
+                Some("cli"),
+                Some("server"),
+                false,
+                &["authorization: Basic explicit".to_string()],
+            ),
+            None
+        );
+        assert_eq!(
+            selected_oauth_profile(
+                Some("cli"),
+                Some("server"),
+                false,
+                &["X-Tenant: acme".to_string()],
+            ),
+            Some("cli".to_string())
+        );
+    }
+
+    #[test]
     fn selected_authorization_header_beats_environment_bearer() {
         let selected_headers = [("authorization".to_string(), "Basic selected".to_string())];
         let cfg = build_http_config_with_env(
@@ -3134,6 +3577,22 @@ mod tests {
             cfg.headers.get("Authorization").map(String::as_str),
             Some("Bearer explicit-token")
         );
+    }
+
+    #[test]
+    fn explicit_oauth_suppresses_profile_and_environment_bearers() {
+        let selected = selected_oauth_profile(Some("work"), None, false, &[]);
+        assert_eq!(selected.as_deref(), Some("work"));
+
+        let cfg = build_http_config_with_env(
+            None,
+            &[],
+            selected.is_none().then(|| "profile-token".to_string()),
+            &[],
+            selected.is_none().then(|| "environment-token".to_string()),
+        )
+        .unwrap();
+        assert!(!cfg.headers.contains_key("Authorization"));
     }
 
     #[test]

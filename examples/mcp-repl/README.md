@@ -69,6 +69,51 @@ mcp-repl --http https://internal.example/mcp --header "X-Api-Key: abc"
 `--bearer` and `--header` apply only to HTTP connections; they are ignored
 (with a warning) for the demo and stdio-child transports.
 
+For an MCP server using OAuth authorization-code + PKCE, create a named login
+without opening an MCP session:
+
+```bash
+# Discovers the protected resource and authorization server, opens the browser,
+# receives the redirect on an ephemeral loopback port, and saves the credentials.
+mcp-repl --login work --http https://mcp.example.com/mcp \
+  --oauth-scope openid --oauth-scope offline_access
+
+# Reuse its saved URL directly, retarget it with --http, or select it through
+# a server profile.
+mcp-repl --oauth work
+mcp-repl --oauth work --http https://mcp-alt.example.com/mcp
+
+# If automatic browser launch is unavailable, print the URL and wait for the
+# loopback redirect (remote use requires forwarding that loopback callback).
+mcp-repl --login work --http https://mcp.example.com/mcp --no-browser
+
+# Remove both profile metadata and credentials.
+mcp-repl --logout work
+```
+
+Login follows MCP protected-resource and authorization-server discovery,
+requires PKCE S256, tries an optional Client ID Metadata Document before
+Dynamic Client Registration, and requests refresh-token support when the
+server advertises it. Use
+`--oauth-client-id-metadata-document https://client.example/metadata.json` for
+CIMD or `--oauth-authorization-server ISSUER` to select one exact issuer when
+discovery advertises several.
+
+Only non-secret routing metadata is written to `config.toml`. Access tokens,
+refresh tokens, and dynamically registered client secrets are kept in macOS
+Keychain, Windows Credential Manager, or the Linux Secret Service through the
+platform credential store. If no secure store is available, mcp-repl fails
+closed; it never writes a plaintext credential fallback. A saved expired token
+is refreshed automatically. A failed refresh tells you to run `--login` again;
+an explicit login discards the unusable token while retaining reusable DCR
+registration.
+
+`--exec`/`--json` never starts an interactive authorization or opens a browser.
+It either restores/refreshes the saved credential or exits with an actionable
+`--login` command. Runtime insufficient-scope challenges are retried at most
+twice; interactive sessions can authorize the added scopes, while one-shot
+commands fail immediately with the same login guidance.
+
 ## Profiles
 
 A config file names servers so a connection is `mcp-repl <name>` instead of a
@@ -83,6 +128,15 @@ url = "https://cratesio-mcp.fly.dev/"
 bearer_env = "CRATESIO_TOKEN"      # read the token from the environment
 headers = { "X-Api-Key" = "abc" }
 
+[oauth.work]
+url = "https://mcp.example.com/mcp"
+scopes = ["openid", "offline_access"]
+
+[servers.work]
+transport = "http"
+oauth = "work"
+headers = { "X-Tenant" = "acme" }
+
 [servers.local]
 transport = "stdio"
 command = ["cargo", "run", "--example", "getting_started"]
@@ -95,10 +149,17 @@ mcp-repl cratesio                  # a bare name works too
 ```
 
 - `transport` is optional: a profile with a `url` is HTTP, one with a
-  `command` is stdio. A profile with both must say which.
+  `command` is stdio, and one with `oauth` is HTTP and may reuse that OAuth
+  profile's saved URL. A profile with both a URL/OAuth selection and a command
+  must say which.
 - Explicit flags override profile fields. `--http <url>` retargets the URL
   while keeping the profile's auth; `--bearer` replaces the profile's token;
   each `--header` overrides the profile header of the same name.
+- OAuth precedence is explicit static authorization (`--bearer` or
+  `--header Authorization`) first, then explicit `--oauth`, then a server
+  profile's `oauth`, then native/imported static credentials, and finally
+  `MCP_BEARER`. A server profile cannot combine `oauth` with `bearer`,
+  `bearer_env`, or an `Authorization` header; non-auth headers remain valid.
 - The bare-name form only resolves when the single positional matches a
   configured profile, so spawning a stdio server by bare name still works.
   Because everything after the first positional belongs to the spawned

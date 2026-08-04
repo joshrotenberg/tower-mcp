@@ -251,6 +251,7 @@ fn resolve_entry(
                 url: expand(url, &workspace, lookup)?,
                 bearer: None,
                 headers,
+                oauth: None,
             })
         }
     }
@@ -398,6 +399,7 @@ mod tests {
                 url: "https://example/mcp".to_string(),
                 bearer: None,
                 headers: vec![("Authorization".to_string(), "Bearer secret".to_string())],
+                oauth: None,
             }
         );
     }
