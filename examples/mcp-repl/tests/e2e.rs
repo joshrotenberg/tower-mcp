@@ -682,9 +682,10 @@ async fn exercise_interactive_final_task(http: &HttpFixture) {
         .expect("write task command");
     wait_for_file(&http.subscription_file, "final subscription").await;
     // The subscription is immediate, while the bounded task poller remains a
-    // fallback. Leave enough room for either path to observe completion before
-    // asking the editor thread to exit.
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    // fallback. The fixture advertises a two-second poll interval, so leave a
+    // full extra second for the fallback to observe completion before asking
+    // the editor thread to exit.
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
     stdin
         .write_all(b"jobs\nquit\n")
         .await
