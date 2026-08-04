@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.9] - 2026-08-04
+
+### Bug Fixes
+
+- **mcp-repl:** Subscribe to final surface changes ([#1159](https://github.com/joshrotenberg/tower-mcp/pull/1159))
+
+### Features
+
+- **mcp-repl:** Define strict scripting contracts ([#1162](https://github.com/joshrotenberg/tower-mcp/pull/1162))
+- **mcp-repl:** Import standard MCP server configs ([#1164](https://github.com/joshrotenberg/tower-mcp/pull/1164))
+- **mcp-repl:** Validate schema snapshots ([#1165](https://github.com/joshrotenberg/tower-mcp/pull/1165))
+- **mcp-repl:** Add secure OAuth profiles ([#1166](https://github.com/joshrotenberg/tower-mcp/pull/1166))
+
+### Miscellaneous Tasks
+
+- **mcp-repl:** Prepare standalone lifecycle ([#1169](https://github.com/joshrotenberg/tower-mcp/pull/1169))
+
+### Refactor
+
+- **mcp-repl:** Split library core from binary ([#1167](https://github.com/joshrotenberg/tower-mcp/pull/1167))
+
+### Testing
+
+- **mcp-repl:** Add binary transport E2E coverage ([#1160](https://github.com/joshrotenberg/tower-mcp/pull/1160))
+
+
+
 ## [0.1.8] - 2026-08-03
 
 ### Miscellaneous Tasks

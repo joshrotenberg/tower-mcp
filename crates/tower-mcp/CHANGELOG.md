@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.18.1] - 2026-08-04
+
+### Bug Fixes
+
+- **client:** Separate HTTP-only request path ([#1171](https://github.com/joshrotenberg/tower-mcp/pull/1171))
+
+### Features
+
+- **mcp-repl:** Import standard MCP server configs ([#1164](https://github.com/joshrotenberg/tower-mcp/pull/1164))
+- **mcp-repl:** Add secure OAuth profiles ([#1166](https://github.com/joshrotenberg/tower-mcp/pull/1166))
+
+
+
 ## [0.18.0] - 2026-08-03
 
 ### Features
