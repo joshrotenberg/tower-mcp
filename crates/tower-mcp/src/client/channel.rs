@@ -67,9 +67,11 @@ use crate::context::{NotificationReceiver, notification_channel};
 use crate::error::Result;
 use crate::jsonrpc::JsonRpcService;
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse, McpNotification};
-use crate::router::McpRouter;
+use crate::router::{McpRouter, RouterRequest, RouterResponse};
+use crate::transport::service::{CatchError, InjectAnnotations};
 #[cfg(feature = "stateless")]
 use crate::transport::stdio::{StdioSubscriptionInput, StdioSubscriptions};
+use tower_service::Service;
 
 use super::transport::ClientTransport;
 
@@ -119,10 +121,75 @@ impl ChannelTransport {
     /// handling flow through the same channel.
     ///
     /// [`HttpTransport::with_notifications`]: crate::transport::HttpTransport::with_notifications
-    pub fn with_notifications(
+    pub fn with_notifications(router: McpRouter, notification_rx: NotificationReceiver) -> Self {
+        let service = JsonRpcService::new(router.clone());
+        Self::spawn_with_service(router, service, notification_rx)
+    }
+
+    /// Create a channel transport whose dispatch runs through a Tower layer.
+    ///
+    /// The channel counterpart of [`StdioTransport::layer`]: the layer wraps
+    /// the router's dispatch service, so standard middleware (timeout, rate
+    /// limit, tracing, audit) observes every JSON-RPC request an
+    /// [`McpClient`](crate::client::McpClient) makes in-process, exactly as
+    /// it would over stdio or HTTP. Layers that produce errors are wrapped
+    /// with [`CatchError`] and tool-annotation injection is preserved.
+    ///
+    /// `subscriptions/listen` remains transport-owned on every transport and
+    /// does not pass through the layer (#1182 tracks that boundary).
+    ///
+    /// [`StdioTransport::layer`]: crate::transport::StdioTransport::layer
+    pub fn layer<L>(router: McpRouter, layer: L) -> Self
+    where
+        L: tower::Layer<McpRouter>,
+        L::Service: Service<RouterRequest, Response = RouterResponse> + Clone + Send + 'static,
+        <L::Service as Service<RouterRequest>>::Error: std::fmt::Display + Send,
+        <L::Service as Service<RouterRequest>>::Future: Send,
+    {
+        let (notification_tx, notification_rx) = notification_channel(64);
+        let router = router.with_notification_sender(notification_tx);
+        Self::layer_with_notifications(router, layer, notification_rx)
+    }
+
+    /// [`layer`](Self::layer) with a caller-owned notification receiver, the
+    /// layered counterpart of [`with_notifications`](Self::with_notifications).
+    pub fn layer_with_notifications<L>(
         router: McpRouter,
+        layer: L,
+        notification_rx: NotificationReceiver,
+    ) -> Self
+    where
+        L: tower::Layer<McpRouter>,
+        L::Service: Service<RouterRequest, Response = RouterResponse> + Clone + Send + 'static,
+        <L::Service as Service<RouterRequest>>::Error: std::fmt::Display + Send,
+        <L::Service as Service<RouterRequest>>::Future: Send,
+    {
+        let annotations = router.tool_annotations_map();
+        let wrapped = layer.layer(router.clone());
+        let service = InjectAnnotations::new(CatchError::new(wrapped), annotations);
+        Self::spawn_with_service(router, JsonRpcService::new(service), notification_rx)
+    }
+
+    /// Spawn the request and notification loops over an arbitrary dispatch
+    /// service.
+    ///
+    /// The router is retained alongside the service for transport metadata
+    /// only: server identity and tasks opt-in for subscription handling, and
+    /// the `notifications/initialized` forward. Requests dispatch through
+    /// `service`, never through the router directly, so a wrapping layer sees
+    /// every request.
+    fn spawn_with_service<S>(
+        router: McpRouter,
+        service: JsonRpcService<S>,
         mut notification_rx: NotificationReceiver,
-    ) -> Self {
+    ) -> Self
+    where
+        S: Service<RouterRequest, Response = RouterResponse, Error = std::convert::Infallible>
+            + Clone
+            + Send
+            + 'static,
+        S::Future: Send,
+    {
         let (request_tx, mut request_rx) = mpsc::channel::<String>(64);
         let (response_tx, response_rx) = mpsc::channel::<String>(64);
 
@@ -161,8 +228,6 @@ impl ChannelTransport {
                 }
             }
         });
-
-        let service = JsonRpcService::new(router.clone());
 
         tokio::spawn(async move {
             while let Some(raw_request) = request_rx.recv().await {

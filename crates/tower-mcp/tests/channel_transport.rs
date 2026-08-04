@@ -258,3 +258,153 @@ async fn final_subscription_listen_filters_channel_transport_notifications() {
     );
     subscription.cancel().await.expect("subscription cancel");
 }
+
+// =============================================================================
+// Layered dispatch (#1181)
+// =============================================================================
+
+mod layered {
+    use super::*;
+    use std::sync::Mutex;
+    use std::task::{Context, Poll};
+
+    use tower_mcp::router::{RouterRequest, RouterResponse};
+
+    /// Records the method name of every request that passes through.
+    #[derive(Clone)]
+    struct RecordingLayer {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[derive(Clone)]
+    struct RecordingService<S> {
+        inner: S,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl<S> tower::Layer<S> for RecordingLayer {
+        type Service = RecordingService<S>;
+
+        fn layer(&self, inner: S) -> Self::Service {
+            RecordingService {
+                inner,
+                seen: self.seen.clone(),
+            }
+        }
+    }
+
+    impl<S> tower_service::Service<RouterRequest> for RecordingService<S>
+    where
+        S: tower_service::Service<RouterRequest, Response = RouterResponse>,
+    {
+        type Response = S::Response;
+        type Error = S::Error;
+        type Future = S::Future;
+
+        fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            self.inner.poll_ready(cx)
+        }
+
+        fn call(&mut self, request: RouterRequest) -> Self::Future {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(request.inner.method_name().to_string());
+            self.inner.call(request)
+        }
+    }
+
+    /// The acceptance criterion of #1181: middleware on the in-process
+    /// transport observes the same requests it would see over stdio or HTTP.
+    #[tokio::test]
+    async fn layer_observes_requests_made_through_the_client() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let router = McpRouter::new()
+            .server_info("layered-channel", "1.0.0")
+            .tool(slow_tool("quick", 0));
+
+        let transport = ChannelTransport::layer(router, RecordingLayer { seen: seen.clone() });
+        let client = McpClient::connect(transport).await.expect("connect");
+        client
+            .initialize("test", "1.0.0")
+            .await
+            .expect("initialize");
+        client.list_tools().await.expect("list tools");
+        client
+            .call_tool("quick", serde_json::json!({}))
+            .await
+            .expect("call tool");
+
+        let observed = seen.lock().unwrap().clone();
+        assert_eq!(observed, vec!["initialize", "tools/list", "tools/call"]);
+    }
+
+    /// Middleware errors surface as JSON-RPC errors through CatchError, and a
+    /// budget generous enough for the handler lets the call through.
+    #[tokio::test]
+    async fn layer_errors_become_jsonrpc_errors() {
+        let router = McpRouter::new()
+            .server_info("layered-channel", "1.0.0")
+            .tool(slow_tool("slow", 200));
+
+        let transport = ChannelTransport::layer(
+            router,
+            tower::timeout::TimeoutLayer::new(Duration::from_millis(20)),
+        );
+        let client = McpClient::connect(transport).await.expect("connect");
+        client
+            .initialize("test", "1.0.0")
+            .await
+            .expect("fast requests pass the timeout layer");
+
+        let error = client
+            .call_tool("slow", serde_json::json!({}))
+            .await
+            .expect_err("the slow call must exceed the layer budget");
+        assert!(
+            error.to_string().to_lowercase().contains("timed out")
+                || error.to_string().to_lowercase().contains("timeout"),
+            "error should come from the timeout layer, got: {error}"
+        );
+    }
+
+    /// The layered constructor with a caller-owned notification channel keeps
+    /// host-pushed notifications flowing.
+    #[tokio::test]
+    async fn layered_transport_still_delivers_notifications() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (notif_tx, notif_rx) = notification_channel(64);
+        let router = McpRouter::new()
+            .server_info("layered-channel", "1.0.0")
+            .with_notification_sender(notif_tx.clone());
+
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let handler = NotificationHandler::new().on_tools_changed(move || {
+            let _ = seen_tx.send(());
+        });
+
+        let transport = ChannelTransport::layer_with_notifications(
+            router,
+            RecordingLayer { seen: seen.clone() },
+            notif_rx,
+        );
+        let client = McpClient::connect_with_handler(transport, handler)
+            .await
+            .expect("connect");
+        client
+            .initialize("test", "1.0.0")
+            .await
+            .expect("initialize");
+
+        notif_tx
+            .send(ServerNotification::ToolsListChanged)
+            .await
+            .expect("push notification");
+        tokio::time::timeout(Duration::from_secs(2), seen_rx.recv())
+            .await
+            .expect("notification must arrive through the layered transport")
+            .expect("handler channel open");
+
+        assert_eq!(*seen.lock().unwrap(), vec!["initialize"]);
+    }
+}
