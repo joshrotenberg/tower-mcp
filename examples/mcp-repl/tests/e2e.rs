@@ -1,5 +1,6 @@
 //! Black-box coverage for the published `mcp-repl` process boundary.
 
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::time::Duration;
@@ -23,18 +24,46 @@ fn workspace_root() -> PathBuf {
 }
 
 async fn run(mut command: Command, label: &str, timeout: Duration) -> Output {
+    // Capture through files rather than `Child::wait_with_output`. On Windows,
+    // a server grandchild can retain an inherited pipe handle after mcp-repl
+    // exits, which makes waiting for pipe EOF look like a hung parent process.
+    let mut stdout = tempfile::tempfile().expect("create stdout capture");
+    let mut stderr = tempfile::tempfile().expect("create stderr capture");
     command
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdout(stdout.try_clone().expect("clone stdout capture"))
+        .stderr(stderr.try_clone().expect("clone stderr capture"))
         .kill_on_drop(true);
-    let child = command
+    let mut child = command
         .spawn()
         .unwrap_or_else(|error| panic!("spawn {label}: {error}"));
-    tokio::time::timeout(timeout, child.wait_with_output())
-        .await
-        .unwrap_or_else(|_| panic!("{label} exceeded {timeout:?}"))
-        .unwrap_or_else(|error| panic!("wait for {label}: {error}"))
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(result) => result.unwrap_or_else(|error| panic!("wait for {label}: {error}")),
+        Err(_) => {
+            let _ = child.kill().await;
+            let stdout = read_capture(&mut stdout, label, "stdout");
+            let stderr = read_capture(&mut stderr, label, "stderr");
+            panic!(
+                "{label} exceeded {timeout:?}\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+    };
+    Output {
+        status,
+        stdout: read_capture(&mut stdout, label, "stdout"),
+        stderr: read_capture(&mut stderr, label, "stderr"),
+    }
+}
+
+fn read_capture(file: &mut std::fs::File, label: &str, stream: &str) -> Vec<u8> {
+    file.rewind()
+        .unwrap_or_else(|error| panic!("rewind {label} {stream}: {error}"));
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .unwrap_or_else(|error| panic!("read {label} {stream}: {error}"));
+    bytes
 }
 
 fn assert_success(output: &Output, label: &str) {
