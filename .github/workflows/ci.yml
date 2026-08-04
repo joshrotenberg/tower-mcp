@@ -224,7 +224,7 @@ jobs:
           cargo build -p tower-mcp-examples --examples --all-features
       - name: Build workspace example crates
         run: |
-          cargo build -p mcp-repl
+          cargo build -p mcp2md
           cargo build --manifest-path examples/conformance-server/Cargo.toml
           cargo build --manifest-path examples/codegen-mcp/Cargo.toml
 
