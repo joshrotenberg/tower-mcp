@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.18.2] - 2026-08-04
+
+### Features
+
+- **protocol:** Enable 2026-07-28 by default on feature-compiled clients ([#1183](https://github.com/joshrotenberg/tower-mcp/pull/1183))
+- **transport:** Route subscriptions/listen through the middleware boundary ([#1185](https://github.com/joshrotenberg/tower-mcp/pull/1185))
+
+
+
 ## [0.18.1] - 2026-08-04
 
 

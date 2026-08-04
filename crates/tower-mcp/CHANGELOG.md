@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.18.2] - 2026-08-04
+
+### Bug Fixes
+
+- **proxy:** Stack repeated backend_layer calls instead of replacing ([#1176](https://github.com/joshrotenberg/tower-mcp/pull/1176))
+- **client:** Fail initialize when notifications/initialized is not delivered ([#1177](https://github.com/joshrotenberg/tower-mcp/pull/1177))
+
+### Features
+
+- **protocol:** Enable 2026-07-28 by default on feature-compiled clients ([#1183](https://github.com/joshrotenberg/tower-mcp/pull/1183))
+- **channel:** Apply Tower layers to the in-process transport ([#1184](https://github.com/joshrotenberg/tower-mcp/pull/1184))
+- **transport:** Route subscriptions/listen through the middleware boundary ([#1185](https://github.com/joshrotenberg/tower-mcp/pull/1185))
+- **transport:** Observe the terminal half of subscriptions/listen streams ([#1186](https://github.com/joshrotenberg/tower-mcp/pull/1186))
+
+
+
 ## [0.18.1] - 2026-08-04
 
 ### Bug Fixes
