@@ -440,6 +440,9 @@ struct McpRouterInner {
     /// can publish after the transport attaches its subscription registry.
     #[cfg(all(feature = "http", feature = "stateless"))]
     modern_notification_sink: Arc<RwLock<Option<ModernNotificationSink>>>,
+    #[cfg(feature = "stateless")]
+    subscription_observer:
+        Arc<RwLock<Option<Arc<dyn crate::transport::subscriptions::SubscriptionObserver>>>>,
     /// Handle for sending requests to the client (for sampling, etc.)
     client_requester: Option<ClientRequesterHandle>,
     /// Task store for async operations
@@ -605,6 +608,8 @@ impl McpRouter {
                 notification_tx: None,
                 #[cfg(all(feature = "http", feature = "stateless"))]
                 modern_notification_sink: Arc::new(RwLock::new(None)),
+                #[cfg(feature = "stateless")]
+                subscription_observer: Arc::new(RwLock::new(None)),
                 client_requester: None,
                 task_store: Arc::new(MemoryTaskStore::new()),
                 subscriptions: Arc::new(RwLock::new(HashSet::new())),
@@ -886,6 +891,35 @@ impl McpRouter {
         }
         inner.notification_tx = Some(tx);
         self
+    }
+
+    /// Observe the terminal half of `subscriptions/listen` streams.
+    ///
+    /// Every transport built from this router reports stream closes (reason
+    /// and duration) through the observer. The request half of the boundary
+    /// is ordinary `Service<RouterRequest>` middleware; see
+    /// [`SubscriptionObserver`](crate::transport::subscriptions::SubscriptionObserver) for how the two compose.
+    #[cfg(feature = "stateless")]
+    pub fn with_subscription_observer(
+        self,
+        observer: Arc<dyn crate::transport::subscriptions::SubscriptionObserver>,
+    ) -> Self {
+        if let Ok(mut slot) = self.inner.subscription_observer.write() {
+            *slot = Some(observer);
+        }
+        self
+    }
+
+    /// The attached close observer, if any.
+    #[cfg(feature = "stateless")]
+    pub(crate) fn subscription_observer(
+        &self,
+    ) -> Option<Arc<dyn crate::transport::subscriptions::SubscriptionObserver>> {
+        self.inner
+            .subscription_observer
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
     }
 
     /// Attach the transport-lifetime final subscription notification path.

@@ -194,9 +194,10 @@ impl ChannelTransport {
         let (response_tx, response_rx) = mpsc::channel::<String>(64);
 
         #[cfg(feature = "stateless")]
-        let subscriptions = Arc::new(StdMutex::new(StdioSubscriptions::new(Some(
-            router.implementation(),
-        ))));
+        let subscriptions = Arc::new(StdMutex::new(
+            StdioSubscriptions::new(Some(router.implementation()))
+                .with_observer(router.subscription_observer()),
+        ));
 
         // Notification pump: serialize ServerNotifications into JSON-RPC
         // notification frames on the shared response stream.
@@ -335,6 +336,13 @@ impl ChannelTransport {
                     // the task simply ends.
                     let _ = response_out.send(json).await;
                 });
+            }
+
+            // The client dropped its sender: any registered streams die with
+            // the transport and cannot receive a terminal frame.
+            #[cfg(feature = "stateless")]
+            if let Ok(mut subscriptions) = subscriptions.lock() {
+                subscriptions.drain_disconnected();
             }
         });
 

@@ -1,5 +1,7 @@
 //! Shared transport helpers for final-protocol subscriptions.
 
+use std::time::Duration;
+
 use crate::context::ServerNotification;
 use crate::protocol::{
     Implementation, JsonRpcNotification, JsonRpcResponse, NotificationMeta, RequestId, ResultType,
@@ -85,6 +87,55 @@ pub(crate) fn subscription_acknowledgment(
         })
         .expect("subscription acknowledgment is serializable"),
     )
+}
+
+/// Why a `subscriptions/listen` stream ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SubscriptionCloseReason {
+    /// The client cancelled the subscription with `notifications/cancelled`.
+    Cancelled,
+    /// The client connection or response stream dropped.
+    Disconnected,
+    /// The server drained the stream gracefully (shutdown or an explicit
+    /// close), sending the terminal `SubscriptionsListenResult` first where
+    /// the transport still could.
+    Drained,
+}
+
+/// Terminal record of one `subscriptions/listen` stream.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct SubscriptionClose {
+    /// JSON-RPC id of the `subscriptions/listen` request that opened the
+    /// stream, the same id middleware observed at acceptance.
+    pub subscription_id: RequestId,
+    /// Why the stream ended.
+    pub reason: SubscriptionCloseReason,
+    /// Time from acceptance to close.
+    pub duration: Duration,
+}
+
+/// Observes the terminal half of `subscriptions/listen` streams.
+///
+/// The request half of the observation boundary is ordinary
+/// `Service<RouterRequest>` middleware: transports dispatch the listen
+/// request through the service before upgrading, so a layer sees acceptance
+/// and rejection like any other method. What that boundary cannot express is
+/// the stream's end, which happens long after the service call returns. This
+/// hook carries exactly that remainder and nothing else: implement it for
+/// ledger or audit records that need terminal reason and duration, and pair
+/// it with a layer for the request half.
+///
+/// Attach with [`McpRouter::with_subscription_observer`]; every transport
+/// that owns listen streams (stdio, generic stdio, bidirectional stdio,
+/// channel, HTTP) reports through it. Calls are made from transport
+/// internals, so implementations must be fast and non-blocking.
+///
+/// [`McpRouter::with_subscription_observer`]: crate::McpRouter::with_subscription_observer
+pub trait SubscriptionObserver: Send + Sync {
+    /// A `subscriptions/listen` stream reached its end.
+    fn on_close(&self, close: SubscriptionClose);
 }
 
 pub(crate) fn subscription_complete_response(

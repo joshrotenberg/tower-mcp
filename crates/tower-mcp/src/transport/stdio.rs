@@ -54,8 +54,8 @@ use crate::router::{McpRouter, RouterRequest, RouterResponse};
 use crate::transport::service::{CatchError, InjectAnnotations};
 #[cfg(feature = "stateless")]
 use crate::transport::subscriptions::{
-    subscription_acknowledgment, subscription_complete_response, subscription_matches,
-    tagged_subscription_notification,
+    SubscriptionClose, SubscriptionCloseReason, SubscriptionObserver, subscription_acknowledgment,
+    subscription_complete_response, subscription_matches, tagged_subscription_notification,
 };
 use crate::{ProtocolSupport, ProtocolSupportError};
 
@@ -109,9 +109,17 @@ fn stdio_control_channel() -> (
 #[cfg(feature = "stateless")]
 #[derive(Default)]
 pub(crate) struct StdioSubscriptions {
-    active: HashMap<RequestId, SubscriptionFilter>,
+    active: HashMap<RequestId, ActiveSubscription>,
     modern_mode: bool,
     server_info: Option<Implementation>,
+    observer: Option<Arc<dyn SubscriptionObserver>>,
+}
+
+/// One registered listen stream: the accepted filter and when it started.
+#[cfg(feature = "stateless")]
+struct ActiveSubscription {
+    filter: SubscriptionFilter,
+    started: std::time::Instant,
 }
 
 #[cfg(feature = "stateless")]
@@ -134,6 +142,40 @@ impl StdioSubscriptions {
         }
     }
 
+    pub(crate) fn with_observer(mut self, observer: Option<Arc<dyn SubscriptionObserver>>) -> Self {
+        self.observer = observer;
+        self
+    }
+
+    fn observe_close(
+        &self,
+        subscription_id: RequestId,
+        started: std::time::Instant,
+        reason: SubscriptionCloseReason,
+    ) {
+        if let Some(observer) = &self.observer {
+            observer.on_close(SubscriptionClose {
+                subscription_id,
+                reason,
+                duration: started.elapsed(),
+            });
+        }
+    }
+
+    /// Report every remaining stream as disconnected.
+    ///
+    /// Called when the transport's read loop ends (EOF or client drop): the
+    /// streams die with the connection and no terminal frame can be written.
+    pub(crate) fn drain_disconnected(&mut self) {
+        for (id, subscription) in std::mem::take(&mut self.active) {
+            self.observe_close(
+                id,
+                subscription.started,
+                SubscriptionCloseReason::Disconnected,
+            );
+        }
+    }
+
     pub(crate) fn handle_input<S>(
         &mut self,
         service: &JsonRpcService<S>,
@@ -152,9 +194,14 @@ impl StdioSubscriptions {
                 return Ok(StdioSubscriptionInput::NotHandled);
             };
             if let Some(request_id) = params.request_id
-                && self.active.remove(&request_id).is_some()
+                && let Some(subscription) = self.active.remove(&request_id)
             {
                 tracing::debug!(?request_id, "Cancelled stdio subscription");
+                self.observe_close(
+                    request_id,
+                    subscription.started,
+                    SubscriptionCloseReason::Cancelled,
+                );
                 return Ok(StdioSubscriptionInput::Handled(Vec::new()));
             }
             return Ok(StdioSubscriptionInput::NotHandled);
@@ -245,7 +292,13 @@ impl StdioSubscriptions {
         let acknowledgment = subscription_acknowledgment(request_id.clone(), accepted.clone());
         let acknowledgment = serde_json::to_string(&acknowledgment)?;
         self.modern_mode = true;
-        self.active.insert(request_id, accepted);
+        self.active.insert(
+            request_id,
+            ActiveSubscription {
+                filter: accepted,
+                started: std::time::Instant::now(),
+            },
+        );
         Ok(vec![acknowledgment])
     }
 
@@ -271,16 +324,23 @@ impl StdioSubscriptions {
         Some(
             self.active
                 .iter()
-                .filter(|(_, filter)| subscription_matches(notification, filter))
+                .filter(|(_, subscription)| {
+                    subscription_matches(notification, &subscription.filter)
+                })
                 .filter_map(|(id, _)| tagged_subscription_notification(notification, id))
                 .collect(),
         )
     }
 
     fn close(&mut self, request_id: &RequestId) -> Result<Option<String>> {
-        if self.active.remove(request_id).is_none() {
+        let Some(subscription) = self.active.remove(request_id) else {
             return Ok(None);
-        }
+        };
+        self.observe_close(
+            request_id.clone(),
+            subscription.started,
+            SubscriptionCloseReason::Drained,
+        );
         Ok(Some(serde_json::to_string(
             &subscription_complete_response(request_id.clone(), self.server_info.clone()),
         )?))
@@ -572,6 +632,8 @@ impl StdioTransport {
     {
         let protocol_support = self.service.configured_protocol_support().clone();
         let annotations = self.router.tool_annotations_map();
+        #[cfg(feature = "stateless")]
+        let subscription_observer = self.router.subscription_observer();
         let wrapped = layer.layer(self.router);
         let service = InjectAnnotations::new(CatchError::new(wrapped), annotations);
         GenericStdioTransport {
@@ -579,6 +641,8 @@ impl StdioTransport {
             notification_rx: Some(self.notification_rx),
             control_tx: self.control_tx,
             control_rx: self.control_rx,
+            #[cfg(feature = "stateless")]
+            subscription_observer,
         }
     }
 
@@ -614,7 +678,8 @@ impl StdioTransport {
         let mut subscriptions = StdioSubscriptions {
             server_info: Some(self.router.implementation()),
             ..StdioSubscriptions::default()
-        };
+        }
+        .with_observer(self.router.subscription_observer());
 
         tracing::info!("Stdio transport started, waiting for input");
 
@@ -728,6 +793,10 @@ impl StdioTransport {
             }
         }
 
+        // The read loop is over: any streams still registered die with
+        // the connection and cannot receive a terminal frame.
+        #[cfg(feature = "stateless")]
+        subscriptions.drain_disconnected();
         Ok(())
     }
 }
@@ -788,6 +857,11 @@ where
     notification_rx: Option<NotificationReceiver>,
     control_tx: mpsc::UnboundedSender<StdioControl>,
     control_rx: mpsc::UnboundedReceiver<StdioControl>,
+    /// Close observer threaded from the router by [`StdioTransport::layer`];
+    /// `None` for directly constructed generic transports, which have no
+    /// router to read it from.
+    #[cfg(feature = "stateless")]
+    subscription_observer: Option<Arc<dyn SubscriptionObserver>>,
 }
 
 impl<S> GenericStdioTransport<S>
@@ -813,6 +887,8 @@ where
             notification_rx: None,
             control_tx,
             control_rx,
+            #[cfg(feature = "stateless")]
+            subscription_observer: None,
         }
     }
 
@@ -830,6 +906,8 @@ where
             notification_rx: Some(notification_rx),
             control_tx,
             control_rx,
+            #[cfg(feature = "stateless")]
+            subscription_observer: None,
         }
     }
 
@@ -880,7 +958,8 @@ where
     {
         let mut lines = BufReader::new(reader).lines();
         #[cfg(feature = "stateless")]
-        let mut subscriptions = StdioSubscriptions::default();
+        let mut subscriptions =
+            StdioSubscriptions::default().with_observer(self.subscription_observer.clone());
 
         tracing::info!("Generic stdio transport started, waiting for input");
 
@@ -966,6 +1045,10 @@ where
             }
         }
 
+        // The read loop is over: any streams still registered die with
+        // the connection and cannot receive a terminal frame.
+        #[cfg(feature = "stateless")]
+        subscriptions.drain_disconnected();
         Ok(())
     }
 
@@ -1371,7 +1454,8 @@ impl BidirectionalStdioTransport {
         let mut subscriptions = StdioSubscriptions {
             server_info: Some(self.router.implementation()),
             ..StdioSubscriptions::default()
-        };
+        }
+        .with_observer(self.router.subscription_observer());
 
         tracing::info!("Bidirectional stdio transport started, waiting for input");
 
@@ -1441,6 +1525,10 @@ impl BidirectionalStdioTransport {
             }
         }
 
+        // The read loop is over: any streams still registered die with
+        // the connection and cannot receive a terminal frame.
+        #[cfg(feature = "stateless")]
+        subscriptions.drain_disconnected();
         Ok(())
     }
 

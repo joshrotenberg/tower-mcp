@@ -658,6 +658,11 @@ pub use transport::{
     SyncStdioTransport,
 };
 
+#[cfg(feature = "stateless")]
+pub use transport::subscriptions::{
+    SubscriptionClose, SubscriptionCloseReason, SubscriptionObserver,
+};
+
 #[cfg(feature = "http")]
 pub use transport::{HttpTransport, SessionHandle, SessionInfo};
 

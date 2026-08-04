@@ -1355,6 +1355,7 @@ struct ModernSubscription {
     subscription_id: RequestId,
     filter: SubscriptionFilter,
     tx: mpsc::UnboundedSender<String>,
+    started: std::time::Instant,
 }
 
 /// Process-local registry for sessionless final-protocol subscriptions.
@@ -1366,15 +1367,34 @@ struct ModernSubscriptionRegistry {
     next_key: AtomicU64,
     subscriptions: std::sync::Mutex<HashMap<u64, ModernSubscription>>,
     server_info: Option<Implementation>,
+    observer: Option<Arc<dyn crate::transport::subscriptions::SubscriptionObserver>>,
 }
 
 #[cfg(feature = "stateless")]
 impl ModernSubscriptionRegistry {
-    fn new(server_info: Option<Implementation>) -> Self {
+    fn new(
+        server_info: Option<Implementation>,
+        observer: Option<Arc<dyn crate::transport::subscriptions::SubscriptionObserver>>,
+    ) -> Self {
         Self {
             next_key: AtomicU64::new(0),
             subscriptions: std::sync::Mutex::new(HashMap::new()),
             server_info,
+            observer,
+        }
+    }
+
+    fn observe_close(
+        &self,
+        subscription: &ModernSubscription,
+        reason: crate::transport::subscriptions::SubscriptionCloseReason,
+    ) {
+        if let Some(observer) = &self.observer {
+            observer.on_close(crate::transport::subscriptions::SubscriptionClose {
+                subscription_id: subscription.subscription_id.clone(),
+                reason,
+                duration: subscription.started.elapsed(),
+            });
         }
     }
 
@@ -1391,6 +1411,7 @@ impl ModernSubscriptionRegistry {
                 subscription_id,
                 filter,
                 tx,
+                started: std::time::Instant::now(),
             },
         );
         (
@@ -1424,13 +1445,23 @@ impl ModernSubscriptionRegistry {
             "Routing final-protocol subscription notification"
         );
         subscriptions.retain(|_, subscription| {
-            if subscription_matches(notification, &subscription.filter)
+            let keep = if subscription_matches(notification, &subscription.filter)
                 && let Some(json) =
                     tagged_subscription_notification(notification, &subscription.subscription_id)
             {
-                return subscription.tx.send(json).is_ok();
+                subscription.tx.send(json).is_ok()
+            } else {
+                !subscription.tx.is_closed()
+            };
+            if !keep {
+                // Detected here rather than at guard drop: the entry is
+                // removed exactly once, so the close is reported exactly once.
+                self.observe_close(
+                    subscription,
+                    crate::transport::subscriptions::SubscriptionCloseReason::Disconnected,
+                );
             }
-            !subscription.tx.is_closed()
+            keep
         });
         true
     }
@@ -1450,6 +1481,10 @@ impl ModernSubscriptionRegistry {
         };
         let count = subscriptions.len();
         for subscription in subscriptions {
+            self.observe_close(
+                &subscription,
+                crate::transport::subscriptions::SubscriptionCloseReason::Drained,
+            );
             let response = subscription_complete_response(
                 subscription.subscription_id,
                 self.server_info.clone(),
@@ -1465,7 +1500,7 @@ impl ModernSubscriptionRegistry {
 #[cfg(feature = "stateless")]
 impl Default for ModernSubscriptionRegistry {
     fn default() -> Self {
-        Self::new(None)
+        Self::new(None, None)
     }
 }
 
@@ -1478,11 +1513,18 @@ struct ModernSubscriptionGuard {
 #[cfg(feature = "stateless")]
 impl Drop for ModernSubscriptionGuard {
     fn drop(&mut self) {
-        self.registry
+        let removed = self
+            .registry
             .subscriptions
             .lock()
             .unwrap()
             .remove(&self.key);
+        if let Some(subscription) = removed {
+            self.registry.observe_close(
+                &subscription,
+                crate::transport::subscriptions::SubscriptionCloseReason::Disconnected,
+            );
+        }
     }
 }
 
@@ -2257,6 +2299,10 @@ impl HttpTransport {
                     Some(router.implementation())
                 }
                 _ => None,
+            },
+            match &self.service_source {
+                ServiceSource::Router { router, .. } => router.subscription_observer(),
+                ServiceSource::Service(_) => None,
             },
         ));
 
@@ -4898,6 +4944,63 @@ mod tests {
         let before = serde_json::to_value(&legacy).unwrap();
         apply_protocol_result_fields(&mut legacy, "resources/read", "2025-11-25");
         assert_eq!(serde_json::to_value(legacy).unwrap(), before);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "stateless")]
+    async fn modern_subscription_registry_reports_closes() {
+        use crate::transport::subscriptions::{
+            SubscriptionClose, SubscriptionCloseReason, SubscriptionObserver,
+        };
+
+        #[derive(Default)]
+        struct RecordingObserver {
+            closes: std::sync::Mutex<Vec<SubscriptionClose>>,
+        }
+        impl SubscriptionObserver for RecordingObserver {
+            fn on_close(&self, close: SubscriptionClose) {
+                self.closes.lock().unwrap().push(close);
+            }
+        }
+
+        let observer = Arc::new(RecordingObserver::default());
+        let registry = Arc::new(ModernSubscriptionRegistry::new(
+            None,
+            Some(observer.clone()),
+        ));
+
+        // A dropped guard is a client disconnect.
+        let (_rx, guard) = registry.register(
+            RequestId::String("disconnects".into()),
+            SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            },
+        );
+        drop(guard);
+
+        // A drained registry is a graceful server-side close.
+        let (_rx2, guard2) = registry.register(
+            RequestId::String("drains".into()),
+            SubscriptionFilter::default(),
+        );
+        assert_eq!(registry.close_all(), 1);
+        // The entry is already gone, so the later guard drop must not
+        // produce a second record.
+        drop(guard2);
+
+        let closes = observer.closes.lock().unwrap();
+        assert_eq!(closes.len(), 2, "one record per stream: {closes:?}");
+        assert_eq!(
+            closes[0].subscription_id,
+            RequestId::String("disconnects".into())
+        );
+        assert_eq!(closes[0].reason, SubscriptionCloseReason::Disconnected);
+        assert_eq!(
+            closes[1].subscription_id,
+            RequestId::String("drains".into())
+        );
+        assert_eq!(closes[1].reason, SubscriptionCloseReason::Drained);
     }
 
     #[tokio::test]

@@ -1365,3 +1365,174 @@ mod listen_observation {
         );
     }
 }
+
+// =============================================================================
+// Close observation (#1182, terminal half)
+// =============================================================================
+
+#[cfg(feature = "stateless")]
+mod close_observation {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    use tower_mcp::{SubscriptionClose, SubscriptionCloseReason, SubscriptionObserver};
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        closes: Mutex<Vec<SubscriptionClose>>,
+    }
+
+    impl SubscriptionObserver for RecordingObserver {
+        fn on_close(&self, close: SubscriptionClose) {
+            self.closes.lock().unwrap().push(close);
+        }
+    }
+
+    fn observed_router(observer: Arc<RecordingObserver>) -> McpRouter {
+        subscription_router().with_subscription_observer(observer)
+    }
+
+    fn listen_frame(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "subscriptions/listen",
+            "params": {
+                "_meta": final_meta(tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28),
+                "notifications": {"toolsListChanged": true}
+            }
+        })
+    }
+
+    /// The client cancels its subscription; the observer records the reason
+    /// and a duration measured from acceptance.
+    #[tokio::test]
+    async fn cancellation_reaches_the_observer() {
+        let observer = Arc::new(RecordingObserver::default());
+        let mut transport = StdioTransport::new(observed_router(observer.clone()));
+        let control = transport.handle();
+        let (mut stdin_writer, server_stdin) = tokio::io::duplex(8192);
+        let (server_stdout, stdout_reader) = tokio::io::duplex(8192);
+        let task = tokio::spawn(async move {
+            transport
+                .run_with_streams(server_stdin, server_stdout)
+                .await
+        });
+
+        stdin_writer
+            .write_all(format!("{}\n", listen_frame("cancel-me")).as_bytes())
+            .await
+            .unwrap();
+        let mut reader = BufReader::new(stdout_reader);
+        let _ack = timeout(Duration::from_secs(2), read_frame(&mut reader))
+            .await
+            .expect("acknowledgment");
+
+        let cancel = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": "cancel-me"}
+        });
+        stdin_writer
+            .write_all(format!("{cancel}\n").as_bytes())
+            .await
+            .unwrap();
+        stdin_writer.flush().await.unwrap();
+
+        // The cancellation produces no frame; give the loop a beat, then
+        // shut down and join before asserting.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        control.shutdown().unwrap();
+        let _ = task.await;
+
+        let closes = observer.closes.lock().unwrap();
+        assert_eq!(closes.len(), 1, "exactly one close record");
+        assert_eq!(
+            closes[0].subscription_id,
+            tower_mcp::RequestId::String("cancel-me".to_string())
+        );
+        assert_eq!(closes[0].reason, SubscriptionCloseReason::Cancelled);
+    }
+
+    /// A server-driven graceful close reports Drained; the terminal frame
+    /// still reaches the wire.
+    #[tokio::test]
+    async fn graceful_close_reports_drained() {
+        let observer = Arc::new(RecordingObserver::default());
+        let mut transport = StdioTransport::new(observed_router(observer.clone()));
+        let control = transport.handle();
+        let (mut stdin_writer, server_stdin) = tokio::io::duplex(8192);
+        let (server_stdout, stdout_reader) = tokio::io::duplex(8192);
+        let task = tokio::spawn(async move {
+            transport
+                .run_with_streams(server_stdin, server_stdout)
+                .await
+        });
+
+        stdin_writer
+            .write_all(format!("{}\n", listen_frame("drain-me")).as_bytes())
+            .await
+            .unwrap();
+        stdin_writer.flush().await.unwrap();
+        let mut reader = BufReader::new(stdout_reader);
+        let _ack = timeout(Duration::from_secs(2), read_frame(&mut reader))
+            .await
+            .expect("acknowledgment");
+
+        control
+            .close_subscription(tower_mcp::RequestId::String("drain-me".to_string()))
+            .unwrap();
+        let complete = timeout(Duration::from_secs(2), read_frame(&mut reader))
+            .await
+            .expect("graceful terminal result");
+        assert_eq!(complete["result"]["resultType"], "complete");
+
+        control.shutdown().unwrap();
+        let _ = task.await;
+
+        let closes = observer.closes.lock().unwrap();
+        assert_eq!(closes.len(), 1);
+        assert_eq!(closes[0].reason, SubscriptionCloseReason::Drained);
+    }
+
+    /// EOF with a live stream reports Disconnected: the connection died and
+    /// no terminal frame could be written.
+    #[tokio::test]
+    async fn eof_reports_disconnected() {
+        let observer = Arc::new(RecordingObserver::default());
+        let mut transport = StdioTransport::new(observed_router(observer.clone()));
+        let (mut stdin_writer, server_stdin) = tokio::io::duplex(8192);
+        let (server_stdout, stdout_reader) = tokio::io::duplex(8192);
+        let task = tokio::spawn(async move {
+            transport
+                .run_with_streams(server_stdin, server_stdout)
+                .await
+        });
+
+        stdin_writer
+            .write_all(format!("{}\n", listen_frame("drop-me")).as_bytes())
+            .await
+            .unwrap();
+        stdin_writer.flush().await.unwrap();
+        let mut reader = BufReader::new(stdout_reader);
+        let _ack = timeout(Duration::from_secs(2), read_frame(&mut reader))
+            .await
+            .expect("acknowledgment");
+
+        // Closing the write half is EOF for the transport's read loop.
+        drop(stdin_writer);
+        timeout(Duration::from_secs(2), task)
+            .await
+            .expect("loop must end at EOF")
+            .expect("join")
+            .expect("run ok");
+
+        let closes = observer.closes.lock().unwrap();
+        assert_eq!(closes.len(), 1);
+        assert_eq!(
+            closes[0].subscription_id,
+            tower_mcp::RequestId::String("drop-me".to_string())
+        );
+        assert_eq!(closes[0].reason, SubscriptionCloseReason::Disconnected);
+    }
+}
