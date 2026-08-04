@@ -995,8 +995,8 @@ impl OAuthAuthorizationFlow {
         };
 
         if let Some(token) = self.inner.token_store.load(&binding).await?
-            && token_is_valid(&token, self.inner.refresh_buffer)
             && scopes_are_covered(&scopes, &token.scopes)
+            && (token_is_valid(&token, self.inner.refresh_buffer) || token.refresh_token.is_some())
         {
             *self.inner.current.write().await = Some(ActiveToken {
                 binding,
@@ -1005,6 +1005,9 @@ impl OAuthAuthorizationFlow {
                 registration,
                 auth_method,
             });
+            if !token_is_valid(&token, self.inner.refresh_buffer) {
+                TokenProvider::get_token(self).await?;
+            }
             return Ok(OAuthAuthorizationStart::Authorized {
                 scopes: token.scopes,
             });
@@ -1785,12 +1788,16 @@ async fn prepare_redirect(
 
 async fn run_loopback_callback(
     listener: tokio::net::TcpListener,
-    sender: oneshot::Sender<String>,
+    mut sender: oneshot::Sender<String>,
     callback_base: String,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let Ok((mut stream, _)) = listener.accept().await else {
+    let accepted = tokio::select! {
+        _ = sender.closed() => return,
+        accepted = listener.accept() => accepted,
+    };
+    let Ok((mut stream, _)) = accepted else {
         return;
     };
     let mut bytes = vec![0_u8; 8192];
@@ -2329,6 +2336,64 @@ mod tests {
                 "resource".to_string(),
                 "https://mcp.example.com/mcp".to_string()
             )));
+    }
+
+    #[tokio::test]
+    async fn expired_persisted_token_refreshes_after_flow_rebuild() {
+        let http = MockOAuthHttp::new(RegistrationMode::Dynamic).expiring();
+        let tokens = MemoryOAuthTokenStore::new();
+        let registrations = super::super::oauth_authcode::MemoryOAuthClientRegistrationStore::new();
+        let first_handler = AutomaticAuthorizationHandler::default();
+
+        let first = flow_builder(http.clone(), dynamic_options(), first_handler)
+            .registration_store(registrations.clone())
+            .token_store(tokens.clone())
+            .refresh_buffer(Duration::ZERO)
+            .build()
+            .unwrap();
+        first.authorize(["challenge.scope"]).await.unwrap();
+
+        let restored_handler = AutomaticAuthorizationHandler::default();
+        let restored_calls = restored_handler.calls.clone();
+        let restored = flow_builder(http, dynamic_options(), restored_handler)
+            .registration_store(registrations)
+            .token_store(tokens)
+            .refresh_buffer(Duration::ZERO)
+            .build()
+            .unwrap();
+
+        let start = restored.begin(["challenge.scope"]).await.unwrap();
+        assert!(matches!(start, OAuthAuthorizationStart::Authorized { .. }));
+        assert_eq!(restored_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(restored.get_token().await.unwrap(), "refreshed-token");
+    }
+
+    #[tokio::test]
+    async fn dropped_loopback_attempt_releases_its_listener() {
+        let probe = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let (_, receiver) = prepare_redirect(
+            &OAuthRedirectPolicy::loopback_at(port, "/callback"),
+            "state",
+        )
+        .await
+        .unwrap();
+        drop(receiver);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                    Ok(listener) => break drop(listener),
+                    Err(_) => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await
+        .expect("dropped OAuth attempt kept its loopback port bound");
     }
 
     #[tokio::test]
