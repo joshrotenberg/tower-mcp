@@ -18,7 +18,7 @@
 use std::process::Stdio;
 
 use async_trait::async_trait;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, Command};
 
 use super::transport::ClientTransport;
@@ -33,7 +33,11 @@ use crate::error::{Error, Result};
 pub struct StdioClientTransport {
     child: Option<Child>,
     stdin: Option<tokio::process::ChildStdin>,
-    stdout: BufReader<tokio::process::ChildStdout>,
+    // `Lines::next_line` retains a partially read frame when its future is
+    // cancelled by the client's `select!` loop. A bare `read_line` future can
+    // discard those bytes while leaving the newline behind, turning a valid
+    // response into an empty frame when outgoing commands arrive concurrently.
+    stdout: Lines<BufReader<tokio::process::ChildStdout>>,
 }
 
 impl StdioClientTransport {
@@ -92,7 +96,7 @@ impl StdioClientTransport {
         Ok(Self {
             child: Some(child),
             stdin: Some(stdin),
-            stdout: BufReader::new(stdout),
+            stdout: BufReader::new(stdout).lines(),
         })
     }
 
@@ -121,7 +125,7 @@ impl StdioClientTransport {
         Ok(Self {
             child: Some(child),
             stdin: Some(stdin),
-            stdout: BufReader::new(stdout),
+            stdout: BufReader::new(stdout).lines(),
         })
     }
 }
@@ -150,18 +154,12 @@ impl ClientTransport for StdioClientTransport {
     }
 
     async fn recv(&mut self) -> Result<Option<String>> {
-        let mut line = String::new();
-        let bytes = self
+        let line = self
             .stdout
-            .read_line(&mut line)
+            .next_line()
             .await
             .map_err(|e| Error::Transport(format!("Failed to read: {}", e)))?;
-
-        if bytes == 0 {
-            return Ok(None); // EOF
-        }
-
-        Ok(Some(line.trim().to_string()))
+        Ok(line.map(|line| line.trim().to_string()))
     }
 
     fn is_connected(&self) -> bool {
@@ -237,6 +235,24 @@ mod tests {
         // Should get None (EOF) since `true` produces no output and exits
         let result = transport.recv().await.unwrap();
         assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn line_reader_preserves_partial_frame_when_receive_is_cancelled() {
+        let (mut writer, reader) = tokio::io::duplex(256);
+        let mut lines = BufReader::new(reader).lines();
+        let frame = r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}"#;
+
+        writer.write_all(frame.as_bytes()).await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), lines.next_line())
+                .await
+                .is_err(),
+            "a partial frame must remain pending until its newline arrives"
+        );
+
+        writer.write_all(b"\n").await.unwrap();
+        assert_eq!(lines.next_line().await.unwrap().as_deref(), Some(frame));
     }
 
     #[tokio::test]

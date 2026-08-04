@@ -163,6 +163,55 @@ async fn stdio_transport_loop_continues_after_parse_error() {
     );
 }
 
+/// A control or notification branch may win `select!` while stdin holds only
+/// part of a JSON frame. The line reader must retain that prefix until the
+/// newline arrives instead of discarding it and parsing only the suffix.
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn stdio_transport_preserves_partial_frame_when_read_is_cancelled() {
+    let mut transport = StdioTransport::new(router());
+    let control = transport.handle();
+    let (mut server_stdin_writer, server_stdin) = tokio::io::duplex(4096);
+    let (server_stdout, server_stdout_reader) = tokio::io::duplex(4096);
+    let handle = tokio::spawn(async move {
+        transport
+            .run_with_streams(server_stdin, server_stdout)
+            .await
+    });
+
+    server_stdin_writer
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":42,")
+        .await
+        .unwrap();
+    server_stdin_writer.flush().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // An unknown subscription is deliberately a no-op, but receiving this
+    // control message forces the competing branch to win once.
+    control
+        .close_subscription(tower_mcp::protocol::RequestId::Number(999))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    server_stdin_writer
+        .write_all(b"\"method\":\"ping\"}\n")
+        .await
+        .unwrap();
+    drop(server_stdin_writer);
+
+    let frames = read_n_frames(BufReader::new(server_stdout_reader), 1).await;
+    handle
+        .await
+        .expect("transport task join")
+        .expect("run_with_streams ok");
+    assert_eq!(frames.len(), 1, "expected one response: {frames:?}");
+    assert_eq!(frames[0]["id"], 42, "the request prefix was lost");
+    assert!(
+        frames[0].get("result").is_some(),
+        "unexpected frame: {frames:?}"
+    );
+}
+
 /// Test 3: closing the writer side of the input stream (EOF) cleanly
 /// terminates the loop -- `run_with_streams` returns `Ok(())`.
 #[tokio::test]

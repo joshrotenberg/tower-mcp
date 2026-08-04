@@ -594,7 +594,11 @@ impl StdioTransport {
         R: tokio::io::AsyncRead + Unpin + Send,
         W: tokio::io::AsyncWrite + Unpin + Send,
     {
-        let mut reader = BufReader::new(reader);
+        // Keep the line buffer across cancelled `select!` branches. Tokio's
+        // `read_line` future can discard a partial JSON frame when a
+        // notification or control message wins the race; `next_line` stores
+        // that partial frame in `Lines` until the following poll.
+        let mut lines = BufReader::new(reader).lines();
         #[cfg(feature = "stateless")]
         let mut subscriptions = StdioSubscriptions {
             server_info: Some(self.router.implementation()),
@@ -605,20 +609,17 @@ impl StdioTransport {
         tracing::info!("Stdio transport started, waiting for input");
 
         loop {
-            let mut line = String::new();
-
             tokio::select! {
                 // Handle incoming messages from stdin
-                result = reader.read_line(&mut line) => {
-                    let bytes_read = result.map_err(|e| {
+                result = lines.next_line() => {
+                    let line = result.map_err(|e| {
                         Error::Transport(format!("Failed to read from stdin: {}", e))
                     })?;
-
-                    if bytes_read == 0 {
+                    let Some(line) = line else {
                         // EOF
                         tracing::info!("Stdin closed, shutting down");
                         break;
-                    }
+                    };
 
                     let trimmed = clean_input_line(&line);
                     if trimmed.is_empty() {
@@ -851,27 +852,24 @@ where
         R: tokio::io::AsyncRead + Unpin + Send,
         W: tokio::io::AsyncWrite + Unpin + Send,
     {
-        let mut reader = BufReader::new(reader);
+        let mut lines = BufReader::new(reader).lines();
         #[cfg(feature = "stateless")]
         let mut subscriptions = StdioSubscriptions::default();
 
         tracing::info!("Generic stdio transport started, waiting for input");
 
         loop {
-            let mut line = String::new();
-
             // Use select! if we have a notification receiver, otherwise just read
             if let Some(ref mut notif_rx) = self.notification_rx {
                 tokio::select! {
-                    result = reader.read_line(&mut line) => {
-                        let bytes_read = result.map_err(|e| {
+                    result = lines.next_line() => {
+                        let line = result.map_err(|e| {
                             Error::Transport(format!("Failed to read from stdin: {}", e))
                         })?;
-
-                        if bytes_read == 0 {
+                        let Some(line) = line else {
                             tracing::info!("Stdin closed, shutting down");
                             break;
-                        }
+                        };
 
                         Self::process_input(
                             &mut self.service,
@@ -911,14 +909,14 @@ where
                 }
             } else {
                 tokio::select! {
-                    result = reader.read_line(&mut line) => {
-                        let bytes_read = result.map_err(|e| {
+                    result = lines.next_line() => {
+                        let line = result.map_err(|e| {
                             Error::Transport(format!("Failed to read from stdin: {}", e))
                         })?;
-                        if bytes_read == 0 {
+                        let Some(line) = line else {
                             tracing::info!("Stdin closed, shutting down");
                             break;
-                        }
+                        };
                         Self::process_input(
                             &mut self.service,
                             &line,
@@ -1331,7 +1329,7 @@ impl BidirectionalStdioTransport {
         W: tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let writer = Arc::new(Mutex::new(writer));
-        let mut reader = BufReader::new(reader);
+        let mut lines = BufReader::new(reader).lines();
         #[cfg(feature = "stateless")]
         let mut subscriptions = StdioSubscriptions {
             server_info: Some(self.router.implementation()),
@@ -1342,19 +1340,16 @@ impl BidirectionalStdioTransport {
         tracing::info!("Bidirectional stdio transport started, waiting for input");
 
         loop {
-            let mut line = String::new();
-
             tokio::select! {
                 // Handle incoming messages from stdin
-                result = reader.read_line(&mut line) => {
-                    let bytes_read = result.map_err(|e| {
+                result = lines.next_line() => {
+                    let line = result.map_err(|e| {
                         Error::Transport(format!("Failed to read from stdin: {}", e))
                     })?;
-
-                    if bytes_read == 0 {
+                    let Some(line) = line else {
                         tracing::info!("Stdin closed, shutting down");
                         break;
-                    }
+                    };
 
                     let trimmed = clean_input_line(&line);
                     if trimmed.is_empty() {
