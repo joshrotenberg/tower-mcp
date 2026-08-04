@@ -8,9 +8,12 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 
-const CASE_TIMEOUT: Duration = Duration::from_secs(20);
+// Each process normally finishes in well under a second, but beta and Windows
+// runners can be CPU-starved while the all-target workspace job is active.
+// Keep hangs bounded without treating scheduler stalls as product failures.
+const CASE_TIMEOUT: Duration = Duration::from_secs(60);
 const BUILD_TIMEOUT: Duration = Duration::from_secs(180);
-const SUITE_TIMEOUT: Duration = Duration::from_secs(300);
+const SUITE_TIMEOUT: Duration = Duration::from_secs(600);
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
