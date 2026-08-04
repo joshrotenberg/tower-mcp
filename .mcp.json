@@ -2,14 +2,14 @@
   "mcpServers": {
     "tower-mcp-example": {
       "command": "cargo",
-      "args": ["run", "-p", "tower-mcp", "--example", "getting_started"],
+      "args": ["run", "-p", "tower-mcp-examples", "--example", "getting_started"],
       "env": {
         "RUST_LOG": "tower_mcp=debug"
       }
     },
     "weather": {
       "command": "cargo",
-      "args": ["run", "-p", "tower-mcp", "--example", "weather_server"],
+      "args": ["run", "-p", "tower-mcp-examples", "--example", "weather_server"],
       "env": {
         "RUST_LOG": "tower_mcp=info"
       }

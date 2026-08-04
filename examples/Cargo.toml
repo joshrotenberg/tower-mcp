@@ -47,6 +47,10 @@ stateless = ["tower-mcp/stateless"]
 # package preserves `cargo run --example ...` while keeping release archives
 # focused on the library crates.
 
+[[test]]
+name = "repository_mcp_config"
+path = "repository_mcp_config.rs"
+
 # --- Getting started ---
 [[example]]
 name = "getting_started"

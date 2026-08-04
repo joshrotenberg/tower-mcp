@@ -26,7 +26,7 @@ Resources: `project://Cargo.toml`, `project://src/main.rs`, `project://state.jso
 
 1. Read `examples/README.md` for an index of all examples
 2. Read the `source://getting_started.rs` resource to see how a server is built
-3. Run any example: `cargo run --example getting_started`
+3. Run any example: `cargo run -p tower-mcp-examples --example getting_started`
 
 ## Development
 

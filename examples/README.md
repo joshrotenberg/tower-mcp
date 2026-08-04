@@ -18,44 +18,44 @@ For a guided path, see
 
 ```bash
 # Stdio examples (no feature flags needed)
-cargo run --example getting_started
-cargo run --example middleware
-cargo run --example rate_limiting
+cargo run -p tower-mcp-examples --example getting_started
+cargo run -p tower-mcp-examples --example middleware
+cargo run -p tower-mcp-examples --example rate_limiting
 
 # HTTP transport
-cargo run --example http_server --features http
+cargo run -p tower-mcp-examples --example http_server --features http
 
 # Typed MCP Apps server (stdio)
-cargo run --example mcp_apps --features mcp-apps
+cargo run -p tower-mcp-examples --example mcp_apps --features mcp-apps
 
 # Embed MCP inside an existing axum app
-cargo run --example axum_embedding --features http
+cargo run -p tower-mcp-examples --example axum_embedding --features http
 
 # WebSocket transport
-cargo run --example websocket_server --features websocket
+cargo run -p tower-mcp-examples --example websocket_server --features websocket
 
 # Clients (start http_server first, or run stateless_http_client standalone)
-cargo run --example http_client --features http-client
-cargo run --example http_sse_client --features http
-cargo run --example stateless_http_client --features "http,http-client,protocol-2026-07-28"
+cargo run -p tower-mcp-examples --example http_client --features http-client
+cargo run -p tower-mcp-examples --example http_sse_client --features http
+cargo run -p tower-mcp-examples --example stateless_http_client --features "http,http-client,protocol-2026-07-28"
 
 # Released 2026-07-28 discovery and Tasks extension
-cargo run --example server_discover --features "http,protocol-2026-07-28"
-cargo run --example tasks --features protocol-2026-07-28
+cargo run -p tower-mcp-examples --example server_discover --features "http,protocol-2026-07-28"
+cargo run -p tower-mcp-examples --example tasks --features protocol-2026-07-28
 
 # OAuth resource server and clients (see the published OAuth guide for configuration)
-cargo run --example http_auth --features jwks -- --auth jwks
-cargo run --example oauth_client --features oauth-client -- --mode authorization-code
-cargo run --example oauth_client --features oauth-client -- --mode credentials
+cargo run -p tower-mcp-examples --example http_auth --features jwks -- --auth jwks
+cargo run -p tower-mcp-examples --example oauth_client --features oauth-client -- --mode authorization-code
+cargo run -p tower-mcp-examples --example oauth_client --features oauth-client -- --mode credentials
 
 # Dynamic capabilities
-cargo run --example dynamic_capabilities --features dynamic-tools
+cargo run -p tower-mcp-examples --example dynamic_capabilities --features dynamic-tools
 
 # Testing
-cargo run --example testing --features testing
+cargo run -p tower-mcp-examples --example testing --features testing
 
 # Macros
-cargo run --example tool_macro --features macros
+cargo run -p tower-mcp-examples --example tool_macro --features macros
 ```
 
 ## Example Index
