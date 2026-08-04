@@ -180,10 +180,12 @@ enum LoopCommand {
         request_id: RequestId,
         done_tx: Option<oneshot::Sender<Result<()>>>,
     },
-    /// Send a JSON-RPC notification (no response expected).
+    /// Send a JSON-RPC notification (no JSON-RPC response expected; the
+    /// completion channel reports whether the transport delivered it).
     Notify {
         method: String,
         params: serde_json::Value,
+        done_tx: oneshot::Sender<Result<()>>,
     },
     /// Reset the transport's session state for re-initialization.
     ResetSession { done_tx: oneshot::Sender<()> },
@@ -678,9 +680,16 @@ impl McpClient {
         *self.init_params.write().await =
             Some((client_name.to_string(), client_version.to_string()));
 
-        // Send initialized notification
+        // Send initialized notification. A delivery failure is an
+        // initialization failure: the server will reject every subsequent
+        // request until the notification arrives.
         self.send_notification("notifications/initialized", &serde_json::json!({}))
-            .await?;
+            .await
+            .map_err(|error| {
+                Error::Transport(format!(
+                    "failed to deliver notifications/initialized: {error}"
+                ))
+            })?;
         self.initialized.store(true, Ordering::Release);
 
         Ok(result)
@@ -2004,7 +2013,12 @@ impl McpClient {
         *self.server_info.write().await = Some(result);
 
         self.send_notification("notifications/initialized", &serde_json::json!({}))
-            .await?;
+            .await
+            .map_err(|error| {
+                Error::Transport(format!(
+                    "failed to deliver notifications/initialized: {error}"
+                ))
+            })?;
         self.initialized.store(true, Ordering::Release);
 
         Ok(())
@@ -2016,15 +2030,24 @@ impl McpClient {
             .map_err(|e| Error::Transport(format!("Failed to serialize params: {}", e)))?;
         let params_value = self.with_final_request_meta(params_value).await?;
 
+        // Await the transport result rather than returning on enqueue: a
+        // notification the transport failed to deliver must surface here.
+        // `initialize()` depends on this for `notifications/initialized`;
+        // reporting success while the handshake never completed leaves the
+        // session unusable and every later request rejected (#1174).
+        let (done_tx, done_rx) = oneshot::channel();
         self.command_tx
             .send(LoopCommand::Notify {
                 method: method.to_string(),
                 params: params_value,
+                done_tx,
             })
             .await
             .map_err(|_| Error::Transport("Connection closed".to_string()))?;
 
-        Ok(())
+        done_rx
+            .await
+            .map_err(|_| Error::Transport("Connection closed".to_string()))?
     }
 
     async fn resolve_input_requests(&self, requests: InputRequests) -> Result<InputResponses> {
@@ -2288,13 +2311,22 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
                             let _ = done_tx.send(result);
                         }
                     }
-                    Some(LoopCommand::Notify { method, params }) => {
+                    Some(LoopCommand::Notify { method, params, done_tx }) => {
                         let notification = JsonRpcNotification::new(&method)
                             .with_params(params);
-                        if let Ok(json) = serde_json::to_string(&notification) {
-                            tracing::debug!(method = %method, "Sending notification");
-                            let _ = transport.send(&json).await;
+                        let result = match serde_json::to_string(&notification) {
+                            Ok(json) => {
+                                tracing::debug!(method = %method, "Sending notification");
+                                transport.send(&json).await
+                            }
+                            Err(error) => Err(Error::Transport(format!(
+                                "Failed to serialize notification: {error}"
+                            ))),
+                        };
+                        if let Err(error) = &result {
+                            tracing::warn!(method = %method, %error, "Notification send failed");
                         }
+                        let _ = done_tx.send(result);
                     }
                     Some(LoopCommand::ResolveInputs { requests, response_tx }) => {
                         let result = resolve_inputs_with_handler(&handler, &roots, requests).await;
@@ -2908,6 +2940,9 @@ mod tests {
         /// Collected outgoing messages from `send()`.
         outgoing: Arc<Mutex<Vec<String>>>,
         connected: Arc<AtomicBool>,
+        /// When set, `send()` fails for notifications (messages without an
+        /// `id`), simulating a transport that could not deliver them.
+        fail_notification_sends: Arc<AtomicBool>,
     }
 
     enum MockReply {
@@ -2926,6 +2961,7 @@ mod tests {
                 incoming_rx: rx,
                 outgoing: Arc::new(Mutex::new(Vec::new())),
                 connected: Arc::new(AtomicBool::new(true)),
+                fail_notification_sends: Arc::new(AtomicBool::new(false)),
             }
         }
 
@@ -2945,6 +2981,7 @@ mod tests {
                 incoming_rx: rx,
                 outgoing: Arc::new(Mutex::new(Vec::new())),
                 connected: Arc::new(AtomicBool::new(true)),
+                fail_notification_sends: Arc::new(AtomicBool::new(false)),
             }
         }
 
@@ -2957,6 +2994,7 @@ mod tests {
                 incoming_rx: rx,
                 outgoing: Arc::new(Mutex::new(Vec::new())),
                 connected: Arc::new(AtomicBool::new(true)),
+                fail_notification_sends: Arc::new(AtomicBool::new(false)),
             }
         }
     }
@@ -2968,6 +3006,13 @@ mod tests {
 
             // Parse the outgoing message to extract the request ID
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(message) {
+                if parsed.get("id").is_none()
+                    && self.fail_notification_sends.load(Ordering::Relaxed)
+                {
+                    return Err(Error::Transport(
+                        "mock transport dropped the notification".to_string(),
+                    ));
+                }
                 // Only respond to requests (messages with an id and method)
                 if let Some(id) = parsed.get("id") {
                     let idx = self
@@ -3025,6 +3070,60 @@ mod tests {
                 "tools": {}
             }
         })
+    }
+
+    /// #1174: a notification the transport fails to deliver must fail
+    /// `initialize()`. Reporting success left the handshake incomplete and a
+    /// strict server rejecting every subsequent request with -32600.
+    #[tokio::test]
+    async fn initialize_fails_when_initialized_notification_is_not_delivered() {
+        let transport = MockTransport::with_responses(vec![mock_initialize_response()]);
+        let fail_notifications = transport.fail_notification_sends.clone();
+        let outgoing = transport.outgoing.clone();
+        // The initialize request itself succeeds; only the follow-up
+        // notification is dropped.
+        fail_notifications.store(true, Ordering::Relaxed);
+
+        let client = McpClient::connect(transport).await.unwrap();
+        let error = client
+            .initialize("test-client", "1.0.0")
+            .await
+            .expect_err("undelivered notifications/initialized must fail initialize");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to deliver notifications/initialized"),
+            "error should name the handshake step, got: {error}"
+        );
+        // The notification was attempted, not skipped.
+        assert!(
+            outgoing
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|message| message.contains("notifications/initialized")),
+            "the client must have tried to send the notification"
+        );
+        // The client must not consider itself initialized.
+        assert!(!client.is_initialized());
+    }
+
+    #[tokio::test]
+    async fn notification_delivery_errors_reach_the_caller() {
+        let transport = MockTransport::with_responses(vec![mock_initialize_response()]);
+        let fail_notifications = transport.fail_notification_sends.clone();
+
+        let client = McpClient::connect(transport).await.unwrap();
+        client.initialize("test-client", "1.0.0").await.unwrap();
+
+        // Healthy so far; now the transport starts dropping notifications.
+        fail_notifications.store(true, Ordering::Relaxed);
+        let error = client
+            .notify("notifications/progress", &serde_json::json!({}))
+            .await
+            .expect_err("a dropped notification must surface as an error");
+        assert!(error.to_string().contains("dropped the notification"));
     }
 
     #[tokio::test]
@@ -4073,6 +4172,7 @@ mod tests {
             incoming_rx: rx,
             outgoing: Arc::new(Mutex::new(Vec::new())),
             connected: Arc::new(AtomicBool::new(true)),
+            fail_notification_sends: Arc::new(AtomicBool::new(false)),
         };
 
         let client = McpClient::builder()

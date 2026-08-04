@@ -3599,11 +3599,16 @@ async fn post_session_request_failure_wakes_caller() {
 ///
 /// The notification is awaited inline to keep it ordered ahead of the first
 /// request (#967), which blocks the single message loop for the duration.
-/// `notification_timeout` bounds that block independently. Here the raw server
-/// reads the notification POST and never answers it; with a short
-/// `notification_timeout` the client abandons it quickly and `tools/list` still
-/// completes well under the 20s `request_timeout`. Before the fix, `tools/list`
-/// waited behind the notification for the full request timeout.
+/// `notification_timeout` bounds that block independently (#999). Here the raw
+/// server reads the notification POST and never answers it; with a short
+/// `notification_timeout` the client abandons it quickly.
+///
+/// Since #1174 the abandoned notification is also an `initialize()` error
+/// rather than a silent success: the handshake did not complete, and a strict
+/// server would reject every later request with -32600. The caller retries
+/// initialization; it no longer proceeds into a poisoned session. The bounded
+/// behavior this test originally guarded is asserted the same way, through
+/// the outer timeout.
 #[tokio::test]
 async fn stalled_initialized_notification_does_not_freeze_client() {
     use tokio::io::AsyncWriteExt;
@@ -3673,14 +3678,22 @@ async fn stalled_initialized_notification_does_not_freeze_client() {
     };
     let transport = HttpClientTransport::with_config(url, config);
     let client = McpClient::connect(transport).await.unwrap();
-    client.initialize("raw-client", "1.0.0").await.unwrap();
 
     // The stalled notification is abandoned after ~300ms, so this resolves
-    // quickly. Before the fix it waited behind the notification for the full
-    // 20s request_timeout; bound it at 8s so a regression fails as a timeout.
-    let tools = tokio::time::timeout(Duration::from_secs(8), client.list_tools())
-        .await
-        .expect("tools/list blocked behind the stalled notification (the bug this guards)")
-        .expect("tools/list should succeed once the stalled notification is abandoned");
-    assert_eq!(tools.tools.len(), 1);
+    // quickly. Before #999 it blocked for the full 20s request_timeout; bound
+    // it at 8s so a freeze regression fails as a timeout rather than hanging.
+    let error = tokio::time::timeout(
+        Duration::from_secs(8),
+        client.initialize("raw-client", "1.0.0"),
+    )
+    .await
+    .expect("initialize blocked behind the stalled notification (the bug this guards)")
+    .expect_err("a stalled notifications/initialized must fail initialize, not be swallowed");
+
+    assert!(
+        error
+            .to_string()
+            .contains("failed to deliver notifications/initialized"),
+        "error should name the handshake step, got: {error}"
+    );
 }
