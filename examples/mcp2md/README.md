@@ -4,6 +4,11 @@
 deterministic Markdown reference. It also reports documentation gaps without
 calling tools, rendering prompts, or reading resources.
 
+The package also exposes a small library for custom collectors and report
+pipelines: [`Snapshot`](https://docs.rs/mcp2md/latest/mcp2md/struct.Snapshot.html),
+[`assess`](https://docs.rs/mcp2md/latest/mcp2md/fn.assess.html), and
+[`render_markdown`](https://docs.rs/mcp2md/latest/mcp2md/fn.render_markdown.html).
+
 ## Installation
 
 ```console

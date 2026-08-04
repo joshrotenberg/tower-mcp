@@ -1,4 +1,49 @@
-//! Markdown rendering and documentation assessment for a discovered MCP surface.
+//! Deterministic Markdown rendering and documentation assessment for a
+//! discovered MCP surface.
+//!
+//! The [`Snapshot`] type is lifecycle-neutral: a caller can collect it through
+//! stable `initialize` or final `server/discover`, then use the same rendering
+//! and assessment functions. The library itself performs no network requests
+//! and invokes no server operations. The `mcp2md` binary is the reference
+//! collector; it only performs the handshake and advertised list operations.
+//!
+//! Documentation coverage measures whether descriptions are present for the
+//! server, surface entries, named schema fields, and prompt or resource-template
+//! arguments. It does not claim those descriptions are accurate or useful.
+//! Optional presentation and contract metadata is reported separately so a
+//! missing title or output schema cannot distort the documentation score.
+//!
+//! # Example
+//!
+//! ```rust
+//! use mcp2md::{RenderOptions, Snapshot, assess, render_markdown};
+//! use tower_mcp::protocol::{Implementation, ServerCapabilities};
+//!
+//! let mut snapshot = Snapshot {
+//!     protocol_version: "2025-11-25".into(),
+//!     supported_versions: None,
+//!     server_info: Implementation {
+//!         name: "weather".into(),
+//!         version: "1.0.0".into(),
+//!         description: Some("Weather forecasts and alerts.".into()),
+//!         ..Default::default()
+//!     },
+//!     capabilities: ServerCapabilities::default(),
+//!     instructions: None,
+//!     tools: Vec::new(),
+//!     prompts: Vec::new(),
+//!     resources: Vec::new(),
+//!     resource_templates: Vec::new(),
+//! };
+//! snapshot.sort();
+//!
+//! let assessment = assess(&snapshot);
+//! assert_eq!(assessment.overall.percentage(), 100);
+//! let markdown = render_markdown(&snapshot, RenderOptions::default());
+//! assert!(markdown.contains("# weather MCP server"));
+//! ```
+
+#![deny(missing_docs)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -15,17 +60,27 @@ use tower_mcp::protocol::{
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
+    /// Protocol version selected for the inspected connection.
     pub protocol_version: String,
     /// Exhaustive versions reported by `server/discover`. Legacy initialize
     /// only reports the selected version, so this is absent on that lifecycle.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supported_versions: Option<Vec<String>>,
+    /// Identity and optional presentation metadata advertised by the server.
     pub server_info: Implementation,
+    /// Capability shape advertised by the server.
     pub capabilities: ServerCapabilities,
+    /// Server-wide usage guidance from initialization or discovery.
     pub instructions: Option<String>,
+    /// Complete tool definitions returned by the paginated tools surface.
     pub tools: Vec<ToolDefinition>,
+    /// Complete prompt definitions returned by the paginated prompts surface.
     pub prompts: Vec<PromptDefinition>,
+    /// Complete concrete resource definitions returned by the paginated
+    /// resources surface.
     pub resources: Vec<ResourceDefinition>,
+    /// Complete resource-template definitions returned by the paginated
+    /// resource-template surface.
     pub resource_templates: Vec<ResourceTemplateDefinition>,
 }
 
@@ -49,7 +104,10 @@ impl Snapshot {
 /// Controls optional, potentially verbose sections in the generated document.
 #[derive(Debug, Clone, Copy)]
 pub struct RenderOptions {
+    /// Include the human-readable documentation score and gap list.
     pub assessment: bool,
+    /// Include exact schemas and a canonical JSON inventory after the readable
+    /// reference.
     pub raw_json: bool,
 }
 
@@ -62,14 +120,20 @@ impl Default for RenderOptions {
     }
 }
 
+/// Count of documented items relative to all applicable items.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Coverage {
+    /// Applicable items with a non-empty description.
     pub documented: usize,
+    /// All applicable items in this scope.
     pub total: usize,
 }
 
 impl Coverage {
+    /// Rounded whole-number percentage, treating an empty scope as fully
+    /// covered because it has no missing documentation.
+    #[must_use]
     pub fn percentage(&self) -> usize {
         (self.documented * 100 + self.total / 2)
             .checked_div(self.total)
@@ -77,17 +141,23 @@ impl Coverage {
     }
 }
 
+/// Documentation coverage for one named MCP surface area.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CoverageCategory {
+    /// Stable human-readable category name.
     pub name: &'static str,
+    /// Coverage counts for the category.
     pub coverage: Coverage,
 }
 
+/// One concrete omission that lowers the documentation score.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DocumentationGap {
+    /// Stable dotted path to the undocumented server item or field.
     pub path: String,
+    /// Suggested documentation improvement.
     pub message: String,
 }
 
@@ -96,18 +166,28 @@ pub struct DocumentationGap {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MetadataCoverage {
+    /// Surface entries carrying a display title.
     pub titled: Coverage,
+    /// Tools carrying an output schema.
     pub tools_with_output_schema: Coverage,
+    /// Tools carrying behavior annotations.
     pub tools_with_annotations: Coverage,
+    /// Resources and resource templates carrying a MIME type.
     pub resources_with_mime_type: Coverage,
 }
 
+/// Complete documentation assessment for one [`Snapshot`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DocumentationAssessment {
+    /// Aggregate description coverage across every applicable category.
     pub overall: Coverage,
+    /// Per-surface description coverage in stable display order.
     pub categories: Vec<CoverageCategory>,
+    /// Every concrete omission included in [`Self::overall`].
     pub gaps: Vec<DocumentationGap>,
+    /// Informational presentation and contract metadata coverage, excluded
+    /// from the documentation score.
     pub metadata: MetadataCoverage,
 }
 
@@ -116,14 +196,20 @@ pub struct DocumentationAssessment {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssessmentReport {
+    /// Advertised server implementation name.
     pub server_name: String,
+    /// Advertised server implementation version.
     pub server_version: String,
+    /// Protocol version selected for the inspected connection.
     pub protocol_version: String,
+    /// Convenience copy of the rounded overall percentage.
     pub documentation_score: usize,
+    /// Full counts, category breakdown, gaps, and optional metadata coverage.
     pub assessment: DocumentationAssessment,
 }
 
 /// Build the structured form written by the CLI's assessment output option.
+#[must_use]
 pub fn assessment_report(snapshot: &Snapshot) -> AssessmentReport {
     let assessment = assess(snapshot);
     AssessmentReport {
@@ -146,6 +232,7 @@ struct CategoryCounter {
 /// The score covers a server overview, descriptions for surface entries, and
 /// descriptions for named tool fields and prompt/template arguments. Optional
 /// presentation and behavioral metadata is reported separately.
+#[must_use]
 pub fn assess(snapshot: &Snapshot) -> DocumentationAssessment {
     let mut categories: BTreeMap<&'static str, CategoryCounter> = [
         ("Server", CategoryCounter::default()),
@@ -367,6 +454,12 @@ fn record_schema_fields(
 }
 
 /// Render one complete Markdown reference.
+///
+/// Call [`Snapshot::sort`] before rendering when the snapshot was not already
+/// collected in deterministic order. All server-controlled text is escaped for
+/// its Markdown context, but the returned document is still untrusted content
+/// and should pass through the publishing system's normal review process.
+#[must_use]
 pub fn render_markdown(snapshot: &Snapshot, options: RenderOptions) -> String {
     let mut output = String::new();
     let display_name = snapshot
