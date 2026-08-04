@@ -10,6 +10,10 @@ description = "Interactive MCP client REPL: connects to any MCP server and turns
 keywords = ["mcp", "repl", "cli", "client", "protocol"]
 categories = ["command-line-utilities", "development-tools"]
 
+[lib]
+name = "mcp_repl"
+path = "src/lib.rs"
+
 [[bin]]
 name = "mcp-repl"
 path = "src/main.rs"

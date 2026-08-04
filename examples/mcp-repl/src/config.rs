@@ -29,8 +29,8 @@
 //! ```
 //!
 //! Command aliases live in the same file: `[aliases]` for every server, and
-//! `[servers.<name>.aliases]` for one profile. See [`crate::alias`], which
-//! also writes them back.
+//! `[servers.<name>.aliases]` for one profile. The interactive `alias` and
+//! `unalias` commands write them back.
 //!
 //! Tokens are read from the environment via `bearer_env` rather than stored in
 //! the file; an inline `bearer` literal works but warns.
@@ -51,7 +51,7 @@ pub struct Config {
     /// registered client secrets live in the operating-system credential store.
     #[serde(default)]
     pub oauth: BTreeMap<String, OAuthProfile>,
-    /// Command aliases in effect against every server. See [`crate::alias`].
+    /// Command aliases in effect against every server.
     #[serde(default)]
     pub aliases: BTreeMap<String, String>,
 }
