@@ -229,6 +229,8 @@ async fn auth_failure_server() -> (String, tokio::task::JoinHandle<()>) {
 }
 
 async fn exercise_json_contract(fixture: &Path, temp: &TempDir) {
+    // Keep one round trip after `announce` so the asynchronous notification
+    // handler drains before the one-shot process exits, including on Windows.
     let multiple = run_stdio(
         fixture,
         temp,
@@ -240,9 +242,9 @@ async fn exercise_json_contract(fixture: &Path, temp: &TempDir) {
             "--exec",
             "tools",
             "--exec",
-            "add a=20 b=22",
-            "--exec",
             "announce",
+            "--exec",
+            "add a=20 b=22",
         ],
     )
     .await;
@@ -255,11 +257,11 @@ async fn exercise_json_contract(fixture: &Path, temp: &TempDir) {
     );
     assert_eq!(
         values[1].pointer("/content/0/text"),
-        Some(&serde_json::json!("42"))
+        Some(&serde_json::json!("announced"))
     );
     assert_eq!(
         values[2].pointer("/content/0/text"),
-        Some(&serde_json::json!("announced"))
+        Some(&serde_json::json!("42"))
     );
     assert!(
         !String::from_utf8_lossy(&multiple.stdout).contains("connected:"),
