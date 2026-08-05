@@ -57,7 +57,7 @@ default = []
 full = ["http", "websocket", "unix", "childproc", "oauth", "jwks", "testing", "dynamic-tools", "http-client", "oauth-client", "proxy", "macros", "resilience", "mcp-apps", "protocol-2026-07-28"]
 # Transport features
 http = ["dep:axum", "dep:hyper", "dep:http", "dep:http-body-util", "dep:tokio-stream", "dep:uuid"]
-websocket = ["dep:axum", "dep:uuid"]
+websocket = ["dep:axum", "dep:uuid", "dep:tokio-tungstenite", "dep:futures-util"]
 unix = ["http"]
 childproc = []
 # OAuth 2.1 resource server support
@@ -88,6 +88,14 @@ protocol-2026-07-28 = ["stateless"]
 # Compatibility alias for the former feature name. New consumers should enable
 # `protocol-2026-07-28`; existing `stateless` users retain the same behavior.
 stateless = ["dep:sha2"]
+
+[dependencies.tokio-tungstenite]
+workspace = true
+optional = true
+
+[dependencies.futures-util]
+version = "0.3"
+optional = true
 
 [dependencies.axum]
 workspace = true

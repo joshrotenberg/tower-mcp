@@ -46,6 +46,8 @@ mod oauth_flow;
 mod response_cache;
 mod stdio;
 mod transport;
+#[cfg(feature = "websocket")]
+mod websocket;
 
 pub use channel::ChannelTransport;
 pub use handler::{ClientHandler, NotificationHandler, ServerNotification};
@@ -80,6 +82,8 @@ pub use oauth_flow::{
 pub use response_cache::{ClientCacheConfig, DEFAULT_MAX_CACHE_TTL};
 pub use stdio::StdioClientTransport;
 pub use transport::ClientTransport;
+#[cfg(feature = "websocket")]
+pub use websocket::{WebSocketClientConfig, WebSocketClientTransport};
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -60,6 +60,9 @@ base64 = "0.23.0"
 # Elicitation form fields render in declaration order, so their schema map
 # must preserve insertion order (#1199).
 indexmap = { version = "2", features = ["serde"] }
+# Client-side WebSocket. The server side rides on axum, but a client needs its
+# own implementation.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 
 # Crypto
 sha2 = "0.11"
