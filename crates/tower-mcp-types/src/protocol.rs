@@ -3634,8 +3634,12 @@ pub struct UnsubscribeResourceParams {
 /// Parameters for listing resource templates
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListResourceTemplatesParams {
-    /// Pagination cursor from previous response
-    #[serde(default)]
+    /// Opaque cursor returned by the preceding page, or `None` for page one.
+    ///
+    /// Omitted when absent rather than sent as `null`: the schema types this
+    /// `string | undefined`, so a server generating validators from it
+    /// rejects an explicit null (#1213).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
     /// Optional protocol-level metadata
     #[serde(
@@ -4413,10 +4417,10 @@ impl<'de> Deserialize<'de> for CreateTaskResult {
 #[serde(rename_all = "camelCase")]
 pub struct ListTasksParams {
     /// Filter by status (optional)
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<TaskStatus>,
     /// Pagination cursor
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
     /// Optional protocol-level metadata
     #[serde(
@@ -4478,7 +4482,7 @@ pub struct CancelTaskParams {
     /// Task ID to cancel
     pub task_id: String,
     /// Optional reason for cancellation
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// Optional protocol-level metadata
     #[serde(
@@ -8168,6 +8172,98 @@ mod tolerant_meta_tests {
                 .unwrap()
                 .get("io.modelcontextprotocol/serverInfo")
                 .is_some()
+        );
+    }
+}
+
+#[cfg(test)]
+mod absent_optional_param_tests {
+    use super::*;
+
+    fn keys(value: &serde_json::Value) -> Vec<&str> {
+        value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// #1213: `"cursor": null` is not the same as an absent cursor. The
+    /// schema types it `string | undefined`, so a server generating
+    /// validators from it (Zod, in the two cases that reported this) rejects
+    /// an explicit null and the whole listing fails.
+    #[test]
+    fn a_first_page_list_request_omits_the_cursor() {
+        for value in [
+            serde_json::to_value(ListToolsParams::default()).unwrap(),
+            serde_json::to_value(ListResourcesParams::default()).unwrap(),
+            serde_json::to_value(ListResourceTemplatesParams::default()).unwrap(),
+            serde_json::to_value(ListPromptsParams::default()).unwrap(),
+        ] {
+            assert!(
+                !keys(&value).contains(&"cursor"),
+                "an absent cursor must not be sent at all: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cursor_that_is_set_is_still_sent() {
+        let value = serde_json::to_value(ListResourceTemplatesParams {
+            cursor: Some("page-2".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(value["cursor"], "page-2");
+    }
+
+    #[test]
+    fn other_absent_optional_params_are_omitted() {
+        let tasks = serde_json::to_value(ListTasksParams::default()).unwrap();
+        assert!(!keys(&tasks).contains(&"status"), "{tasks}");
+        assert!(!keys(&tasks).contains(&"cursor"), "{tasks}");
+
+        let cancel = serde_json::to_value(CancelTaskParams {
+            task_id: "t".to_string(),
+            reason: None,
+            meta: None,
+        })
+        .unwrap();
+        assert!(!keys(&cancel).contains(&"reason"), "{cancel}");
+    }
+
+    /// Two nulls are deliberate and must stay. `requestId` is required on
+    /// `notifications/cancelled`, so sending null is the correct signal for a
+    /// malformed send rather than something to hide; and a legacy task's
+    /// `ttl` uses null to mean unlimited, which is distinct from absent.
+    #[test]
+    fn meaningful_nulls_are_preserved() {
+        let cancelled = serde_json::to_value(CancelledParams {
+            request_id: None,
+            reason: None,
+            meta: None,
+        })
+        .unwrap();
+        assert!(
+            cancelled["requestId"].is_null(),
+            "a malformed cancellation must remain visibly malformed: {cancelled}"
+        );
+
+        let status = serde_json::to_value(TaskStatusParams {
+            task_id: "t".to_string(),
+            status: TaskStatus::Working,
+            status_message: None,
+            created_at: "now".to_string(),
+            last_updated_at: "now".to_string(),
+            ttl: None,
+            poll_interval: None,
+            meta: None,
+        })
+        .unwrap();
+        assert!(
+            status["ttl"].is_null(),
+            "null ttl means unlimited, not absent: {status}"
         );
     }
 }
