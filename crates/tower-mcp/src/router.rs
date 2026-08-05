@@ -2421,7 +2421,6 @@ impl McpRouter {
     /// The handler has returned; the task waits in `input_required` until the
     /// client answers with `tasks/update`, at which point [`Self::resume_task`]
     /// runs it again (#1208).
-    #[cfg(feature = "stateless")]
     async fn park_task_for_input(
         &self,
         task_id: &str,
@@ -2460,7 +2459,6 @@ impl McpRouter {
     /// the top with the accumulated answers readable through
     /// `RequestContext::input_responses`, exactly as a non-task MRTR handler
     /// sees them on the client's retry.
-    #[cfg(feature = "stateless")]
     async fn resume_task(&self, task_id: &str) {
         let resume = match self.inner.task_store.resume_context(task_id).await {
             Ok(Some(resume)) => resume,
@@ -2507,6 +2505,11 @@ impl McpRouter {
         };
 
         let mut ctx = RequestContext::new(RequestId::String(task_id.to_string()));
+        // The answers reach the handler through the same MRTR extension a
+        // client retry populates. Only a `stateless` build can register an
+        // `mrtr_handler`, so a build without it can never park a task and
+        // never reaches this.
+        #[cfg(feature = "stateless")]
         ctx.extensions_mut().insert(crate::mrtr::MrtrRequest::new(
             Some(resume.input_responses),
             None,
