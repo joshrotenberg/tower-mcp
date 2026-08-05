@@ -17,7 +17,7 @@ authoritative for protocol behavior:
 
 ## Current support policy
 
-| Wire revision | Status in tower-mcp 0.18 | Compile-time switch | Lifecycle |
+| Wire revision | Status in tower-mcp 0.19 | Compile-time switch | Lifecycle |
 |---|---|---|---|
 | `2026-07-28` | released, enabled when compiled | `protocol-2026-07-28` | sessionless, per-request metadata, optional `server/discover` first |
 | `2025-11-25` | stable default | always available | `initialize` session lifecycle |
