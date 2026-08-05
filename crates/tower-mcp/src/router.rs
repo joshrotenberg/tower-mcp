@@ -2416,6 +2416,128 @@ impl McpRouter {
         Ok((detailed, meta))
     }
 
+    /// Park a task on the input its handler asked for.
+    ///
+    /// The handler has returned; the task waits in `input_required` until the
+    /// client answers with `tasks/update`, at which point [`Self::resume_task`]
+    /// runs it again (#1208).
+    #[cfg(feature = "stateless")]
+    async fn park_task_for_input(
+        &self,
+        task_id: &str,
+        input_required: crate::protocol::InputRequiredResult,
+    ) {
+        let requests = input_required.input_requests.unwrap_or_default();
+        if requests.is_empty() {
+            // Parking here would strand the task: no `tasks/update` can ever
+            // complete an empty request set.
+            let error = JsonRpcError::internal_error(
+                "handler asked for input without naming any requests, so the task has \
+                 nothing to wait for",
+            );
+            if let Err(e) = self.inner.task_store.fail_task(task_id, error).await {
+                tracing::warn!(task_id = %task_id, error = %e, "failed to record task failure");
+            }
+            self.notify_task_state(task_id).await;
+            return;
+        }
+
+        if let Err(e) = self
+            .inner
+            .task_store
+            .require_input(task_id, requests, input_required.request_state.as_deref())
+            .await
+        {
+            tracing::warn!(task_id = %task_id, error = %e, "failed to park task for input");
+        }
+        self.notify_task_state(task_id).await;
+    }
+
+    /// Re-invoke a task's handler after its input requests were answered.
+    ///
+    /// A task's client answers through `tasks/update` rather than by retrying
+    /// `tools/call`, so the server performs the retry. The handler runs from
+    /// the top with the accumulated answers readable through
+    /// `RequestContext::input_responses`, exactly as a non-task MRTR handler
+    /// sees them on the client's retry.
+    #[cfg(feature = "stateless")]
+    async fn resume_task(&self, task_id: &str) {
+        let resume = match self.inner.task_store.resume_context(task_id).await {
+            Ok(Some(resume)) => resume,
+            Ok(None) => {
+                // Either the task vanished, or the store predates resumption
+                // and cannot supply what a re-invocation needs. Fail loudly
+                // rather than leave the task working forever.
+                let error = JsonRpcError::internal_error(
+                    "this task store cannot resume a task after input was provided; \
+                     implement TaskStore::resume_context to support handlers that ask \
+                     for input",
+                );
+                if let Err(e) = self.inner.task_store.fail_task(task_id, error).await {
+                    tracing::warn!(task_id = %task_id, error = %e, "failed to record task failure");
+                }
+                self.notify_task_state(task_id).await;
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(task_id = %task_id, error = %e, "failed to read resume context");
+                return;
+            }
+        };
+
+        // Static tools first, then dynamic, matching `tools/call`.
+        let tool = self.inner.tools.get(&resume.tool_name).cloned();
+        #[cfg(feature = "dynamic-tools")]
+        let tool = tool.or_else(|| {
+            self.inner
+                .dynamic_tools
+                .as_ref()
+                .and_then(|d| d.get(&resume.tool_name))
+        });
+        let Some(tool) = tool else {
+            let error = JsonRpcError::internal_error(format!(
+                "tool '{}' is no longer registered, so the task cannot resume",
+                resume.tool_name
+            ));
+            if let Err(e) = self.inner.task_store.fail_task(task_id, error).await {
+                tracing::warn!(task_id = %task_id, error = %e, "failed to record task failure");
+            }
+            self.notify_task_state(task_id).await;
+            return;
+        };
+
+        let mut ctx = RequestContext::new(RequestId::String(task_id.to_string()));
+        ctx.extensions_mut().insert(crate::mrtr::MrtrRequest::new(
+            Some(resume.input_responses),
+            None,
+        ));
+        if let Some(tx) = &self.inner.notification_tx {
+            ctx = ctx.with_notification_sender(tx.clone());
+        }
+
+        let task_id = task_id.to_string();
+        let notifier = self.clone();
+        let task_store = self.inner.task_store.clone();
+        tokio::spawn(async move {
+            let outcome = tool.call_outcome_with_context(ctx, resume.arguments).await;
+            let result = match outcome {
+                Ok(crate::protocol::RequestOutcome::Complete(result)) => result,
+                // A handler may ask again; each round parks and resumes the
+                // same way, so multi-step interactions need no special casing.
+                Ok(crate::protocol::RequestOutcome::InputRequired(input_required)) => {
+                    notifier.park_task_for_input(&task_id, input_required).await;
+                    return;
+                }
+                Err(error) => CallToolResult::error(error.to_string()),
+            };
+
+            if let Err(e) = task_store.complete_task(&task_id, result).await {
+                tracing::warn!(task_id = %task_id, error = %e, "failed to record task completion");
+            }
+            notifier.notify_task_state(&task_id).await;
+        });
+    }
+
     /// Push the current state of a task to subscribed listen streams.
     ///
     /// Best effort by design. A task outlives the request that created it, so
@@ -2879,41 +3001,20 @@ impl McpRouter {
 
                         // Execute the tool.
                         //
-                        // The outcome-aware call is used so an input-required
-                        // return can be recognized rather than flattened into
-                        // an error mentioning an internal Rust method. Tasks
-                        // cannot yet service that outcome: the client answers
-                        // a task through `tasks/update` rather than by
-                        // retrying `tools/call`, so resuming is the server's
-                        // job, and neither the stored response values nor a
-                        // re-dispatch path exist yet (#1207). Failing here is
-                        // deliberate: routing the outcome into the store would
-                        // move the task to `input_required`, accept the
-                        // client's answers, discard them, and hang.
+                        // The outcome-aware call preserves an input-required
+                        // return, which parks the task until the client
+                        // answers with `tasks/update` and the router resumes
+                        // it (#1208).
                         let start = std::time::Instant::now();
                         let outcome = tool.call_outcome_with_context(ctx, arguments).await;
                         let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
                         let result = match outcome {
                             Ok(crate::protocol::RequestOutcome::Complete(result)) => result,
-                            Ok(crate::protocol::RequestOutcome::InputRequired(_)) => {
-                                let error = JsonRpcError::internal_error(format!(
-                                    "Tool '{tool_name}' asked for additional input, which a \
-                                     task cannot service yet: combining task support with an \
-                                     input-required handler is not supported. Run the tool \
-                                     without task augmentation, where the client fulfils the \
-                                     request and retries."
-                                ));
-                                if let Err(e) = task_store.fail_task(&task_id_clone, error).await {
-                                    tracing::warn!(task_id = %task_id_clone, error = %e, "failed to record task failure");
-                                }
-                                tracing::warn!(
-                                    target: "mcp::tools",
-                                    tool = %tool_name,
-                                    task_id = %task_id_clone,
-                                    "task-augmented call returned an input-required outcome"
-                                );
-                                notifier.notify_task_state(&task_id_clone).await;
+                            Ok(crate::protocol::RequestOutcome::InputRequired(input_required)) => {
+                                notifier
+                                    .park_task_for_input(&task_id_clone, input_required)
+                                    .await;
                                 return;
                             }
                             // Preserved from the previous call path: a handler
@@ -3531,7 +3632,8 @@ impl McpRouter {
                     // Partial responses are the normal case: the store
                     // consumes what matches an outstanding request and ignores
                     // unknown, already-answered, and superseded keys.
-                    self.inner
+                    let applied = self
+                        .inner
                         .task_store
                         .apply_input_responses(
                             &params.task_id,
@@ -3544,6 +3646,12 @@ impl McpRouter {
                     // so the status a subscriber sees changes here even though
                     // the ack itself is empty.
                     self.notify_task_state(&params.task_id).await;
+                    // The client answered everything outstanding, so re-invoke
+                    // the handler with the accumulated responses (#1208). A
+                    // partial answer leaves the task parked for the rest.
+                    if applied.is_complete() {
+                        self.resume_task(&params.task_id).await;
+                    }
                     return Ok(McpResponse::FinalTaskAck(
                         crate::tasks::TaskAcknowledgement::new(),
                     ));
@@ -5869,18 +5977,212 @@ mod tests {
     // Task Lifecycle Tests
     // =========================================================================
 
-    /// #1207: a task-capable tool whose handler returns an input-required
-    /// outcome fails with a message about the unsupported combination,
-    /// rather than one naming an internal Rust method.
-    ///
-    /// Failing is deliberate rather than provisional. A task's client answers
-    /// through `tasks/update`, so resumption is the server's job, and the
-    /// store retains only the answered keys, not their values. Moving the
-    /// task to `input_required` here would accept the operator's answers,
-    /// discard them, and hang.
+    /// #1208: the full task input round trip. The handler asks, the task
+    /// parks in `input_required` carrying the requests, the client answers
+    /// with `tasks/update`, the router re-invokes the handler with the
+    /// answers, and the task completes.
     #[cfg(feature = "stateless")]
     #[tokio::test]
-    async fn task_augmented_input_required_fails_with_an_actionable_message() {
+    async fn a_task_resumes_after_its_input_is_answered() {
+        use crate::async_task::{MemoryTaskStore, TaskStore};
+        use crate::protocol::{
+            ElicitFormParams, ElicitFormSchema, ElicitRequestParams, InputRequest, InputRequests,
+            InputRequiredResult, RequestOutcome,
+        };
+
+        let asks = ToolBuilder::new("asks")
+            .description("Needs a decision")
+            .task_support(TaskSupportMode::Optional)
+            .mrtr_handler::<serde_json::Value, _, _>(|ctx, _input| async move {
+                // Resume leg: the answers are readable exactly as a non-task
+                // MRTR handler sees them on the client's retry.
+                if let Some(responses) = ctx.input_responses()
+                    && responses.contains_key("decision")
+                {
+                    return Ok(RequestOutcome::Complete(CallToolResult::text("approved")));
+                }
+                let mut requests: InputRequests = Default::default();
+                requests.insert(
+                    "decision".to_string(),
+                    InputRequest::Elicit(ElicitRequestParams::Form(ElicitFormParams {
+                        mode: None,
+                        message: "approve?".to_string(),
+                        requested_schema: ElicitFormSchema::new(),
+                        meta: None,
+                    })),
+                );
+                Ok(RequestOutcome::input_required(
+                    InputRequiredResult::with_requests(requests),
+                ))
+            })
+            .build();
+
+        let store = std::sync::Arc::new(MemoryTaskStore::new());
+        let mut router = McpRouter::new()
+            .task_store(store.clone())
+            .tool(asks)
+            .with_tasks();
+        init_router(&mut router).await;
+
+        let resp = router
+            .ready()
+            .await
+            .unwrap()
+            .call(RouterRequest {
+                id: RequestId::Number(1),
+                inner: McpRequest::CallTool(CallToolParams {
+                    input_responses: None,
+                    request_state: None,
+                    name: "asks".to_string(),
+                    arguments: serde_json::json!({}),
+                    meta: None,
+                    task: None,
+                }),
+                extensions: tasks_client_extensions(),
+            })
+            .await
+            .unwrap();
+        let task_id = match resp.inner {
+            Ok(McpResponse::FinalCreateTask(result)) => result.task.metadata.task_id,
+            other => panic!("expected a created task, got {other:?}"),
+        };
+
+        // The task parks rather than failing.
+        let mut parked = false;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let task = store.get_task(&task_id).await.unwrap().unwrap();
+            if task.status == TaskStatus::InputRequired {
+                parked = true;
+                break;
+            }
+            assert_ne!(task.status, TaskStatus::Failed, "must park, not fail");
+        }
+        assert!(parked, "the task must reach input_required");
+
+        // The outstanding request is visible to the client.
+        let outstanding = store
+            .outstanding_input_requests(&task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(outstanding.contains_key("decision"));
+
+        // The client answers.
+        let update = router
+            .ready()
+            .await
+            .unwrap()
+            .call(RouterRequest {
+                id: RequestId::Number(2),
+                inner: McpRequest::UpdateTask(UpdateTaskParams {
+                    task_id: task_id.clone(),
+                    input_responses: [(
+                        "decision".to_string(),
+                        serde_json::json!({"action": "accept"}),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    meta: None,
+                }),
+                extensions: tasks_client_extensions(),
+            })
+            .await
+            .unwrap();
+        assert!(update.inner.is_ok(), "update must be acknowledged");
+
+        // The handler runs again and the task completes with its answer.
+        let mut completed = None;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let (task, result, _) = store.get_task_result(&task_id).await.unwrap().unwrap();
+            if task.status == TaskStatus::Completed {
+                completed = result;
+                break;
+            }
+            assert_ne!(
+                task.status,
+                TaskStatus::Failed,
+                "the resumed handler must not fail"
+            );
+        }
+        let completed = completed.expect("the task must complete after resuming");
+        assert_eq!(completed.all_text(), "approved");
+    }
+
+    /// A store predating resumption cannot supply what a re-invocation needs,
+    /// so it must fail the task loudly rather than strand it in `working`.
+    ///
+    /// `CountingTaskStore` delegates everything to `MemoryTaskStore` but does
+    /// not override `resume_context`, which is exactly the shape of an
+    /// external store written before resumption existed.
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn a_store_without_resume_support_fails_the_task() {
+        let store = Arc::new(CountingTaskStore::new());
+        assert!(
+            store.resume_context("anything").await.unwrap().is_none(),
+            "the trait default must report no resume support"
+        );
+
+        let (task_id, _cancel) = store
+            .create_task("t", serde_json::json!({}), None, None)
+            .await
+            .unwrap();
+        let requests: crate::protocol::InputRequests = [(
+            "k".to_string(),
+            crate::protocol::InputRequest::ListRoots(crate::protocol::ListRootsParams {
+                meta: None,
+            }),
+        )]
+        .into_iter()
+        .collect();
+        store.require_input(&task_id, requests, None).await.unwrap();
+
+        let mut router = McpRouter::new()
+            .task_store(store.clone() as Arc<dyn TaskStore>)
+            .with_tasks();
+        init_router(&mut router).await;
+        router
+            .ready()
+            .await
+            .unwrap()
+            .call(RouterRequest {
+                id: RequestId::Number(1),
+                inner: McpRequest::UpdateTask(UpdateTaskParams {
+                    task_id: task_id.clone(),
+                    input_responses: [("k".to_string(), serde_json::json!({"roots": []}))]
+                        .into_iter()
+                        .collect(),
+                    meta: None,
+                }),
+                extensions: tasks_client_extensions(),
+            })
+            .await
+            .unwrap();
+
+        let (task, _, error) = store.get_task_result(&task_id).await.unwrap().unwrap();
+        assert_eq!(
+            task.status,
+            TaskStatus::Failed,
+            "a store that cannot resume must fail the task, not strand it"
+        );
+        assert!(
+            error.unwrap().message.contains("resume_context"),
+            "the failure must name what to implement"
+        );
+    }
+
+    /// A handler that asks for input without naming any requests would strand
+    /// its task: no `tasks/update` can complete an empty request set, so the
+    /// task would sit in `input_required` forever. It fails instead.
+    ///
+    /// This started life as #1207's assertion that the combination was
+    /// unsupported; #1208 made it work, and the remaining failure case is
+    /// this one.
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn asking_for_input_without_requests_fails_rather_than_stranding() {
         use crate::async_task::{MemoryTaskStore, TaskStore};
         use crate::protocol::{InputRequiredResult, RequestOutcome};
 
@@ -5938,9 +6240,8 @@ mod tests {
 
         let error = error.expect("the task must reach a terminal failure");
         assert!(
-            error.message.contains("task cannot service yet")
-                || error.message.contains("not supported"),
-            "must name the unsupported combination: {}",
+            error.message.contains("nothing to wait for"),
+            "must explain why the task cannot park: {}",
             error.message
         );
         assert!(

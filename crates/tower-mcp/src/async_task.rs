@@ -161,6 +161,13 @@ pub struct Task {
     pub input_requests: InputRequests,
     /// Keys answered by a previous `tasks/update`.
     pub answered_input_keys: BTreeSet<String>,
+    /// The answers themselves, accumulated across every `tasks/update`.
+    ///
+    /// A task's client answers through `tasks/update` rather than by retrying
+    /// `tools/call`, so the server owns resumption and must keep the values
+    /// to hand back to the resumed handler. Recording only the keys made the
+    /// answers unrecoverable (#1208).
+    pub input_responses: InputResponses,
     /// Keys displaced by a later [`TaskStore::require_input`] before being
     /// answered.
     pub superseded_input_keys: BTreeSet<String>,
@@ -200,6 +207,7 @@ impl Task {
             owner,
             input_requests: InputRequests::new(),
             answered_input_keys: BTreeSet::new(),
+            input_responses: InputResponses::new(),
             superseded_input_keys: BTreeSet::new(),
             cancellation_token: CancellationToken { cancelled },
             completed_at: None,
@@ -300,6 +308,22 @@ pub struct AppliedInputResponses {
     pub ignored: BTreeSet<String>,
     /// Requests still awaiting a response after this update.
     pub still_outstanding: BTreeSet<String>,
+}
+
+/// What a resumed task needs to run its handler again.
+///
+/// The client answers a task through `tasks/update`, not by retrying
+/// `tools/call`, so the server re-invokes the handler itself and must supply
+/// what the client would otherwise have resent.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct TaskResumeContext {
+    /// Tool to re-invoke.
+    pub tool_name: String,
+    /// The original call arguments, unchanged.
+    pub arguments: serde_json::Value,
+    /// Every answer accumulated so far, keyed as the requests were issued.
+    pub input_responses: InputResponses,
 }
 
 impl AppliedInputResponses {
@@ -468,6 +492,19 @@ pub trait TaskStore: Send + Sync + 'static {
         task_id: &str,
         responses: InputResponses,
     ) -> Result<Option<AppliedInputResponses>>;
+
+    /// Everything needed to re-invoke a task's handler after its input
+    /// requests were answered.
+    ///
+    /// Returning `None` means this store cannot resume, and the router fails
+    /// the task with a message saying so rather than leaving it in `working`
+    /// forever. The default returns `None` so an external store written
+    /// before resumption existed keeps compiling and fails loudly instead of
+    /// hanging; implement it to support the flow (#1208).
+    async fn resume_context(&self, task_id: &str) -> Result<Option<TaskResumeContext>> {
+        let _ = task_id;
+        Ok(None)
+    }
 
     /// Update a task's time-to-live, measured from creation.
     ///
@@ -737,9 +774,10 @@ impl TaskStore for MemoryTaskStore {
         }
 
         let mut applied = AppliedInputResponses::default();
-        for key in responses.into_keys() {
+        for (key, response) in responses {
             if task.input_requests.remove(&key).is_some() {
                 task.answered_input_keys.insert(key.clone());
+                task.input_responses.insert(key.clone(), response);
                 applied.accepted.insert(key);
             } else {
                 // Never issued, already answered, or superseded. All three are
@@ -758,6 +796,20 @@ impl TaskStore for MemoryTaskStore {
             task.status_message = Some("Task resumed".to_string());
         }
         Ok(Some(applied))
+    }
+
+    async fn resume_context(&self, task_id: &str) -> Result<Option<TaskResumeContext>> {
+        let Ok(tasks) = self.tasks.read() else {
+            return Ok(None);
+        };
+        Ok(tasks
+            .get(task_id)
+            .filter(|task| !task.is_expired())
+            .map(|task| TaskResumeContext {
+                tool_name: task.tool_name.clone(),
+                arguments: task.arguments.clone(),
+                input_responses: task.input_responses.clone(),
+            }))
     }
 
     async fn set_ttl(&self, task_id: &str, ttl_ms: u64) -> Result<bool> {
