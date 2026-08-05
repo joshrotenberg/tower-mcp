@@ -408,3 +408,130 @@ mod layered {
         assert_eq!(*seen.lock().unwrap(), vec!["initialize"]);
     }
 }
+
+// =============================================================================
+// Client-requested progress (#1190)
+// =============================================================================
+
+mod progress {
+    use super::*;
+    use std::sync::Mutex;
+
+    use tower_mcp::extract::Context;
+    use tower_mcp::protocol::ProgressParams;
+
+    fn reporting_router() -> McpRouter {
+        let scan = ToolBuilder::new("scan")
+            .description("Reports progress as it goes")
+            .extractor_handler((), |ctx: Context, RawArgs(_): RawArgs| async move {
+                for step in 1..=3u32 {
+                    ctx.report_progress(step as f64, Some(3.0), Some("scanning"))
+                        .await;
+                }
+                Ok(CallToolResult::text("done"))
+            })
+            .build();
+        McpRouter::new()
+            .server_info("progress-server", "1.0.0")
+            .tool(scan)
+    }
+
+    fn collecting_handler() -> (NotificationHandler, Arc<Mutex<Vec<ProgressParams>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let handler = NotificationHandler::new().on_progress(move |params| {
+            sink.lock().unwrap().push(params);
+        });
+        (handler, seen)
+    }
+
+    /// #1190: a server only emits progress when the request carries a token,
+    /// and the client had no way to send one, so `report_progress` was
+    /// silently discarded for every consumer of the typed API.
+    #[tokio::test]
+    async fn opting_in_delivers_progress_notifications() {
+        let (handler, seen) = collecting_handler();
+        let client = McpClient::builder()
+            .request_progress()
+            .connect(ChannelTransport::new(reporting_router()), handler)
+            .await
+            .expect("connect");
+        client
+            .initialize("test", "1.0.0")
+            .await
+            .expect("initialize");
+
+        client
+            .call_tool("scan", serde_json::json!({}))
+            .await
+            .expect("call tool");
+
+        // The notifications race the response, so allow the loop to drain.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let progress = seen.lock().unwrap();
+        assert_eq!(progress.len(), 3, "every step must arrive: {progress:?}");
+        assert_eq!(progress[0].progress, 1.0);
+        assert_eq!(progress[2].progress, 3.0);
+        assert_eq!(progress[0].total, Some(3.0));
+    }
+
+    /// Off by default: a client that never asked for progress must not add
+    /// wire traffic or receive frames.
+    #[tokio::test]
+    async fn progress_is_off_by_default() {
+        let (handler, seen) = collecting_handler();
+        let client =
+            McpClient::connect_with_handler(ChannelTransport::new(reporting_router()), handler)
+                .await
+                .expect("connect");
+        client
+            .initialize("test", "1.0.0")
+            .await
+            .expect("initialize");
+
+        client
+            .call_tool("scan", serde_json::json!({}))
+            .await
+            .expect("call tool");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a client that did not opt in receives no progress"
+        );
+    }
+
+    /// Each request gets its own token, so a server can attribute progress to
+    /// the call that produced it.
+    #[tokio::test]
+    async fn each_request_carries_a_distinct_token() {
+        let (handler, seen) = collecting_handler();
+        let client = McpClient::builder()
+            .request_progress()
+            .connect(ChannelTransport::new(reporting_router()), handler)
+            .await
+            .expect("connect");
+        client
+            .initialize("test", "1.0.0")
+            .await
+            .expect("initialize");
+
+        client
+            .call_tool("scan", serde_json::json!({}))
+            .await
+            .unwrap();
+        client
+            .call_tool("scan", serde_json::json!({}))
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let progress = seen.lock().unwrap();
+        assert_eq!(progress.len(), 6, "both calls report: {progress:?}");
+        let tokens: std::collections::BTreeSet<String> = progress
+            .iter()
+            .map(|p| format!("{:?}", p.progress_token))
+            .collect();
+        assert_eq!(tokens.len(), 2, "one distinct token per call: {tokens:?}");
+    }
+}

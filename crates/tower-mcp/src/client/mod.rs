@@ -355,6 +355,20 @@ pub struct McpClient {
     max_mrtr_rounds: usize,
     /// SEP-2549 final-protocol response cache.
     response_cache: Arc<ClientResponseCache>,
+    /// Allocator for per-request progress tokens; `None` when the client did
+    /// not opt into progress.
+    progress_tokens: Option<Arc<AtomicI64>>,
+}
+
+/// Settings a builder hands to the connect path, grouped so the private
+/// constructor keeps one parameter per concern rather than one per field.
+struct ClientSettings {
+    capabilities: ClientCapabilities,
+    roots: Vec<Root>,
+    protocol_support: ProtocolSupport,
+    max_mrtr_rounds: usize,
+    cache_config: ClientCacheConfig,
+    request_progress: bool,
 }
 
 /// Builder for configuring and connecting an [`McpClient`].
@@ -382,6 +396,7 @@ pub struct McpClientBuilder {
     protocol_support: ProtocolSupport,
     max_mrtr_rounds: usize,
     cache_config: ClientCacheConfig,
+    request_progress: bool,
 }
 
 impl McpClientBuilder {
@@ -398,7 +413,27 @@ impl McpClientBuilder {
             protocol_support: ProtocolSupport::default(),
             max_mrtr_rounds: 8,
             cache_config: ClientCacheConfig::default(),
+            request_progress: false,
         }
+    }
+
+    /// Ask servers to report progress for this client's requests.
+    ///
+    /// A server only emits progress when the request carries a progress
+    /// token, so [`RequestContext::report_progress`] is a no-op for a client
+    /// that never sends one. With this enabled, every request this client
+    /// issues carries a fresh token and the matching
+    /// `notifications/progress` frames reach the handler's
+    /// [`on_progress`](crate::client::NotificationHandler::on_progress)
+    /// callback.
+    ///
+    /// Off by default: a token asks the server to do extra work, and a client
+    /// with no progress handler would only add wire traffic.
+    ///
+    /// [`RequestContext::report_progress`]: crate::context::RequestContext::report_progress
+    pub fn request_progress(mut self) -> Self {
+        self.request_progress = true;
+        self
     }
 
     /// Configure roots for this client.
@@ -500,11 +535,14 @@ impl McpClientBuilder {
         McpClient::connect_inner(
             transport,
             handler,
-            self.capabilities,
-            self.roots,
-            self.protocol_support,
-            self.max_mrtr_rounds,
-            self.cache_config,
+            ClientSettings {
+                capabilities: self.capabilities,
+                roots: self.roots,
+                protocol_support: self.protocol_support,
+                max_mrtr_rounds: self.max_mrtr_rounds,
+                cache_config: self.cache_config,
+                request_progress: self.request_progress,
+            },
         )
         .await
     }
@@ -546,19 +584,19 @@ impl McpClient {
     }
 
     /// Internal connect implementation.
-    async fn connect_inner<T, H>(
-        transport: T,
-        handler: H,
-        capabilities: ClientCapabilities,
-        roots: Vec<Root>,
-        protocol_support: ProtocolSupport,
-        max_mrtr_rounds: usize,
-        cache_config: ClientCacheConfig,
-    ) -> Result<Self>
+    async fn connect_inner<T, H>(transport: T, handler: H, settings: ClientSettings) -> Result<Self>
     where
         T: ClientTransport,
         H: ClientHandler,
     {
+        let ClientSettings {
+            capabilities,
+            roots,
+            protocol_support,
+            max_mrtr_rounds,
+            cache_config,
+            request_progress,
+        } = settings;
         let supports_session_recovery = transport.supports_session_recovery();
         let (command_tx, command_rx) = mpsc::channel::<LoopCommand>(64);
         let connected = Arc::new(AtomicBool::new(true));
@@ -598,6 +636,7 @@ impl McpClient {
             recovery_lock: Mutex::new(()),
             max_mrtr_rounds,
             response_cache,
+            progress_tokens: request_progress.then(|| Arc::new(AtomicI64::new(1))),
         })
     }
 
@@ -1952,6 +1991,7 @@ impl McpClient {
         let params_value = serde_json::to_value(params)
             .map_err(|e| Error::Transport(format!("Failed to serialize params: {}", e)))?;
         let params_value = self.with_final_request_meta(params_value).await?;
+        let params_value = self.with_progress_token(params_value);
 
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
@@ -2103,6 +2143,34 @@ impl McpClient {
             client_capabilities: Some(self.capabilities.clone()),
             log_level: None,
         }
+    }
+
+    /// Attach a fresh progress token when the client opted into progress.
+    ///
+    /// Applied at the one point every typed request method funnels through,
+    /// so `call_tool`, `read_resource`, `get_prompt`, and anything added
+    /// later all carry a token without each growing an options argument
+    /// (#1190). A caller that set its own token keeps it.
+    fn with_progress_token(&self, mut params: serde_json::Value) -> serde_json::Value {
+        let Some(tokens) = &self.progress_tokens else {
+            return params;
+        };
+        // Only an object can carry `_meta`; a positional or null params value
+        // has nowhere to put one.
+        let Some(object) = params.as_object_mut() else {
+            return params;
+        };
+        let meta = object
+            .entry("_meta")
+            .or_insert_with(|| serde_json::json!({}));
+        let Some(meta) = meta.as_object_mut() else {
+            return params;
+        };
+        if !meta.contains_key("progressToken") {
+            let token = tokens.fetch_add(1, Ordering::Relaxed);
+            meta.insert("progressToken".to_string(), serde_json::json!(token));
+        }
+        params
     }
 
     async fn with_final_request_meta(
