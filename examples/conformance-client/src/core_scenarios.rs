@@ -24,24 +24,24 @@ pub(crate) fn client_builder() -> Result<McpClientBuilder> {
     Ok(builder)
 }
 
-/// Run a handshake, retrying a bounded number of times on transport-level
-/// failures.
+/// Retry an attempt a bounded number of times on transport-level failures.
 ///
-/// The suite runs against a loopback server, where a POST occasionally fails
+/// The suite runs against a loopback server where a POST occasionally fails
 /// to send outright. Since #1174 an undelivered `notifications/initialized`
 /// is an `initialize()` error rather than a silent no-op, which is correct
 /// but turns that rare transient into a red conformance check attributed to
-/// whichever PR happened to be running (#1196).
+/// whichever PR happened to be running.
 ///
 /// Only [`tower_mcp::Error::Transport`] is retried. A protocol error is a
 /// real conformance result and must surface on the first attempt; retrying
 /// one would mask the failures this suite exists to catch. Each retry is
 /// logged so a systematic problem still looks systematic.
 ///
-/// Retrying `initialize` on the same client is safe: the server creates a
-/// fresh session for any `initialize`, and the transport adopts the new
-/// session id from the response.
-pub(crate) async fn with_handshake_retry<F, Fut, T>(what: &str, mut attempt: F) -> Result<T>
+/// The attempt must build a **fresh client**. #1197 retried the handshake on
+/// the existing one, which does not recover: a half-failed handshake leaves
+/// client and server disagreeing about which session is initialized, and the
+/// retry then fails with `-32600` (#1219).
+pub(crate) async fn retry_transport<F, Fut, T>(what: &str, mut attempt: F) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = std::result::Result<T, tower_mcp::Error>>,
@@ -61,7 +61,7 @@ where
                     %error,
                     attempt = attempt_number,
                     attempts = ATTEMPTS,
-                    "transport failure during {what}, retrying"
+                    "transport failure during {what}, rebuilding and retrying"
                 );
                 last_error = Some(error);
                 if attempt_number < ATTEMPTS {
@@ -77,29 +77,93 @@ where
         .into())
 }
 
+/// Run the handshake once, without retrying.
+///
+/// Retrying belongs to [`connect_activated`], which rebuilds the client: a
+/// handshake that half-failed leaves the client and server disagreeing about
+/// which session is initialized, and re-running `initialize` on that client
+/// does not clean it up (#1219).
 pub(crate) async fn activate(client: &McpClient) -> Result<()> {
+    handshake(client).await?;
+    Ok(())
+}
+
+/// The handshake, preserving `tower_mcp::Error` so a caller can tell a
+/// transport failure from a protocol one.
+async fn handshake(client: &McpClient) -> std::result::Result<(), tower_mcp::Error> {
     if uses_final_protocol() {
-        with_handshake_retry("discover", || {
-            client.discover("conformance-client", "0.1.0")
-        })
-        .await?;
+        client.discover("conformance-client", "0.1.0").await?;
     } else {
-        with_handshake_retry("initialize", || {
-            client.initialize("conformance-client", "0.1.0")
-        })
-        .await?;
+        client.initialize("conformance-client", "0.1.0").await?;
     }
     Ok(())
 }
 
+/// Connect and complete the handshake, rebuilding the client if the
+/// transport fails partway.
+///
+/// Each attempt builds a fresh transport and client, so nothing from a
+/// failed attempt survives. See [`retry_transport`] for why that matters.
+pub(crate) async fn connect_activated<H, MakeHandler, Configure>(
+    server_url: &str,
+    make_handler: MakeHandler,
+    configure: Configure,
+) -> Result<McpClient>
+where
+    H: tower_mcp::client::ClientHandler,
+    MakeHandler: Fn() -> H,
+    Configure: Fn(McpClientBuilder) -> McpClientBuilder,
+{
+    // Resolved once: it depends on the environment, not on the attempt, and
+    // it is the only fallible part of building the builder.
+    let support = if uses_final_protocol() {
+        Some(ProtocolSupport::try_new([requested_protocol_version()])?)
+    } else {
+        None
+    };
+
+    retry_transport("connect", || async {
+        let mut builder = McpClient::builder();
+        if let Some(support) = &support {
+            builder = builder.protocol_support(support.clone());
+        }
+        let client = configure(builder)
+            .connect(HttpClientTransport::new(server_url), make_handler())
+            .await?;
+        handshake(&client).await?;
+        Ok(client)
+    })
+    .await
+}
+
+/// [`connect_activated`] for scenarios that need the `InitializeResult`.
+///
+/// Stable lifecycle only: it drives `initialize` directly rather than
+/// choosing by protocol version, because every scenario that inspects the
+/// result is 2025-11-25.
+pub(crate) async fn connect_initialized<H, MakeHandler, Configure>(
+    server_url: &str,
+    make_handler: MakeHandler,
+    configure: Configure,
+) -> Result<(McpClient, tower_mcp::protocol::InitializeResult)>
+where
+    H: tower_mcp::client::ClientHandler,
+    MakeHandler: Fn() -> H,
+    Configure: Fn(McpClientBuilder) -> McpClientBuilder,
+{
+    retry_transport("connect", || async {
+        let client = configure(McpClient::builder())
+            .connect(HttpClientTransport::new(server_url), make_handler())
+            .await?;
+        let result = client.initialize("conformance-client", "0.1.0").await?;
+        Ok((client, result))
+    })
+    .await
+}
+
 /// `initialize` -- Connect, list tools, disconnect.
 pub async fn initialize(server_url: &str) -> Result<()> {
-    let transport = HttpClientTransport::new(server_url);
-    let client = client_builder()?
-        .connect(transport, handlers::BasicHandler)
-        .await?;
-
-    activate(&client).await?;
+    let client = connect_activated(server_url, || handlers::BasicHandler, |b| b).await?;
     let tools = client.list_tools().await?;
     tracing::info!("Listed {} tools", tools.tools.len());
 
@@ -109,14 +173,12 @@ pub async fn initialize(server_url: &str) -> Result<()> {
 
 /// `tools_call` -- Connect with full handler, list and call all tools.
 pub async fn tools_call(server_url: &str) -> Result<()> {
-    let transport = HttpClientTransport::new(server_url);
-    let client = client_builder()?
-        .with_sampling()
-        .with_elicitation()
-        .connect(transport, handlers::FullHandler)
-        .await?;
-
-    activate(&client).await?;
+    let client = connect_activated(
+        server_url,
+        || handlers::FullHandler,
+        |b: McpClientBuilder| b.with_sampling().with_elicitation(),
+    )
+    .await?;
     let tools = client.list_tools().await?;
     tracing::info!("Listed {} tools", tools.tools.len());
 
@@ -141,11 +203,7 @@ pub async fn tools_call(server_url: &str) -> Result<()> {
 
 /// Exercise all named and unnamed request headers required by SEP-2243.
 pub async fn http_standard_headers(server_url: &str) -> Result<()> {
-    let transport = HttpClientTransport::new(server_url);
-    let client = client_builder()?
-        .connect(transport, handlers::BasicHandler)
-        .await?;
-    activate(&client).await?;
+    let client = connect_activated(server_url, || handlers::BasicHandler, |b| b).await?;
 
     let tools = client.list_tools().await?;
     if let Some(tool) = tools.tools.first() {
@@ -171,11 +229,7 @@ pub async fn http_custom_headers(
     server_url: &str,
     context: &Option<serde_json::Value>,
 ) -> Result<()> {
-    let transport = HttpClientTransport::new(server_url);
-    let client = client_builder()?
-        .connect(transport, handlers::BasicHandler)
-        .await?;
-    activate(&client).await?;
+    let client = connect_activated(server_url, || handlers::BasicHandler, |b| b).await?;
     client.list_tools().await?;
 
     let calls = context
@@ -201,11 +255,7 @@ pub async fn http_custom_headers(
 
 /// Confirm invalid header annotations are excluded without hiding valid tools.
 pub async fn http_invalid_tool_headers(server_url: &str) -> Result<()> {
-    let transport = HttpClientTransport::new(server_url);
-    let client = client_builder()?
-        .connect(transport, handlers::BasicHandler)
-        .await?;
-    activate(&client).await?;
+    let client = connect_activated(server_url, || handlers::BasicHandler, |b| b).await?;
     let tools = client.list_tools().await?;
     let valid = tools
         .tools
@@ -222,12 +272,12 @@ pub async fn http_invalid_tool_headers(server_url: &str) -> Result<()> {
 
 /// Exercise request-state echo, omission, request-id freshness, and isolation.
 pub async fn mrtr_request_state(server_url: &str) -> Result<()> {
-    let transport = HttpClientTransport::new(server_url);
-    let client = client_builder()?
-        .with_elicitation()
-        .connect(transport, handlers::FullHandler)
-        .await?;
-    activate(&client).await?;
+    let client = connect_activated(
+        server_url,
+        || handlers::FullHandler,
+        |b: McpClientBuilder| b.with_elicitation(),
+    )
+    .await?;
     let tools = client.list_tools().await?;
 
     for name in [
@@ -250,15 +300,7 @@ pub async fn mrtr_request_state(server_url: &str) -> Result<()> {
 /// `sse-retry` -- Connect and call the test_reconnection tool.
 /// The SSE reconnection logic is handled by HttpClientTransport internally.
 pub async fn sse_retry(server_url: &str) -> Result<()> {
-    let transport = HttpClientTransport::new(server_url);
-    let client = McpClient::builder()
-        .connect(transport, handlers::BasicHandler)
-        .await?;
-
-    with_handshake_retry("initialize", || {
-        client.initialize("conformance-client", "0.1.0")
-    })
-    .await?;
+    let (client, _) = connect_initialized(server_url, || handlers::BasicHandler, |b| b).await?;
     let tools = client.list_tools().await?;
 
     if let Some(tool) = tools.tools.iter().find(|t| t.name == "test_reconnection") {
@@ -274,15 +316,11 @@ pub async fn sse_retry(server_url: &str) -> Result<()> {
 
 /// `elicitation-defaults` -- Connect with elicitation handler that applies defaults.
 pub async fn elicitation_defaults(server_url: &str) -> Result<()> {
-    let transport = HttpClientTransport::new(server_url);
-    let client = McpClient::builder()
-        .with_elicitation()
-        .connect(transport, handlers::ElicitationDefaultsHandler)
-        .await?;
-
-    with_handshake_retry("initialize", || {
-        client.initialize("conformance-client", "0.1.0")
-    })
+    let (client, _) = connect_initialized(
+        server_url,
+        || handlers::ElicitationDefaultsHandler,
+        |b: McpClientBuilder| b.with_elicitation(),
+    )
     .await?;
     let tools = client.list_tools().await?;
 
@@ -312,15 +350,7 @@ pub async fn elicitation_defaults(server_url: &str) -> Result<()> {
 /// Asserts that the server includes `ttlMs: 60000` in the `tools/list`
 /// response, exercising the SEP-2549 list TTL field end-to-end.
 pub async fn ttl_list(server_url: &str) -> Result<()> {
-    let transport = HttpClientTransport::new(server_url);
-    let client = McpClient::builder()
-        .connect(transport, handlers::BasicHandler)
-        .await?;
-
-    with_handshake_retry("initialize", || {
-        client.initialize("conformance-client", "0.1.0")
-    })
-    .await?;
+    let (client, _) = connect_initialized(server_url, || handlers::BasicHandler, |b| b).await?;
     let tools = client.list_tools().await?;
 
     anyhow::ensure!(
@@ -337,15 +367,8 @@ pub async fn ttl_list(server_url: &str) -> Result<()> {
 /// `deprecated-capability` -- Connect and verify the logging capability carries
 /// SEP-2577 deprecation metadata in the initialize result.
 pub async fn deprecated_capability(server_url: &str) -> Result<()> {
-    let transport = HttpClientTransport::new(server_url);
-    let client = McpClient::builder()
-        .connect(transport, handlers::BasicHandler)
-        .await?;
-
-    let result = with_handshake_retry("initialize", || {
-        client.initialize("conformance-client", "0.1.0")
-    })
-    .await?;
+    let (client, result) =
+        connect_initialized(server_url, || handlers::BasicHandler, |b| b).await?;
 
     let logging = result
         .capabilities
@@ -375,15 +398,8 @@ pub async fn deprecated_capability(server_url: &str) -> Result<()> {
 /// The final 2026-07-28 lifecycle intentionally withholds the extension until
 /// the remaining SEP-2663 behavior tracked in #951 is complete.
 pub async fn tasks_extension(server_url: &str) -> Result<()> {
-    let transport = HttpClientTransport::new(server_url);
-    let client = McpClient::builder()
-        .connect(transport, handlers::BasicHandler)
-        .await?;
-
-    let result = with_handshake_retry("initialize", || {
-        client.initialize("conformance-client", "0.1.0")
-    })
-    .await?;
+    let (client, result) =
+        connect_initialized(server_url, || handlers::BasicHandler, |b| b).await?;
 
     let extensions = result
         .capabilities
@@ -449,7 +465,7 @@ mod handshake_retry_tests {
     #[tokio::test]
     async fn a_transient_transport_failure_is_retried() {
         let attempts = AtomicU32::new(0);
-        let result = with_handshake_retry("test", || {
+        let result = retry_transport("test", || {
             let attempt = attempts.fetch_add(1, Ordering::Relaxed);
             async move {
                 if attempt == 0 {
@@ -472,7 +488,7 @@ mod handshake_retry_tests {
     #[tokio::test]
     async fn a_protocol_error_is_not_retried() {
         let attempts = AtomicU32::new(0);
-        let error = with_handshake_retry("test", || {
+        let error = retry_transport("test", || {
             attempts.fetch_add(1, Ordering::Relaxed);
             async move {
                 Err::<(), _>(tower_mcp::Error::JsonRpc(
@@ -491,10 +507,40 @@ mod handshake_retry_tests {
         );
     }
 
+    /// #1219: the retry must give the attempt a chance to rebuild, not just
+    /// re-run the same failed operation. This asserts the closure is invoked
+    /// afresh each time, which is what lets `connect_*` discard a poisoned
+    /// client instead of reusing it.
+    #[tokio::test]
+    async fn each_attempt_runs_the_closure_again() {
+        let seen = std::sync::Mutex::new(Vec::new());
+        let attempts = AtomicU32::new(0);
+        let result = retry_transport("test", || {
+            let n = attempts.fetch_add(1, Ordering::Relaxed);
+            seen.lock().unwrap().push(n);
+            async move {
+                if n < 2 {
+                    Err(tower_mcp::Error::Transport("reset".into()))
+                } else {
+                    Ok(n)
+                }
+            }
+        })
+        .await
+        .expect("the third attempt succeeds");
+
+        assert_eq!(result, 2);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![0, 1, 2],
+            "every attempt must re-enter the closure, so a fresh client is built"
+        );
+    }
+
     #[tokio::test]
     async fn a_persistent_transport_failure_gives_up() {
         let attempts = AtomicU32::new(0);
-        let error = with_handshake_retry("test", || {
+        let error = retry_transport("test", || {
             attempts.fetch_add(1, Ordering::Relaxed);
             async move { Err::<(), _>(tower_mcp::Error::Transport("server is down".into())) }
         })
