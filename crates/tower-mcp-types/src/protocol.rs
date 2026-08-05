@@ -59,6 +59,18 @@ impl std::error::Error for MetaValidationError {}
 /// This checks syntax only. Prefixes whose second label is `mcp` or
 /// `modelcontextprotocol` are reserved for MCP, but remain valid for the
 /// protocol's own keys.
+/// Validate a `_meta` key against the spec's name grammar.
+///
+/// Applied strictly when serializing and leniently when deserializing: a
+/// nonconforming inbound entry is dropped rather than failing the value that
+/// carries it. `_meta` is extensible, ignorable metadata, so discarding a
+/// whole `tools/list` result because one key is misnamed trades all of the
+/// useful data for none of it (#1212).
+///
+/// The asymmetry costs nothing in discoverability. A server built on this
+/// crate is told at once, because emitting a bad key is a hard error. A bad
+/// key read from a peer belongs to an author this process cannot reach, so
+/// there is no one here to inform.
 pub fn validate_meta_key(key: &str) -> Result<(), MetaValidationError> {
     let (prefix, name) = match key.split_once('/') {
         Some((prefix, name)) => (Some(prefix), name),
@@ -153,11 +165,34 @@ pub(crate) mod meta_object_serde {
         T: serde::de::DeserializeOwned,
         D: Deserializer<'de>,
     {
-        let value = Option::<Value>::deserialize(deserializer)?;
+        let mut value = Option::<Value>::deserialize(deserializer)?;
+
+        // Strict on the way out, tolerant on the way in for *key names*.
+        // `_meta` is extensible, ignorable metadata, so rejecting a whole
+        // response because one key is misnamed trades all of the useful data
+        // for none of it. A nonconforming entry is dropped rather than
+        // propagated, so nothing downstream sees a key this crate would
+        // refuse to emit (#1212).
+        //
+        // The shape is a different question and stays strict: `_meta` must be
+        // an object. A non-object is structurally malformed rather than an
+        // unrecognized extension, and there is nothing to salvage from it.
+        match value.as_mut() {
+            Some(Value::Object(map)) => {
+                map.retain(|key, _| super::validate_meta_key(key).is_ok());
+            }
+            Some(other) => {
+                return Err(D::Error::custom(
+                    super::validate_meta_object(other)
+                        .expect_err("a non-object _meta must fail the object check"),
+                ));
+            }
+            None => {}
+        }
+
         let Some(value) = value else {
             return Ok(None);
         };
-        super::validate_meta_object(&value).map_err(D::Error::custom)?;
         serde_json::from_value(value)
             .map(Some)
             .map_err(D::Error::custom)
@@ -5853,8 +5888,18 @@ mod tests {
         .unwrap();
         assert!(valid.meta.is_some());
 
+        // A non-object `_meta` is structurally malformed and still rejected.
+        let value = serde_json::json!({
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": { "name": "client", "version": "1" },
+            "_meta": []
+        });
+        assert!(serde_json::from_value::<InitializeParams>(value).is_err());
+
+        // A misnamed key is dropped rather than failing the value, so a peer's
+        // minor nonconformance does not cost us the whole message (#1212).
         for meta in [
-            serde_json::json!([]),
             serde_json::json!({"bad/key/again": true}),
             serde_json::json!({"-bad": true}),
         ] {
@@ -5864,7 +5909,14 @@ mod tests {
                 "clientInfo": { "name": "client", "version": "1" },
                 "_meta": meta
             });
-            assert!(serde_json::from_value::<InitializeParams>(value).is_err());
+            let parsed = serde_json::from_value::<InitializeParams>(value)
+                .expect("a misnamed _meta key must not fail the request");
+            assert!(
+                parsed
+                    .meta
+                    .is_some_and(|m| m.as_object().is_some_and(|o| o.is_empty())),
+                "the offending entry is dropped"
+            );
         }
 
         let invalid_outbound = InitializeParams {
@@ -8039,5 +8091,83 @@ mod primitive_schema_dispatch_tests {
         let json = serde_json::json!({"type": "null", "title": "Nothing"});
         let parsed: PrimitiveSchemaDefinition = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(serde_json::to_value(&parsed).unwrap(), json);
+    }
+}
+
+#[cfg(test)]
+mod tolerant_meta_tests {
+    use super::*;
+
+    /// #1212: a single misnamed `_meta` key made an entire response
+    /// undeserializable, so a client could not list tools from any FastMCP
+    /// server. `_fastmcp` starts with an underscore, which the name grammar
+    /// forbids, and the whole `tools/list` result was discarded over it.
+    #[test]
+    fn a_nonconforming_meta_key_does_not_discard_the_response() {
+        let wire = r#"{
+            "tools": [{"name": "ask", "inputSchema": {"type": "object"}}],
+            "_meta": {"_fastmcp": {"version": "2"}, "io.example/ok": 1}
+        }"#;
+        let result: ListToolsResult =
+            serde_json::from_str(wire).expect("a bad _meta key must not lose the tools");
+
+        assert_eq!(result.tools.len(), 1, "the useful data must survive");
+        let meta = result.meta.expect("conforming entries remain");
+        assert!(
+            meta.get("_fastmcp").is_none(),
+            "the offending entry is dropped, not propagated: {meta}"
+        );
+        assert_eq!(
+            meta.get("io.example/ok"),
+            Some(&serde_json::json!(1)),
+            "conforming entries are untouched: {meta}"
+        );
+    }
+
+    /// Dropping every entry leaves an empty object rather than failing.
+    #[test]
+    fn a_meta_of_only_bad_keys_deserializes_empty() {
+        let wire = r#"{"tools": [], "_meta": {"_a": 1, "_b": 2}}"#;
+        let result: ListToolsResult = serde_json::from_str(wire).expect("must not fail");
+        assert!(
+            result
+                .meta
+                .is_some_and(|m| m.as_object().unwrap().is_empty()),
+            "all entries dropped, value retained"
+        );
+    }
+
+    /// The rule still binds what this crate emits, which is where a server
+    /// author actually needs to hear about it.
+    #[test]
+    fn serializing_a_nonconforming_meta_key_still_fails() {
+        let result = ListToolsResult {
+            tools: vec![],
+            next_cursor: None,
+            ttl_ms: None,
+            cache_scope: None,
+            meta: Some(serde_json::json!({"_fastmcp": 1})),
+        };
+        let error = serde_json::to_string(&result)
+            .expect_err("emitting a bad _meta key must remain an error");
+        assert!(
+            error.to_string().contains("invalid name"),
+            "the error must name the problem: {error}"
+        );
+    }
+
+    /// A prefixed key that conforms is unaffected by the tolerance.
+    #[test]
+    fn conforming_prefixed_keys_round_trip() {
+        let wire =
+            r#"{"tools": [], "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "s"}}}"#;
+        let result: ListToolsResult = serde_json::from_str(wire).unwrap();
+        assert!(
+            result
+                .meta
+                .unwrap()
+                .get("io.modelcontextprotocol/serverInfo")
+                .is_some()
+        );
     }
 }
