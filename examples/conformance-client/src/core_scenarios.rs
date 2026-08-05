@@ -24,11 +24,70 @@ pub(crate) fn client_builder() -> Result<McpClientBuilder> {
     Ok(builder)
 }
 
+/// Run a handshake, retrying a bounded number of times on transport-level
+/// failures.
+///
+/// The suite runs against a loopback server, where a POST occasionally fails
+/// to send outright. Since #1174 an undelivered `notifications/initialized`
+/// is an `initialize()` error rather than a silent no-op, which is correct
+/// but turns that rare transient into a red conformance check attributed to
+/// whichever PR happened to be running (#1196).
+///
+/// Only [`tower_mcp::Error::Transport`] is retried. A protocol error is a
+/// real conformance result and must surface on the first attempt; retrying
+/// one would mask the failures this suite exists to catch. Each retry is
+/// logged so a systematic problem still looks systematic.
+///
+/// Retrying `initialize` on the same client is safe: the server creates a
+/// fresh session for any `initialize`, and the transport adopts the new
+/// session id from the response.
+pub(crate) async fn with_handshake_retry<F, Fut, T>(what: &str, mut attempt: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, tower_mcp::Error>>,
+{
+    const ATTEMPTS: u32 = 3;
+    let mut delay = std::time::Duration::from_millis(50);
+    let mut last_error = None;
+
+    for attempt_number in 1..=ATTEMPTS {
+        match attempt().await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                if !matches!(error, tower_mcp::Error::Transport(_)) {
+                    return Err(error.into());
+                }
+                tracing::warn!(
+                    %error,
+                    attempt = attempt_number,
+                    attempts = ATTEMPTS,
+                    "transport failure during {what}, retrying"
+                );
+                last_error = Some(error);
+                if attempt_number < ATTEMPTS {
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+            }
+        }
+    }
+
+    Err(last_error
+        .expect("a failed retry loop records its last error")
+        .into())
+}
+
 pub(crate) async fn activate(client: &McpClient) -> Result<()> {
     if uses_final_protocol() {
-        client.discover("conformance-client", "0.1.0").await?;
+        with_handshake_retry("discover", || {
+            client.discover("conformance-client", "0.1.0")
+        })
+        .await?;
     } else {
-        client.initialize("conformance-client", "0.1.0").await?;
+        with_handshake_retry("initialize", || {
+            client.initialize("conformance-client", "0.1.0")
+        })
+        .await?;
     }
     Ok(())
 }
@@ -196,7 +255,10 @@ pub async fn sse_retry(server_url: &str) -> Result<()> {
         .connect(transport, handlers::BasicHandler)
         .await?;
 
-    client.initialize("conformance-client", "0.1.0").await?;
+    with_handshake_retry("initialize", || {
+        client.initialize("conformance-client", "0.1.0")
+    })
+    .await?;
     let tools = client.list_tools().await?;
 
     if let Some(tool) = tools.tools.iter().find(|t| t.name == "test_reconnection") {
@@ -218,7 +280,10 @@ pub async fn elicitation_defaults(server_url: &str) -> Result<()> {
         .connect(transport, handlers::ElicitationDefaultsHandler)
         .await?;
 
-    client.initialize("conformance-client", "0.1.0").await?;
+    with_handshake_retry("initialize", || {
+        client.initialize("conformance-client", "0.1.0")
+    })
+    .await?;
     let tools = client.list_tools().await?;
 
     // Look for the elicitation defaults test tool
@@ -252,7 +317,10 @@ pub async fn ttl_list(server_url: &str) -> Result<()> {
         .connect(transport, handlers::BasicHandler)
         .await?;
 
-    client.initialize("conformance-client", "0.1.0").await?;
+    with_handshake_retry("initialize", || {
+        client.initialize("conformance-client", "0.1.0")
+    })
+    .await?;
     let tools = client.list_tools().await?;
 
     anyhow::ensure!(
@@ -274,7 +342,10 @@ pub async fn deprecated_capability(server_url: &str) -> Result<()> {
         .connect(transport, handlers::BasicHandler)
         .await?;
 
-    let result = client.initialize("conformance-client", "0.1.0").await?;
+    let result = with_handshake_retry("initialize", || {
+        client.initialize("conformance-client", "0.1.0")
+    })
+    .await?;
 
     let logging = result
         .capabilities
@@ -309,7 +380,10 @@ pub async fn tasks_extension(server_url: &str) -> Result<()> {
         .connect(transport, handlers::BasicHandler)
         .await?;
 
-    let result = client.initialize("conformance-client", "0.1.0").await?;
+    let result = with_handshake_retry("initialize", || {
+        client.initialize("conformance-client", "0.1.0")
+    })
+    .await?;
 
     let extensions = result
         .capabilities
@@ -365,4 +439,69 @@ pub fn build_tool_arguments(schema: &serde_json::Value) -> serde_json::Value {
     }
 
     serde_json::Value::Object(args)
+}
+
+#[cfg(test)]
+mod handshake_retry_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[tokio::test]
+    async fn a_transient_transport_failure_is_retried() {
+        let attempts = AtomicU32::new(0);
+        let result = with_handshake_retry("test", || {
+            let attempt = attempts.fetch_add(1, Ordering::Relaxed);
+            async move {
+                if attempt == 0 {
+                    Err(tower_mcp::Error::Transport("connection reset".into()))
+                } else {
+                    Ok(42)
+                }
+            }
+        })
+        .await
+        .expect("the second attempt succeeds");
+
+        assert_eq!(result, 42);
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+    }
+
+    /// The property that keeps the suite meaningful: a protocol error is a
+    /// real conformance result, so it must fail on the first attempt rather
+    /// than being retried into a pass or a slower failure.
+    #[tokio::test]
+    async fn a_protocol_error_is_not_retried() {
+        let attempts = AtomicU32::new(0);
+        let error = with_handshake_retry("test", || {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            async move {
+                Err::<(), _>(tower_mcp::Error::JsonRpc(
+                    tower_mcp::error::JsonRpcError::invalid_request("bad handshake"),
+                ))
+            }
+        })
+        .await
+        .expect_err("a protocol error must surface");
+
+        assert!(error.to_string().contains("bad handshake"));
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            1,
+            "a protocol error must not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_persistent_transport_failure_gives_up() {
+        let attempts = AtomicU32::new(0);
+        let error = with_handshake_retry("test", || {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            async move { Err::<(), _>(tower_mcp::Error::Transport("server is down".into())) }
+        })
+        .await
+        .expect_err("a persistent failure must still fail");
+
+        assert!(error.to_string().contains("server is down"));
+        assert_eq!(attempts.load(Ordering::Relaxed), 3, "bounded, not infinite");
+    }
 }
