@@ -60,13 +60,16 @@
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-#[cfg(feature = "stateless")]
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 
-use crate::context::{NotificationReceiver, notification_channel};
+use crate::context::{
+    ChannelClientRequester, ClientRequesterHandle, NotificationReceiver, OutgoingRequestReceiver,
+    notification_channel, outgoing_request_channel,
+};
 use crate::error::Result;
 use crate::jsonrpc::JsonRpcService;
-use crate::protocol::{JsonRpcRequest, JsonRpcResponse, McpNotification};
+use crate::protocol::{JsonRpcRequest, JsonRpcResponse, McpNotification, RequestId};
 use crate::router::{McpRouter, RouterRequest, RouterResponse};
 use crate::transport::service::{CatchError, InjectAnnotations};
 #[cfg(feature = "stateless")]
@@ -107,6 +110,18 @@ impl ChannelTransport {
         Self::with_notifications(router, notification_rx)
     }
 
+    /// Attach a client requester so handlers can call back to the client.
+    ///
+    /// Server-initiated requests (elicitation, sampling) need a route from
+    /// the handler back out to the client. The stdio, HTTP, and WebSocket
+    /// transports build one; this does the same for the in-process path, and
+    /// must run before the router is wrapped by a service or layer.
+    fn with_client_requester(router: McpRouter) -> (McpRouter, OutgoingRequestReceiver) {
+        let (request_tx, request_rx) = outgoing_request_channel(32);
+        let requester: ClientRequesterHandle = Arc::new(ChannelClientRequester::new(request_tx));
+        (router.with_client_requester(requester), request_rx)
+    }
+
     /// Create a channel transport with a caller-owned notification receiver.
     ///
     /// Mirrors [`HttpTransport::with_notifications`]: the host process keeps
@@ -122,8 +137,9 @@ impl ChannelTransport {
     ///
     /// [`HttpTransport::with_notifications`]: crate::transport::HttpTransport::with_notifications
     pub fn with_notifications(router: McpRouter, notification_rx: NotificationReceiver) -> Self {
+        let (router, request_rx) = Self::with_client_requester(router);
         let service = JsonRpcService::new(router.clone());
-        Self::spawn_with_service(router, service, notification_rx)
+        Self::spawn_with_service(router, service, notification_rx, request_rx)
     }
 
     /// Create a channel transport whose dispatch runs through a Tower layer.
@@ -164,10 +180,16 @@ impl ChannelTransport {
         <L::Service as Service<RouterRequest>>::Error: std::fmt::Display + Send,
         <L::Service as Service<RouterRequest>>::Future: Send,
     {
+        let (router, request_rx) = Self::with_client_requester(router);
         let annotations = router.tool_annotations_map();
         let wrapped = layer.layer(router.clone());
         let service = InjectAnnotations::new(CatchError::new(wrapped), annotations);
-        Self::spawn_with_service(router, JsonRpcService::new(service), notification_rx)
+        Self::spawn_with_service(
+            router,
+            JsonRpcService::new(service),
+            notification_rx,
+            request_rx,
+        )
     }
 
     /// Spawn the request and notification loops over an arbitrary dispatch
@@ -182,6 +204,7 @@ impl ChannelTransport {
         router: McpRouter,
         service: JsonRpcService<S>,
         mut notification_rx: NotificationReceiver,
+        mut outgoing_rx: OutgoingRequestReceiver,
     ) -> Self
     where
         S: Service<RouterRequest, Response = RouterResponse, Error = std::convert::Infallible>
@@ -192,6 +215,51 @@ impl ChannelTransport {
     {
         let (request_tx, mut request_rx) = mpsc::channel::<String>(64);
         let (response_tx, response_rx) = mpsc::channel::<String>(64);
+
+        // Server-initiated requests awaiting a client reply, keyed by the id
+        // the requester allocated.
+        type PendingClientRequests = Arc<
+            StdMutex<HashMap<RequestId, tokio::sync::oneshot::Sender<Result<serde_json::Value>>>>,
+        >;
+        let pending: PendingClientRequests = Arc::new(StdMutex::new(HashMap::new()));
+
+        // Outgoing request pump: serialize each server-initiated request onto
+        // the shared stream and park its responder until the client answers.
+        let outgoing_out = response_tx.clone();
+        let outgoing_pending = pending.clone();
+        tokio::spawn(async move {
+            while let Some(outgoing) = outgoing_rx.recv().await {
+                let frame = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": outgoing.id,
+                    "method": outgoing.method,
+                    "params": outgoing.params,
+                });
+                let Ok(json) = serde_json::to_string(&frame) else {
+                    let _ = outgoing.response_tx.send(Err(crate::error::Error::internal(
+                        "ChannelTransport: failed to serialize server request",
+                    )));
+                    continue;
+                };
+                if let Ok(mut pending) = outgoing_pending.lock() {
+                    pending.insert(outgoing.id.clone(), outgoing.response_tx);
+                } else {
+                    continue;
+                }
+                if outgoing_out.send(json).await.is_err() {
+                    // The client is gone; fail the request rather than leave
+                    // the handler awaiting a reply that cannot arrive.
+                    if let Ok(mut pending) = outgoing_pending.lock()
+                        && let Some(responder) = pending.remove(&outgoing.id)
+                    {
+                        let _ = responder.send(Err(crate::error::Error::internal(
+                            "ChannelTransport: client disconnected",
+                        )));
+                    }
+                    return;
+                }
+            }
+        });
 
         #[cfg(feature = "stateless")]
         let subscriptions = Arc::new(StdMutex::new(
@@ -282,6 +350,35 @@ impl ChannelTransport {
                         _ => {}
                     }
                 }
+                // A reply to a server-initiated request: it carries an id
+                // and a result or error but no method. This must be checked
+                // before the request parse below, which such a frame cannot
+                // satisfy (JsonRpcRequest requires `method`).
+                if parsed.get("method").is_none()
+                    && parsed.get("id").is_some()
+                    && (parsed.get("result").is_some() || parsed.get("error").is_some())
+                {
+                    if let Ok(id) = serde_json::from_value::<RequestId>(parsed["id"].clone()) {
+                        let responder = pending.lock().ok().and_then(|mut p| p.remove(&id));
+                        if let Some(responder) = responder {
+                            let result = if let Some(error) = parsed.get("error") {
+                                Err(crate::error::Error::internal(format!(
+                                    "Client error: {error}"
+                                )))
+                            } else {
+                                Ok(parsed
+                                    .get("result")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null))
+                            };
+                            let _ = responder.send(result);
+                        } else {
+                            tracing::warn!(?id, "ChannelTransport: reply for unknown request");
+                        }
+                    }
+                    continue;
+                }
+
                 if parsed.get("id").is_none() {
                     if parsed.get("method").and_then(|m| m.as_str())
                         == Some("notifications/initialized")

@@ -410,6 +410,147 @@ mod layered {
 }
 
 // =============================================================================
+// Server-initiated requests (#1191)
+// =============================================================================
+
+mod bidirectional {
+    use super::*;
+    use async_trait::async_trait;
+
+    use tower_mcp::client::ClientHandler;
+    use tower_mcp::error::JsonRpcError;
+    use tower_mcp::extract::Context;
+    use tower_mcp::protocol::{
+        ContentRole, CreateMessageParams, CreateMessageResult, ElicitAction, ElicitFormParams,
+        ElicitFormSchema, ElicitResult, SamplingContent, SamplingContentOrArray,
+    };
+
+    struct AnsweringHandler;
+
+    #[async_trait]
+    impl ClientHandler for AnsweringHandler {
+        async fn handle_elicit(
+            &self,
+            _params: tower_mcp::protocol::ElicitRequestParams,
+        ) -> Result<ElicitResult, JsonRpcError> {
+            Ok(ElicitResult {
+                action: ElicitAction::Accept,
+                content: Some(
+                    [(
+                        "answer".to_string(),
+                        tower_mcp::protocol::ElicitFieldValue::String("yes".to_string()),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+                meta: None,
+            })
+        }
+
+        async fn handle_create_message(
+            &self,
+            _params: CreateMessageParams,
+        ) -> Result<CreateMessageResult, JsonRpcError> {
+            Ok(CreateMessageResult {
+                role: ContentRole::Assistant,
+                content: SamplingContentOrArray::Single(SamplingContent::Text {
+                    text: "sampled".to_string(),
+                    annotations: None,
+                    meta: None,
+                }),
+                model: "test-model".to_string(),
+                stop_reason: None,
+                meta: None,
+            })
+        }
+    }
+
+    /// #1191: ChannelTransport wired no client requester, so any handler
+    /// calling back to the client failed with "no client requester
+    /// configured", making elicitation and sampling structurally impossible
+    /// in-process.
+    #[tokio::test]
+    async fn elicitation_reaches_the_client_handler() {
+        let ask = ToolBuilder::new("ask")
+            .description("Ask the client a question")
+            .extractor_handler((), |ctx: Context, RawArgs(_): RawArgs| async move {
+                let result = ctx
+                    .elicit_form(ElicitFormParams {
+                        mode: None,
+                        message: "confirm?".to_string(),
+                        requested_schema: ElicitFormSchema::default(),
+                        meta: None,
+                    })
+                    .await?;
+                Ok(CallToolResult::text(format!("{:?}", result.action)))
+            })
+            .build();
+
+        let router = McpRouter::new()
+            .server_info("bidi-channel", "1.0.0")
+            .tool(ask);
+        let client =
+            McpClient::connect_with_handler(ChannelTransport::new(router), AnsweringHandler)
+                .await
+                .expect("connect");
+        client
+            .initialize("test", "1.0.0")
+            .await
+            .expect("initialize");
+
+        let result = client
+            .call_tool("ask", serde_json::json!({}))
+            .await
+            .expect("the elicitation must round trip to the client handler");
+        assert_eq!(result.all_text(), "Accept");
+    }
+
+    #[tokio::test]
+    async fn sampling_reaches_the_client_handler() {
+        let summarize = ToolBuilder::new("summarize")
+            .description("Ask the client's model")
+            .extractor_handler((), |ctx: Context, RawArgs(_): RawArgs| async move {
+                let result = ctx
+                    .sample(CreateMessageParams {
+                        messages: Vec::new(),
+                        max_tokens: 16,
+                        system_prompt: None,
+                        temperature: None,
+                        stop_sequences: Vec::new(),
+                        model_preferences: None,
+                        include_context: None,
+                        metadata: None,
+                        tools: None,
+                        tool_choice: None,
+                        task: None,
+                        meta: None,
+                    })
+                    .await?;
+                Ok(CallToolResult::text(result.model))
+            })
+            .build();
+
+        let router = McpRouter::new()
+            .server_info("bidi-channel", "1.0.0")
+            .tool(summarize);
+        let client =
+            McpClient::connect_with_handler(ChannelTransport::new(router), AnsweringHandler)
+                .await
+                .expect("connect");
+        client
+            .initialize("test", "1.0.0")
+            .await
+            .expect("initialize");
+
+        let result = client
+            .call_tool("summarize", serde_json::json!({}))
+            .await
+            .expect("the sampling request must round trip to the client handler");
+        assert_eq!(result.all_text(), "test-model");
+    }
+}
+
+// =============================================================================
 // Client-requested progress (#1190)
 // =============================================================================
 
