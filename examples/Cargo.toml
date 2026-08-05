@@ -66,6 +66,11 @@ name = "tasks"
 path = "tasks.rs"
 required-features = ["protocol-2026-07-28"]
 
+[[example]]
+name = "mrtr_elicitation"
+path = "mrtr_elicitation.rs"
+required-features = ["protocol-2026-07-28"]
+
 # --- Transports ---
 [[example]]
 name = "http_server"

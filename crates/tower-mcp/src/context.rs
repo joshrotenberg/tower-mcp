@@ -342,6 +342,11 @@ pub struct RequestContext {
     extensions: Arc<Extensions>,
     /// Minimum log level set by the client (shared with router for dynamic updates)
     min_log_level: Option<Arc<RwLock<LogLevel>>>,
+    /// Whether this request arrived on the 2026-07-28 lifecycle, where the
+    /// server never initiates JSON-RPC requests. Distinguishes "the protocol
+    /// has no route for this" from "a transport did not wire one up", which
+    /// are the same absent requester but very different problems (#1201).
+    final_lifecycle: bool,
 }
 
 /// Type-erased extensions map for passing data to handlers.
@@ -427,6 +432,7 @@ impl RequestContext {
             cancellation: tokio_util::sync::CancellationToken::new(),
             notification_tx: None,
             client_requester: None,
+            final_lifecycle: false,
             extensions: Arc::new(Extensions::new()),
             min_log_level: None,
         }
@@ -454,6 +460,34 @@ impl RequestContext {
     }
 
     /// Set the client requester for server-to-client requests
+    /// Mark this context as serving a 2026-07-28 request.
+    ///
+    /// Only affects diagnostics: the final lifecycle has no server-initiated
+    /// requests, so the router does not attach a requester, and this lets the
+    /// resulting error say why rather than blaming configuration.
+    pub(crate) fn with_final_lifecycle(mut self, final_lifecycle: bool) -> Self {
+        self.final_lifecycle = final_lifecycle;
+        self
+    }
+
+    /// The error for a server-initiated request that has no route to the client.
+    fn no_requester(&self, what: &str, replacement: &str) -> Error {
+        if self.final_lifecycle {
+            Error::Internal(format!(
+                "{what} is not available on the 2026-07-28 lifecycle: servers do not \
+                 initiate JSON-RPC requests. Return {replacement} from the handler \
+                 instead, so the client fulfils the request and retries (SEP-2322 \
+                 Multi Round-Trip Requests)."
+            ))
+        } else {
+            Error::Internal(format!(
+                "{what} is not available: no client requester is configured. The \
+                 transport must provide one; stdio, HTTP, WebSocket, and the \
+                 in-process channel transport all do."
+            ))
+        }
+    }
+
     pub fn with_client_requester(mut self, requester: ClientRequesterHandle) -> Self {
         self.client_requester = Some(requester);
         self
@@ -802,9 +836,28 @@ impl RequestContext {
     ///     Ok(CallToolResult::text(format!("{:?}", result.content)))
     /// }
     /// ```
+    /// # Protocol lifecycle
+    ///
+    /// This is a 2025-11-25 mechanism. The 2026-07-28 lifecycle has no
+    /// server-initiated JSON-RPC requests: `ElicitRequest` and
+    /// `CreateMessageRequest` survive only as members of `InputRequest`,
+    /// carried inside an [`InputRequiredResult`](crate::protocol::InputRequiredResult)
+    /// that the client fulfils and retries. Calling this on a 2026-07-28
+    /// request therefore fails; return
+    /// [`RequestOutcome::input_required`](crate::protocol::RequestOutcome::input_required)
+    /// from the handler instead (SEP-2322 Multi Round-Trip Requests).
+    ///
+    /// [`can_sample`](Self::can_sample) and [`can_elicit`](Self::can_elicit)
+    /// both report `false` on that lifecycle, so a handler serving both eras
+    /// can branch on them rather than on the protocol version.
+    ///
     pub async fn sample(&self, params: CreateMessageParams) -> Result<CreateMessageResult> {
         let requester = self.client_requester.as_ref().ok_or_else(|| {
-            Error::Internal("Sampling not available: no client requester configured".to_string())
+            self.no_requester(
+                "Sampling",
+                "`RequestOutcome::input_required` carrying an \
+                 `InputRequest::CreateMessage`",
+            )
         })?;
 
         requester.sample(params).await
@@ -850,9 +903,27 @@ impl RequestContext {
     ///     }
     /// }
     /// ```
+    /// # Protocol lifecycle
+    ///
+    /// This is a 2025-11-25 mechanism. The 2026-07-28 lifecycle has no
+    /// server-initiated JSON-RPC requests: `ElicitRequest` and
+    /// `CreateMessageRequest` survive only as members of `InputRequest`,
+    /// carried inside an [`InputRequiredResult`](crate::protocol::InputRequiredResult)
+    /// that the client fulfils and retries. Calling this on a 2026-07-28
+    /// request therefore fails; return
+    /// [`RequestOutcome::input_required`](crate::protocol::RequestOutcome::input_required)
+    /// from the handler instead (SEP-2322 Multi Round-Trip Requests).
+    ///
+    /// [`can_sample`](Self::can_sample) and [`can_elicit`](Self::can_elicit)
+    /// both report `false` on that lifecycle, so a handler serving both eras
+    /// can branch on them rather than on the protocol version.
+    ///
     pub async fn elicit_form(&self, params: ElicitFormParams) -> Result<ElicitResult> {
         let requester = self.client_requester.as_ref().ok_or_else(|| {
-            Error::Internal("Elicitation not available: no client requester configured".to_string())
+            self.no_requester(
+                "Elicitation",
+                "`RequestOutcome::input_required` carrying an `InputRequest::Elicit`",
+            )
         })?;
 
         requester.elicit(ElicitRequestParams::Form(params)).await
@@ -894,9 +965,27 @@ impl RequestContext {
     ///     }
     /// }
     /// ```
+    /// # Protocol lifecycle
+    ///
+    /// This is a 2025-11-25 mechanism. The 2026-07-28 lifecycle has no
+    /// server-initiated JSON-RPC requests: `ElicitRequest` and
+    /// `CreateMessageRequest` survive only as members of `InputRequest`,
+    /// carried inside an [`InputRequiredResult`](crate::protocol::InputRequiredResult)
+    /// that the client fulfils and retries. Calling this on a 2026-07-28
+    /// request therefore fails; return
+    /// [`RequestOutcome::input_required`](crate::protocol::RequestOutcome::input_required)
+    /// from the handler instead (SEP-2322 Multi Round-Trip Requests).
+    ///
+    /// [`can_sample`](Self::can_sample) and [`can_elicit`](Self::can_elicit)
+    /// both report `false` on that lifecycle, so a handler serving both eras
+    /// can branch on them rather than on the protocol version.
+    ///
     pub async fn elicit_url(&self, params: ElicitUrlParams) -> Result<ElicitResult> {
         let requester = self.client_requester.as_ref().ok_or_else(|| {
-            Error::Internal("Elicitation not available: no client requester configured".to_string())
+            self.no_requester(
+                "Elicitation",
+                "`RequestOutcome::input_required` carrying an `InputRequest::Elicit`",
+            )
         })?;
 
         requester.elicit(ElicitRequestParams::Url(params)).await
@@ -1047,8 +1136,9 @@ impl RequestContext {
         params: serde_json::Value,
     ) -> Result<serde_json::Value> {
         let requester = self.client_requester.as_ref().ok_or_else(|| {
-            Error::Internal(
-                "Client request not available: no client requester configured".to_string(),
+            self.no_requester(
+                "A server-initiated client request",
+                "`RequestOutcome::input_required`",
             )
         })?;
         requester.request(method.to_string(), params).await
@@ -1250,7 +1340,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Sampling not available")
+                .contains("Sampling is not available: no client requester is configured")
         );
     }
 
@@ -1300,7 +1390,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Elicitation not available")
+                .contains("Elicitation is not available: no client requester is configured")
         );
     }
 
@@ -1323,7 +1413,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Elicitation not available")
+                .contains("Elicitation is not available: no client requester is configured")
         );
     }
 
@@ -1337,7 +1427,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Elicitation not available")
+                .contains("Elicitation is not available: no client requester is configured")
         );
     }
 
@@ -1581,7 +1671,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Client request not available")
+                .contains("no client requester is configured")
         );
     }
 
@@ -1606,5 +1696,103 @@ mod tests {
 
         let err = ctx.get_task_info("x").await.unwrap_err();
         assert!(err.to_string().contains("does not support arbitrary"));
+    }
+}
+
+#[cfg(test)]
+mod final_lifecycle_diagnostics_tests {
+    use super::*;
+    use crate::protocol::{ElicitFormParams, ElicitFormSchema};
+
+    fn params() -> ElicitFormParams {
+        ElicitFormParams {
+            mode: None,
+            message: "confirm?".to_string(),
+            requested_schema: ElicitFormSchema::new(),
+            meta: None,
+        }
+    }
+
+    fn sampling_params() -> CreateMessageParams {
+        CreateMessageParams {
+            messages: Vec::new(),
+            max_tokens: 1,
+            system_prompt: None,
+            temperature: None,
+            stop_sequences: Vec::new(),
+            model_preferences: None,
+            include_context: None,
+            metadata: None,
+            tools: None,
+            tool_choice: None,
+            task: None,
+            meta: None,
+        }
+    }
+
+    /// #1201: the final lifecycle has no server-initiated requests, so the
+    /// absent requester is a protocol fact rather than missing configuration.
+    /// The message must say so and name the replacement, because the generic
+    /// text sent a reporter looking at transport wiring that was correct.
+    #[tokio::test]
+    async fn final_lifecycle_elicitation_error_names_the_replacement() {
+        let ctx = RequestContext::new(RequestId::Number(1)).with_final_lifecycle(true);
+
+        let error = ctx.elicit_form(params()).await.unwrap_err().to_string();
+        assert!(
+            error.contains("2026-07-28"),
+            "must name the lifecycle: {error}"
+        );
+        assert!(
+            error.contains("do not \ninitiate JSON-RPC requests")
+                || error.contains("do not initiate JSON-RPC requests"),
+            "must explain the cause: {error}"
+        );
+        assert!(
+            error.contains("RequestOutcome::input_required"),
+            "must name the replacement API: {error}"
+        );
+        assert!(
+            error.contains("SEP-2322"),
+            "must cite the mechanism: {error}"
+        );
+        assert!(
+            !error.contains("no client requester is configured"),
+            "must not blame configuration: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn final_lifecycle_sampling_error_names_the_replacement() {
+        let ctx = RequestContext::new(RequestId::Number(1)).with_final_lifecycle(true);
+        let error = ctx.sample(sampling_params()).await.unwrap_err().to_string();
+        assert!(error.contains("2026-07-28"), "{error}");
+        assert!(error.contains("RequestOutcome::input_required"), "{error}");
+    }
+
+    /// A legacy request with no requester is still a configuration problem,
+    /// and must not be mislabelled as a protocol restriction.
+    #[tokio::test]
+    async fn legacy_lifecycle_keeps_the_configuration_error() {
+        let ctx = RequestContext::new(RequestId::Number(1));
+
+        let error = ctx.elicit_form(params()).await.unwrap_err().to_string();
+        assert!(
+            error.contains("no client requester is configured"),
+            "a legacy transport without a requester is misconfigured: {error}"
+        );
+        assert!(
+            !error.contains("2026-07-28"),
+            "must not blame the protocol: {error}"
+        );
+    }
+
+    /// The capability probes report the restriction too, so a handler serving
+    /// both eras can branch without inspecting the protocol version.
+    #[tokio::test]
+    async fn capability_probes_report_false_on_the_final_lifecycle() {
+        let ctx = RequestContext::new(RequestId::Number(1)).with_final_lifecycle(true);
+        assert!(!ctx.can_elicit());
+        assert!(!ctx.can_sample());
     }
 }

@@ -1089,7 +1089,9 @@ impl McpRouter {
         // requests. Legacy transports may provide a requester scoped to the
         // originating request; prefer it over a transport-wide fallback so
         // restricted requests stay on their associated response channel.
-        let ctx = if !is_final_protocol_request(per_request)
+        let final_lifecycle = is_final_protocol_request(per_request);
+        let ctx = ctx.with_final_lifecycle(final_lifecycle);
+        let ctx = if !final_lifecycle
             && let Some(requester) = merged
                 .get::<ClientRequesterHandle>()
                 .cloned()
