@@ -160,10 +160,38 @@ impl_cacheable_response!(
     ReadResourceResult,
 );
 
+/// Cancels an in-flight request if its caller's future is dropped.
+///
+/// Disarmed as soon as the response arrives, so only an abandoned request is
+/// cancelled. Uses `try_send` because `Drop` cannot await: if the command
+/// channel is full or closed the cancellation is skipped rather than blocking
+/// a drop, which is the same trade-off `SubscriptionHandle` already makes.
+struct CancelOnDrop {
+    id: RequestId,
+    command_tx: mpsc::Sender<LoopCommand>,
+    armed: bool,
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.command_tx.try_send(LoopCommand::CancelRequest {
+                request_id: self.id.clone(),
+                done_tx: None,
+            });
+        }
+    }
+}
+
 /// Internal command sent from McpClient methods to the background loop.
 enum LoopCommand {
     /// Send a JSON-RPC request and await a response.
+    ///
+    /// The id is allocated by the caller rather than the loop, so a caller
+    /// can cancel the request it sent (#1202). The loop previously owned the
+    /// counter, which left callers with no way to name their own request.
     Request {
+        id: RequestId,
         method: String,
         params: serde_json::Value,
         response_tx: oneshot::Sender<Result<serde_json::Value>>,
@@ -175,7 +203,7 @@ enum LoopCommand {
         acknowledgment_tx: oneshot::Sender<SubscriptionFilter>,
         response_tx: oneshot::Sender<Result<serde_json::Value>>,
     },
-    /// Cancel one active subscription request.
+    /// Cancel one in-flight request, of any method.
     CancelRequest {
         request_id: RequestId,
         done_tx: Option<oneshot::Sender<Result<()>>>,
@@ -358,6 +386,9 @@ pub struct McpClient {
     /// Allocator for per-request progress tokens; `None` when the client did
     /// not opt into progress.
     progress_tokens: Option<Arc<AtomicI64>>,
+    /// Allocator for JSON-RPC request ids, shared with the message loop so
+    /// caller-issued and loop-issued ids never collide.
+    next_request_id: Arc<AtomicI64>,
 }
 
 /// Settings a builder hands to the connect path, grouped so the private
@@ -606,6 +637,8 @@ impl McpClient {
         let loop_connected = connected.clone();
         let loop_roots = roots.clone();
         let loop_response_cache = response_cache.clone();
+        let next_request_id = Arc::new(AtomicI64::new(1));
+        let loop_next_id = next_request_id.clone();
 
         let task = tokio::spawn(async move {
             message_loop(
@@ -615,6 +648,7 @@ impl McpClient {
                 loop_connected,
                 loop_roots,
                 loop_response_cache,
+                loop_next_id,
             )
             .await;
         });
@@ -637,6 +671,7 @@ impl McpClient {
             max_mrtr_rounds,
             response_cache,
             progress_tokens: request_progress.then(|| Arc::new(AtomicI64::new(1))),
+            next_request_id,
         })
     }
 
@@ -1993,9 +2028,11 @@ impl McpClient {
         let params_value = self.with_final_request_meta(params_value).await?;
         let params_value = self.with_progress_token(params_value);
 
+        let id = RequestId::Number(self.next_request_id.fetch_add(1, Ordering::Relaxed));
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(LoopCommand::Request {
+                id: id.clone(),
                 method: method.to_string(),
                 params: params_value,
                 response_tx,
@@ -2003,9 +2040,22 @@ impl McpClient {
             .await
             .map_err(|_| Error::Transport("Connection closed".to_string()))?;
 
+        // Dropping the returned future is what a Rust caller does to abandon
+        // a call: a `select!` losing a race, a timeout, a Ctrl-C handler. The
+        // server was never told, so it kept working on an answer nobody was
+        // waiting for. This guard tells it (#1202), and disarms once the
+        // response arrives so a completed request is never cancelled.
+        let mut guard = CancelOnDrop {
+            id,
+            command_tx: self.command_tx.clone(),
+            armed: true,
+        };
+
         let result = response_rx
             .await
-            .map_err(|_| Error::Transport("Connection closed".to_string()))??;
+            .map_err(|_| Error::Transport("Connection closed".to_string()));
+        guard.armed = false;
+        let result = result??;
 
         serde_json::from_value(result)
             .map_err(|e| Error::Transport(format!("Failed to deserialize response: {}", e)))
@@ -2287,18 +2337,17 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
     connected: Arc<AtomicBool>,
     roots: Arc<RwLock<Vec<Root>>>,
     response_cache: Arc<ClientResponseCache>,
+    next_id: Arc<AtomicI64>,
 ) {
     let handler = Arc::new(handler);
     let mut pending_requests: HashMap<RequestId, PendingRequest> = HashMap::new();
-    let next_id = AtomicI64::new(1);
 
     loop {
         tokio::select! {
             // Commands from McpClient methods
             command = command_rx.recv() => {
                 match command {
-                    Some(LoopCommand::Request { method, params, response_tx }) => {
-                        let id = RequestId::Number(next_id.fetch_add(1, Ordering::Relaxed));
+                    Some(LoopCommand::Request { id, method, params, response_tx }) => {
 
                         let request = JsonRpcRequest::new(id.clone(), &method)
                             .with_params(params);
@@ -2365,21 +2414,32 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
                         request_id,
                         done_tx,
                     }) => {
-                        let result = if pending_requests
-                            .get(&request_id)
-                            .is_some_and(|pending| pending.method == "subscriptions/listen")
-                        {
-                            let result = transport.cancel_request(&request_id).await;
-                            if result.is_ok()
-                                && let Some(pending) = pending_requests.remove(&request_id)
-                            {
-                                let _ = pending.response_tx.send(Err(Error::Transport(
-                                    "subscription cancelled".to_string(),
-                                )));
+                        // Any in-flight request may be cancelled, not only a
+                        // subscription (#1202). An id with nothing pending is
+                        // a no-op: the response already arrived, or the caller
+                        // cancelled twice.
+                        let result = match pending_requests.remove(&request_id) {
+                            Some(pending) => {
+                                let subscription = pending.method == "subscriptions/listen";
+                                let result = transport.cancel_request(&request_id).await;
+                                if result.is_ok() {
+                                    let reason = if subscription {
+                                        "subscription cancelled"
+                                    } else {
+                                        "request cancelled"
+                                    };
+                                    let _ = pending
+                                        .response_tx
+                                        .send(Err(Error::Transport(reason.to_string())));
+                                } else {
+                                    // The notification did not go out, so the
+                                    // request is still live on the server;
+                                    // put it back rather than orphan it.
+                                    pending_requests.insert(request_id.clone(), pending);
+                                }
+                                result
                             }
-                            result
-                        } else {
-                            Ok(())
+                            None => Ok(()),
                         };
                         if let Some(done_tx) = done_tx {
                             let _ = done_tx.send(result);

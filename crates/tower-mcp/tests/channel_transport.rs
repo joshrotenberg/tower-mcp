@@ -676,3 +676,181 @@ mod progress {
         assert_eq!(tokens.len(), 2, "one distinct token per call: {tokens:?}");
     }
 }
+
+// =============================================================================
+// Client-side request cancellation (#1202)
+// =============================================================================
+
+mod cancellation {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::Duration as StdDuration;
+
+    use tower_mcp::extract::Context;
+
+    /// Records every frame the client sends, so a `notifications/cancelled`
+    /// can be observed with the id it carried.
+    #[derive(Clone, Default)]
+    struct FrameLog(Arc<Mutex<Vec<serde_json::Value>>>);
+
+    impl FrameLog {
+        fn cancelled_ids(&self) -> Vec<serde_json::Value> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|f| f["method"] == "notifications/cancelled")
+                .map(|f| f["params"]["requestId"].clone())
+                .collect()
+        }
+    }
+
+    /// Wraps ChannelTransport to observe outbound frames.
+    struct LoggingTransport {
+        inner: ChannelTransport,
+        log: FrameLog,
+    }
+
+    #[async_trait::async_trait]
+    impl tower_mcp::client::ClientTransport for LoggingTransport {
+        async fn send(&mut self, message: &str) -> tower_mcp::Result<()> {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(message) {
+                self.log.0.lock().unwrap().push(v);
+            }
+            self.inner.send(message).await
+        }
+        async fn recv(&mut self) -> tower_mcp::Result<Option<String>> {
+            self.inner.recv().await
+        }
+        fn is_connected(&self) -> bool {
+            self.inner.is_connected()
+        }
+        async fn close(&mut self) -> tower_mcp::Result<()> {
+            self.inner.close().await
+        }
+    }
+
+    fn slow_router() -> McpRouter {
+        let slow = ToolBuilder::new("slow")
+            .description("Runs long enough to be abandoned")
+            .extractor_handler((), |_ctx: Context, RawArgs(_): RawArgs| async move {
+                tokio::time::sleep(StdDuration::from_secs(30)).await;
+                Ok(CallToolResult::text("finished"))
+            })
+            .build();
+        McpRouter::new()
+            .server_info("cancel-test", "1.0.0")
+            .tool(slow)
+    }
+
+    async fn connected(log: FrameLog) -> McpClient {
+        let transport = LoggingTransport {
+            inner: ChannelTransport::new(slow_router()),
+            log,
+        };
+        let client = McpClient::connect(transport).await.expect("connect");
+        client
+            .initialize("test", "1.0.0")
+            .await
+            .expect("initialize");
+        client
+    }
+
+    /// #1202: abandoning a call left the server working on an answer nobody
+    /// was waiting for. Dropping the future is what a Rust caller does on
+    /// Ctrl-C or a timeout, so that is the trigger.
+    #[tokio::test]
+    async fn dropping_a_call_cancels_it_on_the_server() {
+        let log = FrameLog::default();
+        let client = connected(log.clone()).await;
+
+        // Abandon the call the way a timeout or a select! loser would.
+        let abandoned = tokio::time::timeout(
+            StdDuration::from_millis(100),
+            client.call_tool("slow", serde_json::json!({})),
+        )
+        .await;
+        assert!(abandoned.is_err(), "the call must still be running");
+
+        // The guard runs on drop; give the loop a moment to send.
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+
+        let cancelled = log.cancelled_ids();
+        assert_eq!(
+            cancelled.len(),
+            1,
+            "exactly one cancellation must be sent: {cancelled:?}"
+        );
+        assert!(
+            cancelled[0].is_number(),
+            "the id must keep its original JSON type, not become a string: {:?}",
+            cancelled[0]
+        );
+    }
+
+    /// A completed call must never be cancelled: the guard disarms on the
+    /// response, so a normal call emits nothing.
+    #[tokio::test]
+    async fn a_completed_call_is_not_cancelled() {
+        let quick = ToolBuilder::new("quick")
+            .description("Returns immediately")
+            .extractor_handler((), |_ctx: Context, RawArgs(_): RawArgs| async move {
+                Ok(CallToolResult::text("done"))
+            })
+            .build();
+        let log = FrameLog::default();
+        let transport = LoggingTransport {
+            inner: ChannelTransport::new(
+                McpRouter::new()
+                    .server_info("cancel-test", "1.0.0")
+                    .tool(quick),
+            ),
+            log: log.clone(),
+        };
+        let client = McpClient::connect(transport).await.unwrap();
+        client.initialize("test", "1.0.0").await.unwrap();
+
+        client
+            .call_tool("quick", serde_json::json!({}))
+            .await
+            .expect("call completes");
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+
+        assert!(
+            log.cancelled_ids().is_empty(),
+            "a completed call must not be cancelled: {:?}",
+            log.cancelled_ids()
+        );
+    }
+
+    /// Cancelling one call must not disturb another in flight, which is the
+    /// risk that made matching ids out of a wire trace unworkable downstream.
+    #[tokio::test]
+    async fn cancelling_one_call_leaves_another_running() {
+        let log = FrameLog::default();
+        let client = Arc::new(connected(log.clone()).await);
+
+        // A long call we intend to keep.
+        let keeper = {
+            let client = client.clone();
+            tokio::spawn(async move { client.call_tool("slow", serde_json::json!({})).await })
+        };
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+
+        // A second call we abandon.
+        let _ = tokio::time::timeout(
+            StdDuration::from_millis(100),
+            client.call_tool("slow", serde_json::json!({})),
+        )
+        .await;
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+
+        let cancelled = log.cancelled_ids();
+        assert_eq!(cancelled.len(), 1, "only the abandoned call: {cancelled:?}");
+        assert!(
+            !keeper.is_finished(),
+            "the call that was not abandoned must still be pending"
+        );
+        keeper.abort();
+    }
+}
