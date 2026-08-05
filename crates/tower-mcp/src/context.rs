@@ -459,7 +459,6 @@ impl RequestContext {
         self
     }
 
-    /// Set the client requester for server-to-client requests
     /// Mark this context as serving a 2026-07-28 request.
     ///
     /// Only affects diagnostics: the final lifecycle has no server-initiated
@@ -488,6 +487,11 @@ impl RequestContext {
         }
     }
 
+    /// Set the client requester for server-to-client requests.
+    ///
+    /// Only the 2025-11-25 lifecycle uses this: the router does not attach a
+    /// requester to a 2026-07-28 request, because that protocol has no
+    /// server-initiated JSON-RPC requests.
     pub fn with_client_requester(mut self, requester: ClientRequesterHandle) -> Self {
         self.client_requester = Some(requester);
         self
