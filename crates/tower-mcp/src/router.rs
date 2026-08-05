@@ -2877,10 +2877,50 @@ impl McpRouter {
                             return;
                         }
 
-                        // Execute the tool
+                        // Execute the tool.
+                        //
+                        // The outcome-aware call is used so an input-required
+                        // return can be recognized rather than flattened into
+                        // an error mentioning an internal Rust method. Tasks
+                        // cannot yet service that outcome: the client answers
+                        // a task through `tasks/update` rather than by
+                        // retrying `tools/call`, so resuming is the server's
+                        // job, and neither the stored response values nor a
+                        // re-dispatch path exist yet (#1207). Failing here is
+                        // deliberate: routing the outcome into the store would
+                        // move the task to `input_required`, accept the
+                        // client's answers, discard them, and hang.
                         let start = std::time::Instant::now();
-                        let result = tool.call_with_context(ctx, arguments).await;
+                        let outcome = tool.call_outcome_with_context(ctx, arguments).await;
                         let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+                        let result = match outcome {
+                            Ok(crate::protocol::RequestOutcome::Complete(result)) => result,
+                            Ok(crate::protocol::RequestOutcome::InputRequired(_)) => {
+                                let error = JsonRpcError::internal_error(format!(
+                                    "Tool '{tool_name}' asked for additional input, which a \
+                                     task cannot service yet: combining task support with an \
+                                     input-required handler is not supported. Run the tool \
+                                     without task augmentation, where the client fulfils the \
+                                     request and retries."
+                                ));
+                                if let Err(e) = task_store.fail_task(&task_id_clone, error).await {
+                                    tracing::warn!(task_id = %task_id_clone, error = %e, "failed to record task failure");
+                                }
+                                tracing::warn!(
+                                    target: "mcp::tools",
+                                    tool = %tool_name,
+                                    task_id = %task_id_clone,
+                                    "task-augmented call returned an input-required outcome"
+                                );
+                                notifier.notify_task_state(&task_id_clone).await;
+                                return;
+                            }
+                            // Preserved from the previous call path: a handler
+                            // error becomes an `isError` result, which
+                            // completes the task rather than failing it.
+                            Err(error) => CallToolResult::error(error.to_string()),
+                        };
 
                         if cancellation_token.is_cancelled() {
                             tracing::debug!(task_id = %task_id_clone, "Task cancelled during execution");
@@ -5828,6 +5868,87 @@ mod tests {
     // =========================================================================
     // Task Lifecycle Tests
     // =========================================================================
+
+    /// #1207: a task-capable tool whose handler returns an input-required
+    /// outcome fails with a message about the unsupported combination,
+    /// rather than one naming an internal Rust method.
+    ///
+    /// Failing is deliberate rather than provisional. A task's client answers
+    /// through `tasks/update`, so resumption is the server's job, and the
+    /// store retains only the answered keys, not their values. Moving the
+    /// task to `input_required` here would accept the operator's answers,
+    /// discard them, and hang.
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn task_augmented_input_required_fails_with_an_actionable_message() {
+        use crate::async_task::{MemoryTaskStore, TaskStore};
+        use crate::protocol::{InputRequiredResult, RequestOutcome};
+
+        let asks = ToolBuilder::new("asks")
+            .description("Wants input")
+            .task_support(TaskSupportMode::Optional)
+            .mrtr_handler::<serde_json::Value, _, _>(|_ctx, _input| async move {
+                Ok(RequestOutcome::input_required(
+                    InputRequiredResult::new().with_request_state("state"),
+                ))
+            })
+            .build();
+
+        let store = std::sync::Arc::new(MemoryTaskStore::new());
+        let mut router = McpRouter::new()
+            .task_store(store.clone())
+            .tool(asks)
+            .with_tasks();
+        init_router(&mut router).await;
+
+        let resp = router
+            .ready()
+            .await
+            .unwrap()
+            .call(RouterRequest {
+                id: RequestId::Number(1),
+                inner: McpRequest::CallTool(CallToolParams {
+                    input_responses: None,
+                    request_state: None,
+                    name: "asks".to_string(),
+                    arguments: serde_json::json!({}),
+                    meta: None,
+                    task: None,
+                }),
+                extensions: tasks_client_extensions(),
+            })
+            .await
+            .unwrap();
+
+        let task_id = match resp.inner {
+            Ok(McpResponse::FinalCreateTask(result)) => result.task.metadata.task_id,
+            other => panic!("expected a created task, got {other:?}"),
+        };
+
+        // The spawned handler runs concurrently; wait for a terminal state.
+        let mut error = None;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let (task, _, err) = store.get_task_result(&task_id).await.unwrap().unwrap();
+            if task.status == TaskStatus::Failed {
+                error = err;
+                break;
+            }
+        }
+
+        let error = error.expect("the task must reach a terminal failure");
+        assert!(
+            error.message.contains("task cannot service yet")
+                || error.message.contains("not supported"),
+            "must name the unsupported combination: {}",
+            error.message
+        );
+        assert!(
+            !error.message.contains("call_outcome_with_context"),
+            "must not name an internal Rust API: {}",
+            error.message
+        );
+    }
 
     /// #1188: on the stable lifecycle, `tasks/update` acknowledged the client
     /// but never routed `inputResponses` to the store, so a task that reached
