@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.20.1] - 2026-08-05
+
+### Bug Fixes
+
+- **types:** Omit absent optional params instead of sending null ([#1216](https://github.com/joshrotenberg/tower-mcp/pull/1216))
+- **types:** Drop nonconforming _meta keys instead of failing the value ([#1217](https://github.com/joshrotenberg/tower-mcp/pull/1217))
+
+
+
 ## [0.20.0] - 2026-08-05
 
 ### Bug Fixes

@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.20.1] - 2026-08-05
+
+### Features
+
+- **client:** Add a WebSocket client transport ([#1222](https://github.com/joshrotenberg/tower-mcp/pull/1222))
+
+
+
 ## [0.20.0] - 2026-08-05
 
 ### Bug Fixes
