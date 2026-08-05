@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.20.0] - 2026-08-05
+
+### Bug Fixes
+
+- **tasks:** Fail honestly when a task-capable tool asks for input ([#1209](https://github.com/joshrotenberg/tower-mcp/pull/1209))
+
+### Documentation
+
+- **context:** Explain why the final lifecycle has no client requester ([#1206](https://github.com/joshrotenberg/tower-mcp/pull/1206))
+
+### Features
+
+- **client:** Cancel an in-flight request when its caller drops ([#1210](https://github.com/joshrotenberg/tower-mcp/pull/1210))
+- **tasks:** Resume a task whose handler asked for input ([#1211](https://github.com/joshrotenberg/tower-mcp/pull/1211))
+
+
+
 ## [0.19.0] - 2026-08-05
 
 ### Bug Fixes

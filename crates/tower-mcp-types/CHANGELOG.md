@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.20.0] - 2026-08-05
+
+### Bug Fixes
+
+- **types:** Preserve elicitation form field order ([#1203](https://github.com/joshrotenberg/tower-mcp/pull/1203))
+
+
+
 ## [0.19.0] - 2026-08-05
 
 ### Bug Fixes
