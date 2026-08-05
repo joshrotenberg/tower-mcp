@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.19.0] - 2026-08-05
+
+### Bug Fixes
+
+- **types:** Dispatch PrimitiveSchemaDefinition on the declared type ([#1193](https://github.com/joshrotenberg/tower-mcp/pull/1193))
+
+
+
 ## [0.18.2] - 2026-08-04
 
 ### Features

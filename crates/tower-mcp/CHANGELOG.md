@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.19.0] - 2026-08-05
+
+### Bug Fixes
+
+- **tasks:** Apply tasks/update inputResponses on the stable lifecycle ([#1192](https://github.com/joshrotenberg/tower-mcp/pull/1192))
+
+### Features
+
+- **channel:** Support server-initiated requests in-process ([#1194](https://github.com/joshrotenberg/tower-mcp/pull/1194))
+- **client:** Let a client request progress notifications ([#1195](https://github.com/joshrotenberg/tower-mcp/pull/1195))
+
+
+
 ## [0.18.2] - 2026-08-04
 
 ### Bug Fixes
