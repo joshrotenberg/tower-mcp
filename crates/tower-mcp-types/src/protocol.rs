@@ -4662,8 +4662,14 @@ pub struct ElicitFormSchema {
     /// Must be "object"
     #[serde(rename = "type")]
     pub schema_type: String,
-    /// Map of property names to their schema definitions
-    pub properties: std::collections::HashMap<String, PrimitiveSchemaDefinition>,
+    /// Property names mapped to their schema definitions, in the order the
+    /// server declared them.
+    ///
+    /// Insertion order is preserved and is protocol-significant: a client
+    /// renders the form fields in this order. A hash map would have made the
+    /// rendered order arbitrary and, with `HashMap`'s per-process seed,
+    /// unstable between runs of the same server (#1199).
+    pub properties: indexmap::IndexMap<String, PrimitiveSchemaDefinition>,
     /// List of required property names
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required: Vec<String>,
@@ -4674,7 +4680,7 @@ impl ElicitFormSchema {
     pub fn new() -> Self {
         Self {
             schema_type: "object".to_string(),
-            properties: std::collections::HashMap::new(),
+            properties: indexmap::IndexMap::new(),
             required: Vec::new(),
         }
     }
@@ -7832,6 +7838,102 @@ mod draft_2026_07_28_tests {
         let parsed: InputRequiredResult = serde_json::from_value(example).unwrap();
         assert_eq!(parsed.result_type, ResultType::InputRequired);
         assert!(parsed.input_requests.is_some_and(|r| r.contains_key("r1")));
+    }
+}
+
+#[cfg(test)]
+mod elicitation_field_order_tests {
+    use super::*;
+
+    /// Raw wire bytes, not a `json!` value: the macro builds a map that may
+    /// itself reorder keys, which would pre-sort the input and make these
+    /// tests pass for the wrong reason.
+    const DECLARED: &str = r#"{"type":"object","properties":{"firstName":{"type":"string"},"lastName":{"type":"string"},"email":{"type":"string"},"age":{"type":"integer"}},"required":["firstName"]}"#;
+
+    fn parse_declared() -> ElicitFormSchema {
+        serde_json::from_str(DECLARED).expect("declared schema parses")
+    }
+
+    /// #1199: elicitation schemas are the one place in MCP where a JSON
+    /// object's key order carries presentation meaning, since it is the order
+    /// a client renders the form in. A hash map made that order arbitrary and,
+    /// because `HashMap` seeds per process, unstable between runs of the same
+    /// server.
+    #[test]
+    fn declared_field_order_survives_a_round_trip() {
+        let parsed = parse_declared();
+
+        let order: Vec<&str> = parsed.properties.keys().map(String::as_str).collect();
+        assert_eq!(order, ["firstName", "lastName", "email", "age"]);
+
+        // Direct serialization, and the `Value` hop the JSON-RPC layer takes
+        // on every response. The latter needs serde_json's `preserve_order`;
+        // without it the ordered map is re-sorted on the way out.
+        let direct: ElicitFormSchema =
+            serde_json::from_str(&serde_json::to_string(&parsed).expect("serialize"))
+                .expect("reparse");
+        assert_eq!(
+            direct
+                .properties
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["firstName", "lastName", "email", "age"],
+        );
+
+        let round = serde_json::to_value(&parsed).unwrap();
+        let wire: Vec<&str> = round["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            wire,
+            ["firstName", "lastName", "email", "age"],
+            "the order a server declared must reach the wire unchanged"
+        );
+    }
+
+    /// The order must also be stable across repeated decodes, which a
+    /// per-process-seeded hash map could not guarantee.
+    #[test]
+    fn field_order_is_deterministic_across_decodes() {
+        let first: Vec<String> = parse_declared().properties.keys().cloned().collect();
+        for _ in 0..16 {
+            let again: Vec<String> = parse_declared().properties.keys().cloned().collect();
+            assert_eq!(first, again);
+        }
+    }
+
+    /// The builder's declaration order is the order that ships.
+    #[test]
+    fn builder_insertion_order_is_preserved() {
+        let schema = ElicitFormSchema::new()
+            .string_field("zulu", None, true)
+            .string_field("alpha", None, false)
+            .string_field("mike", None, false);
+
+        let order: Vec<&str> = schema.properties.keys().map(String::as_str).collect();
+        assert_eq!(
+            order,
+            ["zulu", "alpha", "mike"],
+            "builder order must not be re-sorted"
+        );
+    }
+
+    /// Field types still dispatch correctly through the ordered map (#1189).
+    #[test]
+    fn ordering_does_not_disturb_variant_dispatch() {
+        let parsed = parse_declared();
+        assert!(matches!(
+            parsed.properties.get("age"),
+            Some(PrimitiveSchemaDefinition::Integer(_))
+        ));
+        assert!(matches!(
+            parsed.properties.get("firstName"),
+            Some(PrimitiveSchemaDefinition::String(_))
+        ));
     }
 }
 
