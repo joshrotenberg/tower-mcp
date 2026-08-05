@@ -4924,7 +4924,7 @@ impl Default for ElicitFormSchema {
 }
 
 /// Primitive schema definition for form fields
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 #[non_exhaustive]
 pub enum PrimitiveSchemaDefinition {
@@ -4942,6 +4942,46 @@ pub enum PrimitiveSchemaDefinition {
     MultiSelectEnum(MultiSelectEnumSchema),
     /// Raw JSON schema (for advanced/custom schemas)
     Raw(serde_json::Value),
+}
+
+// Dispatch on the JSON Schema `type` (and on `enum` for the select variants)
+// rather than letting an untagged enum try variants in order. Every schema
+// struct here declares `type` as a plain `String` that accepts any value, so
+// the first variant matched everything: a `{"type": "boolean"}` field parsed
+// as `String`, and a single-select's `enum` values were dropped entirely
+// because `StringSchema` has nowhere to keep them (#1189).
+impl<'de> Deserialize<'de> for PrimitiveSchemaDefinition {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let schema_type = value.get("type").and_then(Value::as_str);
+        let has_enum = value.get("enum").is_some();
+
+        // An unrecognized shape is preserved verbatim as `Raw` rather than
+        // rejected, so a server using a schema keyword this crate does not
+        // model yet still round-trips through a client.
+        fn parse<T, E>(value: Value) -> Result<T, E>
+        where
+            T: serde::de::DeserializeOwned,
+            E: serde::de::Error,
+        {
+            serde_json::from_value(value).map_err(serde::de::Error::custom)
+        }
+
+        Ok(match (schema_type, has_enum) {
+            (Some("string"), true) => Self::SingleSelectEnum(parse(value)?),
+            (Some("string"), false) => Self::String(parse(value)?),
+            (Some("integer"), _) => Self::Integer(parse(value)?),
+            (Some("number"), _) => Self::Number(parse(value)?),
+            (Some("boolean"), _) => Self::Boolean(parse(value)?),
+            // The multi-select carries its choices in `items.enum`, so the
+            // top-level `enum` check does not apply.
+            (Some("array"), _) => Self::MultiSelectEnum(parse(value)?),
+            _ => Self::Raw(value),
+        })
+    }
 }
 
 /// String field schema
@@ -7792,5 +7832,110 @@ mod draft_2026_07_28_tests {
         let parsed: InputRequiredResult = serde_json::from_value(example).unwrap();
         assert_eq!(parsed.result_type, ResultType::InputRequired);
         assert!(parsed.input_requests.is_some_and(|r| r.contains_key("r1")));
+    }
+}
+
+#[cfg(test)]
+mod primitive_schema_dispatch_tests {
+    use super::*;
+
+    fn variant(json: serde_json::Value) -> &'static str {
+        match serde_json::from_value::<PrimitiveSchemaDefinition>(json).unwrap() {
+            PrimitiveSchemaDefinition::String(_) => "String",
+            PrimitiveSchemaDefinition::Integer(_) => "Integer",
+            PrimitiveSchemaDefinition::Number(_) => "Number",
+            PrimitiveSchemaDefinition::Boolean(_) => "Boolean",
+            PrimitiveSchemaDefinition::SingleSelectEnum(_) => "SingleSelectEnum",
+            PrimitiveSchemaDefinition::MultiSelectEnum(_) => "MultiSelectEnum",
+            PrimitiveSchemaDefinition::Raw(_) => "Raw",
+        }
+    }
+
+    /// #1189: the untagged union matched `String` for every field, so a
+    /// client that matched on the variant coerced every elicitation field to
+    /// text.
+    #[test]
+    fn each_declared_type_parses_to_its_own_variant() {
+        assert_eq!(variant(serde_json::json!({"type": "string"})), "String");
+        assert_eq!(variant(serde_json::json!({"type": "integer"})), "Integer");
+        assert_eq!(variant(serde_json::json!({"type": "number"})), "Number");
+        assert_eq!(variant(serde_json::json!({"type": "boolean"})), "Boolean");
+        assert_eq!(
+            variant(serde_json::json!({"type": "string", "enum": ["a", "b"]})),
+            "SingleSelectEnum"
+        );
+        assert_eq!(
+            variant(serde_json::json!({
+                "type": "array",
+                "items": {"type": "string", "enum": ["a", "b"]}
+            })),
+            "MultiSelectEnum"
+        );
+    }
+
+    /// The values were not merely mislabelled: `StringSchema` has nowhere to
+    /// keep them, so they were destroyed before a client ever saw them.
+    #[test]
+    fn single_select_choices_survive_a_round_trip() {
+        let json = serde_json::json!({"type": "string", "enum": ["a", "b"]});
+        let parsed: PrimitiveSchemaDefinition = serde_json::from_value(json.clone()).unwrap();
+        match &parsed {
+            PrimitiveSchemaDefinition::SingleSelectEnum(schema) => {
+                assert_eq!(schema.enum_values, vec!["a".to_string(), "b".to_string()]);
+            }
+            other => panic!("expected SingleSelectEnum, got {other:?}"),
+        }
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), json);
+    }
+
+    #[test]
+    fn multi_select_choices_survive_a_round_trip() {
+        let json = serde_json::json!({
+            "type": "array",
+            "items": {"type": "string", "enum": ["x", "y"]}
+        });
+        let parsed: PrimitiveSchemaDefinition = serde_json::from_value(json.clone()).unwrap();
+        match &parsed {
+            PrimitiveSchemaDefinition::MultiSelectEnum(schema) => {
+                assert_eq!(
+                    schema.items.enum_values,
+                    vec!["x".to_string(), "y".to_string()]
+                );
+            }
+            other => panic!("expected MultiSelectEnum, got {other:?}"),
+        }
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), json);
+    }
+
+    /// Field-level detail still lands on the right struct.
+    #[test]
+    fn variant_fields_are_preserved() {
+        let json = serde_json::json!({
+            "type": "integer",
+            "title": "Count",
+            "minimum": 1,
+            "maximum": 10
+        });
+        let parsed: PrimitiveSchemaDefinition = serde_json::from_value(json.clone()).unwrap();
+        match &parsed {
+            PrimitiveSchemaDefinition::Integer(schema) => {
+                assert_eq!(schema.title.as_deref(), Some("Count"));
+                assert_eq!(schema.minimum, Some(1));
+                assert_eq!(schema.maximum, Some(10));
+            }
+            other => panic!("expected Integer, got {other:?}"),
+        }
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), json);
+    }
+
+    /// An unmodelled shape is preserved verbatim rather than rejected or
+    /// coerced, so a server ahead of this crate still round-trips.
+    #[test]
+    fn unknown_shapes_fall_back_to_raw() {
+        assert_eq!(variant(serde_json::json!({"type": "null"})), "Raw");
+        assert_eq!(variant(serde_json::json!({"anyOf": []})), "Raw");
+        let json = serde_json::json!({"type": "null", "title": "Nothing"});
+        let parsed: PrimitiveSchemaDefinition = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), json);
     }
 }
