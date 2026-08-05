@@ -9,6 +9,7 @@ members = [
     "examples/conformance-client",
     "examples/codegen-mcp",
     "examples/mcp2md",
+    "tools/interop-probe",
     "tools/rmcp-compat",
     "tools/sdk-interop",
 ]

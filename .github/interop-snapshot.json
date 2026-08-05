@@ -1,0 +1,78 @@
+[
+  {
+    "name": "deepwiki",
+    "connect": {
+      "outcome": "ok"
+    },
+    "protocol_version": "2025-11-25",
+    "tools": {
+      "outcome": "ok"
+    },
+    "resources": {
+      "outcome": "ok"
+    },
+    "resource_templates": {
+      "outcome": "ok"
+    },
+    "prompts": {
+      "outcome": "ok"
+    }
+  },
+  {
+    "name": "gitmcp",
+    "connect": {
+      "outcome": "ok"
+    },
+    "protocol_version": "2025-03-26",
+    "tools": {
+      "outcome": "ok"
+    },
+    "resources": {
+      "outcome": "not_declared"
+    },
+    "resource_templates": {
+      "outcome": "not_declared"
+    },
+    "prompts": {
+      "outcome": "not_declared"
+    }
+  },
+  {
+    "name": "context7",
+    "connect": {
+      "outcome": "ok"
+    },
+    "protocol_version": "2025-11-25",
+    "tools": {
+      "outcome": "ok"
+    },
+    "resources": {
+      "outcome": "ok"
+    },
+    "resource_templates": {
+      "outcome": "ok"
+    },
+    "prompts": {
+      "outcome": "ok"
+    }
+  },
+  {
+    "name": "huggingface",
+    "connect": {
+      "outcome": "ok"
+    },
+    "protocol_version": "2025-11-25",
+    "tools": {
+      "outcome": "ok"
+    },
+    "resources": {
+      "outcome": "ok"
+    },
+    "resource_templates": {
+      "outcome": "ok"
+    },
+    "prompts": {
+      "outcome": "not_declared"
+    }
+  }
+]

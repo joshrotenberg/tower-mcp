@@ -1,0 +1,118 @@
+name: Public server interop
+
+# Exercises tower-mcp's client against real public MCP servers.
+#
+# Deliberately never gates a pull request. A third party being down, slow, or
+# mid-deploy is not our regression, and a lane that reddens for that reason
+# teaches people to ignore CI. The signal is a *change* from the recorded
+# snapshot, reported as an issue.
+
+on:
+  schedule:
+    # Daily, offset from the top of the hour to avoid the scheduling crowd.
+    - cron: "23 7 * * *"
+  workflow_dispatch:
+  pull_request:
+    # Run on changes to the probe itself, so a broken probe is caught before
+    # it starts reporting nonsense on a schedule. Still non-gating below.
+    paths:
+      - "tools/interop-probe/**"
+      - ".github/workflows/interop.yml"
+      - ".github/interop-snapshot.json"
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  probe:
+    name: Probe public servers
+    runs-on: ubuntu-latest
+    # Never fail the workflow: the report is the product, not the exit code.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Probe
+        id: probe
+        run: |
+          set +e
+          cargo run -q -p interop-probe > interop-report.txt 2>&1
+          cargo run -q -p interop-probe -- --snapshot > interop-current.json 2>/dev/null
+          set -e
+          echo "--- report ---"
+          cat interop-report.txt
+
+      - name: Compare against the recorded snapshot
+        id: diff
+        run: |
+          if [ ! -s interop-current.json ]; then
+            echo "changed=error" >> "$GITHUB_OUTPUT"
+            echo "The probe produced no snapshot." > interop-diff.txt
+            exit 0
+          fi
+          if diff -u .github/interop-snapshot.json interop-current.json > interop-diff.txt; then
+            echo "changed=no" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=yes" >> "$GITHUB_OUTPUT"
+            echo "--- diff ---"
+            cat interop-diff.txt
+          fi
+
+      - name: Open or update the tracking issue
+        if: steps.diff.outputs.changed != 'no' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TITLE="Public server interop changed"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          # Built with a heredoc rather than printf: the diff and report are
+          # multi-line and contain backticks and quotes.
+          {
+            echo "The scheduled interop probe saw different behavior than the recorded snapshot."
+            echo
+            echo "This is not necessarily a regression in tower-mcp. A third-party server may have"
+            echo "changed, be mid-deploy, or be down. Read the diff before assuming."
+            echo
+            echo '```diff'
+            cat interop-diff.txt
+            echo '```'
+            echo
+            echo '<details><summary>Full report</summary>'
+            echo
+            echo '```'
+            cat interop-report.txt
+            echo '```'
+            echo
+            echo '</details>'
+            echo
+            echo "If the new behavior is correct, refresh the snapshot with"
+            # Backticks are literal here: this is a markdown code span, not
+            # command substitution.
+            # shellcheck disable=SC2016
+            echo '`cargo run -p interop-probe -- --snapshot > .github/interop-snapshot.json`.'
+            echo "If it is our bug, file it separately and link back here."
+            echo
+            echo "Run: $RUN_URL"
+          } > interop-issue.md
+
+          EXISTING=$(gh issue list --search "$TITLE in:title" --state open --json number --jq '.[0].number' || true)
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body-file interop-issue.md
+          else
+            gh issue create --title "$TITLE" --body-file interop-issue.md
+          fi
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-report
+          path: |
+            interop-report.txt
+            interop-current.json
+            interop-diff.txt
+          retention-days: 30
