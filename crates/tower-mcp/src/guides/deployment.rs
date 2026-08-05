@@ -16,7 +16,7 @@ outside a trusted network.
 
 ```toml
 [dependencies]
-tower-mcp = { version = "0.19", features = ["http"] }
+tower-mcp = { version = "0.20", features = ["http"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 axum = "0.8"
 ```

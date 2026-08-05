@@ -2,7 +2,7 @@
 
 ## Current Status
 
-- **Version**: 0.19.x
+- **Version**: 0.20.x
 - **Spec version**: 2025-11-25 by default, plus the released 2026-07-28 protocol as an opt-in implementation behind `protocol-2026-07-28`
 - **Server conformance (2025-11-25)**: 48/48 (empty baseline)
 - **Client conformance (2025-11-25)**: 235/235 (empty baseline)
@@ -20,7 +20,7 @@ tower-mcp targets Tier 2 per the [MCP SDK Tiering System](https://modelcontextpr
 | 2 | Client conformance >= 80% | 235/235 stable; 399/399 final |
 | 3 | Issue triage within 1 month | Active |
 | 4 | P0 resolution within 2 weeks | 0 open |
-| 5 | Stable release >= 1.0.0 | 0.19.x -- pre-1.0 |
+| 5 | Stable release >= 1.0.0 | 0.20.x -- pre-1.0 |
 | 6 | Spec tracking within 6 months | Current (2026-07-28) |
 | 7 | Documentation coverage | In progress |
 | 8 | Dependency update policy | dependabot.yml |

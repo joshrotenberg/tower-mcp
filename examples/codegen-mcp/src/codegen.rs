@@ -10,7 +10,7 @@
 
 use crate::state::{HandlerType, LayerType, ProjectState, ToolBuilderState, ToolDef, Transport};
 
-const TOWER_MCP_RELEASE_LINE: &str = "0.19";
+const TOWER_MCP_RELEASE_LINE: &str = "0.20";
 const REQWEST_RELEASE_LINE: &str = "0.13";
 
 /// Generate complete Rust code from the project state.
