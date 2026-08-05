@@ -3509,17 +3509,18 @@ impl McpRouter {
 
                 self.authorize_task(&params.task_id, &extensions).await?;
 
-                // SEP-2663 `tasks/update`: validate the task exists and
-                // acknowledge with an empty result. tower-mcp does not yet
-                // model server-initiated `inputRequests` for tasks (that's a
-                // future MRTR-flavored feature), so we currently treat any
-                // submitted `inputResponses` as ignorable per spec ("A server
-                // SHOULD ignore any inputResponses mapped to a key that is
-                // not currently outstanding").
-                let _ = self
-                    .inner
+                // Input responses reach the store on this path exactly as they
+                // do on the final path above. The spec allowance for ignoring
+                // `inputResponses` covers keys that are not outstanding, not
+                // every key, so dropping them wholesale left a server whose
+                // store models input requests with a working flow on
+                // 2026-07-28 and a silent stall on 2025-11-25 (#1188).
+                self.inner
                     .task_store
-                    .get_task(&params.task_id)
+                    .apply_input_responses(
+                        &params.task_id,
+                        decode_input_responses(&params.input_responses),
+                    )
                     .await
                     .map_err(task_store_error)?
                     .ok_or_else(|| {
@@ -3528,6 +3529,10 @@ impl McpRouter {
                             params.task_id
                         )))
                     })?;
+                // A final-protocol subscriber watching this task should see it
+                // resume regardless of which lifecycle the updating client
+                // used. Self-guards when the extension is not enabled.
+                self.notify_task_state(&params.task_id).await;
                 Ok(McpResponse::UpdateTask(EmptyResult {}))
             }
 
@@ -5821,6 +5826,142 @@ mod tests {
     // =========================================================================
     // Task Lifecycle Tests
     // =========================================================================
+
+    /// #1188: on the stable lifecycle, `tasks/update` acknowledged the client
+    /// but never routed `inputResponses` to the store, so a task that reached
+    /// `input_required` stayed there forever while the same flow worked on
+    /// 2026-07-28.
+    #[tokio::test]
+    async fn stable_task_update_applies_input_responses() {
+        use crate::async_task::{MemoryTaskStore, TaskStore};
+        use crate::protocol::{InputRequest, ListRootsParams};
+
+        let store = std::sync::Arc::new(MemoryTaskStore::new());
+        let mut router = McpRouter::new().task_store(store.clone());
+        init_router(&mut router).await;
+
+        let (task_id, _cancel) = store
+            .create_task("permission_gate", serde_json::json!({}), None, None)
+            .await
+            .expect("create task");
+        let requests: crate::protocol::InputRequests = [(
+            "permission".to_string(),
+            InputRequest::ListRoots(ListRootsParams { meta: None }),
+        )]
+        .into_iter()
+        .collect();
+        store
+            .require_input(&task_id, requests, Some("need a decision"))
+            .await
+            .expect("require input");
+        assert_eq!(
+            store.get_task(&task_id).await.unwrap().unwrap().status,
+            TaskStatus::InputRequired
+        );
+
+        // A stable-lifecycle update: no final-protocol extensions present.
+        let resp = router
+            .ready()
+            .await
+            .unwrap()
+            .call(RouterRequest {
+                id: RequestId::Number(1),
+                inner: McpRequest::UpdateTask(UpdateTaskParams {
+                    task_id: task_id.clone(),
+                    input_responses: [("permission".to_string(), serde_json::json!({"roots": []}))]
+                        .into_iter()
+                        .collect(),
+                    meta: None,
+                }),
+                extensions: Extensions::new(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp.inner, Ok(McpResponse::UpdateTask(_))),
+            "the empty-result acknowledgment shape is unchanged: {:?}",
+            resp.inner
+        );
+
+        // The response was consumed and the task resumed, rather than the ack
+        // being a black hole.
+        assert!(
+            store
+                .outstanding_input_requests(&task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_empty(),
+            "the outstanding request must be consumed"
+        );
+        assert_eq!(
+            store.get_task(&task_id).await.unwrap().unwrap().status,
+            TaskStatus::Working,
+            "answering the last outstanding request resumes the task"
+        );
+    }
+
+    /// Unknown keys stay ignorable, which is the part of the spec allowance
+    /// that does apply, and an unknown task still reports -32602.
+    #[tokio::test]
+    async fn stable_task_update_ignores_unmatched_keys() {
+        use crate::async_task::{MemoryTaskStore, TaskStore};
+
+        let store = std::sync::Arc::new(MemoryTaskStore::new());
+        let mut router = McpRouter::new().task_store(store.clone());
+        init_router(&mut router).await;
+
+        let (task_id, _cancel) = store
+            .create_task("noop", serde_json::json!({}), None, None)
+            .await
+            .expect("create task");
+
+        let resp = router
+            .ready()
+            .await
+            .unwrap()
+            .call(RouterRequest {
+                id: RequestId::Number(1),
+                inner: McpRequest::UpdateTask(UpdateTaskParams {
+                    task_id: task_id.clone(),
+                    input_responses: [(
+                        "never-issued".to_string(),
+                        serde_json::json!({"roots": []}),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    meta: None,
+                }),
+                extensions: Extensions::new(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp.inner, Ok(McpResponse::UpdateTask(_))),
+            "an unmatched key is ignored, not rejected: {:?}",
+            resp.inner
+        );
+
+        let unknown = router
+            .ready()
+            .await
+            .unwrap()
+            .call(RouterRequest {
+                id: RequestId::Number(2),
+                inner: McpRequest::UpdateTask(UpdateTaskParams {
+                    task_id: "no-such-task".to_string(),
+                    input_responses: HashMap::new(),
+                    meta: None,
+                }),
+                extensions: Extensions::new(),
+            })
+            .await
+            .unwrap();
+        match unknown.inner {
+            Err(error) => assert_eq!(error.code, -32602),
+            other => panic!("expected -32602 for an unknown task, got {other:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn test_create_task_via_call_tool() {
