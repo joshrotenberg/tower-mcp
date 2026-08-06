@@ -90,6 +90,20 @@ fn is_final_protocol_request(_extensions: &crate::context::Extensions) -> bool {
     false
 }
 
+/// Recover a readable message from a panic payload.
+///
+/// `panic!` with a literal yields `&str` and with a format yields `String`;
+/// anything else is opaque and reported as such rather than guessed at.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&'static str>() {
+        (*text).to_string()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "panicked with a non-string payload".to_string()
+    }
+}
+
 /// Whether this request's client declared the final Tasks extension.
 ///
 /// Final requests carry client capabilities per request, so negotiation is
@@ -424,6 +438,9 @@ struct McpRouterInner {
     /// URL of the server's website
     server_website_url: Option<String>,
     instructions: Option<String>,
+    /// Whether to convert a panicking tool handler into an error result
+    /// rather than letting it unwind out of the service (#1230).
+    catch_panics: bool,
     auto_instructions: Option<AutoInstructionsConfig>,
     tools: HashMap<String, Arc<Tool>>,
     resources: HashMap<String, Arc<Resource>>,
@@ -599,6 +616,7 @@ impl McpRouter {
                 server_icons: None,
                 server_website_url: None,
                 instructions: None,
+                catch_panics: false,
                 auto_instructions: None,
                 tools: HashMap::new(),
                 resources: HashMap::new(),
@@ -1210,6 +1228,31 @@ impl McpRouter {
     /// Set instructions for LLMs describing how to use this server
     pub fn instructions(mut self, instructions: impl Into<String>) -> Self {
         Arc::make_mut(&mut self.inner).instructions = Some(instructions.into());
+        self
+    }
+
+    /// Convert a panicking tool handler into an error result instead of
+    /// letting it unwind out of the service.
+    ///
+    /// Without this, a panic in one handler ends the whole server over stdio
+    /// and kills the connection task over HTTP. A bug in one tool should fail
+    /// that call, not disconnect every client on the process, which is what
+    /// makes this worth having on a long-running shared server.
+    ///
+    /// Off by default, deliberately. A panic is an invariant violation, and
+    /// converting one into a tidy error result hides a bug that the author
+    /// probably wants to see. Opting in is a statement that availability
+    /// matters more than failing fast, which is true for a shared server and
+    /// often false for a local one.
+    ///
+    /// The caught panic becomes a `CallToolResult` with `is_error: true`
+    /// carrying the panic message, and is logged at error level with the tool
+    /// name so it is not silently swallowed.
+    ///
+    /// A panic that unwinds is caught; one that aborts the process (a
+    /// double panic, or `panic = "abort"`) cannot be, by construction.
+    pub fn catch_panics(mut self) -> Self {
+        Arc::make_mut(&mut self.inner).catch_panics = true;
         self
     }
 
@@ -2522,7 +2565,9 @@ impl McpRouter {
         let notifier = self.clone();
         let task_store = self.inner.task_store.clone();
         tokio::spawn(async move {
-            let outcome = tool.call_outcome_with_context(ctx, resume.arguments).await;
+            let outcome = notifier
+                .invoke_tool(&tool, ctx, resume.arguments, &resume.tool_name)
+                .await;
             let result = match outcome {
                 Ok(crate::protocol::RequestOutcome::Complete(result)) => result,
                 // A handler may ask again; each round parks and resumes the
@@ -2539,6 +2584,50 @@ impl McpRouter {
             }
             notifier.notify_task_state(&task_id).await;
         });
+    }
+
+    /// Invoke a tool, optionally converting a panic into an error result.
+    ///
+    /// Enabled by [`McpRouter::catch_panics`]. Without it this is a direct
+    /// call and a panic unwinds as before, which is the default because a
+    /// panic is an invariant violation and hiding one is not always a favour.
+    async fn invoke_tool(
+        &self,
+        tool: &crate::tool::Tool,
+        ctx: RequestContext,
+        arguments: serde_json::Value,
+        tool_name: &str,
+    ) -> Result<crate::protocol::RequestOutcome<CallToolResult>> {
+        if !self.inner.catch_panics {
+            return tool.call_outcome_with_context(ctx, arguments).await;
+        }
+
+        use futures::FutureExt;
+        // AssertUnwindSafe: the future may hold &mut across the await, which
+        // Rust cannot prove safe to observe post-unwind. Any state a panicking
+        // handler leaves behind belongs to that handler; the router's own
+        // state is not mutated by this call.
+        let called = std::panic::AssertUnwindSafe(tool.call_outcome_with_context(ctx, arguments))
+            .catch_unwind()
+            .await;
+
+        match called {
+            Ok(outcome) => outcome,
+            Err(payload) => {
+                let message = panic_message(&*payload);
+                // Logged at error, not swallowed: an operator who opted into
+                // availability still needs to learn about the bug.
+                tracing::error!(
+                    target: "mcp::tools",
+                    tool = %tool_name,
+                    panic = %message,
+                    "tool handler panicked; returning an error result"
+                );
+                Ok(crate::protocol::RequestOutcome::Complete(
+                    CallToolResult::error(format!("tool '{tool_name}' panicked: {message}")),
+                ))
+            }
+        }
     }
 
     /// Push the current state of a task to subscribed listen streams.
@@ -3009,7 +3098,9 @@ impl McpRouter {
                         // answers with `tasks/update` and the router resumes
                         // it (#1208).
                         let start = std::time::Instant::now();
-                        let outcome = tool.call_outcome_with_context(ctx, arguments).await;
+                        let outcome = notifier
+                            .invoke_tool(&tool, ctx, arguments, &tool_name)
+                            .await;
                         let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
                         let result = match outcome {
@@ -3105,8 +3196,8 @@ impl McpRouter {
                     };
 
                     let start = std::time::Instant::now();
-                    let outcome = tool
-                        .call_outcome_with_context(ctx, params.arguments)
+                    let outcome = self
+                        .invoke_tool(&tool, ctx, params.arguments, &params.name)
                         .await?;
                     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -5979,6 +6070,22 @@ mod tests {
     // =========================================================================
     // Task Lifecycle Tests
     // =========================================================================
+
+    /// #1230: a panic payload is `&'static str` for a literal and `String`
+    /// for a formatted message, and both have to survive the trip through
+    /// `Box<dyn Any>` or the error result says nothing useful.
+    #[test]
+    fn panic_message_recovers_both_payload_shapes() {
+        let literal = std::panic::catch_unwind(|| panic!("boom literal")).unwrap_err();
+        assert_eq!(panic_message(&*literal), "boom literal");
+
+        let n = 7;
+        let formatted = std::panic::catch_unwind(|| panic!("boom {n}")).unwrap_err();
+        assert_eq!(panic_message(&*formatted), "boom 7");
+
+        let odd = std::panic::catch_unwind(|| std::panic::panic_any(42u8)).unwrap_err();
+        assert_eq!(panic_message(&*odd), "panicked with a non-string payload");
+    }
 
     /// #1208: the full task input round trip. The handler asks, the task
     /// parks in `input_required` carrying the requests, the client answers

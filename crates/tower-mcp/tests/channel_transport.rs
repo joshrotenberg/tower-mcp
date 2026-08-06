@@ -854,3 +854,119 @@ mod cancellation {
         keeper.abort();
     }
 }
+
+// =============================================================================
+// Panic containment (#1230)
+// =============================================================================
+
+mod panics {
+    use super::*;
+    use tower_mcp::extract::Context;
+
+    fn panicking_router(catch: bool) -> McpRouter {
+        let boom = ToolBuilder::new("boom")
+            .description("Panics")
+            .extractor_handler((), |_ctx: Context, RawArgs(_): RawArgs| async move {
+                panic!("overflow when adding duration to `SystemTime`");
+                #[allow(unreachable_code)]
+                Ok(CallToolResult::text("unreachable"))
+            })
+            .build();
+        let fine = ToolBuilder::new("fine")
+            .description("Works")
+            .extractor_handler((), |_ctx: Context, RawArgs(_): RawArgs| async move {
+                Ok(CallToolResult::text("ok"))
+            })
+            .build();
+
+        let router = McpRouter::new()
+            .server_info("panic-test", "1.0.0")
+            .tool(boom)
+            .tool(fine);
+        if catch { router.catch_panics() } else { router }
+    }
+
+    /// #1230: a panicking handler took down the whole server. The blast
+    /// radius is the point: a bug in one tool should fail that call, not
+    /// disconnect every client on the process.
+    #[tokio::test]
+    async fn a_panicking_tool_does_not_take_down_the_server() {
+        let client = McpClient::connect(ChannelTransport::new(panicking_router(true)))
+            .await
+            .expect("connect");
+        client
+            .initialize("test", "1.0.0")
+            .await
+            .expect("initialize");
+
+        let result = client
+            .call_tool("boom", serde_json::json!({}))
+            .await
+            .expect("the call must return, not kill the connection");
+        assert!(result.is_error, "a caught panic is an error result");
+        assert!(
+            result.all_text().contains("panicked"),
+            "the message must say what happened: {}",
+            result.all_text()
+        );
+        assert!(
+            result.all_text().contains("SystemTime"),
+            "and carry the panic's own message: {}",
+            result.all_text()
+        );
+
+        // The decisive assertion: the connection survives and other tools
+        // still work.
+        let after = client
+            .call_tool("fine", serde_json::json!({}))
+            .await
+            .expect("the server must still be serving");
+        assert_eq!(after.all_text(), "ok");
+    }
+
+    /// Off by default: opting in is a statement that availability matters
+    /// more than failing fast, and that is the caller's call to make.
+    #[tokio::test]
+    async fn panics_are_not_caught_by_default() {
+        let client = McpClient::connect(ChannelTransport::new(panicking_router(false)))
+            .await
+            .expect("connect");
+        client
+            .initialize("test", "1.0.0")
+            .await
+            .expect("initialize");
+
+        // The panic unwinds out of the spawned dispatch task rather than
+        // becoming a tidy error result, so the caller does not receive one.
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            client.call_tool("boom", serde_json::json!({})),
+        )
+        .await;
+        let caught_as_error =
+            matches!(&result, Ok(Ok(r)) if r.is_error && r.all_text().contains("panicked"));
+        assert!(
+            !caught_as_error,
+            "without catch_panics the panic must not be converted: {result:?}"
+        );
+    }
+
+    /// A tool that returns an error normally is unaffected by the wrapper.
+    #[tokio::test]
+    async fn catching_panics_does_not_disturb_ordinary_results() {
+        let client = McpClient::connect(ChannelTransport::new(panicking_router(true)))
+            .await
+            .expect("connect");
+        client
+            .initialize("test", "1.0.0")
+            .await
+            .expect("initialize");
+
+        let result = client
+            .call_tool("fine", serde_json::json!({}))
+            .await
+            .expect("call");
+        assert!(!result.is_error);
+        assert_eq!(result.all_text(), "ok");
+    }
+}
