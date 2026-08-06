@@ -104,6 +104,100 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+/// The kind of capability a [`MergeConflict`] refers to.
+///
+/// Ordered so that [`McpRouter::conflicts`] reports tools before resources
+/// before prompts, which reads more naturally than alphabetical order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MergeConflictKind {
+    /// A tool name defined by both routers.
+    Tool,
+    /// A resource URI defined by both routers.
+    Resource,
+    /// A resource template pattern defined by both routers.
+    ResourceTemplate,
+    /// A prompt name defined by both routers.
+    Prompt,
+}
+
+impl MergeConflictKind {
+    /// The name of this kind as it appears in a conflict message.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Tool => "tool",
+            Self::Resource => "resource",
+            Self::ResourceTemplate => "resource template",
+            Self::Prompt => "prompt",
+        }
+    }
+}
+
+impl std::fmt::Display for MergeConflictKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One capability defined by both routers in a [`McpRouter::try_merge`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MergeConflict {
+    /// Which kind of capability collided.
+    pub kind: MergeConflictKind,
+    /// The tool or prompt name, or the resource URI or template pattern.
+    pub name: String,
+}
+
+impl MergeConflict {
+    fn new(kind: MergeConflictKind, name: impl Into<String>) -> Self {
+        Self {
+            kind,
+            name: name.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for MergeConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} '{}'", self.kind, self.name)
+    }
+}
+
+/// The error returned by [`McpRouter::try_merge`].
+///
+/// Carries every conflicting name rather than the first, so a startup check
+/// reports all the work at once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeConflicts {
+    conflicts: Vec<MergeConflict>,
+}
+
+impl MergeConflicts {
+    /// The conflicting capabilities, ordered by kind and then name.
+    pub fn conflicts(&self) -> &[MergeConflict] {
+        &self.conflicts
+    }
+
+    /// Take ownership of the conflicting capabilities.
+    pub fn into_conflicts(self) -> Vec<MergeConflict> {
+        self.conflicts
+    }
+}
+
+impl std::fmt::Display for MergeConflicts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cannot merge routers: ")?;
+        for (index, conflict) in self.conflicts.iter().enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{conflict}")?;
+        }
+        f.write_str(" defined by both")
+    }
+}
+
+impl std::error::Error for MergeConflicts {}
+
 /// Whether this request's client declared the final Tasks extension.
 ///
 /// Final requests carry client capabilities per request, so negotiation is
@@ -1677,6 +1771,140 @@ impl McpRouter {
         }
 
         self
+    }
+
+    /// Report the names both this router and `other` define.
+    ///
+    /// [`merge`](Self::merge) resolves a collision by letting the incoming
+    /// router win, which is a reasonable default but leaves no trace that an
+    /// implementation was dropped. A host that composes a router it does not
+    /// own can call this first and fail at startup, which is the cheapest
+    /// moment to catch the clash (#1232).
+    ///
+    /// Results are ordered by kind and then name, so they are stable enough
+    /// to assert on and to print.
+    ///
+    /// Protocol extension declarations are deliberately excluded. Two routers
+    /// both declaring the same extension is ordinary composition rather than
+    /// a collision, since a declaration carries no implementation to lose.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::{McpRouter, ToolBuilder, CallToolResult};
+    /// use schemars::JsonSchema;
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Debug, Deserialize, JsonSchema)]
+    /// struct Input { value: String }
+    ///
+    /// fn router_with(name: &str) -> McpRouter {
+    ///     McpRouter::new().tool(
+    ///         ToolBuilder::new(name)
+    ///             .description("example")
+    ///             .handler(|i: Input| async move { Ok(CallToolResult::text(&i.value)) })
+    ///             .build(),
+    ///     )
+    /// }
+    ///
+    /// let host = router_with("get_task");
+    /// let library = router_with("get_task");
+    /// let clashes = host.conflicts(&library);
+    /// assert_eq!(clashes.len(), 1);
+    /// assert_eq!(clashes[0].name, "get_task");
+    /// ```
+    pub fn conflicts(&self, other: &McpRouter) -> Vec<MergeConflict> {
+        let mut found = Vec::new();
+
+        for name in other.inner.tools.keys() {
+            if self.inner.tools.contains_key(name) {
+                found.push(MergeConflict::new(MergeConflictKind::Tool, name));
+            }
+        }
+        for uri in other.inner.resources.keys() {
+            if self.inner.resources.contains_key(uri) {
+                found.push(MergeConflict::new(MergeConflictKind::Resource, uri));
+            }
+        }
+        // Templates are stored as a list rather than a map because matching
+        // is pattern-based, so identity here is the template string itself.
+        for template in &other.inner.resource_templates {
+            if self
+                .inner
+                .resource_templates
+                .iter()
+                .any(|existing| existing.uri_template == template.uri_template)
+            {
+                found.push(MergeConflict::new(
+                    MergeConflictKind::ResourceTemplate,
+                    &template.uri_template,
+                ));
+            }
+        }
+        for name in other.inner.prompts.keys() {
+            if self.inner.prompts.contains_key(name) {
+                found.push(MergeConflict::new(MergeConflictKind::Prompt, name));
+            }
+        }
+
+        // `tools`, `resources`, and `prompts` are hash maps, so without this
+        // the order would vary between runs.
+        found.sort_by(|a, b| (a.kind, &a.name).cmp(&(b.kind, &b.name)));
+        found
+    }
+
+    /// Merge another router, failing if either defines a name the other does.
+    ///
+    /// This is [`merge`](Self::merge) with the collision reported instead of
+    /// resolved. Use it when a silently dropped tool would surface later as a
+    /// capability that behaves unexpectedly rather than as an error, which is
+    /// the usual case when a host merges in a router from a library that
+    /// cannot know what the host already registered.
+    ///
+    /// Callers who want the incoming router to win keep using
+    /// [`merge`](Self::merge). To inspect without consuming either router,
+    /// use [`conflicts`](Self::conflicts).
+    ///
+    /// # Errors
+    ///
+    /// Returns every conflicting name, not just the first, so a startup
+    /// failure names all the work to be done.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::{McpRouter, ToolBuilder, CallToolResult};
+    /// use schemars::JsonSchema;
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Debug, Deserialize, JsonSchema)]
+    /// struct Input { value: String }
+    ///
+    /// fn router_with(name: &str) -> McpRouter {
+    ///     McpRouter::new().tool(
+    ///         ToolBuilder::new(name)
+    ///             .description("example")
+    ///             .handler(|i: Input| async move { Ok(CallToolResult::text(&i.value)) })
+    ///             .build(),
+    ///     )
+    /// }
+    ///
+    /// // Distinct names merge.
+    /// let combined = router_with("query").try_merge(router_with("fetch"));
+    /// assert!(combined.is_ok());
+    ///
+    /// // A shared name is reported rather than dropped.
+    /// let clash = router_with("get_task").try_merge(router_with("get_task"));
+    /// let error = clash.unwrap_err();
+    /// assert_eq!(error.conflicts().len(), 1);
+    /// ```
+    pub fn try_merge(self, other: McpRouter) -> std::result::Result<Self, MergeConflicts> {
+        let conflicts = self.conflicts(&other);
+        if conflicts.is_empty() {
+            Ok(self.merge(other))
+        } else {
+            Err(MergeConflicts { conflicts })
+        }
     }
 
     /// Nest another router's capabilities under a prefix.

@@ -645,7 +645,10 @@ pub use resource::{
 };
 #[cfg(feature = "stateless")]
 pub use resource::{MrtrResourceHandler, MrtrResourceTemplateHandler};
-pub use router::{McpRouter, RouterRequest, RouterResponse, ToolAnnotationsMap};
+pub use router::{
+    McpRouter, MergeConflict, MergeConflictKind, MergeConflicts, RouterRequest, RouterResponse,
+    ToolAnnotationsMap,
+};
 pub use session::{SessionPhase, SessionState};
 #[cfg(feature = "stateless")]
 pub use tool::MrtrToolHandler;
