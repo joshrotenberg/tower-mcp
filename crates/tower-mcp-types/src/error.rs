@@ -182,6 +182,24 @@ pub struct JsonRpcError {
     pub data: Option<serde_json::Value>,
 }
 
+impl std::fmt::Display for JsonRpcError {
+    /// Render for a human.
+    ///
+    /// This is the most common failure a client has to show, since it is
+    /// every rejection a server returns. `Debug` still gives the full struct
+    /// for a log or a panic; this gives the two parts a person reads.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (code {})", self.message, self.code)?;
+        // Structured detail is worth showing when a producer supplied it, and
+        // worth omitting entirely when it did not: `data: None` tells a reader
+        // nothing.
+        if let Some(data) = &self.data {
+            write!(f, ": {data}")?;
+        }
+        Ok(())
+    }
+}
+
 impl JsonRpcError {
     /// Create an error with a standard JSON-RPC code and no structured data.
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
@@ -469,7 +487,7 @@ impl ToolError {
 #[non_exhaustive]
 pub enum Error {
     /// A protocol-level JSON-RPC error returned by a peer or handler.
-    #[error("JSON-RPC error: {0:?}")]
+    #[error("JSON-RPC error: {0}")]
     JsonRpc(JsonRpcError),
 
     /// JSON encoding or decoding failed.
@@ -868,5 +886,58 @@ mod tests {
         assert_eq!(result.tool_err().unwrap(), 42);
         let result: std::result::Result<i32, std::io::Error> = Ok(42);
         assert_eq!(result.tool_context("should not appear").unwrap(), 42);
+    }
+}
+
+#[cfg(test)]
+mod jsonrpc_error_display_tests {
+    use super::*;
+
+    /// #1223: `Error::JsonRpc` rendered through `{0:?}`, so every rejection a
+    /// peer sent reached the user as a struct dump, including `data: None`
+    /// which says nothing at all.
+    #[test]
+    fn a_jsonrpc_error_reads_as_a_sentence() {
+        let error = Error::JsonRpc(JsonRpcError {
+            code: -32603,
+            message: "tool index unavailable".to_string(),
+            data: None,
+        });
+        assert_eq!(
+            error.to_string(),
+            "JSON-RPC error: tool index unavailable (code -32603)"
+        );
+        assert!(
+            !error.to_string().contains("data: None"),
+            "absent data must not be mentioned: {error}"
+        );
+    }
+
+    /// Structured detail is shown when a producer supplied it.
+    #[test]
+    fn structured_data_is_shown_when_present() {
+        let error = JsonRpcError {
+            code: -32021,
+            message: "Missing required client capability".to_string(),
+            data: Some(serde_json::json!({"requiredCapabilities": {"extensions": {}}})),
+        };
+        let rendered = error.to_string();
+        assert!(rendered.starts_with("Missing required client capability (code -32021): "));
+        assert!(rendered.contains("requiredCapabilities"));
+    }
+
+    /// `Debug` still yields the full value, which is what a log or a panic
+    /// wants and what `{0:?}` was reaching for.
+    #[test]
+    fn debug_is_unchanged() {
+        let error = JsonRpcError {
+            code: -32603,
+            message: "boom".to_string(),
+            data: None,
+        };
+        let debug = format!("{error:?}");
+        assert!(debug.contains("JsonRpcError"));
+        assert!(debug.contains("code: -32603"));
+        assert!(debug.contains("data: None"));
     }
 }
