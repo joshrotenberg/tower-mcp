@@ -343,25 +343,42 @@ async fn stdio_supports_final_and_legacy_lifecycles_on_one_stream() {
         .expect("run_with_streams ok");
     assert_eq!(frames.len(), 7, "unexpected frames: {frames:#?}");
 
-    assert_eq!(frames[0]["result"]["resultType"], "complete");
-    assert_eq!(frames[0]["result"]["ttlMs"], 0);
-    assert_eq!(frames[0]["result"]["cacheScope"], "private");
-    assert_eq!(frames[1]["result"]["resultType"], "complete");
-    assert_eq!(frames[1]["result"]["ttlMs"], 0);
+    // Requests are handled concurrently (#1231), so responses arrive in
+    // completion order. JSON-RPC pairs them by id, and so does this test.
+    // The version-rejection error is the exception: it is produced before
+    // the id is read, so it goes out with a null id and is matched by code.
+    let by_id: std::collections::HashMap<i64, &serde_json::Value> = frames
+        .iter()
+        .filter_map(|f| f["id"].as_i64().map(|id| (id, f)))
+        .collect();
+    let response = |id: i64| {
+        *by_id
+            .get(&id)
+            .unwrap_or_else(|| panic!("no response for id {id} in {frames:#?}"))
+    };
+    let version_error = frames
+        .iter()
+        .find(|f| f["error"]["code"] == -32022)
+        .unwrap_or_else(|| panic!("no version-rejection error in {frames:#?}"));
+
+    assert_eq!(response(1)["result"]["resultType"], "complete");
+    assert_eq!(response(1)["result"]["ttlMs"], 0);
+    assert_eq!(response(1)["result"]["cacheScope"], "private");
+    assert_eq!(response(2)["result"]["resultType"], "complete");
+    assert_eq!(response(2)["result"]["ttlMs"], 0);
     assert_eq!(
-        frames[2]["result"]["content"][0]["text"],
+        response(3)["result"]["content"][0]["text"],
         format!("{final_version}|can_elicit=false")
     );
-    assert_eq!(frames[2]["result"]["resultType"], "complete");
-    assert!(frames[2]["result"].get("ttlMs").is_none());
-    assert_eq!(frames[3]["error"]["code"], -32601);
-    assert_eq!(frames[4]["error"]["code"], -32022);
-    assert_eq!(frames[4]["error"]["data"]["requested"], "2099-01-01");
+    assert_eq!(response(3)["result"]["resultType"], "complete");
+    assert!(response(3)["result"].get("ttlMs").is_none());
+    assert_eq!(response(4)["error"]["code"], -32601);
+    assert_eq!(version_error["error"]["data"]["requested"], "2099-01-01");
 
     // Legacy responses retain their established wire shape.
-    assert!(frames[5]["result"].get("resultType").is_none());
-    assert!(frames[6]["result"].get("resultType").is_none());
-    assert_eq!(frames[6]["result"]["tools"].as_array().unwrap().len(), 1);
+    assert!(response(6)["result"].get("resultType").is_none());
+    assert!(response(7)["result"].get("resultType").is_none());
+    assert_eq!(response(7)["result"]["tools"].as_array().unwrap().len(), 1);
 }
 
 /// Runtime support can be narrowed even when the final implementation is
@@ -1534,5 +1551,110 @@ mod close_observation {
             tower_mcp::RequestId::String("drop-me".to_string())
         );
         assert_eq!(closes[0].reason, SubscriptionCloseReason::Disconnected);
+    }
+}
+
+// ============================================================================
+// Concurrent request handling (#1231)
+// ============================================================================
+
+mod concurrency {
+    use super::*;
+    use tower_mcp::extract::RawArgs;
+
+    /// `slow` sleeps long enough that a serial loop cannot possibly answer
+    /// `fast` first, so ordering alone tells us which behaviour we got.
+    const SLOW: Duration = Duration::from_millis(400);
+
+    fn router_with_a_slow_tool() -> McpRouter {
+        let slow = ToolBuilder::new("slow")
+            .description("Sleeps before answering")
+            .extractor_handler((), |_ctx: Context, RawArgs(_): RawArgs| async move {
+                tokio::time::sleep(SLOW).await;
+                Ok(CallToolResult::text("slow"))
+            })
+            .build();
+        let fast = ToolBuilder::new("fast")
+            .description("Answers immediately")
+            .extractor_handler((), |_ctx: Context, RawArgs(_): RawArgs| async move {
+                Ok(CallToolResult::text("fast"))
+            })
+            .build();
+        McpRouter::new()
+            .server_info("stdio-concurrency-test", "0.0.0")
+            .tool(slow)
+            .tool(fast)
+    }
+
+    const INIT: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#;
+    const CALL_SLOW: &str =
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"slow","arguments":{}}}"#;
+    const CALL_FAST: &str =
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fast","arguments":{}}}"#;
+
+    /// Drive a transport with the handshake plus both tool calls, then close
+    /// stdin. Returns the response ids in the order they were written.
+    async fn response_id_order(mut transport: StdioTransport) -> Vec<i64> {
+        let (mut stdin_writer, server_stdin) = tokio::io::duplex(4096);
+        let (server_stdout, server_stdout_reader) = tokio::io::duplex(4096);
+
+        let handle = tokio::spawn(async move {
+            transport
+                .run_with_streams(server_stdin, server_stdout)
+                .await
+        });
+
+        for line in [INIT, CALL_SLOW, CALL_FAST] {
+            stdin_writer.write_all(line.as_bytes()).await.unwrap();
+            stdin_writer.write_all(b"\n").await.unwrap();
+        }
+        stdin_writer.flush().await.unwrap();
+        // EOF while both calls are still in flight: their responses must
+        // still be written before the loop returns.
+        drop(stdin_writer);
+
+        let frames = timeout(
+            Duration::from_secs(10),
+            read_n_frames(BufReader::new(server_stdout_reader), 3),
+        )
+        .await
+        .expect("responses must arrive");
+
+        handle
+            .await
+            .expect("transport task join")
+            .expect("run_with_streams ok");
+
+        assert_eq!(frames.len(), 3, "expected three responses, got {frames:?}");
+        frames
+            .iter()
+            .map(|f| f["id"].as_i64().expect("response carries an id"))
+            .collect()
+    }
+
+    /// #1231: the loop awaited each handler inline, so one slow tool blocked
+    /// every other call on the connection. The fast call is issued second and
+    /// must still be answered first.
+    #[tokio::test]
+    async fn a_slow_tool_does_not_block_later_requests() {
+        let ids = response_id_order(StdioTransport::new(router_with_a_slow_tool())).await;
+        assert_eq!(
+            ids,
+            vec![1, 3, 2],
+            "the fast call (3) was issued after the slow one (2) and must be answered first"
+        );
+    }
+
+    /// `max_concurrent_requests(1)` is the escape hatch back to the old
+    /// behaviour for handlers that assume no two requests overlap.
+    #[tokio::test]
+    async fn a_limit_of_one_restores_serial_handling() {
+        let transport = StdioTransport::new(router_with_a_slow_tool()).max_concurrent_requests(1);
+        let ids = response_id_order(transport).await;
+        assert_eq!(
+            ids,
+            vec![1, 2, 3],
+            "with a limit of 1 the slow call (2) must be answered before the fast one (3)"
+        );
     }
 }

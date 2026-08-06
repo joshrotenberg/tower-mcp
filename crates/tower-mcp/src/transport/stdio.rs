@@ -11,6 +11,23 @@
 //! lifecycle, so both eras can coexist on one stdio stream. Use
 //! [`StdioTransport::protocol_support`] to set the exact runtime allow-list.
 //!
+//! # Concurrency
+//!
+//! Requests are handled on their own tasks, so a slow tool does not block
+//! the rest of the connection. This matches the HTTP and WebSocket
+//! transports, which matters because servers are usually developed over
+//! stdio and deployed over HTTP. Responses are written by the read loop
+//! alone, keeping the single-writer requirement of a line-delimited stream,
+//! and arrive in completion order rather than request order: JSON-RPC pairs
+//! a response to its request by id, not by position.
+//!
+//! `initialize` and `notifications/initialized` are the exception. They
+//! establish the protocol revision that later requests are read against, so
+//! they are handled before anything behind them.
+//!
+//! Use [`StdioTransport::max_concurrent_requests`] to bound how many run at
+//! once, or to return to strictly serial handling with `1`.
+//!
 //! # Bidirectional Support
 //!
 //! For legacy protocols, [`BidirectionalStdioTransport`] enables
@@ -34,7 +51,7 @@ use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
 
 use crate::context::{
     ChannelClientRequester, ClientRequesterHandle, NotificationReceiver, OutgoingRequest,
@@ -377,6 +394,77 @@ pub(crate) fn parse_error_response(message: impl Into<String>) -> JsonRpcRespons
     JsonRpcResponse::error(None, crate::error::JsonRpcError::parse_error(message))
 }
 
+/// Frames produced by concurrently handled requests, drained by the read
+/// loop so that exactly one task ever writes to the output stream.
+type OutboundFrames = mpsc::UnboundedSender<String>;
+
+/// Whether a frame has to be handled before anything that follows it.
+///
+/// `initialize` establishes the protocol revision every later request is
+/// interpreted against, and `notifications/initialized` closes that
+/// handshake, so neither can race the traffic behind it. Both are also
+/// first on the connection, where there is nothing to run concurrently
+/// with anyway, so holding the read loop for them costs nothing.
+///
+/// Everything else is explicitly not a barrier. `notifications/cancelled`
+/// in particular has to overtake the request it cancels, which is the
+/// whole point of handling requests concurrently (#1231).
+fn is_ordering_barrier(line: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct MethodPeek<'a> {
+        #[serde(borrow, default)]
+        method: Option<std::borrow::Cow<'a, str>>,
+    }
+
+    match serde_json::from_str::<MethodPeek>(line) {
+        Ok(MethodPeek {
+            method: Some(method),
+        }) => matches!(method.as_ref(), "initialize" | "notifications/initialized"),
+        _ => false,
+    }
+}
+
+/// Wait for permission to start another concurrent request.
+///
+/// `None` means the caller set no bound, so there is nothing to wait for.
+async fn acquire_request_permit(
+    limit: &Option<Arc<Semaphore>>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    match limit {
+        Some(semaphore) => semaphore.clone().acquire_owned().await.ok(),
+        None => None,
+    }
+}
+
+/// Run one request on its own task, sending any response frame back to the
+/// read loop.
+///
+/// #1231: awaiting the handler inline meant a single slow tool blocked
+/// every other call on the connection, including the `notifications/cancelled`
+/// a client would use to stop it.
+fn spawn_request<F>(
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    out_tx: &OutboundFrames,
+    work: F,
+) where
+    F: std::future::Future<Output = Option<String>> + Send + 'static,
+{
+    let out_tx = out_tx.clone();
+    tokio::spawn(async move {
+        // Held for the life of the request so the bound counts work in
+        // flight rather than requests accepted.
+        let _permit = permit;
+        if let Some(frame) = work.await {
+            let _ = out_tx.send(frame);
+        }
+    });
+}
+
+/// Build the semaphore backing a `max_concurrent_requests` setting.
+fn request_limiter(max_concurrent_requests: Option<usize>) -> Option<Arc<Semaphore>> {
+    max_concurrent_requests.map(|limit| Arc::new(Semaphore::new(limit.max(1))))
+}
+
 /// Process a single line of JSON-RPC input
 ///
 /// Returns `Ok(Some(response))` for requests, `Ok(None)` for notifications.
@@ -541,6 +629,8 @@ pub struct StdioTransport {
     notification_rx: NotificationReceiver,
     control_tx: mpsc::UnboundedSender<StdioControl>,
     control_rx: mpsc::UnboundedReceiver<StdioControl>,
+    /// Bound on requests in flight at once; `None` leaves it unbounded (#1231).
+    max_concurrent_requests: Option<usize>,
 }
 
 impl StdioTransport {
@@ -556,6 +646,7 @@ impl StdioTransport {
             notification_rx,
             control_tx,
             control_rx,
+            max_concurrent_requests: None,
         }
     }
 
@@ -565,6 +656,32 @@ impl StdioTransport {
         StdioTransportHandle {
             control_tx: self.control_tx.clone(),
         }
+    }
+
+    /// Cap how many requests this transport handles at once.
+    ///
+    /// Requests run concurrently by default, matching the HTTP and WebSocket
+    /// transports, so a slow tool does not block the rest of the connection.
+    /// That is unbounded: a client can start as many requests as it can
+    /// write. Set a cap when handlers are expensive enough that the number
+    /// running at once matters.
+    ///
+    /// Reaching the cap applies backpressure by pausing the read loop, so
+    /// requests queue on the input stream rather than piling up in memory.
+    ///
+    /// `1` restores the strictly serial handling this transport used before
+    /// 0.21, which is the escape hatch for handlers that assume no two
+    /// requests overlap.
+    ///
+    /// ```rust
+    /// use tower_mcp::{McpRouter, StdioTransport};
+    ///
+    /// let router = McpRouter::new().server_info("my-server", "1.0.0");
+    /// let transport = StdioTransport::new(router).max_concurrent_requests(16);
+    /// ```
+    pub fn max_concurrent_requests(mut self, limit: usize) -> Self {
+        self.max_concurrent_requests = Some(limit);
+        self
     }
 
     /// Set the exact protocol versions this transport accepts and advertises.
@@ -641,6 +758,9 @@ impl StdioTransport {
             notification_rx: Some(self.notification_rx),
             control_tx: self.control_tx,
             control_rx: self.control_rx,
+            // Carried across the conversion so `.layer()` does not silently
+            // discard a concurrency bound set before it.
+            max_concurrent_requests: self.max_concurrent_requests,
             #[cfg(feature = "stateless")]
             subscription_observer,
         }
@@ -680,6 +800,12 @@ impl StdioTransport {
             ..StdioSubscriptions::default()
         }
         .with_observer(self.router.subscription_observer());
+
+        // Requests run on their own tasks and hand their responses back
+        // here, so this loop stays the only writer to the output stream
+        // (#1231).
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+        let limit = request_limiter(self.max_concurrent_requests);
 
         tracing::info!("Stdio transport started, waiting for input");
 
@@ -735,26 +861,47 @@ impl StdioTransport {
                         }
                     }
 
-                    match process_line(&mut self.service, &self.router, trimmed).await {
-                        Ok(Some(response)) => {
-                            let response_json = serde_json::to_string(&response).map_err(|e| {
-                                Error::Transport(format!("Failed to serialize response: {}", e))
-                            })?;
-                            tracing::debug!(output = %response_json, "Sending response");
-                            write_line_to_stdout(&mut writer, &response_json).await?;
+                    let barrier = is_ordering_barrier(trimmed);
+                    let mut service = self.service.clone();
+                    let router = self.router.clone();
+                    let owned = trimmed.to_string();
+                    // The service clone shares the negotiated protocol
+                    // revision through an `Arc`, so concurrent requests all
+                    // see the same handshake state.
+                    let work = async move {
+                        match process_line(&mut service, &router, &owned).await {
+                            Ok(Some(response)) => match serde_json::to_string(&response) {
+                                Ok(json) => {
+                                    tracing::debug!(output = %json, "Sending response");
+                                    Some(json)
+                                }
+                                Err(e) => {
+                                    tracing::error!(error = %e, "Failed to serialize response");
+                                    None
+                                }
+                            },
+                            Ok(None) => None, // Notification, no response needed
+                            Err(e) => {
+                                tracing::error!(error = %e, "Error processing message");
+                                serde_json::to_string(&parse_error_response(e.to_string())).ok()
+                            }
                         }
-                        Ok(None) => {
-                            // Notification, no response needed
+                    };
+
+                    if barrier {
+                        if let Some(frame) = work.await {
+                            write_line_to_stdout(&mut writer, &frame).await?;
                         }
-                        Err(e) => {
-                            tracing::error!(error = %e, "Error processing message");
-                            let error_response = parse_error_response(e.to_string());
-                            let response_json = serde_json::to_string(&error_response).map_err(|e| {
-                                Error::Transport(format!("Failed to serialize error: {}", e))
-                            })?;
-                            write_line_to_stdout(&mut writer, &response_json).await?;
-                        }
+                    } else {
+                        let permit = acquire_request_permit(&limit).await;
+                        spawn_request(permit, &out_tx, work);
                     }
+                }
+
+                // Responses from concurrently handled requests. Writing
+                // them here keeps stdout framing correct with one writer.
+                Some(frame) = out_rx.recv() => {
+                    write_line_to_stdout(&mut writer, &frame).await?;
                 }
 
                 // Forward server notifications to stdout
@@ -791,6 +938,14 @@ impl StdioTransport {
                     }
                 }
             }
+        }
+
+        // Dropping this loop's sender leaves only the in-flight requests
+        // holding one, so the drain ends when the last of them finishes.
+        // Without it their responses would be lost on shutdown.
+        drop(out_tx);
+        while let Some(frame) = out_rx.recv().await {
+            write_line_to_stdout(&mut writer, &frame).await?;
         }
 
         // The read loop is over: any streams still registered die with
@@ -857,6 +1012,8 @@ where
     notification_rx: Option<NotificationReceiver>,
     control_tx: mpsc::UnboundedSender<StdioControl>,
     control_rx: mpsc::UnboundedReceiver<StdioControl>,
+    /// Bound on requests in flight at once; `None` leaves it unbounded (#1231).
+    max_concurrent_requests: Option<usize>,
     /// Close observer threaded from the router by [`StdioTransport::layer`];
     /// `None` for directly constructed generic transports, which have no
     /// router to read it from.
@@ -887,9 +1044,19 @@ where
             notification_rx: None,
             control_tx,
             control_rx,
+            max_concurrent_requests: None,
             #[cfg(feature = "stateless")]
             subscription_observer: None,
         }
+    }
+
+    /// Cap how many requests this transport handles at once.
+    ///
+    /// See [`StdioTransport::max_concurrent_requests`]. Requests run
+    /// concurrently by default; `1` restores strictly serial handling.
+    pub fn max_concurrent_requests(mut self, limit: usize) -> Self {
+        self.max_concurrent_requests = Some(limit);
+        self
     }
 
     /// Create a new generic stdio transport with notification forwarding.
@@ -906,6 +1073,7 @@ where
             notification_rx: Some(notification_rx),
             control_tx,
             control_rx,
+            max_concurrent_requests: None,
             #[cfg(feature = "stateless")]
             subscription_observer: None,
         }
@@ -961,6 +1129,12 @@ where
         let mut subscriptions =
             StdioSubscriptions::default().with_observer(self.subscription_observer.clone());
 
+        // Requests run on their own tasks and hand their responses back
+        // here, so this loop stays the only writer to the output stream
+        // (#1231).
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+        let limit = request_limiter(self.max_concurrent_requests);
+
         tracing::info!("Generic stdio transport started, waiting for input");
 
         loop {
@@ -979,11 +1153,16 @@ where
                         Self::process_input(
                             &mut self.service,
                             &line,
-                            &mut writer,
+                            &out_tx,
+                            &limit,
                             true,
                             #[cfg(feature = "stateless")]
                             &mut subscriptions,
                         ).await?;
+                    }
+
+                    Some(frame) = out_rx.recv() => {
+                        write_line_to_stdout(&mut writer, &frame).await?;
                     }
 
                     Some(notification) = notif_rx.recv() => {
@@ -1025,12 +1204,17 @@ where
                         Self::process_input(
                             &mut self.service,
                             &line,
-                            &mut writer,
+                            &out_tx,
+                            &limit,
                             false,
                             #[cfg(feature = "stateless")]
                             &mut subscriptions,
                         ).await?;
                     }
+                    Some(frame) = out_rx.recv() => {
+                        write_line_to_stdout(&mut writer, &frame).await?;
+                    }
+
                     Some(control) = self.control_rx.recv() => {
                         if Self::handle_control(
                             control,
@@ -1045,6 +1229,14 @@ where
             }
         }
 
+        // Dropping this loop's sender leaves only the in-flight requests
+        // holding one, so the drain ends when the last of them finishes.
+        // Without it their responses would be lost on shutdown.
+        drop(out_tx);
+        while let Some(frame) = out_rx.recv().await {
+            write_line_to_stdout(&mut writer, &frame).await?;
+        }
+
         // The read loop is over: any streams still registered die with
         // the connection and cannot receive a terminal frame.
         #[cfg(feature = "stateless")]
@@ -1052,16 +1244,19 @@ where
         Ok(())
     }
 
-    async fn process_input<W>(
+    /// Handle one input line.
+    ///
+    /// Frames go out through `out_tx` rather than straight to the writer so
+    /// that requests can be answered on their own tasks while the read loop
+    /// stays the only writer (#1231).
+    async fn process_input(
         service: &mut JsonRpcService<S>,
         line: &str,
-        writer: &mut W,
+        out_tx: &OutboundFrames,
+        limit: &Option<Arc<Semaphore>>,
         subscriptions_enabled: bool,
         #[cfg(feature = "stateless")] subscriptions: &mut StdioSubscriptions,
-    ) -> Result<()>
-    where
-        W: tokio::io::AsyncWrite + Unpin + Send,
-    {
+    ) -> Result<()> {
         let trimmed = clean_input_line(line);
         if trimmed.is_empty() {
             return Ok(());
@@ -1073,7 +1268,7 @@ where
         let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
             Err(e) => {
-                Self::write_error(writer, None, &e.to_string()).await?;
+                let _ = out_tx.send(Self::error_frame(None, &e.to_string())?);
                 return Ok(());
             }
         };
@@ -1083,7 +1278,7 @@ where
             match subscriptions.handle_input(service, &parsed)? {
                 StdioSubscriptionInput::Handled(frames) => {
                     for frame in frames {
-                        write_line_to_stdout(writer, &frame).await?;
+                        let _ = out_tx.send(frame);
                     }
                     return Ok(());
                 }
@@ -1092,7 +1287,7 @@ where
                     let response =
                         dispatch_listen_request(service, *request, request_id.clone()).await;
                     for frame in subscriptions.complete_listen(request_id, &response)? {
-                        write_line_to_stdout(writer, &frame).await?;
+                        let _ = out_tx.send(frame);
                     }
                     return Ok(());
                 }
@@ -1106,7 +1301,7 @@ where
             service.inspect_incoming_value(&parsed, crate::inspection::McpDirection::ClientToServer)
         {
             let response = JsonRpcResponse::error(None, error);
-            write_line_to_stdout(writer, &serde_json::to_string(&response)?).await?;
+            let _ = out_tx.send(serde_json::to_string(&response)?);
             return Ok(());
         }
 
@@ -1123,23 +1318,40 @@ where
         let message: JsonRpcMessage = match serde_json::from_str(trimmed) {
             Ok(m) => m,
             Err(e) => {
-                Self::write_error(writer, None, &e.to_string()).await?;
+                let _ = out_tx.send(Self::error_frame(None, &e.to_string())?);
                 return Ok(());
             }
         };
 
-        match service.call_message(message).await {
-            Ok(response) => {
-                let response_json = serde_json::to_string(&response).map_err(|e| {
-                    Error::Transport(format!("Failed to serialize response: {}", e))
-                })?;
-                tracing::debug!(output = %response_json, "Sending response");
-                write_line_to_stdout(writer, &response_json).await?;
+        // The service clone shares the negotiated protocol revision through
+        // an `Arc`, so concurrent requests all see the same handshake state.
+        let mut service = service.clone();
+        let work = async move {
+            match service.call_message(message).await {
+                Ok(response) => match serde_json::to_string(&response) {
+                    Ok(json) => {
+                        tracing::debug!(output = %json, "Sending response");
+                        Some(json)
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to serialize response");
+                        None
+                    }
+                },
+                Err(e) => {
+                    tracing::error!(error = %e, "Error processing message");
+                    Self::error_frame(None, &e.to_string()).ok()
+                }
             }
-            Err(e) => {
-                tracing::error!(error = %e, "Error processing message");
-                Self::write_error(writer, None, &e.to_string()).await?;
+        };
+
+        if is_ordering_barrier(trimmed) {
+            if let Some(frame) = work.await {
+                let _ = out_tx.send(frame);
             }
+        } else {
+            let permit = acquire_request_permit(limit).await;
+            spawn_request(permit, out_tx, work);
         }
         Ok(())
     }
@@ -1172,14 +1384,8 @@ where
         }
     }
 
-    async fn write_error<W>(
-        writer: &mut W,
-        id: Option<crate::protocol::RequestId>,
-        message: &str,
-    ) -> Result<()>
-    where
-        W: tokio::io::AsyncWrite + Unpin + Send,
-    {
+    /// Serialize a parse-error response for the read loop to write.
+    fn error_frame(id: Option<crate::protocol::RequestId>, message: &str) -> Result<String> {
         // `id` is currently always `None` from every call site (parse-error
         // path), so use the shared helper; preserve the parameter for callers
         // that may want to surface a known-id error in future.
@@ -1188,9 +1394,8 @@ where
         } else {
             parse_error_response(message)
         };
-        let response_json = serde_json::to_string(&error_response)
-            .map_err(|e| Error::Transport(format!("Failed to serialize error: {}", e)))?;
-        write_line_to_stdout(writer, &response_json).await
+        serde_json::to_string(&error_response)
+            .map_err(|e| Error::Transport(format!("Failed to serialize error: {}", e)))
     }
 }
 
