@@ -2307,8 +2307,7 @@ mod try_merge {
     use tower_mcp::extract::{Context, RawArgs};
     use tower_mcp::{
         CallToolResult, GetPromptResult, McpRouter, MergeConflictKind, PromptBuilder,
-        ReadResourceResult, ResourceBuilder, ResourceContent, ResourceTemplateBuilder, TestClient,
-        ToolBuilder,
+        ReadResourceResult, ResourceBuilder, ResourceContent, ResourceTemplateBuilder, ToolBuilder,
     };
 
     fn body(uri: &str) -> ReadResourceResult {
@@ -2334,40 +2333,57 @@ mod try_merge {
             .build()
     }
 
-    fn tool_router(name: &str) -> McpRouter {
+    pub(super) fn tool_router(name: &str) -> McpRouter {
         McpRouter::new()
             .server_info("merge-test", "1.0.0")
             .tool(tool_named(name))
     }
 
-    /// Names of the tools the router actually serves.
-    async fn served_tool_names(router: McpRouter) -> Vec<String> {
-        let mut client = TestClient::from_router(router);
-        client.initialize().await;
-        let mut names: Vec<String> = client
-            .list_tools()
-            .await
-            .iter()
-            .map(|t| t["name"].as_str().expect("tool has a name").to_string())
-            .collect();
-        names.sort();
-        names
+    /// A router defining one of every kind, so a self-merge collides on all
+    /// four at once.
+    fn full_router() -> McpRouter {
+        McpRouter::new()
+            .tool(tool_named("dup_tool"))
+            .resource(
+                ResourceBuilder::new("file:///dup")
+                    .name("dup")
+                    .handler(|| async move { Ok(body("file:///dup")) })
+                    .build(),
+            )
+            .resource_template(
+                ResourceTemplateBuilder::new("file:///dup/{id}")
+                    .name("dup-template")
+                    .handler(|uri: String, _vars: HashMap<String, String>| async move {
+                        Ok(body(&uri))
+                    }),
+            )
+            .prompt(
+                PromptBuilder::new("dup_prompt")
+                    .description("example")
+                    .handler(|_args| async move {
+                        Ok(GetPromptResult {
+                            description: None,
+                            messages: Vec::new(),
+                            meta: None,
+                        })
+                    })
+                    .build(),
+            )
     }
 
-    /// Distinct names merge exactly as `merge` would.
-    #[tokio::test]
-    async fn disjoint_routers_merge() {
-        let merged = tool_router("query")
-            .try_merge(tool_router("fetch"))
-            .expect("no conflicts");
-        assert_eq!(served_tool_names(merged).await, vec!["fetch", "query"]);
+    /// Distinct names merge, and report nothing.
+    #[test]
+    fn disjoint_routers_merge() {
+        let host = tool_router("query");
+        assert!(host.conflicts(&tool_router("fetch")).is_empty());
+        assert!(host.try_merge(tool_router("fetch")).is_ok());
     }
 
     /// #1232: `merge` resolves a collision by dropping one implementation and
     /// says nothing. The point of `try_merge` is that the drop becomes an
     /// error a host can fail on at startup.
-    #[tokio::test]
-    async fn a_shared_tool_name_is_reported_not_dropped() {
+    #[test]
+    fn a_shared_tool_name_is_reported() {
         let error = tool_router("get_task")
             .try_merge(tool_router("get_task"))
             .expect_err("a shared name must not merge");
@@ -2378,46 +2394,12 @@ mod try_merge {
             error.to_string().contains("get_task"),
             "the message must name the clash: {error}"
         );
-
-        // `merge` still silently resolves it, so the default is unchanged.
-        let merged = tool_router("get_task").merge(tool_router("get_task"));
-        assert_eq!(served_tool_names(merged).await, vec!["get_task"]);
     }
 
     /// Every conflicting name is reported, not just the first, so one startup
     /// failure names all the work.
     #[test]
     fn every_conflicting_kind_is_reported() {
-        fn full_router() -> McpRouter {
-            McpRouter::new()
-                .tool(tool_named("dup_tool"))
-                .resource(
-                    ResourceBuilder::new("file:///dup")
-                        .name("dup")
-                        .handler(|| async move { Ok(body("file:///dup")) })
-                        .build(),
-                )
-                .resource_template(
-                    ResourceTemplateBuilder::new("file:///dup/{id}")
-                        .name("dup-template")
-                        .handler(|uri: String, _vars: HashMap<String, String>| async move {
-                            Ok(body(&uri))
-                        }),
-                )
-                .prompt(
-                    PromptBuilder::new("dup_prompt")
-                        .description("example")
-                        .handler(|_args| async move {
-                            Ok(GetPromptResult {
-                                description: None,
-                                messages: Vec::new(),
-                                meta: None,
-                            })
-                        })
-                        .build(),
-                )
-        }
-
         let error = full_router()
             .try_merge(full_router())
             .expect_err("everything collides");
@@ -2436,13 +2418,49 @@ mod try_merge {
 
     /// `conflicts` answers the question without consuming either router, so a
     /// host can assert at startup and still build.
-    #[tokio::test]
-    async fn conflicts_inspects_without_consuming() {
+    #[test]
+    fn conflicts_inspects_without_consuming() {
         let host = tool_router("get_task");
         let library = tool_router("get_task");
         assert_eq!(host.conflicts(&library).len(), 1);
         // Both are still usable afterwards.
-        let merged = host.merge(library);
-        assert_eq!(served_tool_names(merged).await, vec!["get_task"]);
+        let _merged = host.merge(library);
+    }
+
+    /// What the merged routers actually serve, which is the claim that
+    /// matters and the one an internal accessor could not make.
+    #[cfg(feature = "testing")]
+    mod served {
+        use super::tool_router;
+        use tower_mcp::{McpRouter, TestClient};
+
+        async fn tool_names(router: McpRouter) -> Vec<String> {
+            let mut client = TestClient::from_router(router);
+            client.initialize().await;
+            let mut names: Vec<String> = client
+                .list_tools()
+                .await
+                .iter()
+                .map(|t| t["name"].as_str().expect("tool has a name").to_string())
+                .collect();
+            names.sort();
+            names
+        }
+
+        #[tokio::test]
+        async fn a_successful_try_merge_serves_both_tools() {
+            let merged = tool_router("query")
+                .try_merge(tool_router("fetch"))
+                .expect("no conflicts");
+            assert_eq!(tool_names(merged).await, vec!["fetch", "query"]);
+        }
+
+        /// The behaviour `try_merge` exists to prevent: one implementation
+        /// silently gone, with nothing in `tools/list` to show it.
+        #[tokio::test]
+        async fn merge_still_drops_one_implementation() {
+            let merged = tool_router("get_task").merge(tool_router("get_task"));
+            assert_eq!(tool_names(merged).await, vec!["get_task"]);
+        }
     }
 }
