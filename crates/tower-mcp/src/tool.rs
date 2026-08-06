@@ -750,7 +750,7 @@ where
 /// in [`ToolCatchError`] to convert any errors (from handlers or middleware)
 /// into `CallToolResult::error()` responses.
 pub struct Tool {
-    /// Tool name (must be 1-128 chars, alphanumeric/underscore/hyphen/dot only)
+    /// Tool name (must be 1-64 chars, alphanumeric/underscore/hyphen/dot only)
     pub name: String,
     /// Human-readable title for the tool
     pub title: Option<String>,

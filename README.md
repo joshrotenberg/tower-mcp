@@ -365,8 +365,8 @@ let v1 = McpRouter::new().tool(legacy_tool);
 let v2 = McpRouter::new().tool(new_tool);
 
 let versioned = McpRouter::new()
-    .nest("v1", v1)   // Tools become "v1_legacy_tool"
-    .nest("v2", v2);  // Tools become "v2_new_tool"
+    .nest("v1", v1)   // Tools become "v1.legacy_tool"
+    .nest("v2", v2);  // Tools become "v2.new_tool"
 ```
 
 ## Multi-Server Proxy
@@ -454,7 +454,7 @@ let router = McpRouter::new()
     .tool(my_tool);
 
 // Serve over stdin/stdout
-StdioTransport::new(router).serve().await?;
+StdioTransport::new(router).run().await?;
 ```
 
 ### HTTP with SSE
