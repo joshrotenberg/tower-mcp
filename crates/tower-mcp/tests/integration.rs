@@ -2464,3 +2464,27 @@ mod try_merge {
         }
     }
 }
+
+// =============================================================================
+// Crate-root re-exports (#1240)
+// =============================================================================
+
+mod reexports {
+    /// #1240: `NotificationSender`, `NotificationReceiver`, and
+    /// `ServerNotification` were all reachable from the crate root, but
+    /// `notification_channel`, the only public constructor for that pair,
+    /// was not. This is the exact import from the report.
+    #[tokio::test]
+    async fn notification_channel_is_reachable_from_the_crate_root() {
+        use tower_mcp::{NotificationSender, ServerNotification, notification_channel};
+
+        let (tx, mut rx): (NotificationSender, _) = notification_channel(4);
+        tx.send(ServerNotification::ToolsListChanged)
+            .await
+            .expect("send");
+        assert!(matches!(
+            rx.recv().await,
+            Some(ServerNotification::ToolsListChanged)
+        ));
+    }
+}

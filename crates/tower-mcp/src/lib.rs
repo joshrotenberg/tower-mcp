@@ -579,7 +579,7 @@ pub use context::{
     ChannelClientRequester, ClientRequester, ClientRequesterHandle, Extensions,
     NotificationReceiver, NotificationSender, OutgoingRequest, OutgoingRequestReceiver,
     OutgoingRequestSender, RequestContext, RequestContextBuilder, ServerNotification,
-    outgoing_request_channel,
+    notification_channel, outgoing_request_channel,
 };
 pub use error::{BoxError, Error, Result, ResultExt, ToolError};
 pub use extension::{ExtensionDeclaration, NegotiatedExtension, NegotiatedExtensions};
