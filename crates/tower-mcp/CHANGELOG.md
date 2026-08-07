@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.21.0] - 2026-08-07
+
+### Bug Fixes
+
+- Re-export notification_channel from the crate root ([#1241](https://github.com/joshrotenberg/tower-mcp/pull/1241))
+
+### Documentation
+
+- Correct three claims that contradict the code ([#1235](https://github.com/joshrotenberg/tower-mcp/pull/1235))
+
+### Features
+
+- **router:** Add opt-in panic containment for tool handlers ([#1236](https://github.com/joshrotenberg/tower-mcp/pull/1236))
+- **stdio:** Handle requests concurrently ([#1238](https://github.com/joshrotenberg/tower-mcp/pull/1238))
+- **router:** Add try_merge and conflicts for router composition ([#1239](https://github.com/joshrotenberg/tower-mcp/pull/1239))
+
+
+
 ## [0.20.1] - 2026-08-05
 
 ### Features

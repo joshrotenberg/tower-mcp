@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.21.0] - 2026-08-07
+
+### Bug Fixes
+
+- **types:** Give JsonRpcError a Display impl ([#1234](https://github.com/joshrotenberg/tower-mcp/pull/1234))
+
+### Documentation
+
+- Correct three claims that contradict the code ([#1235](https://github.com/joshrotenberg/tower-mcp/pull/1235))
+
+
+
 ## [0.20.1] - 2026-08-05
 
 ### Bug Fixes
