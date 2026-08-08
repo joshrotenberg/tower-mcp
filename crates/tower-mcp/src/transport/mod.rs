@@ -26,6 +26,9 @@ pub mod unix;
 #[cfg(feature = "childproc")]
 pub mod childproc;
 
+#[cfg(any(feature = "http", feature = "websocket"))]
+pub(crate) mod extension_bridge;
+
 pub mod service;
 
 pub use service::{CatchError, InjectAnnotations};
