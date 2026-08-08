@@ -16,6 +16,13 @@ All notable changes to this project will be documented in this file.
 
 - **router:** Add opt-in panic containment for tool handlers ([#1236](https://github.com/joshrotenberg/tower-mcp/pull/1236))
 - **stdio:** Handle requests concurrently ([#1238](https://github.com/joshrotenberg/tower-mcp/pull/1238))
+
+  Requests on a stdio connection now run on their own tasks, so a slow tool
+  no longer blocks the rest of the connection. Responses consequently arrive
+  in completion order rather than request order. JSON-RPC pairs a response to
+  its request by id, so this is within spec, but code that assumed responses
+  came back positionally needs to match by id. `StdioTransport::max_concurrent_requests(1)`
+  restores the previous strictly serial handling.
 - **router:** Add try_merge and conflicts for router composition ([#1239](https://github.com/joshrotenberg/tower-mcp/pull/1239))
 
 

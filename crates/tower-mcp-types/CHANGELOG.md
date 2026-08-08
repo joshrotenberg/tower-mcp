@@ -8,6 +8,10 @@ All notable changes to this project will be documented in this file.
 
 - **types:** Give JsonRpcError a Display impl ([#1234](https://github.com/joshrotenberg/tower-mcp/pull/1234))
 
+  Breaking: `JsonRpcError` now renders as `message (code N)` rather than the
+  derived debug form, and `Error::JsonRpc` renders the inner error directly.
+  Code matching on those message strings needs updating.
+
 ### Documentation
 
 - Correct three claims that contradict the code ([#1235](https://github.com/joshrotenberg/tower-mcp/pull/1235))
