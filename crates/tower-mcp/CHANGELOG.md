@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.21.1] - 2026-08-08
+
+### Features
+
+- **http,ws:** Bridge server-supplied request extensions into RequestContext ([#1243](https://github.com/joshrotenberg/tower-mcp/pull/1243))
+
+
+
 ## [0.21.0] - 2026-08-07
 
 ### Bug Fixes
