@@ -1317,6 +1317,9 @@ enum ServiceSource {
 struct AppState {
     /// Source for creating new session services
     service_source: ServiceSource,
+    /// Types copied from each HTTP request's extensions into the per-request
+    /// MCP extensions (#1242). Empty by default.
+    extension_bridges: Vec<crate::transport::extension_bridge::ExtensionBridge>,
     /// Exact protocol versions accepted and advertised by this transport.
     protocol_support: ProtocolSupport,
     /// Session store
@@ -1557,6 +1560,9 @@ pub(crate) struct OAuthConfig {
 ///   `.layer()` is not supported in this mode.
 pub struct HttpTransport {
     service_source: ServiceSource,
+    /// Types copied from each HTTP request's extensions into the per-request
+    /// MCP extensions (#1242). Empty by default.
+    extension_bridges: Vec<crate::transport::extension_bridge::ExtensionBridge>,
     protocol_support: ProtocolSupport,
     validate_origin: bool,
     allowed_origins: Vec<String>,
@@ -1621,8 +1627,49 @@ impl HttpTransport {
             #[cfg(feature = "oauth")]
             oauth_config: None,
             sse_responses: false,
+            extension_bridges: Vec::new(),
             max_body_size: DEFAULT_MAX_BODY_SIZE,
         }
+    }
+
+    /// Copy `T` out of each HTTP request's extensions into the per-request
+    /// MCP extensions.
+    ///
+    /// A tower layer in front of this transport can attach anything it likes
+    /// to the request: a resolved identity, a tenant, a tracing id, the peer
+    /// address. Registering the type here is what makes it visible to
+    /// handlers through
+    /// [`RequestContext::extension`](crate::RequestContext::extension)
+    /// (#1242).
+    ///
+    /// Requests that do not carry a `T` are left alone, so a layer that only
+    /// attaches its value on some routes is fine.
+    ///
+    /// Bridging is per type rather than wholesale, so nothing crosses into
+    /// handler code that the server did not choose to expose.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use tower_mcp::{McpRouter, HttpTransport};
+    ///
+    /// #[derive(Clone)]
+    /// struct AgentIdentity(String);
+    ///
+    /// let router = McpRouter::new().server_info("my-server", "1.0.0");
+    /// let app = HttpTransport::new(router)
+    ///     .bridge_extension::<AgentIdentity>()
+    ///     .into_router_at("/mcp");
+    /// // A layer inserts AgentIdentity; a handler reads it with
+    /// // ctx.extension::<AgentIdentity>().
+    /// ```
+    pub fn bridge_extension<T>(mut self) -> Self
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        self.extension_bridges
+            .push(crate::transport::extension_bridge::extension_bridge::<T>());
+        self
     }
 
     /// Create an HTTP transport from a pre-built service.
@@ -1681,6 +1728,7 @@ impl HttpTransport {
             #[cfg(feature = "oauth")]
             oauth_config: None,
             sse_responses: false,
+            extension_bridges: Vec::new(),
             max_body_size: DEFAULT_MAX_BODY_SIZE,
         }
     }
@@ -2370,6 +2418,7 @@ impl HttpTransport {
             #[cfg(feature = "stateless")]
             modern_subscriptions,
             sse_responses: self.sse_responses,
+            extension_bridges: self.extension_bridges.clone(),
             max_body_size: self.max_body_size,
         })
     }
@@ -2877,11 +2926,11 @@ async fn handle_post(
         }
     };
 
-    // Bridge TokenClaims from HTTP extensions to MCP extensions (if present)
-    #[cfg(feature = "oauth")]
+    // Per-request data bridged from HTTP into MCP extensions: OAuth claims
+    // when that feature is compiled in, plus whatever types the server
+    // registered with `bridge_extension`, which is independent of OAuth
+    // (#1242). Always bound, since the bridges run in every build.
     let http_extensions = parts.extensions;
-    #[cfg(not(feature = "oauth"))]
-    let _ = parts.extensions;
 
     // Parse the request body
     let parsed: serde_json::Value = match serde_json::from_str(&body) {
@@ -3138,6 +3187,11 @@ async fn handle_post(
                 ext.insert(claims.clone());
             }
             stash_per_request_meta(&request, &mut ext);
+            crate::transport::extension_bridge::apply_extension_bridges(
+                &state.extension_bridges,
+                &http_extensions,
+                &mut ext,
+            );
 
             // rmcp #967 analog: give the request a cancellation token that
             // fires if the client disconnects before the response is
@@ -3341,6 +3395,11 @@ async fn handle_post(
             }
             #[cfg(feature = "stateless")]
             stash_per_request_meta(&request, &mut ext);
+            crate::transport::extension_bridge::apply_extension_bridges(
+                &state.extension_bridges,
+                &http_extensions,
+                &mut ext,
+            );
             if !ext.is_empty() {
                 service = service.with_extensions(ext);
             }
@@ -3373,7 +3432,7 @@ async fn handle_post(
     // must be established before consulting any legacy session state.
     #[cfg(feature = "stateless")]
     if modern_request && request_method == "subscriptions/listen" {
-        return handle_modern_subscriptions_listen_sse(state, &parsed).await;
+        return handle_modern_subscriptions_listen_sse(state, &parsed, &http_extensions).await;
     }
 
     // Runtime allowlist enforcement precedes semantic profile validation.
@@ -3545,6 +3604,11 @@ async fn handle_post(
         if let Some(claims) = http_extensions.get::<crate::oauth::token::TokenClaims>() {
             extensions.insert(claims.clone());
         }
+        crate::transport::extension_bridge::apply_extension_bridges(
+            &state.extension_bridges,
+            &http_extensions,
+            &mut extensions,
+        );
 
         let mut service = JsonRpcService::new(session.make_service())
             .with_extensions(extensions)
@@ -3760,6 +3824,11 @@ async fn handle_post(
     if let Some(claims) = http_extensions.get::<crate::oauth::token::TokenClaims>() {
         ext.insert(claims.clone());
     }
+    crate::transport::extension_bridge::apply_extension_bridges(
+        &state.extension_bridges,
+        &http_extensions,
+        &mut ext,
+    );
     #[cfg(feature = "stateless")]
     stash_per_request_meta(&request, &mut ext);
 
@@ -4290,6 +4359,7 @@ fn stateless_sse_with_notifications(
 async fn handle_modern_subscriptions_listen_sse(
     state: Arc<AppState>,
     parsed: &serde_json::Value,
+    http_extensions: &axum::http::Extensions,
 ) -> Response {
     let id = extract_request_id(parsed);
     let Some(subscription_id) = id.clone() else {
@@ -4328,6 +4398,11 @@ async fn handle_modern_subscriptions_listen_sse(
     let mut ext = crate::router::Extensions::new();
     ext.insert(state.protocol_support.clone());
     stash_per_request_meta(&request, &mut ext);
+    crate::transport::extension_bridge::apply_extension_bridges(
+        &state.extension_bridges,
+        http_extensions,
+        &mut ext,
+    );
     if ext
         .get::<crate::stateless::StatelessRequestMeta>()
         .is_none()

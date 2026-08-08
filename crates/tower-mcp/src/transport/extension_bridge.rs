@@ -103,7 +103,10 @@ mod tests {
 
         let mut to = Extensions::new();
         apply_extension_bridges(
-            &[extension_bridge::<Identity>(), extension_bridge::<TraceId>()],
+            &[
+                extension_bridge::<Identity>(),
+                extension_bridge::<TraceId>(),
+            ],
             &from,
             &mut to,
         );

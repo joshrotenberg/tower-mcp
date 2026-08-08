@@ -206,6 +206,9 @@ struct PendingRequest {
 /// Shared state for WebSocket transport
 struct AppState {
     router_template: McpRouter,
+    /// Types copied from each upgrade request's extensions into the
+    /// per-connection MCP extensions (#1242). Empty by default.
+    extension_bridges: Vec<crate::transport::extension_bridge::ExtensionBridge>,
     service_factory: ServiceFactory,
     sessions: SessionStore,
     protocol_support: ProtocolSupport,
@@ -231,6 +234,9 @@ struct AppState {
 /// `subscriptions/listen` multiplexing is not implemented on this binding.
 pub struct WebSocketTransport {
     router: McpRouter,
+    /// Types copied from each upgrade request's extensions into the
+    /// per-connection MCP extensions (#1242). Empty by default.
+    extension_bridges: Vec<crate::transport::extension_bridge::ExtensionBridge>,
     sampling_enabled: bool,
     service_factory: ServiceFactory,
     protocol_support: ProtocolSupport,
@@ -239,10 +245,26 @@ pub struct WebSocketTransport {
 }
 
 impl WebSocketTransport {
+    /// Copy `T` out of each upgrade request's extensions into the
+    /// per-connection MCP extensions.
+    ///
+    /// See [`HttpTransport::bridge_extension`](crate::HttpTransport::bridge_extension).
+    /// The value is read once, from the HTTP request that opens the socket,
+    /// and is then visible to every request on that connection.
+    pub fn bridge_extension<T>(mut self) -> Self
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        self.extension_bridges
+            .push(crate::transport::extension_bridge::extension_bridge::<T>());
+        self
+    }
+
     /// Create a new WebSocket transport
     pub fn new(router: McpRouter) -> Self {
         Self {
             router,
+            extension_bridges: Vec::new(),
             sampling_enabled: false,
             service_factory: identity_factory(),
             protocol_support: ProtocolSupport::default(),
@@ -406,6 +428,7 @@ impl WebSocketTransport {
 
         let state = Arc::new(AppState {
             router_template: self.router,
+            extension_bridges: self.extension_bridges,
             service_factory: self.service_factory,
             sessions: SessionStore::new(),
             protocol_support: self.protocol_support,
@@ -429,6 +452,7 @@ impl WebSocketTransport {
 
         let state = Arc::new(AppState {
             router_template: self.router,
+            extension_bridges: self.extension_bridges,
             service_factory: self.service_factory,
             sessions: SessionStore::new(),
             protocol_support: self.protocol_support,
@@ -570,6 +594,11 @@ async fn handle_websocket(
             mcp_extensions.insert(claims.clone());
         }
     }
+    crate::transport::extension_bridge::apply_extension_bridges(
+        &state.extension_bridges,
+        &parts.extensions,
+        &mut mcp_extensions,
+    );
 
     // Store subprotocol auth token in extensions for downstream use
     if let Some(ref token) = subprotocols.auth_token {
