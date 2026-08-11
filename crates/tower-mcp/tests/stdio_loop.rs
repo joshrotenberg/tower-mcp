@@ -1919,3 +1919,188 @@ mod inbound_notifications {
         );
     }
 }
+
+// ============================================================================
+// Bounded, observable shutdown (#1252)
+// ============================================================================
+
+mod shutdown {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+    use tower_mcp::extract::RawArgs;
+
+    /// A handler that only finishes when the application says so, which is
+    /// the shape that deadlocked: its exit is coordinated by application
+    /// lifecycle rather than by request cancellation.
+    fn router_needing_app_shutdown(app_stopped: Arc<Notify>) -> McpRouter {
+        let wait = ToolBuilder::new("wait")
+            .description("Finishes only on application shutdown")
+            .extractor_handler((), move |_ctx: Context, RawArgs(_): RawArgs| {
+                let app_stopped = app_stopped.clone();
+                async move {
+                    app_stopped.notified().await;
+                    Ok(CallToolResult::text("stopped"))
+                }
+            })
+            .build();
+        McpRouter::new()
+            .server_info("shutdown-test", "0.0.0")
+            .tool(wait)
+    }
+
+    const INIT: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#;
+    const CALL_WAIT: &str =
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"wait","arguments":{}}}"#;
+
+    /// #1252: closing stdin is the host's shutdown signal, but `run` waits
+    /// for every in-flight request before returning, and the server planned
+    /// to shut its workers down *after* `run` returned. Neither side could
+    /// advance. Observing `stopping()` breaks the cycle.
+    #[tokio::test]
+    async fn stopping_fires_before_the_drain_so_the_application_can_release_handlers() {
+        let app_stopped = Arc::new(Notify::new());
+        let mut transport = StdioTransport::new(router_needing_app_shutdown(app_stopped.clone()));
+        let handle = transport.handle();
+
+        let (mut stdin_writer, server_stdin) = tokio::io::duplex(4096);
+        let (server_stdout, server_stdout_reader) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            transport
+                .run_with_streams(server_stdin, server_stdout)
+                .await
+        });
+
+        // The application shuts down when the transport stops reading, which
+        // is the only order that can work here.
+        let release = app_stopped.clone();
+        tokio::spawn(async move {
+            handle.stopping().await;
+            release.notify_waiters();
+        });
+
+        for line in [INIT, CALL_WAIT] {
+            stdin_writer.write_all(line.as_bytes()).await.unwrap();
+            stdin_writer.write_all(b"\n").await.unwrap();
+        }
+        stdin_writer.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        drop(stdin_writer); // EOF: the host's shutdown signal
+
+        let frames = timeout(
+            Duration::from_secs(5),
+            read_n_frames(BufReader::new(server_stdout_reader), 2),
+        )
+        .await
+        .expect("run must not deadlock against application shutdown");
+
+        timeout(Duration::from_secs(5), server)
+            .await
+            .expect("run must return")
+            .expect("join")
+            .expect("run_with_streams ok");
+
+        let answer = frames
+            .iter()
+            .find(|f| f["id"] == 2)
+            .unwrap_or_else(|| panic!("the released call must be answered: {frames:?}"));
+        assert_eq!(answer["result"]["content"][0]["text"], "stopped");
+    }
+
+    /// The deadline is the backstop for when nothing releases the handler.
+    /// It abandons the response rather than never returning.
+    #[tokio::test]
+    async fn a_drain_deadline_lets_run_return_when_a_handler_never_finishes() {
+        let never = Arc::new(Notify::new());
+        let mut transport = StdioTransport::new(router_needing_app_shutdown(never))
+            .drain_timeout(Duration::from_millis(200));
+
+        let (mut stdin_writer, server_stdin) = tokio::io::duplex(4096);
+        let (server_stdout, _reader) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            transport
+                .run_with_streams(server_stdin, server_stdout)
+                .await
+        });
+
+        for line in [INIT, CALL_WAIT] {
+            stdin_writer.write_all(line.as_bytes()).await.unwrap();
+            stdin_writer.write_all(b"\n").await.unwrap();
+        }
+        stdin_writer.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        drop(stdin_writer);
+
+        timeout(Duration::from_secs(5), server)
+            .await
+            .expect("the deadline must let run return")
+            .expect("join")
+            .expect("run_with_streams ok");
+    }
+
+    /// The graceful drain stays the default: a finite call still running at
+    /// EOF is answered, not dropped.
+    #[tokio::test]
+    async fn the_default_still_waits_for_a_finite_call() {
+        let slow = ToolBuilder::new("slow")
+            .description("Takes a moment")
+            .extractor_handler((), |_ctx: Context, RawArgs(_): RawArgs| async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                Ok(CallToolResult::text("done"))
+            })
+            .build();
+        let router = McpRouter::new()
+            .server_info("shutdown-test", "0.0.0")
+            .tool(slow);
+        let mut transport = StdioTransport::new(router);
+
+        let (mut stdin_writer, server_stdin) = tokio::io::duplex(4096);
+        let (server_stdout, server_stdout_reader) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            transport
+                .run_with_streams(server_stdin, server_stdout)
+                .await
+        });
+
+        let call = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"slow","arguments":{}}}"#;
+        for line in [INIT, call] {
+            stdin_writer.write_all(line.as_bytes()).await.unwrap();
+            stdin_writer.write_all(b"\n").await.unwrap();
+        }
+        stdin_writer.flush().await.unwrap();
+        drop(stdin_writer);
+
+        let frames = timeout(
+            Duration::from_secs(5),
+            read_n_frames(BufReader::new(server_stdout_reader), 2),
+        )
+        .await
+        .expect("the in-flight call must still be answered");
+        let answer = frames.iter().find(|f| f["id"] == 2).expect("answered");
+        assert_eq!(answer["result"]["content"][0]["text"], "done");
+    }
+
+    /// `shutdown()` is a stopping cause too, not just end of input.
+    #[tokio::test]
+    async fn an_explicit_shutdown_also_fires_stopping() {
+        let mut transport = StdioTransport::new(McpRouter::new().server_info("s", "0.0.0"));
+        let handle = transport.handle();
+        let (_stdin_writer, server_stdin) = tokio::io::duplex(64);
+        let (server_stdout, _reader) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            transport
+                .run_with_streams(server_stdin, server_stdout)
+                .await
+        });
+
+        let observer = handle.clone();
+        let observed = tokio::spawn(async move { observer.stopping().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        handle.shutdown().expect("shutdown");
+
+        timeout(Duration::from_secs(5), observed)
+            .await
+            .expect("stopping must fire on an explicit shutdown")
+            .expect("join");
+    }
+}

@@ -95,6 +95,7 @@ enum StdioControl {
 #[derive(Clone)]
 pub struct StdioTransportHandle {
     control_tx: mpsc::UnboundedSender<StdioControl>,
+    stopping: tokio::sync::watch::Receiver<bool>,
 }
 
 impl StdioTransportHandle {
@@ -107,6 +108,44 @@ impl StdioTransportHandle {
         self.control_tx
             .send(StdioControl::CloseSubscription(request_id))
             .map_err(|_| Error::Transport("stdio transport is not running".to_string()))
+    }
+
+    /// Resolves once the transport has stopped reading input, before it
+    /// waits for in-flight requests.
+    ///
+    /// Fires on end of input, a [`shutdown`](Self::shutdown) request, or a
+    /// read failure. Observing it is what lets a server begin its own
+    /// shutdown while `run` is still draining, which is the only way to
+    /// break this cycle (#1252):
+    ///
+    /// 1. closing stdin is the host's shutdown signal
+    /// 2. the server awaits `run()`, planning to stop its workers afterwards
+    /// 3. `run()` stops reading and waits for every request task
+    /// 4. a request is blocked on work only that shutdown would release
+    ///
+    /// ```rust,no_run
+    /// # use tower_mcp::{McpRouter, StdioTransport};
+    /// # async fn example(app: impl Clone + Send + 'static) -> Result<(), tower_mcp::BoxError> {
+    /// let mut transport = StdioTransport::new(McpRouter::new());
+    /// let handle = transport.handle();
+    /// tokio::spawn(async move {
+    ///     handle.stopping().await;
+    ///     // Release anything holding an in-flight handler open.
+    /// });
+    /// transport.run().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Returns immediately if the transport has already stopped or been
+    /// dropped.
+    pub async fn stopping(&self) {
+        let mut stopping = self.stopping.clone();
+        while !*stopping.borrow_and_update() {
+            if stopping.changed().await.is_err() {
+                return;
+            }
+        }
     }
 
     /// Gracefully finish all subscriptions and stop the stdio transport.
@@ -122,6 +161,51 @@ fn stdio_control_channel() -> (
     mpsc::UnboundedReceiver<StdioControl>,
 ) {
     mpsc::unbounded_channel()
+}
+
+/// Write whatever in-flight requests still produce, then return.
+///
+/// `timeout` bounds the wait. `None` waits for every in-flight request,
+/// which is the historical behaviour and stays the default: a finite call
+/// that is still running should be answered rather than dropped.
+///
+/// A bound exists for the case where a handler cannot finish until the
+/// application shuts down, and the application is waiting on `run` to
+/// return before shutting down (#1252). Reaching it abandons the remaining
+/// responses, which is why it is opt-in.
+async fn drain_responses<W>(
+    out_rx: &mut mpsc::UnboundedReceiver<String>,
+    writer: &mut W,
+    timeout: Option<std::time::Duration>,
+) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin + Send,
+{
+    let drain = async {
+        while let Some(frame) = out_rx.recv().await {
+            write_line_to_stdout(writer, &frame).await?;
+        }
+        Ok(())
+    };
+
+    match timeout {
+        None => drain.await,
+        Some(limit) => match tokio::time::timeout(limit, drain).await {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::warn!(
+                    timeout_ms = limit.as_millis() as u64,
+                    "drain timed out; abandoning in-flight responses"
+                );
+                Ok(())
+            }
+        },
+    }
+}
+
+/// Signals handles that the read loop has ended (#1252).
+fn stopping_signal() -> tokio::sync::watch::Sender<bool> {
+    tokio::sync::watch::channel(false).0
 }
 
 #[cfg(feature = "stateless")]
@@ -695,6 +779,11 @@ pub struct StdioTransport {
     notification_rx: NotificationReceiver,
     control_tx: mpsc::UnboundedSender<StdioControl>,
     control_rx: mpsc::UnboundedReceiver<StdioControl>,
+    /// Fires when the read loop ends, before the drain (#1252).
+    stopping: tokio::sync::watch::Sender<bool>,
+    /// How long the drain waits for in-flight requests once input has ended.
+    /// `None` waits for all of them, which is the historical behaviour.
+    drain_timeout: Option<std::time::Duration>,
     /// Held only by [`StdioTransport::without_server_notifications`], to keep
     /// the unused outbound channel open rather than closed (#1250).
     ///
@@ -718,6 +807,8 @@ impl StdioTransport {
             service,
             router,
             notification_rx,
+            stopping: stopping_signal(),
+            drain_timeout: None,
             outbound_disabled: None,
             control_tx,
             control_rx,
@@ -730,6 +821,7 @@ impl StdioTransport {
     pub fn handle(&self) -> StdioTransportHandle {
         StdioTransportHandle {
             control_tx: self.control_tx.clone(),
+            stopping: self.stopping.subscribe(),
         }
     }
 
@@ -764,11 +856,30 @@ impl StdioTransport {
             service,
             router,
             notification_rx,
+            stopping: stopping_signal(),
+            drain_timeout: None,
             outbound_disabled: Some(notification_tx),
             control_tx,
             control_rx,
             max_concurrent_requests: None,
         }
+    }
+
+    /// Bound how long the transport waits for in-flight requests after input
+    /// has ended.
+    ///
+    /// By default it waits for all of them, so a call that is still running
+    /// when stdin closes is still answered. That is the right default and it
+    /// stays the default.
+    ///
+    /// Set a bound when a handler might not finish on its own. Reaching it
+    /// abandons the remaining responses and returns, which is preferable to
+    /// never returning. Pair it with
+    /// [`StdioTransportHandle::stopping`] so the application can release
+    /// those handlers rather than relying on the deadline (#1252).
+    pub fn drain_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.drain_timeout = Some(timeout);
+        self
     }
 
     /// Cap how many requests this transport handles at once.
@@ -879,6 +990,8 @@ impl StdioTransport {
             control_tx: self.control_tx,
             control_rx: self.control_rx,
             incoming_notifications,
+            stopping: self.stopping,
+            drain_timeout: self.drain_timeout,
             // Carried across the conversion so `.layer()` does not silently
             // discard a concurrency bound set before it.
             max_concurrent_requests: self.max_concurrent_requests,
@@ -1068,15 +1181,18 @@ impl StdioTransport {
             }
         }
 
+        // Input has stopped. Signalling before the drain is the point: a
+        // server that only releases its handlers during its own shutdown
+        // cannot start that shutdown if it is waiting on `run` (#1252).
+        let _ = self.stopping.send(true);
+
         // Closing the queue lets the dispatcher finish what it has and drop
         // its own sender; dropping this loop's leaves only the in-flight
         // requests holding one, so the drain ends when the last finishes.
         // Without this their responses would be lost on shutdown.
         drop(work_tx);
         drop(out_tx);
-        while let Some(frame) = out_rx.recv().await {
-            write_line_to_stdout(&mut writer, &frame).await?;
-        }
+        drain_responses(&mut out_rx, &mut writer, self.drain_timeout).await?;
 
         // The read loop is over: any streams still registered die with
         // the connection and cannot receive a terminal frame.
@@ -1142,6 +1258,10 @@ where
     notification_rx: Option<NotificationReceiver>,
     control_tx: mpsc::UnboundedSender<StdioControl>,
     control_rx: mpsc::UnboundedReceiver<StdioControl>,
+    /// Fires when the read loop ends, before the drain (#1252).
+    stopping: tokio::sync::watch::Sender<bool>,
+    /// How long the drain waits for in-flight requests once input has ended.
+    drain_timeout: Option<std::time::Duration>,
     /// Where inbound client notifications go. `None` drops them, which is
     /// what a directly constructed generic transport did unconditionally
     /// before (#1250).
@@ -1178,6 +1298,8 @@ where
             notification_rx: None,
             control_tx,
             control_rx,
+            stopping: stopping_signal(),
+            drain_timeout: None,
             incoming_notifications: None,
             max_concurrent_requests: None,
             #[cfg(feature = "stateless")]
@@ -1196,6 +1318,15 @@ where
     /// transports built directly from a service.
     pub fn route_notifications_to(mut self, router: McpRouter) -> Self {
         self.incoming_notifications = Some(router_notification_handler(router));
+        self
+    }
+
+    /// Bound how long the transport waits for in-flight requests after input
+    /// has ended.
+    ///
+    /// See [`StdioTransport::drain_timeout`].
+    pub fn drain_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.drain_timeout = Some(timeout);
         self
     }
 
@@ -1222,6 +1353,8 @@ where
             notification_rx: Some(notification_rx),
             control_tx,
             control_rx,
+            stopping: stopping_signal(),
+            drain_timeout: None,
             incoming_notifications: None,
             max_concurrent_requests: None,
             #[cfg(feature = "stateless")]
@@ -1234,6 +1367,7 @@ where
     pub fn handle(&self) -> StdioTransportHandle {
         StdioTransportHandle {
             control_tx: self.control_tx.clone(),
+            stopping: self.stopping.subscribe(),
         }
     }
 
@@ -1385,15 +1519,18 @@ where
             }
         }
 
+        // Input has stopped. Signalling before the drain is the point: a
+        // server that only releases its handlers during its own shutdown
+        // cannot start that shutdown if it is waiting on `run` (#1252).
+        let _ = self.stopping.send(true);
+
         // Closing the queue lets the dispatcher finish what it has and drop
         // its own sender; dropping this loop's leaves only the in-flight
         // requests holding one, so the drain ends when the last finishes.
         // Without this their responses would be lost on shutdown.
         drop(work_tx);
         drop(out_tx);
-        while let Some(frame) = out_rx.recv().await {
-            write_line_to_stdout(&mut writer, &frame).await?;
-        }
+        drain_responses(&mut out_rx, &mut writer, self.drain_timeout).await?;
 
         // The read loop is over: any streams still registered die with
         // the connection and cannot receive a terminal frame.
@@ -1725,6 +1862,8 @@ struct PendingRequest {
 /// }
 /// ```
 pub struct BidirectionalStdioTransport {
+    /// Fires when the read loop ends (#1252).
+    stopping: tokio::sync::watch::Sender<bool>,
     service: JsonRpcService<McpRouter>,
     router: McpRouter,
     /// Channel for receiving outgoing requests to send to the client
@@ -1761,6 +1900,7 @@ impl BidirectionalStdioTransport {
             client_requester,
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             notification_rx,
+            stopping: stopping_signal(),
             control_tx,
             control_rx,
         }
@@ -1771,6 +1911,7 @@ impl BidirectionalStdioTransport {
     pub fn handle(&self) -> StdioTransportHandle {
         StdioTransportHandle {
             control_tx: self.control_tx.clone(),
+            stopping: self.stopping.subscribe(),
         }
     }
 
@@ -1904,6 +2045,8 @@ impl BidirectionalStdioTransport {
                 }
             }
         }
+
+        let _ = self.stopping.send(true);
 
         // The read loop is over: any streams still registered die with
         // the connection and cannot receive a terminal frame.
