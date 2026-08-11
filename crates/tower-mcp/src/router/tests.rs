@@ -3215,12 +3215,83 @@ async fn test_subscription_capability_advertised() {
 
     match resp.inner {
         Ok(McpResponse::Initialize(result)) => {
-            // Should have resources capability with subscribe enabled
+            // Subscriptions are advertised by default on the legacy
+            // lifecycle, which is where the methods exist.
             let resources_cap = result.capabilities.resources.unwrap();
             assert!(resources_cap.subscribe);
         }
         _ => panic!("Expected Initialize response"),
     }
+}
+
+/// #1261: `subscribe` was hardcoded true as soon as any resource existed, so
+/// a server exposing read-only resources could not say otherwise.
+#[test]
+fn resource_subscriptions_can_be_declined() {
+    let router = McpRouter::new()
+        .server_info("read-only", "1.0")
+        .resource(
+            crate::resource::ResourceBuilder::new("mem://one")
+                .name("one")
+                .text("hi"),
+        )
+        .resource_subscriptions(false);
+
+    let resources = router.capabilities().resources.expect("resources exist");
+    assert!(
+        !resources.subscribe,
+        "a server that declined subscriptions must not advertise them"
+    );
+
+    // The default is unchanged.
+    let default_router = McpRouter::new().server_info("default", "1.0").resource(
+        crate::resource::ResourceBuilder::new("mem://one")
+            .name("one")
+            .text("hi"),
+    );
+    assert!(default_router.capabilities().resources.unwrap().subscribe);
+}
+
+/// The 2026-07-28 revision has no `resources/subscribe`, and this crate's own
+/// inspector classifies the method as unavailable there. Advertising it would
+/// promise a method the same build refuses to route (#1261).
+#[test]
+fn the_final_protocol_never_advertises_resource_subscriptions() {
+    for advertise in [true, false] {
+        let router = McpRouter::new()
+            .server_info("final", "1.0")
+            .resource(
+                crate::resource::ResourceBuilder::new("mem://one")
+                    .name("one")
+                    .text("hi"),
+            )
+            .resource_subscriptions(advertise);
+
+        let final_caps =
+            router.capabilities_for_protocol(Some(crate::protocol::PROTOCOL_VERSION_2026_07_28));
+        assert!(
+            !final_caps.resources.expect("resources exist").subscribe,
+            "advertise={advertise} must not surface subscribe on 2026-07-28"
+        );
+
+        // The legacy lifecycle still reflects the setting.
+        let legacy_caps = router.capabilities_for_protocol(Some("2025-11-25"));
+        assert_eq!(
+            legacy_caps.resources.expect("resources exist").subscribe,
+            advertise,
+            "the legacy lifecycle must honour the setting"
+        );
+    }
+}
+
+/// A server with no resources advertises no resources capability at all, so
+/// there is nothing for the setting to affect.
+#[test]
+fn declining_subscriptions_does_not_invent_a_resources_capability() {
+    let router = McpRouter::new()
+        .server_info("no-resources", "1.0")
+        .resource_subscriptions(false);
+    assert!(router.capabilities().resources.is_none());
 }
 
 #[tokio::test]

@@ -541,6 +541,9 @@ struct McpRouterInner {
     /// Resource templates for dynamic resource matching (keyed by uri_template)
     resource_templates: Vec<Arc<ResourceTemplate>>,
     prompts: HashMap<String, Arc<Prompt>>,
+    /// Whether to advertise `resources.subscribe`. Defaults to true, which
+    /// is what this router has always advertised when resources exist (#1261).
+    advertise_resource_subscriptions: bool,
     /// In-flight requests for cancellation tracking (shared across clones)
     in_flight: Arc<RwLock<HashMap<RequestId, CancellationToken>>>,
     /// Channel for sending notifications to connected clients
@@ -716,6 +719,7 @@ impl McpRouter {
                 resources: HashMap::new(),
                 resource_templates: Vec::new(),
                 prompts: HashMap::new(),
+                advertise_resource_subscriptions: true,
                 in_flight: Arc::new(RwLock::new(HashMap::new())),
                 notification_tx: None,
                 #[cfg(all(feature = "http", feature = "stateless"))]
@@ -1254,6 +1258,34 @@ impl McpRouter {
         };
         token.cancel();
         true
+    }
+
+    /// Whether to advertise `resources.subscribe` when resources exist.
+    ///
+    /// Defaults to `true`, which is what this router has always advertised as
+    /// soon as any resource or template is registered. Pass `false` for a
+    /// server that exposes read-only resources and no update stream, so it
+    /// does not promise a subscription it will not honour (#1261).
+    ///
+    /// This affects advertisement only. `resources/subscribe` continues to be
+    /// routed either way, so a client that ignores the capability and calls it
+    /// anyway behaves as before.
+    ///
+    /// The 2026-07-28 revision has no `resources/subscribe` method at all, so
+    /// the capability is never advertised on that lifecycle regardless of this
+    /// setting.
+    ///
+    /// ```rust
+    /// use tower_mcp::{McpRouter, ResourceBuilder};
+    ///
+    /// let router = McpRouter::new()
+    ///     .server_info("read-only", "1.0.0")
+    ///     .resource(ResourceBuilder::new("mem://one").name("one").text("hi"))
+    ///     .resource_subscriptions(false);
+    /// ```
+    pub fn resource_subscriptions(mut self, advertise: bool) -> Self {
+        Arc::make_mut(&mut self.inner).advertise_resource_subscriptions = advertise;
+        self
     }
 
     /// Set server info
@@ -2444,7 +2476,7 @@ impl McpRouter {
             },
             resources: if has_resources || has_dynamic_resources {
                 Some(ResourcesCapability {
-                    subscribe: true,
+                    subscribe: self.inner.advertise_resource_subscriptions,
                     list_changed: has_notifications,
                 })
             } else {
@@ -2529,6 +2561,13 @@ impl McpRouter {
         let mut capabilities = self.capabilities();
         if protocol_version == Some(crate::protocol::PROTOCOL_VERSION_2026_07_28) {
             capabilities.tasks = None;
+            // `resources/subscribe` and `resources/unsubscribe` are not part
+            // of this revision, and the inspector already classifies them as
+            // unavailable here. Advertising the capability would promise a
+            // method the same build refuses to route (#1261).
+            if let Some(resources) = capabilities.resources.as_mut() {
+                resources.subscribe = false;
+            }
             if !self.final_tasks_enabled()
                 && let Some(extensions) = capabilities.extensions.as_mut()
             {
