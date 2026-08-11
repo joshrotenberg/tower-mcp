@@ -885,11 +885,16 @@ async fn a_hung_handler_does_not_block_other_requests() {
             Ok(CallToolResult::text("unreachable"))
         })
         .build();
-    let mut server = Server::with_router(
-        McpRouter::new()
-            .server_info("adversarial", "1.0.0")
-            .tool(hang)
-            .tool(echo_tool()),
+    // A bounded drain: the hung request never finishes, and the default
+    // `None` would make the shutdown wait for it forever (#1252).
+    let mut server = Server::start(
+        StdioTransport::new(
+            McpRouter::new()
+                .server_info("adversarial", "1.0.0")
+                .tool(hang)
+                .tool(echo_tool()),
+        )
+        .drain_timeout(Duration::from_millis(50)),
     );
     server.initialize().await;
 
