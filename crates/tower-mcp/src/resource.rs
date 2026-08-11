@@ -1625,6 +1625,9 @@ pub struct ResourceTemplate {
     pub annotations: Option<ContentAnnotations>,
     /// Compiled regex for matching URIs
     pattern: regex::Regex,
+    /// Variables declared by a form-style query expression, empty when the
+    /// template has none (#1253).
+    query_variables: Vec<String>,
     /// Variable names in order of appearance
     variables: Vec<String>,
     /// Handler for reading matched resources
@@ -1644,6 +1647,7 @@ impl Clone for ResourceTemplate {
             icons: self.icons.clone(),
             annotations: self.annotations.clone(),
             pattern: self.pattern.clone(),
+            query_variables: self.query_variables.clone(),
             variables: self.variables.clone(),
             handler: self.handler.clone(),
             #[cfg(feature = "stateless")]
@@ -1692,7 +1696,19 @@ impl ResourceTemplate {
     /// Returns `Some(HashMap)` with extracted variables if the URI matches,
     /// `None` if it doesn't match.
     pub fn match_uri(&self, uri: &str) -> Option<HashMap<String, String>> {
-        self.pattern.captures(uri).map(|caps| {
+        // Only a template that declares a query expression splits the URI.
+        // Without one the pattern matches the whole string, including any
+        // literal `?`, exactly as it did before query support existed.
+        let (path, query) = if self.query_variables.is_empty() {
+            (uri, None)
+        } else {
+            match uri.split_once('?') {
+                Some((path, query)) => (path, Some(query)),
+                None => (uri, None),
+            }
+        };
+
+        let mut matched: HashMap<String, String> = self.pattern.captures(path).map(|caps| {
             self.variables
                 .iter()
                 .enumerate()
@@ -1701,7 +1717,12 @@ impl ResourceTemplate {
                         .map(|m| (name.clone(), m.as_str().to_string()))
                 })
                 .collect()
-        })
+        })?;
+
+        if let Some(query) = query {
+            matched.extend(extract_query_variables(query, &self.query_variables));
+        }
+        Some(matched)
     }
 
     /// Read a resource at the given URI using this template's handler
@@ -1799,14 +1820,32 @@ impl ResourceTemplateBuilder {
     ///
     /// # URI Template Syntax
     ///
-    /// Templates use RFC 6570 Level 1 syntax with simple variable expansion:
-    /// - `{varname}` - Matches any non-slash characters
+    /// - `{varname}` - simple expansion, matches any non-slash characters
+    /// - `{+varname}` - reserved expansion, matches any characters
+    /// - `{?a,b}` or `{&a,b}` - form-style query expansion (#1253)
     ///
     /// # Examples
     ///
     /// - `file:///{path}` - Matches `file:///README.md`
     /// - `db://users/{id}` - Matches `db://users/123`
     /// - `api://v1/{resource}/{id}` - Matches `api://v1/posts/456`
+    /// - `agent://threads{?cursor,limit}` - Matches `agent://threads` and
+    ///   `agent://threads?limit=20`
+    ///
+    /// # Query expansion
+    ///
+    /// A query expression describes the query string, so it must end the
+    /// template. Every variable it lists is optional: the template matches
+    /// with none of them present, in any order, and each arrives under its
+    /// own name rather than as one undifferentiated suffix.
+    ///
+    /// RFC 6570 defines expansion, not matching, so the routing policy is
+    /// this crate's: a declared variable present with no value maps to an
+    /// empty string and is distinct from being absent, undeclared keys are
+    /// ignored rather than rejected so an added tracking parameter cannot
+    /// break routing, and the first occurrence of a repeated key wins.
+    /// Values are percent-decoded and `+` is read as a space; path captures
+    /// are still handed over exactly as matched.
     pub fn new(uri_template: impl Into<String>) -> Self {
         Self {
             uri_template: uri_template.into(),
@@ -1912,7 +1951,11 @@ impl ResourceTemplateBuilder {
         F: Fn(String, HashMap<String, String>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<ReadResourceResult>> + Send + 'static,
     {
-        let (pattern, variables) = compile_uri_template(&self.uri_template)?;
+        let CompiledTemplate {
+            pattern,
+            variables,
+            query_variables,
+        } = compile_uri_template(&self.uri_template)?;
         let name = self.name.unwrap_or_else(|| self.uri_template.clone());
 
         Ok(ResourceTemplate {
@@ -1924,6 +1967,7 @@ impl ResourceTemplateBuilder {
             icons: self.icons,
             annotations: self.annotations,
             pattern,
+            query_variables,
             variables,
             handler: Some(Arc::new(FnTemplateHandler { handler })),
             #[cfg(feature = "stateless")]
@@ -1957,7 +2001,11 @@ impl ResourceTemplateBuilder {
         F: Fn(RequestContext, String, HashMap<String, String>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<RequestOutcome<ReadResourceResult>>> + Send + 'static,
     {
-        let (pattern, variables) = compile_uri_template(&self.uri_template)?;
+        let CompiledTemplate {
+            pattern,
+            variables,
+            query_variables,
+        } = compile_uri_template(&self.uri_template)?;
         let name = self.name.unwrap_or_else(|| self.uri_template.clone());
 
         Ok(ResourceTemplate {
@@ -1969,6 +2017,7 @@ impl ResourceTemplateBuilder {
             icons: self.icons,
             annotations: self.annotations,
             pattern,
+            query_variables,
             variables,
             handler: None,
             mrtr_handler: Some(Arc::new(MrtrFnTemplateHandler { handler })),
@@ -2017,21 +2066,65 @@ where
     }
 }
 
+/// A URI template compiled for matching.
+struct CompiledTemplate {
+    /// Matches the part of a URI before any query string.
+    pattern: regex::Regex,
+    /// Path variables, in capture order.
+    variables: Vec<String>,
+    /// Variables declared by a form-style query expression, if any.
+    ///
+    /// Empty for a template without one, which is what keeps such templates
+    /// matching a literal `?` exactly as before.
+    query_variables: Vec<String>,
+}
+
 /// Compile a URI template into a regex pattern and extract variable names.
 ///
-/// Supports RFC 6570 Level 1 (simple expansion):
-/// - `{var}` matches any characters except `/`
-/// - `{+var}` matches any characters including `/` (reserved expansion)
+/// Supports:
+/// - `{var}`, simple expansion, matching any characters except `/`
+/// - `{+var}`, reserved expansion, matching any characters
+/// - `{?a,b}` and `{&a,b}`, form-style query expansion (RFC 6570 section
+///   3.2.8), matched against the URI's query string rather than the regex
 ///
-/// Returns the compiled regex and a list of variable names in order,
-/// or an error if the template produces an invalid regex pattern.
-fn compile_uri_template(template: &str) -> std::result::Result<(regex::Regex, Vec<String>), Error> {
+/// A query expression must be the last thing in the template, since it
+/// describes the query string and nothing can follow that (#1253).
+fn compile_uri_template(template: &str) -> std::result::Result<CompiledTemplate, Error> {
     let mut pattern = String::from("^");
     let mut variables = Vec::new();
+    let mut query_variables: Vec<String> = Vec::new();
 
     let mut chars = template.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '{' {
+            // Form-style query expansion describes the query string, so it is
+            // matched separately rather than compiled into the regex.
+            if matches!(chars.peek(), Some('?') | Some('&')) {
+                chars.next();
+                let body: String = chars.by_ref().take_while(|&c| c != '}').collect();
+                if !query_variables.is_empty() {
+                    return Err(Error::Internal(format!(
+                        "URI template '{template}' declares more than one query expression"
+                    )));
+                }
+                for name in body.split(',') {
+                    let name = name.trim();
+                    if name.is_empty() {
+                        return Err(Error::Internal(format!(
+                            "URI template '{template}' has an empty query variable name"
+                        )));
+                    }
+                    query_variables.push(name.to_string());
+                }
+                if chars.peek().is_some() {
+                    return Err(Error::Internal(format!(
+                        "URI template '{template}' has text after its query expression, \
+                         which describes the end of the URI"
+                    )));
+                }
+                continue;
+            }
+
             // Check for + prefix (reserved expansion)
             let is_reserved = chars.peek() == Some(&'+');
             if is_reserved {
@@ -2068,7 +2161,225 @@ fn compile_uri_template(template: &str) -> std::result::Result<(regex::Regex, Ve
     let regex = regex::Regex::new(&pattern)
         .map_err(|e| Error::Internal(format!("Invalid URI template '{}': {}", template, e)))?;
 
-    Ok((regex, variables))
+    Ok(CompiledTemplate {
+        pattern: regex,
+        variables,
+        query_variables,
+    })
+}
+
+/// Percent-decode a query component, treating `+` as a space.
+///
+/// Kept local rather than pulling in a decoder: resource templates are core,
+/// and the crate's only percent-encoding dependency is optional and enabled
+/// by an unrelated feature.
+///
+/// A malformed escape is left as written rather than dropped, so a bad value
+/// still reaches the handler instead of silently vanishing from the map.
+fn decode_query_component(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hex = &value[i + 1..i + 3];
+                match u8::from_str_radix(hex, 16) {
+                    Ok(byte) => {
+                        out.push(byte);
+                        i += 3;
+                    }
+                    Err(_) => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| value.to_string())
+}
+
+/// Pull the declared variables out of a URI's query string.
+///
+/// Routing policy, which RFC 6570 does not specify for matching:
+///
+/// - every declared variable is optional, so a URI with none still matches
+/// - order does not matter
+/// - a variable present with no value maps to an empty string, which is
+///   distinct from being absent
+/// - keys that were not declared are ignored rather than rejected, so an
+///   added tracking parameter does not break routing
+/// - the first occurrence of a repeated key wins
+fn extract_query_variables(query: &str, declared: &[String]) -> HashMap<String, String> {
+    let mut found = HashMap::new();
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let (raw_key, raw_value) = match pair.split_once('=') {
+            Some((key, value)) => (key, value),
+            None => (pair, ""),
+        };
+        let key = decode_query_component(raw_key);
+        if !declared.contains(&key) {
+            continue;
+        }
+        found
+            .entry(key)
+            .or_insert_with(|| decode_query_component(raw_value));
+    }
+    found
+}
+
+#[cfg(test)]
+mod query_expansion_tests {
+    use super::*;
+
+    fn template(pattern: &str) -> ResourceTemplate {
+        ResourceTemplateBuilder::new(pattern).name("t").handler(
+            |uri: String, _vars: HashMap<String, String>| async move {
+                Ok(ReadResourceResult {
+                    contents: vec![ResourceContent {
+                        uri,
+                        mime_type: None,
+                        text: Some("body".into()),
+                        blob: None,
+                        meta: None,
+                    }],
+                    meta: None,
+                    ..Default::default()
+                })
+            },
+        )
+    }
+
+    /// #1253: `{?cursor,limit}` was read as one variable literally named
+    /// "?cursor,limit", with a required capture, so the base URI did not
+    /// match at all.
+    #[test]
+    fn the_base_uri_matches_when_no_query_variable_is_present() {
+        let t = template("agent://threads{?cursor,limit}");
+        let vars = t.match_uri("agent://threads").expect("base URI must match");
+        assert!(
+            vars.is_empty(),
+            "no query variables were supplied: {vars:?}"
+        );
+    }
+
+    #[test]
+    fn each_query_variable_arrives_under_its_own_name() {
+        let t = template("agent://threads{?cursor,limit}");
+        let vars = t
+            .match_uri("agent://threads?cursor=abc&limit=20")
+            .expect("must match");
+        assert_eq!(vars.get("cursor").map(String::as_str), Some("abc"));
+        assert_eq!(vars.get("limit").map(String::as_str), Some("20"));
+    }
+
+    /// Every declared variable is optional and order is not significant,
+    /// which is the routing policy RFC 6570 leaves open.
+    #[test]
+    fn any_subset_in_any_order_matches() {
+        let t = template("codex://threads{?cursor,limit,cwd}");
+        let vars = t
+            .match_uri("codex://threads?cwd=%2Ftmp&cursor=x")
+            .expect("must match");
+        assert_eq!(vars.get("cursor").map(String::as_str), Some("x"));
+        assert_eq!(vars.get("cwd").map(String::as_str), Some("/tmp"));
+        assert!(!vars.contains_key("limit"), "absent stays absent: {vars:?}");
+    }
+
+    #[test]
+    fn query_expansion_composes_with_path_variables() {
+        let t = template("claude://projects/{project_key}/sessions{?cursor}");
+        let vars = t
+            .match_uri("claude://projects/abc/sessions?cursor=n2")
+            .expect("must match");
+        assert_eq!(vars.get("project_key").map(String::as_str), Some("abc"));
+        assert_eq!(vars.get("cursor").map(String::as_str), Some("n2"));
+
+        let bare = t
+            .match_uri("claude://projects/abc/sessions")
+            .expect("must match without a query");
+        assert_eq!(bare.get("project_key").map(String::as_str), Some("abc"));
+        assert!(!bare.contains_key("cursor"));
+    }
+
+    /// Present-but-empty is a different fact from absent, and a handler that
+    /// distinguishes them should be able to.
+    #[test]
+    fn an_empty_value_is_present_not_absent() {
+        let t = template("agent://threads{?cursor}");
+        let vars = t.match_uri("agent://threads?cursor=").expect("must match");
+        assert_eq!(vars.get("cursor").map(String::as_str), Some(""));
+    }
+
+    /// Routing must not break because a caller appended something we never
+    /// declared, and a repeated key resolves predictably.
+    #[test]
+    fn undeclared_keys_are_ignored_and_the_first_duplicate_wins() {
+        let t = template("agent://threads{?cursor}");
+        let vars = t
+            .match_uri("agent://threads?utm=x&cursor=first&cursor=second")
+            .expect("must match");
+        assert_eq!(vars.get("cursor").map(String::as_str), Some("first"));
+        assert!(!vars.contains_key("utm"));
+    }
+
+    #[test]
+    fn values_are_percent_decoded_and_plus_is_a_space() {
+        let t = template("agent://search{?q}");
+        let vars = t
+            .match_uri("agent://search?q=a%20b+c%2Fd")
+            .expect("must match");
+        assert_eq!(vars.get("q").map(String::as_str), Some("a b c/d"));
+    }
+
+    /// A malformed escape reaches the handler as written rather than
+    /// disappearing, so the caller can see what they sent.
+    #[test]
+    fn a_malformed_escape_is_left_alone() {
+        let t = template("agent://search{?q}");
+        let vars = t.match_uri("agent://search?q=100%").expect("must match");
+        assert_eq!(vars.get("q").map(String::as_str), Some("100%"));
+    }
+
+    /// The `&` continuation form is the same expansion.
+    #[test]
+    fn the_continuation_operator_is_supported() {
+        let t = template("agent://threads{&cursor}");
+        let vars = t.match_uri("agent://threads?cursor=z").expect("must match");
+        assert_eq!(vars.get("cursor").map(String::as_str), Some("z"));
+    }
+
+    /// A template without a query expression keeps matching a literal `?`
+    /// exactly as before, which is what stops this being a breaking change.
+    #[test]
+    fn templates_without_a_query_expression_are_unchanged() {
+        let compiled = compile_uri_template("http://example.com/api?query={q}").unwrap();
+        assert!(compiled.query_variables.is_empty());
+        assert_eq!(compiled.variables, vec!["q".to_string()]);
+
+        let t = template("http://example.com/api?query={q}");
+        let vars = t
+            .match_uri("http://example.com/api?query=hello")
+            .expect("must match");
+        assert_eq!(vars.get("q").map(String::as_str), Some("hello"));
+    }
+
+    #[test]
+    fn a_query_expression_must_end_the_template() {
+        assert!(compile_uri_template("agent://x{?a}/more").is_err());
+        assert!(compile_uri_template("agent://x{?a}{?b}").is_err());
+        assert!(compile_uri_template("agent://x{?}").is_err());
+        assert!(compile_uri_template("agent://x{?a,}").is_err());
+    }
 }
 
 #[cfg(test)]
@@ -2408,7 +2719,11 @@ mod tests {
 
     #[test]
     fn test_compile_uri_template_simple() {
-        let (regex, vars) = compile_uri_template("file:///{path}").unwrap();
+        let CompiledTemplate {
+            pattern: regex,
+            variables: vars,
+            ..
+        } = compile_uri_template("file:///{path}").unwrap();
         assert_eq!(vars, vec!["path"]);
         assert!(regex.is_match("file:///README.md"));
         assert!(!regex.is_match("file:///foo/bar")); // no slashes in simple expansion
@@ -2416,7 +2731,11 @@ mod tests {
 
     #[test]
     fn test_compile_uri_template_multiple_vars() {
-        let (regex, vars) = compile_uri_template("api://v1/{resource}/{id}").unwrap();
+        let CompiledTemplate {
+            pattern: regex,
+            variables: vars,
+            ..
+        } = compile_uri_template("api://v1/{resource}/{id}").unwrap();
         assert_eq!(vars, vec!["resource", "id"]);
         assert!(regex.is_match("api://v1/users/123"));
         assert!(regex.is_match("api://v1/posts/abc"));
@@ -2425,7 +2744,11 @@ mod tests {
 
     #[test]
     fn test_compile_uri_template_reserved_expansion() {
-        let (regex, vars) = compile_uri_template("file:///{+path}").unwrap();
+        let CompiledTemplate {
+            pattern: regex,
+            variables: vars,
+            ..
+        } = compile_uri_template("file:///{+path}").unwrap();
         assert_eq!(vars, vec!["path"]);
         assert!(regex.is_match("file:///README.md"));
         assert!(regex.is_match("file:///foo/bar/baz.txt")); // slashes allowed
@@ -2433,7 +2756,11 @@ mod tests {
 
     #[test]
     fn test_compile_uri_template_special_chars() {
-        let (regex, vars) = compile_uri_template("http://example.com/api?query={q}").unwrap();
+        let CompiledTemplate {
+            pattern: regex,
+            variables: vars,
+            ..
+        } = compile_uri_template("http://example.com/api?query={q}").unwrap();
         assert_eq!(vars, vec!["q"]);
         assert!(regex.is_match("http://example.com/api?query=hello"));
     }
