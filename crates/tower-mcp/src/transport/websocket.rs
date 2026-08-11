@@ -911,6 +911,21 @@ where
 {
     let parsed: serde_json::Value = serde_json::from_str(text)?;
 
+    // A notification cannot be answered, so a validation failure on one is
+    // logged rather than sent back (#1272). Requests fall through.
+    if !parsed.is_array()
+        && parsed.get("id").is_none()
+        && let Err(error) =
+            service.inspect_incoming_value(&parsed, crate::inspection::McpDirection::ClientToServer)
+    {
+        tracing::debug!(
+            method = parsed.get("method").and_then(|m| m.as_str()),
+            %error,
+            "rejected an invalid notification"
+        );
+        return Ok(());
+    }
+
     if let Err(error) =
         service.inspect_incoming_value(&parsed, crate::inspection::McpDirection::ClientToServer)
     {
@@ -1076,8 +1091,29 @@ async fn process_message(
     router: &McpRouter,
     text: &str,
 ) -> Result<Option<crate::protocol::JsonRpcResponseMessage>> {
-    // Check if it's a notification (no id field)
     let parsed: serde_json::Value = serde_json::from_str(text)?;
+
+    // Classify before validating: a frame with no id has nowhere to put a
+    // response, so answering one is a JSON-RPC violation regardless of what
+    // validation says. Same fix as the stdio transport (#1272).
+    if !parsed.is_array() && parsed.get("id").is_none() {
+        let method = parsed.get("method").and_then(|m| m.as_str());
+        if let Err(error) =
+            service.inspect_incoming_value(&parsed, crate::inspection::McpDirection::ClientToServer)
+        {
+            tracing::debug!(method, %error, "rejected an invalid notification");
+            return Ok(None);
+        }
+        match serde_json::from_str::<JsonRpcNotification>(text) {
+            Ok(notification) => {
+                let mcp_notification = McpNotification::from_jsonrpc(&notification)?;
+                router.handle_notification(mcp_notification);
+            }
+            Err(_) => tracing::debug!(method, "unparseable notification"),
+        }
+        return Ok(None);
+    }
+
     if let Err(error) =
         service.inspect_incoming_value(&parsed, crate::inspection::McpDirection::ClientToServer)
     {
@@ -1085,17 +1121,14 @@ async fn process_message(
             JsonRpcResponse::error(None, error),
         )));
     }
-    if !parsed.is_array()
-        && parsed.get("id").is_none()
-        && let Ok(notification) = serde_json::from_str::<JsonRpcNotification>(text)
-    {
-        let mcp_notification = McpNotification::from_jsonrpc(&notification)?;
-        router.handle_notification(mcp_notification);
-        return Ok(None);
-    }
 
-    // Parse and process as a request
-    let message: JsonRpcMessage = serde_json::from_str(text)?;
+    // Parse and process as a request. The serde error is not surfaced: for an
+    // untagged enum it names the Rust type (#1272).
+    let Ok(message) = serde_json::from_str::<JsonRpcMessage>(text) else {
+        return Ok(Some(crate::protocol::JsonRpcResponseMessage::Single(
+            crate::transport::stdio::parse_error_response("not a valid JSON-RPC request"),
+        )));
+    };
     let response = service.call_message(message).await?;
     Ok(Some(response))
 }

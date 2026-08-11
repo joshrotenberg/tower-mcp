@@ -692,7 +692,6 @@ async fn an_unknown_notification_method_is_ignored() {
 /// whether the frame is a notification, so a validation failure is answered
 /// with an unsolicited `-32602` carrying a null id.
 #[tokio::test]
-#[ignore = "BUG: a notification that fails MCP inspection is answered with a JSON-RPC error, which JSON-RPC 2.0 forbids"]
 async fn a_notification_with_invalid_params_is_not_answered() {
     let mut server = Server::with_router(base_router());
     server.initialize().await;
@@ -713,7 +712,6 @@ async fn a_notification_with_invalid_params_is_not_answered() {
 /// `JsonRpcMessage`, and is answered with `-32700` whose message leaks the
 /// internal Rust type name.
 #[tokio::test]
-#[ignore = "BUG: StdioTransport answers a stray JSON-RPC response frame with -32700 instead of ignoring it"]
 async fn a_stray_response_frame_is_not_answered() {
     let mut server = Server::with_router(base_router());
     server.initialize().await;
