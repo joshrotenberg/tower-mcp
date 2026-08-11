@@ -3468,17 +3468,28 @@ impl McpRouter {
                                 input_ready: tokio::sync::Notify::new(),
                                 cancelled: crate::context::CancellationToken::new(),
                             });
+                            // Register before inspecting the store token, not
+                            // after. A `tasks/cancel` landing between the two
+                            // used to find no live handle, take the store path,
+                            // terminalize, and acknowledge, after which the
+                            // handle was registered uncancelled and the handler
+                            // ran on against an already-cancelled task (#1294).
+                            //
+                            // In this order a cancel before registration is
+                            // caught by the check below, and one after it
+                            // signals the handle directly. There is no ordering
+                            // left where cancellation selects the store path
+                            // while live execution is running and cannot see it.
+                            notifier.register_live_task(&task_id_clone, handle.clone());
                             if cancellation_token.is_cancelled() {
                                 handle.cancelled.cancel();
                             }
-                            notifier.register_live_task(&task_id_clone, handle.clone());
                             let live_ctx =
                                 crate::tool::TaskContext::with_live(task_id_clone.clone(), handle);
 
                             let start = std::time::Instant::now();
                             let outcome = live_handler.call(ctx, live_ctx, arguments).await;
                             let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
-                            notifier.unregister_live_task(&task_id_clone);
 
                             let applied = match outcome {
                                 Ok(crate::tool::TaskOutcome::Completed(result)) => task_store
@@ -3513,6 +3524,16 @@ impl McpRouter {
                                     .await
                                     .map(|_| "failed"),
                             };
+                            // Unregister only after the single terminal write
+                            // has been attempted. Unregistering first left a
+                            // window where a cancel took the store path and
+                            // wrote `cancelled` over a task whose handler had
+                            // already produced a result, breaking the
+                            // single-writer property (#1294). A cancel arriving
+                            // in this interval now signals a handle nobody
+                            // reads, which is inert.
+                            notifier.unregister_live_task(&task_id_clone);
+
                             match applied {
                                 Ok(status) => tracing::info!(
                                     target: "mcp::tools",

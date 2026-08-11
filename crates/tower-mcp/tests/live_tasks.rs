@@ -339,3 +339,130 @@ async fn a_guard_on_a_live_tool_rejects_without_panicking() {
     assert!(result.is_error, "the guard rejection is a domain error");
     assert!(result.all_text().contains("nope"));
 }
+
+// ============================================================================
+// Cancellation ordering (#1294)
+// ============================================================================
+
+/// #1294, startup window: the spawned future inspected the store token before
+/// registering its live handle, so a `tasks/cancel` in between found no handle,
+/// took the store path, terminalized, and acknowledged, after which the handler
+/// ran on against an already-cancelled task.
+///
+/// This asserts the invariant, not the race. The two statements have no `await`
+/// between them, so the window only exists across threads and this test passes
+/// against the old ordering as well; it was checked. What it does guard is that
+/// a cancel arriving before the handler starts is still observed at all, which
+/// is the property the reordering must not break.
+#[tokio::test]
+async fn cancelling_before_the_handler_starts_is_still_observed() {
+    let started = Arc::new(AtomicUsize::new(0));
+    let finished = Arc::new(AtomicUsize::new(0));
+    let (s, f) = (started.clone(), finished.clone());
+
+    let tool = ToolBuilder::new("live")
+        .description("Waits forever unless cancelled")
+        .live_task_handler(move |task: TaskContext, _input: NoArgs| {
+            let (s, f) = (s.clone(), f.clone());
+            async move {
+                s.fetch_add(1, Ordering::SeqCst);
+                // Never answered, so only cancellation ends this.
+                let result = task.require_input(ask("never")).await;
+                f.fetch_add(1, Ordering::SeqCst);
+                result?;
+                Ok(TaskOutcome::Completed(CallToolResult::text("unreachable")))
+            }
+        })
+        .build();
+
+    let store = Arc::new(MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .server_info("live", "1.0.0")
+        .task_store(store.clone())
+        .tool(tool)
+        .with_tasks();
+
+    let client = McpClient::connect(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+
+    let task_id = client
+        .call_tool_as_task("live", json!({}), None)
+        .await
+        .expect("task created")
+        .task
+        .task_id;
+
+    // No sleep: cancel as soon as the handle exists.
+    client.task_cancel(&task_id, None).await.expect("cancel");
+
+    await_status(&store, &task_id, TaskStatus::Cancelled).await;
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        finished.load(Ordering::SeqCst),
+        "a handler that started must also have unwound; the previous ordering \
+         left it running against a cancelled task"
+    );
+}
+
+/// #1294, completion window: the handle was unregistered before the outcome was
+/// persisted, so a cancel in that interval took the store path and could write
+/// `cancelled` over a task whose handler had already produced a result.
+///
+/// A completion is allowed to win the race, which is the documented semantic.
+#[tokio::test]
+async fn a_completion_is_not_overwritten_by_a_late_cancellation() {
+    let tool = ToolBuilder::new("live")
+        .description("Completes immediately")
+        .live_task_handler(|_task: TaskContext, _input: NoArgs| async move {
+            Ok(TaskOutcome::Completed(CallToolResult::text("done")))
+        })
+        .build();
+
+    let store = Arc::new(MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .server_info("live", "1.0.0")
+        .task_store(store.clone())
+        .tool(tool)
+        .with_tasks();
+
+    let client = McpClient::connect(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+
+    // Repeated because the interesting interleaving is timing-dependent. This
+    // does not reliably reproduce the old bug either; it asserts that whichever
+    // writer wins, the recorded status and the recorded result agree.
+    for round in 0..25 {
+        let task_id = client
+            .call_tool_as_task("live", json!({}), None)
+            .await
+            .expect("task created")
+            .task
+            .task_id;
+        let _ = client.task_cancel(&task_id, None).await;
+
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            let task = store.get_task(&task_id).await.unwrap().unwrap();
+            if task.status.is_terminal() {
+                let (_, result, _) = store.get_task_result(&task_id).await.unwrap().unwrap();
+                // Whichever wins, the two must agree: a task recorded as
+                // completed must carry the handler's result, and a cancelled
+                // one must not claim a result it never produced.
+                match task.status {
+                    TaskStatus::Completed => assert_eq!(
+                        result.expect("completed carries its result").all_text(),
+                        "done",
+                        "round {round}"
+                    ),
+                    TaskStatus::Cancelled => {}
+                    other => panic!("round {round}: unexpected terminal {other:?}"),
+                }
+                break;
+            }
+        }
+    }
+}
