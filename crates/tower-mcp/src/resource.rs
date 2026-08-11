@@ -827,7 +827,12 @@ pub struct ResourceBuilder {
 }
 
 impl ResourceBuilder {
-    /// Create a new resource builder with the given URI.
+    /// Start a resource at this URI.
+    ///
+    /// The URI is the key the router registers under, so registering a second
+    /// resource with the same URI replaces the first rather than failing.
+    /// [`McpRouter::try_merge`](crate::McpRouter::try_merge) is the way to
+    /// find that out instead of discovering it in production.
     pub fn new(uri: impl Into<String>) -> Self {
         Self {
             uri: uri.into(),
@@ -841,13 +846,19 @@ impl ResourceBuilder {
         }
     }
 
-    /// Set the resource name (human-readable)
+    /// Set the name clients list this resource under.
+    ///
+    /// Defaults to the URI when unset, which is legal and unhelpful in a
+    /// picker.
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
     }
 
-    /// Set a human-readable title for the resource
+    /// Set the display title, which a client prefers over the name.
+    ///
+    /// Worth setting when the name has to stay stable for other reasons and
+    /// is not what a person should read.
     pub fn title(mut self, title: impl Into<String>) -> Self {
         self.title = Some(title.into());
         self
@@ -859,7 +870,13 @@ impl ResourceBuilder {
         self
     }
 
-    /// Set the MIME type of the resource
+    /// Declare the MIME type in `resources/list`.
+    ///
+    /// A handler sets the type on each content item it returns, and nothing
+    /// reconciles the two, so a resource that declares one type and returns
+    /// another is simply lying to clients. [`text`](Self::text) and
+    /// [`json`](Self::json) cannot drift this way because they build the
+    /// content themselves.
     pub fn mime_type(mut self, mime_type: impl Into<String>) -> Self {
         self.mime_type = Some(mime_type.into());
         self
@@ -892,7 +909,9 @@ impl ResourceBuilder {
         self
     }
 
-    /// Set the size of the resource in bytes
+    /// Advertise a size in bytes, so a client can decide before reading.
+    ///
+    /// A hint only: nothing compares it with what the handler returns.
     pub fn size(mut self, size: u64) -> Self {
         self.size = Some(size);
         self
@@ -1642,10 +1661,14 @@ where
 // Trait-based resource definition
 // =============================================================================
 
-/// Trait for defining resources with full control
+/// Define a resource as a type rather than a closure.
 ///
-/// Implement this trait when you need more control than the builder provides,
-/// or when you want to define resources as standalone types.
+/// The URI, name, description, and MIME type are associated constants, so they
+/// are decided at compile time and the type owns whatever state the read needs.
+/// A resource whose identity is only known at runtime belongs in
+/// [`ResourceBuilder`] instead. Finish with
+/// [`into_resource`](Self::into_resource), which produces the same [`Resource`]
+/// the builder does.
 ///
 /// # Example
 ///

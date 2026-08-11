@@ -648,7 +648,12 @@ pub struct PromptBuilder {
 }
 
 impl PromptBuilder {
-    /// Create a new prompt builder with the given name.
+    /// Start a prompt with this name.
+    ///
+    /// The name is the key the router registers under, so registering a second
+    /// prompt with the same name replaces the first rather than failing.
+    /// [`McpRouter::try_merge`](crate::McpRouter::try_merge) reports that
+    /// collision when composing routers.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -659,7 +664,10 @@ impl PromptBuilder {
         }
     }
 
-    /// Set a human-readable title for the prompt
+    /// Set the display title, which a client prefers over the name.
+    ///
+    /// Worth setting when the name has to stay stable for other reasons and
+    /// is not what a person should read.
     pub fn title(mut self, title: impl Into<String>) -> Self {
         self.title = Some(title.into());
         self
@@ -1360,10 +1368,13 @@ impl PromptHandler for ServiceContextHandler {
 // Trait-based prompt definition
 // =============================================================================
 
-/// Trait for defining prompts with full control
+/// Define a prompt as a type rather than a closure.
 ///
-/// Implement this trait when you need more control than the builder provides,
-/// or when you want to define prompts as standalone types.
+/// The name and description are associated constants and the arguments come
+/// from a method, so a prompt with state holds it in `self` rather than in an
+/// `Arc` captured by a closure. Finish with
+/// [`into_prompt`](Self::into_prompt), which produces the same [`Prompt`] the
+/// builder does.
 ///
 /// # Example
 ///
