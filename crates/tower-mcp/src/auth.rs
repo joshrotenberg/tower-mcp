@@ -321,6 +321,26 @@ impl Validate for StaticBearerValidator {
 // Authorization Header Parsing
 // =============================================================================
 
+/// Strip an auth scheme prefix, comparing the scheme case-insensitively.
+///
+/// RFC 7235 defines the scheme as a case-insensitive token, so `bearer`,
+/// `Bearer`, and `BEARER` are the same scheme. Comparing bytes directly keeps
+/// this allocation-free, and the token after the space is returned untouched
+/// because only the scheme is case-insensitive, never the credential (#1276).
+fn strip_scheme<'a>(header: &'a str, scheme: &str) -> Option<&'a str> {
+    let rest = header.get(..scheme.len())?;
+    if !rest.eq_ignore_ascii_case(scheme) {
+        return None;
+    }
+    let after = header.get(scheme.len()..)?;
+    // The scheme must be followed by whitespace, or `Bearerish` would match
+    // `Bearer`.
+    if !after.starts_with(' ') {
+        return None;
+    }
+    Some(after.trim_start())
+}
+
 /// Extract an API key from an Authorization header
 ///
 /// Supports formats:
@@ -351,26 +371,6 @@ impl Validate for StaticBearerValidator {
 /// assert_eq!(extract_api_key("bearer sk-123"), Some("sk-123"));
 /// assert_eq!(extract_api_key("BEARER sk-123"), Some("sk-123"));
 /// ```
-/// Strip an auth scheme prefix, comparing the scheme case-insensitively.
-///
-/// RFC 7235 defines the scheme as a case-insensitive token, so `bearer`,
-/// `Bearer`, and `BEARER` are the same scheme. Comparing bytes directly keeps
-/// this allocation-free, and the token after the space is returned untouched
-/// because only the scheme is case-insensitive, never the credential (#1276).
-fn strip_scheme<'a>(header: &'a str, scheme: &str) -> Option<&'a str> {
-    let rest = header.get(..scheme.len())?;
-    if !rest.eq_ignore_ascii_case(scheme) {
-        return None;
-    }
-    let after = header.get(scheme.len()..)?;
-    // The scheme must be followed by whitespace, or `Bearerish` would match
-    // `Bearer`.
-    if !after.starts_with(' ') {
-        return None;
-    }
-    Some(after.trim_start())
-}
-
 pub fn extract_api_key(auth_header: &str) -> Option<&str> {
     let auth_header = auth_header.trim();
 
