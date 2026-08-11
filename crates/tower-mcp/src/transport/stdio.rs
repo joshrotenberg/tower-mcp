@@ -28,6 +28,14 @@
 //! Use [`StdioTransport::max_concurrent_requests`] to bound how many run at
 //! once, or to return to strictly serial handling with `1`.
 //!
+//! # Malformed input
+//!
+//! Frames are delimited by newline bytes and decoded one at a time, so a
+//! frame the peer sends malformed costs that frame and nothing else. Both
+//! JSON that does not parse and bytes that are not valid UTF-8 are answered
+//! with a JSON-RPC parse error (`-32700`, null id) and discarded; the loop
+//! keeps reading and later requests are served normally.
+//!
 //! # Bidirectional Support
 //!
 //! For legacy protocols, [`BidirectionalStdioTransport`] enables
