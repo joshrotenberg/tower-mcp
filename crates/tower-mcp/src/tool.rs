@@ -472,6 +472,39 @@ pub(crate) trait LiveToolHandler: Send + Sync {
     ) -> Result<TaskOutcome>;
 }
 
+/// The input schema a live registration derives from its input type.
+fn live_input_schema<I: JsonSchema>() -> Value {
+    serde_json::to_value(schemars::schema_for!(I))
+        .unwrap_or_else(|_| serde_json::json!({"type": "object"}))
+}
+
+struct FnLiveToolHandlerWithContext<I, F> {
+    handler: F,
+    _input: std::marker::PhantomData<fn() -> I>,
+}
+
+#[async_trait::async_trait]
+impl<I, F, Fut> LiveToolHandler for FnLiveToolHandlerWithContext<I, F>
+where
+    I: DeserializeOwned + Send + Sync + 'static,
+    F: Fn(RequestContext, TaskContext, I) -> Fut + Send + Sync,
+    Fut: Future<Output = Result<TaskOutcome>> + Send,
+{
+    async fn call(
+        &self,
+        ctx: RequestContext,
+        task: TaskContext,
+        arguments: Value,
+    ) -> Result<TaskOutcome> {
+        let input: I = serde_json::from_value(arguments).map_err(|e| {
+            crate::error::Error::Tool(crate::error::ToolError::new(format!(
+                "invalid arguments: {e}"
+            )))
+        })?;
+        (self.handler)(ctx, task, input).await
+    }
+}
+
 /// Applies a guard to a live handler.
 ///
 /// Mirrors `GuardedMrtrToolHandler`. Without this, `Tool::with_guard` on a
@@ -1890,22 +1923,97 @@ impl ToolBuilder {
     /// A live future does not survive its process. On restart, live tasks left
     /// non-terminal have nothing behind them, and the application reconciles
     /// them rather than the router guessing.
-    pub fn live_task_handler<I, F, Fut>(self, handler: F) -> ToolBuilderWithLiveHandler<I, F>
+    pub fn live_task_handler<I, F, Fut>(self, handler: F) -> ToolBuilderWithLiveHandler
     where
         I: JsonSchema + DeserializeOwned + Send + Sync + 'static,
         F: Fn(TaskContext, I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<TaskOutcome>> + Send + 'static,
     {
+        self.into_live(
+            Arc::new(FnLiveToolHandler {
+                handler,
+                _input: std::marker::PhantomData::<fn() -> I>,
+            }),
+            live_input_schema::<I>(),
+        )
+    }
+
+    /// A live task handler that also receives the request's context.
+    ///
+    /// Same as [`live_task_handler`](Self::live_task_handler), plus the
+    /// [`RequestContext`] of the `tools/call` that created the task. That is
+    /// how a live handler reads an authenticated principal, a trace id, or an
+    /// extension added by [`TaskPreparation`], without keeping its own
+    /// registry keyed by task id (#1301).
+    ///
+    /// # The context is the request's, not the task's
+    ///
+    /// The originating `tools/call` has already returned a task handle to the
+    /// client, so its cancellation token tracks *that request*. Reaching for
+    /// `ctx.cancelled()` when you mean task cancellation is wrong in both
+    /// directions: it can fire when a client disconnects from a call that was
+    /// already answered, and it does not fire when the task itself is
+    /// cancelled.
+    ///
+    /// Task cancellation is [`TaskContext`], which is what
+    /// [`TaskContext::require_input`] already returns
+    /// [`crate::Error::TaskCancelled`] from.
+    ///
+    /// ```rust,no_run
+    /// use tower_mcp::{CallToolResult, RequestContext, TaskContext, TaskOutcome, ToolBuilder};
+    /// use serde::Deserialize;
+    /// use tower_mcp::schemars::JsonSchema;
+    ///
+    /// #[derive(Clone)]
+    /// struct Principal(String);
+    ///
+    /// #[derive(Deserialize, JsonSchema)]
+    /// struct Run { prompt: String }
+    ///
+    /// let tool = ToolBuilder::new("run")
+    ///     .description("Runs as the calling principal")
+    ///     .live_task_handler_with_context(
+    ///         |ctx: RequestContext, task: TaskContext, input: Run| async move {
+    ///             let who = ctx
+    ///                 .extension::<Principal>()
+    ///                 .map(|p| p.0.clone())
+    ///                 .unwrap_or_else(|| "anonymous".into());
+    ///             let _ = (task, input);
+    ///             Ok(TaskOutcome::Completed(CallToolResult::text(who)))
+    ///         },
+    ///     )
+    ///     .build();
+    /// ```
+    pub fn live_task_handler_with_context<I, F, Fut>(self, handler: F) -> ToolBuilderWithLiveHandler
+    where
+        I: JsonSchema + DeserializeOwned + Send + Sync + 'static,
+        F: Fn(RequestContext, TaskContext, I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<TaskOutcome>> + Send + 'static,
+    {
+        self.into_live(
+            Arc::new(FnLiveToolHandlerWithContext {
+                handler,
+                _input: std::marker::PhantomData::<fn() -> I>,
+            }),
+            live_input_schema::<I>(),
+        )
+    }
+
+    /// Shared tail of both live registration forms.
+    fn into_live(
+        self,
+        handler: Arc<dyn LiveToolHandler>,
+        derived_schema: Value,
+    ) -> ToolBuilderWithLiveHandler {
         ToolBuilderWithLiveHandler {
             name: self.name,
             title: self.title,
             description: self.description,
             output_schema: self.output_schema,
-            input_schema_override: self.input_schema_override,
+            input_schema: self.input_schema_override.unwrap_or(derived_schema),
             icons: self.icons,
             annotations: self.annotations,
             handler,
-            _phantom: std::marker::PhantomData,
         }
     }
 
@@ -2180,30 +2288,24 @@ pub struct ToolBuilderWithMrtrHandler<I, F> {
 ///
 /// A live handler owns its execution, so it is only meaningful as a task and
 /// the tool is registered with [`TaskSupportMode::Required`] (#1246).
-pub struct ToolBuilderWithLiveHandler<I, F> {
+/// Builder state after a live task handler is set.
+///
+/// Both registration forms build their adapter here and store one boxed
+/// handler, so they cannot drift and `build` has a single path.
+pub struct ToolBuilderWithLiveHandler {
     name: String,
     title: Option<String>,
     description: Option<String>,
     output_schema: Option<Value>,
-    input_schema_override: Option<Value>,
+    input_schema: Value,
     icons: Option<Vec<ToolIcon>>,
     annotations: Option<ToolAnnotations>,
-    handler: F,
-    _phantom: std::marker::PhantomData<I>,
+    handler: Arc<dyn LiveToolHandler>,
 }
 
-impl<I, F, Fut> ToolBuilderWithLiveHandler<I, F>
-where
-    I: JsonSchema + DeserializeOwned + Send + Sync + 'static,
-    F: Fn(TaskContext, I) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<TaskOutcome>> + Send + 'static,
-{
+impl ToolBuilderWithLiveHandler {
     /// Finish the tool.
     pub fn build(self) -> Tool {
-        let input_schema = ensure_object_schema(self.input_schema_override.unwrap_or_else(|| {
-            serde_json::to_value(schemars::schema_for!(I))
-                .unwrap_or_else(|_| serde_json::json!({"type": "object"}))
-        }));
         Tool {
             name: self.name,
             title: self.title,
@@ -2221,11 +2323,8 @@ where
             service: None,
             #[cfg(feature = "stateless")]
             mrtr_handler: None,
-            live_handler: Some(Arc::new(FnLiveToolHandler {
-                handler: self.handler,
-                _input: std::marker::PhantomData::<fn() -> I>,
-            })),
-            input_schema,
+            live_handler: Some(self.handler),
+            input_schema: ensure_object_schema(self.input_schema),
         }
     }
 }
