@@ -436,6 +436,59 @@ async fn acquire_request_permit(
     }
 }
 
+/// Whether a frame expects a response.
+///
+/// A JSON-RPC notification carries no `id`, and a notification must never
+/// queue behind an ordinary request or wait for an execution permit:
+/// `notifications/cancelled` has to reach a running handler precisely when
+/// every slot is busy, which is the case that would otherwise deadlock
+/// (#1251). Batches count as requests, since one may contain them.
+fn expects_a_response(line: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct IdPeek {
+        #[serde(default)]
+        id: Option<serde_json::Value>,
+    }
+
+    if line.trim_start().starts_with('[') {
+        return true;
+    }
+    match serde_json::from_str::<IdPeek>(line) {
+        Ok(IdPeek { id: Some(id) }) => !id.is_null(),
+        // Unparseable input still takes the request path, so the existing
+        // parse-error response is produced exactly as before.
+        Ok(IdPeek { id: None }) => false,
+        Err(_) => true,
+    }
+}
+
+/// One request's work, queued for the dispatcher.
+type QueuedRequest = std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>;
+
+/// Run the queue that stands between reading and executing.
+///
+/// #1251: waiting for a permit in the read loop meant a saturated limit
+/// stopped the transport reading at all, so a `notifications/cancelled`
+/// queued behind an ordinary request could never arrive, and the request it
+/// would have cancelled never released its permit. Nothing progressed.
+///
+/// Moving the wait here keeps the reader free for control traffic while
+/// still bounding how many handlers run at once. Taking requests in order
+/// from a channel, rather than letting each spawned task race for a permit,
+/// is what keeps execution order predictable under a limit.
+fn spawn_request_dispatcher(
+    mut queue: mpsc::UnboundedReceiver<QueuedRequest>,
+    limit: Option<Arc<Semaphore>>,
+    out_tx: OutboundFrames,
+) {
+    tokio::spawn(async move {
+        while let Some(work) = queue.recv().await {
+            let permit = acquire_request_permit(&limit).await;
+            spawn_request(permit, &out_tx, work);
+        }
+    });
+}
+
 /// Run one request on its own task, sending any response frame back to the
 /// read loop.
 ///
@@ -666,8 +719,11 @@ impl StdioTransport {
     /// write. Set a cap when handlers are expensive enough that the number
     /// running at once matters.
     ///
-    /// Reaching the cap applies backpressure by pausing the read loop, so
-    /// requests queue on the input stream rather than piling up in memory.
+    /// The cap bounds how many handlers run at once, not how fast input is
+    /// read. Requests past the cap wait their turn in order. The transport
+    /// keeps reading either way, because control traffic such as
+    /// `notifications/cancelled` has to reach a running handler even when
+    /// every execution slot is busy (#1251).
     ///
     /// `1` restores the strictly serial handling this transport used before
     /// 0.21, which is the escape hatch for handlers that assume no two
@@ -806,6 +862,10 @@ impl StdioTransport {
         // (#1231).
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
         let limit = request_limiter(self.max_concurrent_requests);
+        // The reader hands work to the dispatcher and moves on, so a
+        // saturated limit never stops it reading control traffic (#1251).
+        let (work_tx, work_rx) = mpsc::unbounded_channel::<QueuedRequest>();
+        spawn_request_dispatcher(work_rx, limit, out_tx.clone());
 
         tracing::info!("Stdio transport started, waiting for input");
 
@@ -892,9 +952,12 @@ impl StdioTransport {
                         if let Some(frame) = work.await {
                             write_line_to_stdout(&mut writer, &frame).await?;
                         }
+                    } else if expects_a_response(trimmed) {
+                        let _ = work_tx.send(Box::pin(work));
                     } else {
-                        let permit = acquire_request_permit(&limit).await;
-                        spawn_request(permit, &out_tx, work);
+                        // No permit and no queue: a notification must be able
+                        // to overtake the requests it affects (#1251).
+                        spawn_request(None, &out_tx, work);
                     }
                 }
 
@@ -940,9 +1003,11 @@ impl StdioTransport {
             }
         }
 
-        // Dropping this loop's sender leaves only the in-flight requests
-        // holding one, so the drain ends when the last of them finishes.
-        // Without it their responses would be lost on shutdown.
+        // Closing the queue lets the dispatcher finish what it has and drop
+        // its own sender; dropping this loop's leaves only the in-flight
+        // requests holding one, so the drain ends when the last finishes.
+        // Without this their responses would be lost on shutdown.
+        drop(work_tx);
         drop(out_tx);
         while let Some(frame) = out_rx.recv().await {
             write_line_to_stdout(&mut writer, &frame).await?;
@@ -1134,6 +1199,10 @@ where
         // (#1231).
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
         let limit = request_limiter(self.max_concurrent_requests);
+        // Same reasoning as the plain transport: reading must not stall on a
+        // saturated limit (#1251).
+        let (work_tx, work_rx) = mpsc::unbounded_channel::<QueuedRequest>();
+        spawn_request_dispatcher(work_rx, limit, out_tx.clone());
 
         tracing::info!("Generic stdio transport started, waiting for input");
 
@@ -1154,7 +1223,7 @@ where
                             &mut self.service,
                             &line,
                             &out_tx,
-                            &limit,
+                            &work_tx,
                             true,
                             #[cfg(feature = "stateless")]
                             &mut subscriptions,
@@ -1205,7 +1274,7 @@ where
                             &mut self.service,
                             &line,
                             &out_tx,
-                            &limit,
+                            &work_tx,
                             false,
                             #[cfg(feature = "stateless")]
                             &mut subscriptions,
@@ -1229,9 +1298,11 @@ where
             }
         }
 
-        // Dropping this loop's sender leaves only the in-flight requests
-        // holding one, so the drain ends when the last of them finishes.
-        // Without it their responses would be lost on shutdown.
+        // Closing the queue lets the dispatcher finish what it has and drop
+        // its own sender; dropping this loop's leaves only the in-flight
+        // requests holding one, so the drain ends when the last finishes.
+        // Without this their responses would be lost on shutdown.
+        drop(work_tx);
         drop(out_tx);
         while let Some(frame) = out_rx.recv().await {
             write_line_to_stdout(&mut writer, &frame).await?;
@@ -1253,7 +1324,7 @@ where
         service: &mut JsonRpcService<S>,
         line: &str,
         out_tx: &OutboundFrames,
-        limit: &Option<Arc<Semaphore>>,
+        work_tx: &mpsc::UnboundedSender<QueuedRequest>,
         subscriptions_enabled: bool,
         #[cfg(feature = "stateless")] subscriptions: &mut StdioSubscriptions,
     ) -> Result<()> {
@@ -1349,9 +1420,10 @@ where
             if let Some(frame) = work.await {
                 let _ = out_tx.send(frame);
             }
+        } else if expects_a_response(trimmed) {
+            let _ = work_tx.send(Box::pin(work));
         } else {
-            let permit = acquire_request_permit(limit).await;
-            spawn_request(permit, out_tx, work);
+            spawn_request(None, out_tx, work);
         }
         Ok(())
     }

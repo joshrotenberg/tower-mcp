@@ -1658,3 +1658,125 @@ mod concurrency {
         );
     }
 }
+
+// ============================================================================
+// Control traffic under a concurrency cap (#1251)
+// ============================================================================
+
+mod control_under_saturation {
+    use super::*;
+    use tower_mcp::extract::RawArgs;
+
+    /// A tool that only finishes when its request is cancelled.
+    fn router_with_a_waiting_tool() -> McpRouter {
+        let wait = ToolBuilder::new("wait")
+            .description("Waits until cancelled")
+            .extractor_handler((), |ctx: Context, RawArgs(_): RawArgs| async move {
+                ctx.cancelled().await;
+                Ok(CallToolResult::text("cancelled"))
+            })
+            .build();
+        McpRouter::new()
+            .server_info("stdio-control-test", "0.0.0")
+            .tool(wait)
+    }
+
+    const INIT: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#;
+    const CALL_WAIT: &str =
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"wait","arguments":{}}}"#;
+    const PING: &str = r#"{"jsonrpc":"2.0","id":3,"method":"ping","params":{}}"#;
+    const CANCEL: &str =
+        r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}"#;
+
+    /// Control: with no cap at all, does stdio cancellation reach a running
+    /// handler? If this fails the problem is the harness, not the limit.
+    #[tokio::test]
+    async fn cancellation_reaches_a_running_handler_without_a_limit() {
+        let mut transport = StdioTransport::new(router_with_a_waiting_tool());
+
+        let (mut stdin_writer, server_stdin) = tokio::io::duplex(4096);
+        let (server_stdout, server_stdout_reader) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            transport
+                .run_with_streams(server_stdin, server_stdout)
+                .await
+        });
+
+        for line in [INIT, CALL_WAIT] {
+            stdin_writer.write_all(line.as_bytes()).await.unwrap();
+            stdin_writer.write_all(b"\n").await.unwrap();
+        }
+        stdin_writer.flush().await.unwrap();
+        // Let the call register as in-flight first. A real client cancels
+        // something it has observed; a cancellation that overtakes its own
+        // request names an id the server has not seen yet.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        for line in [PING, CANCEL] {
+            stdin_writer.write_all(line.as_bytes()).await.unwrap();
+            stdin_writer.write_all(b"\n").await.unwrap();
+        }
+        stdin_writer.flush().await.unwrap();
+
+        let frames = timeout(
+            Duration::from_secs(5),
+            read_n_frames(BufReader::new(server_stdout_reader), 3),
+        )
+        .await
+        .expect("unlimited transport must answer all three");
+        let ids: Vec<i64> = frames.iter().filter_map(|f| f["id"].as_i64()).collect();
+        assert!(ids.contains(&2), "cancelled call answered: {frames:?}");
+    }
+
+    /// #1251: the permit is acquired inside the read loop, so once every slot
+    /// is busy the loop stops reading. A `notifications/cancelled` queued
+    /// behind an ordinary request can then never be read, and the request it
+    /// would have cancelled never releases its permit. Nothing progresses.
+    ///
+    /// The transport's own documentation says cancellation has to overtake
+    /// the request it cancels, which is exactly what a cap prevents today.
+    #[tokio::test]
+    async fn a_saturated_limit_must_not_starve_cancellation() {
+        let mut transport =
+            StdioTransport::new(router_with_a_waiting_tool()).max_concurrent_requests(1);
+
+        let (mut stdin_writer, server_stdin) = tokio::io::duplex(4096);
+        let (server_stdout, server_stdout_reader) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            transport
+                .run_with_streams(server_stdin, server_stdout)
+                .await
+        });
+
+        for line in [INIT, CALL_WAIT] {
+            stdin_writer.write_all(line.as_bytes()).await.unwrap();
+            stdin_writer.write_all(b"\n").await.unwrap();
+        }
+        stdin_writer.flush().await.unwrap();
+        // Let the call register as in-flight first. A real client cancels
+        // something it has observed; a cancellation that overtakes its own
+        // request names an id the server has not seen yet.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        for line in [PING, CANCEL] {
+            stdin_writer.write_all(line.as_bytes()).await.unwrap();
+            stdin_writer.write_all(b"\n").await.unwrap();
+        }
+        stdin_writer.flush().await.unwrap();
+
+        let frames = timeout(
+            Duration::from_secs(5),
+            read_n_frames(BufReader::new(server_stdout_reader), 3),
+        )
+        .await
+        .expect("cancellation must be readable while the limit is saturated");
+
+        let ids: Vec<i64> = frames.iter().filter_map(|f| f["id"].as_i64()).collect();
+        assert!(
+            ids.contains(&2),
+            "the cancelled call must be answered: {frames:?}"
+        );
+        assert!(
+            ids.contains(&3),
+            "the queued request must run once the permit frees: {frames:?}"
+        );
+    }
+}
