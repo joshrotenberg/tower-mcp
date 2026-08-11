@@ -3,6 +3,27 @@
 //! Provides [`StdioClientTransport`] which spawns a child process and
 //! communicates using line-delimited JSON over stdin/stdout.
 //!
+//! # Malformed output from the server
+//!
+//! Frames are delimited by newline bytes and decoded one at a time, so a
+//! frame the server writes malformed costs that frame and nothing else. A
+//! frame that is not valid UTF-8, a stray debug print or a mis-encoded log
+//! line on stdout, is logged and discarded, and the transport reads on.
+//!
+//! Discarding is what a client has available. The server side answers the
+//! same input with a JSON-RPC parse error and keeps serving (#1271); a client
+//! has nobody to send that to. The alternative, reporting it as a transport
+//! error, ends the connection and fails every pending request, which lets a
+//! server that is otherwise working correctly disconnect its client with one
+//! stray byte (#1296). It is also the treatment the layer above already gives
+//! JSON that does not parse: warn, drop the message, keep the connection.
+//!
+//! One consequence is worth stating plainly. If the discarded frame held the
+//! response to a pending request, that request is not failed early; it waits
+//! for its own timeout, exactly as it would have if the server had never
+//! answered. Failing it early would need the request id, which is inside the
+//! bytes that would not decode.
+//!
 //! # Example
 //!
 //! ```rust,no_run
@@ -18,11 +39,12 @@
 use std::process::Stdio;
 
 use async_trait::async_trait;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
 
 use super::transport::ClientTransport;
 use crate::error::{Error, Result};
+use crate::framing::{FrameReader, InputFrame};
 
 /// Client transport that communicates with a subprocess via stdio.
 ///
@@ -33,11 +55,13 @@ use crate::error::{Error, Result};
 pub struct StdioClientTransport {
     child: Option<Child>,
     stdin: Option<tokio::process::ChildStdin>,
-    // `Lines::next_line` retains a partially read frame when its future is
-    // cancelled by the client's `select!` loop. A bare `read_line` future can
+    // `FrameReader` retains a partially read frame when its future is
+    // cancelled by the client's `select!` loop. A bare `read_until` future can
     // discard those bytes while leaving the newline behind, turning a valid
     // response into an empty frame when outgoing commands arrive concurrently.
-    stdout: Lines<BufReader<tokio::process::ChildStdout>>,
+    // It also frames over bytes rather than decoded text, so output the
+    // decoder rejects costs one frame instead of the connection (#1296).
+    stdout: FrameReader<tokio::process::ChildStdout>,
 }
 
 impl StdioClientTransport {
@@ -96,7 +120,7 @@ impl StdioClientTransport {
         Ok(Self {
             child: Some(child),
             stdin: Some(stdin),
-            stdout: BufReader::new(stdout).lines(),
+            stdout: FrameReader::new(stdout),
         })
     }
 
@@ -125,7 +149,7 @@ impl StdioClientTransport {
         Ok(Self {
             child: Some(child),
             stdin: Some(stdin),
-            stdout: BufReader::new(stdout).lines(),
+            stdout: FrameReader::new(stdout),
         })
     }
 }
@@ -153,13 +177,39 @@ impl ClientTransport for StdioClientTransport {
         Ok(())
     }
 
+    /// Read the next message the server wrote.
+    ///
+    /// Frames that are not valid UTF-8 are logged and skipped rather than
+    /// reported, so `Err` keeps meaning the connection is over and `Ok(None)`
+    /// keeps meaning EOF. See the module docs for why, and for what the skip
+    /// costs a request whose response was in the discarded frame.
+    ///
+    /// Cancel-safe: the client's message loop polls this inside a `select!`,
+    /// and bytes read before a lost race stay buffered for the next call.
+    /// Skipping happens between reads, so a cancellation can only lose a
+    /// frame that was going to be discarded anyway.
     async fn recv(&mut self) -> Result<Option<String>> {
-        let line = self
-            .stdout
-            .next_line()
-            .await
-            .map_err(|e| Error::Transport(format!("Failed to read: {}", e)))?;
-        Ok(line.map(|line| line.trim().to_string()))
+        loop {
+            let Some(frame) = self
+                .stdout
+                .next_frame()
+                .await
+                .map_err(|e| Error::Transport(format!("Failed to read: {}", e)))?
+            else {
+                return Ok(None);
+            };
+
+            match frame {
+                InputFrame::Line(line) => return Ok(Some(line.trim().to_string())),
+                InputFrame::Undecodable => {
+                    tracing::warn!(
+                        "invalid UTF-8 in a frame from the server, discarding it; \
+                         a response carried in it will not arrive and its request \
+                         will wait for its timeout"
+                    );
+                }
+            }
+        }
     }
 
     fn is_connected(&self) -> bool {
@@ -195,6 +245,7 @@ impl ClientTransport for StdioClientTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncBufReadExt, BufReader};
 
     #[tokio::test]
     async fn test_spawn_nonexistent_program() {
@@ -237,22 +288,85 @@ mod tests {
         assert_eq!(result, None);
     }
 
-    #[tokio::test]
-    async fn line_reader_preserves_partial_frame_when_receive_is_cancelled() {
-        let (mut writer, reader) = tokio::io::duplex(256);
-        let mut lines = BufReader::new(reader).lines();
-        let frame = r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}"#;
+    // =========================================================================
+    // Output that will not decode (#1296)
+    //
+    // A stray byte on the server's stdout used to surface as `InvalidData`,
+    // which `recv` turned into `Error::Transport`. The client's message loop
+    // treats `Err` as the connection being over: it breaks and fails every
+    // pending request. These pin that one bad frame now costs one frame.
+    // =========================================================================
 
-        writer.write_all(frame.as_bytes()).await.unwrap();
+    /// Spawn a shell that writes exactly `script` to stdout.
+    ///
+    /// Octal escapes keep `printf` portable across the shells CI runs.
+    async fn spawn_writer(script: &str) -> StdioClientTransport {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", script]);
+        StdioClientTransport::spawn_command(&mut cmd).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_frame_is_skipped_and_the_next_one_is_delivered() {
+        let response = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+        let mut transport =
+            spawn_writer(r#"printf '\377\376\n'; printf '{"jsonrpc":"2.0","id":1,"result":{}}\n'"#)
+                .await;
+
+        assert_eq!(
+            transport.recv().await.unwrap().as_deref(),
+            Some(response),
+            "the frame after a bad one must still be delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_undecodable_frames_do_not_end_the_transport() {
+        let response = r#"{"jsonrpc":"2.0","id":7,"result":{}}"#;
+        let mut transport = spawn_writer(
+            r#"printf '\377\n\376\n\377\376\n'; printf '{"jsonrpc":"2.0","id":7,"result":{}}\n'"#,
+        )
+        .await;
+
+        assert_eq!(transport.recv().await.unwrap().as_deref(), Some(response));
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_frame_before_eof_reports_eof_rather_than_an_error() {
+        // A server whose last output does not decode has still closed
+        // cleanly. Reporting an error here would fail pending requests that
+        // EOF handling is supposed to close out normally.
+        let mut transport = spawn_writer(r#"printf '\377\376\n'"#).await;
+
+        assert_eq!(transport.recv().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_final_frame_without_a_newline_reports_eof() {
+        let mut transport = spawn_writer(r#"printf '\377\376'"#).await;
+
+        assert_eq!(transport.recv().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_partial_frame_survives_a_cancelled_receive() {
+        // The client's message loop polls `recv` inside a `select!`, so a
+        // frame that loses the race has to survive to the next call rather
+        // than arriving split in two.
+        let frame = r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}"#;
+        let mut transport = spawn_writer(
+            r#"printf '{"jsonrpc":"2.0","id":2,'; sleep 0.2; printf '"result":{"tools":[]}}\n'"#,
+        )
+        .await;
+
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(10), lines.next_line())
+            tokio::time::timeout(std::time::Duration::from_millis(50), transport.recv())
                 .await
                 .is_err(),
             "a partial frame must remain pending until its newline arrives"
         );
 
-        writer.write_all(b"\n").await.unwrap();
-        assert_eq!(lines.next_line().await.unwrap().as_deref(), Some(frame));
+        assert_eq!(transport.recv().await.unwrap().as_deref(), Some(frame));
     }
 
     #[tokio::test]

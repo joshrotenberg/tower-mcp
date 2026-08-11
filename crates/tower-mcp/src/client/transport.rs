@@ -57,6 +57,13 @@ pub trait ClientTransport: Send + 'static {
     ///
     /// Returns `Ok(Some(json))` for a message, `Ok(None)` for clean EOF/close,
     /// or `Err(...)` for transport errors.
+    ///
+    /// Both non-message returns end the connection: the client's message loop
+    /// stops reading and fails every pending request. Reserve them for the
+    /// connection actually being over. A single message that arrives damaged,
+    /// such as one the transport cannot decode, is not that; log it, drop it,
+    /// and return the next one. [`StdioClientTransport`](super::StdioClientTransport)
+    /// documents the reasoning in full.
     async fn recv(&mut self) -> Result<Option<String>>;
 
     /// Check if the transport is still connected.
