@@ -53,7 +53,7 @@ jobs:
             --url http://127.0.0.1:3001/mcp \
             --suite all \
             --spec-version 2025-11-25 \
-            --expected-failures ./conformance-baseline.yml
+            --expected-failures ./.github/conformance/conformance-baseline.yml
 
       - name: Show server logs on failure
         if: failure()
@@ -236,7 +236,7 @@ jobs:
             --suite all \
             --spec-version 2025-11-25 \
             --command "cargo run --manifest-path examples/conformance-client/Cargo.toml --" \
-            --expected-failures ./conformance-baseline-client.yml
+            --expected-failures ./.github/conformance/conformance-baseline-client.yml
 
   draft-conformance:
     name: Official 2026-07-28 Suite
@@ -282,7 +282,7 @@ jobs:
             --url http://127.0.0.1:3001/mcp \
             --spec-version 2026-07-28 \
             --suite all \
-            --expected-failures ./conformance-baseline-draft.yml
+            --expected-failures ./.github/conformance/conformance-baseline-draft.yml
 
       - name: Show server logs on failure
         if: failure()
@@ -317,7 +317,7 @@ jobs:
             --suite all \
             --spec-version 2026-07-28 \
             --command "cargo run --manifest-path examples/conformance-client/Cargo.toml --" \
-            --expected-failures ./conformance-baseline-draft-client.yml \
+            --expected-failures ./.github/conformance/conformance-baseline-draft-client.yml \
             | tee /tmp/conformance-draft-client.log
 
       - name: Publish suite summary
