@@ -3971,7 +3971,16 @@ impl McpRouter {
                     // The client answered everything outstanding, so re-invoke
                     // the handler with the accumulated responses (#1208). A
                     // partial answer leaves the task parked for the rest.
-                    if applied.is_complete() {
+                    //
+                    // `is_complete` is also true when nothing was outstanding
+                    // in the first place, so on its own it would resume a task
+                    // that never parked. Requiring this update to have answered
+                    // something is what distinguishes a real
+                    // `input_required -> working` transition from a stray,
+                    // duplicate, or already-satisfied update, either of which
+                    // would otherwise start a second handler alongside the one
+                    // still running (#1246).
+                    if !applied.accepted.is_empty() && applied.is_complete() {
                         self.resume_task(&params.task_id).await;
                     }
                     return Ok(McpResponse::FinalTaskAck(
@@ -6508,6 +6517,99 @@ mod tests {
         assert!(
             error.unwrap().message.contains("resume_context"),
             "the failure must name what to implement"
+        );
+    }
+    /// #1246 point 1: `tasks/update` resumes whenever nothing is
+    /// outstanding, without checking that an `input_required -> working`
+    /// transition actually happened. A stray update while the first handler
+    /// is still running therefore starts a second one.
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn a_stray_update_while_working_must_not_reinvoke_the_handler() {
+        use crate::async_task::{MemoryTaskStore, TaskStore};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let invocations = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = invocations.clone();
+
+        let slow = ToolBuilder::new("slow")
+            .description("Runs for a while")
+            .task_support(TaskSupportMode::Optional)
+            .mrtr_handler::<serde_json::Value, _, _>(move |_ctx, _input| {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    Ok(crate::protocol::RequestOutcome::Complete(
+                        CallToolResult::text("done"),
+                    ))
+                }
+            })
+            .build();
+
+        let store = std::sync::Arc::new(MemoryTaskStore::new());
+        let mut router = McpRouter::new()
+            .task_store(store.clone())
+            .tool(slow)
+            .with_tasks();
+        init_router(&mut router).await;
+
+        let resp = router
+            .ready()
+            .await
+            .unwrap()
+            .call(RouterRequest {
+                id: RequestId::Number(1),
+                inner: McpRequest::CallTool(CallToolParams {
+                    input_responses: None,
+                    request_state: None,
+                    name: "slow".to_string(),
+                    arguments: serde_json::json!({}),
+                    meta: None,
+                    task: None,
+                }),
+                extensions: tasks_client_extensions(),
+            })
+            .await
+            .unwrap();
+        let task_id = match resp.inner {
+            Ok(McpResponse::FinalCreateTask(result)) => result.task.metadata.task_id,
+            other => panic!("expected a created task, got {other:?}"),
+        };
+
+        // The handler is running and nothing is outstanding.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "handler started once"
+        );
+        let task = store.get_task(&task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Working);
+
+        // A stray update answering nothing.
+        let update = router
+            .ready()
+            .await
+            .unwrap()
+            .call(RouterRequest {
+                id: RequestId::Number(2),
+                inner: McpRequest::UpdateTask(UpdateTaskParams {
+                    task_id: task_id.clone(),
+                    input_responses: Default::default(),
+                    meta: None,
+                }),
+                extensions: tasks_client_extensions(),
+            })
+            .await
+            .unwrap();
+        assert!(update.inner.is_ok());
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "a stray update must not start a second handler"
         );
     }
 
