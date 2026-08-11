@@ -75,8 +75,13 @@ fn main() -> Result<(), BoxError> {
     let stable = ProtocolSupport::stable();
     assert!(stable.contains("2025-11-25"));
 
+    // Selectable only when the revision is compiled in, which is exactly
+    // what the paragraph above describes.
+#   #[cfg(feature = "protocol-2026-07-28")]
+#   {
     let final_only = ProtocolSupport::try_new(["2026-07-28"])?;
     assert_eq!(final_only.preferred(), "2026-07-28");
+#   }
     Ok(())
 }
 ```
@@ -108,20 +113,26 @@ snippets also require `protocol-2026-07-28`.
 ### Stable-only server
 
 ```rust
+# #[cfg(feature = "http")]
 use tower_mcp::{HttpTransport, McpRouter, ProtocolSupport};
 
+# #[cfg(feature = "http")]
 fn main() {
     let transport = HttpTransport::new(McpRouter::new())
         .protocol_support(ProtocolSupport::stable());
     drop(transport);
 }
+# #[cfg(not(feature = "http"))]
+# fn main() {}
 ```
 
 ### Final-only server
 
 ```rust
+# #[cfg(feature = "http")]
 use tower_mcp::{BoxError, HttpTransport, McpRouter, ProtocolSupport};
 
+# #[cfg(feature = "http")]
 fn main() -> Result<(), BoxError> {
     let support = ProtocolSupport::try_new(["2026-07-28"])?;
     let transport = HttpTransport::new(McpRouter::new())
@@ -129,13 +140,17 @@ fn main() -> Result<(), BoxError> {
     drop(transport);
     Ok(())
 }
+# #[cfg(not(feature = "http"))]
+# fn main() {}
 ```
 
 ### Explicit dual-era server
 
 ```rust
+# #[cfg(feature = "http")]
 use tower_mcp::{BoxError, HttpTransport, McpRouter, ProtocolSupport};
 
+# #[cfg(feature = "http")]
 fn main() -> Result<(), BoxError> {
     let support = ProtocolSupport::try_new([
         "2026-07-28",
@@ -147,6 +162,8 @@ fn main() -> Result<(), BoxError> {
     drop(transport);
     Ok(())
 }
+# #[cfg(not(feature = "http"))]
+# fn main() {}
 ```
 
 The order is advertised as preference order. `protocol_versions(...)` is a

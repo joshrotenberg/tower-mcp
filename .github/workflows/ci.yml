@@ -124,6 +124,12 @@ jobs:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-targets --all-features
+      # `--all-targets` excludes doctests, so without this step no doc
+      # example is ever executed (#1275). Run both feature sets: all-features
+      # covers every example, and default catches an example that silently
+      # depends on a feature the reader may not have enabled.
+      - run: cargo test --workspace --all-features --doc
+      - run: cargo test -p tower-mcp --doc
 
   msrv:
     name: MSRV (1.90)
