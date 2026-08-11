@@ -1596,6 +1596,10 @@ pub struct HttpTransport {
     ///
     /// See [`HttpTransport::max_body_size()`] for details.
     max_body_size: usize,
+    /// How long [`HttpTransport::serve_with_shutdown()`] waits for open
+    /// connections once the shutdown signal fires. `None` waits for all of
+    /// them.
+    drain_timeout: Option<Duration>,
 }
 
 impl HttpTransport {
@@ -1629,6 +1633,7 @@ impl HttpTransport {
             sse_responses: false,
             extension_bridges: Vec::new(),
             max_body_size: DEFAULT_MAX_BODY_SIZE,
+            drain_timeout: None,
         }
     }
 
@@ -1730,6 +1735,7 @@ impl HttpTransport {
             sse_responses: false,
             extension_bridges: Vec::new(),
             max_body_size: DEFAULT_MAX_BODY_SIZE,
+            drain_timeout: None,
         }
     }
 
@@ -2509,22 +2515,81 @@ impl HttpTransport {
         (router, handle)
     }
 
-    /// Serve the transport on the given address
+    /// Bound how long [`serve_with_shutdown`](Self::serve_with_shutdown)
+    /// waits for open connections after the shutdown signal fires.
+    ///
+    /// By default it waits for all of them, so a request in flight when the
+    /// signal arrives is still answered. That is the right default and it
+    /// stays the default.
+    ///
+    /// Set a bound when a connection might not close on its own. An SSE
+    /// notification stream is the case that matters here: it is a live
+    /// connection until its client hangs up, so an unbounded drain can
+    /// outlast the shutdown that started it. Reaching the bound returns
+    /// rather than waiting further, which is preferable to never returning.
+    /// This mirrors
+    /// [`StdioTransport::drain_timeout`](crate::transport::stdio::StdioTransport::drain_timeout).
+    ///
+    /// Returning does not close the connections that are still open; axum
+    /// serves each on its own task. The listener is closed either way, as
+    /// soon as the signal fires, so nothing new is accepted while the drain
+    /// runs.
+    pub fn drain_timeout(mut self, timeout: Duration) -> Self {
+        self.drain_timeout = Some(timeout);
+        self
+    }
+
+    /// Serve the transport on the given address, forever.
     ///
     /// This is a convenience method that creates a TCP listener and serves the transport.
+    ///
+    /// This future never resolves on its own. Use
+    /// [`serve_with_shutdown`](Self::serve_with_shutdown) in any process that
+    /// has to stop the server without exiting.
     pub async fn serve(self, addr: &str) -> Result<()> {
+        self.serve_with_shutdown(addr, std::future::pending::<()>())
+            .await
+    }
+
+    /// Serve the transport on the given address until `signal` resolves.
+    ///
+    /// The signal has the same shape as
+    /// `axum::serve(..).with_graceful_shutdown(..)`, because that is what it
+    /// drives: once it resolves the listener stops accepting, connections
+    /// already open are given a chance to finish, and then this future
+    /// returns. Binding still happens up front, so a bind error is reported
+    /// before the signal is ever awaited.
+    ///
+    /// Set [`drain_timeout`](Self::drain_timeout) to bound the wait for open
+    /// connections. Without it a client holding an SSE stream open keeps the
+    /// server alive.
+    ///
+    /// ```rust,no_run
+    /// use tower_mcp::{HttpTransport, McpRouter};
+    ///
+    /// # async fn example() -> Result<(), tower_mcp::BoxError> {
+    /// HttpTransport::new(McpRouter::new())
+    ///     .serve_with_shutdown("127.0.0.1:3000", async {
+    ///         tokio::signal::ctrl_c().await.ok();
+    ///     })
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn serve_with_shutdown<F>(self, addr: &str, signal: F) -> Result<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| Error::Transport(format!("Failed to bind to {}: {}", addr, e)))?;
 
         tracing::info!("MCP HTTP transport listening on {}", addr);
 
+        let drain_timeout = self.drain_timeout;
         let router = self.into_router();
-        axum::serve(listener, router)
+        crate::transport::graceful::serve_with_shutdown(listener, router, signal, drain_timeout)
             .await
-            .map_err(|e| Error::Transport(format!("Server error: {}", e)))?;
-
-        Ok(())
     }
 
     /// Add the OAuth Protected Resource Metadata well-known route if configured.

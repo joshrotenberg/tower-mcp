@@ -68,7 +68,9 @@
 //! ```
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     Router,
@@ -242,6 +244,10 @@ pub struct WebSocketTransport {
     protocol_support: ProtocolSupport,
     #[cfg(feature = "oauth")]
     oauth_config: Option<crate::oauth::ProtectedResourceMetadata>,
+    /// How long [`WebSocketTransport::serve_with_shutdown()`] waits for open
+    /// connections once the shutdown signal fires. `None` waits for all of
+    /// them.
+    drain_timeout: Option<Duration>,
 }
 
 impl WebSocketTransport {
@@ -270,6 +276,7 @@ impl WebSocketTransport {
             protocol_support: ProtocolSupport::default(),
             #[cfg(feature = "oauth")]
             oauth_config: None,
+            drain_timeout: None,
         }
     }
 
@@ -471,20 +478,72 @@ impl WebSocketTransport {
         router
     }
 
-    /// Serve the transport on the given address
+    /// Bound how long [`serve_with_shutdown`](Self::serve_with_shutdown)
+    /// waits for open connections after the shutdown signal fires.
+    ///
+    /// Setting this matters more here than on the other transports. Every
+    /// client of this transport holds a WebSocket open for as long as it
+    /// intends to talk to the server, and a graceful shutdown waits for
+    /// connections to close. With no bound, one idle client is enough to keep
+    /// the server running after it was told to stop.
+    ///
+    /// Reaching the bound returns rather than waiting further. See
+    /// [`HttpTransport::drain_timeout`](crate::HttpTransport::drain_timeout).
+    pub fn drain_timeout(mut self, timeout: Duration) -> Self {
+        self.drain_timeout = Some(timeout);
+        self
+    }
+
+    /// Serve the transport on the given address, forever.
+    ///
+    /// This future never resolves on its own. Use
+    /// [`serve_with_shutdown`](Self::serve_with_shutdown) in any process that
+    /// has to stop the server without exiting.
     pub async fn serve(self, addr: &str) -> Result<()> {
+        self.serve_with_shutdown(addr, std::future::pending::<()>())
+            .await
+    }
+
+    /// Serve the transport on the given address until `signal` resolves.
+    ///
+    /// The signal has the same shape as
+    /// `axum::serve(..).with_graceful_shutdown(..)`, because that is what it
+    /// drives: once it resolves the listener stops accepting, connections
+    /// already open are given a chance to finish, and then this future
+    /// returns. Binding still happens up front, so a bind error is reported
+    /// before the signal is ever awaited.
+    ///
+    /// Pair it with [`drain_timeout`](Self::drain_timeout): a connected
+    /// client that is simply idle never closes its socket, and the drain
+    /// waits for it.
+    ///
+    /// ```rust,no_run
+    /// use tower_mcp::{McpRouter, WebSocketTransport};
+    ///
+    /// # async fn example() -> Result<(), tower_mcp::BoxError> {
+    /// WebSocketTransport::new(McpRouter::new())
+    ///     .drain_timeout(std::time::Duration::from_secs(5))
+    ///     .serve_with_shutdown("127.0.0.1:3000", async {
+    ///         tokio::signal::ctrl_c().await.ok();
+    ///     })
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn serve_with_shutdown<F>(self, addr: &str, signal: F) -> Result<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| Error::Transport(format!("Failed to bind to {}: {}", addr, e)))?;
 
         tracing::info!("MCP WebSocket transport listening on {}", addr);
 
+        let drain_timeout = self.drain_timeout;
         let router = self.into_router();
-        axum::serve(listener, router)
+        crate::transport::graceful::serve_with_shutdown(listener, router, signal, drain_timeout)
             .await
-            .map_err(|e| Error::Transport(format!("Server error: {}", e)))?;
-
-        Ok(())
     }
 }
 

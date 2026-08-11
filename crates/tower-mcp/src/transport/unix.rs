@@ -22,10 +22,13 @@
 //! }
 //! ```
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::error::Error;
 use crate::router::McpRouter;
+use crate::transport::graceful::serve_with_shutdown;
 use crate::transport::http::{HttpTransport, SessionConfig, SessionHandle};
 use crate::{ProtocolSupport, ProtocolSupportError};
 
@@ -41,6 +44,10 @@ use crate::{ProtocolSupport, ProtocolSupportError};
 pub struct UnixSocketTransport {
     inner: HttpTransport,
     cleanup_on_bind: bool,
+    /// How long [`serve_with_shutdown`](Self::serve_with_shutdown) waits for
+    /// open connections once the shutdown signal fires. `None` waits for all
+    /// of them.
+    drain_timeout: Option<Duration>,
 }
 
 impl UnixSocketTransport {
@@ -49,6 +56,7 @@ impl UnixSocketTransport {
         Self {
             inner: HttpTransport::new(router),
             cleanup_on_bind: true,
+            drain_timeout: None,
         }
     }
 
@@ -69,6 +77,7 @@ impl UnixSocketTransport {
         Self {
             inner: HttpTransport::from_service(service),
             cleanup_on_bind: true,
+            drain_timeout: None,
         }
     }
 
@@ -214,6 +223,18 @@ impl UnixSocketTransport {
         self
     }
 
+    /// Bound how long [`serve_with_shutdown`](Self::serve_with_shutdown)
+    /// waits for open connections after the shutdown signal fires.
+    ///
+    /// See [`HttpTransport::drain_timeout`], which this mirrors. The bound
+    /// matters here for the same reason: an SSE notification stream stays
+    /// open until its client hangs up, so an unbounded drain can outlive the
+    /// shutdown that triggered it.
+    pub fn drain_timeout(mut self, timeout: Duration) -> Self {
+        self.drain_timeout = Some(timeout);
+        self
+    }
+
     /// Build the axum router for this transport.
     ///
     /// Use this when you want to serve the router yourself with a custom
@@ -228,13 +249,60 @@ impl UnixSocketTransport {
         self.inner.into_router_with_handle()
     }
 
-    /// Serve the transport on the given Unix socket path.
+    /// Serve the transport on the given Unix socket path, forever.
     ///
     /// If `cleanup_on_bind` is enabled (the default), any existing file at
     /// `path` is removed before binding. The socket file is **not**
     /// automatically removed on shutdown -- callers should handle cleanup
     /// if needed (e.g., via a signal handler or `Drop` guard).
+    ///
+    /// This future never resolves on its own. Use
+    /// [`serve_with_shutdown`](Self::serve_with_shutdown) in any process that
+    /// has to stop the server without exiting.
     pub async fn serve<P: AsRef<Path>>(self, path: P) -> crate::Result<()> {
+        self.serve_with_shutdown(path, std::future::pending::<()>())
+            .await
+    }
+
+    /// Serve the transport on the given Unix socket path until `signal`
+    /// resolves.
+    ///
+    /// The signal has the same shape as
+    /// `axum::serve(..).with_graceful_shutdown(..)`, because that is what it
+    /// drives: once it resolves the listener stops accepting, connections
+    /// already open are given a chance to finish, and then this future
+    /// returns. Binding still happens up front, so a bind error is reported
+    /// before the signal is ever awaited.
+    ///
+    /// Set [`drain_timeout`](Self::drain_timeout) to bound the wait for open
+    /// connections. Without it a client holding an SSE stream open keeps the
+    /// server alive.
+    ///
+    /// ```rust,no_run
+    /// use tower_mcp::{McpRouter, UnixSocketTransport};
+    ///
+    /// # async fn example() -> Result<(), tower_mcp::BoxError> {
+    /// let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    /// let server = tokio::spawn(async move {
+    ///     UnixSocketTransport::new(McpRouter::new())
+    ///         .serve_with_shutdown("/tmp/mcp.sock", async {
+    ///             rx.await.ok();
+    ///         })
+    ///         .await
+    /// });
+    ///
+    /// // Later, from wherever the stop decision is made.
+    /// tx.send(()).ok();
+    /// server.await??;
+    /// std::fs::remove_file("/tmp/mcp.sock").ok();
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn serve_with_shutdown<P, F>(self, path: P, signal: F) -> crate::Result<()>
+    where
+        P: AsRef<Path>,
+        F: Future<Output = ()> + Send + 'static,
+    {
         let path = path.as_ref().to_path_buf();
 
         if self.cleanup_on_bind {
@@ -251,12 +319,9 @@ impl UnixSocketTransport {
 
         tracing::info!("MCP Unix socket transport listening on {}", path.display());
 
+        let drain_timeout = self.drain_timeout;
         let router = self.inner.into_router();
-        axum::serve(listener, router)
-            .await
-            .map_err(|e| Error::Transport(format!("Server error: {}", e)))?;
-
-        Ok(())
+        serve_with_shutdown(listener, router, signal, drain_timeout).await
     }
 }
 
