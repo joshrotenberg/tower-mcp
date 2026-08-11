@@ -464,7 +464,42 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// exists so the router can hold one type-erased (#1246).
 #[async_trait::async_trait]
 pub(crate) trait LiveToolHandler: Send + Sync {
-    async fn call(&self, task: TaskContext, arguments: Value) -> Result<TaskOutcome>;
+    async fn call(
+        &self,
+        ctx: RequestContext,
+        task: TaskContext,
+        arguments: Value,
+    ) -> Result<TaskOutcome>;
+}
+
+/// Applies a guard to a live handler.
+///
+/// Mirrors `GuardedMrtrToolHandler`. Without this, `Tool::with_guard` on a
+/// live tool reached an `expect` on the absent service and panicked (#1295).
+struct GuardedLiveToolHandler<G> {
+    guard: G,
+    inner: Arc<dyn LiveToolHandler>,
+}
+
+#[async_trait::async_trait]
+impl<G> LiveToolHandler for GuardedLiveToolHandler<G>
+where
+    G: Fn(&ToolRequest) -> std::result::Result<(), String> + Clone + Send + Sync + 'static,
+{
+    async fn call(
+        &self,
+        ctx: RequestContext,
+        task: TaskContext,
+        arguments: Value,
+    ) -> Result<TaskOutcome> {
+        let request = ToolRequest::new(ctx, arguments);
+        match (self.guard)(&request) {
+            Ok(()) => self.inner.call(request.ctx, task, request.args).await,
+            // A rejected call completes with a domain error, matching what a
+            // guarded ordinary or MRTR tool does.
+            Err(message) => Ok(TaskOutcome::Completed(CallToolResult::error(message))),
+        }
+    }
 }
 
 struct FnLiveToolHandler<I, F> {
@@ -479,7 +514,12 @@ where
     F: Fn(TaskContext, I) -> Fut + Send + Sync,
     Fut: Future<Output = Result<TaskOutcome>> + Send,
 {
-    async fn call(&self, task: TaskContext, arguments: Value) -> Result<TaskOutcome> {
+    async fn call(
+        &self,
+        _ctx: RequestContext,
+        task: TaskContext,
+        arguments: Value,
+    ) -> Result<TaskOutcome> {
         let input: I = serde_json::from_value(arguments).map_err(|e| {
             crate::error::Error::Tool(crate::error::ToolError::new(format!(
                 "invalid arguments: {e}"
@@ -1085,7 +1125,7 @@ unsafe impl Sync for Tool {}
 impl Clone for Tool {
     fn clone(&self) -> Self {
         Self {
-            live_handler: None,
+            live_handler: self.live_handler.clone(),
             name: self.name.clone(),
             title: self.title.clone(),
             description: self.description.clone(),
@@ -1295,6 +1335,13 @@ impl Tool {
     where
         G: Fn(&ToolRequest) -> std::result::Result<(), String> + Clone + Send + Sync + 'static,
     {
+        if let Some(inner) = self.live_handler.clone() {
+            return Tool {
+                live_handler: Some(Arc::new(GuardedLiveToolHandler { guard, inner })),
+                ..self
+            };
+        }
+
         #[cfg(feature = "stateless")]
         if let Some(inner) = self.mrtr_handler.clone() {
             return Tool {
@@ -1344,7 +1391,7 @@ impl Tool {
     /// ```
     pub fn with_name_prefix(&self, prefix: &str) -> Self {
         Self {
-            live_handler: None,
+            live_handler: self.live_handler.clone(),
             name: format!("{}.{}", prefix, self.name),
             title: self.title.clone(),
             description: self.description.clone(),

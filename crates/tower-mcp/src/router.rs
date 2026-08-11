@@ -3476,7 +3476,7 @@ impl McpRouter {
                                 crate::tool::TaskContext::with_live(task_id_clone.clone(), handle);
 
                             let start = std::time::Instant::now();
-                            let outcome = live_handler.call(live_ctx, arguments).await;
+                            let outcome = live_handler.call(ctx, live_ctx, arguments).await;
                             let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
                             notifier.unregister_live_task(&task_id_clone);
 

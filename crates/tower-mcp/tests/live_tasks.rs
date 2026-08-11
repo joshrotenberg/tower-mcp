@@ -235,3 +235,107 @@ async fn cancellation_is_confirmed_by_the_handler_rather_than_imposed() {
         "the handler ran its teardown rather than being abandoned"
     );
 }
+
+// ============================================================================
+// Clone, prefix, and nest (#1295)
+// ============================================================================
+
+/// #1295: `Tool::clone` and `Tool::with_name_prefix` set `live_handler: None`,
+/// so a cloned or prefixed live tool still advertised
+/// `TaskSupportMode::Required` while having neither a live handler nor an
+/// ordinary service. Ordinary router lookup clones `Arc<Tool>` and stayed
+/// correct, which is why nothing caught it.
+///
+/// This asserts the nested tool actually runs a task to completion. Checking
+/// that the field survived would pass even if the clone were otherwise broken.
+#[tokio::test]
+async fn a_nested_live_tool_still_runs() {
+    let tool = ToolBuilder::new("run")
+        .description("Completes immediately")
+        .live_task_handler(|_task: TaskContext, _input: NoArgs| async move {
+            Ok(TaskOutcome::Completed(CallToolResult::text("ran")))
+        })
+        .build();
+
+    let inner = McpRouter::new().server_info("inner", "1.0.0").tool(tool);
+
+    let store = Arc::new(MemoryTaskStore::new());
+    let outer = McpRouter::new()
+        .server_info("outer", "1.0.0")
+        .task_store(store.clone())
+        .nest("provider", inner)
+        .with_tasks();
+
+    let client = McpClient::connect(ChannelTransport::new(outer))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+
+    let names: Vec<String> = client
+        .list_tools()
+        .await
+        .expect("list")
+        .tools
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "provider.run"),
+        "nested tool must be listed: {names:?}"
+    );
+
+    let task_id = client
+        .call_tool_as_task("provider.run", json!({}), None)
+        .await
+        .expect("task created")
+        .task
+        .task_id;
+    await_status(&store, &task_id, TaskStatus::Completed).await;
+
+    let (_, result, _) = store.get_task_result(&task_id).await.unwrap().unwrap();
+    assert_eq!(
+        result.unwrap().all_text(),
+        "ran",
+        "the nested live handler must actually execute"
+    );
+}
+
+/// A guard on a live tool must reject through the ordinary domain-error path
+/// rather than panicking on the absent service.
+#[tokio::test]
+async fn a_guard_on_a_live_tool_rejects_without_panicking() {
+    let tool = ToolBuilder::new("guarded")
+        .description("Always rejected")
+        .live_task_handler(|_task: TaskContext, _input: NoArgs| async move {
+            Ok(TaskOutcome::Completed(CallToolResult::text(
+                "should not run",
+            )))
+        })
+        .build()
+        .with_guard(|_req: &tower_mcp::ToolRequest| Err("nope".to_string()));
+
+    let store = Arc::new(MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .server_info("guarded", "1.0.0")
+        .task_store(store.clone())
+        .tool(tool)
+        .with_tasks();
+
+    let client = McpClient::connect(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+
+    let task_id = client
+        .call_tool_as_task("guarded", json!({}), None)
+        .await
+        .expect("task created")
+        .task
+        .task_id;
+    await_status(&store, &task_id, TaskStatus::Completed).await;
+
+    let (_, result, _) = store.get_task_result(&task_id).await.unwrap().unwrap();
+    let result = result.expect("a rejected call still produces a result");
+    assert!(result.is_error, "the guard rejection is a domain error");
+    assert!(result.all_text().contains("nope"));
+}
