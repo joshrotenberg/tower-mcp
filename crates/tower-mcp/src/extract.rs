@@ -255,8 +255,10 @@ impl std::fmt::Display for ExtensionRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Extension of type `{}` not found. Did you call `router.with_state()` or `router.with_extension()`?",
-            self.type_name
+            "Extension of type `{name}` not found. Did you call `router.with_state()`, \
+             `router.with_extension()`, or `transport.bridge_extension::<{name}>()` for a \
+             type a tower layer inserts into the request?",
+            name = self.type_name
         )
     }
 }
@@ -517,6 +519,12 @@ impl<S> FromToolRequest<S> for RawArgs {
 /// This extractor retrieves data that was added to the router via
 /// [`crate::McpRouter::with_state()`] or [`crate::McpRouter::with_extension()`], or
 /// inserted by middleware into the request context's extensions.
+///
+/// A type that a tower layer attaches to the HTTP request arrives by a third
+/// route: registering it with
+/// [`HttpTransport::bridge_extension`](crate::HttpTransport::bridge_extension)
+/// (or its `WebSocketTransport` equivalent) is what copies it into the
+/// per-request extensions. See `examples/middleware_extension.rs`.
 ///
 /// # Example
 ///
@@ -1614,7 +1622,19 @@ mod tests {
         let rejection = ExtensionRejection::not_found::<String>();
         assert!(rejection.type_name().contains("String"));
         assert!(rejection.to_string().contains("not found"));
-        assert!(rejection.to_string().contains("with_state"));
+
+        // Every way an extension can arrive is worth suggesting: a type a
+        // tower layer inserted is missing because `bridge_extension` was not
+        // called, and `with_state` is no help there.
+        let message = rejection.to_string();
+        assert!(message.contains("with_state"));
+        assert!(message.contains("with_extension"));
+        // The turbofish is the thing the user has to type, so it carries the
+        // type name rather than leaving them to fill it in.
+        assert!(message.contains(&format!(
+            "bridge_extension::<{}>()",
+            std::any::type_name::<String>()
+        )));
 
         // Test conversion to Error
         let error: Error = rejection.into();
