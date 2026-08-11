@@ -55,8 +55,8 @@ use tokio::sync::Mutex;
 use crate::context::{Extensions, RequestContext};
 use crate::error::{Error, Result, ResultExt};
 use crate::protocol::{
-    CallToolResult, ClientCapabilities, RequestOutcome, TaskSupportMode, ToolAnnotations,
-    ToolDefinition, ToolExecution, ToolIcon,
+    CallToolResult, ClientCapabilities, InputRequests, InputResponses, RequestOutcome, TaskStatus,
+    TaskSupportMode, ToolAnnotations, ToolDefinition, ToolExecution, ToolIcon,
 };
 
 // =============================================================================
@@ -458,23 +458,300 @@ pub(crate) fn ensure_object_schema(mut schema: Value) -> Value {
 /// A boxed future for tool handlers
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// A tool handler that owns its execution rather than being replayed.
+///
+/// Implemented for closures by [`ToolBuilder::live_task_handler`]; the trait
+/// exists so the router can hold one type-erased (#1246).
+#[async_trait::async_trait]
+pub(crate) trait LiveToolHandler: Send + Sync {
+    async fn call(&self, task: TaskContext, arguments: Value) -> Result<TaskOutcome>;
+}
+
+struct FnLiveToolHandler<I, F> {
+    handler: F,
+    _input: std::marker::PhantomData<fn() -> I>,
+}
+
+#[async_trait::async_trait]
+impl<I, F, Fut> LiveToolHandler for FnLiveToolHandler<I, F>
+where
+    I: DeserializeOwned + Send + Sync + 'static,
+    F: Fn(TaskContext, I) -> Fut + Send + Sync,
+    Fut: Future<Output = Result<TaskOutcome>> + Send,
+{
+    async fn call(&self, task: TaskContext, arguments: Value) -> Result<TaskOutcome> {
+        let input: I = serde_json::from_value(arguments).map_err(|e| {
+            crate::error::Error::Tool(crate::error::ToolError::new(format!(
+                "invalid arguments: {e}"
+            )))
+        })?;
+        (self.handler)(task, input).await
+    }
+}
+
 /// Identity allocated for one task-backed tool execution.
 ///
 /// The same value is supplied to task preparation and inserted into the
 /// background handler's request extensions.
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskContext {
     task_id: String,
+    live: Option<Arc<LiveTask>>,
+}
+
+impl std::fmt::Debug for TaskContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskContext")
+            .field("task_id", &self.task_id)
+            .field("live", &self.live.is_some())
+            .finish()
+    }
+}
+
+/// Identity comparison. A task is its id; the live handle is machinery.
+impl PartialEq for TaskContext {
+    fn eq(&self, other: &Self) -> bool {
+        self.task_id == other.task_id
+    }
+}
+
+impl Eq for TaskContext {}
+
+/// What a live handler needs in order to park and be woken.
+///
+/// Held by both the running handler, through its [`TaskContext`], and the
+/// router, which signals it once `tasks/update` has committed.
+pub(crate) struct LiveTask {
+    pub(crate) store: Arc<dyn crate::async_task::TaskStore>,
+    /// Signalled after responses are durably recorded, never before.
+    pub(crate) input_ready: tokio::sync::Notify,
+    pub(crate) cancelled: crate::context::CancellationToken,
+}
+
+/// How a live task ended.
+///
+/// The handler returns this and the router applies it. Nothing else writes
+/// terminal state, so completion cannot race the handler and no transition
+/// needs a compare-and-swap. It also makes "returned without terminalizing"
+/// unrepresentable: the return type is the terminal state (#1246).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum TaskOutcome {
+    /// The tool ran and produced a result.
+    ///
+    /// A result carrying `isError: true` still completes the task: the tool
+    /// ran and reported a domain error, which SEP-2663 distinguishes from an
+    /// execution failure.
+    Completed(CallToolResult),
+    /// Execution failed. The structured error reaches `tasks/get` intact.
+    Failed(crate::error::JsonRpcError),
+    /// The handler observed cancellation and finished unwinding.
+    ///
+    /// Returned by the handler rather than imposed by the store, so a task
+    /// stays non-terminal between the `tasks/cancel` acknowledgement and the
+    /// worker confirming it stopped.
+    Cancelled {
+        /// Optional detail for the task's status message.
+        message: Option<String>,
+    },
 }
 
 impl TaskContext {
     pub(crate) fn new(task_id: String) -> Self {
-        Self { task_id }
+        Self {
+            task_id,
+            live: None,
+        }
+    }
+
+    pub(crate) fn with_live(task_id: String, live: Arc<LiveTask>) -> Self {
+        Self {
+            task_id,
+            live: Some(live),
+        }
     }
 
     /// The server-generated task identifier.
     pub fn task_id(&self) -> &str {
         &self.task_id
+    }
+
+    /// Whether this context can park and await client input.
+    ///
+    /// True only inside a live handler. A replay handler returns
+    /// `RequestOutcome::InputRequired` instead and is re-invoked once the
+    /// answers arrive.
+    pub fn is_live(&self) -> bool {
+        self.live.is_some()
+    }
+
+    /// Ask the client for input and wait for it.
+    ///
+    /// Records the requests, parks the task in `input_required`, and returns
+    /// once every one of them is answered. The handler future stays alive
+    /// throughout, so whatever it owns (a subprocess, a stream, an in-flight
+    /// request) is still there when this returns (#1246).
+    ///
+    /// Only the answers to `requests` come back, keyed as they were sent.
+    /// Earlier answers stay in the store rather than being handed over again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::TaskCancelled`](crate::Error::TaskCancelled) if the
+    /// task is cancelled while waiting, so a handler that propagates with `?`
+    /// unwinds correctly without writing a `select!`. The router maps that
+    /// error to [`TaskOutcome::Cancelled`].
+    ///
+    /// Request keys must be unique over the task's lifetime (SEP-2663), so
+    /// reusing a spent key is an error rather than a fresh question.
+    pub async fn require_input(&self, requests: InputRequests) -> Result<InputResponses> {
+        self.require_input_inner(requests, None).await
+    }
+
+    /// [`require_input`](Self::require_input) with a status message for
+    /// clients polling the task.
+    pub async fn require_input_with_message(
+        &self,
+        requests: InputRequests,
+        message: impl Into<String>,
+    ) -> Result<InputResponses> {
+        self.require_input_inner(requests, Some(message.into()))
+            .await
+    }
+
+    async fn require_input_inner(
+        &self,
+        requests: InputRequests,
+        message: Option<String>,
+    ) -> Result<InputResponses> {
+        let live = self.live.as_ref().ok_or_else(|| {
+            crate::error::Error::Tool(crate::error::ToolError::new(
+                "require_input needs a live task handler; a replay handler returns RequestOutcome::InputRequired instead",
+            ))
+        })?;
+        if requests.is_empty() {
+            return Err(crate::error::Error::Tool(crate::error::ToolError::new(
+                "require_input needs at least one request, or the task would wait for something that can never arrive",
+            )));
+        }
+        let asked: Vec<String> = requests.keys().cloned().collect();
+
+        if live.cancelled.is_cancelled() {
+            return Err(crate::error::Error::TaskCancelled);
+        }
+
+        // Created before the store write, so a `tasks/update` landing between
+        // the two is not missed.
+        let woken = live.input_ready.notified();
+        let accepted = live
+            .store
+            .require_input(&self.task_id, requests, message.as_deref())
+            .await
+            .map_err(|e| {
+                crate::error::Error::Tool(crate::error::ToolError::new(format!(
+                    "could not park the task for input: {e}"
+                )))
+            })?;
+        if !accepted {
+            return Err(crate::error::Error::Tool(crate::error::ToolError::new(
+                "the task is already terminal, so it cannot ask for input",
+            )));
+        }
+
+        tokio::select! {
+            _ = woken => {}
+            _ = live.cancelled.cancelled() => {
+                return Err(crate::error::Error::TaskCancelled);
+            }
+        }
+
+        // A partial answer leaves some of these outstanding. Wait for the
+        // rest rather than reissuing, which would be key reuse.
+        loop {
+            let outstanding = live
+                .store
+                .outstanding_input_requests(&self.task_id)
+                .await
+                .map_err(|e| {
+                    crate::error::Error::Tool(crate::error::ToolError::new(format!(
+                        "could not read outstanding requests: {e}"
+                    )))
+                })?
+                .unwrap_or_default();
+            if !outstanding.keys().any(|key| asked.contains(key)) {
+                break;
+            }
+            let woken = live.input_ready.notified();
+            tokio::select! {
+                _ = woken => {}
+                _ = live.cancelled.cancelled() => {
+                    return Err(crate::error::Error::TaskCancelled);
+                }
+            }
+        }
+
+        let all = live
+            .store
+            .input_responses(&self.task_id)
+            .await
+            .map_err(|e| {
+                crate::error::Error::Tool(crate::error::ToolError::new(format!(
+                    "could not read input responses: {e}"
+                )))
+            })?
+            .unwrap_or_default();
+        Ok(all
+            .into_iter()
+            .filter(|(key, _)| asked.contains(key))
+            .collect())
+    }
+
+    /// Record a non-terminal status for clients polling this task.
+    pub async fn working(&self, message: impl Into<String>) -> Result<()> {
+        let live = self.live.as_ref().ok_or_else(|| {
+            crate::error::Error::Tool(crate::error::ToolError::new(
+                "working needs a live task handler",
+            ))
+        })?;
+        live.store
+            .set_status(&self.task_id, TaskStatus::Working, Some(&message.into()))
+            .await
+            .map_err(|e| {
+                crate::error::Error::Tool(crate::error::ToolError::new(format!(
+                    "could not update task status: {e}"
+                )))
+            })?;
+        Ok(())
+    }
+
+    /// Whether this task has been asked to cancel.
+    ///
+    /// A live task stays non-terminal until its handler returns, so this being
+    /// true means the request arrived, not that the task is over.
+    pub fn is_cancelled(&self) -> bool {
+        self.live
+            .as_ref()
+            .is_some_and(|live| live.cancelled.is_cancelled())
+    }
+
+    /// Resolves when this task is asked to cancel.
+    ///
+    /// Only needed by a handler that interleaves teardown with its own work.
+    /// A handler that awaits [`require_input`](Self::require_input) gets
+    /// correct behaviour from the error it returns.
+    pub async fn cancelled(&self) {
+        match self.live.as_ref() {
+            Some(live) => live.cancelled.cancelled().await,
+            None => std::future::pending().await,
+        }
+    }
+}
+
+impl Clone for TaskContext {
+    fn clone(&self) -> Self {
+        Self {
+            task_id: self.task_id.clone(),
+            live: self.live.clone(),
+        }
     }
 }
 
@@ -775,6 +1052,8 @@ pub struct Tool {
     pub(crate) service: Option<BoxToolService>,
     #[cfg(feature = "stateless")]
     pub(crate) mrtr_handler: Option<Arc<dyn MrtrToolHandler>>,
+    /// Live handler, which owns its execution instead of being replayed (#1246).
+    pub(crate) live_handler: Option<Arc<dyn LiveToolHandler>>,
     /// JSON Schema for the tool's input
     pub(crate) input_schema: Value,
 }
@@ -806,6 +1085,7 @@ unsafe impl Sync for Tool {}
 impl Clone for Tool {
     fn clone(&self) -> Self {
         Self {
+            live_handler: None,
             name: self.name.clone(),
             title: self.title.clone(),
             description: self.description.clone(),
@@ -1064,6 +1344,7 @@ impl Tool {
     /// ```
     pub fn with_name_prefix(&self, prefix: &str) -> Self {
         Self {
+            live_handler: None,
             name: format!("{}.{}", prefix, self.name),
             title: self.title.clone(),
             description: self.description.clone(),
@@ -1101,6 +1382,7 @@ impl Tool {
         let service = BoxCloneService::new(catch_error);
 
         Self {
+            live_handler: None,
             name,
             title,
             description,
@@ -1134,6 +1416,7 @@ impl Tool {
         let input_schema =
             ensure_object_schema(input_schema_override.unwrap_or_else(|| handler.input_schema()));
         Self {
+            live_handler: None,
             name,
             title,
             description,
@@ -1903,6 +2186,7 @@ where
         let service = BoxCloneService::new(catch_error);
 
         Tool {
+            live_handler: None,
             name: self.name,
             title: self.title,
             description: self.description,
@@ -2131,6 +2415,7 @@ where
         let service = BoxCloneService::new(MrtrToolCatchError::new(service));
 
         Tool {
+            live_handler: None,
             name: self.name,
             title: self.title,
             description: self.description,
@@ -2232,6 +2517,7 @@ where
         let service = BoxCloneService::new(catch_error);
 
         Tool {
+            live_handler: None,
             name: self.name,
             title: self.title,
             description: self.description,

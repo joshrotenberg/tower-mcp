@@ -506,6 +506,14 @@ pub enum Error {
     #[error("Transport error: {0}")]
     Transport(String),
 
+    /// A live task was cancelled while its handler was waiting.
+    ///
+    /// Returned by the awaiting methods on `TaskContext` so a handler that
+    /// propagates with `?` unwinds correctly without writing a `select!`.
+    /// The router maps it to a cancelled task rather than a failed one.
+    #[error("Task cancelled")]
+    TaskCancelled,
+
     /// The server indicated the session has expired or is not found.
     ///
     /// This corresponds to JSON-RPC error code `-32005` (SessionNotFound)

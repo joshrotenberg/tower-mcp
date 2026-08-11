@@ -1062,6 +1062,7 @@ where
         let service = BoxCloneService::new(catch_error);
 
         Tool {
+            live_handler: None,
             name: self.name,
             title: self.title,
             description: self.description,
@@ -1191,6 +1192,7 @@ where
         let service = BoxCloneService::new(catch_error);
 
         Tool {
+            live_handler: None,
             name: self.name,
             title: self.title,
             description: self.description,
@@ -1300,6 +1302,7 @@ where
         let service = BoxCloneService::new(catch_error);
 
         Tool {
+            live_handler: None,
             name: self.name,
             title: self.title,
             description: self.description,

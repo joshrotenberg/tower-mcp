@@ -986,6 +986,35 @@ pub trait TaskStore: Send + Sync + 'static {
         responses: InputResponses,
     ) -> Result<Option<AppliedInputResponses>>;
 
+    /// Every answer accumulated for a task so far, keyed as issued.
+    ///
+    /// A live handler reads this after being woken, so that what it observes
+    /// is exactly what was durably recorded (#1246). Defaults to reading
+    /// through [`resume_context`](Self::resume_context), so a store that
+    /// already supports resumption needs no change.
+    async fn input_responses(&self, task_id: &str) -> Result<Option<InputResponses>> {
+        Ok(self
+            .resume_context(task_id)
+            .await?
+            .map(|resume| resume.input_responses))
+    }
+
+    /// Set a task's non-terminal status and message.
+    ///
+    /// Terminal states are reached through [`complete_task`](Self::complete_task),
+    /// [`fail_task`](Self::fail_task), and [`cancel_task`](Self::cancel_task);
+    /// this is for progress reporting while a task is still running. Returns
+    /// `Ok(false)` if the task is unknown, expired, or already terminal.
+    async fn set_status(
+        &self,
+        task_id: &str,
+        status: TaskStatus,
+        message: Option<&str>,
+    ) -> Result<bool> {
+        let _ = (task_id, status, message);
+        Ok(false)
+    }
+
     /// Everything needed to re-invoke a task's handler after its input
     /// requests were answered.
     ///
@@ -1517,6 +1546,34 @@ impl TaskStore for MemoryTaskStore {
             task.status_message = Some("Task resumed".to_string());
         }
         Ok(Some(applied))
+    }
+
+    async fn set_status(
+        &self,
+        task_id: &str,
+        status: TaskStatus,
+        message: Option<&str>,
+    ) -> Result<bool> {
+        if status.is_terminal() {
+            return Err(TaskStoreError::InvalidTransition(format!(
+                "set_status is for non-terminal progress; use complete_task, fail_task, or cancel_task to reach {status:?}"
+            )));
+        }
+        let Ok(mut tasks) = self.tasks.write() else {
+            return Ok(false);
+        };
+        let Some(task) = tasks.get_mut(task_id).filter(|t| !t.is_expired()) else {
+            return Ok(false);
+        };
+        if task.status.is_terminal() {
+            return Ok(false);
+        }
+        task.status = status;
+        if let Some(message) = message {
+            task.status_message = Some(message.to_string());
+        }
+        task.last_updated_at_str = chrono_now_iso8601();
+        Ok(true)
     }
 
     async fn resume_context(&self, task_id: &str) -> Result<Option<TaskResumeContext>> {
