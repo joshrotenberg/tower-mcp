@@ -353,11 +353,17 @@ impl CancellationToken {
 
 /// Errors returned by [`TaskStore`] implementations.
 ///
-/// Mirrors the three-variant shape of
-/// [`SessionStoreError`](crate::session_store::SessionStoreError): encode and
-/// decode errors from (de)serializing task state, and catch-all backend errors
-/// from the storage layer. [`MemoryTaskStore`] never returns errors; the
-/// variants exist for external implementations.
+/// Encode and decode errors come from (de)serializing task state, and
+/// [`Backend`](Self::Backend) is the catch-all for the storage layer. Those
+/// three mirror
+/// [`SessionStoreError`](crate::session_store::SessionStoreError) and exist
+/// for external implementations; [`MemoryTaskStore`] never returns them.
+///
+/// [`InvalidTransition`](Self::InvalidTransition) is different in kind. It
+/// reports that the requested change is not legal for the task's current
+/// state, which is deterministic and says nothing about storage health, so a
+/// caller must not treat it as retryable. [`MemoryTaskStore`] does return it
+/// (#1246).
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum TaskStoreError {
@@ -370,6 +376,30 @@ pub enum TaskStoreError {
     /// Backend error (e.g. connection failure, transient storage error).
     #[error("backend error: {0}")]
     Backend(String),
+    /// The requested change is not valid for the task's current state.
+    ///
+    /// Deterministic: the same call fails the same way, so retrying cannot
+    /// help and callers should not confuse it with an infrastructure
+    /// failure. Reusing an input request key is the current instance (#1246).
+    #[error("invalid task transition: {0}")]
+    InvalidTransition(String),
+}
+
+/// Whether two input requests are the same question.
+///
+/// [`InputRequest`](crate::protocol::InputRequest) is `#[non_exhaustive]` and
+/// carries params that do not implement `Eq`, so this compares their
+/// serialized forms. A request that cannot be serialized is treated as
+/// changed, which errs toward reporting reuse rather than silently accepting
+/// a second question under a spent key.
+fn same_input_request(
+    a: &crate::protocol::InputRequest,
+    b: &crate::protocol::InputRequest,
+) -> bool {
+    match (serde_json::to_value(a), serde_json::to_value(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Result alias for task store operations.
@@ -461,22 +491,41 @@ pub trait TaskStore: Send + Sync + 'static {
 
     /// Mark a task as requiring input, recording the requests to be answered.
     ///
-    /// `requests` replaces the outstanding set. Any key that was outstanding
-    /// and is not re-issued becomes superseded; a re-issued key is a fresh
-    /// question and becomes outstanding again even if previously answered.
+    /// `requests` replaces the outstanding set. A key that was outstanding
+    /// and does not appear in the new snapshot becomes superseded.
     ///
     /// Returns `Ok(false)` if the task is unknown, expired, or already
     /// terminal.
+    ///
     /// # Key uniqueness
     ///
     /// SEP-2663 requires every request key to be unique over a single task's
-    /// lifetime: a key is spent once it has been issued, whether it was
-    /// answered or superseded, and must never name a second request. An
-    /// implementation is expected to return an error rather than reissue one,
-    /// which is what lets a client deduplicate across polls (#1246).
+    /// lifetime. A key is spent once its request has been answered or
+    /// superseded, and must never name a second request; that guarantee is
+    /// what lets a client deduplicate across polls and lets a server ignore
+    /// responses for already-satisfied requests (#1246).
+    ///
+    /// Reissuing a spent key is a
+    /// [`TaskStoreError::InvalidTransition`], not a backend failure: it is
+    /// deterministic, and retrying cannot help.
+    ///
+    /// Carrying an unanswered request forward is not reuse. Because
+    /// `requests` replaces the whole snapshot, a still-outstanding key has to
+    /// be reissued to stay outstanding, and doing so names the same question
+    /// rather than a second one. Repointing a live key at a *different*
+    /// request is reuse and must be rejected.
     ///
     /// The uniqueness scope is the task. Keys from a preceding MRTR phase are
     /// a separate namespace and do not constrain a task's keys.
+    ///
+    /// # Implementing this
+    ///
+    /// An external store must enforce the same rule, and the check and the
+    /// snapshot replacement must be atomic: two concurrent parks that each
+    /// see a key as unspent would otherwise both admit it. Stores written
+    /// before this rule existed keep compiling and keep their old permissive
+    /// behaviour, so this is a behavioural migration rather than a
+    /// compile-visible one.
     async fn require_input(
         &self,
         task_id: &str,
@@ -743,17 +792,28 @@ impl TaskStore for MemoryTaskStore {
         // That guarantee is what lets a client deduplicate across polls and
         // lets a server ignore responses for already-satisfied requests, so
         // reissuing a key is rejected rather than quietly accepted (#1246).
+        //
+        // A key still outstanding is a different case. `requests` replaces
+        // the whole snapshot, so carrying an unanswered request forward
+        // reissues its key without naming a second request. That is only
+        // reuse if the request behind the key changed.
         let reused: Vec<String> = requests
-            .keys()
-            .filter(|key| {
-                task.answered_input_keys.contains(*key)
+            .iter()
+            .filter(|(key, request)| {
+                if task.answered_input_keys.contains(*key)
                     || task.superseded_input_keys.contains(*key)
-                    || task.input_requests.contains_key(*key)
+                {
+                    return true;
+                }
+                match task.input_requests.get(*key) {
+                    Some(current) => !same_input_request(current, request),
+                    None => false,
+                }
             })
-            .cloned()
+            .map(|(key, _)| key.clone())
             .collect();
         if !reused.is_empty() {
-            return Err(TaskStoreError::Backend(format!(
+            return Err(TaskStoreError::InvalidTransition(format!(
                 "input request keys must be unique over a task's lifetime, but {} \
                  already {} used by this task; use a new key to ask again",
                 reused.join(", "),
@@ -761,11 +821,13 @@ impl TaskStore for MemoryTaskStore {
             )));
         }
 
-        // Outstanding requests the server did not reissue are superseded.
-        // They stay recorded, since a superseded key is still spent for the
-        // rest of the task's lifetime.
+        // Outstanding requests the server dropped from the snapshot are
+        // superseded, and stay recorded because a superseded key is spent for
+        // the rest of the task's lifetime. A key carried forward is not.
         for key in std::mem::take(&mut task.input_requests).into_keys() {
-            task.superseded_input_keys.insert(key);
+            if !requests.contains_key(&key) {
+                task.superseded_input_keys.insert(key);
+            }
         }
 
         task.input_requests = requests;
@@ -1534,6 +1596,80 @@ mod tests {
             error.to_string().contains("approval"),
             "the message must name the offending key: {error}"
         );
+    }
+
+    /// `requests` replaces the whole snapshot, so an unanswered request has
+    /// to be reissued to stay outstanding. Carrying it forward alongside a
+    /// new one is not reuse: the key still names the same question.
+    #[tokio::test]
+    async fn an_outstanding_request_can_be_carried_forward() {
+        let store = MemoryTaskStore::new();
+        let id = working_task(&store, None).await;
+        store
+            .require_input(&id, requests(&["approval"]), None)
+            .await
+            .unwrap();
+
+        // {approval} -> {approval, region}: approval is retained, not reused.
+        assert!(
+            store
+                .require_input(&id, requests(&["approval", "region"]), None)
+                .await
+                .unwrap()
+        );
+
+        let outstanding = store
+            .outstanding_input_requests(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(outstanding.contains_key("approval"));
+        assert!(outstanding.contains_key("region"));
+
+        // Both still answer normally.
+        let applied = store
+            .apply_input_responses(
+                &id,
+                [accept("approval"), accept("region")].into_iter().collect(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            applied.accepted,
+            ["approval".to_string(), "region".to_string()].into()
+        );
+        assert!(applied.is_complete());
+    }
+
+    /// Carrying a key forward is only legitimate while it names the same
+    /// question. Pointing a live key at a different request is the reuse the
+    /// SEP forbids.
+    #[tokio::test]
+    async fn an_outstanding_key_cannot_change_what_it_asks() {
+        use crate::protocol::{ElicitFormParams, ElicitFormSchema, ElicitRequestParams};
+
+        let store = MemoryTaskStore::new();
+        let id = working_task(&store, None).await;
+        store
+            .require_input(&id, requests(&["approval"]), None)
+            .await
+            .unwrap();
+
+        let mut changed: InputRequests = Default::default();
+        changed.insert(
+            "approval".to_string(),
+            InputRequest::Elicit(ElicitRequestParams::Form(ElicitFormParams {
+                mode: None,
+                message: "a different question".to_string(),
+                requested_schema: ElicitFormSchema::new(),
+                meta: None,
+            })),
+        );
+        store
+            .require_input(&id, changed, None)
+            .await
+            .expect_err("a live key must not be repointed at another request");
     }
 
     /// A key issued and then superseded without an answer is spent too: the

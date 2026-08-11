@@ -2730,10 +2730,33 @@ impl McpRouter {
                 );
             }
             Err(e) => {
-                tracing::warn!(task_id = %task_id, error = %e, "failed to park task for input");
-                let error = JsonRpcError::internal_error(format!(
-                    "handler could not park the task for input: {e}"
-                ));
+                // Either way the park is lost and the task can never be
+                // answered, so both end it. They are not the same fault
+                // though: an invalid transition is the handler asking for
+                // something the protocol forbids, which no retry fixes,
+                // while a backend failure is infrastructure (#1246).
+                let error = match &e {
+                    crate::async_task::TaskStoreError::InvalidTransition(message) => {
+                        tracing::error!(
+                            task_id = %task_id,
+                            error = %message,
+                            "handler asked for input the protocol does not allow"
+                        );
+                        JsonRpcError::internal_error(format!(
+                            "handler asked for input the protocol does not allow: {message}"
+                        ))
+                    }
+                    other => {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            error = %other,
+                            "task store could not park the task for input"
+                        );
+                        JsonRpcError::internal_error(format!(
+                            "could not park the task for input: {other}"
+                        ))
+                    }
+                };
                 if let Err(e) = self.inner.task_store.fail_task(task_id, error).await {
                     tracing::warn!(task_id = %task_id, error = %e, "failed to record task failure");
                 }
@@ -6538,10 +6561,6 @@ mod tests {
             "the failure must name what to implement"
         );
     }
-    /// #1246 point 1: `tasks/update` resumes whenever nothing is
-    /// outstanding, without checking that an `input_required -> working`
-    /// transition actually happened. A stray update while the first handler
-    /// is still running therefore starts a second one.
     /// #1246 point 5: a handler that reuses a spent key is asking for
     /// something SEP-2663 forbids the server to send. The park is refused,
     /// and the task must say so rather than sit in `working` with nothing
@@ -6661,6 +6680,10 @@ mod tests {
         );
     }
 
+    /// #1246 point 1: `tasks/update` resumes whenever nothing is
+    /// outstanding, without checking that an `input_required -> working`
+    /// transition actually happened. A stray update while the first handler
+    /// is still running therefore starts a second one.
     #[cfg(feature = "stateless")]
     #[tokio::test]
     async fn a_stray_update_while_working_must_not_reinvoke_the_handler() {
