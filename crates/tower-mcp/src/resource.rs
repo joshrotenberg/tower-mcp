@@ -31,9 +31,10 @@
 //! | [`ResourceTemplateBuilder::handler`] | the request URI and the extracted variables |
 //!
 //! Each returns a [`ReadResourceResult`]. For content already in memory,
-//! [`ResourceBuilder::text`] and [`ResourceBuilder::json`] skip the handler
-//! entirely. With the `stateless` feature, `mrtr_handler` accepts a handler
-//! that can suspend and ask the client for more input (SEP-2322).
+//! [`ResourceBuilder::text`] and [`ResourceBuilder::json`] finish the builder
+//! without a handler at all. With the `stateless` feature, `mrtr_handler`
+//! accepts a handler that can suspend and ask the client for more input
+//! (SEP-2322).
 //!
 //! # A failing resource handler is not a failed request
 //!
