@@ -861,7 +861,34 @@ mod cancellation {
 
 mod panics {
     use super::*;
+    use std::io::Write;
+    use std::sync::Mutex;
+    use tower_mcp::PanicPolicy;
     use tower_mcp::extract::Context;
+
+    #[derive(Clone, Default)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("capture lock")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CaptureWriter {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().expect("capture lock").clone())
+                .expect("tracing output is UTF-8")
+        }
+    }
 
     fn panicking_router(catch: bool) -> McpRouter {
         let boom = ToolBuilder::new("boom")
@@ -904,15 +931,10 @@ mod panics {
             .await
             .expect("the call must return, not kill the connection");
         assert!(result.is_error, "a caught panic is an error result");
-        assert!(
-            result.all_text().contains("panicked"),
-            "the message must say what happened: {}",
-            result.all_text()
-        );
-        assert!(
-            result.all_text().contains("SystemTime"),
-            "and carry the panic's own message: {}",
-            result.all_text()
+        assert_eq!(
+            result.all_text(),
+            "tool 'boom' panicked: overflow when adding duration to `SystemTime`",
+            "the compatibility builder keeps its detailed response"
         );
 
         // The decisive assertion: the connection survives and other tools
@@ -922,6 +944,155 @@ mod panics {
             .await
             .expect("the server must still be serving");
         assert_eq!(after.all_text(), "ok");
+    }
+
+    /// #1306: strict servers can isolate a panic without copying handler
+    /// data into either the client response or Tower's tracing event.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_redacted_policy_omits_string_and_non_string_panic_payloads() {
+        const TOOL_NAME: &str = "private.provider.operation";
+        const PAYLOAD: &str = "secret path /private/provider/home";
+        const SAFE_MESSAGE: &str = "internal tool failure";
+
+        let string_panic = ToolBuilder::new(TOOL_NAME)
+            .description("Panics with sensitive text")
+            .extractor_handler((), |_ctx: Context, RawArgs(_): RawArgs| async move {
+                panic!("{PAYLOAD}");
+                #[allow(unreachable_code)]
+                Ok(CallToolResult::text("unreachable"))
+            })
+            .build();
+        let odd_panic = ToolBuilder::new("private.provider.non-string")
+            .description("Panics with an opaque payload")
+            .extractor_handler((), |_ctx: Context, RawArgs(_): RawArgs| async move {
+                std::panic::panic_any(42_u8);
+                #[allow(unreachable_code)]
+                Ok(CallToolResult::text("unreachable"))
+            })
+            .build();
+        let fine = ToolBuilder::new("fine")
+            .description("Works")
+            .extractor_handler((), |_ctx: Context, RawArgs(_): RawArgs| async move {
+                Ok(CallToolResult::text("ok"))
+            })
+            .build();
+
+        let captured = CaptureWriter::default();
+        let trace_output = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::ERROR)
+            .with_writer(move || captured.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+
+        let router = McpRouter::new()
+            .server_info("panic-test", "1.0.0")
+            .tool(string_panic)
+            .tool(odd_panic)
+            .tool(fine)
+            .catch_panics_with(PanicPolicy::redacted(SAFE_MESSAGE));
+        let client = McpClient::connect(ChannelTransport::new(router))
+            .await
+            .expect("connect");
+        client
+            .initialize("test", "1.0.0")
+            .await
+            .expect("initialize");
+
+        for name in [TOOL_NAME, "private.provider.non-string"] {
+            let result = client
+                .call_tool(name, serde_json::json!({}))
+                .await
+                .expect("caught panic returns a result");
+            assert!(result.is_error);
+            assert_eq!(result.all_text(), SAFE_MESSAGE);
+        }
+
+        let after = client
+            .call_tool("fine", serde_json::json!({}))
+            .await
+            .expect("call");
+        assert_eq!(after.all_text(), "ok");
+
+        let traces = trace_output.contents();
+        assert!(traces.contains("tool handler panicked"), "{traces}");
+        assert!(!traces.contains(TOOL_NAME), "tool name leaked: {traces}");
+        assert!(!traces.contains(PAYLOAD), "panic payload leaked: {traces}");
+        assert!(
+            !traces.contains("non-string payload"),
+            "opaque panic payload was inspected: {traces}"
+        );
+    }
+
+    /// Client and tracing tool-name disclosure are separate switches.
+    #[tokio::test(flavor = "current_thread")]
+    async fn panic_policy_tool_name_disclosures_are_independent() {
+        const TOOL_NAME: &str = "private.provider.named";
+        const PAYLOAD: &str = "private panic payload";
+
+        let boom = ToolBuilder::new(TOOL_NAME)
+            .description("Panics")
+            .extractor_handler((), |_ctx: Context, RawArgs(_): RawArgs| async move {
+                panic!("{PAYLOAD}");
+                #[allow(unreachable_code)]
+                Ok(CallToolResult::text("unreachable"))
+            })
+            .build();
+        let captured = CaptureWriter::default();
+        let trace_output = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::ERROR)
+            .with_writer(move || captured.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+
+        let router = McpRouter::new()
+            .server_info("panic-test", "1.0.0")
+            .tool(boom)
+            .catch_panics_with(
+                PanicPolicy::redacted("internal tool failure")
+                    .client_tool_name("client-safe-tool")
+                    .log_tool_name("log-safe-tool")
+                    .include_payload_in_logs(true),
+            );
+        let client = McpClient::connect(ChannelTransport::new(router))
+            .await
+            .expect("connect");
+        client
+            .initialize("test", "1.0.0")
+            .await
+            .expect("initialize");
+
+        let result = client
+            .call_tool(TOOL_NAME, serde_json::json!({}))
+            .await
+            .expect("caught panic returns a result");
+        assert_eq!(
+            result.all_text(),
+            "tool 'client-safe-tool': internal tool failure"
+        );
+
+        let traces = trace_output.contents();
+        assert!(
+            traces.contains("log-safe-tool"),
+            "log alias absent: {traces}"
+        );
+        assert!(
+            !traces.contains("client-safe-tool"),
+            "client alias crossed into tracing: {traces}"
+        );
+        assert!(
+            !traces.contains(TOOL_NAME),
+            "raw tool name leaked: {traces}"
+        );
+        assert!(
+            traces.contains(PAYLOAD),
+            "the independently enabled log payload is absent: {traces}"
+        );
     }
 
     /// Off by default: opting in is a statement that availability matters

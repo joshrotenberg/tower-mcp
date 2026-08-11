@@ -121,6 +121,163 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+#[derive(Clone)]
+enum ClientPanicMessage {
+    Detailed,
+    Fixed(Arc<str>),
+}
+
+#[derive(Clone)]
+enum ToolNameDisclosure {
+    Omit,
+    Original,
+    Fixed(Arc<str>),
+}
+
+impl ToolNameDisclosure {
+    fn value<'a>(&'a self, original: &'a str) -> Option<&'a str> {
+        match self {
+            Self::Omit => None,
+            Self::Original => Some(original),
+            Self::Fixed(name) => Some(name),
+        }
+    }
+
+    fn mode(&self) -> &'static str {
+        match self {
+            Self::Omit => "omitted",
+            Self::Original => "original",
+            Self::Fixed(_) => "fixed",
+        }
+    }
+}
+
+/// Controls what Tower discloses after isolating a panicking tool handler.
+///
+/// Construct a redacted policy with [`PanicPolicy::redacted`], then opt in to
+/// individual disclosures only when they are safe for the application. Panic
+/// payloads are never included in a custom policy's client response.
+///
+/// Rust's process-global panic hook runs before Tower catches an unwind. This
+/// policy governs only Tower's client response and Tower-generated tracing
+/// event; it cannot redact output produced by an application-installed panic
+/// hook or by Rust's default panic hook.
+#[derive(Clone)]
+pub struct PanicPolicy {
+    client_message: ClientPanicMessage,
+    client_tool_name: ToolNameDisclosure,
+    log_tool_name: ToolNameDisclosure,
+    include_payload_in_logs: bool,
+}
+
+impl std::fmt::Debug for PanicPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let client_message = match self.client_message {
+            ClientPanicMessage::Detailed => "detailed",
+            ClientPanicMessage::Fixed(_) => "fixed",
+        };
+        f.debug_struct("PanicPolicy")
+            .field("client_message", &client_message)
+            .field("client_tool_name", &self.client_tool_name.mode())
+            .field("log_tool_name", &self.log_tool_name.mode())
+            .field("include_payload_in_logs", &self.include_payload_in_logs)
+            .finish()
+    }
+}
+
+impl PanicPolicy {
+    /// Create a policy whose client response is fixed application-supplied
+    /// text and whose Tower tracing event contains neither the tool name nor
+    /// the panic payload.
+    pub fn redacted(client_message: impl Into<String>) -> Self {
+        Self {
+            client_message: ClientPanicMessage::Fixed(Arc::from(client_message.into())),
+            client_tool_name: ToolNameDisclosure::Omit,
+            log_tool_name: ToolNameDisclosure::Omit,
+            include_payload_in_logs: false,
+        }
+    }
+
+    fn detailed() -> Self {
+        Self {
+            client_message: ClientPanicMessage::Detailed,
+            client_tool_name: ToolNameDisclosure::Original,
+            log_tool_name: ToolNameDisclosure::Original,
+            include_payload_in_logs: true,
+        }
+    }
+
+    /// Include the registered tool name in the client-visible error.
+    ///
+    /// With a redacted policy this changes the response from the exact fixed
+    /// message to `tool '<name>': <fixed message>`.
+    #[must_use]
+    pub fn include_tool_name_in_client_message(mut self, include: bool) -> Self {
+        self.client_tool_name = if include {
+            ToolNameDisclosure::Original
+        } else {
+            ToolNameDisclosure::Omit
+        };
+        self
+    }
+
+    /// Replace the registered tool name in the client-visible error with a
+    /// fixed application-selected label.
+    ///
+    /// This is useful when the original catalog name is sensitive but a
+    /// stable category such as `provider tool` is still useful to callers.
+    #[must_use]
+    pub fn client_tool_name(mut self, name: impl Into<String>) -> Self {
+        self.client_tool_name = ToolNameDisclosure::Fixed(Arc::from(name.into()));
+        self
+    }
+
+    /// Include the registered tool name in Tower's panic tracing event.
+    #[must_use]
+    pub fn include_tool_name_in_logs(mut self, include: bool) -> Self {
+        self.log_tool_name = if include {
+            ToolNameDisclosure::Original
+        } else {
+            ToolNameDisclosure::Omit
+        };
+        self
+    }
+
+    /// Replace the registered tool name in Tower's panic tracing event with
+    /// a fixed application-selected label.
+    #[must_use]
+    pub fn log_tool_name(mut self, name: impl Into<String>) -> Self {
+        self.log_tool_name = ToolNameDisclosure::Fixed(Arc::from(name.into()));
+        self
+    }
+
+    /// Include the recovered panic payload in Tower's panic tracing event.
+    ///
+    /// This switch never changes the client-visible error.
+    #[must_use]
+    pub fn include_payload_in_logs(mut self, include: bool) -> Self {
+        self.include_payload_in_logs = include;
+        self
+    }
+
+    fn client_message(&self, tool_name: &str, payload: Option<&str>) -> String {
+        match &self.client_message {
+            ClientPanicMessage::Detailed => format!(
+                "tool '{tool_name}' panicked: {}",
+                payload.expect("detailed panic policy always recovers the payload")
+            ),
+            ClientPanicMessage::Fixed(message) => match self.client_tool_name.value(tool_name) {
+                Some(name) => format!("tool '{name}': {message}"),
+                None => message.to_string(),
+            },
+        }
+    }
+
+    fn needs_payload(&self) -> bool {
+        matches!(self.client_message, ClientPanicMessage::Detailed) || self.include_payload_in_logs
+    }
+}
+
 /// The kind of capability a [`MergeConflict`] refers to.
 ///
 /// Ordered so that [`McpRouter::conflicts`] reports tools before resources
@@ -549,9 +706,9 @@ struct McpRouterInner {
     /// URL of the server's website
     server_website_url: Option<String>,
     instructions: Option<String>,
-    /// Whether to convert a panicking tool handler into an error result
-    /// rather than letting it unwind out of the service (#1230).
-    catch_panics: bool,
+    /// How to convert a panicking tool handler into an error result rather
+    /// than letting it unwind out of the service (#1230, #1306).
+    panic_policy: Option<PanicPolicy>,
     auto_instructions: Option<AutoInstructionsConfig>,
     tools: HashMap<String, Arc<Tool>>,
     resources: HashMap<String, Arc<Resource>>,
@@ -736,7 +893,7 @@ impl McpRouter {
                 server_icons: None,
                 server_website_url: None,
                 instructions: None,
-                catch_panics: false,
+                panic_policy: None,
                 auto_instructions: None,
                 tools: HashMap::new(),
                 resources: HashMap::new(),
@@ -1395,14 +1552,40 @@ impl McpRouter {
     /// matters more than failing fast, which is true for a shared server and
     /// often false for a local one.
     ///
-    /// The caught panic becomes a `CallToolResult` with `is_error: true`
-    /// carrying the panic message, and is logged at error level with the tool
-    /// name so it is not silently swallowed.
+    /// For ordinary and replayed handlers, the caught panic becomes a
+    /// `CallToolResult` with `is_error: true` carrying the panic message. A
+    /// live Task handler instead reaches `failed` with the same detailed
+    /// message. Both are logged at error level with the tool name so the panic
+    /// is not silently swallowed.
     ///
     /// A panic that unwinds is caught; one that aborts the process (a
     /// double panic, or `panic = "abort"`) cannot be, by construction.
     pub fn catch_panics(mut self) -> Self {
-        Arc::make_mut(&mut self.inner).catch_panics = true;
+        Arc::make_mut(&mut self.inner).panic_policy = Some(PanicPolicy::detailed());
+        self
+    }
+
+    /// Convert a panicking tool handler into an error result using an
+    /// application-selected disclosure policy.
+    ///
+    /// [`PanicPolicy::redacted`] returns fixed client text and omits both the
+    /// tool name and panic payload from Tower's tracing event by default.
+    /// Unlike [`McpRouter::catch_panics`], a custom policy never includes the
+    /// panic payload in the client response.
+    ///
+    /// The policy applies to ordinary calls and both replayed and live Task
+    /// handlers registered on this router. Router-level configuration is not
+    /// imported when another router is merged or nested, so the receiving
+    /// router's policy governs the combined catalog.
+    ///
+    /// Rust's process-global panic hook runs before the unwind is caught, so
+    /// this controls Tower's client response and tracing event only. It does
+    /// not suppress application or default panic-hook output.
+    ///
+    /// A panic that aborts the process (a double panic, or
+    /// `panic = "abort"`) cannot be caught.
+    pub fn catch_panics_with(mut self, policy: PanicPolicy) -> Self {
+        Arc::make_mut(&mut self.inner).panic_policy = Some(policy);
         self
     }
 
@@ -2971,9 +3154,10 @@ impl McpRouter {
 
     /// Invoke a tool, optionally converting a panic into an error result.
     ///
-    /// Enabled by [`McpRouter::catch_panics`]. Without it this is a direct
-    /// call and a panic unwinds as before, which is the default because a
-    /// panic is an invariant violation and hiding one is not always a favour.
+    /// Enabled by [`McpRouter::catch_panics`] or
+    /// [`McpRouter::catch_panics_with`]. Without either this is a direct call
+    /// and a panic unwinds as before, which is the default because a panic is
+    /// an invariant violation and hiding one is not always a favour.
     async fn invoke_tool(
         &self,
         tool: &crate::tool::Tool,
@@ -2981,35 +3165,99 @@ impl McpRouter {
         arguments: serde_json::Value,
         tool_name: &str,
     ) -> Result<crate::protocol::RequestOutcome<CallToolResult>> {
-        if !self.inner.catch_panics {
+        let Some(policy) = &self.inner.panic_policy else {
             return tool.call_outcome_with_context(ctx, arguments).await;
-        }
+        };
 
         use futures::FutureExt;
         // AssertUnwindSafe: the future may hold &mut across the await, which
         // Rust cannot prove safe to observe post-unwind. Any state a panicking
         // handler leaves behind belongs to that handler; the router's own
         // state is not mutated by this call.
-        let called = std::panic::AssertUnwindSafe(tool.call_outcome_with_context(ctx, arguments))
-            .catch_unwind()
-            .await;
+        let called = std::panic::AssertUnwindSafe(async move {
+            tool.call_outcome_with_context(ctx, arguments).await
+        })
+        .catch_unwind()
+        .await;
 
         match called {
             Ok(outcome) => outcome,
             Err(payload) => {
-                let message = panic_message(&*payload);
-                // Logged at error, not swallowed: an operator who opted into
-                // availability still needs to learn about the bug.
-                tracing::error!(
-                    target: "mcp::tools",
-                    tool = %tool_name,
-                    panic = %message,
-                    "tool handler panicked; returning an error result"
-                );
+                let message = self.handle_caught_panic(policy, tool_name, None, &*payload);
                 Ok(crate::protocol::RequestOutcome::Complete(
-                    CallToolResult::error(format!("tool '{tool_name}' panicked: {message}")),
+                    CallToolResult::error(message),
                 ))
             }
+        }
+    }
+
+    /// Apply the selected disclosure policy to a caught handler panic.
+    ///
+    /// Payload recovery is intentionally conditional: the fully redacted
+    /// path never downcasts, clones, or formats the panic payload.
+    fn handle_caught_panic(
+        &self,
+        policy: &PanicPolicy,
+        tool_name: &str,
+        task_id: Option<&str>,
+        payload: &(dyn std::any::Any + Send),
+    ) -> String {
+        let payload = policy.needs_payload().then(|| panic_message(payload));
+        let logged_tool = policy.log_tool_name.value(tool_name);
+        let logged_payload = policy
+            .include_payload_in_logs
+            .then(|| payload.as_deref().expect("log payload was recovered"));
+
+        Self::log_caught_panic(logged_tool, logged_payload, task_id);
+        policy.client_message(tool_name, payload.as_deref())
+    }
+
+    fn log_caught_panic(tool_name: Option<&str>, payload: Option<&str>, task_id: Option<&str>) {
+        match (tool_name, payload, task_id) {
+            (Some(tool_name), Some(payload), Some(task_id)) => tracing::error!(
+                target: "mcp::tools",
+                tool = %tool_name,
+                panic = %payload,
+                task_id = %task_id,
+                "tool handler panicked; returning an error result"
+            ),
+            (Some(tool_name), Some(payload), None) => tracing::error!(
+                target: "mcp::tools",
+                tool = %tool_name,
+                panic = %payload,
+                "tool handler panicked; returning an error result"
+            ),
+            (Some(tool_name), None, Some(task_id)) => tracing::error!(
+                target: "mcp::tools",
+                tool = %tool_name,
+                task_id = %task_id,
+                "tool handler panicked; returning an error result"
+            ),
+            (Some(tool_name), None, None) => tracing::error!(
+                target: "mcp::tools",
+                tool = %tool_name,
+                "tool handler panicked; returning an error result"
+            ),
+            (None, Some(payload), Some(task_id)) => tracing::error!(
+                target: "mcp::tools",
+                panic = %payload,
+                task_id = %task_id,
+                "tool handler panicked; returning an error result"
+            ),
+            (None, Some(payload), None) => tracing::error!(
+                target: "mcp::tools",
+                panic = %payload,
+                "tool handler panicked; returning an error result"
+            ),
+            (None, None, Some(task_id)) => tracing::error!(
+                target: "mcp::tools",
+                task_id = %task_id,
+                "tool handler panicked; returning an error result"
+            ),
+            (None, None, None) => tracing::error!(
+                target: "mcp::tools",
+                "tool handler panicked; returning an error result"
+            ),
         }
     }
 
@@ -3500,7 +3748,7 @@ impl McpRouter {
                             notifier.register_live_task(&task_id_clone, handle.clone());
                             // Released on drop, so the entry goes whether the
                             // handler returns, panics, or is dropped (#1305).
-                            let _registration = LiveTaskRegistration {
+                            let registration = LiveTaskRegistration {
                                 router: notifier.clone(),
                                 task_id: task_id_clone.clone(),
                             };
@@ -3516,33 +3764,33 @@ impl McpRouter {
                             // directly and had none, so a panic unwound before
                             // any terminal state was written and left the task
                             // at `working` forever (#1305).
-                            let called = live_handler.call(ctx, live_ctx, arguments);
-                            let outcome = if notifier.inner.catch_panics {
+                            let outcome = if let Some(policy) = &notifier.inner.panic_policy {
                                 use futures::FutureExt;
-                                match std::panic::AssertUnwindSafe(called).catch_unwind().await {
+                                let called = std::panic::AssertUnwindSafe(async move {
+                                    live_handler.call(ctx, live_ctx, arguments).await
+                                })
+                                .catch_unwind()
+                                .await;
+                                match called {
                                     Ok(outcome) => outcome,
                                     Err(payload) => {
-                                        let message = panic_message(&*payload);
-                                        tracing::error!(
-                                            target: "mcp::tools",
-                                            tool = %tool_name,
-                                            task_id = %task_id_clone,
-                                            panic = %message,
-                                            "live task handler panicked"
+                                        let message = notifier.handle_caught_panic(
+                                            policy,
+                                            &tool_name,
+                                            Some(&task_id_clone),
+                                            &*payload,
                                         );
                                         // A panic is an execution failure, not
                                         // a tool reporting a domain error, so
                                         // it fails the task rather than
                                         // completing it with `isError`.
                                         Ok(crate::tool::TaskOutcome::Failed(
-                                            JsonRpcError::internal_error(format!(
-                                                "tool '{tool_name}' panicked: {message}"
-                                            )),
+                                            JsonRpcError::internal_error(message),
                                         ))
                                     }
                                 }
                             } else {
-                                called.await
+                                live_handler.call(ctx, live_ctx, arguments).await
                             };
                             let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -3579,13 +3827,13 @@ impl McpRouter {
                                     .await
                                     .map(|_| "failed"),
                             };
-                            // The registration guard releases the entry when
-                            // it drops at the end of this block, which is after
-                            // the terminal write above. Unregistering before
-                            // that write left a window where a cancel took the
-                            // store path and wrote `cancelled` over a task
-                            // whose handler had already produced a result
-                            // (#1294).
+                            // The terminal write must win before unregistering
+                            // (#1294), but the dead handle must not remain
+                            // visible through logging or notification awaits.
+                            // If the write failed, a later cancellation can
+                            // now take the store path instead of signalling a
+                            // handler that has already returned (#1305).
+                            drop(registration);
 
                             match applied {
                                 Ok(status) => tracing::info!(
