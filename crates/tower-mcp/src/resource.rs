@@ -2186,14 +2186,21 @@ fn decode_query_component(value: &str) -> String {
                 out.push(b' ');
                 i += 1;
             }
+            // Decoded from the byte array rather than by slicing the
+            // string. `&value[i + 1..i + 3]` panics when either index lands
+            // inside a multibyte character, which a client can trigger with
+            // something as ordinary as `?q=%a\u{e9}`. Indexing bytes cannot
+            // cross a boundary, and any byte that is not an ASCII hex digit
+            // fails `to_digit` and falls through to the malformed path.
             b'%' if i + 2 < bytes.len() => {
-                let hex = &value[i + 1..i + 3];
-                match u8::from_str_radix(hex, 16) {
-                    Ok(byte) => {
-                        out.push(byte);
+                let high = (bytes[i + 1] as char).to_digit(16);
+                let low = (bytes[i + 2] as char).to_digit(16);
+                match (high, low) {
+                    (Some(high), Some(low)) => {
+                        out.push((high * 16 + low) as u8);
                         i += 3;
                     }
-                    Err(_) => {
+                    _ => {
                         out.push(bytes[i]);
                         i += 1;
                     }
@@ -2339,6 +2346,61 @@ mod query_expansion_tests {
             .match_uri("agent://search?q=a%20b+c%2Fd")
             .expect("must match");
         assert_eq!(vars.get("q").map(String::as_str), Some("a b c/d"));
+    }
+
+    /// A percent sign next to a multibyte character used to panic: the
+    /// decoder sliced the string by byte offset after checking only length,
+    /// so either end of the slice could land inside a character. Any client
+    /// could reach it through a query expression, because even an undeclared
+    /// key is decoded before it is discarded.
+    #[test]
+    fn percent_decoding_survives_multibyte_input() {
+        let t = template("agent://search{?q}");
+        for (uri, expected) in [
+            ("agent://search?q=%a\u{e9}", "%a\u{e9}"),
+            ("agent://search?q=a%9\u{e9}", "a%9\u{e9}"),
+            ("agent://search?q=\u{e9}%\u{e9}", "\u{e9}%\u{e9}"),
+            ("agent://search?q=%\u{1f600}", "%\u{1f600}"),
+        ] {
+            let vars = t
+                .match_uri(uri)
+                .unwrap_or_else(|| panic!("must match: {uri}"));
+            assert_eq!(
+                vars.get("q").map(String::as_str),
+                Some(expected),
+                "for {uri}"
+            );
+        }
+    }
+
+    /// An undeclared key is decoded before it is discarded, so it is just as
+    /// reachable as a declared one.
+    #[test]
+    fn an_undeclared_key_with_multibyte_input_is_also_safe() {
+        let t = template("agent://search{?q}");
+        let vars = t
+            .match_uri("agent://search?%a\u{e9}=x&q=fine")
+            .expect("must match");
+        assert_eq!(vars.get("q").map(String::as_str), Some("fine"));
+    }
+
+    /// A percent at or near the end has no two digits to read.
+    #[test]
+    fn a_truncated_escape_is_left_alone() {
+        let t = template("agent://search{?q}");
+        for (uri, expected) in [
+            ("agent://search?q=%", "%"),
+            ("agent://search?q=%2", "%2"),
+            ("agent://search?q=a%", "a%"),
+            ("agent://search?q=%zz", "%zz"),
+        ] {
+            let vars = t.match_uri(uri).expect("must match");
+            assert_eq!(
+                vars.get("q").map(String::as_str),
+                Some(expected),
+                "for {uri}"
+            );
+        }
     }
 
     /// A malformed escape reaches the handler as written rather than
