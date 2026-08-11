@@ -950,6 +950,14 @@ mod tests {
         format!("{major}.{minor}")
     }
 
+    /// The release lines this crate emits into generated projects.
+    ///
+    /// `TOWER_MCP_RELEASE_LINE` is the one version reference in the repository
+    /// that the workspace-wide scan cannot see, because it is a Rust constant
+    /// rather than a dependency declaration. Everything written as a
+    /// declaration, including the macro crate's doc example that this test used
+    /// to reach across for, is covered by
+    /// `crates/tower-mcp/tests/version_drift.rs` (#1264).
     #[test]
     fn generated_dependency_versions_track_release_hygiene() {
         assert_eq!(TOWER_MCP_RELEASE_LINE, workspace_release_line());
@@ -966,11 +974,6 @@ mod tests {
         )));
         assert!(generated.readme_md.contains(&format!(
             "reqwest = {{ version = \"{REQWEST_RELEASE_LINE}\", features = [\"json\"] }}"
-        )));
-
-        let macro_docs = include_str!("../../../crates/tower-mcp-macros/src/lib.rs");
-        assert!(macro_docs.contains(&format!(
-            "tower-mcp = {{ version = \"{TOWER_MCP_RELEASE_LINE}\", features = [\"macros\"] }}"
         )));
     }
 }
