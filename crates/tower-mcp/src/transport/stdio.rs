@@ -54,8 +54,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
 
 use crate::context::{
-    ChannelClientRequester, ClientRequesterHandle, NotificationReceiver, OutgoingRequest,
-    OutgoingRequestReceiver, ServerNotification, notification_channel, outgoing_request_channel,
+    ChannelClientRequester, ClientRequesterHandle, NotificationReceiver, NotificationSender,
+    OutgoingRequest, OutgoingRequestReceiver, ServerNotification, notification_channel,
+    outgoing_request_channel,
 };
 use tower_service::Service;
 
@@ -436,6 +437,18 @@ async fn acquire_request_permit(
     }
 }
 
+/// Routes a client-to-server notification to whatever owns request state.
+///
+/// [`GenericStdioTransport`] has no router of its own, so without this it
+/// drops every inbound notification, including `notifications/cancelled` for
+/// an ordinary in-flight request (#1250).
+pub(crate) type IncomingNotificationHandler = Arc<dyn Fn(McpNotification) + Send + Sync + 'static>;
+
+/// Build a handler that routes notifications back into a router.
+pub(crate) fn router_notification_handler(router: McpRouter) -> IncomingNotificationHandler {
+    Arc::new(move |notification| router.handle_notification(notification))
+}
+
 /// Whether a frame expects a response.
 ///
 /// A JSON-RPC notification carries no `id`, and a notification must never
@@ -682,6 +695,14 @@ pub struct StdioTransport {
     notification_rx: NotificationReceiver,
     control_tx: mpsc::UnboundedSender<StdioControl>,
     control_rx: mpsc::UnboundedReceiver<StdioControl>,
+    /// Held only by [`StdioTransport::without_server_notifications`], to keep
+    /// the unused outbound channel open rather than closed (#1250).
+    ///
+    /// Never read: the point is the sender's lifetime, not its value. A
+    /// dropped sender would make the receiver return `None` on every poll,
+    /// so the read loop would re-check a dead branch each iteration.
+    #[allow(dead_code)]
+    outbound_disabled: Option<NotificationSender>,
     /// Bound on requests in flight at once; `None` leaves it unbounded (#1231).
     max_concurrent_requests: Option<usize>,
 }
@@ -697,6 +718,7 @@ impl StdioTransport {
             service,
             router,
             notification_rx,
+            outbound_disabled: None,
             control_tx,
             control_rx,
             max_concurrent_requests: None,
@@ -708,6 +730,44 @@ impl StdioTransport {
     pub fn handle(&self) -> StdioTransportHandle {
         StdioTransportHandle {
             control_tx: self.control_tx.clone(),
+        }
+    }
+
+    /// Create a transport that receives client notifications but sends none.
+    ///
+    /// [`new`](Self::new) installs an outbound notification sender on the
+    /// router, which is also what makes capability synthesis advertise MCP
+    /// logging and set `listChanged`. A server that logs to stderr or OTLP
+    /// and deliberately does not expose MCP logging had no way to keep
+    /// inbound `notifications/cancelled` without also advertising features it
+    /// does not offer (#1250).
+    ///
+    /// This routes inbound notifications exactly as [`new`](Self::new) does.
+    /// It only declines to send: no progress, logging, or `listChanged`
+    /// frames are emitted, and the router advertises neither.
+    ///
+    /// ```rust
+    /// use tower_mcp::{McpRouter, StdioTransport};
+    ///
+    /// let router = McpRouter::new().server_info("my-server", "1.0.0");
+    /// let transport = StdioTransport::without_server_notifications(router);
+    /// ```
+    pub fn without_server_notifications(router: McpRouter) -> Self {
+        let (notification_tx, notification_rx) = notification_channel(256);
+        let (control_tx, control_rx) = stdio_control_channel();
+        // The router never learns about the sender, so it advertises no
+        // notification-derived capabilities. Holding the sender here keeps
+        // the receiver pending forever rather than immediately closed, which
+        // would make the read loop poll a dead branch every iteration.
+        let service = JsonRpcService::new(router.clone());
+        Self {
+            service,
+            router,
+            notification_rx,
+            outbound_disabled: Some(notification_tx),
+            control_tx,
+            control_rx,
+            max_concurrent_requests: None,
         }
     }
 
@@ -805,6 +865,10 @@ impl StdioTransport {
     {
         let protocol_support = self.service.configured_protocol_support().clone();
         let annotations = self.router.tool_annotations_map();
+        // Taken before the layer consumes the router. A clone shares the
+        // in-flight request registry, so cancellation routed through it
+        // reaches requests dispatched by the layered service (#1250).
+        let incoming_notifications = Some(router_notification_handler(self.router.clone()));
         #[cfg(feature = "stateless")]
         let subscription_observer = self.router.subscription_observer();
         let wrapped = layer.layer(self.router);
@@ -814,6 +878,7 @@ impl StdioTransport {
             notification_rx: Some(self.notification_rx),
             control_tx: self.control_tx,
             control_rx: self.control_rx,
+            incoming_notifications,
             // Carried across the conversion so `.layer()` does not silently
             // discard a concurrency bound set before it.
             max_concurrent_requests: self.max_concurrent_requests,
@@ -1077,6 +1142,10 @@ where
     notification_rx: Option<NotificationReceiver>,
     control_tx: mpsc::UnboundedSender<StdioControl>,
     control_rx: mpsc::UnboundedReceiver<StdioControl>,
+    /// Where inbound client notifications go. `None` drops them, which is
+    /// what a directly constructed generic transport did unconditionally
+    /// before (#1250).
+    incoming_notifications: Option<IncomingNotificationHandler>,
     /// Bound on requests in flight at once; `None` leaves it unbounded (#1231).
     max_concurrent_requests: Option<usize>,
     /// Close observer threaded from the router by [`StdioTransport::layer`];
@@ -1109,10 +1178,25 @@ where
             notification_rx: None,
             control_tx,
             control_rx,
+            incoming_notifications: None,
             max_concurrent_requests: None,
             #[cfg(feature = "stateless")]
             subscription_observer: None,
         }
+    }
+
+    /// Route inbound client notifications into `router`.
+    ///
+    /// A generic transport has no router of its own, so by default it drops
+    /// every client-to-server notification, including
+    /// `notifications/cancelled` for an in-flight request. Pass the router
+    /// backing this service to restore that (#1250).
+    ///
+    /// [`StdioTransport::layer`] does this automatically, so this is for
+    /// transports built directly from a service.
+    pub fn route_notifications_to(mut self, router: McpRouter) -> Self {
+        self.incoming_notifications = Some(router_notification_handler(router));
+        self
     }
 
     /// Cap how many requests this transport handles at once.
@@ -1138,6 +1222,7 @@ where
             notification_rx: Some(notification_rx),
             control_tx,
             control_rx,
+            incoming_notifications: None,
             max_concurrent_requests: None,
             #[cfg(feature = "stateless")]
             subscription_observer: None,
@@ -1224,6 +1309,7 @@ where
                             &line,
                             &out_tx,
                             &work_tx,
+                            self.incoming_notifications.as_ref(),
                             true,
                             #[cfg(feature = "stateless")]
                             &mut subscriptions,
@@ -1275,6 +1361,7 @@ where
                             &line,
                             &out_tx,
                             &work_tx,
+                            self.incoming_notifications.as_ref(),
                             false,
                             #[cfg(feature = "stateless")]
                             &mut subscriptions,
@@ -1325,6 +1412,7 @@ where
         line: &str,
         out_tx: &OutboundFrames,
         work_tx: &mpsc::UnboundedSender<QueuedRequest>,
+        incoming_notifications: Option<&IncomingNotificationHandler>,
         subscriptions_enabled: bool,
         #[cfg(feature = "stateless")] subscriptions: &mut StdioSubscriptions,
     ) -> Result<()> {
@@ -1377,11 +1465,26 @@ where
         }
 
         if !parsed.is_array() && parsed.get("id").is_none() {
-            // Notification - log and ignore since we don't have router access
-            tracing::debug!(
-                method = parsed.get("method").and_then(|m| m.as_str()),
-                "Received notification (ignored in generic transport)"
-            );
+            // Routed when the transport was given somewhere to route to,
+            // which is what keeps `notifications/cancelled` working after a
+            // layer is applied (#1250). Without a handler there is still
+            // nowhere for it to go.
+            match incoming_notifications {
+                Some(handler) => match serde_json::from_str::<JsonRpcNotification>(trimmed)
+                    .ok()
+                    .and_then(|n| McpNotification::from_jsonrpc(&n).ok())
+                {
+                    Some(notification) => handler(notification),
+                    None => tracing::debug!(
+                        method = parsed.get("method").and_then(|m| m.as_str()),
+                        "Unrecognized notification"
+                    ),
+                },
+                None => tracing::debug!(
+                    method = parsed.get("method").and_then(|m| m.as_str()),
+                    "Received notification but no handler is configured"
+                ),
+            }
             return Ok(());
         }
 

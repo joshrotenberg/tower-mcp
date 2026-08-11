@@ -1780,3 +1780,142 @@ mod control_under_saturation {
         );
     }
 }
+
+// ============================================================================
+// Inbound notification routing (#1250)
+// ============================================================================
+
+mod inbound_notifications {
+    use super::*;
+    use tower_mcp::extract::RawArgs;
+
+    fn router_with_a_waiting_tool() -> McpRouter {
+        let wait = ToolBuilder::new("wait")
+            .description("Waits until cancelled")
+            .extractor_handler((), |ctx: Context, RawArgs(_): RawArgs| async move {
+                ctx.cancelled().await;
+                Ok(CallToolResult::text("cancelled"))
+            })
+            .build();
+        McpRouter::new()
+            .server_info("inbound-test", "0.0.0")
+            .tool(wait)
+    }
+
+    const INIT: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#;
+    const CALL_WAIT: &str =
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"wait","arguments":{}}}"#;
+    const CANCEL: &str =
+        r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}"#;
+
+    /// Drive a transport through initialize, a slow call, and a cancellation.
+    /// Returns the frames written back.
+    async fn cancel_a_running_call<F, Fut>(run: F) -> Vec<serde_json::Value>
+    where
+        F: FnOnce(tokio::io::DuplexStream, tokio::io::DuplexStream) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (mut stdin_writer, server_stdin) = tokio::io::duplex(4096);
+        let (server_stdout, server_stdout_reader) = tokio::io::duplex(4096);
+        tokio::spawn(run(server_stdin, server_stdout));
+
+        for line in [INIT, CALL_WAIT] {
+            stdin_writer.write_all(line.as_bytes()).await.unwrap();
+            stdin_writer.write_all(b"\n").await.unwrap();
+        }
+        stdin_writer.flush().await.unwrap();
+        // Let the call register before cancelling it.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        stdin_writer.write_all(CANCEL.as_bytes()).await.unwrap();
+        stdin_writer.write_all(b"\n").await.unwrap();
+        stdin_writer.flush().await.unwrap();
+
+        timeout(
+            Duration::from_secs(5),
+            read_n_frames(BufReader::new(server_stdout_reader), 2),
+        )
+        .await
+        .expect("the cancelled call must be answered")
+    }
+
+    /// #1250: applying ordinary tower middleware converted the transport to
+    /// the generic one, which had no router and dropped every inbound
+    /// notification. Adding a no-op layer silently broke cancellation.
+    #[tokio::test]
+    async fn cancellation_survives_a_middleware_layer() {
+        let frames = cancel_a_running_call(|stdin, stdout| async move {
+            let mut transport = StdioTransport::new(router_with_a_waiting_tool())
+                .layer(tower::layer::util::Identity::new());
+            let _ = transport.run_with_streams(stdin, stdout).await;
+        })
+        .await;
+
+        let answer = frames
+            .iter()
+            .find(|f| f["id"] == 2)
+            .unwrap_or_else(|| panic!("no answer for the cancelled call: {frames:?}"));
+        assert_eq!(answer["result"]["content"][0]["text"], "cancelled");
+    }
+
+    /// The same guarantee without any outbound notification channel, which
+    /// is the configuration that previously forced a server to advertise
+    /// MCP logging just to receive cancellation.
+    #[tokio::test]
+    async fn cancellation_works_without_server_notifications() {
+        let frames = cancel_a_running_call(|stdin, stdout| async move {
+            let mut transport =
+                StdioTransport::without_server_notifications(router_with_a_waiting_tool());
+            let _ = transport.run_with_streams(stdin, stdout).await;
+        })
+        .await;
+
+        let answer = frames
+            .iter()
+            .find(|f| f["id"] == 2)
+            .unwrap_or_else(|| panic!("no answer for the cancelled call: {frames:?}"));
+        assert_eq!(answer["result"]["content"][0]["text"], "cancelled");
+    }
+
+    /// Capability advertisement must reflect what the server actually offers,
+    /// not the mere fact that it wants to receive control messages.
+    #[tokio::test]
+    async fn declining_outbound_notifications_drops_the_logging_capability() {
+        async fn initialize_with(transport: impl FnOnce() -> StdioTransport) -> serde_json::Value {
+            let mut transport = transport();
+            let (mut stdin_writer, server_stdin) = tokio::io::duplex(4096);
+            let (server_stdout, server_stdout_reader) = tokio::io::duplex(4096);
+            tokio::spawn(async move {
+                transport
+                    .run_with_streams(server_stdin, server_stdout)
+                    .await
+            });
+            stdin_writer.write_all(INIT.as_bytes()).await.unwrap();
+            stdin_writer.write_all(b"\n").await.unwrap();
+            stdin_writer.flush().await.unwrap();
+            drop(stdin_writer);
+            read_n_frames(BufReader::new(server_stdout_reader), 1)
+                .await
+                .remove(0)
+        }
+
+        let with = initialize_with(|| StdioTransport::new(router_with_a_waiting_tool())).await;
+        assert!(
+            with["result"]["capabilities"]["logging"].is_object(),
+            "the default still advertises logging: {with}"
+        );
+        assert_eq!(with["result"]["capabilities"]["tools"]["listChanged"], true);
+
+        let without = initialize_with(|| {
+            StdioTransport::without_server_notifications(router_with_a_waiting_tool())
+        })
+        .await;
+        assert!(
+            without["result"]["capabilities"]["logging"].is_null(),
+            "logging must not be advertised when nothing can be sent: {without}"
+        );
+        assert_ne!(
+            without["result"]["capabilities"]["tools"]["listChanged"], true,
+            "listChanged must not be claimed either: {without}"
+        );
+    }
+}
