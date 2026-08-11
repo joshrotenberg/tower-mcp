@@ -1,71 +1,100 @@
-//! Resource definition and builder API
+//! Resources: one fixed URI, or a URI template that routes
 //!
-//! Provides ergonomic ways to define MCP resources:
+//! A resource is content a client reads by URI. Which of the two kinds you
+//! build depends on whether the URI is known before the request arrives:
 //!
-//! 1. **Builder pattern** - Fluent API for defining resources
-//! 2. **Trait-based** - Implement `McpResource` for full control
-//! 3. **Resource templates** - Parameterized resources using URI templates (RFC 6570)
+//! - [`Resource`], built with [`ResourceBuilder`], answers for exactly one
+//!   URI and appears in `resources/list`.
+//! - [`ResourceTemplate`], built with [`ResourceTemplateBuilder`], answers for
+//!   a family of URIs described by an RFC 6570 template, appears in
+//!   `resources/templates/list`, and hands its handler the variables it
+//!   extracted from the request URI.
 //!
-//! ## Per-Resource Middleware
+//! A resource can also be written as a type rather than a closure by
+//! implementing [`McpResource`].
 //!
-//! Resources are implemented as Tower services internally, enabling middleware
-//! composition via the `.layer()` method:
+//! # How a read finds its handler
+//!
+//! [`McpRouter`](crate::McpRouter) answers `resources/read` by trying an exact
+//! URI match against the registered resources first, then each registered
+//! template in registration order, stopping at the first template that
+//! matches. Registration order is the only tie-break, so register the narrower
+//! pattern first: `db://users/{id}` before `db://{+rest}`, or the second one
+//! swallows every read and the first never runs.
+//!
+//! # Handler forms
+//!
+//! | builder call | what the handler receives |
+//! |---|---|
+//! | [`ResourceBuilder::handler`] | nothing |
+//! | [`ResourceBuilder::handler_with_context`] | a [`RequestContext`] for progress, cancellation, and client requests |
+//! | [`ResourceTemplateBuilder::handler`] | the request URI and the extracted variables |
+//!
+//! Each returns a [`ReadResourceResult`]. For content already in memory,
+//! [`ResourceBuilder::text`] and [`ResourceBuilder::json`] skip the handler
+//! entirely. With the `stateless` feature, `mrtr_handler` accepts a handler
+//! that can suspend and ask the client for more input (SEP-2322).
+//!
+//! # A failing resource handler is not a failed request
+//!
+//! Every [`Resource`] handler is wrapped in an error-catching service, because
+//! a Tower stack composes only when the inner service cannot fail. An `Err`
+//! from the handler, or from middleware such as a timeout, therefore reaches
+//! the client as a successful read whose text is the error message, not as a
+//! JSON-RPC error. [`ResourceTemplate`] handlers are not wrapped: their errors
+//! propagate and the router reports them as JSON-RPC errors. See
+//! [`Resource::read`] for a worked example of the difference.
+//!
+//! # Per-resource middleware
+//!
+//! Resources are Tower services internally, so any layer composes onto a
+//! single resource through `.layer()`. This is the per-resource counterpart to
+//! layering the whole router, and the place to put a bound that only one
+//! expensive resource needs:
 //!
 //! ```rust
 //! use std::time::Duration;
 //! use tower::timeout::TimeoutLayer;
 //! use tower_mcp::resource::ResourceBuilder;
-//! use tower_mcp::protocol::{ReadResourceResult, ResourceContent};
+//! use tower_mcp::protocol::ReadResourceResult;
 //!
 //! let resource = ResourceBuilder::new("file:///large-file.txt")
 //!     .name("Large File")
-//!     .description("A large file that may take time to read")
+//!     .description("A file large enough that a read can hang")
 //!     .handler(|| async {
-//!         // Simulate slow read
-//!         Ok(ReadResourceResult {
-//!             contents: vec![ResourceContent {
-//!                 uri: "file:///large-file.txt".to_string(),
-//!                 mime_type: Some("text/plain".to_string()),
-//!                 text: Some("content".to_string()),
-//!                 blob: None,
-//!                 meta: None,
-//!             }],
-//!             meta: None,
-//!             ..Default::default()
-//!         })
+//!         Ok(ReadResourceResult::text("file:///large-file.txt", "content"))
 //!     })
 //!     .layer(TimeoutLayer::new(Duration::from_secs(30)))
 //!     .build();
 //! ```
 //!
-//! # Resource Templates
+//! # URI templates
 //!
-//! Resource templates allow servers to expose parameterized resources using URI templates.
-//! When a client requests `resources/read` with a URI matching a template, the server
-//! extracts the variables and passes them to the handler.
+//! A template is compiled once, at build time, into a matcher:
+//!
+//! - `{var}` matches any run of non-slash characters
+//! - `{+var}` matches any characters at all, including `/`
+//! - `{?a,b}` and `{&a,b}` declare optional query parameters (#1253)
+//!
+//! [`ResourceTemplate::match_uri`] documents the matching rules and shows each
+//! of them running against real URIs.
 //!
 //! ```rust
 //! use tower_mcp::resource::ResourceTemplateBuilder;
-//! use tower_mcp::protocol::{ReadResourceResult, ResourceContent};
+//! use tower_mcp::protocol::ReadResourceResult;
 //! use std::collections::HashMap;
 //!
-//! let template = ResourceTemplateBuilder::new("file:///{path}")
+//! let template = ResourceTemplateBuilder::new("file:///{+path}")
 //!     .name("Project Files")
-//!     .description("Access files in the project directory")
+//!     .description("Any file under the project directory")
 //!     .handler(|uri: String, vars: HashMap<String, String>| async move {
-//!         let path = vars.get("path").unwrap_or(&String::new()).clone();
-//!         Ok(ReadResourceResult {
-//!             contents: vec![ResourceContent {
-//!                 uri,
-//!                 mime_type: Some("text/plain".to_string()),
-//!                 text: Some(format!("Contents of {}", path)),
-//!                 blob: None,
-//!                 meta: None,
-//!             }],
-//!             meta: None,
-//!             ..Default::default()
-//!         })
+//!         let path = vars["path"].clone();
+//!         Ok(ReadResourceResult::text(uri, format!("contents of {path}")))
 //!     });
+//!
+//! // `{+path}` spans slashes, so nested paths reach the same handler.
+//! let vars = template.match_uri("file:///src/lib.rs").unwrap();
+//! assert_eq!(vars["path"], "src/lib.rs");
 //! ```
 
 use std::collections::HashMap;
@@ -98,10 +127,11 @@ use crate::protocol::{
 // Service Types for Per-Resource Middleware
 // =============================================================================
 
-/// Request type for resource services.
+/// What a layer applied with `.layer()` sees for one read.
 ///
-/// Contains the request context (for progress reporting, cancellation, etc.)
-/// and the resource URI being read.
+/// Middleware runs on this rather than on the handler's arguments, so a layer
+/// can read the URI and the request context without knowing anything about the
+/// handler behind it.
 #[derive(Debug, Clone)]
 pub struct ResourceRequest {
     /// Request context for progress reporting, cancellation, and client requests
@@ -290,7 +320,12 @@ where
 /// A boxed future for resource handlers
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Resource handler trait - the core abstraction for resource reading
+/// The shape a resource handler is adapted to internally.
+///
+/// [`ResourceBuilder`] wraps closures in an implementation of this trait, and
+/// the router reads every resource through it. No public constructor accepts
+/// an implementation, so a resource written as a type rather than a closure
+/// implements [`McpResource`] instead.
 pub trait ResourceHandler: Send + Sync {
     /// Read the resource contents
     fn read(&self) -> BoxFuture<'_, Result<ReadResourceResult>>;
@@ -439,12 +474,16 @@ where
     }
 }
 
-/// A complete resource definition with service-based execution.
+/// A resource that is ready to register.
 ///
-/// Resources are implemented as Tower services internally, enabling middleware
-/// composition via the builder's `.layer()` method. The service is wrapped
-/// in [`ResourceCatchError`] to convert any errors (from handlers or middleware)
-/// into error result responses.
+/// Produced by [`ResourceBuilder`] or [`McpResource::into_resource`] and
+/// consumed by [`McpRouter::resource`](crate::McpRouter::resource). The public
+/// fields are what `resources/list` advertises; behind them is a Tower service,
+/// which is what lets `.layer()` compose middleware onto a single resource.
+///
+/// That service is wrapped so it cannot fail, so handler and middleware errors
+/// come back as content rather than as errors. [`read`](Self::read) shows what
+/// that looks like.
 pub struct Resource {
     /// Resource URI
     pub uri: String,
@@ -516,7 +555,7 @@ impl Resource {
         ResourceBuilder::new(uri)
     }
 
-    /// Get the resource definition for resources/list
+    /// The entry this resource contributes to `resources/list`.
     pub fn definition(&self) -> ResourceDefinition {
         ResourceDefinition {
             uri: self.uri.clone(),
@@ -531,7 +570,29 @@ impl Resource {
         }
     }
 
-    /// Attach validated protocol metadata to this resource definition.
+    /// Attach `_meta` to what `resources/list` publishes for this resource.
+    ///
+    /// The value is checked here rather than at serialization time, so a key
+    /// that does not fit the spec's name grammar is rejected while there is
+    /// still a caller to tell.
+    ///
+    /// ```rust
+    /// use serde_json::json;
+    /// use tower_mcp::resource::ResourceBuilder;
+    ///
+    /// let resource = ResourceBuilder::new("docs://usage")
+    ///     .name("Usage")
+    ///     .text("...")
+    ///     .with_meta(json!({ "example.com/generated-at": "2026-08-10" }))
+    ///     .expect("valid _meta key");
+    ///
+    /// assert!(
+    ///     resource
+    ///         .clone()
+    ///         .with_meta(json!({ "/leading-slash": true }))
+    ///         .is_err()
+    /// );
+    /// ```
     pub fn with_meta(
         mut self,
         meta: Value,
@@ -541,25 +602,54 @@ impl Resource {
         Ok(self)
     }
 
-    /// Read the resource without context
+    /// Read the resource with a placeholder request context.
     ///
-    /// Creates a dummy request context. For full context support, use
-    /// [`read_with_context`](Self::read_with_context).
+    /// Progress reporting, cancellation, and client requests are inert on the
+    /// placeholder context, so this is for tests and for handlers built with
+    /// [`ResourceBuilder::handler`], which never see the context anyway. The
+    /// transports call [`read_with_context`](Self::read_with_context).
+    ///
+    /// There is no `Result` here because a handler error has already been
+    /// turned into the value returned. That is the cost of letting middleware
+    /// compose onto a resource, and it means a failed read still looks like a
+    /// read: the error text arrives as content.
+    ///
+    /// ```rust
+    /// use tower_mcp::error::Error;
+    /// use tower_mcp::resource::ResourceBuilder;
+    ///
+    /// # tokio_test::block_on(async {
+    /// let resource = ResourceBuilder::new("db://users")
+    ///     .name("Users")
+    ///     .handler(|| async { Err(Error::internal("database is offline")) })
+    ///     .build();
+    ///
+    /// let result = resource.read().await;
+    /// let text = result.contents[0].text.as_deref().unwrap();
+    /// assert!(text.contains("database is offline"), "{text}");
+    /// # });
+    /// ```
+    ///
+    /// A [`ResourceTemplate`] handler behaves the other way round: its errors
+    /// stay errors, and [`ResourceTemplate::read`] returns a `Result`.
     pub fn read(&self) -> BoxFuture<'static, ReadResourceResult> {
         let ctx = RequestContext::new(crate::protocol::RequestId::Number(0));
         self.read_with_context(ctx)
     }
 
-    /// Read the resource with request context
+    /// Read the resource with the request context the transport built.
     ///
-    /// The context provides progress reporting, cancellation support, and
-    /// access to client requests (for sampling, etc.).
+    /// This is the path the router takes. The context carries the request id,
+    /// progress reporting, the cancellation token, and the client requester
+    /// used for sampling and elicitation. Handlers registered through
+    /// [`ResourceBuilder::handler`] ignore it; those registered through
+    /// [`ResourceBuilder::handler_with_context`] receive it.
     ///
-    /// # Note
-    ///
-    /// This method returns `ReadResourceResult` directly (not `Result<ReadResourceResult>`).
-    /// Any errors from the handler or middleware are converted to error responses
-    /// in the result contents.
+    /// Errors become content rather than a `Result`, as described on
+    /// [`read`](Self::read). A handler that suspends for client input is
+    /// reported the same way, since this signature has nowhere to put a
+    /// continuation; use [`read_outcome_with_context`](Self::read_outcome_with_context)
+    /// for that.
     pub fn read_with_context(&self, ctx: RequestContext) -> BoxFuture<'static, ReadResourceResult> {
         let resource = self.clone();
         let uri = self.uri.clone();
@@ -594,6 +684,10 @@ impl Resource {
     }
 
     /// Read the resource while preserving an SEP-2322 continuation.
+    ///
+    /// The router calls this so that a handler which needs more input from the
+    /// client can say so, instead of having that outcome flattened into
+    /// content by [`read_with_context`](Self::read_with_context).
     pub fn read_outcome_with_context(
         &self,
         ctx: RequestContext,
@@ -683,34 +777,43 @@ impl Resource {
 // Builder API
 // =============================================================================
 
-/// Builder for creating resources with a fluent API
+/// Builder for a resource served at one fixed URI.
+///
+/// The URI is the identity clients read by; the name is what a user sees in a
+/// picker, and defaults to the URI when it is not set. Finish the chain with a
+/// handler and [`build`](ResourceBuilderWithHandler::build), or with
+/// [`text`](Self::text) or [`json`](Self::json) for content already in memory,
+/// then register the result with
+/// [`McpRouter::resource`](crate::McpRouter::resource).
 ///
 /// # Example
 ///
 /// ```rust
+/// use tower_mcp::protocol::ReadResourceResult;
 /// use tower_mcp::resource::ResourceBuilder;
-/// use tower_mcp::protocol::{ReadResourceResult, ResourceContent};
 ///
+/// # tokio_test::block_on(async {
 /// let resource = ResourceBuilder::new("file:///config.json")
 ///     .name("Configuration")
 ///     .description("Application configuration file")
 ///     .mime_type("application/json")
 ///     .handler(|| async {
-///         Ok(ReadResourceResult {
-///             contents: vec![ResourceContent {
-///                 uri: "file:///config.json".to_string(),
-///                 mime_type: Some("application/json".to_string()),
-///                 text: Some(r#"{"setting": "value"}"#.to_string()),
-///                 blob: None,
-///                 meta: None,
-///             }],
-///             meta: None,
-///             ..Default::default()
-///         })
+///         Ok(ReadResourceResult::text_with_mime(
+///             "file:///config.json",
+///             r#"{"setting": "value"}"#,
+///             "application/json",
+///         ))
 ///     })
 ///     .build();
 ///
 /// assert_eq!(resource.uri, "file:///config.json");
+///
+/// let result = resource.read().await;
+/// assert_eq!(
+///     result.contents[0].text.as_deref(),
+///     Some(r#"{"setting": "value"}"#)
+/// );
+/// # });
 /// ```
 pub struct ResourceBuilder {
     uri: String,
@@ -861,13 +964,46 @@ impl ResourceBuilder {
         }
     }
 
-    /// Set a context-aware handler for reading the resource.
+    /// Set a handler that receives the [`RequestContext`].
     ///
-    /// The handler receives a `RequestContext` for progress reporting and
-    /// cancellation checking.
+    /// Take this form when the read runs long enough to report progress
+    /// against, has to notice cancellation, or wants to ask the client
+    /// something. Everything else can use [`handler`](Self::handler), which
+    /// skips the context entirely.
     ///
-    /// Returns a [`ResourceBuilderWithContextHandler`] that can be used to apply
-    /// middleware layers via `.layer()` or build the resource directly via `.build()`.
+    /// Reporting progress is unconditional in the handler and free when
+    /// unwanted: a client that sent no progress token receives nothing.
+    ///
+    /// ```rust
+    /// use tower_mcp::context::RequestContext;
+    /// use tower_mcp::error::Error;
+    /// use tower_mcp::protocol::ReadResourceResult;
+    /// use tower_mcp::resource::ResourceBuilder;
+    ///
+    /// let resource = ResourceBuilder::new("logs://today")
+    ///     .name("Today's logs")
+    ///     .handler_with_context(|ctx: RequestContext| async move {
+    ///         let mut pages = Vec::new();
+    ///         for page in 0..4 {
+    ///             if ctx.is_cancelled() {
+    ///                 return Err(Error::internal("read cancelled"));
+    ///             }
+    ///             ctx.report_progress(f64::from(page), Some(4.0), Some("reading"))
+    ///                 .await;
+    ///             pages.push(format!("page {page}"));
+    ///         }
+    ///         Ok(ReadResourceResult::text("logs://today", pages.join("\n")))
+    ///     })
+    ///     .build();
+    ///
+    /// # tokio_test::block_on(async {
+    /// let result = resource.read().await;
+    /// let text = result.contents[0].text.as_deref().unwrap();
+    /// assert!(text.contains("page 3"), "{text}");
+    /// # });
+    /// ```
+    ///
+    /// Returns a builder that still accepts `.layer()` before `.build()`.
     pub fn handler_with_context<F, Fut>(self, handler: F) -> ResourceBuilderWithContextHandler<F>
     where
         F: Fn(RequestContext) -> Fut + Send + Sync + 'static,
@@ -906,7 +1042,28 @@ impl ResourceBuilder {
         }
     }
 
-    /// Create a static text resource (convenience method)
+    /// Finish the builder by serving a fixed string.
+    ///
+    /// The content is captured once, so this is for text that does not change
+    /// while the server runs: instructions, a licence, a schema. Anything read
+    /// from disk or a database on demand needs [`handler`](Self::handler).
+    ///
+    /// ```rust
+    /// use tower_mcp::resource::ResourceBuilder;
+    ///
+    /// # tokio_test::block_on(async {
+    /// let resource = ResourceBuilder::new("docs://usage")
+    ///     .name("Usage")
+    ///     .mime_type("text/markdown")
+    ///     .text("# Usage\n\nStart the server, then call `tools/list`.");
+    ///
+    /// let result = resource.read().await;
+    /// assert_eq!(
+    ///     result.contents[0].mime_type.as_deref(),
+    ///     Some("text/markdown")
+    /// );
+    /// # });
+    /// ```
     pub fn text(self, content: impl Into<String>) -> Resource {
         let uri = self.uri.clone();
         let content = content.into();
@@ -933,7 +1090,28 @@ impl ResourceBuilder {
         .build()
     }
 
-    /// Create a static JSON resource (convenience method)
+    /// Finish the builder by serving a fixed JSON value.
+    ///
+    /// The value is serialized once, at build time, and the MIME type is set
+    /// to `application/json` whatever [`mime_type`](Self::mime_type) said
+    /// earlier, so the declared type cannot drift from the body.
+    ///
+    /// ```rust
+    /// use serde_json::json;
+    /// use tower_mcp::resource::ResourceBuilder;
+    ///
+    /// # tokio_test::block_on(async {
+    /// let resource = ResourceBuilder::new("config://limits")
+    ///     .name("Limits")
+    ///     .json(json!({ "max_connections": 100 }));
+    ///
+    /// let result = resource.read().await;
+    /// assert_eq!(
+    ///     result.contents[0].mime_type.as_deref(),
+    ///     Some("application/json")
+    /// );
+    /// # });
+    /// ```
     pub fn json(mut self, value: serde_json::Value) -> Resource {
         let uri = self.uri.clone();
         self.mime_type = Some("application/json".to_string());
@@ -1553,10 +1731,13 @@ impl<T: McpResource> ResourceHandler for McpResourceHandler<T> {
 // Resource Templates
 // =============================================================================
 
-/// Handler trait for resource templates
+/// The shape a resource-template handler is adapted to internally.
 ///
-/// Unlike [`ResourceHandler`], template handlers receive the extracted
-/// URI variables as a parameter.
+/// Unlike [`ResourceHandler`], a template handler is told which URI matched
+/// and what was extracted from it, because one handler serves many URIs.
+/// Templates are built from closures through
+/// [`ResourceTemplateBuilder::handler`]; no public constructor accepts an
+/// implementation of this trait.
 pub trait ResourceTemplateHandler: Send + Sync {
     /// Read a resource with the given URI variables extracted from the template
     fn read(
@@ -1578,35 +1759,44 @@ pub trait MrtrResourceTemplateHandler: Send + Sync {
     ) -> BoxFuture<'_, Result<RequestOutcome<ReadResourceResult>>>;
 }
 
-/// A parameterized resource template
+/// A resource whose URI is a pattern rather than a constant.
 ///
-/// Resource templates use URI template syntax (RFC 6570) to match multiple URIs
-/// and extract variable values. This allows servers to expose dynamic resources
-/// like file systems or database records.
+/// The pattern is compiled once, when the handler is attached, and every
+/// `resources/read` that does not name a registered [`Resource`] is offered to
+/// each template in registration order. The first match wins, and the
+/// variables it extracted are passed to the handler together with the URI that
+/// produced them, so one handler serves a whole family of URIs: a filesystem
+/// subtree, a table of records, a paged listing.
+///
+/// [`match_uri`](Self::match_uri) documents the matching rules and shows them
+/// running.
 ///
 /// # Example
 ///
 /// ```rust
-/// use tower_mcp::resource::ResourceTemplateBuilder;
-/// use tower_mcp::protocol::{ReadResourceResult, ResourceContent};
 /// use std::collections::HashMap;
+/// use serde_json::json;
+/// use tower_mcp::protocol::ReadResourceResult;
+/// use tower_mcp::resource::ResourceTemplateBuilder;
 ///
-/// let template = ResourceTemplateBuilder::new("file:///{path}")
-///     .name("Project Files")
+/// let template = ResourceTemplateBuilder::new("db://users/{id}")
+///     .name("User Records")
+///     .description("One user record per id")
 ///     .handler(|uri: String, vars: HashMap<String, String>| async move {
-///         let path = vars.get("path").unwrap_or(&String::new()).clone();
-///         Ok(ReadResourceResult {
-///             contents: vec![ResourceContent {
-///                 uri,
-///                 mime_type: Some("text/plain".to_string()),
-///                 text: Some(format!("Contents of {}", path)),
-///                 blob: None,
-///                 meta: None,
-///             }],
-///             meta: None,
-///             ..Default::default()
-///         })
+///         let id = vars["id"].clone();
+///         Ok(ReadResourceResult::json(uri, &json!({ "id": id })))
 ///     });
+///
+/// # tokio_test::block_on(async {
+/// let vars = template.match_uri("db://users/42").expect("42 is one segment");
+/// assert_eq!(vars["id"], "42");
+///
+/// let result = template.read("db://users/42", vars).await.unwrap();
+/// assert!(result.contents[0].text.as_deref().unwrap().contains("42"));
+/// # });
+///
+/// // `{id}` stops at a slash, so a deeper URI is left for another template.
+/// assert!(template.match_uri("db://users/42/posts").is_none());
 /// ```
 pub struct ResourceTemplate {
     /// The URI template pattern (e.g., `file:///{path}`)
@@ -1676,7 +1866,10 @@ impl ResourceTemplate {
         ResourceTemplateBuilder::new(uri_template)
     }
 
-    /// Get the template definition for resources/templates/list
+    /// The entry this template contributes to `resources/templates/list`.
+    ///
+    /// Clients discover the pattern itself and expand it themselves, so the
+    /// declared variables are not repeated as `arguments`.
     pub fn definition(&self) -> ResourceTemplateDefinition {
         ResourceTemplateDefinition {
             uri_template: self.uri_template.clone(),
@@ -1691,10 +1884,116 @@ impl ResourceTemplate {
         }
     }
 
-    /// Check if a URI matches this template and extract variables
+    /// Match a URI against this template and extract its variables.
     ///
-    /// Returns `Some(HashMap)` with extracted variables if the URI matches,
-    /// `None` if it doesn't match.
+    /// `None` means this template does not serve that URI, which is the
+    /// router's signal to try the next one. The whole URI must match, not a
+    /// prefix of it.
+    ///
+    /// # Path expansion
+    ///
+    /// `{var}` matches a run of non-slash characters and `{+var}` matches
+    /// anything at all. That single difference decides whether a template
+    /// routes one path segment or an entire subtree:
+    ///
+    /// ```rust
+    /// use std::collections::HashMap;
+    /// use tower_mcp::protocol::ReadResourceResult;
+    /// use tower_mcp::resource::{ResourceTemplate, ResourceTemplateBuilder};
+    ///
+    /// fn template(pattern: &str) -> ResourceTemplate {
+    ///     ResourceTemplateBuilder::new(pattern).name("example").handler(
+    ///         |uri: String, _vars: HashMap<String, String>| async move {
+    ///             Ok(ReadResourceResult::text(uri, "body"))
+    ///         },
+    ///     )
+    /// }
+    ///
+    /// let segment = template("db://users/{id}");
+    /// assert_eq!(segment.match_uri("db://users/42").unwrap()["id"], "42");
+    /// assert!(segment.match_uri("db://users/42/posts").is_none());
+    ///
+    /// let subtree = template("file:///{+path}");
+    /// assert_eq!(
+    ///     subtree.match_uri("file:///src/lib.rs").unwrap()["path"],
+    ///     "src/lib.rs"
+    /// );
+    ///
+    /// // Both forms require something to capture: neither matches empty.
+    /// assert!(segment.match_uri("db://users/").is_none());
+    /// ```
+    ///
+    /// # Query expansion
+    ///
+    /// `{?a,b}`, and the `{&a,b}` continuation form, declare query parameters
+    /// (#1253). They are matched against the URI's query string rather than
+    /// compiled into the pattern, because a regex cannot reasonably express
+    /// "any subset of these, in any order".
+    ///
+    /// RFC 6570 defines expansion rather than matching, so the routing policy
+    /// is this crate's:
+    ///
+    /// - every declared variable is optional, and the bare URI still matches
+    /// - order is not significant
+    /// - present with no value is an empty string, and distinct from absent
+    /// - undeclared keys are ignored rather than rejected, so a caller
+    ///   appending a tracking parameter cannot break routing
+    /// - the first occurrence of a repeated key wins
+    /// - values are percent-decoded and `+` reads as a space; a malformed
+    ///   escape is left as written rather than dropped, so a bad value still
+    ///   reaches the handler instead of vanishing
+    ///
+    /// Path captures are handed over exactly as matched. That asymmetry is
+    /// deliberate: query strings are form-encoded by convention, and path
+    /// captures were never decoded, so decoding them now would silently change
+    /// what existing handlers receive.
+    ///
+    /// ```rust
+    /// # use std::collections::HashMap;
+    /// # use tower_mcp::protocol::ReadResourceResult;
+    /// # use tower_mcp::resource::{ResourceTemplate, ResourceTemplateBuilder};
+    /// # fn template(pattern: &str) -> ResourceTemplate {
+    /// #     ResourceTemplateBuilder::new(pattern).name("example").handler(
+    /// #         |uri: String, _vars: HashMap<String, String>| async move {
+    /// #             Ok(ReadResourceResult::text(uri, "body"))
+    /// #         },
+    /// #     )
+    /// # }
+    /// let threads = template("agent://threads{?cursor,limit}");
+    ///
+    /// // Nothing supplied still routes here, with no variables.
+    /// assert!(threads.match_uri("agent://threads").unwrap().is_empty());
+    ///
+    /// // A subset in any order, each variable under its own name.
+    /// let vars = threads.match_uri("agent://threads?limit=20").unwrap();
+    /// assert_eq!(vars["limit"], "20");
+    /// assert!(!vars.contains_key("cursor"));
+    ///
+    /// // Present-but-empty is a different fact from absent.
+    /// let vars = threads.match_uri("agent://threads?cursor=").unwrap();
+    /// assert_eq!(vars["cursor"], "");
+    ///
+    /// // An undeclared key is ignored; a repeated key keeps the first.
+    /// let vars = threads
+    ///     .match_uri("agent://threads?utm=ad&cursor=one&cursor=two")
+    ///     .unwrap();
+    /// assert_eq!(vars["cursor"], "one");
+    /// assert!(!vars.contains_key("utm"));
+    ///
+    /// // Query values are decoded; the path capture beside them is not.
+    /// let files = template("file:///{name}{?rev}");
+    /// let vars = files.match_uri("file:///a%20b?rev=a+b").unwrap();
+    /// assert_eq!(vars["name"], "a%20b");
+    /// assert_eq!(vars["rev"], "a b");
+    ///
+    /// // A template that declares no query expression never splits on `?`,
+    /// // so a literal `?` in the pattern keeps matching literally.
+    /// let literal = template("http://example.com/api?query={q}");
+    /// assert_eq!(
+    ///     literal.match_uri("http://example.com/api?query=hello").unwrap()["q"],
+    ///     "hello"
+    /// );
+    /// ```
     pub fn match_uri(&self, uri: &str) -> Option<HashMap<String, String>> {
         // Only a template that declares a query expression splits the URI.
         // Without one the pattern matches the whole string, including any
@@ -1725,12 +2024,20 @@ impl ResourceTemplate {
         Some(matched)
     }
 
-    /// Read a resource at the given URI using this template's handler
+    /// Read one URI through this template's handler.
     ///
-    /// # Arguments
+    /// `variables` is what [`match_uri`](Self::match_uri) returned for `uri`.
+    /// Nothing re-derives or checks it here, so a map taken from a different
+    /// URI is passed to the handler as given.
     ///
-    /// * `uri` - The actual URI being read
-    /// * `variables` - Variables extracted from matching the URI against the template
+    /// Unlike [`Resource::read`], this returns a `Result`. Template handlers
+    /// are not wrapped in an error-catching service, so an `Err` stays an
+    /// error and the router turns it into a JSON-RPC error rather than into
+    /// resource content.
+    ///
+    /// A template built with `mrtr_handler` has no plain handler to call and
+    /// reports that as an error here; use
+    /// [`read_outcome_with_context`](Self::read_outcome_with_context).
     pub fn read(
         &self,
         uri: &str,
@@ -1778,32 +2085,47 @@ impl ResourceTemplate {
     }
 }
 
-/// Builder for creating resource templates
+/// Builder for a [`ResourceTemplate`].
+///
+/// The chain ends at [`handler`](Self::handler), which compiles the pattern
+/// and returns the template itself; there is no separate `build` step. The
+/// name defaults to the pattern when it is not set.
 ///
 /// # Example
 ///
-/// ```rust
-/// use tower_mcp::resource::ResourceTemplateBuilder;
-/// use tower_mcp::protocol::{ReadResourceResult, ResourceContent};
-/// use std::collections::HashMap;
+/// A paged listing, where the page cursor is a declared query variable and the
+/// handler has to cope with its absence because every query variable is
+/// optional:
 ///
-/// let template = ResourceTemplateBuilder::new("db://users/{id}")
-///     .name("User Records")
-///     .description("Access user records by ID")
+/// ```rust
+/// use std::collections::HashMap;
+/// use tower_mcp::protocol::ReadResourceResult;
+/// use tower_mcp::resource::ResourceTemplateBuilder;
+///
+/// let template = ResourceTemplateBuilder::new("agent://threads{?cursor,limit}")
+///     .name("Threads")
+///     .description("Conversation threads, newest first")
+///     .mime_type("application/json")
 ///     .handler(|uri: String, vars: HashMap<String, String>| async move {
-///         let id = vars.get("id").unwrap();
-///         Ok(ReadResourceResult {
-///             contents: vec![ResourceContent {
-///                 uri,
-///                 mime_type: Some("application/json".to_string()),
-///                 text: Some(format!(r#"{{"id": "{}"}}"#, id)),
-///                 blob: None,
-///                 meta: None,
-///             }],
-///             meta: None,
-///             ..Default::default()
-///         })
+///         let cursor = vars.get("cursor").map(String::as_str).unwrap_or("start");
+///         let limit: usize = vars
+///             .get("limit")
+///             .and_then(|value| value.parse().ok())
+///             .unwrap_or(50);
+///         Ok(ReadResourceResult::text(
+///             uri,
+///             format!("{limit} threads from {cursor}"),
+///         ))
 ///     });
+///
+/// # tokio_test::block_on(async {
+/// let vars = template.match_uri("agent://threads").unwrap();
+/// let result = template.read("agent://threads", vars).await.unwrap();
+/// assert_eq!(
+///     result.contents[0].text.as_deref(),
+///     Some("50 threads from start")
+/// );
+/// # });
 /// ```
 pub struct ResourceTemplateBuilder {
     uri_template: String,
@@ -1816,36 +2138,32 @@ pub struct ResourceTemplateBuilder {
 }
 
 impl ResourceTemplateBuilder {
-    /// Create a new builder with the given URI template
+    /// Start a template from an RFC 6570 URI pattern.
     ///
-    /// # URI Template Syntax
+    /// The pattern is not compiled until a handler is attached, so a mistake
+    /// in it surfaces at [`handler`](Self::handler) (a panic) or
+    /// [`try_handler`](Self::try_handler) (an error), not here.
     ///
-    /// - `{varname}` - simple expansion, matches any non-slash characters
-    /// - `{+varname}` - reserved expansion, matches any characters
-    /// - `{?a,b}` or `{&a,b}` - form-style query expansion (#1253)
+    /// # Supported expansions
     ///
-    /// # Examples
+    /// | form | matches | example |
+    /// |---|---|---|
+    /// | `{var}` | any run of non-slash characters | `db://users/{id}` matches `db://users/123` |
+    /// | `{+var}` | any characters, slashes included | `file:///{+path}` matches `file:///src/lib.rs` |
+    /// | `{?a,b}`, `{&a,b}` | optional query parameters (#1253) | `agent://threads{?cursor,limit}` matches `agent://threads` and `agent://threads?limit=20` |
     ///
-    /// - `file:///{path}` - Matches `file:///README.md`
-    /// - `db://users/{id}` - Matches `db://users/123`
-    /// - `api://v1/{resource}/{id}` - Matches `api://v1/posts/456`
-    /// - `agent://threads{?cursor,limit}` - Matches `agent://threads` and
-    ///   `agent://threads?limit=20`
+    /// Everything else in the pattern is literal, including a `?` in a
+    /// template that declares no query expression.
+    /// [`ResourceTemplate::match_uri`] documents the matching rules in full,
+    /// with the query routing policy this crate settled on where RFC 6570
+    /// defines expansion but not matching.
     ///
-    /// # Query expansion
+    /// # Rejected at build time
     ///
-    /// A query expression describes the query string, so it must end the
-    /// template. Every variable it lists is optional: the template matches
-    /// with none of them present, in any order, and each arrives under its
-    /// own name rather than as one undifferentiated suffix.
-    ///
-    /// RFC 6570 defines expansion, not matching, so the routing policy is
-    /// this crate's: a declared variable present with no value maps to an
-    /// empty string and is distinct from being absent, undeclared keys are
-    /// ignored rather than rejected so an added tracking parameter cannot
-    /// break routing, and the first occurrence of a repeated key wins.
-    /// Values are percent-decoded and `+` is read as a space; path captures
-    /// are still handed over exactly as matched.
+    /// A query expression describes the query string, so nothing can follow
+    /// it: trailing text, a second query expression, and an empty variable
+    /// name are all reported rather than left to mismatch silently at
+    /// request time.
     pub fn new(uri_template: impl Into<String>) -> Self {
         Self {
             uri_template: uri_template.into(),
@@ -1915,17 +2233,42 @@ impl ResourceTemplateBuilder {
         self
     }
 
-    /// Set the handler function for reading template resources.
+    /// Attach the handler, compile the pattern, and return the template.
     ///
-    /// The handler receives:
-    /// - `uri`: The full URI being read
-    /// - `variables`: A map of variable names to their values extracted from the URI
+    /// The handler is called with the URI that was requested and the variables
+    /// [`ResourceTemplate::match_uri`] pulled out of it. Only variables that
+    /// actually matched are present: path variables always are, query
+    /// variables only when the request supplied them.
+    ///
+    /// ```rust
+    /// use std::collections::HashMap;
+    /// use tower_mcp::protocol::ReadResourceResult;
+    /// use tower_mcp::resource::ResourceTemplateBuilder;
+    ///
+    /// let template = ResourceTemplateBuilder::new("api://v1/{collection}/{id}")
+    ///     .name("API records")
+    ///     .handler(|uri: String, vars: HashMap<String, String>| async move {
+    ///         let body = format!("{} #{}", vars["collection"], vars["id"]);
+    ///         Ok(ReadResourceResult::text(uri, body))
+    ///     });
+    ///
+    /// # tokio_test::block_on(async {
+    /// let uri = "api://v1/posts/456";
+    /// let vars = template.match_uri(uri).unwrap();
+    /// let result = template.read(uri, vars).await.unwrap();
+    /// assert_eq!(result.contents[0].text.as_deref(), Some("posts #456"));
+    /// # });
+    /// ```
+    ///
+    /// Indexing the map, as above, is safe for a path variable the pattern
+    /// declares and a panic for anything else. Use `get` for query variables.
     ///
     /// # Panics
     ///
-    /// Panics if the URI template produces an invalid regex pattern. For a
-    /// non-panicking alternative (useful with dynamic/user-supplied templates),
-    /// use [`try_handler`](Self::try_handler).
+    /// Panics if the URI template is not a valid pattern. That is the right
+    /// trade for a template written as a literal, since it fails on the first
+    /// run rather than on the first request. For a pattern that comes from
+    /// configuration or user input, use [`try_handler`](Self::try_handler).
     pub fn handler<F, Fut>(self, handler: F) -> ResourceTemplate
     where
         F: Fn(String, HashMap<String, String>) -> Fut + Send + Sync + 'static,
@@ -1936,16 +2279,35 @@ impl ResourceTemplateBuilder {
         })
     }
 
-    /// Set the handler function for reading template resources, returning an
-    /// error if the URI template is invalid.
+    /// The fallible form of [`handler`](Self::handler).
     ///
-    /// This is the fallible version of [`handler`](Self::handler), suitable for
-    /// use with dynamically created templates where the URI pattern may come
-    /// from user input.
+    /// Reach for this when the pattern is not a literal in the source: a
+    /// plugin manifest, a config file, an argument. A bad pattern then
+    /// disables one template with a reportable error instead of taking down
+    /// the server that loaded it.
     ///
-    /// The handler receives:
-    /// - `uri`: The full URI being read
-    /// - `variables`: A map of variable names to their values extracted from the URI
+    /// ```rust
+    /// use std::collections::HashMap;
+    /// use tower_mcp::protocol::ReadResourceResult;
+    /// use tower_mcp::resource::ResourceTemplateBuilder;
+    ///
+    /// fn load(pattern: &str) -> Result<(), String> {
+    ///     ResourceTemplateBuilder::new(pattern)
+    ///         .name("configured")
+    ///         .try_handler(|uri: String, _vars: HashMap<String, String>| async move {
+    ///             Ok(ReadResourceResult::text(uri, "body"))
+    ///         })
+    ///         .map(|_template| ())
+    ///         .map_err(|error| error.to_string())
+    /// }
+    ///
+    /// assert!(load("agent://threads{?cursor}").is_ok());
+    ///
+    /// // A query expression describes the end of the URI, so nothing may
+    /// // follow it.
+    /// let error = load("agent://threads{?cursor}/latest").unwrap_err();
+    /// assert!(error.contains("after its query expression"), "{error}");
+    /// ```
     pub fn try_handler<F, Fut>(self, handler: F) -> std::result::Result<ResourceTemplate, Error>
     where
         F: Fn(String, HashMap<String, String>) -> Fut + Send + Sync + 'static,

@@ -1,46 +1,73 @@
-//! Prompt definition and builder API
+//! Prompts: named message templates a user invokes
 //!
-//! Provides ergonomic ways to define MCP prompts:
+//! A prompt is a named generator of chat messages that the user picks
+//! deliberately, unlike a tool, which the model calls. `prompts/list`
+//! advertises the name, description, and arguments; `prompts/get` passes the
+//! supplied arguments to the handler and returns the messages it built.
 //!
-//! 1. **Builder pattern** - Fluent API for defining prompts
-//! 2. **Trait-based** - Implement `McpPrompt` for full control
-//! 3. **Per-prompt middleware** - Apply tower middleware layers to individual prompts
+//! Build one with [`PromptBuilder`], or write it as a type by implementing
+//! [`McpPrompt`], then register it with
+//! [`McpRouter::prompt`](crate::McpRouter::prompt).
 //!
-//! # Per-Prompt Middleware
+//! # Arguments are strings, and nothing checks them
 //!
-//! The `.layer()` method on `PromptBuilder` (after `.handler()`) allows applying
-//! tower middleware to a single prompt. This is useful for prompt-specific concerns
-//! like timeouts, rate limiting, or caching.
+//! Arguments arrive as a `HashMap<String, String>` because the protocol
+//! carries them that way, so a numeric argument is a string the handler
+//! parses. [`PromptBuilder::required_arg`] and [`PromptBuilder::optional_arg`]
+//! describe arguments to clients and nothing more: the router does not reject
+//! a `prompts/get` that omits a required argument, and a handler that assumes
+//! one is present is a handler that can be made to panic by a client. Read
+//! them with `get`, not by indexing.
+//!
+//! # Handler forms
+//!
+//! | builder call | what the handler receives |
+//! |---|---|
+//! | [`PromptBuilder::handler`] | the arguments |
+//! | [`PromptBuilder::handler_with_context`] | a [`RequestContext`] and the arguments |
+//! | [`PromptBuilder::static_prompt`], [`PromptBuilder::user_message`] | no handler at all |
+//!
+//! With the `stateless` feature, `mrtr_handler` accepts a handler that can
+//! suspend and ask the client for more input (SEP-2322).
+//!
+//! # Adding a layer changes what a handler error means
+//!
+//! Without middleware, an `Err` from the handler propagates and the router
+//! reports a JSON-RPC error. Add `.layer()` and the handler becomes a Tower
+//! service, whose errors have to be caught for the stack to compose, so the
+//! same `Err` (and any middleware error, such as a timeout) comes back as a
+//! successful `prompts/get` whose assistant message carries the error text:
 //!
 //! ```rust
 //! use std::collections::HashMap;
 //! use std::time::Duration;
 //! use tower::timeout::TimeoutLayer;
+//! use tower_mcp::error::Error;
 //! use tower_mcp::prompt::PromptBuilder;
-//! use tower_mcp::protocol::{GetPromptResult, PromptMessage, PromptRole, Content};
 //!
-//! let prompt = PromptBuilder::new("slow_prompt")
-//!     .description("A prompt that might take a while")
-//!     .handler(|args: HashMap<String, String>| async move {
-//!         // Slow prompt generation logic...
-//!         Ok(GetPromptResult {
-//!             description: Some("Generated prompt".to_string()),
-//!             messages: vec![PromptMessage {
-//!                 role: PromptRole::User,
-//!                 content: Content::Text {
-//!                     text: "Hello!".to_string(),
-//!                     annotations: None,
-//!                     meta: None,
-//!                 },
-//!                 meta: None,
-//!             }],
-//!             meta: None,
-//!         })
+//! # tokio_test::block_on(async {
+//! let plain = PromptBuilder::new("plain")
+//!     .handler(|_: HashMap<String, String>| async {
+//!         Err(Error::internal("template store is offline"))
+//!     })
+//!     .build();
+//! assert!(plain.get(HashMap::new()).await.is_err());
+//!
+//! let layered = PromptBuilder::new("layered")
+//!     .handler(|_: HashMap<String, String>| async {
+//!         Err(Error::internal("template store is offline"))
 //!     })
 //!     .layer(TimeoutLayer::new(Duration::from_secs(5)));
 //!
-//! assert_eq!(prompt.name, "slow_prompt");
+//! let result = layered.get(HashMap::new()).await.unwrap();
+//! let text = result.first_message_text().unwrap();
+//! assert!(text.contains("template store is offline"), "{text}");
+//! # });
 //! ```
+//!
+//! Per-prompt middleware is the place for a bound that only one prompt needs,
+//! such as a timeout on a prompt that reads from a network template store.
+//! Layering the whole router covers everything else.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -71,10 +98,11 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 // Per-Prompt Middleware Types
 // =============================================================================
 
-/// Request type for prompt middleware.
+/// What a layer applied with `.layer()` sees for one `prompts/get`.
 ///
-/// Contains the request context and prompt arguments, allowing middleware
-/// to access and modify the request before it reaches the prompt handler.
+/// Middleware runs on this rather than on the handler's arguments, so a layer
+/// can read or rewrite the arguments, and reach the request context, without
+/// knowing anything about the handler behind it.
 #[derive(Debug, Clone)]
 pub struct PromptRequest {
     /// The request context with progress reporting, cancellation, etc.
@@ -89,7 +117,11 @@ impl PromptRequest {
         Self { context, arguments }
     }
 
-    /// Create a prompt request with a default context (for testing or simple use cases).
+    /// Create a request carrying a placeholder context.
+    ///
+    /// The context reports request id `0`, has no notification channel, and is
+    /// never cancelled, which is what a test or an isolated layer needs and
+    /// not what a real request carries.
     pub fn with_arguments(arguments: HashMap<String, String>) -> Self {
         Self {
             context: RequestContext::new(RequestId::Number(0)),
@@ -370,7 +402,12 @@ where
     }
 }
 
-/// Prompt handler trait - the core abstraction for prompt generation
+/// The shape a prompt handler is adapted to internally.
+///
+/// [`PromptBuilder`] wraps closures, and layered services, in an
+/// implementation of this trait, and the router drives every prompt through
+/// it. No public constructor accepts an implementation, so a prompt written as
+/// a type rather than a closure implements [`McpPrompt`] instead.
 pub trait PromptHandler: Send + Sync {
     /// Get the prompt with the given arguments
     fn get(&self, arguments: HashMap<String, String>) -> BoxFuture<'_, Result<GetPromptResult>>;
@@ -405,7 +442,12 @@ pub trait MrtrPromptHandler: Send + Sync {
     ) -> BoxFuture<'_, Result<RequestOutcome<GetPromptResult>>>;
 }
 
-/// A complete prompt definition with handler
+/// A prompt that is ready to register.
+///
+/// Produced by [`PromptBuilder`] or [`McpPrompt::into_prompt`] and consumed by
+/// [`McpRouter::prompt`](crate::McpRouter::prompt). The public fields are
+/// exactly what `prompts/list` advertises; the handler behind them is private,
+/// so a prompt is cheap to clone and to share between routers.
 pub struct Prompt {
     /// The prompt name (must be unique within the router).
     pub name: String,
@@ -455,7 +497,7 @@ impl Prompt {
         PromptBuilder::new(name)
     }
 
-    /// Get the prompt definition for prompts/list
+    /// The entry this prompt contributes to `prompts/list`.
     pub fn definition(&self) -> PromptDefinition {
         PromptDefinition {
             name: self.name.clone(),
@@ -467,7 +509,16 @@ impl Prompt {
         }
     }
 
-    /// Get the prompt with arguments
+    /// Generate the messages for these arguments.
+    ///
+    /// A handler registered through [`PromptBuilder::handler_with_context`]
+    /// still runs, but against a placeholder context, so progress reporting
+    /// and cancellation are inert. The router calls
+    /// [`get_with_context`](Self::get_with_context) instead.
+    ///
+    /// Whether a handler error arrives as `Err` or as an assistant message
+    /// depends on whether the prompt carries middleware; see the [module
+    /// documentation](crate::prompt).
     pub fn get(
         &self,
         arguments: HashMap<String, String>,
@@ -482,9 +533,15 @@ impl Prompt {
         }
     }
 
-    /// Get the prompt with request context
+    /// Generate the messages with the context the transport built.
     ///
-    /// Use this when you have a RequestContext available for progress/cancellation.
+    /// This is the path the router takes. The context carries the request id,
+    /// progress reporting, the cancellation token, and the client requester
+    /// used for sampling and elicitation.
+    ///
+    /// A prompt registered with `mrtr_handler` has no plain handler to call
+    /// and reports that as an error here; use
+    /// [`get_outcome_with_context`](Self::get_outcome_with_context).
     pub fn get_with_context(
         &self,
         ctx: RequestContext,
@@ -500,7 +557,12 @@ impl Prompt {
         }
     }
 
-    /// Get the prompt while preserving an SEP-2322 input-required outcome.
+    /// Generate the messages while preserving an SEP-2322 continuation.
+    ///
+    /// The router calls this so a handler that needs more input from the
+    /// client can say so, rather than having the request fail or return
+    /// half-built messages. A prompt without an MRTR handler answers here
+    /// too, always with a completed result.
     pub fn get_outcome_with_context(
         &self,
         ctx: RequestContext,
@@ -525,7 +587,11 @@ impl Prompt {
         }
     }
 
-    /// Returns true if this prompt uses context
+    /// Whether the handler was registered in a context-aware form.
+    ///
+    /// An MRTR prompt reports `true` as well, since a continuation is only
+    /// reachable through the context. The router does not branch on this; it
+    /// is here for code that drives prompts directly.
     pub fn uses_context(&self) -> bool {
         self.handler
             .as_ref()
@@ -537,36 +603,41 @@ impl Prompt {
 // Builder API
 // =============================================================================
 
-/// Builder for creating prompts with a fluent API
+/// Builder for a prompt.
+///
+/// The name is the identity clients call by and must be unique in the router.
+/// Declare the arguments so a client knows what to collect, attach a handler,
+/// and finish with `.build()`. For a prompt with no logic behind it, end the
+/// chain at [`user_message`](Self::user_message) or
+/// [`static_prompt`](Self::static_prompt) instead.
 ///
 /// # Example
 ///
 /// ```rust
+/// use std::collections::HashMap;
 /// use tower_mcp::prompt::PromptBuilder;
-/// use tower_mcp::protocol::{GetPromptResult, PromptMessage, PromptRole, Content};
+/// use tower_mcp::protocol::GetPromptResult;
 ///
+/// # tokio_test::block_on(async {
 /// let prompt = PromptBuilder::new("greet")
 ///     .description("Generate a greeting")
 ///     .required_arg("name", "The name to greet")
-///     .handler(|args| async move {
-///         let name = args.get("name").map(|s| s.as_str()).unwrap_or("World");
-///         Ok(GetPromptResult {
-///             description: Some("A greeting prompt".to_string()),
-///             messages: vec![PromptMessage {
-///                 role: PromptRole::User,
-///                 content: Content::Text {
-///                     text: format!("Please greet {}", name),
-///                     annotations: None,
-///                     meta: None,
-///                 },
-///                 meta: None,
-///             }],
-///             meta: None,
-///         })
+///     .handler(|args: HashMap<String, String>| async move {
+///         // Required arguments are advertised, not enforced, so read
+///         // defensively rather than indexing.
+///         let name = args.get("name").map(String::as_str).unwrap_or("World");
+///         Ok(GetPromptResult::user_message_with_description(
+///             format!("Please greet {name}"),
+///             "A greeting prompt",
+///         ))
 ///     })
 ///     .build();
 ///
 /// assert_eq!(prompt.name, "greet");
+///
+/// let result = prompt.get(HashMap::new()).await.unwrap();
+/// assert_eq!(result.first_message_text(), Some("Please greet World"));
+/// # });
 /// ```
 pub struct PromptBuilder {
     name: String,
@@ -627,7 +698,11 @@ impl PromptBuilder {
         self
     }
 
-    /// Add a required argument
+    /// Declare an argument clients are expected to supply.
+    ///
+    /// This is advertisement, not validation. The argument appears in
+    /// `prompts/list` so a client can collect it, and a `prompts/get` that
+    /// omits it still reaches the handler, so the handler needs a fallback.
     pub fn required_arg(mut self, name: impl Into<String>, description: impl Into<String>) -> Self {
         self.arguments.push(PromptArgument {
             name: name.into(),
@@ -637,7 +712,10 @@ impl PromptBuilder {
         self
     }
 
-    /// Add an optional argument
+    /// Declare an argument clients may supply.
+    ///
+    /// The only difference from [`required_arg`](Self::required_arg) is the
+    /// flag clients see, since neither is enforced server-side.
     pub fn optional_arg(mut self, name: impl Into<String>, description: impl Into<String>) -> Self {
         self.arguments.push(PromptArgument {
             name: name.into(),
@@ -647,16 +725,21 @@ impl PromptBuilder {
         self
     }
 
-    /// Add an argument with full control
+    /// Add an argument that was built elsewhere.
+    ///
+    /// For argument metadata that comes from a schema, a manifest, or another
+    /// prompt, rather than from a literal in the builder chain.
     pub fn argument(mut self, arg: PromptArgument) -> Self {
         self.arguments.push(arg);
         self
     }
 
-    /// Set the handler function for getting the prompt.
+    /// Set the handler that builds the messages.
     ///
-    /// Returns a `PromptBuilderWithHandler` which can be finalized with `.build()`
-    /// or have middleware applied with `.layer()`.
+    /// The handler is called with whatever arguments the client sent, as
+    /// strings, with no entry at all for the ones it left out. Finish with
+    /// `.build()`, or apply middleware with `.layer()` first, remembering that
+    /// a layer turns handler errors into prompt content.
     ///
     /// # Sharing State
     ///
@@ -715,10 +798,46 @@ impl PromptBuilder {
         }
     }
 
-    /// Set a context-aware handler function for getting the prompt
+    /// Set a handler that receives the [`RequestContext`] with the arguments.
     ///
-    /// The handler receives a `RequestContext` for progress reporting and
-    /// cancellation checking, along with the prompt arguments.
+    /// Worth the extra parameter when assembling the messages is expensive
+    /// enough to report progress against or to abandon on cancellation, or
+    /// when the prompt needs something from the client. Otherwise use
+    /// [`handler`](Self::handler).
+    ///
+    /// ```rust
+    /// use std::collections::HashMap;
+    /// use tower_mcp::context::RequestContext;
+    /// use tower_mcp::error::Error;
+    /// use tower_mcp::prompt::PromptBuilder;
+    /// use tower_mcp::protocol::GetPromptResult;
+    ///
+    /// let prompt = PromptBuilder::new("summarize_changes")
+    ///     .description("Summarize the changed files")
+    ///     .handler_with_context(
+    ///         |ctx: RequestContext, _args: HashMap<String, String>| async move {
+    ///             let files = ["src/lib.rs", "src/router.rs"];
+    ///             let mut body = String::new();
+    ///             for (index, file) in files.iter().enumerate() {
+    ///                 if ctx.is_cancelled() {
+    ///                     return Err(Error::internal("cancelled while reading files"));
+    ///                 }
+    ///                 ctx.report_progress(index as f64, Some(files.len() as f64), Some(file))
+    ///                     .await;
+    ///                 body.push_str(file);
+    ///                 body.push('\n');
+    ///             }
+    ///             Ok(GetPromptResult::user_message(format!("Summarize:\n{body}")))
+    ///         },
+    ///     )
+    ///     .build();
+    ///
+    /// # tokio_test::block_on(async {
+    /// let result = prompt.get(HashMap::new()).await.unwrap();
+    /// let text = result.first_message_text().unwrap();
+    /// assert!(text.contains("src/router.rs"), "{text}");
+    /// # });
+    /// ```
     pub fn handler_with_context<F, Fut>(self, handler: F) -> PromptBuilderWithContextHandler<F>
     where
         F: Fn(RequestContext, HashMap<String, String>) -> Fut + Send + Sync + Clone + 'static,
@@ -751,7 +870,41 @@ impl PromptBuilder {
         }
     }
 
-    /// Create a static prompt (no arguments needed)
+    /// Finish the builder with a fixed list of messages.
+    ///
+    /// Arguments are ignored, so this is for a prompt that is the same every
+    /// time: a checklist, a house style, a standing instruction. The
+    /// description set on the builder is carried into every result.
+    ///
+    /// ```rust
+    /// use std::collections::HashMap;
+    /// use tower_mcp::prompt::PromptBuilder;
+    /// use tower_mcp::protocol::{Content, PromptMessage, PromptRole};
+    ///
+    /// # tokio_test::block_on(async {
+    /// let prompt = PromptBuilder::new("review_checklist")
+    ///     .description("The standing review checklist")
+    ///     .static_prompt(vec![
+    ///         PromptMessage {
+    ///             role: PromptRole::Assistant,
+    ///             content: Content::text("I check correctness before style."),
+    ///             meta: None,
+    ///         },
+    ///         PromptMessage {
+    ///             role: PromptRole::User,
+    ///             content: Content::text("Review the diff."),
+    ///             meta: None,
+    ///         },
+    ///     ]);
+    ///
+    /// let result = prompt.get(HashMap::new()).await.unwrap();
+    /// assert_eq!(result.messages.len(), 2);
+    /// assert_eq!(
+    ///     result.description.as_deref(),
+    ///     Some("The standing review checklist")
+    /// );
+    /// # });
+    /// ```
     pub fn static_prompt(self, messages: Vec<PromptMessage>) -> Prompt {
         let description = self.description.clone();
         self.handler(move |_| {
@@ -768,7 +921,24 @@ impl PromptBuilder {
         .build()
     }
 
-    /// Create a simple text prompt with a user message
+    /// Finish the builder with one user message.
+    ///
+    /// The shortest complete prompt there is, and the shape most prompts that
+    /// only seed a conversation want.
+    ///
+    /// ```rust
+    /// use std::collections::HashMap;
+    /// use tower_mcp::prompt::PromptBuilder;
+    ///
+    /// # tokio_test::block_on(async {
+    /// let prompt = PromptBuilder::new("help")
+    ///     .description("Ask the user what they need")
+    ///     .user_message("How can I help you today?");
+    ///
+    /// let result = prompt.get(HashMap::new()).await.unwrap();
+    /// assert_eq!(result.first_message_text(), Some("How can I help you today?"));
+    /// # });
+    /// ```
     pub fn user_message(self, text: impl Into<String>) -> Prompt {
         let text = text.into();
         self.static_prompt(vec![PromptMessage {
@@ -782,10 +952,13 @@ impl PromptBuilder {
         }])
     }
 
-    /// Finalize the builder into a Prompt
+    /// Attach a handler and finish, in one call.
     ///
-    /// This is an alias for `handler(...).build()` for when you want to
-    /// explicitly mark the build step.
+    /// `PromptBuilder::build(handler)` and `handler(handler).build()` produce
+    /// the same prompt. Note that the argument-less `.build()` seen in most
+    /// examples belongs to the builder [`handler`](Self::handler) returns, not
+    /// to this type, so only this form takes the handler as a parameter, and
+    /// only the other form can be preceded by `.layer()`.
     pub fn build<F, Fut>(self, handler: F) -> Prompt
     where
         F: Fn(HashMap<String, String>) -> Fut + Send + Sync + Clone + 'static,
