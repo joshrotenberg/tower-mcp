@@ -581,7 +581,14 @@ pub use context::{
     OutgoingRequestSender, RequestContext, RequestContextBuilder, ServerNotification,
     notification_channel, outgoing_request_channel,
 };
-pub use error::{BoxError, Error, Result, ResultExt, ToolError};
+// `JsonRpcError` is the type of `JsonRpcErrorResponse::error`, and every
+// other JSON-RPC message type is re-exported here, so leaving it out meant a
+// caller could build the response from the crate root but not name its one
+// field. `ErrorCode` and `McpErrorCode` are its constructor arguments and
+// come along for the same reason (#1258, same class as #1240).
+pub use error::{
+    BoxError, Error, ErrorCode, JsonRpcError, McpErrorCode, Result, ResultExt, ToolError,
+};
 pub use extension::{ExtensionDeclaration, NegotiatedExtension, NegotiatedExtensions};
 pub use filter::{
     CapabilityFilter, DenialBehavior, Filterable, PromptFilter, ResourceFilter, ToolFilter,
