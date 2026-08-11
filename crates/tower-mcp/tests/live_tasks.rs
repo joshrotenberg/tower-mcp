@@ -466,3 +466,110 @@ async fn a_completion_is_not_overwritten_by_a_late_cancellation() {
         }
     }
 }
+
+// ============================================================================
+// Panic isolation (#1305)
+// ============================================================================
+
+fn panicking_live_router(catch: bool) -> (Arc<MemoryTaskStore>, McpRouter) {
+    let boom = ToolBuilder::new("boom")
+        .description("Panics")
+        .live_task_handler(|_task: TaskContext, _input: NoArgs| async move {
+            panic!("live handler exploded");
+            #[allow(unreachable_code)]
+            Ok(TaskOutcome::Completed(CallToolResult::text("unreachable")))
+        })
+        .build();
+    let fine = ToolBuilder::new("fine")
+        .description("Works")
+        .live_task_handler(|_task: TaskContext, _input: NoArgs| async move {
+            Ok(TaskOutcome::Completed(CallToolResult::text("ok")))
+        })
+        .build();
+
+    let store = Arc::new(MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .server_info("panic-live", "1.0.0")
+        .task_store(store.clone())
+        .tool(boom)
+        .tool(fine)
+        .with_tasks();
+    let router = if catch { router.catch_panics() } else { router };
+    (store, router)
+}
+
+/// #1305: the live branch had no panic boundary, so a panicking handler
+/// unwound before any terminal state was written. The task sat at `working`
+/// forever: not failed, not cancelled, and nothing running.
+#[tokio::test]
+async fn a_panicking_live_handler_reaches_a_terminal_state() {
+    let (store, router) = panicking_live_router(true);
+    let client = McpClient::connect(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+
+    let task_id = client
+        .call_tool_as_task("boom", json!({}), None)
+        .await
+        .expect("task created")
+        .task
+        .task_id;
+
+    await_status(&store, &task_id, TaskStatus::Failed).await;
+    let (_, _, error) = store.get_task_result(&task_id).await.unwrap().unwrap();
+    let error = error.expect("a failed task carries a structured error");
+    assert!(
+        error.message.contains("panicked"),
+        "the failure must say what happened: {}",
+        error.message
+    );
+
+    // The decisive part: the server still serves.
+    let next = client
+        .call_tool_as_task("fine", json!({}), None)
+        .await
+        .expect("the server must still be serving")
+        .task
+        .task_id;
+    await_status(&store, &next, TaskStatus::Completed).await;
+}
+
+/// The registry entry must be released however the handler leaves, so a later
+/// cancellation does not target a dead handle. This holds without
+/// `catch_panics` too: opting out means the bug stays visible, not that
+/// registry state leaks.
+#[tokio::test]
+async fn a_panicking_live_handler_releases_its_registry_entry() {
+    for catch in [true, false] {
+        let (store, router) = panicking_live_router(catch);
+        let client = McpClient::connect(ChannelTransport::new(router))
+            .await
+            .expect("connect");
+        client.initialize("t", "1.0.0").await.expect("init");
+
+        let task_id = client
+            .call_tool_as_task("boom", json!({}), None)
+            .await
+            .expect("task created")
+            .task
+            .task_id;
+
+        // Let the handler panic and unwind.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // With a stale entry the router takes the live path, signals a handle
+        // nobody reads, and leaves the task non-terminal. With the entry gone
+        // it takes the store path and terminalizes.
+        let _ = client.task_cancel(&task_id, None).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let task = store.get_task(&task_id).await.unwrap().unwrap();
+        assert!(
+            task.status.is_terminal(),
+            "catch_panics={catch}: cancelling after a panic must terminalize, \
+             which a stale registry entry would prevent (status {:?})",
+            task.status
+        );
+    }
+}

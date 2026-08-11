@@ -58,6 +58,23 @@ fn encode_cursor(offset: usize) -> String {
 }
 
 /// Map a [`TaskStoreError`] to a JSON-RPC internal error.
+/// Releases a live task's registry entry however its handler leaves.
+///
+/// The handler can return, panic, or be dropped. Unregistering only on the
+/// return path left a panicking handler's entry installed, so a later
+/// `tasks/cancel` found a handle nobody was reading and took the live path
+/// instead of the store one (#1305).
+struct LiveTaskRegistration {
+    router: McpRouter,
+    task_id: String,
+}
+
+impl Drop for LiveTaskRegistration {
+    fn drop(&mut self) {
+        self.router.unregister_live_task(&self.task_id);
+    }
+}
+
 fn task_store_error(e: TaskStoreError) -> Error {
     Error::JsonRpc(JsonRpcError::internal_error(format!(
         "Task store error: {}",
@@ -3481,6 +3498,12 @@ impl McpRouter {
                             // left where cancellation selects the store path
                             // while live execution is running and cannot see it.
                             notifier.register_live_task(&task_id_clone, handle.clone());
+                            // Released on drop, so the entry goes whether the
+                            // handler returns, panics, or is dropped (#1305).
+                            let _registration = LiveTaskRegistration {
+                                router: notifier.clone(),
+                                task_id: task_id_clone.clone(),
+                            };
                             if cancellation_token.is_cancelled() {
                                 handle.cancelled.cancel();
                             }
@@ -3488,7 +3511,39 @@ impl McpRouter {
                                 crate::tool::TaskContext::with_live(task_id_clone.clone(), handle);
 
                             let start = std::time::Instant::now();
-                            let outcome = live_handler.call(ctx, live_ctx, arguments).await;
+                            // The replay paths get their panic boundary from
+                            // `invoke_tool`; the live branch calls the handler
+                            // directly and had none, so a panic unwound before
+                            // any terminal state was written and left the task
+                            // at `working` forever (#1305).
+                            let called = live_handler.call(ctx, live_ctx, arguments);
+                            let outcome = if notifier.inner.catch_panics {
+                                use futures::FutureExt;
+                                match std::panic::AssertUnwindSafe(called).catch_unwind().await {
+                                    Ok(outcome) => outcome,
+                                    Err(payload) => {
+                                        let message = panic_message(&*payload);
+                                        tracing::error!(
+                                            target: "mcp::tools",
+                                            tool = %tool_name,
+                                            task_id = %task_id_clone,
+                                            panic = %message,
+                                            "live task handler panicked"
+                                        );
+                                        // A panic is an execution failure, not
+                                        // a tool reporting a domain error, so
+                                        // it fails the task rather than
+                                        // completing it with `isError`.
+                                        Ok(crate::tool::TaskOutcome::Failed(
+                                            JsonRpcError::internal_error(format!(
+                                                "tool '{tool_name}' panicked: {message}"
+                                            )),
+                                        ))
+                                    }
+                                }
+                            } else {
+                                called.await
+                            };
                             let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
                             let applied = match outcome {
@@ -3524,15 +3579,13 @@ impl McpRouter {
                                     .await
                                     .map(|_| "failed"),
                             };
-                            // Unregister only after the single terminal write
-                            // has been attempted. Unregistering first left a
-                            // window where a cancel took the store path and
-                            // wrote `cancelled` over a task whose handler had
-                            // already produced a result, breaking the
-                            // single-writer property (#1294). A cancel arriving
-                            // in this interval now signals a handle nobody
-                            // reads, which is inert.
-                            notifier.unregister_live_task(&task_id_clone);
+                            // The registration guard releases the entry when
+                            // it drops at the end of this block, which is after
+                            // the terminal write above. Unregistering before
+                            // that write left a window where a cancel took the
+                            // store path and wrote `cancelled` over a task
+                            // whose handler had already produced a result
+                            // (#1294).
 
                             match applied {
                                 Ok(status) => tracing::info!(
