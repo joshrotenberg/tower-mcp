@@ -1892,8 +1892,8 @@ impl ResourceTemplate {
 
     /// The entry this template contributes to `resources/templates/list`.
     ///
-    /// Clients discover the pattern itself and expand it themselves, so the
-    /// declared variables are not repeated as `arguments`.
+    /// It advertises the pattern, not the variables: `arguments` is left
+    /// empty, and a client expands the pattern itself.
     pub fn definition(&self) -> ResourceTemplateDefinition {
         ResourceTemplateDefinition {
             uri_template: self.uri_template.clone(),
