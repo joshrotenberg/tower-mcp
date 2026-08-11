@@ -264,7 +264,7 @@ impl PanicPolicy {
         match &self.client_message {
             ClientPanicMessage::Detailed => format!(
                 "tool '{tool_name}' panicked: {}",
-                payload.expect("detailed panic policy always recovers the payload")
+                payload.unwrap_or("<redacted>")
             ),
             ClientPanicMessage::Fixed(message) => match self.client_tool_name.value(tool_name) {
                 Some(name) => format!("tool '{name}': {message}"),
@@ -3206,7 +3206,7 @@ impl McpRouter {
         let logged_tool = policy.log_tool_name.value(tool_name);
         let logged_payload = policy
             .include_payload_in_logs
-            .then(|| payload.as_deref().expect("log payload was recovered"));
+            .then(|| payload.as_deref().unwrap_or("<redacted>"));
 
         Self::log_caught_panic(logged_tool, logged_payload, task_id);
         policy.client_message(tool_name, payload.as_deref())
