@@ -1,0 +1,237 @@
+//! Live task execution (#1246).
+//!
+//! The distinguishing property is that the handler future stays alive across
+//! an input round trip. A replayed handler is invoked again from the top,
+//! which for a handler owning a subprocess or an open stream starts a second
+//! operation instead of continuing the first. These tests assert the handler
+//! runs exactly once no matter how many rounds of input it asks for.
+
+#![cfg(feature = "stateless")]
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use serde::Deserialize;
+use serde_json::json;
+use tower_mcp::async_task::{MemoryTaskStore, TaskStore};
+use tower_mcp::client::{ChannelTransport, McpClient};
+use tower_mcp::protocol::{
+    ElicitAction, ElicitFormParams, ElicitFormSchema, ElicitRequestParams, ElicitResult,
+    InputRequest, InputRequests, InputResponse, TaskStatus,
+};
+use tower_mcp::schemars::JsonSchema;
+use tower_mcp::{CallToolResult, McpRouter, TaskContext, TaskOutcome, ToolBuilder};
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct NoArgs {}
+
+fn ask(key: &str) -> InputRequests {
+    let mut requests: InputRequests = Default::default();
+    requests.insert(
+        key.to_string(),
+        InputRequest::Elicit(ElicitRequestParams::Form(ElicitFormParams {
+            mode: None,
+            message: format!("answer {key}?"),
+            requested_schema: ElicitFormSchema::new(),
+            meta: None,
+        })),
+    );
+    requests
+}
+
+/// Wait for a task to reach a status, or panic with what it actually reached.
+async fn await_status(store: &MemoryTaskStore, id: &str, want: TaskStatus) {
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let task = store.get_task(id).await.unwrap().unwrap();
+        if task.status == want {
+            return;
+        }
+    }
+    let (task, result, error) = store.get_task_result(id).await.unwrap().unwrap();
+    panic!(
+        "wanted {want:?}, task sat at {:?} msg={:?} result={:?} error={:?}",
+        task.status, task.status_message, result, error
+    );
+}
+
+async fn answer(client: &McpClient, task_id: &str, key: &str) {
+    client
+        .task_update(
+            task_id,
+            [(
+                key.to_string(),
+                InputResponse::Elicit(ElicitResult {
+                    action: ElicitAction::Accept,
+                    content: None,
+                    meta: None,
+                }),
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .await
+        .expect("update accepted");
+}
+
+/// The acceptance criterion from #1246: one invocation across several rounds.
+#[tokio::test]
+async fn a_live_handler_runs_once_across_multiple_input_rounds() {
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let counter = invocations.clone();
+
+    let tool = ToolBuilder::new("live")
+        .description("Asks twice, runs once")
+        .live_task_handler(move |task: TaskContext, _input: NoArgs| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                // State local to this future. A replayed handler would lose it.
+                let mut seen = Vec::new();
+                let first = task.require_input(ask("one")).await?;
+                seen.extend(first.into_keys());
+                let second = task.require_input(ask("two")).await?;
+                seen.extend(second.into_keys());
+                seen.sort();
+                Ok(TaskOutcome::Completed(CallToolResult::text(seen.join(","))))
+            }
+        })
+        .build();
+
+    let store = Arc::new(MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .server_info("live", "1.0.0")
+        .task_store(store.clone())
+        .tool(tool)
+        .with_tasks();
+
+    let client = McpClient::connect(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+
+    let task_id = client
+        .call_tool_as_task("live", json!({}), None)
+        .await
+        .expect("task created")
+        .task
+        .task_id;
+
+    await_status(&store, &task_id, TaskStatus::InputRequired).await;
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        1,
+        "the handler starts once"
+    );
+    answer(&client, &task_id, "one").await;
+
+    await_status(&store, &task_id, TaskStatus::InputRequired).await;
+    answer(&client, &task_id, "two").await;
+
+    await_status(&store, &task_id, TaskStatus::Completed).await;
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        1,
+        "and is never invoked again, however many rounds it asks for"
+    );
+
+    let (_, result, _) = store.get_task_result(&task_id).await.unwrap().unwrap();
+    assert_eq!(
+        result.unwrap().all_text(),
+        "one,two",
+        "state accumulated across both rounds survived, which replay could not do"
+    );
+}
+
+/// A live task records no invocation arguments, which is how a server keeps
+/// prompts or credentials out of durable storage.
+#[tokio::test]
+async fn a_live_task_persists_no_arguments() {
+    let tool = ToolBuilder::new("live")
+        .description("Completes immediately")
+        .live_task_handler(|_task: TaskContext, _input: serde_json::Value| async move {
+            Ok(TaskOutcome::Completed(CallToolResult::text("ok")))
+        })
+        .build();
+
+    let store = Arc::new(MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .server_info("live", "1.0.0")
+        .task_store(store.clone())
+        .tool(tool)
+        .with_tasks();
+
+    let client = McpClient::connect(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+
+    let task_id = client
+        .call_tool_as_task("live", json!({"secret": "hunter2"}), None)
+        .await
+        .expect("task created")
+        .task
+        .task_id;
+    await_status(&store, &task_id, TaskStatus::Completed).await;
+
+    let resume = store.resume_context(&task_id).await.unwrap().unwrap();
+    assert_eq!(
+        resume.arguments,
+        serde_json::Value::Null,
+        "the secret must never have been written to the store"
+    );
+}
+
+/// Cancellation is signalled, not imposed. The task stays non-terminal until
+/// the handler says it finished unwinding.
+#[tokio::test]
+async fn cancellation_is_confirmed_by_the_handler_rather_than_imposed() {
+    let tore_down = Arc::new(AtomicUsize::new(0));
+    let counter = tore_down.clone();
+
+    let tool = ToolBuilder::new("live")
+        .description("Waits, then unwinds on cancel")
+        .live_task_handler(move |task: TaskContext, _input: NoArgs| {
+            let counter = counter.clone();
+            async move {
+                // Propagating with `?` is the ordinary way to unwind.
+                let result = task.require_input(ask("never")).await;
+                counter.fetch_add(1, Ordering::SeqCst);
+                result?;
+                Ok(TaskOutcome::Completed(CallToolResult::text("unreachable")))
+            }
+        })
+        .build();
+
+    let store = Arc::new(MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .server_info("live", "1.0.0")
+        .task_store(store.clone())
+        .tool(tool)
+        .with_tasks();
+
+    let client = McpClient::connect(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+
+    let task_id = client
+        .call_tool_as_task("live", json!({}), None)
+        .await
+        .expect("task created")
+        .task
+        .task_id;
+    await_status(&store, &task_id, TaskStatus::InputRequired).await;
+
+    client
+        .task_cancel(&task_id, None)
+        .await
+        .expect("cancel accepted");
+
+    await_status(&store, &task_id, TaskStatus::Cancelled).await;
+    assert_eq!(
+        tore_down.load(Ordering::SeqCst),
+        1,
+        "the handler ran its teardown rather than being abandoned"
+    );
+}

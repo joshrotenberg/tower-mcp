@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 
 use tower_service::Service;
@@ -544,6 +544,12 @@ struct McpRouterInner {
     /// Whether to advertise `resources.subscribe`. Defaults to true, which
     /// is what this router has always advertised when resources exist (#1261).
     advertise_resource_subscriptions: bool,
+    /// Live tasks currently running, keyed by task id (#1246).
+    ///
+    /// A live handler parks inside its own future rather than returning, so
+    /// the router needs a handle to wake it when `tasks/update` commits and
+    /// to signal it when `tasks/cancel` arrives.
+    live_tasks: Arc<Mutex<HashMap<String, Arc<crate::tool::LiveTask>>>>,
     /// In-flight requests for cancellation tracking (shared across clones)
     in_flight: Arc<RwLock<HashMap<RequestId, CancellationToken>>>,
     /// Channel for sending notifications to connected clients
@@ -720,6 +726,7 @@ impl McpRouter {
                 resource_templates: Vec::new(),
                 prompts: HashMap::new(),
                 advertise_resource_subscriptions: true,
+                live_tasks: Arc::new(Mutex::new(HashMap::new())),
                 in_flight: Arc::new(RwLock::new(HashMap::new())),
                 notification_tx: None,
                 #[cfg(all(feature = "http", feature = "stateless"))]
@@ -2804,6 +2811,56 @@ impl McpRouter {
         self.notify_task_state(task_id).await;
     }
 
+    /// Wake a live task whose input has just been committed.
+    ///
+    /// Returns false when the task is not live, which is how the caller knows
+    /// to fall back to replay (#1246).
+    fn wake_live_task(&self, task_id: &str) -> bool {
+        let Ok(live) = self.inner.live_tasks.lock() else {
+            return false;
+        };
+        match live.get(task_id) {
+            Some(handle) => {
+                // `notify_one`, not `notify_waiters`: a waiter only registers
+                // when its future is polled, so a `notify_waiters` landing
+                // between the store write and the await is lost. `notify_one`
+                // leaves a permit that the next await consumes.
+                handle.input_ready.notify_one();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Signal a live task that cancellation was requested.
+    ///
+    /// The task stays non-terminal: its handler decides when it has finished
+    /// unwinding and says so by returning `TaskOutcome::Cancelled`.
+    fn signal_live_cancellation(&self, task_id: &str) -> bool {
+        let Ok(live) = self.inner.live_tasks.lock() else {
+            return false;
+        };
+        match live.get(task_id) {
+            Some(handle) => {
+                handle.cancelled.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn register_live_task(&self, task_id: &str, handle: Arc<crate::tool::LiveTask>) {
+        if let Ok(mut live) = self.inner.live_tasks.lock() {
+            live.insert(task_id.to_string(), handle);
+        }
+    }
+
+    fn unregister_live_task(&self, task_id: &str) {
+        if let Ok(mut live) = self.inner.live_tasks.lock() {
+            live.remove(task_id);
+        }
+    }
+
     /// Re-invoke a task's handler after its input requests were answered.
     ///
     /// A task's client answers through `tasks/update` rather than by retrying
@@ -3330,7 +3387,15 @@ impl McpRouter {
                         .task_store
                         .create_task(
                             &params.name,
-                            params.arguments.clone(),
+                            // A live task is never replayed, so its arguments
+                            // are not needed and are deliberately not
+                            // persisted. That is how a server keeps prompts or
+                            // credentials out of durable task storage (#1246).
+                            if tool.live_handler.is_some() {
+                                serde_json::Value::Null
+                            } else {
+                                params.arguments.clone()
+                            },
                             task_ttl,
                             request_principal(&extensions),
                         )
@@ -3393,6 +3458,80 @@ impl McpRouter {
                     let tool_name = params.name.clone();
                     let notifier = self.clone();
                     tokio::spawn(async move {
+                        // A live handler owns its execution: it parks inside
+                        // its own future rather than returning, so it is never
+                        // replayed and nothing else writes its terminal state
+                        // (#1246).
+                        if let Some(live_handler) = tool.live_handler.clone() {
+                            let handle = std::sync::Arc::new(crate::tool::LiveTask {
+                                store: task_store.clone(),
+                                input_ready: tokio::sync::Notify::new(),
+                                cancelled: crate::context::CancellationToken::new(),
+                            });
+                            if cancellation_token.is_cancelled() {
+                                handle.cancelled.cancel();
+                            }
+                            notifier.register_live_task(&task_id_clone, handle.clone());
+                            let live_ctx =
+                                crate::tool::TaskContext::with_live(task_id_clone.clone(), handle);
+
+                            let start = std::time::Instant::now();
+                            let outcome = live_handler.call(live_ctx, arguments).await;
+                            let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+                            notifier.unregister_live_task(&task_id_clone);
+
+                            let applied = match outcome {
+                                Ok(crate::tool::TaskOutcome::Completed(result)) => task_store
+                                    .complete_task(&task_id_clone, result)
+                                    .await
+                                    .map(|_| "completed"),
+                                Ok(crate::tool::TaskOutcome::Failed(error)) => task_store
+                                    .fail_task(&task_id_clone, error)
+                                    .await
+                                    .map(|_| "failed"),
+                                Ok(crate::tool::TaskOutcome::Cancelled { message }) => task_store
+                                    .cancel_task(&task_id_clone, message.as_deref())
+                                    .await
+                                    .map(|_| "cancelled"),
+                                // Propagating the cancellation error is the
+                                // ordinary way a live handler unwinds, so it
+                                // ends the task cancelled rather than failed.
+                                Err(crate::error::Error::TaskCancelled) => task_store
+                                    .cancel_task(
+                                        &task_id_clone,
+                                        Some("handler observed cancellation"),
+                                    )
+                                    .await
+                                    .map(|_| "cancelled"),
+                                // An unclassified error is an execution
+                                // failure the handler declined to describe.
+                                Err(error) => task_store
+                                    .fail_task(
+                                        &task_id_clone,
+                                        JsonRpcError::internal_error(error.to_string()),
+                                    )
+                                    .await
+                                    .map(|_| "failed"),
+                            };
+                            match applied {
+                                Ok(status) => tracing::info!(
+                                    target: "mcp::tools",
+                                    tool = %tool_name,
+                                    task_id = %task_id_clone,
+                                    duration_ms,
+                                    status,
+                                    "live task finished"
+                                ),
+                                Err(e) => tracing::warn!(
+                                    task_id = %task_id_clone,
+                                    error = %e,
+                                    "failed to record live task outcome"
+                                ),
+                            }
+                            notifier.notify_task_state(&task_id_clone).await;
+                            return;
+                        }
+
                         // Check for cancellation before starting
                         if cancellation_token.is_cancelled() {
                             tracing::debug!(task_id = %task_id_clone, "Task cancelled before execution");
@@ -4062,7 +4201,13 @@ impl McpRouter {
                     // would otherwise start a second handler alongside the one
                     // still running (#1246).
                     if !applied.accepted.is_empty() && applied.is_complete() {
-                        self.resume_task(&params.task_id).await;
+                        // A live handler is parked inside its own future and
+                        // must be woken, not replayed. Waking only after the
+                        // store has committed is what guarantees it cannot
+                        // observe an answer that was not recorded (#1246).
+                        if !self.wake_live_task(&params.task_id) {
+                            self.resume_task(&params.task_id).await;
+                        }
                     }
                     return Ok(McpResponse::FinalTaskAck(
                         crate::tasks::TaskAcknowledgement::new(),
@@ -4077,7 +4222,8 @@ impl McpRouter {
                 // every key, so dropping them wholesale left a server whose
                 // store models input requests with a working flow on
                 // 2026-07-28 and a silent stall on 2025-11-25 (#1188).
-                self.inner
+                let applied = self
+                    .inner
                     .task_store
                     .apply_input_responses(
                         &params.task_id,
@@ -4095,6 +4241,14 @@ impl McpRouter {
                 // resume regardless of which lifecycle the updating client
                 // used. Self-guards when the extension is not enabled.
                 self.notify_task_state(&params.task_id).await;
+                // A live task parks inside its own future, so answering its
+                // input on this lifecycle has to wake it just as the final
+                // path does, or it waits forever (#1246). Waking only after
+                // the store has committed is what guarantees the handler
+                // cannot observe an unrecorded answer.
+                if !applied.accepted.is_empty() && applied.is_complete() {
+                    self.wake_live_task(&params.task_id);
+                }
                 Ok(McpResponse::UpdateTask(EmptyResult {}))
             }
 
@@ -4102,6 +4256,17 @@ impl McpRouter {
                 if is_final_protocol_request(&extensions) {
                     self.require_negotiated_tasks(&extensions, "tasks/cancel")?;
                     self.authorize_task(&params.task_id, &extensions).await?;
+                    // A live task is signalled and left non-terminal: its
+                    // handler owns the teardown and reports when it actually
+                    // stopped, so completion can still legitimately win the
+                    // race. SEP-2663 describes cancellation as eventually
+                    // consistent, which is exactly this (#1246).
+                    if self.signal_live_cancellation(&params.task_id) {
+                        self.notify_task_state(&params.task_id).await;
+                        return Ok(McpResponse::FinalTaskAck(
+                            crate::tasks::TaskAcknowledgement::new(),
+                        ));
+                    }
                     // The final ack does not require a terminal transition:
                     // cancelling an already-terminal task is acknowledged, and
                     // the observable status is polled via `tasks/get`.
@@ -4118,6 +4283,13 @@ impl McpRouter {
                 }
 
                 self.authorize_task(&params.task_id, &extensions).await?;
+
+                // Same reasoning as the final path: a live task owns its own
+                // teardown, so it is signalled and left non-terminal (#1246).
+                if self.signal_live_cancellation(&params.task_id) {
+                    self.notify_task_state(&params.task_id).await;
+                    return Ok(McpResponse::CancelTask(EmptyResult {}));
+                }
 
                 // First check if the task exists and is not already terminal
                 let current = self

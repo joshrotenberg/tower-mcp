@@ -596,7 +596,7 @@ impl TaskContext {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::TaskCancelled`](crate::Error::TaskCancelled) if the
+    /// Returns [`crate::Error::TaskCancelled`] if the
     /// task is cancelled while waiting, so a handler that propagates with `?`
     /// unwinds correctly without writing a `select!`. The router maps that
     /// error to [`TaskOutcome::Cancelled`].
@@ -1795,13 +1795,6 @@ impl ToolBuilder {
         }
     }
 
-    /// Set an SEP-2322 handler that may return either a complete tool result
-    /// or an input-required continuation.
-    ///
-    /// The handler receives [`RequestContext`], where
-    /// [`RequestContext::input_responses`] and
-    /// [`RequestContext::request_state`] expose values from a retry.
-    #[cfg(feature = "stateless")]
     /// Set a handler that owns its execution instead of being replayed.
     ///
     /// A task handler registered with [`mrtr_handler`](Self::mrtr_handler)
@@ -1869,6 +1862,13 @@ impl ToolBuilder {
         }
     }
 
+    /// Set an SEP-2322 handler that may return either a complete tool result
+    /// or an input-required continuation.
+    ///
+    /// The handler receives [`RequestContext`], where
+    /// [`RequestContext::input_responses`] and
+    /// [`RequestContext::request_state`] expose values from a retry.
+    #[cfg(feature = "stateless")]
     pub fn mrtr_handler<I, F, Fut>(self, handler: F) -> ToolBuilderWithMrtrHandler<I, F>
     where
         I: JsonSchema + DeserializeOwned + Send + Sync + 'static,
