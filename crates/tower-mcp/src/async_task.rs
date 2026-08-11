@@ -491,6 +491,23 @@ pub struct CancellationToken {
 }
 
 impl CancellationToken {
+    /// Create a new, un-cancelled token.
+    ///
+    /// [`TaskStore::create_task`] has to return one of these, so without a
+    /// public constructor the trait could not be implemented outside this
+    /// crate at all: a struct literal fails with `E0451` and there is nothing
+    /// else to hand back. A SQLite, Redis, or Postgres store is exactly the
+    /// case the trait exists for (#1293).
+    ///
+    /// What an implementor can rely on: the token is cooperative, so raising
+    /// it interrupts nothing by itself; every clone observes the same flag;
+    /// and it is never lowered once raised.
+    pub fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     /// Check if cancellation has been requested
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed)
@@ -499,6 +516,12 @@ impl CancellationToken {
     /// Request cancellation
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Default for CancellationToken {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
