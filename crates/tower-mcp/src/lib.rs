@@ -506,6 +506,7 @@ pub mod event_store;
 pub mod extension;
 pub mod extract;
 pub mod filter;
+mod framing;
 pub mod guides;
 pub mod inspection;
 pub mod jsonrpc;
