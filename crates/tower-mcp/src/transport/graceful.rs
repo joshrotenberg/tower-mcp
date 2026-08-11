@@ -17,8 +17,8 @@ use crate::error::Error;
 /// `drain_timeout` bounds that last step. `None` waits for every open
 /// connection, which is what `axum::serve(..).with_graceful_shutdown(..)`
 /// does on its own. That wait has no natural end for a transport that holds
-/// connections open by design: an SSE notification stream or an idle
-/// WebSocket is a live connection until the client hangs up.
+/// connections open by design: an SSE notification stream is an in-flight
+/// response until its client hangs up.
 ///
 /// `Some(limit)` stops waiting after `limit` and returns. It does not close
 /// the connections that are still open: axum serves each one on its own
