@@ -467,6 +467,16 @@ pub trait TaskStore: Send + Sync + 'static {
     ///
     /// Returns `Ok(false)` if the task is unknown, expired, or already
     /// terminal.
+    /// # Key uniqueness
+    ///
+    /// SEP-2663 requires every request key to be unique over a single task's
+    /// lifetime: a key is spent once it has been issued, whether it was
+    /// answered or superseded, and must never name a second request. An
+    /// implementation is expected to return an error rather than reissue one,
+    /// which is what lets a client deduplicate across polls (#1246).
+    ///
+    /// The uniqueness scope is the task. Keys from a preceding MRTR phase are
+    /// a separate namespace and do not constrain a task's keys.
     async fn require_input(
         &self,
         task_id: &str,
@@ -724,16 +734,38 @@ impl TaskStore for MemoryTaskStore {
             return Ok(false);
         }
 
-        // Outstanding requests the server did not re-issue are superseded.
-        for key in std::mem::take(&mut task.input_requests).into_keys() {
-            if !requests.contains_key(&key) {
-                task.superseded_input_keys.insert(key);
-            }
+        // SEP-2663: "Each request key in `inputRequests` MUST be unique over
+        // the lifetime of a single task. A server MUST NOT reuse a key for a
+        // subsequent server-to-client request after a response for that key
+        // has been delivered, and MUST NOT use the same key to refer to two
+        // distinct requests over a task's lifetime."
+        //
+        // That guarantee is what lets a client deduplicate across polls and
+        // lets a server ignore responses for already-satisfied requests, so
+        // reissuing a key is rejected rather than quietly accepted (#1246).
+        let reused: Vec<String> = requests
+            .keys()
+            .filter(|key| {
+                task.answered_input_keys.contains(*key)
+                    || task.superseded_input_keys.contains(*key)
+                    || task.input_requests.contains_key(*key)
+            })
+            .cloned()
+            .collect();
+        if !reused.is_empty() {
+            return Err(TaskStoreError::Backend(format!(
+                "input request keys must be unique over a task's lifetime, but {} \
+                 already {} used by this task; use a new key to ask again",
+                reused.join(", "),
+                if reused.len() == 1 { "was" } else { "were" },
+            )));
         }
-        // A re-issued key is a fresh question, whatever its prior fate.
-        for key in requests.keys() {
-            task.answered_input_keys.remove(key);
-            task.superseded_input_keys.remove(key);
+
+        // Outstanding requests the server did not reissue are superseded.
+        // They stay recorded, since a superseded key is still spent for the
+        // rest of the task's lifetime.
+        for key in std::mem::take(&mut task.input_requests).into_keys() {
+            task.superseded_input_keys.insert(key);
         }
 
         task.input_requests = requests;
@@ -1476,8 +1508,12 @@ mod tests {
         );
     }
 
+    /// SEP-2663: a key is spent for the rest of the task once it has been
+    /// answered. Treating a reissue as a fresh question, which this store
+    /// used to do, breaks the guarantee clients rely on to deduplicate
+    /// across polls (#1246).
     #[tokio::test]
-    async fn reissued_key_becomes_a_fresh_question() {
+    async fn an_answered_key_cannot_be_reissued() {
         let store = MemoryTaskStore::new();
         let id = working_task(&store, None).await;
         store
@@ -1490,18 +1526,67 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        // The server asks the same key again: the earlier answer must not
-        // satisfy it.
+        let error = store
+            .require_input(&id, requests(&["approval"]), None)
+            .await
+            .expect_err("an answered key must not be reissued");
+        assert!(
+            error.to_string().contains("approval"),
+            "the message must name the offending key: {error}"
+        );
+    }
+
+    /// A key issued and then superseded without an answer is spent too: the
+    /// SEP forbids one key naming two distinct requests, regardless of
+    /// whether the first was answered.
+    #[tokio::test]
+    async fn a_superseded_key_cannot_be_reissued() {
+        let store = MemoryTaskStore::new();
+        let id = working_task(&store, None).await;
         store
             .require_input(&id, requests(&["approval"]), None)
             .await
             .unwrap();
-        let applied = store
+        // Asking something else supersedes the unanswered `approval`.
+        store
+            .require_input(&id, requests(&["region"]), None)
+            .await
+            .unwrap();
+
+        store
+            .require_input(&id, requests(&["approval"]), None)
+            .await
+            .expect_err("a superseded key must not be reissued");
+    }
+
+    /// Distinct keys are the normal case and stay unaffected, including
+    /// asking again after an answer under a new name.
+    #[tokio::test]
+    async fn distinct_keys_across_rounds_are_fine() {
+        let store = MemoryTaskStore::new();
+        let id = working_task(&store, None).await;
+        store
+            .require_input(&id, requests(&["approval"]), None)
+            .await
+            .unwrap();
+        store
             .apply_input_responses(&id, [accept("approval")].into_iter().collect())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(applied.accepted, ["approval".to_string()].into());
+
+        assert!(
+            store
+                .require_input(&id, requests(&["approval_2"]), None)
+                .await
+                .unwrap()
+        );
+        let applied = store
+            .apply_input_responses(&id, [accept("approval_2")].into_iter().collect())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(applied.accepted, ["approval_2".to_string()].into());
         assert!(applied.is_complete());
     }
 
