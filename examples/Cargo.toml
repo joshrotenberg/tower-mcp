@@ -118,6 +118,11 @@ name = "middleware"
 path = "middleware.rs"
 
 [[example]]
+name = "middleware_extension"
+path = "middleware_extension.rs"
+required-features = ["http"]
+
+[[example]]
 name = "rate_limiting"
 path = "rate_limiting.rs"
 

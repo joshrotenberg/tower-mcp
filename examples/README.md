@@ -82,6 +82,7 @@ cargo run -p tower-mcp-examples --example tool_macro --features macros
 | Example | What it shows |
 |---------|---------------|
 | [middleware](middleware.rs) | All four levels: transport, per-tool, per-resource, per-prompt, and guards |
+| [middleware_extension](middleware_extension.rs) | A layer resolves a per-request identity and a handler reads it, via `bridge_extension` |
 | [rate_limiting](rate_limiting.rs) | Per-tool rate limiting with tower-resilience |
 | [capability_filtering](capability_filtering.rs) | Session-based tool/resource/prompt visibility |
 | [tool_selection](tool_selection.rs) | Tool groups, safety tiers, allow/deny lists |
