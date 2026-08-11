@@ -5976,3 +5976,121 @@ async fn test_discover_does_not_require_initialization() {
         resp
     );
 }
+
+/// #1249: an expired task is distinguishable from a missing one, but only to
+/// its owner. To anyone else both must answer exactly as an id that was never
+/// issued does, or `tasks/get` becomes an existence oracle: probe ids, and the
+/// ones that answer differently belong to somebody.
+///
+/// This drives the router rather than the store, which is the level the
+/// authorization decision is made at. A store-level test cannot see this bug:
+/// I wrote one first, installed an implementation that disclosed expiry before
+/// checking ownership, and the store-level test passed anyway.
+#[cfg(all(feature = "oauth", feature = "stateless"))]
+#[tokio::test]
+async fn expiry_is_disclosed_to_the_owner_and_to_nobody_else() {
+    fn as_principal(subject: &str) -> Extensions {
+        let mut extensions = tasks_client_extensions();
+        extensions.insert(crate::oauth::token::TokenClaims {
+            sub: Some(subject.to_string()),
+            iss: None,
+            aud: None,
+            exp: None,
+            scope: None,
+            client_id: None,
+            extra: HashMap::new(),
+        });
+        extensions
+    }
+
+    let store = std::sync::Arc::new(crate::async_task::MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .task_store(store.clone())
+        .tool(
+            ToolBuilder::new("optional_task")
+                .task_support(TaskSupportMode::Optional)
+                .handler(|input: AddInput| async move {
+                    Ok(CallToolResult::text(format!("{}", input.a + input.b)))
+                })
+                .build(),
+        )
+        .with_tasks();
+
+    // Alice creates a task, then it expires.
+    let McpResponse::FinalCreateTask(created) = router
+        .handle(
+            RequestId::Number(1),
+            McpRequest::CallTool(CallToolParams {
+                name: "optional_task".to_string(),
+                arguments: serde_json::json!({"a": 1, "b": 2}),
+                input_responses: None,
+                request_state: None,
+                meta: None,
+                task: None,
+            }),
+            as_principal("alice"),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("Expected a final create-task response");
+    };
+    let task_id = created.task.metadata.task_id.clone();
+    assert!(store.set_ttl(&task_id, 1).await.unwrap());
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+    let get = |id: String, who: Extensions| {
+        let router = router.clone();
+        async move {
+            router
+                .handle(
+                    RequestId::Number(9),
+                    McpRequest::GetTaskInfo(GetTaskInfoParams {
+                        task_id: id,
+                        meta: None,
+                    }),
+                    who,
+                )
+                .await
+        }
+    };
+
+    // The owner is told it expired.
+    let owner_saw = get(task_id.clone(), as_principal("alice")).await;
+    let Err(crate::error::Error::JsonRpc(owner_error)) = owner_saw else {
+        panic!("the owner must be told the task expired");
+    };
+    assert_eq!(
+        owner_error.data,
+        Some(serde_json::json!({ "reason": "task_expired" })),
+        "the owner's error must carry the expiry discriminator"
+    );
+
+    // Nobody else can tell it from an id that was never issued. Comparing the
+    // whole error, not just the code, because a discriminator in `data` or a
+    // differing message would leak just as effectively.
+    let stranger_saw = get(task_id.clone(), as_principal("bob")).await;
+    let never_issued = get("never-issued".to_string(), as_principal("bob")).await;
+    let (
+        Err(crate::error::Error::JsonRpc(stranger_error)),
+        Err(crate::error::Error::JsonRpc(missing_error)),
+    ) = (stranger_saw, never_issued)
+    else {
+        panic!("both must be refused");
+    };
+    assert_eq!(
+        stranger_error.code, missing_error.code,
+        "an unauthorized caller must not learn the task exists"
+    );
+    assert_eq!(
+        stranger_error.data, missing_error.data,
+        "nor from the error data"
+    );
+    // The message embeds the id the caller supplied, which tells them nothing
+    // they did not already know, so compare the shape with the id removed.
+    assert_eq!(
+        stranger_error.message.replace(&task_id, "<id>"),
+        missing_error.message.replace("never-issued", "<id>"),
+        "nor from the message, once the caller's own id is factored out"
+    );
+}

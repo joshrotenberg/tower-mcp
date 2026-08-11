@@ -274,6 +274,20 @@ fn request_principal(_extensions: &crate::context::Extensions) -> Option<String>
 ///
 /// Unknown and expired tasks are deliberately indistinguishable, so a caller
 /// cannot probe for the existence of a task whose retention window closed.
+/// The error an owner gets for a task the store still holds but whose TTL
+/// elapsed.
+///
+/// Deliberately distinct from [`unknown_task_error`] in its `data`, and
+/// deliberately only ever produced after the caller has been shown to own the
+/// task. A caller who does not own it gets `unknown_task_error`, which is
+/// also what a genuinely unknown id gets, so the two cannot be told apart
+/// from outside (#1249).
+fn expired_task_error(task_id: &str) -> JsonRpcError {
+    let mut error = JsonRpcError::invalid_params(format!("Task expired: {task_id}"));
+    error.data = Some(serde_json::json!({ "reason": "task_expired" }));
+    error
+}
+
 fn unknown_task_error(task_id: &str) -> JsonRpcError {
     JsonRpcError::invalid_params(format!("Task not found: {task_id}"))
 }
@@ -2644,16 +2658,28 @@ impl McpRouter {
         task_id: &str,
         extensions: &crate::context::Extensions,
     ) -> Result<()> {
-        let owner = self
+        // Resolved through presence so an expired task can be reported as
+        // such to its owner. Everyone else must still see exactly what they
+        // see for an id that was never issued, so the owner check happens
+        // before any of that distinction escapes (#1249).
+        let presence = self
             .inner
             .task_store
-            .task_owner(task_id)
+            .task_presence(task_id)
             .await
-            .map_err(task_store_error)?
-            .ok_or_else(|| Error::JsonRpc(unknown_task_error(task_id)))?;
+            .map_err(task_store_error)?;
+        let Some(owner) = presence.owner() else {
+            return Err(Error::JsonRpc(unknown_task_error(task_id)));
+        };
 
-        if crate::async_task::owner_matches(&owner, request_principal(extensions).as_deref()) {
-            Ok(())
+        if crate::async_task::owner_matches(owner, request_principal(extensions).as_deref()) {
+            match presence {
+                // The owner is told the difference; nobody else reaches here.
+                crate::async_task::TaskPresence::Expired { .. } => {
+                    Err(Error::JsonRpc(expired_task_error(task_id)))
+                }
+                _ => Ok(()),
+            }
         } else {
             tracing::debug!(
                 target: "mcp::tasks",
