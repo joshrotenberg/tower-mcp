@@ -1802,6 +1802,73 @@ impl ToolBuilder {
     /// [`RequestContext::input_responses`] and
     /// [`RequestContext::request_state`] expose values from a retry.
     #[cfg(feature = "stateless")]
+    /// Set a handler that owns its execution instead of being replayed.
+    ///
+    /// A task handler registered with [`mrtr_handler`](Self::mrtr_handler)
+    /// ends when it asks for input, and the router re-invokes it from the top
+    /// once the answers arrive. That is right for a handler which is a
+    /// function of its arguments, and wrong for one that owns live state: a
+    /// subprocess, an open stream, a registered responder. Running it again
+    /// does not continue the operation, it starts a second one.
+    ///
+    /// A live handler stays alive instead. It awaits its answers:
+    ///
+    /// ```rust,no_run
+    /// use tower_mcp::{CallToolResult, TaskContext, TaskOutcome, ToolBuilder};
+    /// use tower_mcp::protocol::InputRequests;
+    /// use serde::Deserialize;
+    /// use tower_mcp::schemars::JsonSchema;
+    ///
+    /// #[derive(Deserialize, JsonSchema)]
+    /// struct Run { prompt: String }
+    ///
+    /// # fn approval() -> InputRequests { Default::default() }
+    /// let tool = ToolBuilder::new("run")
+    ///     .description("Runs something long")
+    ///     .live_task_handler(|task: TaskContext, input: Run| async move {
+    ///         // Whatever this owns is still owned after the await.
+    ///         let answers = task.require_input(approval()).await?;
+    ///         let _ = (answers, input);
+    ///         Ok(TaskOutcome::Completed(CallToolResult::text("done")))
+    ///     })
+    ///     .build();
+    /// ```
+    ///
+    /// The handler returns a [`TaskOutcome`] and the router applies it, so
+    /// nothing else writes terminal state and completion cannot race the
+    /// handler.
+    ///
+    /// # Consequences
+    ///
+    /// The tool is registered as [`TaskSupportMode::Required`], because a
+    /// live handler has no task to park against otherwise.
+    ///
+    /// No invocation arguments are persisted, since nothing replays them. A
+    /// server whose arguments carry prompts or credentials keeps them out of
+    /// durable storage by using a live handler.
+    ///
+    /// A live future does not survive its process. On restart, live tasks left
+    /// non-terminal have nothing behind them, and the application reconciles
+    /// them rather than the router guessing.
+    pub fn live_task_handler<I, F, Fut>(self, handler: F) -> ToolBuilderWithLiveHandler<I, F>
+    where
+        I: JsonSchema + DeserializeOwned + Send + Sync + 'static,
+        F: Fn(TaskContext, I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<TaskOutcome>> + Send + 'static,
+    {
+        ToolBuilderWithLiveHandler {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            output_schema: self.output_schema,
+            input_schema_override: self.input_schema_override,
+            icons: self.icons,
+            annotations: self.annotations,
+            handler,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
     pub fn mrtr_handler<I, F, Fut>(self, handler: F) -> ToolBuilderWithMrtrHandler<I, F>
     where
         I: JsonSchema + DeserializeOwned + Send + Sync + 'static,
@@ -2060,6 +2127,60 @@ pub struct ToolBuilderWithMrtrHandler<I, F> {
     task_support: TaskSupportMode,
     handler: F,
     _phantom: std::marker::PhantomData<I>,
+}
+
+/// Builder state after a live task handler is set.
+///
+/// A live handler owns its execution, so it is only meaningful as a task and
+/// the tool is registered with [`TaskSupportMode::Required`] (#1246).
+pub struct ToolBuilderWithLiveHandler<I, F> {
+    name: String,
+    title: Option<String>,
+    description: Option<String>,
+    output_schema: Option<Value>,
+    input_schema_override: Option<Value>,
+    icons: Option<Vec<ToolIcon>>,
+    annotations: Option<ToolAnnotations>,
+    handler: F,
+    _phantom: std::marker::PhantomData<I>,
+}
+
+impl<I, F, Fut> ToolBuilderWithLiveHandler<I, F>
+where
+    I: JsonSchema + DeserializeOwned + Send + Sync + 'static,
+    F: Fn(TaskContext, I) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<TaskOutcome>> + Send + 'static,
+{
+    /// Finish the tool.
+    pub fn build(self) -> Tool {
+        let input_schema = ensure_object_schema(self.input_schema_override.unwrap_or_else(|| {
+            serde_json::to_value(schemars::schema_for!(I))
+                .unwrap_or_else(|_| serde_json::json!({"type": "object"}))
+        }));
+        Tool {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            output_schema: self.output_schema,
+            icons: self.icons,
+            annotations: self.annotations,
+            meta: None,
+            // A live handler cannot run without a task to park against, so
+            // requiring one is the honest contract rather than silently
+            // degrading when a client does not ask for a task.
+            task_support: TaskSupportMode::Required,
+            required_client_capabilities: None,
+            task_preparer: None,
+            service: None,
+            #[cfg(feature = "stateless")]
+            mrtr_handler: None,
+            live_handler: Some(Arc::new(FnLiveToolHandler {
+                handler: self.handler,
+                _input: std::marker::PhantomData::<fn() -> I>,
+            })),
+            input_schema,
+        }
+    }
 }
 
 /// Builder state after a layer has been applied to an MRTR handler.

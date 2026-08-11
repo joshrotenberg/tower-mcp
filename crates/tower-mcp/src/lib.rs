@@ -675,8 +675,8 @@ pub use session::{SessionPhase, SessionState};
 #[cfg(feature = "stateless")]
 pub use tool::MrtrToolHandler;
 pub use tool::{
-    BoxToolService, GuardLayer, McpTool, NoParams, TaskContext, TaskPreparation, Tool, ToolBuilder,
-    ToolHandler, ToolRequest,
+    BoxToolService, GuardLayer, McpTool, NoParams, TaskContext, TaskOutcome, TaskPreparation, Tool,
+    ToolBuilder, ToolHandler, ToolRequest,
 };
 pub use transport::{
     BidirectionalStdioTransport, CatchError, GenericStdioTransport, StdioTransport,
