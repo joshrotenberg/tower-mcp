@@ -23,8 +23,7 @@ use std::time::Duration;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tower::timeout::TimeoutLayer;
-use tower_mcp::transport::WebSocketTransport;
-use tower_mcp::{CallToolResult, McpRouter, ResourceBuilder, ToolBuilder};
+use tower_mcp::{CallToolResult, McpRouter, ResourceBuilder, ToolBuilder, WebSocketTransport};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct EchoInput {

@@ -18,10 +18,9 @@
 use std::time::Duration;
 
 use tower::timeout::TimeoutLayer;
-use tower_mcp::GenericStdioTransport;
 use tower_mcp::client::StdioClientTransport;
-use tower_mcp::context::notification_channel;
 use tower_mcp::proxy::McpProxy;
+use tower_mcp::{GenericStdioTransport, notification_channel};
 
 #[tokio::main]
 async fn main() -> Result<(), tower_mcp::BoxError> {

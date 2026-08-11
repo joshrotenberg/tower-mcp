@@ -492,7 +492,7 @@ mod handshake_retry_tests {
             attempts.fetch_add(1, Ordering::Relaxed);
             async move {
                 Err::<(), _>(tower_mcp::Error::JsonRpc(
-                    tower_mcp::error::JsonRpcError::invalid_request("bad handshake"),
+                    tower_mcp::JsonRpcError::invalid_request("bad handshake"),
                 ))
             }
         })

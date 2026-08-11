@@ -1,9 +1,9 @@
 //! Client handlers for server-initiated requests (sampling, elicitation, roots).
 
 use std::collections::HashMap;
+use tower_mcp::JsonRpcError;
 use tower_mcp::client::ClientHandler;
 use tower_mcp::client::ServerNotification;
-use tower_mcp::error::JsonRpcError;
 use tower_mcp::protocol::*;
 
 /// Basic handler that does nothing special. Used for `initialize` and `sse-retry`.

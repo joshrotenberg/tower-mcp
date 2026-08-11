@@ -18,8 +18,7 @@
 use std::collections::HashMap;
 
 use tower_mcp::protocol::{ReadResourceResult, ResourceContent};
-use tower_mcp::resource::ResourceTemplateBuilder;
-use tower_mcp::{BoxError, McpRouter, StdioTransport};
+use tower_mcp::{BoxError, McpRouter, ResourceTemplateBuilder, StdioTransport};
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {

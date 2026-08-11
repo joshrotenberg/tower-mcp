@@ -21,10 +21,7 @@
 
 use std::time::Duration;
 
-use tower_mcp::{
-    BoxError, HttpTransport, McpRouter,
-    context::{ServerNotification, notification_channel},
-};
+use tower_mcp::{BoxError, HttpTransport, McpRouter, ServerNotification, notification_channel};
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {

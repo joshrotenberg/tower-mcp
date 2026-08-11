@@ -30,9 +30,10 @@ mod resources;
 mod tools;
 
 use clap::Parser;
-use tower_mcp::context::notification_channel;
 use tower_mcp::protocol::DeprecationInfo;
-use tower_mcp::{HttpTransport, McpRouter, RequestStateCodec, StdioTransport};
+use tower_mcp::{
+    HttpTransport, McpRouter, RequestStateCodec, StdioTransport, notification_channel,
+};
 
 #[derive(Parser)]
 #[command(name = "conformance-server")]

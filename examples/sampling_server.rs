@@ -16,13 +16,12 @@ use std::time::Duration;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tower_mcp::{
-    CallToolResult, McpRouter, ToolBuilder,
+    BidirectionalStdioTransport, CallToolResult, McpRouter, ToolBuilder,
     extract::{Context, Json},
     protocol::{
         ContentRole, CreateMessageParams, ElicitAction, ElicitFormParams, ElicitFormSchema,
         SamplingContent, SamplingContentOrArray, SamplingMessage,
     },
-    transport::stdio::BidirectionalStdioTransport,
 };
 
 #[derive(Debug, Deserialize, JsonSchema)]

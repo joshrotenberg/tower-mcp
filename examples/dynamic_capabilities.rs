@@ -20,11 +20,10 @@
 
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tower_mcp::context::notification_channel;
 use tower_mcp::extract::{Json, State};
 use tower_mcp::{
     CallToolResult, DynamicToolRegistry, JsonRpcRequest, JsonRpcService, McpRouter, PromptBuilder,
-    ResourceBuilder, ToolBuilder,
+    ResourceBuilder, ToolBuilder, notification_channel,
 };
 
 /// Input for the `create_tool` meta-tool.
