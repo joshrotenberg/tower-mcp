@@ -28,7 +28,6 @@ use std::time::Duration;
 
 use crate::error::Error;
 use crate::router::McpRouter;
-use crate::transport::graceful::serve_with_shutdown;
 use crate::transport::http::{HttpTransport, SessionConfig, SessionHandle};
 use crate::{ProtocolSupport, ProtocolSupportError};
 
@@ -321,7 +320,8 @@ impl UnixSocketTransport {
 
         let drain_timeout = self.drain_timeout;
         let router = self.inner.into_router();
-        serve_with_shutdown(listener, router, signal, drain_timeout).await
+        crate::transport::graceful::serve_with_shutdown(listener, router, signal, drain_timeout)
+            .await
     }
 }
 

@@ -75,23 +75,49 @@
 //!
 //! ## Graceful shutdown
 //!
-//! `axum::serve` supports graceful shutdown via its `with_graceful_shutdown`
-//! method. Use `into_router()` so you own the server lifecycle:
+//! Every transport that binds its own listener takes a shutdown future.
+//! Once it resolves, the listener stops accepting, requests already in
+//! flight are answered, and `serve_with_shutdown` returns:
 //!
 //! ```rust,no_run
 //! # use tower_mcp::{HttpTransport, McpRouter};
 //! # async fn run() -> Result<(), tower_mcp::BoxError> {
 //! let router = McpRouter::new().server_info("my-server", "1.0.0");
-//! let app = HttpTransport::new(router).into_router();
-//! let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
 //!
-//! axum::serve(listener, app)
-//!     .with_graceful_shutdown(async {
+//! HttpTransport::new(router)
+//!     .serve_with_shutdown("0.0.0.0:3000", async {
 //!         tokio::signal::ctrl_c().await.ok();
 //!     })
 //!     .await?;
 //! # Ok(()) }
 //! ```
+//!
+//! The wait for in-flight work is unbounded by default, so nothing already
+//! accepted is dropped. A client holding an SSE notification stream open is
+//! also an in-flight request, and it can outlast the shutdown that started
+//! it. [`drain_timeout`](crate::HttpTransport::drain_timeout) bounds that
+//! wait:
+//!
+//! ```rust,no_run
+//! # use std::time::Duration;
+//! # use tower_mcp::{HttpTransport, McpRouter};
+//! # async fn run() -> Result<(), tower_mcp::BoxError> {
+//! # let router = McpRouter::new().server_info("my-server", "1.0.0");
+//! HttpTransport::new(router)
+//!     .drain_timeout(Duration::from_secs(10))
+//!     .serve_with_shutdown("0.0.0.0:3000", async {
+//!         tokio::signal::ctrl_c().await.ok();
+//!     })
+//!     .await?;
+//! # Ok(()) }
+//! ```
+//!
+//! `UnixSocketTransport` and `WebSocketTransport` take the same shutdown
+//! future. A WebSocket leaves axum's connection tracking when it is
+//! upgraded, so that transport has no `drain_timeout`: shutting down stops
+//! new clients getting in, and open sockets run until their clients hang up.
+//! If you serve the router yourself with `into_router()`, the equivalent of
+//! all this is `axum::serve(..).with_graceful_shutdown(..)`.
 //!
 //! # Health Checks
 //!

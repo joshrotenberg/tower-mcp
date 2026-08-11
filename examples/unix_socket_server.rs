@@ -118,7 +118,20 @@ mod app {
             .layer(TimeoutLayer::new(Duration::from_secs(30)));
 
         tracing::info!("Starting Unix socket MCP server on {}", socket_path);
-        transport.serve(socket_path).await?;
+
+        // Ctrl-C stops the accept loop and lets `serve_with_shutdown`
+        // return, which is what makes the cleanup below reachable. Plain
+        // `serve` never returns.
+        transport
+            .serve_with_shutdown(socket_path, async {
+                tokio::signal::ctrl_c().await.ok();
+                tracing::info!("Shutting down");
+            })
+            .await?;
+
+        // The transport does not unlink the socket file, so the server that
+        // created it does.
+        std::fs::remove_file(socket_path).ok();
 
         Ok(())
     }

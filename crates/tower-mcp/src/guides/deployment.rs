@@ -292,7 +292,34 @@ external authorization server, session store, event store, or downstream tool
 dependency is ready. Add a separate application readiness route when those
 dependencies should gate traffic.
 
-Own the axum server lifecycle when you need graceful shutdown:
+For graceful shutdown, give the transport a shutdown future. Once it
+resolves the listener stops accepting, requests already in flight are
+answered, and `serve_with_shutdown` returns:
+
+```rust,no_run
+use std::time::Duration;
+
+use tower_mcp::{BoxError, HttpTransport, McpRouter};
+
+#[tokio::main]
+async fn main() -> Result<(), BoxError> {
+    HttpTransport::new(McpRouter::new())
+        .drain_timeout(Duration::from_secs(10))
+        .serve_with_shutdown("0.0.0.0:3000", async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
+    Ok(())
+}
+```
+
+`drain_timeout` bounds the wait for requests still in flight. It is
+unbounded by default, and a client holding an SSE notification stream open
+counts as in flight, so a server that has to stop within a deadline should
+set it.
+
+Own the axum lifecycle instead when the MCP endpoint is one route among
+several, or is mounted somewhere other than the root:
 
 ```rust,no_run
 use tower_mcp::{BoxError, HttpTransport, McpRouter};

@@ -81,6 +81,11 @@ async fn serve_in_background(transport: UnixSocketTransport, path: &Path) {
         }
     });
 
+    wait_until_connectable(path).await;
+}
+
+/// Block until the socket accepts a connection, so tests never race the bind.
+async fn wait_until_connectable(path: &Path) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
         if UnixStream::connect(path).await.is_ok() {
@@ -279,6 +284,155 @@ async fn builder_configuration_produces_a_usable_router() {
     let (_router, handle) = transport.into_router_with_handle();
     assert_eq!(handle.session_count().await, 0);
     assert!(handle.list_sessions().await.is_empty());
+}
+
+/// The gap #1285 was filed for: `serve` owns the accept loop and never
+/// returns, so a process that starts one cannot stop it without exiting.
+///
+/// A hang is the failure this guards against, so every wait here is bounded
+/// and the test fails on the timeout rather than blocking the suite.
+#[tokio::test]
+async fn serve_with_shutdown_returns_and_stops_accepting() {
+    let socket = SocketPath::new("shutdown");
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let serve_path = socket.path().to_path_buf();
+
+    let server = tokio::spawn(
+        UnixSocketTransport::new(test_router())
+            .disable_origin_validation()
+            .serve_with_shutdown(serve_path, async move {
+                stop_rx.await.ok();
+            }),
+    );
+
+    // The server is genuinely up: a real MCP round trip is answered first, so
+    // what stops below is a working server rather than a failed bind.
+    wait_until_connectable(socket.path()).await;
+    let init = post_json(socket.path(), &[], &initialize_request()).await;
+    assert_eq!(init["result"]["serverInfo"]["name"], "unix-socket-test");
+
+    stop_tx.send(()).expect("send shutdown signal");
+
+    let served = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("serve_with_shutdown never returned after the signal")
+        .expect("server task panicked");
+    served.expect("serve_with_shutdown reported an error");
+
+    // Returning is not the whole claim: the listener has to be gone too, or
+    // the caller has stopped waiting on a server that is still accepting.
+    assert!(
+        UnixStream::connect(socket.path()).await.is_err(),
+        "socket still accepted a connection after shutdown"
+    );
+}
+
+/// `drain_timeout` bounds the wait for connections that are still open.
+///
+/// The parked handler never finishes, so without the bound this test would
+/// hang: that is exactly the case the bound exists for. The other half of
+/// the pair, that an unbounded shutdown really does wait for an in-flight
+/// request rather than returning early, is in `graceful_shutdown.rs`.
+#[tokio::test]
+async fn drain_timeout_returns_while_a_request_is_still_in_flight() {
+    let socket = SocketPath::new("drain");
+    let park = ParkedTool::new();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let serve_path = socket.path().to_path_buf();
+
+    let server = tokio::spawn(
+        UnixSocketTransport::new(park.router())
+            .disable_origin_validation()
+            .drain_timeout(Duration::from_millis(200))
+            .serve_with_shutdown(serve_path, async move {
+                stop_rx.await.ok();
+            }),
+    );
+
+    wait_until_connectable(socket.path()).await;
+
+    let call_path = socket.path().to_path_buf();
+    let call = tokio::spawn(async move {
+        post(
+            &call_path,
+            &[("MCP-Protocol-Version", PROTOCOL_VERSION)],
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "park", "arguments": {}}
+            })
+            .to_string(),
+        )
+        .await
+    });
+
+    park.started().await;
+    stop_tx.send(()).expect("send shutdown signal");
+
+    let served = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("drain_timeout did not bound the wait for an open connection")
+        .expect("server task panicked");
+    served.expect("serve_with_shutdown reported an error");
+
+    // The bound is what ended the wait: the request it was waiting on is
+    // still unanswered.
+    assert!(
+        !call.is_finished(),
+        "the parked request completed, so the drain was never actually blocked"
+    );
+
+    call.abort();
+    park.release();
+}
+
+/// A tool that does not return until the test releases it, so a request can
+/// be held in flight across a shutdown.
+struct ParkedTool {
+    started: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl ParkedTool {
+    fn new() -> Self {
+        Self {
+            started: std::sync::Arc::new(tokio::sync::Notify::new()),
+            release: std::sync::Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn router(&self) -> McpRouter {
+        let started = self.started.clone();
+        let release = self.release.clone();
+        let park = ToolBuilder::new("park")
+            .description("Blocks until the test releases it")
+            .handler(move |_input: serde_json::Value| {
+                let started = started.clone();
+                let release = release.clone();
+                async move {
+                    // notify_one stores a permit, so this cannot race the
+                    // test's own await.
+                    started.notify_one();
+                    release.notified().await;
+                    Ok(CallToolResult::text("released"))
+                }
+            })
+            .build();
+
+        McpRouter::new()
+            .server_info("unix-socket-test", "1.0.0")
+            .tool(park)
+    }
+
+    /// Resolves once the handler is running.
+    async fn started(&self) {
+        self.started.notified().await;
+    }
+
+    fn release(&self) {
+        self.release.notify_one();
+    }
 }
 
 /// `from_service` accepts a pre-built service, the same as `HttpTransport`.
