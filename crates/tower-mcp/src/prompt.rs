@@ -1196,9 +1196,7 @@ impl PromptHandler for ServiceContextHandler {
 ///
 /// ```rust
 /// use std::collections::HashMap;
-/// use tower_mcp::prompt::McpPrompt;
-/// use tower_mcp::protocol::{GetPromptResult, PromptArgument, PromptMessage, PromptRole, Content};
-/// use tower_mcp::error::Result;
+/// use tower_mcp::{Content, GetPromptResult, McpPrompt, PromptArgument, PromptMessage, PromptRole, Result};
 ///
 /// struct CodeReviewPrompt;
 ///

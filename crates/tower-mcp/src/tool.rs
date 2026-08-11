@@ -2370,8 +2370,7 @@ where
 /// # Example
 ///
 /// ```rust
-/// use tower_mcp::tool::McpTool;
-/// use tower_mcp::error::Result;
+/// use tower_mcp::{McpTool, Result};
 /// use schemars::JsonSchema;
 /// use serde::{Deserialize, Serialize};
 ///
