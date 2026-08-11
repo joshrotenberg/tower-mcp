@@ -15,9 +15,9 @@
 //! carries them that way, so a numeric argument is a string the handler
 //! parses. [`PromptBuilder::required_arg`] and [`PromptBuilder::optional_arg`]
 //! describe arguments to clients and nothing more: the router does not reject
-//! a `prompts/get` that omits a required argument, and a handler that assumes
-//! one is present is a handler that can be made to panic by a client. Read
-//! them with `get`, not by indexing.
+//! a `prompts/get` that omits a required argument, so a handler that indexes
+//! the map can be panicked by a client. Read arguments with `get` and supply
+//! a default.
 //!
 //! # Handler forms
 //!
