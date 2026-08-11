@@ -1,38 +1,59 @@
-//! Authentication middleware helpers for MCP servers
+//! Header-credential authentication for HTTP MCP servers.
 //!
-//! This module provides helper types and layers for common authentication patterns.
-//! Since tower-mcp is built on Tower, standard tower middleware can be used directly.
+//! These helpers cover the case where the credential is a shared secret the
+//! server can check against something it already holds: an API key, or a
+//! bearer token drawn from a fixed set. Write the check as a [`Validate`]
+//! implementation and install it with [`AuthLayer`].
 //!
-//! # Patterns
+//! For OAuth 2.1 resource-server behavior, reach for [`crate::oauth`] instead.
+//! It validates JWT signatures and audiences, enforces scopes, serves
+//! Protected Resource Metadata, and answers with the `WWW-Authenticate`
+//! challenge an OAuth client needs in order to recover. It also bridges the
+//! token's `sub` claim into the request extensions, which is what binds an
+//! async task to the principal that created it. Nothing in this module
+//! populates that claim, so on a server authenticated with an [`AuthLayer`]
+//! every task is unowned (see [`crate::async_task`]).
 //!
-//! ## API Key Authentication
+//! # Where the layer belongs
 //!
-//! ```rust,ignore
-//! // Requires the `http` feature
-//! use tower_mcp::auth::{AuthConfig, ApiKeyValidator};
-//! use tower_mcp::{McpRouter, HttpTransport};
-//! use std::sync::Arc;
+//! [`AuthLayer`] operates on the HTTP request, not on a decoded MCP request,
+//! so it wraps the transport rather than being installed inside it with
+//! [`HttpTransport::layer`]. A request with no acceptable credential is
+//! refused before its JSON-RPC body is parsed, so no handler ever runs for it,
+//! and the rejection costs nothing but the header read.
 //!
-//! // Simple in-memory API key validator
-//! let valid_keys = vec!["sk-test-key-123".to_string()];
-//! let validator = ApiKeyValidator::new(valid_keys);
+//! ```rust
+//! # #[tokio::main]
+//! # async fn main() {
+//! # #[cfg(feature = "http")]
+//! # {
+//! use tower_mcp::auth::{ApiKeyValidator, AuthLayer};
+//! use tower_mcp::transport::HttpTransport;
+//! use tower_mcp::McpRouter;
 //!
+//! let validator = ApiKeyValidator::new(["sk-live-1".to_string()]);
 //! let router = McpRouter::new().server_info("my-server", "1.0.0");
-//! let transport = HttpTransport::new(router);
 //!
-//! // The auth layer extracts the key from the Authorization header
-//! // and validates it using the provided validator
+//! // `into_router` hands back a plain axum router, so the auth layer goes on
+//! // the outside like any other HTTP middleware.
+//! let app = HttpTransport::new(router)
+//!     .into_router()
+//!     .layer(AuthLayer::new(validator));
+//! # let _ = app;
+//! # }
+//! # }
 //! ```
 //!
-//! ## Bearer Token Authentication
+//! # What a rejection looks like
 //!
-//! For OAuth2/JWT tokens, use the `BearerTokenValidator` trait to implement
-//! custom validation logic (e.g., JWT verification, token introspection).
+//! A missing credential and a rejected one both produce HTTP 401 carrying a
+//! JSON-RPC error body; only the message differs. The body's code is
+//! [`McpErrorCode::Forbidden`] (-32007) rather than the -32001 earlier
+//! versions used, because SEP-2243 reclaimed -32001 for `HeaderMismatch` and
+//! clients route on the code.
 //!
-//! ## Custom Authentication
-//!
-//! You can implement custom auth by creating a Tower layer. See the examples
-//! directory for a complete example.
+//! [`HttpTransport::layer`]: crate::transport::HttpTransport::layer
+//! [`McpErrorCode::Forbidden`]: crate::error::McpErrorCode::Forbidden
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -43,16 +64,28 @@ use tower::Layer;
 use tower::ServiceExt;
 
 /// Result of an authentication attempt
+///
+/// Returned by [`Validate::validate`] and consumed by [`AuthService`].
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum AuthResult {
-    /// Authentication succeeded with optional user/client info
+    /// Authentication succeeded with optional user/client info.
+    ///
+    /// The [`AuthInfo`], when present, is inserted into the request's
+    /// extensions for downstream services to read. `None` admits the request
+    /// without recording who sent it, which is worth avoiding on anything
+    /// that later wants to attribute an action.
     Authenticated(Option<AuthInfo>),
     /// Authentication failed with a reason
     Failed(AuthError),
 }
 
 /// Information about an authenticated client
+///
+/// [`AuthService`] inserts this into the HTTP request extensions, so an inner
+/// service reads it with `req.extensions().get::<AuthInfo>()`. It does not
+/// reach an MCP handler's [`RequestContext`](crate::context::RequestContext):
+/// only the OAuth path bridges a principal that far.
 #[derive(Debug, Clone)]
 pub struct AuthInfo {
     /// Client/user identifier
@@ -62,6 +95,11 @@ pub struct AuthInfo {
 }
 
 /// Authentication error
+///
+/// The `code` is for the server's own logs and metrics; it is not the
+/// JSON-RPC error code the client sees, which is always -32007. `message` is
+/// copied into the 401 body verbatim, so it should say what the caller can act
+/// on and nothing about why the check failed internally.
 #[derive(Debug, Clone)]
 pub struct AuthError {
     /// Error code (e.g., "invalid_token", "expired_token")
@@ -88,33 +126,67 @@ impl std::error::Error for AuthError {}
 /// with [`AuthLayer`] and [`AuthService`].
 ///
 /// The credential string passed to [`validate`](Validate::validate) is the
-/// value extracted from the configured request header after parsing
-/// (e.g., the token portion of `"Bearer sk-123"`).
+/// value extracted from the configured request header after parsing by
+/// [`extract_api_key`], so an implementation sees `sk-123` whether the header
+/// read `Bearer sk-123`, `ApiKey sk-123`, or `sk-123`.
+///
+/// The bound is `Clone + Send + Sync + 'static` because [`AuthService`] clones
+/// the validator for every request. Keep any shared state behind an [`Arc`],
+/// as [`ApiKeyValidator`] does, so cloning stays cheap.
 ///
 /// # Example
 ///
+/// A validator that looks the credential up in a store, and reports who the
+/// caller is so the inner service can attribute the request:
+///
 /// ```rust
-/// use tower_mcp::auth::{Validate, AuthResult, AuthInfo, AuthError};
+/// use std::collections::HashMap;
+/// use std::sync::Arc;
+///
+/// use tower_mcp::auth::{AuthError, AuthInfo, AuthResult, Validate};
 ///
 /// #[derive(Clone)]
-/// struct MyValidator;
+/// struct TenantKeys {
+///     // Cheap to clone: the map is shared, not copied, per request.
+///     keys: Arc<HashMap<String, String>>,
+/// }
 ///
-/// impl Validate for MyValidator {
+/// impl Validate for TenantKeys {
 ///     async fn validate(&self, credential: &str) -> AuthResult {
-///         if credential.starts_with("sk-") {
-///             AuthResult::Authenticated(Some(AuthInfo {
-///                 client_id: credential.to_string(),
+///         match self.keys.get(credential) {
+///             Some(tenant) => AuthResult::Authenticated(Some(AuthInfo {
+///                 client_id: tenant.clone(),
 ///                 claims: None,
-///             }))
-///         } else {
-///             AuthResult::Failed(AuthError {
-///                 code: "invalid_credential".to_string(),
-///                 message: "Credential must start with sk-".to_string(),
-///             })
+///             })),
+///             // The message is copied into the 401 body, so it says what to
+///             // do rather than which lookup missed.
+///             None => AuthResult::Failed(AuthError {
+///                 code: "invalid_api_key".to_string(),
+///                 message: "Unknown API key".to_string(),
+///             }),
 ///         }
 ///     }
 /// }
+///
+/// # #[tokio::main]
+/// # async fn main() {
+/// let validator = TenantKeys {
+///     keys: Arc::new(HashMap::from([("sk-live-1".to_string(), "acme".to_string())])),
+/// };
+///
+/// let AuthResult::Authenticated(Some(info)) = validator.validate("sk-live-1").await else {
+///     panic!("a known key authenticates");
+/// };
+/// assert_eq!(info.client_id, "acme");
+///
+/// assert!(matches!(
+///     validator.validate("sk-unknown").await,
+///     AuthResult::Failed(_)
+/// ));
+/// # }
 /// ```
+///
+/// [`Arc`]: std::sync::Arc
 pub trait Validate: Clone + Send + Sync + 'static {
     /// Validate a credential and return the authentication result.
     fn validate(&self, credential: &str) -> impl Future<Output = AuthResult> + Send;
@@ -126,10 +198,17 @@ pub trait Validate: Clone + Send + Sync + 'static {
 
 /// Simple in-memory API key validator
 ///
+/// The key set is fixed at construction and shared by every clone, which is
+/// what makes it cheap enough for [`AuthService`] to clone per request.
+///
 /// For production use, consider:
 /// - Database-backed validation
 /// - Caching with TTL
 /// - Rate limiting per key
+///
+/// The [`AuthInfo`] it reports names the caller as `api_key:` followed by the
+/// first eight characters of the key, so a log line identifies which key was
+/// used without recording the secret.
 #[derive(Debug, Clone)]
 pub struct ApiKeyValidator {
     valid_keys: Arc<HashSet<String>>,
@@ -144,6 +223,26 @@ impl ApiKeyValidator {
     }
 
     /// Add a key to the valid set
+    ///
+    /// The set is copy-on-write, so this affects only the validator it is
+    /// called on. A validator already handed to [`AuthLayer::new`] was cloned
+    /// into the layer, and the running service keeps serving the set it was
+    /// built with. Rotating keys on a live server therefore needs a validator
+    /// that reads shared mutable state, not this method.
+    ///
+    /// ```rust
+    /// use tower_mcp::auth::ApiKeyValidator;
+    ///
+    /// let installed = ApiKeyValidator::new(["sk-live-1".to_string()]);
+    /// let mut local = installed.clone();
+    /// local.add_key("sk-live-2".to_string());
+    ///
+    /// assert!(local.is_valid("sk-live-2"));
+    /// assert!(
+    ///     !installed.is_valid("sk-live-2"),
+    ///     "the clone diverged; the already-installed validator did not change"
+    /// );
+    /// ```
     pub fn add_key(&mut self, key: String) {
         Arc::make_mut(&mut self.valid_keys).insert(key);
     }
@@ -176,10 +275,18 @@ impl Validate for ApiKeyValidator {
 
 /// Simple bearer token validator that checks against a static set of tokens.
 ///
+/// An exact match against an in-memory set: it does not decode the token, so
+/// it cannot notice an expiry, an audience, or a scope. That makes it suitable
+/// for development, tests, and machine-to-machine links where the token is a
+/// shared secret you rotate by restarting.
+///
 /// For production, implement [`Validate`] with:
 /// - JWT verification using a signing key
 /// - OAuth2 token introspection
 /// - OIDC ID token validation
+///
+/// [`crate::oauth`] already does the first of those, including audience checks
+/// and the `WWW-Authenticate` challenge an OAuth client needs to recover.
 #[derive(Debug, Clone)]
 pub struct StaticBearerValidator {
     valid_tokens: Arc<HashSet<String>>,
@@ -220,6 +327,27 @@ impl Validate for StaticBearerValidator {
 /// - `Bearer <key>` (standard)
 /// - `ApiKey <key>`
 /// - `<key>` (raw key)
+///
+/// This is what [`AuthService`] applies to whichever header
+/// [`AuthLayer::header_name`] names, so a custom header accepts all three
+/// forms too.
+///
+/// Two consequences are easy to miss. Any value with no spaces is taken as a
+/// raw key, so a header carrying something that is not a credential at all is
+/// still handed to the validator to reject. And the scheme match is
+/// case-sensitive, so `bearer <key>` is not recognized: it has a space but no
+/// known prefix, which reads as no credential.
+///
+/// ```rust
+/// use tower_mcp::auth::extract_api_key;
+///
+/// assert_eq!(extract_api_key("Bearer sk-123"), Some("sk-123"));
+/// assert_eq!(extract_api_key("ApiKey sk-123"), Some("sk-123"));
+/// assert_eq!(extract_api_key("sk-123"), Some("sk-123"));
+///
+/// assert_eq!(extract_api_key("Basic dXNlcjpwYXNz"), None);
+/// assert_eq!(extract_api_key("bearer sk-123"), None);
+/// ```
 pub fn extract_api_key(auth_header: &str) -> Option<&str> {
     let auth_header = auth_header.trim();
 
@@ -236,6 +364,18 @@ pub fn extract_api_key(auth_header: &str) -> Option<&str> {
 }
 
 /// Extract a bearer token from an Authorization header
+///
+/// Stricter than [`extract_api_key`]: only the `Bearer ` form is accepted, and
+/// the scheme is matched case-sensitively. A bare value with no scheme is
+/// rejected rather than treated as a raw token.
+///
+/// ```rust
+/// use tower_mcp::auth::extract_bearer_token;
+///
+/// assert_eq!(extract_bearer_token("Bearer abc123"), Some("abc123"));
+/// assert_eq!(extract_bearer_token("abc123"), None);
+/// assert_eq!(extract_bearer_token("bearer abc123"), None);
+/// ```
 pub fn extract_bearer_token(auth_header: &str) -> Option<&str> {
     auth_header.trim().strip_prefix("Bearer ").map(|t| t.trim())
 }
@@ -246,8 +386,69 @@ pub fn extract_bearer_token(auth_header: &str) -> Option<&str> {
 
 /// A Tower layer that performs authentication using a provided validator
 ///
-/// This is a generic auth layer that can be used with any validator that
-/// implements the appropriate validation trait.
+/// Wraps an HTTP service with any [`Validate`] implementation: the credential
+/// is read from one header, checked, and either the request continues with an
+/// [`AuthInfo`] in its extensions or it is answered with 401 without reaching
+/// the inner service.
+///
+/// The layer itself imposes no bounds, so it can be constructed in any build.
+/// The [`Service`](tower_service::Service) implementation it produces exists
+/// only with the `http` feature, since that is what supplies the request and
+/// response types.
+///
+/// # Example
+///
+/// ```rust
+/// # #[tokio::main]
+/// # async fn main() {
+/// # #[cfg(feature = "http")]
+/// # {
+/// use axum::body::Body;
+/// use axum::http::{Request, StatusCode};
+/// use axum::response::Response;
+/// use tower::{Layer, ServiceExt};
+/// use tower_mcp::auth::{ApiKeyValidator, AuthInfo, AuthLayer};
+///
+/// // Stands in for the transport. It answers 200 only when the layer named
+/// // the caller, so the assertions below also prove the extension is set.
+/// let inner = tower::service_fn(|req: Request<Body>| async move {
+///     let status = match req.extensions().get::<AuthInfo>() {
+///         Some(_) => StatusCode::OK,
+///         None => StatusCode::INTERNAL_SERVER_ERROR,
+///     };
+///     Ok::<_, std::convert::Infallible>(
+///         Response::builder().status(status).body(Body::empty()).unwrap(),
+///     )
+/// });
+///
+/// let service = AuthLayer::new(ApiKeyValidator::new(["sk-live-1".to_string()])).layer(inner);
+///
+/// let no_credential = Request::builder().uri("/mcp").body(Body::empty()).unwrap();
+/// let response = service.clone().oneshot(no_credential).await.unwrap();
+/// assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+///
+/// let wrong_key = Request::builder()
+///     .uri("/mcp")
+///     .header("Authorization", "Bearer sk-not-issued")
+///     .body(Body::empty())
+///     .unwrap();
+/// let response = service.clone().oneshot(wrong_key).await.unwrap();
+/// assert_eq!(
+///     response.status(),
+///     StatusCode::UNAUTHORIZED,
+///     "a rejected credential is answered exactly like a missing one"
+/// );
+///
+/// let good_key = Request::builder()
+///     .uri("/mcp")
+///     .header("Authorization", "Bearer sk-live-1")
+///     .body(Body::empty())
+///     .unwrap();
+/// let response = service.oneshot(good_key).await.unwrap();
+/// assert_eq!(response.status(), StatusCode::OK);
+/// # }
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct AuthLayer<V> {
     validator: V,
@@ -266,6 +467,15 @@ impl<V> AuthLayer<V> {
     }
 
     /// Use a custom header name for the auth token
+    ///
+    /// Only where the credential is read from changes. The value is still
+    /// parsed by [`extract_api_key`], so `X-API-Key: sk-1` and
+    /// `X-API-Key: Bearer sk-1` are both accepted and both reach the validator
+    /// as `sk-1`.
+    ///
+    /// The named header becomes the only one consulted: an `Authorization`
+    /// header alongside it is ignored, and a request carrying only
+    /// `Authorization` is refused as though it carried no credential at all.
     pub fn header_name(mut self, name: impl Into<String>) -> Self {
         self.header_name = name.into();
         self
@@ -286,24 +496,23 @@ impl<S, V: Clone> Layer<S> for AuthLayer<V> {
 
 /// Tower service that performs authentication on incoming requests.
 ///
-/// Created by [`AuthLayer`]. Extracts credentials from the configured HTTP
-/// header, validates them using the provided [`Validate`] implementation,
-/// and either forwards the request (injecting [`AuthInfo`] into request
-/// extensions) or returns an HTTP 401 response.
+/// Created by [`AuthLayer`], which carries the worked example. Extracts the
+/// credential from the configured HTTP header with [`extract_api_key`],
+/// validates it with the provided [`Validate`] implementation, and either
+/// forwards the request or answers 401 without calling the inner service.
 ///
-/// # Example
+/// Three details are worth knowing before relying on it:
 ///
-/// ```rust,ignore
-/// // Requires the `http` feature
-/// use tower::ServiceBuilder;
-/// use tower_mcp::auth::{AuthLayer, ApiKeyValidator};
-///
-/// let validator = ApiKeyValidator::new(vec!["sk-test-key-123".to_string()]);
-///
-/// let service = ServiceBuilder::new()
-///     .layer(AuthLayer::new(validator))
-///     .service(inner_service);
-/// ```
+/// - A missing credential is refused without consulting the validator, so a
+///   [`Validate`] implementation never sees an empty string and cannot choose
+///   to admit anonymous callers. Use [`AuthLayer`] only on routes that must be
+///   authenticated, and leave public routes outside it.
+/// - [`AuthResult::Authenticated(None)`](AuthResult::Authenticated) forwards
+///   the request with no [`AuthInfo`] in its extensions, so the inner service
+///   cannot tell it apart from an unauthenticated one it never sees.
+/// - `poll_ready` delegates to the inner service, so backpressure is the inner
+///   service's, unchanged. Validation itself runs in the returned future, not
+///   in `poll_ready`.
 #[derive(Clone)]
 #[cfg_attr(not(feature = "http"), allow(dead_code))]
 pub struct AuthService<S, V> {
@@ -395,7 +604,38 @@ fn unauthorized_response(message: &str) -> axum::response::Response {
 // Helper for building auth middleware
 // =============================================================================
 
-/// Builder for creating auth middleware configurations
+/// Auth policy an application applies itself.
+///
+/// A container for the three settings an HTTP server usually needs to decide
+/// before it authenticates anything. Nothing in this crate reads it:
+/// [`AuthLayer`] takes its header name directly and authenticates every
+/// request it wraps, so routing public paths around it, or honoring
+/// `allow_anonymous`, is the application's own dispatch.
+///
+/// [`OAuthLayer::public_path`] is the enforced equivalent for servers on the
+/// OAuth path.
+///
+/// # Example
+///
+/// ```rust
+/// use tower_mcp::auth::AuthConfig;
+///
+/// let config = AuthConfig::new()
+///     .public_path("/health")
+///     .header_name("X-API-Key");
+///
+/// assert!(config.is_public("/health"));
+/// // Matching is by prefix, so everything under a public path is public too.
+/// assert!(config.is_public("/health/ready"));
+/// assert!(!config.is_public("/mcp"));
+///
+/// // Prefix matching does not stop at a path segment: a neighboring route
+/// // that merely starts with the same text is public as well. Name paths
+/// // that would be unsafe to expose so that no prefix of them is listed.
+/// assert!(config.is_public("/healthz-internal"));
+/// ```
+///
+/// [`OAuthLayer::public_path`]: crate::oauth::OAuthLayer::public_path
 #[derive(Clone)]
 pub struct AuthConfig {
     /// Whether to allow unauthenticated requests to pass through
@@ -429,18 +669,26 @@ impl AuthConfig {
     }
 
     /// Add paths that don't require authentication
+    ///
+    /// Read back with [`is_public`](Self::is_public), which matches by prefix.
     pub fn public_path(mut self, path: impl Into<String>) -> Self {
         self.public_paths.push(path.into());
         self
     }
 
     /// Set the header name for auth tokens
+    ///
+    /// Recording the choice here does not apply it. The layer reads whichever
+    /// header [`AuthLayer::header_name`] names.
     pub fn header_name(mut self, name: impl Into<String>) -> Self {
         self.header_name = name.into();
         self
     }
 
     /// Check if a path is public (doesn't require auth)
+    ///
+    /// True when the path starts with any registered prefix. See the type
+    /// documentation for what that includes and does not.
     pub fn is_public(&self, path: &str) -> bool {
         self.public_paths.iter().any(|p| path.starts_with(p))
     }

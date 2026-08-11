@@ -13,18 +13,129 @@
 //! be plugged in so `tasks/get` works on any instance behind a load balancer
 //! in the sessionless 2026-07-28 flows (SEP-2663).
 //!
-//! # Example
+//! Nothing here is advertised until a server asks for it:
+//! [`McpRouter::with_tasks`](crate::McpRouter::with_tasks) is the runtime
+//! opt-in, and a client that did not declare the extension keeps receiving
+//! ordinary synchronous results. See `examples/tasks.rs` for a runnable
+//! server.
 //!
-//! ```rust,no_run
-//! use std::sync::Arc;
+//! # Lifecycle
+//!
+//! A task exists independently of the request that created it. The
+//! `tools/call` response carries the task in place of the tool's result, and
+//! every later operation names the task by its ID rather than by connection or
+//! session. That is what lets a task outlive its transport, and what makes an
+//! external store the requirement for more than one server instance.
+//!
+//! | Status | Reached by | Terminal |
+//! |----------------|--------------------------------------------------------|-----|
+//! | `working`      | creation, and again once every input request is answered | no  |
+//! | `input_required` | [`TaskStore::require_input`]                          | no  |
+//! | `completed`    | [`TaskStore::complete_task`]                            | yes |
+//! | `failed`       | [`TaskStore::fail_task`]                                | yes |
+//! | `cancelled`    | [`TaskStore::cancel_task`]                              | yes |
+//!
+//! Terminal states are immutable. A transition method answers `Ok(false)`
+//! rather than an error when the task is already terminal, unknown, or
+//! expired, so a handler finishing just after a cancellation is dropped
+//! instead of overwriting the recorded outcome.
+//!
+//! Which terminal state a finished tool call reaches is the distinction to get
+//! right:
+//!
+//! - A [`CallToolResult`] with `is_error: true` **completes** the task. The
+//!   tool ran and reported a domain error, which is an answer the caller asked
+//!   for, and `tasks/get` returns it in the result field exactly as the
+//!   synchronous call would have. SEP-2663 keeps that separate from failure.
+//! - `failed` carries a [`JsonRpcError`] and no result, meaning the call never
+//!   produced one. The router uses it when the task machinery itself gives
+//!   out: a park that cannot take, a store that cannot resume, a tool
+//!   deregistered while its task waited.
+//!
+//! A tool handler returning `Err` lands in the first category, not the second:
+//! the router converts it to an `is_error` result, so the task completes. A
+//! server that wants a `failed` task drives [`TaskStore::fail_task`] itself.
+//!
+//! `ttlMs` runs from creation rather than from the terminal transition, so a
+//! task can expire while still working. Past that point every read returns
+//! `None` and every transition returns `Ok(false)`, whether or not the entry
+//! has been reclaimed: an expired task is indistinguishable from one that
+//! never existed.
+//!
+//! ```rust
+//! use tower_mcp::CallToolResult;
 //! use tower_mcp::async_task::{MemoryTaskStore, TaskStore};
-//! use tower_mcp::McpRouter;
+//! use tower_mcp::protocol::TaskStatus;
 //!
-//! let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
-//! let router = McpRouter::new().task_store(store);
+//! # #[tokio::main]
+//! # async fn main() {
+//! let store = MemoryTaskStore::new();
+//! let (id, _cancel) = store
+//!     .create_task("build_report", serde_json::json!({"rows": 10}), None, None)
+//!     .await
+//!     .unwrap();
+//!
+//! assert_eq!(
+//!     store.get_task(&id).await.unwrap().unwrap().status,
+//!     TaskStatus::Working
+//! );
+//!
+//! assert!(
+//!     store
+//!         .complete_task(&id, CallToolResult::text("report ready"))
+//!         .await
+//!         .unwrap()
+//! );
+//!
+//! let (task, result, error) = store.get_task_result(&id).await.unwrap().unwrap();
+//! assert_eq!(task.status, TaskStatus::Completed);
+//! assert_eq!(result.unwrap().all_text(), "report ready");
+//! assert!(error.is_none());
+//!
+//! // Terminal is final: a late transition is reported as not applied rather
+//! // than rewriting the outcome a client may already have read.
+//! assert!(
+//!     !store
+//!         .complete_task(&id, CallToolResult::text("stale"))
+//!         .await
+//!         .unwrap()
+//! );
+//! # }
 //! ```
 //!
-//! See `examples/tasks.rs` for a runnable server.
+//! # Waiting on the client
+//!
+//! A tool handler that needs something from the client returns an
+//! input-required outcome instead of a result. The router parks the task by
+//! calling [`TaskStore::require_input`] with the keyed requests, and the task
+//! sits in `input_required` until the client answers with `tasks/update`.
+//!
+//! The client answers the *task*, not the original call, so there is no
+//! `tools/call` for it to retry and the server performs the retry itself. Once
+//! [`TaskStore::apply_input_responses`] reports nothing outstanding, the router
+//! reads [`TaskStore::resume_context`] and invokes the handler again from the
+//! top, with the accumulated answers reaching it through the request context
+//! exactly as a client retry would have delivered them. A handler is free to
+//! ask again; each round parks and resumes the same way.
+//!
+//! [`TaskStore::resume_context`] has a default returning `None` so that stores
+//! written before resumption existed keep compiling. The router treats that as
+//! "this store cannot resume" and fails the task with a message saying so,
+//! rather than leaving it working forever (#1208).
+//!
+//! Two rules make the exchange safe to replay:
+//!
+//! - **A request key is unique over a task's lifetime.** Once answered or
+//!   superseded it is spent, and reissuing it is a
+//!   [`TaskStoreError::InvalidTransition`]. Reissuing a key that is still
+//!   outstanding, still naming the same question, is not reuse: `requests`
+//!   replaces the whole outstanding set, so carrying a key forward is how it
+//!   stays outstanding (#1246).
+//! - **Response keys that are not outstanding are ignored.** Unknown,
+//!   already-answered, and superseded keys land in
+//!   [`AppliedInputResponses::ignored`] instead of failing the update, so a
+//!   client replaying a stale `tasks/update` neither breaks the task nor
+//!   resumes it early.
 //!
 //! # Authorization
 //!
@@ -120,6 +231,12 @@ const DEFAULT_TTL_MS: u64 = 300_000;
 const DEFAULT_POLL_INTERVAL_MS: u64 = 2_000;
 
 /// Internal task representation with full state
+///
+/// The record [`MemoryTaskStore`] keeps, exposed because its fields describe
+/// what a store has to track. There is no public constructor: tasks come from
+/// [`TaskStore::create_task`], and an external store is free to persist an
+/// entirely different shape as long as it answers the trait's methods the same
+/// way.
 #[derive(Debug)]
 pub struct Task {
     /// Unique task identifier
@@ -216,6 +333,11 @@ impl Task {
     }
 
     /// Convert to TaskObject for API responses
+    ///
+    /// The `result` and `error` fields are deliberately left empty. A task
+    /// object travels in status responses, where the payload is not wanted;
+    /// [`TaskStore::get_task_result`] is what pairs the object with whichever
+    /// of the two the task actually holds.
     pub fn to_task_object(&self) -> TaskObject {
         TaskObject {
             task_id: self.id.clone(),
@@ -290,6 +412,23 @@ pub type TaskOwner = Option<String>;
 /// open". An unowned task can only exist if it was created with no
 /// authenticated context, so a request that now carries a principal is a
 /// different security context and is refused.
+///
+/// ```rust
+/// use tower_mcp::async_task::owner_matches;
+///
+/// assert!(owner_matches(&None, None), "no authentication configured");
+/// assert!(owner_matches(&Some("alice".into()), Some("alice")));
+///
+/// assert!(!owner_matches(&Some("alice".into()), Some("bob")));
+/// assert!(
+///     !owner_matches(&Some("alice".into()), None),
+///     "dropping the token does not grant access"
+/// );
+/// assert!(
+///     !owner_matches(&None, Some("alice")),
+///     "a task created anonymously is unreachable once a token is presented"
+/// );
+/// ```
 pub fn owner_matches(owner: &TaskOwner, principal: Option<&str>) -> bool {
     owner.as_deref() == principal
 }
@@ -299,6 +438,9 @@ pub fn owner_matches(owner: &TaskOwner, principal: Option<&str>) -> bool {
 /// SEP-2663 requires partial responses to be honored: keys that match an
 /// outstanding request are consumed, everything else is ignored rather than
 /// rejected, and any request left unanswered stays outstanding.
+///
+/// Returned by [`TaskStore::apply_input_responses`], which carries the worked
+/// example.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AppliedInputResponses {
     /// Keys matched to an outstanding request and consumed.
@@ -315,6 +457,10 @@ pub struct AppliedInputResponses {
 /// The client answers a task through `tasks/update`, not by retrying
 /// `tools/call`, so the server re-invokes the handler itself and must supply
 /// what the client would otherwise have resent.
+///
+/// The handler runs from the top rather than continuing where it stopped, so
+/// the arguments are the original ones, unmodified, and `input_responses`
+/// accumulates across every round rather than holding only the latest answer.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct TaskResumeContext {
@@ -334,6 +480,11 @@ impl AppliedInputResponses {
 }
 
 /// A shareable cancellation token for task management
+///
+/// Handed back by [`TaskStore::create_task`] and raised by
+/// [`TaskStore::cancel_task`]. It is cooperative: setting it does not
+/// interrupt anything, so long-running work has to check it between steps to
+/// notice. Every clone observes the same flag, and it is never lowered again.
 #[derive(Debug, Clone)]
 pub struct CancellationToken {
     cancelled: Arc<AtomicBool>,
@@ -433,6 +584,137 @@ pub type TaskSnapshot = (TaskObject, Option<CallToolResult>, Option<JsonRpcError
 ///   reaches a terminal state; how an implementation waits (notification,
 ///   polling, pub/sub) is an implementation detail and must not leak into the
 ///   trait.
+///
+/// # Implementing this trait
+///
+/// Three methods carry defaults so that stores written before the features
+/// existed keep compiling: [`set_task_meta`](Self::set_task_meta),
+/// [`discard_task`](Self::discard_task), and
+/// [`resume_context`](Self::resume_context). Each default reports "not
+/// supported" rather than quietly succeeding, and the router turns that into a
+/// visible failure. A store that supports input requests must therefore
+/// override `resume_context`, or its first `tasks/update` fails the task.
+///
+/// That also makes wrapping another store a trap worth naming. A decorator
+/// that implements only the required methods inherits the defaults, which
+/// silently disables resumption for the store it wraps even though the wrapped
+/// store supports it. Forward every method, including the defaulted ones:
+///
+/// ```rust
+/// use std::sync::Arc;
+/// use std::sync::atomic::{AtomicUsize, Ordering};
+///
+/// use async_trait::async_trait;
+/// use tower_mcp::CallToolResult;
+/// use tower_mcp::async_task::{
+///     AppliedInputResponses, CancellationToken, MemoryTaskStore, Result, TaskOwner,
+///     TaskResumeContext, TaskSnapshot, TaskStore,
+/// };
+/// use tower_mcp::error::JsonRpcError;
+/// use tower_mcp::protocol::{InputRequests, InputResponses, TaskObject, TaskStatus};
+///
+/// /// Counts the completions it actually applied, and delegates the rest.
+/// struct CountingStore {
+///     inner: MemoryTaskStore,
+///     completed: Arc<AtomicUsize>,
+/// }
+///
+/// #[async_trait]
+/// impl TaskStore for CountingStore {
+///     async fn complete_task(&self, id: &str, result: CallToolResult) -> Result<bool> {
+///         let applied = self.inner.complete_task(id, result).await?;
+///         // `false` means the task was already terminal, expired, or gone,
+///         // so counting it would inflate the number of finished tasks.
+///         if applied {
+///             self.completed.fetch_add(1, Ordering::Relaxed);
+///         }
+///         Ok(applied)
+///     }
+///
+///     // Required methods, forwarded unchanged.
+///     async fn create_task(
+///         &self,
+///         tool_name: &str,
+///         arguments: serde_json::Value,
+///         ttl: Option<u64>,
+///         owner: TaskOwner,
+///     ) -> Result<(String, CancellationToken)> {
+///         self.inner.create_task(tool_name, arguments, ttl, owner).await
+///     }
+///     async fn task_owner(&self, id: &str) -> Result<Option<TaskOwner>> {
+///         self.inner.task_owner(id).await
+///     }
+///     async fn get_task(&self, id: &str) -> Result<Option<TaskObject>> {
+///         self.inner.get_task(id).await
+///     }
+///     async fn get_task_result(&self, id: &str) -> Result<Option<TaskSnapshot>> {
+///         self.inner.get_task_result(id).await
+///     }
+///     async fn wait_for_completion(&self, id: &str) -> Result<Option<TaskSnapshot>> {
+///         self.inner.wait_for_completion(id).await
+///     }
+///     async fn list_tasks(&self, status: Option<TaskStatus>) -> Result<Vec<TaskObject>> {
+///         self.inner.list_tasks(status).await
+///     }
+///     async fn require_input(
+///         &self,
+///         id: &str,
+///         requests: InputRequests,
+///         message: Option<&str>,
+///     ) -> Result<bool> {
+///         self.inner.require_input(id, requests, message).await
+///     }
+///     async fn outstanding_input_requests(&self, id: &str) -> Result<Option<InputRequests>> {
+///         self.inner.outstanding_input_requests(id).await
+///     }
+///     async fn apply_input_responses(
+///         &self,
+///         id: &str,
+///         responses: InputResponses,
+///     ) -> Result<Option<AppliedInputResponses>> {
+///         self.inner.apply_input_responses(id, responses).await
+///     }
+///     async fn set_ttl(&self, id: &str, ttl_ms: u64) -> Result<bool> {
+///         self.inner.set_ttl(id, ttl_ms).await
+///     }
+///     async fn fail_task(&self, id: &str, error: JsonRpcError) -> Result<bool> {
+///         self.inner.fail_task(id, error).await
+///     }
+///     async fn cancel_task(&self, id: &str, reason: Option<&str>) -> Result<Option<TaskObject>> {
+///         self.inner.cancel_task(id, reason).await
+///     }
+///
+///     // Defaulted methods. Omitting these would leave the wrapper reporting
+///     // "not supported" for a store that supports them.
+///     async fn resume_context(&self, id: &str) -> Result<Option<TaskResumeContext>> {
+///         self.inner.resume_context(id).await
+///     }
+///     async fn set_task_meta(&self, id: &str, meta: serde_json::Value) -> Result<bool> {
+///         self.inner.set_task_meta(id, meta).await
+///     }
+///     async fn discard_task(&self, id: &str) -> Result<bool> {
+///         self.inner.discard_task(id).await
+///     }
+/// }
+///
+/// # #[tokio::main]
+/// # async fn main() {
+/// let completed = Arc::new(AtomicUsize::new(0));
+/// let store: Arc<dyn TaskStore> = Arc::new(CountingStore {
+///     inner: MemoryTaskStore::new(),
+///     completed: completed.clone(),
+/// });
+/// // Ready to hand to `McpRouter::task_store`.
+///
+/// let (id, _cancel) = store
+///     .create_task("build_report", serde_json::json!({}), None, None)
+///     .await
+///     .unwrap();
+/// assert!(store.complete_task(&id, CallToolResult::text("done")).await.unwrap());
+/// assert!(!store.complete_task(&id, CallToolResult::text("again")).await.unwrap());
+/// assert_eq!(completed.load(Ordering::Relaxed), 1);
+/// # }
+/// ```
 #[async_trait]
 pub trait TaskStore: Send + Sync + 'static {
     /// Create and store a new task owned by `owner`.
@@ -526,6 +808,64 @@ pub trait TaskStore: Send + Sync + 'static {
     /// before this rule existed keep compiling and keep their old permissive
     /// behaviour, so this is a behavioural migration rather than a
     /// compile-visible one.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::async_task::{MemoryTaskStore, TaskStore, TaskStoreError};
+    /// use tower_mcp::protocol::{InputRequest, InputRequests, ListRootsParams, TaskStatus};
+    ///
+    /// fn ask(keys: &[&str]) -> InputRequests {
+    ///     keys.iter()
+    ///         .map(|key| {
+    ///             (
+    ///                 key.to_string(),
+    ///                 InputRequest::ListRoots(ListRootsParams { meta: None }),
+    ///             )
+    ///         })
+    ///         .collect()
+    /// }
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let store = MemoryTaskStore::new();
+    /// let (id, _cancel) = store
+    ///     .create_task("deploy", serde_json::json!({}), None, None)
+    ///     .await
+    ///     .unwrap();
+    ///
+    /// assert!(
+    ///     store
+    ///         .require_input(&id, ask(&["approval"]), Some("needs a decision"))
+    ///         .await
+    ///         .unwrap()
+    /// );
+    /// let task = store.get_task(&id).await.unwrap().unwrap();
+    /// assert_eq!(task.status, TaskStatus::InputRequired);
+    /// assert_eq!(task.status_message.as_deref(), Some("needs a decision"));
+    ///
+    /// // Asking a second thing means reissuing the first: the snapshot is
+    /// // replaced wholesale, so a key left out becomes superseded.
+    /// assert!(
+    ///     store
+    ///         .require_input(&id, ask(&["approval", "region"]), None)
+    ///         .await
+    ///         .unwrap()
+    /// );
+    ///
+    /// // A spent key cannot come back. This one was superseded rather than
+    /// // answered; both count as spent.
+    /// store
+    ///     .require_input(&id, ask(&["region"]), None)
+    ///     .await
+    ///     .unwrap();
+    /// let error = store
+    ///     .require_input(&id, ask(&["approval"]), None)
+    ///     .await
+    ///     .expect_err("a spent key must not name a second question");
+    /// assert!(matches!(error, TaskStoreError::InvalidTransition(_)));
+    /// # }
+    /// ```
     async fn require_input(
         &self,
         task_id: &str,
@@ -546,6 +886,100 @@ pub trait TaskStore: Send + Sync + 'static {
     /// [`TaskStatus::Working`].
     ///
     /// Returns `None` if the task is unknown, expired, or already terminal.
+    ///
+    /// Ignoring is deliberate rather than lenient parsing. A key that was
+    /// never issued, one already answered, and one superseded by a later
+    /// request are indistinguishable to a client that is retrying, and
+    /// rejecting the whole update would fail a task over a duplicate delivery.
+    /// They are reported in [`AppliedInputResponses::ignored`] so a server can
+    /// still notice.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::async_task::{MemoryTaskStore, TaskStore};
+    /// use tower_mcp::protocol::{
+    ///     ElicitAction, ElicitResult, InputRequest, InputRequests, InputResponse,
+    ///     ListRootsParams, TaskStatus,
+    /// };
+    ///
+    /// fn ask(keys: &[&str]) -> InputRequests {
+    ///     keys.iter()
+    ///         .map(|key| {
+    ///             (
+    ///                 key.to_string(),
+    ///                 InputRequest::ListRoots(ListRootsParams { meta: None }),
+    ///             )
+    ///         })
+    ///         .collect()
+    /// }
+    ///
+    /// fn accept(key: &str) -> (String, InputResponse) {
+    ///     (
+    ///         key.to_string(),
+    ///         InputResponse::Elicit(ElicitResult {
+    ///             action: ElicitAction::Accept,
+    ///             content: None,
+    ///             meta: None,
+    ///         }),
+    ///     )
+    /// }
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let store = MemoryTaskStore::new();
+    /// let (id, _cancel) = store
+    ///     .create_task("deploy", serde_json::json!({}), None, None)
+    ///     .await
+    ///     .unwrap();
+    /// store
+    ///     .require_input(&id, ask(&["approval", "region"]), None)
+    ///     .await
+    ///     .unwrap();
+    ///
+    /// // A partial answer is valid, and leaves the task parked.
+    /// let applied = store
+    ///     .apply_input_responses(&id, [accept("approval")].into_iter().collect())
+    ///     .await
+    ///     .unwrap()
+    ///     .unwrap();
+    /// assert_eq!(applied.accepted, ["approval".to_string()].into());
+    /// assert_eq!(applied.still_outstanding, ["region".to_string()].into());
+    /// assert!(!applied.is_complete());
+    /// assert_eq!(
+    ///     store.get_task(&id).await.unwrap().unwrap().status,
+    ///     TaskStatus::InputRequired
+    /// );
+    ///
+    /// // A replayed answer, plus a key nobody asked for: both ignored, so the
+    /// // task is neither failed nor resumed early.
+    /// let applied = store
+    ///     .apply_input_responses(
+    ///         &id,
+    ///         [accept("approval"), accept("never-issued")].into_iter().collect(),
+    ///     )
+    ///     .await
+    ///     .unwrap()
+    ///     .unwrap();
+    /// assert!(applied.accepted.is_empty());
+    /// assert_eq!(
+    ///     applied.ignored,
+    ///     ["approval".to_string(), "never-issued".to_string()].into()
+    /// );
+    ///
+    /// // Answering the last outstanding request is what resumes the task.
+    /// let applied = store
+    ///     .apply_input_responses(&id, [accept("region")].into_iter().collect())
+    ///     .await
+    ///     .unwrap()
+    ///     .unwrap();
+    /// assert!(applied.is_complete());
+    /// assert_eq!(
+    ///     store.get_task(&id).await.unwrap().unwrap().status,
+    ///     TaskStatus::Working
+    /// );
+    /// # }
+    /// ```
     async fn apply_input_responses(
         &self,
         task_id: &str,
@@ -560,6 +994,69 @@ pub trait TaskStore: Send + Sync + 'static {
     /// forever. The default returns `None` so an external store written
     /// before resumption existed keeps compiling and fails loudly instead of
     /// hanging; implement it to support the flow (#1208).
+    ///
+    /// # Example
+    ///
+    /// The answers accumulate across rounds, because the handler is re-run
+    /// from the top and has to see everything it was told so far, not only the
+    /// most recent answer:
+    ///
+    /// ```rust
+    /// use tower_mcp::async_task::{MemoryTaskStore, TaskStore};
+    /// use tower_mcp::protocol::{
+    ///     ElicitAction, ElicitResult, InputRequest, InputRequests, InputResponse,
+    ///     ListRootsParams,
+    /// };
+    ///
+    /// # fn ask(keys: &[&str]) -> InputRequests {
+    /// #     keys.iter()
+    /// #         .map(|key| {
+    /// #             (
+    /// #                 key.to_string(),
+    /// #                 InputRequest::ListRoots(ListRootsParams { meta: None }),
+    /// #             )
+    /// #         })
+    /// #         .collect()
+    /// # }
+    /// # fn accept(key: &str) -> (String, InputResponse) {
+    /// #     (
+    /// #         key.to_string(),
+    /// #         InputResponse::Elicit(ElicitResult {
+    /// #             action: ElicitAction::Accept,
+    /// #             content: None,
+    /// #             meta: None,
+    /// #         }),
+    /// #     )
+    /// # }
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let store = MemoryTaskStore::new();
+    /// let (id, _cancel) = store
+    ///     .create_task("deploy", serde_json::json!({"service": "api"}), None, None)
+    ///     .await
+    ///     .unwrap();
+    ///
+    /// store.require_input(&id, ask(&["approval"]), None).await.unwrap();
+    /// store
+    ///     .apply_input_responses(&id, [accept("approval")].into_iter().collect())
+    ///     .await
+    ///     .unwrap();
+    /// store.require_input(&id, ask(&["region"]), None).await.unwrap();
+    /// store
+    ///     .apply_input_responses(&id, [accept("region")].into_iter().collect())
+    ///     .await
+    ///     .unwrap();
+    ///
+    /// let resume = store.resume_context(&id).await.unwrap().unwrap();
+    /// assert_eq!(resume.tool_name, "deploy");
+    /// assert_eq!(resume.arguments, serde_json::json!({"service": "api"}));
+    /// assert_eq!(
+    ///     resume.input_responses.keys().collect::<Vec<_>>(),
+    ///     vec!["approval", "region"],
+    ///     "an earlier round's answer is still there on the second resume"
+    /// );
+    /// # }
+    /// ```
     async fn resume_context(&self, task_id: &str) -> Result<Option<TaskResumeContext>> {
         let _ = task_id;
         Ok(None)
@@ -579,12 +1076,78 @@ pub trait TaskStore: Send + Sync + 'static {
     ///
     /// Returns `Ok(false)` if the task is unknown, expired, or already
     /// terminal.
+    ///
+    /// # Example
+    ///
+    /// A tool that ran and reported a problem is a completed task, and the
+    /// error result is what `tasks/get` hands back:
+    ///
+    /// ```rust
+    /// use tower_mcp::CallToolResult;
+    /// use tower_mcp::async_task::{MemoryTaskStore, TaskStore};
+    /// use tower_mcp::protocol::TaskStatus;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let store = MemoryTaskStore::new();
+    /// let (id, _cancel) = store
+    ///     .create_task("deploy", serde_json::json!({}), None, None)
+    ///     .await
+    ///     .unwrap();
+    ///
+    /// let mut result = CallToolResult::text("region eu-west-3 is not enabled");
+    /// result.is_error = true;
+    /// assert!(store.complete_task(&id, result).await.unwrap());
+    ///
+    /// let (task, result, error) = store.get_task_result(&id).await.unwrap().unwrap();
+    /// assert_eq!(task.status, TaskStatus::Completed);
+    /// assert!(result.unwrap().is_error);
+    /// assert!(error.is_none(), "isError is a result, not a JSON-RPC error");
+    /// # }
+    /// ```
     async fn complete_task(&self, task_id: &str, result: CallToolResult) -> Result<bool>;
 
     /// Mark a task as failed with a structured execution error.
     ///
     /// Returns `Ok(false)` if the task is unknown, expired, or already
     /// terminal.
+    ///
+    /// Reserved for a call that never produced a result at all. A tool that
+    /// ran and reported a problem completes instead, carrying an `isError`
+    /// result; see [`complete_task`](Self::complete_task).
+    ///
+    /// # Example
+    ///
+    /// The error is stored whole, not flattened to a message, because
+    /// SEP-2663 requires `tasks/get` on a failed task to return a JSON-RPC
+    /// error object:
+    ///
+    /// ```rust
+    /// use tower_mcp::async_task::{MemoryTaskStore, TaskStore};
+    /// use tower_mcp::error::JsonRpcError;
+    /// use tower_mcp::protocol::TaskStatus;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let store = MemoryTaskStore::new();
+    /// let (id, _cancel) = store
+    ///     .create_task("deploy", serde_json::json!({}), None, None)
+    ///     .await
+    ///     .unwrap();
+    ///
+    /// let mut error = JsonRpcError::invalid_params("unknown region");
+    /// error.data = Some(serde_json::json!({"field": "region"}));
+    /// assert!(store.fail_task(&id, error).await.unwrap());
+    ///
+    /// let (task, result, error) = store.get_task_result(&id).await.unwrap().unwrap();
+    /// assert_eq!(task.status, TaskStatus::Failed);
+    /// assert!(result.is_none());
+    ///
+    /// let error = error.unwrap();
+    /// assert_eq!(error.code, -32602);
+    /// assert_eq!(error.data.unwrap()["field"], "region");
+    /// # }
+    /// ```
     async fn fail_task(&self, task_id: &str, error: JsonRpcError) -> Result<bool>;
 
     /// Cancel a task.
@@ -592,6 +1155,44 @@ pub trait TaskStore: Send + Sync + 'static {
     /// Signals the task's [`CancellationToken`] and, if the task is not
     /// already terminal, marks it cancelled. Returns the updated task object,
     /// or `None` if the task is unknown.
+    ///
+    /// The token is raised even for a task that already finished, so work
+    /// still winding down behind a completed task is told to stop. That is
+    /// also why the returned object may read `completed` rather than
+    /// `cancelled`: the recorded outcome does not change, only the token.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::CallToolResult;
+    /// use tower_mcp::async_task::{MemoryTaskStore, TaskStore};
+    /// use tower_mcp::protocol::TaskStatus;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let store = MemoryTaskStore::new();
+    /// let (id, token) = store
+    ///     .create_task("deploy", serde_json::json!({}), None, None)
+    ///     .await
+    ///     .unwrap();
+    ///
+    /// // A handler polls the token between steps; cancellation is
+    /// // cooperative and interrupts nothing on its own.
+    /// assert!(!token.is_cancelled());
+    ///
+    /// let task = store.cancel_task(&id, Some("user closed the tab")).await.unwrap();
+    /// assert_eq!(task.unwrap().status, TaskStatus::Cancelled);
+    /// assert!(token.is_cancelled());
+    ///
+    /// // Cancelling again is harmless, and a late result is refused.
+    /// assert!(
+    ///     !store
+    ///         .complete_task(&id, CallToolResult::text("finished anyway"))
+    ///         .await
+    ///         .unwrap()
+    /// );
+    /// # }
+    /// ```
     async fn cancel_task(&self, task_id: &str, reason: Option<&str>) -> Result<Option<TaskObject>>;
 }
 
@@ -628,6 +1229,32 @@ impl MemoryTaskStore {
     ///
     /// Calling this is an optimization, not a correctness requirement: reads
     /// already treat an expired task as absent.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::async_task::{MemoryTaskStore, TaskStore};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let store = MemoryTaskStore::new();
+    /// // A one millisecond retention window, and no terminal state: the
+    /// // clock runs from creation, so the task retires while still working.
+    /// let (id, _cancel) = store
+    ///     .create_task("deploy", serde_json::json!({}), Some(1), None)
+    ///     .await
+    ///     .unwrap();
+    /// tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    ///
+    /// // Already invisible, before anything has been reclaimed.
+    /// assert!(store.get_task(&id).await.unwrap().is_none());
+    /// assert!(store.list_tasks(None).await.unwrap().is_empty());
+    ///
+    /// // Cleanup only frees the memory the entry was still holding.
+    /// assert_eq!(store.cleanup_expired(), 1);
+    /// assert_eq!(store.cleanup_expired(), 0);
+    /// # }
+    /// ```
     pub fn cleanup_expired(&self) -> usize {
         if let Ok(mut tasks) = self.tasks.write() {
             let before = tasks.len();
@@ -1003,6 +1630,18 @@ impl crate::McpRouter {
     /// `io.modelcontextprotocol/tasks`, elect to return tasks from ordinary
     /// `tools/call` requests, or serve the final task methods. Legacy
     /// 2025-11-25 task behavior is unaffected either way.
+    ///
+    /// Adding this cannot change what an existing client sees. Both peers must
+    /// declare the extension for it to be negotiated, so a client that did not
+    /// keeps receiving the synchronous result.
+    ///
+    /// ```rust
+    /// use tower_mcp::McpRouter;
+    ///
+    /// let router = McpRouter::new()
+    ///     .server_info("my-server", "1.0.0")
+    ///     .with_tasks();
+    /// ```
     pub fn with_tasks(self) -> Self {
         self.with_protocol_extension(tasks_extension())
     }

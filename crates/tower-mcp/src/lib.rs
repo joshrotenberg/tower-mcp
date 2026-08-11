@@ -192,6 +192,19 @@
 //! - [Examples index](https://github.com/joshrotenberg/tower-mcp/blob/main/examples/README.md) —
 //!   runnable server, client, transport, middleware, OAuth, and extension patterns.
 //!
+//! ## Module Overviews
+//!
+//! Several modules carry an overview of their own alongside the item docs:
+//!
+//! - [`client`]: connecting, choosing between the two session lifecycles, and
+//!   the common requests.
+//! - [`async_task`]: task lifecycle, the [`TaskStore`] contract, input
+//!   requests and resumption (SEP-2663).
+//! - [`auth`]: header-credential authentication for HTTP servers; see
+//!   [`oauth`] for OAuth 2.1 resource-server behavior.
+//! - [`transport::stdio`]: protocol lifecycles, request concurrency, and
+//!   server notifications over a line-delimited stream.
+//!
 //! ## Middleware Placement Guide
 //!
 //! tower-mcp supports Tower middleware at multiple levels. Choose based on scope:

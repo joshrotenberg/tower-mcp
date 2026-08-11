@@ -8,6 +8,23 @@
 //! See [`crate::guides::client`] for transport selection, lifecycle setup,
 //! callbacks, common requests, caching, retry policy, and shutdown guidance.
 //!
+//! # Opening a connection
+//!
+//! Connecting and starting a session are separate steps, because which session
+//! to start is a choice:
+//!
+//! 1. [`McpClient::connect`] (or [`McpClientBuilder::connect`]) takes the
+//!    transport and spawns the message loop. No MCP traffic has happened yet.
+//! 2. [`McpClient::initialize`] performs the 2025-11-25 handshake, or
+//!    [`McpClient::discover`] starts the sessionless 2026-07-28 lifecycle.
+//!    Every other request is refused until one of them has run.
+//!
+//! Which requests exist depends on that choice, and the difference is not
+//! cosmetic: 2026-07-28 removed `ping`, replaced `resources/subscribe` with
+//! [`McpClient::listen_subscriptions`], and made task creation the server's
+//! decision. The methods that changed say so, and
+//! [`crate::guides::protocol_versions`] covers the split.
+//!
 //! # Example
 //!
 //! ```rust,no_run
@@ -232,11 +249,20 @@ enum LoopCommand {
 
 /// An active `subscriptions/listen` request.
 ///
+/// Returned by [`McpClient::listen_subscriptions`], which is refused unless
+/// the 2026-07-28 lifecycle is active: this is what replaced
+/// `resources/subscribe` there.
+///
 /// The handle exposes the JSON-RPC request ID used as the subscription ID,
 /// the server's acknowledged filter, graceful server completion, and explicit
 /// cancellation. Dropping an active handle requests cancellation on a
 /// best-effort basis; callers that need confirmation should call
 /// [`cancel()`](Self::cancel).
+///
+/// The notifications themselves do not arrive through this handle. They reach
+/// the client's [`NotificationHandler`], tagged with the subscription ID, so a
+/// client that opens a stream without registering one receives nothing it can
+/// observe.
 #[must_use = "dropping the handle cancels the active subscription"]
 pub struct SubscriptionHandle {
     request_id: RequestId,
@@ -332,25 +358,58 @@ impl Drop for SubscriptionHandle {
 /// into a background Tokio task that handles message multiplexing.
 ///
 /// All public methods take `&self`, enabling concurrent use from multiple
-/// tasks.
+/// tasks. Responses are correlated by JSON-RPC id, so two tasks sharing one
+/// client do not queue behind each other and a slow tool call does not hold up
+/// a `tools/list` issued after it.
 ///
-/// # Construction
+/// # Ending the connection
 ///
-/// ```rust,no_run
-/// use tower_mcp::client::{McpClient, StdioClientTransport};
+/// [`shutdown()`](Self::shutdown) asks the loop to stop and waits for it.
+/// Dropping the client instead aborts the loop where it stands, so anything
+/// still in flight is abandoned and the transport closes without a parting
+/// message. Prefer `shutdown` wherever the server cares about a clean close.
 ///
-/// # async fn example() -> Result<(), tower_mcp::BoxError> {
-/// // Simple: no handler for server-initiated requests
-/// let transport = StdioClientTransport::spawn("server", &[]).await?;
-/// let client = McpClient::connect(transport).await?;
+/// # Example
 ///
-/// // With configuration
-/// use tower_mcp::protocol::Root;
-/// let transport = StdioClientTransport::spawn("server", &[]).await?;
-/// let client = McpClient::builder()
-///     .with_roots(vec![Root::new("file:///project")])
-///     .connect_simple(transport)
-///     .await?;
+/// [`ChannelTransport`] connects to a router in the same process, which is
+/// what makes this runnable here. Swap it for [`StdioClientTransport`] or
+/// `HttpClientTransport` and nothing else changes:
+///
+/// ```rust
+/// use tower_mcp::client::{ChannelTransport, McpClient};
+/// use tower_mcp::{CallToolResult, McpRouter, ToolBuilder};
+/// use schemars::JsonSchema;
+/// use serde::Deserialize;
+///
+/// #[derive(Debug, Deserialize, JsonSchema)]
+/// struct AddInput {
+///     a: i64,
+///     b: i64,
+/// }
+///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), tower_mcp::BoxError> {
+/// let add = ToolBuilder::new("add")
+///     .description("Add two numbers")
+///     .handler(|input: AddInput| async move {
+///         Ok(CallToolResult::text((input.a + input.b).to_string()))
+///     })
+///     .build();
+/// let server = McpRouter::new().server_info("calculator", "1.0.0").tool(add);
+///
+/// let client = McpClient::connect(ChannelTransport::new(server)).await?;
+///
+/// // Nothing else is permitted until the session is open.
+/// let server_info = client.initialize("my-client", "1.0.0").await?;
+/// assert_eq!(server_info.server_info.name, "calculator");
+///
+/// let tools = client.list_tools().await?;
+/// assert_eq!(tools.tools[0].name, "add");
+///
+/// let result = client.call_tool("add", serde_json::json!({"a": 2, "b": 3})).await?;
+/// assert_eq!(result.all_text(), "5");
+///
+/// client.shutdown().await?;
 /// # Ok(())
 /// # }
 /// ```
@@ -408,20 +467,39 @@ struct ClientSettings {
 
 /// Builder for configuring and connecting an [`McpClient`].
 ///
+/// Everything here is settled before the connection opens, because it is what
+/// the client declares about itself during the handshake. Declaring a
+/// capability is a promise to answer the matching server request, so pair
+/// [`with_sampling`](Self::with_sampling) and
+/// [`with_elicitation`](Self::with_elicitation) with a [`ClientHandler`] that
+/// implements them; a client that declares one and connects with
+/// [`connect_simple`](Self::connect_simple) advertises something it will
+/// refuse.
+///
 /// # Example
 ///
-/// ```rust,no_run
-/// use tower_mcp::client::{McpClient, StdioClientTransport};
+/// ```rust
+/// use tower_mcp::client::{ChannelTransport, McpClient};
 /// use tower_mcp::protocol::Root;
+/// use tower_mcp::McpRouter;
 ///
-/// # async fn example() -> Result<(), tower_mcp::BoxError> {
-/// let transport = StdioClientTransport::spawn("server", &[]).await?;
-/// let handler = (); // Use a real ClientHandler for bidirectional support
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), tower_mcp::BoxError> {
+/// # let transport = ChannelTransport::new(McpRouter::new().server_info("server", "1.0.0"));
+/// // A handler-free client: it declares roots, which it answers itself, but
+/// // nothing that needs a ClientHandler.
 /// let client = McpClient::builder()
 ///     .with_roots(vec![Root::new("file:///project")])
-///     .with_sampling()
-///     .connect(transport, handler)
+///     .connect_simple(transport)
 ///     .await?;
+///
+/// client.initialize("my-client", "1.0.0").await?;
+/// assert_eq!(client.roots().await.len(), 1);
+///
+/// // Roots stay editable, and the server is told when they change.
+/// client.add_root(Root::new("file:///scratch")).await?;
+/// assert_eq!(client.roots().await.len(), 2);
+/// # client.shutdown().await?;
 /// # Ok(())
 /// # }
 /// ```
@@ -562,6 +640,9 @@ impl McpClientBuilder {
     ///
     /// Spawns a background task to handle message I/O. The transport is
     /// consumed and owned by the background task.
+    ///
+    /// No MCP request has been sent when this returns. Call
+    /// [`McpClient::initialize`] or [`McpClient::discover`] next.
     pub async fn connect<T, H>(self, transport: T, handler: H) -> Result<McpClient>
     where
         T: ClientTransport,
@@ -585,6 +666,9 @@ impl McpClientBuilder {
     /// Connect to a server without a handler.
     ///
     /// All server-initiated requests will be rejected with `method_not_found`.
+    /// Two are answered by the loop itself and so still work: `ping`, and
+    /// `roots/list` whenever [`with_roots`](Self::with_roots) configured a
+    /// non-empty list.
     pub async fn connect_simple<T: ClientTransport>(self, transport: T) -> Result<McpClient> {
         self.connect(transport, ()).await
     }
@@ -739,8 +823,25 @@ impl McpClient {
 
     /// Initialize the MCP connection.
     ///
-    /// Sends the `initialize` request and `notifications/initialized` notification.
-    /// Must be called before any other operations.
+    /// Sends the `initialize` request and `notifications/initialized`
+    /// notification. Must be called before any other operations: everything
+    /// else refuses to run until this has succeeded.
+    ///
+    /// This is the 2025-11-25 handshake. It always offers
+    /// [`LATEST_PROTOCOL_VERSION`](crate::protocol::LATEST_PROTOCOL_VERSION)
+    /// and lets the server choose; the sessionless 2026-07-28 lifecycle is
+    /// [`discover`](Self::discover) instead, and the two are alternatives
+    /// rather than steps.
+    ///
+    /// A failure to deliver `notifications/initialized` fails the whole call,
+    /// even though the `initialize` request itself succeeded. The server
+    /// rejects every later request until that notification lands, so reporting
+    /// success here would leave a client that looks connected and works for
+    /// nothing.
+    ///
+    /// The name and version are recorded, so a transport that supports session
+    /// recovery can re-initialize with the same identity without the caller
+    /// repeating it.
     pub async fn initialize(
         &self,
         client_name: &str,
@@ -885,17 +986,87 @@ impl McpClient {
     }
 
     /// List available tools.
+    ///
+    /// One page. A server that paginates returns a `next_cursor`, and
+    /// ignoring it silently hides the rest of the catalogue, so prefer
+    /// [`list_all_tools`](Self::list_all_tools) unless the caller is driving
+    /// pagination itself with
+    /// [`list_tools_with_cursor`](Self::list_tools_with_cursor).
     pub async fn list_tools(&self) -> Result<ListToolsResult> {
         self.list_tools_with_cursor(None).await
     }
 
     /// Call a tool.
     ///
+    /// Returns the tool's result whatever route the server took to produce it.
+    /// If the server asks for input, the registered [`ClientHandler`] answers
+    /// and the call is retried, up to
+    /// [`max_mrtr_rounds`](McpClientBuilder::max_mrtr_rounds). If the server
+    /// elects to run the call as a task, the task is polled to completion and
+    /// its result returned here. Use
+    /// [`call_tool_once`](Self::call_tool_once) or
+    /// [`call_tool_once_task_aware`](Self::call_tool_once_task_aware) to drive
+    /// either of those yourself.
+    ///
+    /// A result carrying `is_error: true` is returned as `Ok`, not `Err`: the
+    /// tool ran and reported a domain error, which is an answer. `Err` is for
+    /// a call that produced no result at all.
+    ///
     /// On the final lifecycle, a header mismatch, method-not-found, or
     /// invalid-params response can indicate that the cached tool schema is
     /// stale. The client invalidates `tools/list`, refreshes it, and retries
     /// the rejected round once. These errors are raised before tool execution,
     /// so the bounded retry does not replay a completed side effect.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::client::{ChannelTransport, McpClient};
+    /// use tower_mcp::{CallToolResult, McpRouter, ToolBuilder};
+    /// use schemars::JsonSchema;
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Debug, Deserialize, JsonSchema)]
+    /// struct DivideInput {
+    ///     numerator: i64,
+    ///     denominator: i64,
+    /// }
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), tower_mcp::BoxError> {
+    /// let divide = ToolBuilder::new("divide")
+    ///     .description("Divide two integers")
+    ///     .handler(|input: DivideInput| async move {
+    ///         if input.denominator == 0 {
+    ///             return Ok(CallToolResult::error("cannot divide by zero"));
+    ///         }
+    ///         Ok(CallToolResult::text(
+    ///             (input.numerator / input.denominator).to_string(),
+    ///         ))
+    ///     })
+    ///     .build();
+    ///
+    /// let server = McpRouter::new().server_info("math", "1.0.0").tool(divide);
+    /// let client = McpClient::connect(ChannelTransport::new(server)).await?;
+    /// client.initialize("my-client", "1.0.0").await?;
+    ///
+    /// let result = client
+    ///     .call_tool("divide", serde_json::json!({"numerator": 9, "denominator": 3}))
+    ///     .await?;
+    /// assert!(!result.is_error);
+    /// assert_eq!(result.all_text(), "3");
+    ///
+    /// // The tool's own error is a successful call with an error result, so
+    /// // `?` does not short-circuit here.
+    /// let refused = client
+    ///     .call_tool("divide", serde_json::json!({"numerator": 9, "denominator": 0}))
+    ///     .await?;
+    /// assert!(refused.is_error);
+    /// assert_eq!(refused.all_text(), "cannot divide by zero");
+    /// # client.shutdown().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn call_tool(
         &self,
         name: &str,
@@ -1070,6 +1241,11 @@ impl McpClient {
     /// [`CallToolResult`] in its `result` field; for `failed` tasks the
     /// JSON-RPC error is in `error`. Unknown or expired task ids surface as
     /// an invalid-params error from the server.
+    ///
+    /// A denied task reads exactly like an unknown one, so an
+    /// invalid-params answer here does not distinguish "never existed",
+    /// "expired", and "belongs to someone else". [`crate::async_task`]
+    /// explains why the server refuses to tell them apart.
     pub async fn task_get(&self, task_id: &str) -> Result<TaskObject> {
         self.ensure_initialized()?;
         if self.uses_final_protocol().await {
@@ -1177,6 +1353,13 @@ impl McpClient {
     /// task purged after its TTL surfaces as the server's task-not-found
     /// error. Wrap in
     /// [`tokio::time::timeout`] to bound the overall wait.
+    ///
+    /// This loops on its own: there is no upper bound beyond the task's TTL,
+    /// and a task that keeps asking for input keeps the loop running. The
+    /// push alternative is a
+    /// [`listen_subscriptions`](Self::listen_subscriptions) stream naming the
+    /// task, where each `notifications/tasks` carries the whole task and a
+    /// completion arrives with its result already attached.
     pub async fn task_wait(&self, task_id: &str) -> Result<TaskObject> {
         if self.uses_final_protocol().await {
             let result = self.wait_for_final_task(task_id).await?;
@@ -1470,6 +1653,44 @@ impl McpClient {
     }
 
     /// List all tools, following pagination cursors until exhausted.
+    ///
+    /// The pages are separate requests, so a catalogue that changes while the
+    /// walk is in progress can yield a list that never existed at any single
+    /// moment. That is inherent to cursor pagination rather than something
+    /// this method could fix; a client that needs a consistent view should
+    /// re-list after `notifications/tools/list_changed`.
+    ///
+    /// ```rust
+    /// use tower_mcp::client::{ChannelTransport, McpClient};
+    /// use tower_mcp::{CallToolResult, McpRouter, ToolBuilder};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), tower_mcp::BoxError> {
+    /// let mut server = McpRouter::new()
+    ///     .server_info("many-tools", "1.0.0")
+    ///     // One tool per page, so the walk has to follow a cursor.
+    ///     .page_size(1);
+    /// for name in ["alpha", "beta", "gamma"] {
+    ///     server = server.tool(
+    ///         ToolBuilder::new(name)
+    ///             .description("A tool")
+    ///             .no_params_handler(|| async { Ok(CallToolResult::text("ok")) })
+    ///             .build(),
+    ///     );
+    /// }
+    ///
+    /// let client = McpClient::connect(ChannelTransport::new(server)).await?;
+    /// client.initialize("my-client", "1.0.0").await?;
+    ///
+    /// let page = client.list_tools().await?;
+    /// assert_eq!(page.tools.len(), 1);
+    /// assert!(page.next_cursor.is_some(), "there is more to fetch");
+    ///
+    /// assert_eq!(client.list_all_tools().await?.len(), 3);
+    /// # client.shutdown().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn list_all_tools(&self) -> Result<Vec<ToolDefinition>> {
         let mut all = Vec::new();
         let mut cursor = None;
@@ -1535,7 +1756,50 @@ impl McpClient {
     /// If the tool result indicates an error (`is_error` is true), returns
     /// an error with the text content as the message.
     ///
-    /// For more control over the result, use [`call_tool()`](Self::call_tool).
+    /// The convenience costs information in both directions. Non-text content
+    /// (images, embedded resources, structured output) is dropped rather than
+    /// rendered, and a tool's domain error arrives as `Err` here where
+    /// [`call_tool`](Self::call_tool) reports it as a result, which makes it
+    /// indistinguishable from a transport failure at the call site. Reach for
+    /// this when a tool is known to answer in plain text and the caller treats
+    /// any problem the same way.
+    ///
+    /// ```rust
+    /// use tower_mcp::client::{ChannelTransport, McpClient};
+    /// use tower_mcp::{CallToolResult, McpRouter, ToolBuilder};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), tower_mcp::BoxError> {
+    /// let motd = ToolBuilder::new("motd")
+    ///     .description("Message of the day")
+    ///     .no_params_handler(|| async { Ok(CallToolResult::text("be excellent")) })
+    ///     .build();
+    /// let refuse = ToolBuilder::new("refuse")
+    ///     .description("Always reports a domain error")
+    ///     .no_params_handler(|| async { Ok(CallToolResult::error("not today")) })
+    ///     .build();
+    ///
+    /// let server = McpRouter::new()
+    ///     .server_info("greeter", "1.0.0")
+    ///     .tool(motd)
+    ///     .tool(refuse);
+    /// let client = McpClient::connect(ChannelTransport::new(server)).await?;
+    /// client.initialize("my-client", "1.0.0").await?;
+    ///
+    /// assert_eq!(
+    ///     client.call_tool_text("motd", serde_json::json!({})).await?,
+    ///     "be excellent"
+    /// );
+    ///
+    /// let error = client
+    ///     .call_tool_text("refuse", serde_json::json!({}))
+    ///     .await
+    ///     .expect_err("an is_error result becomes an Err here");
+    /// assert!(error.to_string().contains("not today"));
+    /// # client.shutdown().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn call_tool_text(&self, name: &str, arguments: serde_json::Value) -> Result<String> {
         let result = self.call_tool(name, arguments).await?;
         if result.is_error {
@@ -1725,6 +1989,14 @@ impl McpClient {
     }
 
     /// Gracefully shut down the client and close the transport.
+    ///
+    /// Asks the message loop to stop and waits for it to finish, so the
+    /// transport closes in an orderly way and a subprocess server sees its
+    /// stdin end rather than a severed pipe.
+    ///
+    /// Dropping the client instead aborts the loop immediately. Any request
+    /// still awaiting a response is abandoned, which is fine for a process
+    /// that is exiting anyway and wrong for one that keeps running.
     pub async fn shutdown(mut self) -> Result<()> {
         let _ = self.command_tx.send(LoopCommand::Shutdown).await;
         if let Some(task) = self.task.take() {

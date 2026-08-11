@@ -20,7 +20,8 @@ continue with the [OAuth authorization guide](crate::guides::oauth).
 |---|---|---|---|
 | Your application launches a local MCP server | `StdioClientTransport` | none | The normal choice for CLI tools and editor-managed subprocesses. Keep protocol messages on stdout and server logs on stderr. |
 | Your application connects to a remote Streamable HTTP endpoint | `HttpClientTransport` | `http-client` | Supports JSON and SSE responses, legacy sessions and resumption, final-protocol headers, and pluggable authentication. |
-| You have an application-specific connection | implement `ClientTransport` | none | Useful for in-memory channels or a custom framing/connection layer. |
+| The server is an [`McpRouter`](crate::McpRouter) in the same process | [`ChannelTransport`](crate::client::ChannelTransport) | none | No sockets or subprocesses. Used for tests, and for a co-located client such as a REPL or editor integration. |
+| You have an application-specific connection | implement [`ClientTransport`](crate::client::ClientTransport) | none | Useful for a custom framing or connection layer. |
 
 tower-mcp does not currently provide a WebSocket client transport. The
 `websocket` feature is server-side.
