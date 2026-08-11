@@ -1856,6 +1856,21 @@ fn panic_message_recovers_both_payload_shapes() {
     assert_eq!(panic_message(&*odd), "panicked with a non-string payload");
 }
 
+#[test]
+fn panic_policy_debug_does_not_disclose_its_fixed_client_message() {
+    let debug = format!(
+        "{:?}",
+        PanicPolicy::redacted("private incident text")
+            .include_tool_name_in_client_message(true)
+            .include_tool_name_in_logs(true)
+            .include_payload_in_logs(true)
+    );
+    assert!(debug.contains("client_message: \"fixed\""), "{debug}");
+    assert!(debug.contains("client_tool_name: \"original\""), "{debug}");
+    assert!(debug.contains("log_tool_name: \"original\""), "{debug}");
+    assert!(!debug.contains("private incident text"), "{debug}");
+}
+
 /// #1208: the full task input round trip. The handler asks, the task
 /// parks in `input_required` carrying the requests, the client answers
 /// with `tasks/update`, the router re-invokes the handler with the
@@ -1987,6 +2002,126 @@ async fn a_task_resumes_after_its_input_is_answered() {
     }
     let completed = completed.expect("the task must complete after resuming");
     assert_eq!(completed.all_text(), "approved");
+}
+
+/// #1306: replay uses the root router's selected panic disclosure policy,
+/// just like an ordinary call. The existing replay contract still records a
+/// caught panic as a completed tool error rather than changing task semantics.
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn a_replayed_task_panic_uses_the_redacted_policy() {
+    use crate::async_task::{MemoryTaskStore, TaskStore};
+    use crate::protocol::{
+        ElicitFormParams, ElicitFormSchema, ElicitRequestParams, InputRequest, InputRequests,
+        InputRequiredResult, RequestOutcome,
+    };
+
+    const PAYLOAD: &str = "secret replay payload";
+    const SAFE_MESSAGE: &str = "internal tool failure";
+
+    let asks = ToolBuilder::new("private.replay")
+        .description("Panics after input")
+        .task_support(TaskSupportMode::Optional)
+        .mrtr_handler::<serde_json::Value, _, _>(|ctx, _input| async move {
+            if ctx.input_responses().is_some() {
+                panic!("{PAYLOAD}");
+            }
+            let mut requests: InputRequests = Default::default();
+            requests.insert(
+                "decision".to_string(),
+                InputRequest::Elicit(ElicitRequestParams::Form(ElicitFormParams {
+                    mode: None,
+                    message: "approve?".to_string(),
+                    requested_schema: ElicitFormSchema::new(),
+                    meta: None,
+                })),
+            );
+            Ok(RequestOutcome::input_required(
+                InputRequiredResult::with_requests(requests),
+            ))
+        })
+        .build();
+
+    let store = Arc::new(MemoryTaskStore::new());
+    let mut router = McpRouter::new()
+        .task_store(store.clone())
+        .tool(asks)
+        .with_tasks()
+        .catch_panics_with(PanicPolicy::redacted(SAFE_MESSAGE));
+    init_router(&mut router).await;
+
+    let created = router
+        .ready()
+        .await
+        .unwrap()
+        .call(RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::CallTool(CallToolParams {
+                input_responses: None,
+                request_state: None,
+                name: "private.replay".to_string(),
+                arguments: serde_json::json!({}),
+                meta: None,
+                task: None,
+            }),
+            extensions: tasks_client_extensions(),
+        })
+        .await
+        .unwrap();
+    let task_id = match created.inner {
+        Ok(McpResponse::FinalCreateTask(result)) => result.task.metadata.task_id,
+        other => panic!("expected a created task, got {other:?}"),
+    };
+
+    for _ in 0..50 {
+        let task = store.get_task(&task_id).await.unwrap().unwrap();
+        if task.status == TaskStatus::InputRequired {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        store.get_task(&task_id).await.unwrap().unwrap().status,
+        TaskStatus::InputRequired
+    );
+
+    let update = router
+        .ready()
+        .await
+        .unwrap()
+        .call(RouterRequest {
+            id: RequestId::Number(2),
+            inner: McpRequest::UpdateTask(UpdateTaskParams {
+                task_id: task_id.clone(),
+                input_responses: [(
+                    "decision".to_string(),
+                    serde_json::json!({"action": "accept"}),
+                )]
+                .into_iter()
+                .collect(),
+                meta: None,
+            }),
+            extensions: tasks_client_extensions(),
+        })
+        .await
+        .unwrap();
+    assert!(update.inner.is_ok(), "update must be acknowledged");
+
+    let mut completed = None;
+    for _ in 0..50 {
+        let (task, result, _) = store.get_task_result(&task_id).await.unwrap().unwrap();
+        if task.status == TaskStatus::Completed {
+            completed = result;
+            break;
+        }
+        assert_ne!(task.status, TaskStatus::Failed);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let completed = completed.expect("caught replay panic must complete as a tool error");
+    assert!(completed.is_error);
+    assert_eq!(completed.all_text(), SAFE_MESSAGE);
+    assert!(!completed.all_text().contains(PAYLOAD));
+    assert!(!completed.all_text().contains("private.replay"));
 }
 
 /// A store predating resumption cannot supply what a re-invocation needs,
