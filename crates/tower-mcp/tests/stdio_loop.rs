@@ -2104,3 +2104,168 @@ mod shutdown {
             .expect("join");
     }
 }
+
+// ============================================================================
+// Invalid UTF-8 on stdin (#1271)
+// ============================================================================
+//
+// A byte that will not decode is malformed input from the peer, the same
+// class as malformed JSON. #797 pinned that a parse error keeps the loop
+// alive; these pin the same contract one layer down, on every transport that
+// reads newline-delimited frames. Before the fix, `Lines::next_line` surfaced
+// `InvalidData`, the `?` on it ended `run_with_streams`, and the request
+// behind the bad byte was never answered.
+
+mod invalid_utf8 {
+    use super::*;
+    use tower_mcp::GenericStdioTransport;
+
+    /// Answered with a result on a fresh transport, no handshake needed.
+    const PING: &[u8] = br#"{"jsonrpc":"2.0","id":42,"method":"ping"}"#;
+
+    /// Write a frame that cannot be decoded, then a valid ping, and read both
+    /// answers back.
+    async fn answers_after_a_bad_byte<F, Fut>(run: F) -> Vec<serde_json::Value>
+    where
+        F: FnOnce(tokio::io::DuplexStream, tokio::io::DuplexStream) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (mut stdin_writer, server_stdin) = tokio::io::duplex(4096);
+        let (server_stdout, server_stdout_reader) = tokio::io::duplex(4096);
+        tokio::spawn(run(server_stdin, server_stdout));
+
+        stdin_writer.write_all(&[0xff, 0xfe, b'\n']).await.unwrap();
+        stdin_writer.write_all(PING).await.unwrap();
+        stdin_writer.write_all(b"\n").await.unwrap();
+        stdin_writer.flush().await.unwrap();
+        drop(stdin_writer);
+
+        timeout(
+            Duration::from_secs(5),
+            read_n_frames(BufReader::new(server_stdout_reader), 2),
+        )
+        .await
+        .expect("the transport must survive the bad byte and answer the ping")
+    }
+
+    /// The bad frame is answered with `-32700` and discarded; the frame
+    /// behind it is served normally.
+    fn assert_parse_error_then_ping(frames: &[serde_json::Value]) {
+        assert_eq!(
+            frames.len(),
+            2,
+            "expected a parse error and a ping answer, got: {frames:?}"
+        );
+        assert_jsonrpc_error_response(&frames[0]);
+        assert!(
+            frames[0]["id"].is_null(),
+            "a discarded frame has no recoverable id: {}",
+            frames[0]
+        );
+        assert_eq!(frames[0]["error"]["code"].as_i64().unwrap(), -32700);
+        assert_eq!(
+            frames[1]["id"], 42,
+            "the request after the bad byte must be served: {}",
+            frames[1]
+        );
+        assert!(
+            frames[1].get("result").is_some(),
+            "ping must return a successful result frame, got: {}",
+            frames[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn stdio_transport_answers_and_keeps_serving() {
+        let frames = answers_after_a_bad_byte(|stdin, stdout| async move {
+            let mut transport = StdioTransport::new(router());
+            let _ = transport.run_with_streams(stdin, stdout).await;
+        })
+        .await;
+        assert_parse_error_then_ping(&frames);
+    }
+
+    /// A layer converts the transport to the generic one, which reads on its
+    /// own `select!` arm.
+    #[tokio::test]
+    async fn a_layered_transport_answers_and_keeps_serving() {
+        let frames = answers_after_a_bad_byte(|stdin, stdout| async move {
+            let mut transport =
+                StdioTransport::new(router()).layer(tower::layer::util::Identity::new());
+            let _ = transport.run_with_streams(stdin, stdout).await;
+        })
+        .await;
+        assert_parse_error_then_ping(&frames);
+    }
+
+    /// The generic transport has a second `select!` shape for the case with
+    /// no outbound notification channel, and it reads on its own arm too.
+    #[tokio::test]
+    async fn a_generic_transport_without_notifications_answers_and_keeps_serving() {
+        let frames = answers_after_a_bad_byte(|stdin, stdout| async move {
+            let mut transport = GenericStdioTransport::new(router());
+            let _ = transport.run_with_streams(stdin, stdout).await;
+        })
+        .await;
+        assert_parse_error_then_ping(&frames);
+    }
+
+    #[tokio::test]
+    async fn bidi_transport_answers_and_keeps_serving() {
+        let frames = answers_after_a_bad_byte(|stdin, stdout| async move {
+            let mut transport = BidirectionalStdioTransport::new(router());
+            let _ = transport.run_with_streams(stdin, stdout).await;
+        })
+        .await;
+        assert_parse_error_then_ping(&frames);
+    }
+
+    /// Framing is done over bytes, so a multi-byte character split across two
+    /// reads is still one frame with one character in it, not two undecodable
+    /// halves. The id comes back verbatim, which is the proof.
+    #[tokio::test]
+    async fn a_multibyte_character_split_across_reads_still_decodes() {
+        let mut transport = StdioTransport::new(router());
+        let (mut stdin_writer, server_stdin) = tokio::io::duplex(4096);
+        let (server_stdout, server_stdout_reader) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            transport
+                .run_with_streams(server_stdin, server_stdout)
+                .await
+        });
+
+        let frame = "{\"jsonrpc\":\"2.0\",\"id\":\"caf\u{e9}\",\"method\":\"ping\"}\n";
+        // Between the two bytes of the `é`, so neither half decodes alone.
+        let split = frame.find('\u{e9}').expect("the frame carries the char") + 1;
+        stdin_writer
+            .write_all(&frame.as_bytes()[..split])
+            .await
+            .unwrap();
+        stdin_writer.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        stdin_writer
+            .write_all(&frame.as_bytes()[split..])
+            .await
+            .unwrap();
+        stdin_writer.flush().await.unwrap();
+        drop(stdin_writer);
+
+        let frames = timeout(
+            Duration::from_secs(5),
+            read_n_frames(BufReader::new(server_stdout_reader), 1),
+        )
+        .await
+        .expect("the split frame must be answered");
+        assert_eq!(frames.len(), 1, "expected one answer, got: {frames:?}");
+        assert_eq!(
+            frames[0]["id"], "caf\u{e9}",
+            "the character must survive the split: {}",
+            frames[0]
+        );
+        assert!(
+            frames[0].get("result").is_some(),
+            "ping must return a successful result frame, got: {}",
+            frames[0]
+        );
+    }
+}

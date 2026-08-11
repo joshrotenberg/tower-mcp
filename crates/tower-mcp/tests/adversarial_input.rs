@@ -5,7 +5,7 @@
 //! on the wire: duplicate ids, stale notifications, malformed envelopes,
 //! out-of-order lifecycle traffic, and handlers that misbehave.
 //!
-//! Six tests are `#[ignore]`d. Each one asserts the behaviour the code should
+//! Three tests are `#[ignore]`d. Each one asserts the behaviour the code should
 //! have and fails against the behaviour it has today; the attribute carries
 //! the reason. Run them with `cargo test --test adversarial_input -- --ignored`
 //! to reproduce every finding.
@@ -624,13 +624,8 @@ async fn a_batch_with_a_broken_member_still_answers() {
 /// A single byte that is not valid UTF-8 is malformed input from the peer,
 /// exactly like malformed JSON. It must not terminate the transport: #797
 /// established that a parse error keeps the loop alive, and the byte layer
-/// is the same contract one level down.
-///
-/// Today `lines.next_line()` surfaces `InvalidData` and the `?` on it ends
-/// `run_with_streams` with a transport error, so one byte from a client kills
-/// the server for every other request on that connection.
+/// is the same contract one level down (#1271).
 #[tokio::test]
-#[ignore = "BUG: one invalid UTF-8 byte on stdin terminates run_with_streams instead of producing a parse error"]
 async fn invalid_utf8_on_stdin_does_not_kill_the_transport() {
     let mut server = Server::with_router(base_router());
     server.initialize().await;

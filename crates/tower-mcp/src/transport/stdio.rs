@@ -468,6 +468,106 @@ fn clean_input_line(line: &str) -> &str {
     line.strip_prefix('\u{feff}').unwrap_or(line).trim()
 }
 
+/// One newline-delimited frame read from an input stream.
+///
+/// Framing happens over bytes, not over decoded text. `0x0A` cannot appear
+/// inside a multi-byte UTF-8 sequence, so the newline that ends a frame is
+/// unambiguous even when the bytes around it are not decodable, and input
+/// the decoder rejects costs exactly the frame it landed in.
+enum InputFrame {
+    /// A frame that decoded as UTF-8, taking the ordinary path from here.
+    Line(String),
+    /// A frame that is not valid UTF-8.
+    ///
+    /// The frame is discarded rather than repaired. A lossy decode would
+    /// hand the JSON parser text the peer never sent, so a stray byte inside
+    /// a string argument would be served as a request with silently altered
+    /// content. Discarding gives the peer the answer malformed JSON already
+    /// gets: a parse error, and a loop that keeps running (#797, #1271).
+    Undecodable,
+}
+
+/// The parse-error message for a frame whose bytes are not valid UTF-8.
+const UNDECODABLE_FRAME: &str = "invalid UTF-8 in input frame";
+
+/// Strip the delimiter from one raw frame and decode it.
+fn decode_input_frame(mut raw: Vec<u8>) -> InputFrame {
+    if raw.last() == Some(&b'\n') {
+        raw.pop();
+        if raw.last() == Some(&b'\r') {
+            raw.pop();
+        }
+    }
+    match String::from_utf8(raw) {
+        Ok(line) => InputFrame::Line(line),
+        Err(_) => InputFrame::Undecodable,
+    }
+}
+
+/// Build the `-32700` frame that answers an undecodable frame, logging the
+/// discard on the way through so every transport reports it identically.
+fn undecodable_frame_response() -> Result<String> {
+    tracing::warn!("{UNDECODABLE_FRAME}, discarding it");
+    serde_json::to_string(&parse_error_response(UNDECODABLE_FRAME))
+        .map_err(|e| Error::Transport(format!("Failed to serialize error: {}", e)))
+}
+
+/// Newline-delimited frame reader over an async byte stream.
+///
+/// This exists instead of [`tokio::io::Lines`] because `Lines` decodes before
+/// it frames: one byte that is not valid UTF-8 surfaces as `InvalidData`, and
+/// the read loops turn that into a transport error that ends the session for
+/// every other request on the connection (#1271).
+///
+/// Cancellation behaves the way `Lines::next_line` does, which the `select!`
+/// loops depend on: bytes read before a lost race stay in `buf`, and the next
+/// call continues the same frame rather than starting a new one.
+struct FrameReader<R> {
+    reader: BufReader<R>,
+    buf: Vec<u8>,
+}
+
+impl<R> FrameReader<R>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    fn new(reader: R) -> Self {
+        Self {
+            reader: BufReader::new(reader),
+            buf: Vec::new(),
+        }
+    }
+
+    /// Read the next frame, or `None` once the input is exhausted.
+    ///
+    /// Cancel-safe in the sense the type documents.
+    async fn next_frame(&mut self) -> Result<Option<InputFrame>> {
+        let read = self
+            .reader
+            .read_until(b'\n', &mut self.buf)
+            .await
+            .map_err(|e| Error::Transport(format!("Failed to read from stdin: {}", e)))?;
+        // Nothing read and nothing held back: end of input. Bytes still held
+        // are a final frame that arrived without its delimiter.
+        if read == 0 && self.buf.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(decode_input_frame(std::mem::take(&mut self.buf))))
+    }
+}
+
+/// Blocking counterpart of [`FrameReader::next_frame`], for the sync transport.
+fn read_frame_blocking<R: BufRead>(reader: &mut R) -> Result<Option<InputFrame>> {
+    let mut raw = Vec::new();
+    let read = reader
+        .read_until(b'\n', &mut raw)
+        .map_err(|e| Error::Transport(format!("Failed to read from stdin: {}", e)))?;
+    if read == 0 {
+        return Ok(None);
+    }
+    Ok(Some(decode_input_frame(raw)))
+}
+
 /// Build a JSON-RPC parse-error response from a parser/dispatch error message.
 ///
 /// Per JSON-RPC 2.0, a parse error sets `code` to `-32700` and `id` to
@@ -1059,11 +1159,11 @@ impl StdioTransport {
         R: tokio::io::AsyncRead + Unpin + Send,
         W: tokio::io::AsyncWrite + Unpin + Send,
     {
-        // Keep the line buffer across cancelled `select!` branches. Tokio's
-        // `read_line` future can discard a partial JSON frame when a
-        // notification or control message wins the race; `next_line` stores
-        // that partial frame in `Lines` until the following poll.
-        let mut lines = BufReader::new(reader).lines();
+        // Keep the frame buffer across cancelled `select!` branches. A bare
+        // `read_until` future can discard a partial JSON frame when a
+        // notification or control message wins the race; `FrameReader` holds
+        // that partial frame until the following poll.
+        let mut frames = FrameReader::new(reader);
         #[cfg(feature = "stateless")]
         let mut subscriptions = StdioSubscriptions {
             server_info: Some(self.router.implementation()),
@@ -1086,14 +1186,15 @@ impl StdioTransport {
         loop {
             tokio::select! {
                 // Handle incoming messages from stdin
-                result = lines.next_line() => {
-                    let line = result.map_err(|e| {
-                        Error::Transport(format!("Failed to read from stdin: {}", e))
-                    })?;
-                    let Some(line) = line else {
+                result = frames.next_frame() => {
+                    let Some(frame) = result? else {
                         // EOF
                         tracing::info!("Stdin closed, shutting down");
                         break;
+                    };
+                    let InputFrame::Line(line) = frame else {
+                        write_line_to_stdout(&mut writer, &undecodable_frame_response()?).await?;
+                        continue;
                     };
 
                     let trimmed = clean_input_line(&line);
@@ -1444,7 +1545,7 @@ where
         R: tokio::io::AsyncRead + Unpin + Send,
         W: tokio::io::AsyncWrite + Unpin + Send,
     {
-        let mut lines = BufReader::new(reader).lines();
+        let mut frames = FrameReader::new(reader);
         #[cfg(feature = "stateless")]
         let mut subscriptions =
             StdioSubscriptions::default().with_observer(self.subscription_observer.clone());
@@ -1465,13 +1566,17 @@ where
             // Use select! if we have a notification receiver, otherwise just read
             if let Some(ref mut notif_rx) = self.notification_rx {
                 tokio::select! {
-                    result = lines.next_line() => {
-                        let line = result.map_err(|e| {
-                            Error::Transport(format!("Failed to read from stdin: {}", e))
-                        })?;
-                        let Some(line) = line else {
+                    result = frames.next_frame() => {
+                        let Some(frame) = result? else {
                             tracing::info!("Stdin closed, shutting down");
                             break;
+                        };
+                        // Answered through `out_tx` like every other frame
+                        // this loop produces, so the read loop stays the
+                        // only writer.
+                        let InputFrame::Line(line) = frame else {
+                            let _ = out_tx.send(undecodable_frame_response()?);
+                            continue;
                         };
 
                         Self::process_input(
@@ -1518,13 +1623,14 @@ where
                 }
             } else {
                 tokio::select! {
-                    result = lines.next_line() => {
-                        let line = result.map_err(|e| {
-                            Error::Transport(format!("Failed to read from stdin: {}", e))
-                        })?;
-                        let Some(line) = line else {
+                    result = frames.next_frame() => {
+                        let Some(frame) = result? else {
                             tracing::info!("Stdin closed, shutting down");
                             break;
+                        };
+                        let InputFrame::Line(line) = frame else {
+                            let _ = out_tx.send(undecodable_frame_response()?);
+                            continue;
                         };
                         Self::process_input(
                             &mut self.service,
@@ -1795,13 +1901,24 @@ impl SyncStdioTransport {
             .map_err(|e| Error::Transport(format!("Failed to create runtime: {}", e)))?;
 
         let stdin = io::stdin();
+        let mut input = stdin.lock();
         let mut stdout = io::stdout();
 
         tracing::info!("Sync stdio transport started");
 
-        for line in stdin.lock().lines() {
-            let line =
-                line.map_err(|e| Error::Transport(format!("Failed to read from stdin: {}", e)))?;
+        while let Some(frame) = read_frame_blocking(&mut input)? {
+            let line = match frame {
+                InputFrame::Line(line) => line,
+                InputFrame::Undecodable => {
+                    let response_json = undecodable_frame_response()?;
+                    writeln!(stdout, "{}", response_json)
+                        .map_err(|e| Error::Transport(format!("Failed to write error: {}", e)))?;
+                    stdout
+                        .flush()
+                        .map_err(|e| Error::Transport(format!("Failed to flush stdout: {}", e)))?;
+                    continue;
+                }
+            };
 
             let trimmed = clean_input_line(&line);
             if trimmed.is_empty() {
@@ -2006,7 +2123,7 @@ impl BidirectionalStdioTransport {
         W: tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let writer = Arc::new(Mutex::new(writer));
-        let mut lines = BufReader::new(reader).lines();
+        let mut frames = FrameReader::new(reader);
         #[cfg(feature = "stateless")]
         let mut subscriptions = StdioSubscriptions {
             server_info: Some(self.router.implementation()),
@@ -2019,13 +2136,14 @@ impl BidirectionalStdioTransport {
         loop {
             tokio::select! {
                 // Handle incoming messages from stdin
-                result = lines.next_line() => {
-                    let line = result.map_err(|e| {
-                        Error::Transport(format!("Failed to read from stdin: {}", e))
-                    })?;
-                    let Some(line) = line else {
+                result = frames.next_frame() => {
+                    let Some(frame) = result? else {
                         tracing::info!("Stdin closed, shutting down");
                         break;
+                    };
+                    let InputFrame::Line(line) = frame else {
+                        self.write_line(&undecodable_frame_response()?, writer.clone()).await?;
+                        continue;
                     };
 
                     let trimmed = clean_input_line(&line);
@@ -2379,6 +2497,75 @@ mod tests {
             !s.contains('\n'),
             "serialized parse-error response must be single-line, got: {s:?}"
         );
+    }
+
+    // =========================================================================
+    // Frame reading -- byte framing survives input that will not decode
+    // (#1271). The blocking reader is covered here because
+    // `SyncStdioTransport::run_blocking` owns the real stdin and cannot be
+    // driven from a test.
+    // =========================================================================
+
+    /// Assert one frame decoded to exactly `expected`.
+    fn assert_line(frame: Option<InputFrame>, expected: &str) {
+        match frame {
+            Some(InputFrame::Line(line)) => assert_eq!(line, expected),
+            Some(InputFrame::Undecodable) => panic!("{expected:?} must decode"),
+            None => panic!("expected a frame, got end of input"),
+        }
+    }
+
+    /// Assert one frame was rejected by the decoder.
+    fn assert_undecodable(frame: Option<InputFrame>) {
+        assert!(
+            matches!(frame, Some(InputFrame::Undecodable)),
+            "expected an undecodable frame"
+        );
+    }
+
+    #[test]
+    fn decoding_strips_the_delimiter_in_both_line_endings() {
+        assert_line(Some(decode_input_frame(b"{}\n".to_vec())), "{}");
+        assert_line(Some(decode_input_frame(b"{}\r\n".to_vec())), "{}");
+        // A frame that arrived without its delimiter, at end of input.
+        assert_line(Some(decode_input_frame(b"{}".to_vec())), "{}");
+    }
+
+    #[test]
+    fn decoding_rejects_bytes_rather_than_repairing_them() {
+        // A lossy decode would turn this into a frame the peer never sent.
+        assert_undecodable(Some(decode_input_frame(vec![0xff, 0xfe, b'\n'])));
+    }
+
+    #[tokio::test]
+    async fn a_bad_frame_costs_only_itself() {
+        let input: &[u8] = b"\xff\xfe\n{\"id\":1}\n";
+        let mut frames = FrameReader::new(input);
+
+        assert_undecodable(frames.next_frame().await.unwrap());
+        assert_line(frames.next_frame().await.unwrap(), "{\"id\":1}");
+        assert!(
+            frames.next_frame().await.unwrap().is_none(),
+            "end of input must be reported once the frames are consumed"
+        );
+    }
+
+    #[test]
+    fn the_blocking_reader_treats_a_bad_frame_the_same_way() {
+        let mut input: &[u8] = b"\xff\xfe\n{\"id\":1}\n";
+
+        assert_undecodable(read_frame_blocking(&mut input).unwrap());
+        assert_line(read_frame_blocking(&mut input).unwrap(), "{\"id\":1}");
+        assert!(read_frame_blocking(&mut input).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_undecodable_frame_is_answered_with_a_parse_error() {
+        let json: serde_json::Value =
+            serde_json::from_str(&undecodable_frame_response().unwrap()).unwrap();
+        assert_jsonrpc_error_response(&json);
+        assert!(json["id"].is_null(), "nothing to correlate against: {json}");
+        assert_eq!(json["error"]["code"].as_i64().unwrap(), -32700);
     }
 
     // =========================================================================
