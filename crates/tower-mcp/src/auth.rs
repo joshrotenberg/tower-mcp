@@ -346,14 +346,37 @@ impl Validate for StaticBearerValidator {
 /// assert_eq!(extract_api_key("sk-123"), Some("sk-123"));
 ///
 /// assert_eq!(extract_api_key("Basic dXNlcjpwYXNz"), None);
-/// assert_eq!(extract_api_key("bearer sk-123"), None);
+///
+/// // RFC 7235 makes the scheme case-insensitive; the token is not.
+/// assert_eq!(extract_api_key("bearer sk-123"), Some("sk-123"));
+/// assert_eq!(extract_api_key("BEARER sk-123"), Some("sk-123"));
 /// ```
+/// Strip an auth scheme prefix, comparing the scheme case-insensitively.
+///
+/// RFC 7235 defines the scheme as a case-insensitive token, so `bearer`,
+/// `Bearer`, and `BEARER` are the same scheme. Comparing bytes directly keeps
+/// this allocation-free, and the token after the space is returned untouched
+/// because only the scheme is case-insensitive, never the credential (#1276).
+fn strip_scheme<'a>(header: &'a str, scheme: &str) -> Option<&'a str> {
+    let rest = header.get(..scheme.len())?;
+    if !rest.eq_ignore_ascii_case(scheme) {
+        return None;
+    }
+    let after = header.get(scheme.len()..)?;
+    // The scheme must be followed by whitespace, or `Bearerish` would match
+    // `Bearer`.
+    if !after.starts_with(' ') {
+        return None;
+    }
+    Some(after.trim_start())
+}
+
 pub fn extract_api_key(auth_header: &str) -> Option<&str> {
     let auth_header = auth_header.trim();
 
-    if let Some(key) = auth_header.strip_prefix("Bearer ") {
+    if let Some(key) = strip_scheme(auth_header, "Bearer") {
         Some(key.trim())
-    } else if let Some(key) = auth_header.strip_prefix("ApiKey ") {
+    } else if let Some(key) = strip_scheme(auth_header, "ApiKey") {
         Some(key.trim())
     } else if !auth_header.contains(' ') {
         // Raw key without prefix
@@ -365,19 +388,23 @@ pub fn extract_api_key(auth_header: &str) -> Option<&str> {
 
 /// Extract a bearer token from an Authorization header
 ///
-/// Stricter than [`extract_api_key`]: only the `Bearer ` form is accepted, and
-/// the scheme is matched case-sensitively. A bare value with no scheme is
-/// rejected rather than treated as a raw token.
+/// Stricter than [`extract_api_key`]: only the `Bearer` scheme is accepted,
+/// and a bare value with no scheme is rejected rather than treated as a raw
+/// token. The scheme itself is matched case-insensitively, as RFC 7235
+/// requires; the token is not.
 ///
 /// ```rust
 /// use tower_mcp::auth::extract_bearer_token;
 ///
 /// assert_eq!(extract_bearer_token("Bearer abc123"), Some("abc123"));
+/// assert_eq!(extract_bearer_token("bearer abc123"), Some("abc123"));
+///
+/// // A bare value is not a bearer token, and a longer scheme is not `Bearer`.
 /// assert_eq!(extract_bearer_token("abc123"), None);
-/// assert_eq!(extract_bearer_token("bearer abc123"), None);
+/// assert_eq!(extract_bearer_token("Bearerish abc123"), None);
 /// ```
 pub fn extract_bearer_token(auth_header: &str) -> Option<&str> {
-    auth_header.trim().strip_prefix("Bearer ").map(|t| t.trim())
+    strip_scheme(auth_header.trim(), "Bearer").map(|t| t.trim())
 }
 
 // =============================================================================
@@ -719,11 +746,38 @@ mod tests {
         assert_eq!(extract_api_key("Basic user:pass"), None);
     }
 
+    /// RFC 7235 defines the auth scheme as case-insensitive. This test used
+    /// to assert the opposite, which is what made a client sending
+    /// `authorization: bearer ...` get a 401 for no visible reason (#1276).
     #[test]
     fn test_extract_bearer_token() {
         assert_eq!(extract_bearer_token("Bearer abc123"), Some("abc123"));
-        assert_eq!(extract_bearer_token("bearer abc123"), None); // case sensitive
+        assert_eq!(extract_bearer_token("bearer abc123"), Some("abc123"));
+        assert_eq!(extract_bearer_token("BEARER abc123"), Some("abc123"));
+        assert_eq!(extract_bearer_token("BeArEr abc123"), Some("abc123"));
+
+        // The token itself is never case-folded.
+        assert_eq!(extract_bearer_token("Bearer AbC123"), Some("AbC123"));
+
+        // A bare value is still not a bearer token, and a scheme that merely
+        // starts with the right letters is not the right scheme.
         assert_eq!(extract_bearer_token("abc123"), None);
+        assert_eq!(extract_bearer_token("Bearerish abc123"), None);
+        assert_eq!(extract_bearer_token("Basic abc123"), None);
+    }
+
+    /// The same rule on the more permissive extractor, including its raw-key
+    /// fallback which must keep working.
+    #[test]
+    fn extract_api_key_matches_the_scheme_case_insensitively() {
+        for header in ["Bearer sk-1", "bearer sk-1", "BEARER sk-1"] {
+            assert_eq!(extract_api_key(header), Some("sk-1"), "for {header}");
+        }
+        for header in ["ApiKey sk-1", "apikey sk-1", "APIKEY sk-1"] {
+            assert_eq!(extract_api_key(header), Some("sk-1"), "for {header}");
+        }
+        assert_eq!(extract_api_key("sk-1"), Some("sk-1"), "raw key still works");
+        assert_eq!(extract_api_key("Basic dXNlcjpwYXNz"), None);
     }
 
     #[tokio::test]
