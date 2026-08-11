@@ -136,11 +136,57 @@ fn workspace_version(manifest: &str) -> String {
         .to_string()
 }
 
-/// Every file under `root` worth scanning.
+/// Every file worth scanning, as git sees the repository.
+///
+/// Enumerating tracked files rather than walking the filesystem is what keeps
+/// this honest: `.gitignore` holds local scratch (`/tmp/` carries repro servers
+/// and checkouts of other SDKs) and any of it can contain a `Cargo.toml` or a
+/// `.md` naming an old version. A hand-maintained skip list would drift from
+/// `.gitignore` the first time somebody added a directory.
+///
+/// Falls back to a filesystem walk when git is unavailable, which is the
+/// published crate archive. There is no scratch there, so the walk is safe.
+fn scannable_files(root: &Path) -> Vec<PathBuf> {
+    match tracked_files(root) {
+        Some(found) => found,
+        None => walk_files(root),
+    }
+}
+
+/// Tracked paths, or `None` when this is not a git checkout.
+fn tracked_files(root: &Path) -> Option<Vec<PathBuf>> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut found: Vec<PathBuf> = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| root.join(String::from_utf8_lossy(entry).as_ref()))
+        .filter(|path| {
+            SCANNED_EXTENSIONS
+                .iter()
+                .any(|ext| path.extension().is_some_and(|found| found == *ext))
+                && !path
+                    .file_name()
+                    .is_some_and(|name| is_exempt(&name.to_string_lossy()))
+        })
+        .collect();
+    found.sort();
+    Some(found)
+}
+
+/// Filesystem fallback for the published archive.
 ///
 /// Build output, the git directory, and the other dot directories are skipped;
 /// `.claude/worktrees` in particular holds whole extra checkouts.
-fn scannable_files(root: &Path) -> Vec<PathBuf> {
+fn walk_files(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(dir) = pending.pop() {
