@@ -98,7 +98,10 @@ impl TaskStore for ExternalStore {
     }
 
     async fn list_tasks(&self, status: Option<TaskStatus>) -> TaskResult<Vec<TaskObject>> {
-        let tasks = self.tasks.lock().map_err(|e| TaskStoreError::Backend(e.to_string()))?;
+        let tasks = self
+            .tasks
+            .lock()
+            .map_err(|e| TaskStoreError::Backend(e.to_string()))?;
         Ok(tasks
             .values()
             .map(|r| r.object.clone())
@@ -173,10 +176,10 @@ impl TaskStore for ExternalStore {
         // A polling store is a legitimate implementation; the router only
         // needs an eventual answer.
         for _ in 0..200 {
-            if let Some(snapshot) = self.get_task_result(task_id).await? {
-                if snapshot.0.status.is_terminal() {
-                    return Ok(Some(snapshot));
-                }
+            if let Some(snapshot) = self.get_task_result(task_id).await?
+                && snapshot.0.status.is_terminal()
+            {
+                return Ok(Some(snapshot));
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
@@ -184,9 +187,7 @@ impl TaskStore for ExternalStore {
     }
 
     async fn set_task_meta(&self, task_id: &str, meta: serde_json::Value) -> TaskResult<bool> {
-        Ok(self
-            .with(task_id, |r| r.object.meta = Some(meta))
-            .is_some())
+        Ok(self.with(task_id, |r| r.object.meta = Some(meta)).is_some())
     }
 
     async fn discard_task(&self, task_id: &str) -> TaskResult<bool> {
