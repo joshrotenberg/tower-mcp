@@ -2798,6 +2798,109 @@ async fn test_task_lifecycle_complete() {
     }
 }
 
+/// Build a router whose one tool parks for longer than any test will wait.
+async fn parked_router() -> McpRouter {
+    let parked = ToolBuilder::new("park")
+        .description("Never finishes on its own")
+        .handler(|_input: serde_json::Value| async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            Ok(CallToolResult::text("unreachable"))
+        })
+        .build();
+    let mut router = McpRouter::new().tool(parked);
+    init_router(&mut router).await;
+    router
+}
+
+fn park_request(id: i64) -> RouterRequest {
+    RouterRequest {
+        id: RequestId::Number(id),
+        inner: McpRequest::CallTool(CallToolParams {
+            name: "park".to_string(),
+            arguments: serde_json::json!({}),
+            input_responses: None,
+            request_state: None,
+            meta: None,
+            task: None,
+        }),
+        extensions: Extensions::new(),
+    }
+}
+
+fn tracked_dispatches(router: &McpRouter, id: &RequestId) -> usize {
+    router
+        .inner
+        .in_flight
+        .read()
+        .unwrap()
+        .get(id)
+        .map_or(0, Vec::len)
+}
+
+/// #1270: tracking was removed on the success path in `Service::call`, so a
+/// future dropped before reaching it left its entry behind for the process
+/// lifetime. A timeout layer firing or an HTTP client disconnecting does
+/// exactly that.
+#[tokio::test]
+async fn dropping_a_request_future_untracks_it() {
+    let router = parked_router().await;
+    let id = RequestId::Number(1);
+
+    let mut service = router.clone();
+    let mut future = Box::pin(service.call(park_request(1)));
+
+    // Poll it far enough to reach the handler, which parks.
+    let polled = tokio::time::timeout(std::time::Duration::from_millis(100), &mut future).await;
+    assert!(polled.is_err(), "the parked handler must not have finished");
+    assert_eq!(
+        tracked_dispatches(&router, &id),
+        1,
+        "an in-flight request must be tracked, or this test proves nothing"
+    );
+
+    drop(future);
+
+    assert_eq!(
+        tracked_dispatches(&router, &id),
+        0,
+        "dropping the future must untrack the request"
+    );
+    assert!(router.inner.in_flight.read().unwrap().is_empty());
+}
+
+/// The counterpart to the two duplicate-id tests in `adversarial_input.rs`,
+/// asserted against the registry rather than through the wire: twins under one
+/// id coexist, and each drop removes only its own dispatch.
+#[tokio::test]
+async fn twin_dispatches_under_one_id_are_tracked_and_removed_independently() {
+    let router = parked_router().await;
+    let id = RequestId::Number(7);
+
+    let mut first_service = router.clone();
+    let mut first = Box::pin(first_service.call(park_request(7)));
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(100), &mut first).await;
+
+    let mut second_service = router.clone();
+    let mut second = Box::pin(second_service.call(park_request(7)));
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(100), &mut second).await;
+
+    assert_eq!(
+        tracked_dispatches(&router, &id),
+        2,
+        "the second registration must not evict the first"
+    );
+
+    drop(first);
+    assert_eq!(
+        tracked_dispatches(&router, &id),
+        1,
+        "one request ending must leave its twin tracked"
+    );
+
+    drop(second);
+    assert_eq!(tracked_dispatches(&router, &id), 0);
+}
+
 #[tokio::test]
 async fn test_task_cancellation() {
     // Use a slow tool to test cancellation

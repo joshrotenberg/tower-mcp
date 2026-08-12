@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 
@@ -581,8 +582,16 @@ struct McpRouterInner {
     /// the router needs a handle to wake it when `tasks/update` commits and
     /// to signal it when `tasks/cancel` arrives.
     live_tasks: Arc<Mutex<HashMap<String, Arc<crate::tool::LiveTask>>>>,
-    /// In-flight requests for cancellation tracking (shared across clones)
-    in_flight: Arc<RwLock<HashMap<RequestId, CancellationToken>>>,
+    /// In-flight requests for cancellation tracking (shared across clones).
+    ///
+    /// Keyed by request id for lookup, but each id holds one entry per
+    /// *dispatch*. A client should not reuse an id that is still in flight,
+    /// but when one does, the twins have to coexist: keyed by id alone the
+    /// second registration evicted the first and the first became
+    /// uncancellable (#1270).
+    in_flight: Arc<RwLock<HashMap<RequestId, Vec<InFlightDispatch>>>>,
+    /// Source of the per-dispatch ids in `in_flight`, shared across clones.
+    next_dispatch: Arc<AtomicU64>,
     /// Channel for sending notifications to connected clients
     notification_tx: Option<NotificationSender>,
     /// Transport-lifetime sink for final HTTP subscription notifications.
@@ -759,6 +768,7 @@ impl McpRouter {
                 advertise_resource_subscriptions: true,
                 live_tasks: Arc::new(Mutex::new(HashMap::new())),
                 in_flight: Arc::new(RwLock::new(HashMap::new())),
+                next_dispatch: Arc::new(AtomicU64::new(0)),
                 notification_tx: None,
                 #[cfg(all(feature = "http", feature = "stateless"))]
                 modern_notification_sink: Arc::new(RwLock::new(None)),
@@ -1270,32 +1280,89 @@ impl McpRouter {
         // Set up log level filtering
         let ctx = ctx.with_min_log_level(self.inner.min_log_level.clone());
 
-        // Register for cancellation tracking
-        let token = ctx.cancellation_token();
-        if let Ok(mut in_flight) = self.inner.in_flight.write() {
-            in_flight.insert(request_id, token);
-        }
+        // Register for cancellation tracking. `Service::call` mints the
+        // dispatch id and threads it through the extensions so the guard it
+        // holds and this registration name the same entry; a caller driving
+        // the router directly gets a fresh one.
+        let dispatch = per_request
+            .get::<DispatchId>()
+            .copied()
+            .unwrap_or_else(|| self.next_dispatch());
+        self.register_in_flight(request_id, dispatch, ctx.cancellation_token());
 
         ctx
     }
 
-    /// Remove a request from tracking (called when request completes)
+    /// Allocate a dispatch id, unique for the lifetime of this router.
+    fn next_dispatch(&self) -> DispatchId {
+        DispatchId(
+            self.inner
+                .next_dispatch
+                .fetch_add(1, AtomicOrdering::Relaxed),
+        )
+    }
+
+    /// Track one dispatch for cancellation.
+    ///
+    /// Appends rather than overwrites: a client that reuses an id which is
+    /// still in flight gets both requests tracked, so cancelling the id can
+    /// still reach both (#1270).
+    fn register_in_flight(
+        &self,
+        request_id: RequestId,
+        dispatch: DispatchId,
+        token: CancellationToken,
+    ) {
+        if let Ok(mut in_flight) = self.inner.in_flight.write() {
+            in_flight
+                .entry(request_id)
+                .or_default()
+                .push(InFlightDispatch { dispatch, token });
+        }
+    }
+
+    /// Stop tracking one dispatch, leaving any twin under the same id alone.
+    fn complete_dispatch(&self, request_id: &RequestId, dispatch: DispatchId) {
+        if let Ok(mut in_flight) = self.inner.in_flight.write()
+            && let Some(entries) = in_flight.get_mut(request_id)
+        {
+            entries.retain(|entry| entry.dispatch != dispatch);
+            if entries.is_empty() {
+                in_flight.remove(request_id);
+            }
+        }
+    }
+
+    /// Remove a request from tracking (called when request completes).
+    ///
+    /// Untracks *every* dispatch under `request_id`, which is the only
+    /// granularity this signature offers. Requests dispatched through
+    /// [`Service::call`] do not need it: each holds a guard that untracks its
+    /// own dispatch when the future completes, is dropped, or unwinds. It
+    /// remains for callers driving [`McpRouter::create_context`] and request
+    /// handling themselves.
     pub fn complete_request(&self, request_id: &RequestId) {
         if let Ok(mut in_flight) = self.inner.in_flight.write() {
             in_flight.remove(request_id);
         }
     }
 
-    /// Cancel a tracked request
+    /// Cancel a tracked request.
+    ///
+    /// Cancels every dispatch still running under `request_id`. The id is the
+    /// only handle a client has, so a client that reused one in flight gets
+    /// both stopped rather than an arbitrary one.
     fn cancel_request(&self, request_id: &RequestId) -> bool {
         let Ok(in_flight) = self.inner.in_flight.read() else {
             return false;
         };
-        let Some(token) = in_flight.get(request_id) else {
+        let Some(entries) = in_flight.get(request_id) else {
             return false;
         };
-        token.cancel();
-        true
+        for entry in entries {
+            entry.token.cancel();
+        }
+        !entries.is_empty()
     }
 
     /// Whether to advertise `resources.subscribe` when resources exist.
@@ -4847,6 +4914,40 @@ impl RouterResponse {
     }
 }
 
+/// Identifies one dispatch of one request, unique for a router's lifetime.
+///
+/// The request id cannot play this role: a client may reuse one that is still
+/// in flight, and two requests sharing an id must still be tracked separately
+/// (#1270). Minted by [`Service::call`] and passed to the handler through the
+/// request extensions so the registration and the guard name the same entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DispatchId(u64);
+
+/// One tracked dispatch in the router's in-flight registry.
+struct InFlightDispatch {
+    dispatch: DispatchId,
+    token: CancellationToken,
+}
+
+/// Untracks a single dispatch when the request future ends, however it ends.
+///
+/// Removal used to sit on the success path in [`Service::call`], so a future
+/// dropped before that point (a timeout layer firing, an HTTP client
+/// disconnecting, a handler unwinding) left its entry in the registry for the
+/// process lifetime. `Drop` runs on every one of those paths.
+struct InFlightGuard {
+    router: McpRouter,
+    request_id: RequestId,
+    dispatch: DispatchId,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.router
+            .complete_dispatch(&self.request_id, self.dispatch);
+    }
+}
+
 impl Service<RouterRequest> for McpRouter {
     type Response = RouterResponse;
     type Error = std::convert::Infallible; // Errors are in the response
@@ -4857,13 +4958,22 @@ impl Service<RouterRequest> for McpRouter {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, req: RouterRequest) -> Self::Future {
+    fn call(&mut self, mut req: RouterRequest) -> Self::Future {
         let router = self.clone();
         let request_id = req.id.clone();
+
+        // Name the dispatch before `handle` builds its context, so the
+        // registration inside and the guard out here refer to the same entry.
+        let dispatch = router.next_dispatch();
+        req.extensions.insert(dispatch);
+
         Box::pin(async move {
+            let _tracked = InFlightGuard {
+                router: router.clone(),
+                request_id: request_id.clone(),
+                dispatch,
+            };
             let result = router.handle(req.id, req.inner, req.extensions).await;
-            // Clean up tracking after request completes
-            router.complete_request(&request_id);
             Ok(RouterResponse {
                 id: request_id,
                 // Map tower-mcp errors to JSON-RPC errors:

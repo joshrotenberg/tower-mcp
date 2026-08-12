@@ -5,10 +5,11 @@
 //! on the wire: duplicate ids, stale notifications, malformed envelopes,
 //! out-of-order lifecycle traffic, and handlers that misbehave.
 //!
-//! Three tests are `#[ignore]`d. Each one asserts the behaviour the code should
-//! have and fails against the behaviour it has today; the attribute carries
-//! the reason. Run them with `cargo test --test adversarial_input -- --ignored`
-//! to reproduce every finding.
+//! One test is `#[ignore]`d. It asserts the behaviour the code should have and
+//! fails against the behaviour it has today; the attribute carries the reason.
+//! Run it with `cargo test --test adversarial_input -- --ignored`. Tests whose
+//! finding has since been fixed keep the issue number in their doc comment, so
+//! the regression each one guards stays legible.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -300,11 +301,10 @@ async fn concurrent_calls_under_distinct_ids_are_independently_cancellable() {
 /// Two in-flight requests share one id. Cancelling that id must reach every
 /// request still running under it: the id is the only handle a client has.
 ///
-/// Today `McpRouter` tracks in-flight work in a `HashMap<RequestId, _>`, so
-/// the second registration evicts the first and only the last request to
-/// arrive is reachable. The first runs to completion after its cancellation.
+/// `McpRouter` tracks in-flight work per dispatch, keyed by id for lookup, so
+/// the twins coexist. Keyed by id alone the second registration evicted the
+/// first and only the last arrival was reachable (#1270).
 #[tokio::test]
-#[ignore = "BUG: McpRouter::in_flight is keyed by RequestId alone, so a duplicate id evicts the first request's cancellation token"]
 async fn cancelling_a_duplicated_id_reaches_every_request_using_it() {
     let mut server = Server::with_router(base_router());
     server.initialize().await;
@@ -334,10 +334,10 @@ async fn cancelling_a_duplicated_id_reaches_every_request_using_it() {
 /// A short call and a long call share an id. When the short one answers, the
 /// long one is still running under that id and must stay cancellable.
 ///
-/// Today the short call's completion removes the map entry the long call
-/// installed, so the later cancellation finds nothing to cancel.
+/// Each request untracks only its own dispatch. Removing the whole id entry
+/// on completion took the long call's registration with it, so the later
+/// cancellation found nothing to cancel (#1270).
 #[tokio::test]
-#[ignore = "BUG: McpRouter::complete_request removes the whole id entry, untracking a still-running request that shares the id"]
 async fn completing_one_request_does_not_untrack_its_id_twin() {
     let mut server = Server::with_router(base_router());
     server.initialize().await;
