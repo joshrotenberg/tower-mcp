@@ -44,7 +44,7 @@ use tokio::process::{Child, Command};
 
 use super::transport::ClientTransport;
 use crate::error::{Error, Result};
-use crate::framing::{FrameReader, InputFrame};
+use crate::framing::{FrameReader, InputFrame, clean_input_line};
 
 /// Client transport that communicates with a subprocess via stdio.
 ///
@@ -200,7 +200,9 @@ impl ClientTransport for StdioClientTransport {
             };
 
             match frame {
-                InputFrame::Line(line) => return Ok(Some(line.trim().to_string())),
+                InputFrame::Line(line) => {
+                    return Ok(Some(clean_input_line(&line).to_string()));
+                }
                 InputFrame::Undecodable => {
                     tracing::warn!(
                         "invalid UTF-8 in a frame from the server, discarding it; \
@@ -406,6 +408,30 @@ mod tests {
 
         assert_eq!(line.trim(), "diagnostic");
         assert!(transport.take_stderr().is_none());
+    }
+
+    /// #1303: the server strips a BOM before parsing and the client did not,
+    /// so the same frame was handled on one end of the connection and dropped
+    /// on the other. The frame most likely to carry one is the `initialize`
+    /// response, whose loss leaves the handshake waiting for a timeout.
+    #[tokio::test]
+    async fn test_recv_strips_a_leading_bom() {
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            r#"printf '\357\273\277{"jsonrpc":"2.0","id":1,"result":{}}\n'"#,
+        ]);
+
+        let mut transport = StdioClientTransport::spawn_command(&mut cmd).await.unwrap();
+        let frame = transport
+            .recv()
+            .await
+            .unwrap()
+            .expect("the frame must arrive");
+
+        assert_eq!(frame, r#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
+        serde_json::from_str::<serde_json::Value>(&frame)
+            .expect("and it must parse, which is the point");
     }
 
     #[tokio::test]

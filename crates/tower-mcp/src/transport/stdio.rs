@@ -69,7 +69,7 @@ use crate::context::{
 use tower_service::Service;
 
 use crate::error::{Error, Result};
-use crate::framing::{FrameReader, InputFrame, read_frame_blocking};
+use crate::framing::{FrameReader, InputFrame, clean_input_line, read_frame_blocking};
 use crate::jsonrpc::JsonRpcService;
 #[cfg(feature = "stateless")]
 use crate::protocol::{Implementation, SubscriptionFilter};
@@ -466,15 +466,6 @@ impl StdioSubscriptions {
             })
             .collect()
     }
-}
-
-/// Strip an optional UTF-8 BOM, then trim whitespace.
-///
-/// Windows tools sometimes prefix the first stdout line with a UTF-8 BOM
-/// (`\u{feff}`). Without stripping it, the JSON parser sees an unexpected
-/// character at offset 0 and rejects the whole message.
-fn clean_input_line(line: &str) -> &str {
-    line.strip_prefix('\u{feff}').unwrap_or(line).trim()
 }
 
 /// The parse-error message for a frame whose bytes are not valid UTF-8.
@@ -2653,45 +2644,6 @@ mod tests {
         let result = process_line(&mut service, &router, line).await;
 
         assert!(result.is_err());
-    }
-
-    // =========================================================================
-    // clean_input_line tests
-    // =========================================================================
-
-    #[test]
-    fn test_clean_input_line_no_bom() {
-        assert_eq!(
-            clean_input_line(r#"{"jsonrpc":"2.0"}"#),
-            r#"{"jsonrpc":"2.0"}"#
-        );
-    }
-
-    #[test]
-    fn test_clean_input_line_strips_leading_bom() {
-        let with_bom = "\u{feff}{\"jsonrpc\":\"2.0\"}";
-        assert_eq!(clean_input_line(with_bom), r#"{"jsonrpc":"2.0"}"#);
-    }
-
-    #[test]
-    fn test_clean_input_line_strips_bom_then_trims() {
-        // BOM, then whitespace, then content, then trailing newline.
-        let input = "\u{feff}   {\"id\":1}\n";
-        assert_eq!(clean_input_line(input), r#"{"id":1}"#);
-    }
-
-    #[test]
-    fn test_clean_input_line_does_not_strip_internal_bom() {
-        // Only a *leading* BOM is stripped; one inside the payload stays.
-        let input = "{\"text\":\"hi\u{feff}there\"}";
-        assert_eq!(clean_input_line(input), input);
-    }
-
-    #[test]
-    fn test_clean_input_line_empty() {
-        assert_eq!(clean_input_line(""), "");
-        assert_eq!(clean_input_line("\u{feff}"), "");
-        assert_eq!(clean_input_line("   \n\t"), "");
     }
 
     #[tokio::test]

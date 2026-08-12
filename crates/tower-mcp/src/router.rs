@@ -4650,6 +4650,11 @@ impl McpRouter {
                     } else {
                         tracing::info!("Session initialized, entering operation phase");
                     }
+                } else if phase_before == crate::session::SessionPhase::Uninitialized {
+                    tracing::warn!(
+                        "Ignoring initialized notification: no initialize request has been \
+                         received for this session"
+                    );
                 } else {
                     tracing::warn!(
                         phase = ?self.session.phase(),

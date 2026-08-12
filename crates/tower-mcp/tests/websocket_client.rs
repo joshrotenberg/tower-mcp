@@ -163,3 +163,48 @@ async fn connecting_to_a_dead_endpoint_fails_immediately() {
         "the error should name the stage that failed: {error}"
     );
 }
+
+/// #1303: a server whose runtime prefixes its output with a UTF-8 BOM writes
+/// one into its text frames too, and the JSON parser rejects the whole frame
+/// over it. `trim` does not remove a BOM, so the client has to strip it the
+/// way the server side already does.
+#[tokio::test]
+async fn a_bom_prefixed_frame_from_the_server_is_stripped() {
+    use axum::extract::ws::{Message, WebSocketUpgrade};
+    use tower_mcp::client::ClientTransport;
+
+    const FRAME: &str = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+
+    // A bare WebSocket endpoint that writes one BOM-prefixed frame. The
+    // crate's own server never emits one, which is the point: this is what a
+    // peer we do not control does.
+    let app = axum::Router::new().route(
+        "/",
+        axum::routing::get(|upgrade: WebSocketUpgrade| async move {
+            upgrade.on_upgrade(|mut socket| async move {
+                let _ = socket
+                    .send(Message::Text(format!("\u{feff}{FRAME}").into()))
+                    .await;
+            })
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut transport = WebSocketClientTransport::connect(&format!("ws://{addr}/"))
+        .await
+        .expect("connect");
+    let received = tokio::time::timeout(Duration::from_secs(5), transport.recv())
+        .await
+        .expect("a frame must arrive")
+        .expect("recv")
+        .expect("the frame must not be dropped");
+
+    assert_eq!(received, FRAME);
+    serde_json::from_str::<serde_json::Value>(&received)
+        .expect("and it must parse, which is the point");
+}
