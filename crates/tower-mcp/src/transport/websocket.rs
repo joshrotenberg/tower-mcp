@@ -87,7 +87,7 @@ use crate::context::{
     ChannelClientRequester, ClientRequesterHandle, OutgoingRequest, OutgoingRequestReceiver,
     OutgoingRequestSender, outgoing_request_channel,
 };
-use crate::error::{Error, JsonRpcError, Result};
+use crate::error::{Error, Result};
 use crate::jsonrpc::JsonRpcService;
 use crate::protocol::{
     JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpNotification,
@@ -794,7 +794,7 @@ async fn handle_socket_simple(
                         tracing::error!(error = %e, "Error processing message");
                         let error_response = JsonRpcResponse::error(
                             None,
-                            JsonRpcError::internal_error(e.to_string()),
+                            session.router.transport_internal_error(&e),
                         );
                         if let Ok(json) = serde_json::to_string(&error_response) {
                             let _ = sender.send(Message::Text(json.into())).await;
@@ -1052,13 +1052,13 @@ where
         Ok(response) => send_response(&sender, &response).await?,
         Err(e) => {
             tracing::error!(error = %e, "Error processing message");
-            // `e` here is a transport/serialization failure, not a caught
-            // tool panic, so the disclosure policy in `router.rs` (#1309)
-            // does not apply to it and its methods are private to that
-            // module regardless. `e.to_string()` is left as-is rather than
-            // inventing a second disclosure rule for this path.
+            // `e` here is a transport or serialization failure rather than a
+            // caught tool panic, so it carries no tool name and no panic
+            // payload. The operator's disclosure choice still governs what
+            // reaches the client, which is what the router helper applies
+            // (#1354).
             let error_response =
-                JsonRpcResponse::error(request_id, JsonRpcError::internal_error(e.to_string()));
+                JsonRpcResponse::error(request_id, router.transport_internal_error(&e));
             let _ = send_response(&sender, &error_response).await;
         }
     }

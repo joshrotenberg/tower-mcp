@@ -261,6 +261,24 @@ impl PanicPolicy {
     fn needs_payload(&self) -> bool {
         matches!(self.client_message, ClientPanicMessage::Detailed) || self.include_payload_in_logs
     }
+
+    /// The client-visible text for an internal failure that is not a caught
+    /// tool panic.
+    ///
+    /// A transport that builds its own error response has no tool to name and
+    /// no panic payload to redact, so it cannot use `client_message`. The
+    /// operator's disclosure choice still applies: a policy installed to keep
+    /// internal text away from clients should not be bypassed because the
+    /// failure happened while framing a response rather than inside a handler.
+    ///
+    /// The tool-name switches are deliberately not consulted. They select how
+    /// to name a tool, and there is no tool here to name.
+    fn internal_error_message(&self, error: &dyn std::fmt::Display) -> String {
+        match &self.client_message {
+            ClientPanicMessage::Detailed => error.to_string(),
+            ClientPanicMessage::Fixed(message) => message.to_string(),
+        }
+    }
 }
 
 /// The Task operation whose failure is being exposed to a client.
@@ -2990,6 +3008,28 @@ impl McpRouter {
 
         Self::log_caught_panic(logged_tool, logged_payload, task_id);
         policy.client_message(tool_name, payload.as_deref())
+    }
+
+    /// Build the JSON-RPC error a transport sends for an internal failure of
+    /// its own, honouring the configured disclosure policy.
+    ///
+    /// A transport that hand-builds an error response is outside every path
+    /// that consults [`PanicPolicy`], so before this existed it sent the
+    /// error's `Display` text whatever the operator had configured (#1354).
+    /// Routing the two websocket sites through one helper rather than
+    /// widening the panic path is what keeps the next transport from
+    /// reintroducing the gap: the previous round of this, #1335, fixed one of
+    /// a pair of near-identical sites and left the other to drift.
+    ///
+    /// With no policy installed the error's text is returned unchanged, which
+    /// is both the behaviour these paths already had and the stance the crate
+    /// takes elsewhere: a panic is not caught at all until `catch_panics` asks
+    /// for it.
+    pub(crate) fn transport_internal_error(&self, error: &dyn std::fmt::Display) -> JsonRpcError {
+        match &self.inner.panic_policy {
+            Some(policy) => JsonRpcError::internal_error(policy.internal_error_message(error)),
+            None => JsonRpcError::internal_error(error.to_string()),
+        }
     }
 
     fn log_caught_panic(tool_name: Option<&str>, payload: Option<&str>, task_id: Option<&str>) {

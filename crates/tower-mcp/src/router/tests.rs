@@ -1871,6 +1871,55 @@ fn panic_policy_debug_does_not_disclose_its_fixed_client_message() {
     assert!(!debug.contains("private incident text"), "{debug}");
 }
 
+/// #1354: a transport that hand-builds an error response used to send the
+/// error's `Display` text whatever the operator had configured, because the
+/// disclosure policy was reachable only from the caught-panic path.
+#[test]
+fn a_redacted_policy_covers_transport_errors_too() {
+    let leaky = Error::internal("connection to db-primary.internal:5432 refused");
+
+    let router = McpRouter::new().catch_panics_with(PanicPolicy::redacted("internal error"));
+    let error = router.transport_internal_error(&leaky);
+    assert_eq!(error.message, "internal error");
+    assert!(!error.message.contains("db-primary.internal"));
+}
+
+/// Without a policy the text passes through, which is both what these paths
+/// already did and the stance taken for panics: nothing is caught until
+/// `catch_panics` asks for it.
+#[test]
+fn transport_errors_are_unchanged_without_a_policy() {
+    let failure = Error::internal("serialization failed");
+
+    let router = McpRouter::new();
+    assert_eq!(
+        router.transport_internal_error(&failure).message,
+        failure.to_string()
+    );
+
+    // `catch_panics` is the detailed policy, so it discloses too.
+    let detailed = McpRouter::new().catch_panics();
+    assert_eq!(
+        detailed.transport_internal_error(&failure).message,
+        failure.to_string()
+    );
+}
+
+/// The tool-name switches select how to name a tool. A transport-level
+/// failure has none, so a policy that would have prefixed `tool 'x':` onto a
+/// panic must not invent one here.
+#[test]
+fn a_transport_error_is_not_attributed_to_a_tool() {
+    let router = McpRouter::new().catch_panics_with(
+        PanicPolicy::redacted("internal error")
+            .include_tool_name_in_client_message(true)
+            .client_tool_name("provider tool"),
+    );
+    let error = router.transport_internal_error(&Error::internal("boom"));
+    assert_eq!(error.message, "internal error");
+    assert!(!error.message.contains("provider tool"));
+}
+
 /// #1208: the full task input round trip. The handler asks, the task
 /// parks in `input_required` carrying the requests, the client answers
 /// with `tasks/update`, the router re-invokes the handler with the
