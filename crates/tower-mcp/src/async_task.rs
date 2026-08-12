@@ -680,6 +680,7 @@ pub type TaskSnapshot = (TaskObject, Option<CallToolResult>, Option<JsonRpcError
 /// use tower_mcp::async_task::{
 ///     AppliedInputResponses, CancellationToken, MemoryTaskStore, Result, TaskOwner,
 ///     TaskResumeContext, TaskSnapshot, TaskStore,
+///     TaskPresence,
 /// };
 /// use tower_mcp::error::JsonRpcError;
 /// use tower_mcp::protocol::{InputRequests, InputResponses, TaskObject, TaskStatus};
@@ -714,6 +715,12 @@ pub type TaskSnapshot = (TaskObject, Option<CallToolResult>, Option<JsonRpcError
 ///     }
 ///     async fn task_owner(&self, id: &str) -> Result<Option<TaskOwner>> {
 ///         self.inner.task_owner(id).await
+///     }
+///     // Forward this too when the wrapped store retains tombstones, or the
+///     // default turns its `Expired` into `Missing` and the decorator
+///     // silently removes the distinction (#1249).
+///     async fn task_presence(&self, id: &str) -> Result<TaskPresence> {
+///         self.inner.task_presence(id).await
 ///     }
 ///     async fn get_task(&self, id: &str) -> Result<Option<TaskObject>> {
 ///         self.inner.get_task(id).await
