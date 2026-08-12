@@ -161,18 +161,29 @@ jobs:
     name: Coverage
     runs-on: ubuntu-latest
     env:
-      # Production code only. `cargo llvm-cov` reports a sibling `tests.rs`
-      # module as zero instrumented lines but counts an inline
-      # `#[cfg(test)] mod tests { .. }` block, which is covered by definition
-      # because running the suite executes it. So every module that carried
-      # its tests inline was inflating this number with test code covering
-      # itself.
+      # Library code only, and both halves of that have been fixed the hard
+      # way.
       #
-      # #1256 moved the last of those out, and the measurement dropped from
-      # 80.4% to 78.5% without a line of production code changing. 78 is the
-      # real figure, and was all along. Raise it by writing tests, not by
-      # putting test bodies back in front of the meter.
-      COVERAGE_MIN_LINES: "78"
+      # Test code was inflating it. `cargo llvm-cov` reports a sibling
+      # `tests.rs` module as zero instrumented lines but counts an inline
+      # `#[cfg(test)] mod tests { .. }` block, which is covered by definition
+      # because running the suite executes it. #1256 moved the last of those
+      # out and the measurement dropped from 80.4% to 78.5% without a line of
+      # production code changing.
+      #
+      # Binary entry points were deflating it. `tools/rmcp-compat`,
+      # `tools/interop-probe`, and `tools/sdk-interop` contributed 2,537 lines
+      # of `main()` at 0%, which no test can reach. Excluding them took the
+      # measurement from 79.1% to 84.4%, again with no production change, and
+      # they were the only files under `tools/` or `examples/` in the report
+      # at all, so nothing covered was lost (#1367).
+      #
+      # 84 is the real figure. Raise it by writing tests, not by changing what
+      # the meter looks at.
+      COVERAGE_MIN_LINES: "84"
+      # Semantic rather than path-based: a `main()` is a binary entry point
+      # wherever it lives, so a future binary needs no new entry here.
+      COVERAGE_IGNORE: 'src/main\.rs$'
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -184,10 +195,10 @@ jobs:
         run: cargo llvm-cov --workspace --all-features --no-report
       - name: Generate reports
         run: |
-          cargo llvm-cov report --lcov --output-path lcov.info
-          cargo llvm-cov report --json --summary-only --output-path coverage-summary.json
-          cargo llvm-cov report > coverage.txt
-          cargo llvm-cov report --html --output-dir coverage-html
+          cargo llvm-cov report --ignore-filename-regex "$COVERAGE_IGNORE" --lcov --output-path lcov.info
+          cargo llvm-cov report --ignore-filename-regex "$COVERAGE_IGNORE" --json --summary-only --output-path coverage-summary.json
+          cargo llvm-cov report --ignore-filename-regex "$COVERAGE_IGNORE" > coverage.txt
+          cargo llvm-cov report --ignore-filename-regex "$COVERAGE_IGNORE" --html --output-dir coverage-html
       - name: Write job summary
         run: |
           jq -r '
@@ -224,7 +235,7 @@ jobs:
         run: |
           measured="$(jq -r '.data[0].totals.lines.percent' coverage-summary.json)"
           echo "Measured line coverage: ${measured}% (required: ${COVERAGE_MIN_LINES}%)"
-          if ! cargo llvm-cov report --fail-under-lines "${COVERAGE_MIN_LINES}"; then
+          if ! cargo llvm-cov report --ignore-filename-regex "$COVERAGE_IGNORE" --fail-under-lines "${COVERAGE_MIN_LINES}"; then
             echo "::error title=Line coverage below ${COVERAGE_MIN_LINES}%::Measured line coverage ${measured}% is below the required ${COVERAGE_MIN_LINES}% floor."
             exit 1
           fi
