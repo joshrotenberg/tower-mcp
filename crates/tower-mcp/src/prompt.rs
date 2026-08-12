@@ -30,13 +30,16 @@
 //! With the `stateless` feature, `mrtr_handler` accepts a handler that can
 //! suspend and ask the client for more input (SEP-2322).
 //!
-//! # Adding a layer changes what a handler error means
+//! # A layer does not change what a handler error means
 //!
-//! Without middleware, an `Err` from the handler propagates and the router
-//! reports a JSON-RPC error. Add `.layer()` and the handler becomes a Tower
-//! service, whose errors have to be caught for the stack to compose, so the
-//! same `Err` (and any middleware error, such as a timeout) comes back as a
-//! successful `prompts/get` whose assistant message carries the error text:
+//! An `Err` from the handler propagates and the router reports a JSON-RPC
+//! error whether or not `.layer()` was applied. `.layer()` turns the handler
+//! into a Tower service so a middleware stack can compose around it, but the
+//! handler's own error is converted to a structured JSON-RPC error before it
+//! ever reaches a layer, so it rides through untouched. Only a genuine
+//! failure at the Tower level -- a timeout, a rate limit, anything from a
+//! layer rather than from the handler -- is sanitized to a generic `-32603`
+//! Internal Error:
 //!
 //! ```rust
 //! use std::collections::HashMap;
@@ -51,7 +54,8 @@
 //!         Err(Error::internal("template store is offline"))
 //!     })
 //!     .build();
-//! assert!(plain.get(HashMap::new()).await.is_err());
+//! let plain_err = plain.get(HashMap::new()).await.unwrap_err();
+//! assert!(plain_err.to_string().contains("template store is offline"));
 //!
 //! let layered = PromptBuilder::new("layered")
 //!     .handler(|_: HashMap<String, String>| async {
@@ -59,15 +63,14 @@
 //!     })
 //!     .layer(TimeoutLayer::new(Duration::from_secs(5)));
 //!
-//! let result = layered.get(HashMap::new()).await.unwrap();
-//! let text = result.first_message_text().unwrap();
-//! assert!(text.contains("template store is offline"), "{text}");
+//! let layered_err = layered.get(HashMap::new()).await.unwrap_err();
+//! assert!(layered_err.to_string().contains("template store is offline"));
 //! # });
 //! ```
 //!
-//! Per-prompt middleware is the place for a bound that only one prompt needs,
-//! such as a timeout on a prompt that reads from a network template store.
-//! Layering the whole router covers everything else.
+//! Per-prompt middleware is still the place for a bound that only one prompt
+//! needs, such as a timeout on a prompt that reads from a network template
+//! store. Layering the whole router covers everything else.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -85,7 +88,7 @@ use tower::{Layer, ServiceExt};
 use tower_service::Service;
 
 use crate::context::RequestContext;
-use crate::error::{Error, Result};
+use crate::error::{Error, JsonRpcError, Result};
 use crate::protocol::{
     Content, GetPromptResult, PromptArgument, PromptDefinition, PromptMessage, PromptRole,
     RequestId, RequestOutcome, ToolIcon,
@@ -134,12 +137,21 @@ impl PromptRequest {
 ///
 /// This is the service type used internally after applying middleware layers.
 /// It wraps any `Service<PromptRequest>` implementation so that the prompt
-/// handler can consume it without knowing the concrete middleware stack.
-pub type BoxPromptService = BoxCloneService<PromptRequest, GetPromptResult, Infallible>;
+/// handler can consume it without knowing the concrete middleware stack. The
+/// service itself never fails at the Tower level; whether the prompt
+/// succeeded is carried instead in the success value, `Ok(GetPromptResult)`
+/// or `Err(JsonRpcError)`. A structured `JsonRpcError` here is the handler's
+/// own error, converted before it reached any layer; [`PromptCatchError`]
+/// only ever produces one itself for a genuine middleware failure.
+pub type BoxPromptService =
+    BoxCloneService<PromptRequest, std::result::Result<GetPromptResult, JsonRpcError>, Infallible>;
 
 #[cfg(feature = "stateless")]
-type BoxMrtrPromptService =
-    BoxCloneService<PromptRequest, RequestOutcome<GetPromptResult>, Infallible>;
+type BoxMrtrPromptService = BoxCloneService<
+    PromptRequest,
+    std::result::Result<RequestOutcome<GetPromptResult>, JsonRpcError>,
+    Infallible,
+>;
 
 /// A service wrapper that catches errors from middleware and converts them
 /// into prompt errors, maintaining the `Error = Infallible` contract.
@@ -187,39 +199,40 @@ pin_project! {
 
 impl<F, E> Future for PromptCatchErrorFuture<F>
 where
-    F: Future<Output = std::result::Result<GetPromptResult, E>>,
+    F: Future<Output = std::result::Result<std::result::Result<GetPromptResult, JsonRpcError>, E>>,
     E: fmt::Display,
 {
-    type Output = std::result::Result<GetPromptResult, Infallible>;
+    type Output =
+        std::result::Result<std::result::Result<GetPromptResult, JsonRpcError>, Infallible>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.project().inner.poll(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(response)) => Poll::Ready(Ok(response)),
-            Poll::Ready(Err(err)) => Poll::Ready(Ok(GetPromptResult {
-                description: Some(format!("Prompt error: {}", err)),
-                messages: vec![PromptMessage {
-                    role: PromptRole::Assistant,
-                    content: Content::Text {
-                        text: format!("Error generating prompt: {}", err),
-                        annotations: None,
-                        meta: None,
-                    },
-                    meta: None,
-                }],
-                meta: None,
-            })),
+            // The inner service already decided: either the prompt
+            // succeeded, or the handler's own error was already converted
+            // to a structured JsonRpcError. Either way, pass it through
+            // untouched.
+            Poll::Ready(Ok(inner)) => Poll::Ready(Ok(inner)),
+            // The inner service itself failed at the Tower level: a genuine
+            // middleware failure (timeout, rate limit, ...), not the
+            // handler's own error. Sanitize it to a generic Internal Error.
+            Poll::Ready(Err(err)) => {
+                Poll::Ready(Ok(Err(JsonRpcError::internal_error(err.to_string()))))
+            }
         }
     }
 }
 
 impl<S> Service<PromptRequest> for PromptCatchError<S>
 where
-    S: Service<PromptRequest, Response = GetPromptResult> + Clone + Send + 'static,
+    S: Service<PromptRequest, Response = std::result::Result<GetPromptResult, JsonRpcError>>
+        + Clone
+        + Send
+        + 'static,
     S::Error: fmt::Display + Send,
     S::Future: Send,
 {
-    type Response = GetPromptResult;
+    type Response = std::result::Result<GetPromptResult, JsonRpcError>;
     type Error = Infallible;
     type Future = PromptCatchErrorFuture<S::Future>;
 
@@ -250,11 +263,16 @@ impl<S> MrtrPromptCatchError<S> {
 #[cfg(feature = "stateless")]
 impl<S> Service<PromptRequest> for MrtrPromptCatchError<S>
 where
-    S: Service<PromptRequest, Response = RequestOutcome<GetPromptResult>> + Clone + Send + 'static,
+    S: Service<
+            PromptRequest,
+            Response = std::result::Result<RequestOutcome<GetPromptResult>, JsonRpcError>,
+        > + Clone
+        + Send
+        + 'static,
     S::Error: fmt::Display + Send + 'static,
     S::Future: Send + 'static,
 {
-    type Response = RequestOutcome<GetPromptResult>;
+    type Response = std::result::Result<RequestOutcome<GetPromptResult>, JsonRpcError>;
     type Error = Infallible;
     type Future =
         Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
@@ -270,20 +288,8 @@ where
         let future = self.inner.call(req);
         Box::pin(async move {
             Ok(match future.await {
-                Ok(outcome) => outcome,
-                Err(error) => RequestOutcome::Complete(GetPromptResult {
-                    description: Some(format!("Prompt error: {error}")),
-                    messages: vec![PromptMessage {
-                        role: PromptRole::Assistant,
-                        content: Content::Text {
-                            text: format!("Error generating prompt: {error}"),
-                            annotations: None,
-                            meta: None,
-                        },
-                        meta: None,
-                    }],
-                    meta: None,
-                }),
+                Ok(inner) => inner,
+                Err(error) => Err(JsonRpcError::internal_error(error.to_string())),
             })
         })
     }
@@ -314,9 +320,10 @@ where
     F: Fn(HashMap<String, String>) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Result<GetPromptResult>> + Send + 'static,
 {
-    type Response = GetPromptResult;
-    type Error = Error;
-    type Future = Pin<Box<dyn Future<Output = std::result::Result<GetPromptResult, Error>> + Send>>;
+    type Response = std::result::Result<GetPromptResult, JsonRpcError>;
+    type Error = Infallible;
+    type Future =
+        Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Infallible>> + Send>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
@@ -324,7 +331,11 @@ where
 
     fn call(&mut self, req: PromptRequest) -> Self::Future {
         let handler = self.handler.clone();
-        Box::pin(async move { handler(req.arguments).await })
+        Box::pin(async move {
+            Ok(handler(req.arguments)
+                .await
+                .map_err(Error::into_json_rpc_error))
+        })
     }
 }
 
@@ -357,10 +368,10 @@ where
     F: Fn(RequestContext, HashMap<String, String>) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Result<RequestOutcome<GetPromptResult>>> + Send + 'static,
 {
-    type Response = RequestOutcome<GetPromptResult>;
-    type Error = Error;
+    type Response = std::result::Result<RequestOutcome<GetPromptResult>, JsonRpcError>;
+    type Error = Infallible;
     type Future =
-        Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
+        Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Infallible>> + Send>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
@@ -368,7 +379,11 @@ where
 
     fn call(&mut self, req: PromptRequest) -> Self::Future {
         let handler = self.handler.clone();
-        Box::pin(async move { handler(req.context, req.arguments).await })
+        Box::pin(async move {
+            Ok(handler(req.context, req.arguments)
+                .await
+                .map_err(Error::into_json_rpc_error))
+        })
     }
 }
 
@@ -388,9 +403,10 @@ where
     F: Fn(RequestContext, HashMap<String, String>) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Result<GetPromptResult>> + Send + 'static,
 {
-    type Response = GetPromptResult;
-    type Error = Error;
-    type Future = Pin<Box<dyn Future<Output = std::result::Result<GetPromptResult, Error>> + Send>>;
+    type Response = std::result::Result<GetPromptResult, JsonRpcError>;
+    type Error = Infallible;
+    type Future =
+        Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Infallible>> + Send>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
@@ -398,7 +414,11 @@ where
 
     fn call(&mut self, req: PromptRequest) -> Self::Future {
         let handler = self.handler.clone();
-        Box::pin(async move { handler(req.context, req.arguments).await })
+        Box::pin(async move {
+            Ok(handler(req.context, req.arguments)
+                .await
+                .map_err(Error::into_json_rpc_error))
+        })
     }
 }
 
@@ -563,9 +583,8 @@ impl Prompt {
     /// and cancellation are inert. The router calls
     /// [`get_with_context`](Self::get_with_context) instead.
     ///
-    /// Whether a handler error arrives as `Err` or as an assistant message
-    /// depends on whether the prompt carries middleware; see the [module
-    /// documentation](crate::prompt).
+    /// A handler error arrives as `Err` whether or not the prompt carries
+    /// middleware; see the [module documentation](crate::prompt).
     pub fn get(
         &self,
         arguments: HashMap<String, String>,
@@ -793,8 +812,8 @@ impl PromptBuilder {
     ///
     /// The handler is called with whatever arguments the client sent, as
     /// strings, with no entry at all for the ones it left out. Finish with
-    /// `.build()`, or apply middleware with `.layer()` first, remembering that
-    /// a layer turns handler errors into prompt content.
+    /// `.build()`, or apply middleware with `.layer()` first; a handler's
+    /// `Err` propagates the same way either way.
     ///
     /// # Sharing State
     ///
@@ -1108,7 +1127,10 @@ where
     pub fn layer<L>(self, layer: L) -> Prompt
     where
         L: Layer<PromptHandlerService<F>> + Send + Sync + 'static,
-        L::Service: Service<PromptRequest, Response = GetPromptResult> + Clone + Send + 'static,
+        L::Service: Service<PromptRequest, Response = std::result::Result<GetPromptResult, JsonRpcError>>
+            + Clone
+            + Send
+            + 'static,
         <L::Service as Service<PromptRequest>>::Error: fmt::Display + Send,
         <L::Service as Service<PromptRequest>>::Future: Send,
     {
@@ -1157,14 +1179,17 @@ where
     /// Apply a Tower layer to every attempt at this MRTR-capable prompt.
     ///
     /// Each retry is an independent request, so the layer runs once per
-    /// round. Middleware failures become complete prompt error results,
-    /// matching non-MRTR prompt middleware.
+    /// round. A genuine middleware failure is sanitized to a `-32603`
+    /// JSON-RPC error, matching non-MRTR prompt middleware; the handler's
+    /// own error, if any, rides through untouched.
     #[allow(private_bounds)]
     pub fn layer<L>(self, layer: L) -> Prompt
     where
         L: Layer<MrtrPromptHandlerService<F>> + Send + Sync + 'static,
-        L::Service: Service<PromptRequest, Response = RequestOutcome<GetPromptResult>>
-            + Clone
+        L::Service: Service<
+                PromptRequest,
+                Response = std::result::Result<RequestOutcome<GetPromptResult>, JsonRpcError>,
+            > + Clone
             + Send
             + 'static,
         <L::Service as Service<PromptRequest>>::Error: fmt::Display + Send + 'static,
@@ -1225,7 +1250,10 @@ where
     pub fn layer<L>(self, layer: L) -> Prompt
     where
         L: Layer<PromptContextHandlerService<F>> + Send + Sync + 'static,
-        L::Service: Service<PromptRequest, Response = GetPromptResult> + Clone + Send + 'static,
+        L::Service: Service<PromptRequest, Response = std::result::Result<GetPromptResult, JsonRpcError>>
+            + Clone
+            + Send
+            + 'static,
         <L::Service as Service<PromptRequest>>::Error: fmt::Display + Send,
         <L::Service as Service<PromptRequest>>::Future: Send,
     {
@@ -1301,7 +1329,7 @@ impl MrtrPromptHandler for ServiceMrtrPromptHandler {
                 .call(request)
                 .await
                 .expect("MRTR prompt service is infallible");
-            Ok(outcome)
+            outcome.map_err(Into::into)
         })
     }
 }
@@ -1359,8 +1387,12 @@ impl PromptHandler for ServiceHandler {
         Box::pin(async move {
             let req = PromptRequest::with_arguments(arguments);
             let mut service = self.service.lock().await.clone();
-            match service.ready().await {
-                Ok(svc) => svc.call(req).await.map_err(|e| match e {}),
+            let outcome = match service.ready().await {
+                Ok(svc) => svc.call(req).await,
+                Err(e) => match e {},
+            };
+            match outcome {
+                Ok(inner) => inner.map_err(Into::into),
                 Err(e) => match e {},
             }
         })
@@ -1374,8 +1406,12 @@ impl PromptHandler for ServiceHandler {
         Box::pin(async move {
             let req = PromptRequest::new(ctx, arguments);
             let mut service = self.service.lock().await.clone();
-            match service.ready().await {
-                Ok(svc) => svc.call(req).await.map_err(|e| match e {}),
+            let outcome = match service.ready().await {
+                Ok(svc) => svc.call(req).await,
+                Err(e) => match e {},
+            };
+            match outcome {
+                Ok(inner) => inner.map_err(Into::into),
                 Err(e) => match e {},
             }
         })
@@ -1401,8 +1437,12 @@ impl PromptHandler for ServiceContextHandler {
         Box::pin(async move {
             let req = PromptRequest::new(ctx, arguments);
             let mut service = self.service.lock().await.clone();
-            match service.ready().await {
-                Ok(svc) => svc.call(req).await.map_err(|e| match e {}),
+            let outcome = match service.ready().await {
+                Ok(svc) => svc.call(req).await,
+                Err(e) => match e {},
+            };
+            match outcome {
+                Ok(inner) => inner.map_err(Into::into),
                 Err(e) => match e {},
             }
         })
@@ -1746,16 +1786,12 @@ mod tests {
             })
             .layer(TimeoutLayer::new(Duration::from_millis(50)));
 
-        let result = prompt.get(HashMap::new()).await.unwrap();
-
-        // Should get an error message due to timeout
-        assert!(result.description.as_ref().unwrap().contains("error"));
-        match &result.messages[0].content {
-            Content::Text { text, .. } => {
-                assert!(text.contains("Error generating prompt"));
-            }
-            _ => panic!("Expected text content"),
-        }
+        // The timeout is a genuine middleware failure (#1280), not the
+        // handler's own error, so it propagates as an Err sanitized to
+        // -32603 rather than becoming a successful prompt whose assistant
+        // message carries the error text.
+        let error = prompt.get(HashMap::new()).await.unwrap_err();
+        assert!(error.to_string().contains("-32603"));
     }
 
     #[tokio::test]
@@ -1969,24 +2005,12 @@ mod tests {
             })
             .layer(TimeoutLayer::new(Duration::from_millis(10)));
 
-        // The prompt goes through ServiceHandler -> PromptCatchError which
-        // converts the timeout error into a GetPromptResult with an error message.
-        // The .get() method delegates through the handler trait.
-        let result = prompt.get(HashMap::new()).await;
-        // PromptCatchError converts middleware errors to Ok(GetPromptResult)
-        // with the error message in the prompt content.
-        match result {
-            Ok(r) => {
-                // Should contain timeout error text in the message
-                assert!(
-                    !r.messages.is_empty(),
-                    "Expected error message in prompt result"
-                );
-            }
-            Err(_) => {
-                // Also acceptable -- error propagated directly
-            }
-        }
+        // The prompt goes through ServiceHandler -> PromptCatchError. The
+        // timeout is a genuine middleware failure (#1280), so it comes back
+        // as a sanitized Err, not a successful GetPromptResult with the
+        // error text folded into the content.
+        let error = prompt.get(HashMap::new()).await.unwrap_err();
+        assert!(error.to_string().contains("-32603"));
     }
 
     #[tokio::test]

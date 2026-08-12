@@ -609,6 +609,35 @@ impl Error {
     pub fn internal(message: impl Into<String>) -> Self {
         Error::JsonRpc(JsonRpcError::internal_error(message))
     }
+
+    /// Convert into the JSON-RPC error a client will see for this failure.
+    ///
+    /// A structured [`Error::JsonRpc`] is returned as-is, preserving its
+    /// code and message. Every other variant is sanitized to `-32603`
+    /// (Internal Error) using the error's `Display` text, the same policy
+    /// `McpRouter`'s top-level dispatch and `transport::service::CatchError`
+    /// already apply. Callers that sit in front of a `Service` boundary
+    /// (a resource or prompt handler wrapper, for instance) use this to
+    /// convert their own error before it ever reaches a Tower layer, so a
+    /// structured error rides through middleware untouched and only a
+    /// genuine middleware failure needs sanitizing.
+    ///
+    /// ```rust
+    /// # use tower_mcp_types::Error;
+    /// # use tower_mcp_types::error::ErrorCode;
+    /// let structured = Error::invalid_params("bad shape").into_json_rpc_error();
+    /// assert_eq!(structured.code, ErrorCode::InvalidParams.code());
+    ///
+    /// let opaque = Error::Internal("db pool exhausted".to_string()).into_json_rpc_error();
+    /// assert_eq!(opaque.code, ErrorCode::InternalError.code());
+    /// assert!(opaque.message.contains("db pool exhausted"));
+    /// ```
+    pub fn into_json_rpc_error(self) -> JsonRpcError {
+        match self {
+            Error::JsonRpc(err) => err,
+            other => JsonRpcError::internal_error(other.to_string()),
+        }
+    }
 }
 
 /// Extension trait for converting errors into tower-mcp tool errors.
@@ -894,6 +923,29 @@ mod tests {
         assert_eq!(result.tool_err().unwrap(), 42);
         let result: std::result::Result<i32, std::io::Error> = Ok(42);
         assert_eq!(result.tool_context("should not appear").unwrap(), 42);
+    }
+
+    // =========================================================================
+    // #1280: Error::into_json_rpc_error, structured-preserve / opaque-sanitize
+    // =========================================================================
+
+    #[test]
+    fn into_json_rpc_error_preserves_a_structured_error() {
+        let err = Error::JsonRpc(JsonRpcError::invalid_params("bad shape"));
+        let json = err.into_json_rpc_error();
+        assert_eq!(json.code, ErrorCode::InvalidParams.code());
+        assert_eq!(json.message, "bad shape");
+    }
+
+    #[test]
+    fn into_json_rpc_error_sanitizes_an_opaque_error_to_internal_error() {
+        let err = Error::Internal("db pool exhausted".to_string());
+        let json = err.into_json_rpc_error();
+        assert_eq!(json.code, ErrorCode::InternalError.code());
+        // This crate's existing convention (matched by `CatchError` in
+        // `tower-mcp::transport::service`) is to include the `Display` text
+        // in the sanitized message rather than a bare placeholder.
+        assert!(json.message.contains("db pool exhausted"));
     }
 }
 

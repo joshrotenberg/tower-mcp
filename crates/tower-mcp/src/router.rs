@@ -4433,15 +4433,11 @@ impl Service<RouterRequest> for McpRouter {
             let result = router.handle(req.id, req.inner, req.extensions).await;
             Ok(RouterResponse {
                 id: request_id,
-                // Map tower-mcp errors to JSON-RPC errors:
-                // - Error::JsonRpc: forwarded as-is (preserves original code)
-                // - Error::Tool: mapped to -32603 (Internal Error)
-                // - All others: mapped to -32603 (Internal Error)
-                inner: result.map_err(|e| match e {
-                    Error::JsonRpc(err) => err,
-                    Error::Tool(err) => JsonRpcError::internal_error(err.to_string()),
-                    e => JsonRpcError::internal_error(e.to_string()),
-                }),
+                // Map tower-mcp errors to JSON-RPC errors: a structured
+                // Error::JsonRpc is forwarded as-is (preserves the original
+                // code and message); everything else is sanitized to
+                // -32603 (Internal Error). See Error::into_json_rpc_error.
+                inner: result.map_err(Error::into_json_rpc_error),
             })
         })
     }

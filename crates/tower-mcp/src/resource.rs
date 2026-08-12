@@ -36,15 +36,25 @@
 //! accepts a handler that can suspend and ask the client for more input
 //! (SEP-2322).
 //!
-//! # A failing resource handler is not a failed request
+//! # A failing resource handler is a failed request
 //!
 //! Every [`Resource`] handler is wrapped in an error-catching service, because
-//! a Tower stack composes only when the inner service cannot fail. An `Err`
-//! from the handler, or from middleware such as a timeout, therefore reaches
-//! the client as a successful read whose text is the error message, not as a
-//! JSON-RPC error. [`ResourceTemplate`] handlers are not wrapped: their errors
-//! propagate and the router reports them as JSON-RPC errors. See
-//! [`Resource::read`] for a worked example of the difference.
+//! a Tower stack composes only when the inner service cannot fail at the
+//! Tower level. The wrapper does not discard the handler's error, though: it
+//! converts the handler's own error into a structured JSON-RPC error before
+//! any layer sees it, so that error rides through the middleware stack
+//! untouched and the router reports it exactly the way it would for a
+//! [`ResourceTemplate`] (whose handler is never wrapped at all). Only a
+//! genuine failure at the Tower level -- a timeout, a rate limit, anything
+//! from a layer rather than from the handler -- is sanitized to a generic
+//! `-32603` Internal Error.
+//!
+//! [`Resource::read`] and [`Resource::read_with_context`] are the one
+//! exception: their signatures return [`ReadResourceResult`] rather than a
+//! `Result`, so they have nowhere to put an error and still render one as
+//! content. The router does not use them; it calls
+//! [`Resource::read_outcome_with_context`], which does return a `Result` and
+//! is what a client actually sees.
 //!
 //! # Per-resource middleware
 //!
@@ -118,7 +128,7 @@ use tower_service::Service;
 use tokio::sync::Mutex;
 
 use crate::context::RequestContext;
-use crate::error::{Error, Result};
+use crate::error::{Error, JsonRpcError, Result};
 use crate::protocol::{
     ContentAnnotations, PromptArgument, ReadResourceResult, RequestOutcome, ResourceContent,
     ResourceDefinition, ResourceTemplateDefinition, ToolIcon,
@@ -150,13 +160,25 @@ impl ResourceRequest {
 
 /// A boxed, cloneable resource service with `Error = Infallible`.
 ///
-/// This is the internal service type that resources use. Middleware errors are
-/// caught and converted to error results, so the service never fails at the Tower level.
-pub type BoxResourceService = BoxCloneService<ResourceRequest, ReadResourceResult, Infallible>;
+/// This is the internal service type that resources use. The service itself
+/// never fails at the Tower level (`Error = Infallible`), which is what lets
+/// `.layer()` compose; whether the read succeeded is carried instead in the
+/// success value, `Ok(ReadResourceResult)` or `Err(JsonRpcError)`. A
+/// structured `JsonRpcError` here is the handler's own error, converted
+/// before it reached any layer; [`ResourceCatchError`] only ever produces
+/// one itself for a genuine middleware failure (a timeout, a rate limit).
+pub type BoxResourceService = BoxCloneService<
+    ResourceRequest,
+    std::result::Result<ReadResourceResult, JsonRpcError>,
+    Infallible,
+>;
 
 #[cfg(feature = "stateless")]
-type BoxMrtrResourceService =
-    BoxCloneService<ResourceRequest, RequestOutcome<ReadResourceResult>, Infallible>;
+type BoxMrtrResourceService = BoxCloneService<
+    ResourceRequest,
+    std::result::Result<RequestOutcome<ReadResourceResult>, JsonRpcError>,
+    Infallible,
+>;
 
 /// Catches errors from the inner service and converts them to error results.
 ///
@@ -197,35 +219,32 @@ pin_project! {
     pub struct ResourceCatchErrorFuture<F> {
         #[pin]
         inner: F,
-        uri: Option<String>,
     }
 }
 
 impl<F, E> Future for ResourceCatchErrorFuture<F>
 where
-    F: Future<Output = std::result::Result<ReadResourceResult, E>>,
+    F: Future<
+        Output = std::result::Result<std::result::Result<ReadResourceResult, JsonRpcError>, E>,
+    >,
     E: fmt::Display,
 {
-    type Output = std::result::Result<ReadResourceResult, Infallible>;
+    type Output =
+        std::result::Result<std::result::Result<ReadResourceResult, JsonRpcError>, Infallible>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
         match this.inner.poll(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(result)) => Poll::Ready(Ok(result)),
+            // The inner service already decided: either the read succeeded,
+            // or the handler's own error was already converted to a
+            // structured JsonRpcError. Either way, pass it through untouched.
+            Poll::Ready(Ok(inner)) => Poll::Ready(Ok(inner)),
+            // The inner service itself failed at the Tower level: a genuine
+            // middleware failure (timeout, rate limit, ...), not the
+            // handler's own error. Sanitize it to a generic Internal Error.
             Poll::Ready(Err(err)) => {
-                let uri = this.uri.take().unwrap_or_default();
-                Poll::Ready(Ok(ReadResourceResult {
-                    contents: vec![ResourceContent {
-                        uri,
-                        mime_type: Some("text/plain".to_string()),
-                        text: Some(format!("Error reading resource: {}", err)),
-                        blob: None,
-                        meta: None,
-                    }],
-                    meta: None,
-                    ..Default::default()
-                }))
+                Poll::Ready(Ok(Err(JsonRpcError::internal_error(err.to_string()))))
             }
         }
     }
@@ -233,11 +252,14 @@ where
 
 impl<S> Service<ResourceRequest> for ResourceCatchError<S>
 where
-    S: Service<ResourceRequest, Response = ReadResourceResult> + Clone + Send + 'static,
+    S: Service<ResourceRequest, Response = std::result::Result<ReadResourceResult, JsonRpcError>>
+        + Clone
+        + Send
+        + 'static,
     S::Error: fmt::Display + Send,
     S::Future: Send,
 {
-    type Response = ReadResourceResult;
+    type Response = std::result::Result<ReadResourceResult, JsonRpcError>;
     type Error = Infallible;
     type Future = ResourceCatchErrorFuture<S::Future>;
 
@@ -251,13 +273,9 @@ where
     }
 
     fn call(&mut self, req: ResourceRequest) -> Self::Future {
-        let uri = req.uri.clone();
         let fut = self.inner.call(req);
 
-        ResourceCatchErrorFuture {
-            inner: fut,
-            uri: Some(uri),
-        }
+        ResourceCatchErrorFuture { inner: fut }
     }
 }
 
@@ -277,14 +295,16 @@ impl<S> MrtrResourceCatchError<S> {
 #[cfg(feature = "stateless")]
 impl<S> Service<ResourceRequest> for MrtrResourceCatchError<S>
 where
-    S: Service<ResourceRequest, Response = RequestOutcome<ReadResourceResult>>
-        + Clone
+    S: Service<
+            ResourceRequest,
+            Response = std::result::Result<RequestOutcome<ReadResourceResult>, JsonRpcError>,
+        > + Clone
         + Send
         + 'static,
     S::Error: fmt::Display + Send + 'static,
     S::Future: Send + 'static,
 {
-    type Response = RequestOutcome<ReadResourceResult>;
+    type Response = std::result::Result<RequestOutcome<ReadResourceResult>, JsonRpcError>;
     type Error = Infallible;
     type Future =
         Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
@@ -297,22 +317,11 @@ where
     }
 
     fn call(&mut self, req: ResourceRequest) -> Self::Future {
-        let uri = req.uri.clone();
         let future = self.inner.call(req);
         Box::pin(async move {
             Ok(match future.await {
-                Ok(outcome) => outcome,
-                Err(error) => RequestOutcome::Complete(ReadResourceResult {
-                    contents: vec![ResourceContent {
-                        uri,
-                        mime_type: Some("text/plain".to_string()),
-                        text: Some(format!("Error reading resource: {error}")),
-                        blob: None,
-                        meta: None,
-                    }],
-                    meta: None,
-                    ..Default::default()
-                }),
+                Ok(inner) => inner,
+                Err(error) => Err(JsonRpcError::internal_error(error.to_string())),
             })
         })
     }
@@ -378,10 +387,10 @@ impl<H> Service<ResourceRequest> for MrtrResourceHandlerService<H>
 where
     H: MrtrResourceHandler + 'static,
 {
-    type Response = RequestOutcome<ReadResourceResult>;
-    type Error = Error;
+    type Response = std::result::Result<RequestOutcome<ReadResourceResult>, JsonRpcError>;
+    type Error = Infallible;
     type Future =
-        Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
+        Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Infallible>> + Send>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
@@ -389,7 +398,12 @@ where
 
     fn call(&mut self, req: ResourceRequest) -> Self::Future {
         let handler = self.handler.clone();
-        Box::pin(async move { handler.read(req.ctx).await })
+        Box::pin(async move {
+            Ok(handler
+                .read(req.ctx)
+                .await
+                .map_err(Error::into_json_rpc_error))
+        })
     }
 }
 
@@ -415,7 +429,7 @@ impl MrtrResourceHandler for ServiceMrtrResourceHandler {
                 .call(request)
                 .await
                 .expect("MRTR resource service is infallible");
-            Ok(outcome)
+            outcome.map_err(Into::into)
         })
     }
 }
@@ -455,10 +469,10 @@ impl<H> Service<ResourceRequest> for ResourceHandlerService<H>
 where
     H: ResourceHandler + 'static,
 {
-    type Response = ReadResourceResult;
-    type Error = Error;
+    type Response = std::result::Result<ReadResourceResult, JsonRpcError>;
+    type Error = Infallible;
     type Future =
-        Pin<Box<dyn Future<Output = std::result::Result<ReadResourceResult, Error>> + Send>>;
+        Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Infallible>> + Send>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
@@ -466,7 +480,12 @@ where
 
     fn call(&mut self, req: ResourceRequest) -> Self::Future {
         let handler = self.handler.clone();
-        Box::pin(async move { handler.read_with_context(req.ctx).await })
+        Box::pin(async move {
+            Ok(handler
+                .read_with_context(req.ctx)
+                .await
+                .map_err(Error::into_json_rpc_error))
+        })
     }
 }
 
@@ -605,10 +624,13 @@ impl Resource {
     /// [`ResourceBuilder::handler`], which never see the context anyway. The
     /// transports call [`read_with_context`](Self::read_with_context).
     ///
-    /// There is no `Result` here because a handler error has already been
-    /// turned into the value returned. That is the cost of letting middleware
-    /// compose onto a resource, and it means a failed read still looks like a
-    /// read: the error text arrives as content.
+    /// There is no `Result` here because this method's own signature has no
+    /// room for one: it returns [`ReadResourceResult`] outright, so a handler
+    /// error is rendered as content instead. That is purely a property of
+    /// this convenience method, not of how a resource's error is handled in
+    /// general; the protocol-facing path,
+    /// [`read_outcome_with_context`](Self::read_outcome_with_context), does
+    /// return a `Result` and is what the router and a real client see.
     ///
     /// ```rust
     /// use tower_mcp::error::Error;
@@ -626,8 +648,8 @@ impl Resource {
     /// # });
     /// ```
     ///
-    /// A [`ResourceTemplate`] handler behaves the other way round: its errors
-    /// stay errors, and [`ResourceTemplate::read`] returns a `Result`.
+    /// [`ResourceTemplate::read`] has no such convenience wrapper and always
+    /// returns a `Result`.
     pub fn read(&self) -> BoxFuture<'static, ReadResourceResult> {
         let ctx = RequestContext::new(crate::protocol::RequestId::Number(0));
         self.read_with_context(ctx)
@@ -635,17 +657,18 @@ impl Resource {
 
     /// Read the resource with the request context the transport built.
     ///
-    /// This is the path the router takes. The context carries the request id,
-    /// progress reporting, the cancellation token, and the client requester
-    /// used for sampling and elicitation. Handlers registered through
-    /// [`ResourceBuilder::handler`] ignore it; those registered through
+    /// The context carries the request id, progress reporting, the
+    /// cancellation token, and the client requester used for sampling and
+    /// elicitation. Handlers registered through [`ResourceBuilder::handler`]
+    /// ignore it; those registered through
     /// [`ResourceBuilder::handler_with_context`] receive it.
     ///
-    /// Errors become content rather than a `Result`, as described on
-    /// [`read`](Self::read). A handler that suspends for client input is
-    /// reported the same way, since this signature has nowhere to put a
-    /// continuation; use [`read_outcome_with_context`](Self::read_outcome_with_context)
-    /// for that.
+    /// This signature has no room for an error or for an SEP-2322
+    /// continuation, so both are rendered as content, the same way
+    /// [`read`](Self::read) does. The router does not call this method: it
+    /// calls [`read_outcome_with_context`](Self::read_outcome_with_context),
+    /// which returns a `Result` and preserves a continuation instead of
+    /// flattening it.
     pub fn read_with_context(&self, ctx: RequestContext) -> BoxFuture<'static, ReadResourceResult> {
         let resource = self.clone();
         let uri = self.uri.clone();
@@ -703,7 +726,10 @@ impl Resource {
                 .oneshot(ResourceRequest::new(ctx, uri))
                 .await
                 .unwrap();
-            Ok(RequestOutcome::Complete(result))
+            match result {
+                Ok(read_result) => Ok(RequestOutcome::Complete(read_result)),
+                Err(json_rpc_err) => Err(json_rpc_err.into()),
+            }
         })
     }
 
@@ -1234,8 +1260,9 @@ where
     /// Apply a Tower layer to every attempt at this MRTR-capable resource.
     ///
     /// Each retry is an independent request, so the layer runs once per
-    /// round. Middleware failures become complete resource error results,
-    /// matching non-MRTR resource middleware.
+    /// round. A genuine middleware failure is sanitized to a `-32603`
+    /// JSON-RPC error, matching non-MRTR resource middleware; the handler's
+    /// own error, if any, rides through untouched.
     pub fn layer<L>(self, layer: L) -> ResourceBuilderWithMrtrLayer<F, L> {
         ResourceBuilderWithMrtrLayer {
             uri: self.uri,
@@ -1263,8 +1290,10 @@ where
         + Send
         + Sync
         + 'static,
-    L::Service: Service<ResourceRequest, Response = RequestOutcome<ReadResourceResult>>
-        + Clone
+    L::Service: Service<
+            ResourceRequest,
+            Response = std::result::Result<RequestOutcome<ReadResourceResult>, JsonRpcError>,
+        > + Clone
         + Send
         + 'static,
     <L::Service as Service<ResourceRequest>>::Error: fmt::Display + Send + 'static,
@@ -1413,7 +1442,10 @@ where
     F: Fn() -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<ReadResourceResult>> + Send + 'static,
     L: tower::Layer<ResourceHandlerService<FnHandler<F>>> + Clone + Send + Sync + 'static,
-    L::Service: Service<ResourceRequest, Response = ReadResourceResult> + Clone + Send + 'static,
+    L::Service: Service<ResourceRequest, Response = std::result::Result<ReadResourceResult, JsonRpcError>>
+        + Clone
+        + Send
+        + 'static,
     <L::Service as Service<ResourceRequest>>::Error: fmt::Display + Send,
     <L::Service as Service<ResourceRequest>>::Future: Send,
 {
@@ -1544,7 +1576,10 @@ where
     F: Fn(RequestContext) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<ReadResourceResult>> + Send + 'static,
     L: tower::Layer<ResourceHandlerService<ContextAwareHandler<F>>> + Clone + Send + Sync + 'static,
-    L::Service: Service<ResourceRequest, Response = ReadResourceResult> + Clone + Send + 'static,
+    L::Service: Service<ResourceRequest, Response = std::result::Result<ReadResourceResult, JsonRpcError>>
+        + Clone
+        + Send
+        + 'static,
     <L::Service as Service<ResourceRequest>>::Error: fmt::Display + Send,
     <L::Service as Service<ResourceRequest>>::Future: Send,
 {
@@ -3146,14 +3181,11 @@ mod tests {
             .build();
 
         let result = resource.read().await;
-        // Timeout error should be caught and converted to error content
-        assert!(
-            result.contents[0]
-                .text
-                .as_ref()
-                .unwrap()
-                .contains("Error reading resource")
-        );
+        // read() still renders an error as content, since its signature has
+        // no room for a Result. The timeout is a genuine middleware
+        // failure (#1280), so it is sanitized to -32603 rather than
+        // leaking the raw middleware error.
+        assert!(result.contents[0].text.as_ref().unwrap().contains("-32603"));
     }
 
     #[tokio::test]
