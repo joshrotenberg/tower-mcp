@@ -20,6 +20,12 @@ use tower_mcp::{CallToolResult, McpRouter, StdioTransport, ToolBuilder};
 type ServerFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 type Serve = fn(McpRouter, DuplexStream, DuplexStream) -> ServerFuture;
 
+/// The one configuration that suppresses server-to-client notifications.
+///
+/// Named so the table entry and the assertion that singles it out cannot
+/// drift apart.
+const SILENT: &str = "without_server_notifications";
+
 /// Every stdio configuration a server can reasonably be run in.
 fn configurations() -> Vec<(&'static str, Serve)> {
     fn plain(router: McpRouter, stdin: DuplexStream, stdout: DuplexStream) -> ServerFuture {
@@ -72,7 +78,7 @@ fn configurations() -> Vec<(&'static str, Serve)> {
     vec![
         ("plain", plain as Serve),
         ("layered", layered as Serve),
-        ("without_server_notifications", silent as Serve),
+        (SILENT, silent as Serve),
         ("max_concurrent_requests(1)", serial as Serve),
         ("max_concurrent_requests(4)", capped as Serve),
         ("drain_timeout", bounded_drain as Serve),
@@ -93,6 +99,13 @@ fn router() -> McpRouter {
             Ok(CallToolResult::text("cancelled"))
         })
         .build();
+    let notify = ToolBuilder::new("notify")
+        .description("Emits a progress notification, then answers")
+        .extractor_handler((), |ctx: Context, RawArgs(_): RawArgs| async move {
+            ctx.report_progress(1.0, Some(1.0), Some("done")).await;
+            Ok(CallToolResult::text("notified"))
+        })
+        .build();
     let slow = ToolBuilder::new("slow")
         .description("Takes a moment")
         .extractor_handler((), |_ctx: Context, RawArgs(_): RawArgs| async move {
@@ -104,6 +117,7 @@ fn router() -> McpRouter {
         .server_info("matrix", "0.0.0")
         .tool(echo)
         .tool(wait)
+        .tool(notify)
         .tool(slow)
 }
 
@@ -113,6 +127,14 @@ const INITIALIZED: &str = r#"{"jsonrpc":"2.0","method":"notifications/initialize
 fn call(id: u32, tool: &str) -> String {
     format!(
         r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"{tool}","arguments":{{}}}}}}"#
+    )
+}
+
+/// A call carrying a progress token, which is what makes `report_progress`
+/// emit anything at all.
+fn call_with_progress(id: u32, tool: &str, token: &str) -> String {
+    format!(
+        r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"{tool}","arguments":{{}},"_meta":{{"progressToken":"{token}"}}}}}}"#
     )
 }
 
@@ -134,6 +156,52 @@ where
     out
 }
 
+/// Read up to `want` frames, stopping early once `quiet` passes with nothing
+/// arriving.
+///
+/// The counterpart of [`read_n_frames`], for the assertions that are about a
+/// frame *not* arriving: waiting for a fixed count cannot tell "suppressed"
+/// from "slow".
+async fn read_frames_until_quiet<R>(
+    mut reader: BufReader<R>,
+    want: usize,
+    quiet: Duration,
+) -> Vec<serde_json::Value>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut out = Vec::with_capacity(want);
+    while out.len() < want {
+        let mut line = String::new();
+        match timeout(quiet, reader.read_line(&mut line)).await {
+            // Nothing more is coming, which is the answer for a suppressed
+            // notification.
+            Err(_) => break,
+            Ok(read) => {
+                if read.expect("read") == 0 {
+                    break;
+                }
+            }
+        }
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            out.push(serde_json::from_str(trimmed).expect("valid JSON frame"));
+        }
+    }
+    out
+}
+
+/// Spawn one configuration with its streams wired up.
+///
+/// The writer is returned rather than dropped: closing stdin is end of input
+/// to the server, and these tests need it open while they read.
+fn spawn(serve: Serve) -> (DuplexStream, BufReader<DuplexStream>) {
+    let (writer, server_stdin) = tokio::io::duplex(8192);
+    let (server_stdout, reader) = tokio::io::duplex(8192);
+    tokio::spawn(serve(router(), server_stdin, server_stdout));
+    (writer, BufReader::new(reader))
+}
+
 /// Drive one configuration: write `before`, pause so the server registers
 /// them, write `after`, then read `expected` frames.
 async fn exchange(
@@ -142,9 +210,7 @@ async fn exchange(
     after: &[String],
     expected: usize,
 ) -> Vec<serde_json::Value> {
-    let (mut writer, server_stdin) = tokio::io::duplex(8192);
-    let (server_stdout, reader) = tokio::io::duplex(8192);
-    tokio::spawn(serve(router(), server_stdin, server_stdout));
+    let (mut writer, reader) = spawn(serve);
 
     for line in before {
         writer.write_all(line.as_bytes()).await.unwrap();
@@ -164,12 +230,9 @@ async fn exchange(
         writer.flush().await.unwrap();
     }
 
-    timeout(
-        Duration::from_secs(10),
-        read_n_frames(BufReader::new(reader), expected),
-    )
-    .await
-    .expect("frames must arrive")
+    timeout(Duration::from_secs(10), read_n_frames(reader, expected))
+        .await
+        .expect("frames must arrive")
 }
 
 fn id_of(frame: &serde_json::Value) -> Option<i64> {
@@ -306,5 +369,63 @@ async fn an_in_flight_request_survives_end_of_input_everywhere() {
             .find(|f| id_of(f) == Some(2))
             .unwrap_or_else(|| panic!("[{name}] in-flight request dropped: {frames:?}"));
         assert_eq!(answer["result"]["content"][0]["text"], "slow", "[{name}]");
+    }
+}
+
+/// Server-to-client notifications route in every configuration that has not
+/// turned them off, and in exactly none of the one that has.
+///
+/// The last of the four assertions #1258 asked this file to share. It is the
+/// only one whose expected outcome differs per configuration, which is
+/// precisely why it is worth pinning: `without_server_notifications` is a
+/// documented suppression, and any other configuration swallowing a
+/// notification is the #1250 shape rather than a feature.
+#[tokio::test]
+async fn server_notifications_route_everywhere_except_where_suppressed() {
+    for (name, serve) in configurations() {
+        let (mut writer, reader) = spawn(serve);
+        for line in [
+            INIT.to_string(),
+            INITIALIZED.to_string(),
+            call_with_progress(2, "notify", "tok"),
+        ] {
+            writer.write_all(line.as_bytes()).await.unwrap();
+            writer.write_all(b"\n").await.unwrap();
+        }
+        writer.flush().await.unwrap();
+
+        // Three frames at most: the initialize result, the progress
+        // notification, and the tool answer. Reading until quiet rather than
+        // to a fixed count is what lets the suppressed case be observed as an
+        // absence rather than a timeout.
+        let frames = read_frames_until_quiet(reader, 3, Duration::from_millis(750)).await;
+
+        let answered = frames
+            .iter()
+            .find(|f| id_of(f) == Some(2))
+            .unwrap_or_else(|| panic!("[{name}] the call was not answered: {frames:?}"));
+        assert_eq!(
+            answered["result"]["content"][0]["text"], "notified",
+            "[{name}] wrong answer"
+        );
+
+        let progress: Vec<_> = frames
+            .iter()
+            .filter(|f| f["method"] == "notifications/progress")
+            .collect();
+
+        if name == SILENT {
+            assert!(
+                progress.is_empty(),
+                "[{name}] notifications are turned off, so none may reach the client: {frames:?}"
+            );
+        } else {
+            assert_eq!(
+                progress.len(),
+                1,
+                "[{name}] the handler's notification must reach the client: {frames:?}"
+            );
+            assert_eq!(progress[0]["params"]["progressToken"], "tok");
+        }
     }
 }
