@@ -327,7 +327,10 @@ impl Validate for StaticBearerValidator {
 /// `Bearer`, and `BEARER` are the same scheme. Comparing bytes directly keeps
 /// this allocation-free, and the token after the space is returned untouched
 /// because only the scheme is case-insensitive, never the credential (#1276).
-fn strip_scheme<'a>(header: &'a str, scheme: &str) -> Option<&'a str> {
+///
+/// `pub(crate)` so [`crate::oauth::middleware`] can share this implementation
+/// rather than growing a second, divergent copy (#1337).
+pub(crate) fn strip_scheme<'a>(header: &'a str, scheme: &str) -> Option<&'a str> {
     let rest = header.get(..scheme.len())?;
     if !rest.eq_ignore_ascii_case(scheme) {
         return None;

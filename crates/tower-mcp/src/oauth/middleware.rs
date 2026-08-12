@@ -139,12 +139,14 @@ where
                 return inner.oneshot(req).await;
             }
 
-            // Extract bearer token
+            // Extract bearer token. The scheme is matched case-insensitively
+            // per RFC 7235 via the shared `strip_scheme` helper; the
+            // credential itself stays case-sensitive.
             let token = req
                 .headers()
                 .get(header::AUTHORIZATION)
                 .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.strip_prefix("Bearer "))
+                .and_then(|s| crate::auth::strip_scheme(s, "Bearer"))
                 .map(|t| t.trim().to_string());
 
             let resource_metadata_url = metadata.well_known_url().ok();
@@ -300,6 +302,63 @@ mod tests {
         let resp = service.ready().await.unwrap().call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert!(resp.headers().contains_key("WWW-Authenticate"));
+    }
+
+    #[tokio::test]
+    async fn test_bearer_scheme_is_case_insensitive() {
+        let layer = OAuthLayer::new(test_validator(), test_metadata());
+        let mut service = layer.layer(OkService);
+
+        let token = make_token(&serde_json::json!({"sub": "user123"}));
+
+        for scheme in ["Bearer", "bearer", "BEARER", "BeArEr"] {
+            let req = Request::builder()
+                .uri("/mcp")
+                .header("Authorization", format!("{scheme} {token}"))
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = service.ready().await.unwrap().call(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "scheme: {scheme}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bearer_like_scheme_is_rejected() {
+        let layer = OAuthLayer::new(test_validator(), test_metadata());
+        let mut service = layer.layer(OkService);
+
+        let token = make_token(&serde_json::json!({"sub": "user123"}));
+
+        // `Bearerish` must not match `Bearer`: the scheme is case-insensitive
+        // but it must still be exactly `Bearer`, followed by whitespace.
+        let req = Request::builder()
+            .uri("/mcp")
+            .header("Authorization", format!("Bearerish {token}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = service.ready().await.unwrap().call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_bearer_credential_stays_case_sensitive() {
+        let layer = OAuthLayer::new(test_validator(), test_metadata());
+        let mut service = layer.layer(OkService);
+
+        let token = make_token(&serde_json::json!({"sub": "user123"}));
+        let uppercased_token = token.to_uppercase();
+        assert_ne!(token, uppercased_token, "test token must contain letters");
+
+        let req = Request::builder()
+            .uri("/mcp")
+            .header("Authorization", format!("bearer {uppercased_token}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = service.ready().await.unwrap().call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
