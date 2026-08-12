@@ -765,6 +765,22 @@ struct McpRouterInner {
     /// Whether to advertise `resources.subscribe`. Defaults to true, which
     /// is what this router has always advertised when resources exist (#1261).
     advertise_resource_subscriptions: bool,
+    /// Explicit override for whether to advertise `tools.listChanged`.
+    /// `None` derives from whether a notification channel is attached, which
+    /// is what this router has always advertised (#1338).
+    advertise_tools_list_changed: Option<bool>,
+    /// Explicit override for whether to advertise `prompts.listChanged`.
+    /// `None` derives from whether a notification channel is attached, which
+    /// is what this router has always advertised (#1338).
+    advertise_prompts_list_changed: Option<bool>,
+    /// Explicit override for whether to advertise `resources.listChanged`.
+    /// `None` derives from whether a notification channel is attached, which
+    /// is what this router has always advertised (#1338).
+    advertise_resources_list_changed: Option<bool>,
+    /// Explicit override for whether to advertise the `logging` capability.
+    /// `None` derives from whether a notification channel is attached, which
+    /// is what this router has always advertised (#1338).
+    advertise_mcp_logging: Option<bool>,
     /// Live tasks currently running, keyed by task id (#1246).
     ///
     /// A live handler parks inside its own future rather than returning, so
@@ -956,6 +972,10 @@ impl McpRouter {
                 resource_templates: Vec::new(),
                 prompts: HashMap::new(),
                 advertise_resource_subscriptions: true,
+                advertise_tools_list_changed: None,
+                advertise_prompts_list_changed: None,
+                advertise_resources_list_changed: None,
+                advertise_mcp_logging: None,
                 live_tasks: Arc::new(Mutex::new(HashMap::new())),
                 in_flight: Arc::new(RwLock::new(HashMap::new())),
                 next_dispatch: Arc::new(AtomicU64::new(0)),
@@ -1597,6 +1617,137 @@ impl McpRouter {
     /// ```
     pub fn resource_subscriptions(mut self, advertise: bool) -> Self {
         Arc::make_mut(&mut self.inner).advertise_resource_subscriptions = advertise;
+        self
+    }
+
+    /// Whether to advertise `tools.listChanged`.
+    ///
+    /// Defaults to whether a notification channel is attached to this
+    /// router, which is what it has always advertised: choosing a transport
+    /// that installs the channel (for example `StdioTransport::new`)
+    /// promised `tools/list_changed` traffic even for a server that never
+    /// sends it. Pass `true` or `false` to declare the flag independently of
+    /// that channel (#1338).
+    ///
+    /// This affects advertisement only. Notifications are still routed
+    /// through the channel exactly as before; this only changes what
+    /// `initialize` reports.
+    ///
+    /// An explicit call here always wins over the notification-channel
+    /// default, including under `StdioTransport::without_server_notifications`
+    /// (#1257), which leaves the channel unattached. That method is the
+    /// all-or-nothing switch; this builder is the per-flag refinement
+    /// underneath it, so setting `tools_list_changed(true)` still advertises
+    /// the flag even though the transport will never emit it.
+    ///
+    /// ```rust
+    /// use tower_mcp::McpRouter;
+    ///
+    /// let router = McpRouter::new()
+    ///     .server_info("my-server", "1.0.0")
+    ///     .tools_list_changed(true);
+    /// ```
+    pub fn tools_list_changed(mut self, advertise: bool) -> Self {
+        Arc::make_mut(&mut self.inner).advertise_tools_list_changed = Some(advertise);
+        self
+    }
+
+    /// Whether to advertise `prompts.listChanged`.
+    ///
+    /// Defaults to whether a notification channel is attached to this
+    /// router, which is what it has always advertised: choosing a transport
+    /// that installs the channel (for example `StdioTransport::new`)
+    /// promised `prompts/list_changed` traffic even for a server that never
+    /// sends it. Pass `true` or `false` to declare the flag independently of
+    /// that channel (#1338).
+    ///
+    /// This affects advertisement only. Notifications are still routed
+    /// through the channel exactly as before; this only changes what
+    /// `initialize` reports.
+    ///
+    /// An explicit call here always wins over the notification-channel
+    /// default, including under `StdioTransport::without_server_notifications`
+    /// (#1257), which leaves the channel unattached. That method is the
+    /// all-or-nothing switch; this builder is the per-flag refinement
+    /// underneath it, so setting `prompts_list_changed(true)` still
+    /// advertises the flag even though the transport will never emit it.
+    ///
+    /// ```rust
+    /// use tower_mcp::McpRouter;
+    ///
+    /// let router = McpRouter::new()
+    ///     .server_info("my-server", "1.0.0")
+    ///     .prompts_list_changed(false);
+    /// ```
+    pub fn prompts_list_changed(mut self, advertise: bool) -> Self {
+        Arc::make_mut(&mut self.inner).advertise_prompts_list_changed = Some(advertise);
+        self
+    }
+
+    /// Whether to advertise `resources.listChanged`.
+    ///
+    /// Defaults to whether a notification channel is attached to this
+    /// router, which is what it has always advertised: choosing a transport
+    /// that installs the channel (for example `StdioTransport::new`)
+    /// promised `resources/list_changed` traffic even for a server that
+    /// never sends it. Pass `true` or `false` to declare the flag
+    /// independently of that channel (#1338).
+    ///
+    /// This affects advertisement only. Notifications are still routed
+    /// through the channel exactly as before; this only changes what
+    /// `initialize` reports. It is independent of
+    /// [`Self::resource_subscriptions`], which governs `resources.subscribe`
+    /// rather than `resources.listChanged`.
+    ///
+    /// An explicit call here always wins over the notification-channel
+    /// default, including under `StdioTransport::without_server_notifications`
+    /// (#1257), which leaves the channel unattached. That method is the
+    /// all-or-nothing switch; this builder is the per-flag refinement
+    /// underneath it, so setting `resources_list_changed(true)` still
+    /// advertises the flag even though the transport will never emit it.
+    ///
+    /// ```rust
+    /// use tower_mcp::McpRouter;
+    ///
+    /// let router = McpRouter::new()
+    ///     .server_info("my-server", "1.0.0")
+    ///     .resources_list_changed(false);
+    /// ```
+    pub fn resources_list_changed(mut self, advertise: bool) -> Self {
+        Arc::make_mut(&mut self.inner).advertise_resources_list_changed = Some(advertise);
+        self
+    }
+
+    /// Whether to advertise the `logging` capability (MCP logging, i.e.
+    /// `notifications/message`).
+    ///
+    /// Defaults to whether a notification channel is attached to this
+    /// router, which is what it has always advertised: choosing a transport
+    /// that installs the channel (for example `StdioTransport::new`)
+    /// promised MCP logging even for a server that logs elsewhere, such as
+    /// stderr or OTLP. Pass `true` or `false` to declare the flag
+    /// independently of that channel (#1338).
+    ///
+    /// This affects advertisement only. [`McpRouter::log`] and its
+    /// convenience methods still route through the channel exactly as
+    /// before; this only changes what `initialize` reports.
+    ///
+    /// An explicit call here always wins over the notification-channel
+    /// default, including under `StdioTransport::without_server_notifications`
+    /// (#1257), which leaves the channel unattached. That method is the
+    /// all-or-nothing switch; this builder is the per-flag refinement
+    /// underneath it, so setting `mcp_logging(true)` still advertises the
+    /// flag even though the transport will never emit it.
+    ///
+    /// ```rust
+    /// use tower_mcp::McpRouter;
+    ///
+    /// let router = McpRouter::new()
+    ///     .server_info("my-server", "1.0.0")
+    ///     .mcp_logging(false);
+    /// ```
+    pub fn mcp_logging(mut self, advertise: bool) -> Self {
+        Arc::make_mut(&mut self.inner).advertise_mcp_logging = Some(advertise);
         self
     }
 
@@ -2617,6 +2768,29 @@ impl McpRouter {
             !self.inner.resources.is_empty() || !self.inner.resource_templates.is_empty();
         let has_notifications = self.inner.notification_tx.is_some();
 
+        // Each of these defaults to `has_notifications`, which is what this
+        // router has always advertised as soon as a transport attached a
+        // notification channel. An explicit builder call
+        // (`tools_list_changed`, `prompts_list_changed`,
+        // `resources_list_changed`, `mcp_logging`) overrides that default in
+        // either direction, independently of the channel (#1338).
+        let tools_list_changed = self
+            .inner
+            .advertise_tools_list_changed
+            .unwrap_or(has_notifications);
+        let prompts_list_changed = self
+            .inner
+            .advertise_prompts_list_changed
+            .unwrap_or(has_notifications);
+        let resources_list_changed = self
+            .inner
+            .advertise_resources_list_changed
+            .unwrap_or(has_notifications);
+        let mcp_logging = self
+            .inner
+            .advertise_mcp_logging
+            .unwrap_or(has_notifications);
+
         #[cfg(feature = "dynamic-tools")]
         let has_dynamic_tools = self.inner.dynamic_tools.is_some();
         #[cfg(not(feature = "dynamic-tools"))]
@@ -2638,13 +2812,13 @@ impl McpRouter {
                 None
             } else {
                 Some(ToolsCapability {
-                    list_changed: has_notifications,
+                    list_changed: tools_list_changed,
                 })
             },
             resources: if has_resources || has_dynamic_resources {
                 Some(ResourcesCapability {
                     subscribe: self.inner.advertise_resource_subscriptions,
-                    list_changed: has_notifications,
+                    list_changed: resources_list_changed,
                 })
             } else {
                 None
@@ -2653,11 +2827,12 @@ impl McpRouter {
                 None
             } else {
                 Some(PromptsCapability {
-                    list_changed: has_notifications,
+                    list_changed: prompts_list_changed,
                 })
             },
-            // Always advertise logging capability when notification channel is configured
-            logging: if self.inner.notification_tx.is_some() {
+            // Advertised when a notification channel is configured, unless
+            // overridden by `mcp_logging` (#1338).
+            logging: if mcp_logging {
                 Some(LoggingCapability {
                     deprecated: self.inner.logging_deprecated.clone(),
                 })
