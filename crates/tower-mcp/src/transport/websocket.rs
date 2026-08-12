@@ -767,7 +767,12 @@ async fn handle_socket_simple(
 
         match msg {
             Message::Text(text) => {
-                match process_message(&mut service, &session.router, &text).await {
+                // A peer whose runtime prefixes its output with a UTF-8 BOM
+                // writes one into its text frames too; the crate's own
+                // websocket client already strips one on receive (#1303,
+                // `client/websocket.rs`), so the server side must too (#1335).
+                let text = crate::framing::clean_input_line(&text);
+                match process_message(&mut service, &session.router, text).await {
                     Ok(Some(response)) => {
                         let response_json = match serde_json::to_string(&response) {
                             Ok(json) => json,
@@ -875,8 +880,12 @@ async fn handle_socket_bidirectional(
 
                 match msg {
                     Message::Text(text) => {
+                        // See the matching comment in `handle_socket_simple`
+                        // (#1303, #1335): both server loops must strip a
+                        // leading BOM the way the crate's own client does.
+                        let text = crate::framing::clean_input_line(&text);
                         let result = handle_incoming_message(
-                            &text,
+                            text,
                             &mut service,
                             &router,
                             pending_requests.clone(),
@@ -940,6 +949,36 @@ async fn handle_socket_bidirectional(
     }
 }
 
+/// Serialize `value` and send it as one text frame.
+///
+/// Every reply `handle_incoming_message` sends goes through here so the
+/// serialize-then-send pattern (and its error mapping) is written once.
+async fn send_response<S>(sender: &Mutex<S>, value: &impl serde::Serialize) -> Result<()>
+where
+    S: futures::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    let text = serde_json::to_string(value)
+        .map_err(|error| Error::Transport(format!("Failed to serialize response: {error}")))?;
+    sender
+        .lock()
+        .await
+        .send(Message::Text(text.into()))
+        .await
+        .map_err(|error| Error::Transport(format!("Failed to send response: {error}")))
+}
+
+/// The id to answer with if `call_message` fails after `message` already
+/// parsed successfully. A batch has no single id to correlate against,
+/// matching what `call_message` itself does for its own within-batch errors
+/// (see the `Err(Error::JsonRpc(error))` arm in `JsonRpcService::call_message`).
+fn correlating_id(message: &JsonRpcMessage) -> Option<RequestId> {
+    match message {
+        JsonRpcMessage::Single(req) => Some(req.id.clone()),
+        _ => None,
+    }
+}
+
 /// Handle an incoming WebSocket message (bidirectional mode)
 async fn handle_incoming_message<S>(
     text: &str,
@@ -954,70 +993,73 @@ where
 {
     let parsed: serde_json::Value = serde_json::from_str(text)?;
 
-    // A notification cannot be answered, so a validation failure on one is
-    // logged rather than sent back (#1272). Requests fall through.
-    if !parsed.is_array()
-        && parsed.get("id").is_none()
-        && let Err(error) =
-            service.inspect_incoming_value(&parsed, crate::inspection::McpDirection::ClientToServer)
-    {
-        tracing::debug!(
-            method = parsed.get("method").and_then(|m| m.as_str()),
-            %error,
-            "rejected an invalid notification"
-        );
-        return Ok(());
+    // Classify before validating, then response before request: the same
+    // order `process_line` (stdio) and `process_message` (below) use
+    // (#1272, #1335). A malformed notification cannot be answered (there is
+    // nowhere to put the reply), and a response frame is always the peer's
+    // mistake on a binding that never sends requests of its own -- both get
+    // no reply rather than one derived from validation that was never meant
+    // to apply to them.
+    match crate::framing::classify_frame(&parsed) {
+        crate::framing::FrameClass::Notification => {
+            if let Err(error) = service
+                .inspect_incoming_value(&parsed, crate::inspection::McpDirection::ClientToServer)
+            {
+                tracing::debug!(
+                    method = parsed.get("method").and_then(|m| m.as_str()),
+                    %error,
+                    "rejected an invalid notification"
+                );
+                return Ok(());
+            }
+            if let Ok(notification) = serde_json::from_str::<JsonRpcNotification>(text) {
+                let mcp_notification = McpNotification::from_jsonrpc(&notification)?;
+                router.handle_notification(mcp_notification);
+            }
+            return Ok(());
+        }
+        crate::framing::FrameClass::Response => {
+            return handle_response(&parsed, pending_requests).await;
+        }
+        crate::framing::FrameClass::Request => {}
     }
 
     if let Err(error) =
         service.inspect_incoming_value(&parsed, crate::inspection::McpDirection::ClientToServer)
     {
-        let response = JsonRpcResponse::error(None, error);
-        let response = serde_json::to_string(&response)
-            .map_err(|error| Error::Transport(format!("Failed to serialize response: {error}")))?;
-        sender
-            .lock()
-            .await
-            .send(Message::Text(response.into()))
-            .await
-            .map_err(|error| Error::Transport(format!("Failed to send response: {error}")))?;
-        return Ok(());
+        return send_response(&sender, &JsonRpcResponse::error(None, error)).await;
     }
 
-    // Check if this is a response to one of our pending requests
-    if crate::framing::is_response_frame(&parsed) {
-        return handle_response(&parsed, pending_requests).await;
-    }
+    // Parse and process as a request (single or batch). The serde error is
+    // deliberately not surfaced: for an untagged enum it names the Rust
+    // type, which has no business on the wire (#1272). Guarding this parse
+    // rather than propagating it with `?` matters here specifically: the
+    // caller of this function only logs a returned `Err`, so an unguarded
+    // parse failure left the client with no reply at all (#1335).
+    let Ok(message) = serde_json::from_str::<JsonRpcMessage>(text) else {
+        return send_response(
+            &sender,
+            &crate::transport::stdio::parse_error_response("not a valid JSON-RPC request"),
+        )
+        .await;
+    };
 
-    // Check if it's a notification (no id field)
-    if !parsed.is_array() && parsed.get("id").is_none() {
-        if let Ok(notification) = serde_json::from_str::<JsonRpcNotification>(text) {
-            let mcp_notification = McpNotification::from_jsonrpc(&notification)?;
-            router.handle_notification(mcp_notification);
-        }
-        return Ok(());
-    }
+    // Captured before `message` moves into `call_message`, so a failure
+    // there can still answer with the id the client is waiting on (#1335).
+    let request_id = correlating_id(&message);
 
-    // Process as a request
-    let message: JsonRpcMessage = serde_json::from_str(text)?;
     match service.call_message(message).await {
-        Ok(response) => {
-            let response_json = serde_json::to_string(&response)
-                .map_err(|e| Error::Transport(format!("Failed to serialize response: {}", e)))?;
-            let mut sender = sender.lock().await;
-            sender
-                .send(Message::Text(response_json.into()))
-                .await
-                .map_err(|e| Error::Transport(format!("Failed to send response: {}", e)))?;
-        }
+        Ok(response) => send_response(&sender, &response).await?,
         Err(e) => {
             tracing::error!(error = %e, "Error processing message");
+            // `e` here is a transport/serialization failure, not a caught
+            // tool panic, so the disclosure policy in `router.rs` (#1309)
+            // does not apply to it and its methods are private to that
+            // module regardless. `e.to_string()` is left as-is rather than
+            // inventing a second disclosure rule for this path.
             let error_response =
-                JsonRpcResponse::error(None, JsonRpcError::internal_error(e.to_string()));
-            if let Ok(json) = serde_json::to_string(&error_response) {
-                let mut sender = sender.lock().await;
-                let _ = sender.send(Message::Text(json.into())).await;
-            }
+                JsonRpcResponse::error(request_id, JsonRpcError::internal_error(e.to_string()));
+            let _ = send_response(&sender, &error_response).await;
         }
     }
 
@@ -1134,32 +1176,35 @@ async fn process_message(
 ) -> Result<Option<crate::protocol::JsonRpcResponseMessage>> {
     let parsed: serde_json::Value = serde_json::from_str(text)?;
 
-    // Classify before validating: a frame with no id has nowhere to put a
-    // response, so answering one is a JSON-RPC violation regardless of what
-    // validation says. Same fix as the stdio transport (#1272).
-    if !parsed.is_array() && parsed.get("id").is_none() {
-        let method = parsed.get("method").and_then(|m| m.as_str());
-        if let Err(error) =
-            service.inspect_incoming_value(&parsed, crate::inspection::McpDirection::ClientToServer)
-        {
-            tracing::debug!(method, %error, "rejected an invalid notification");
+    // Classify before validating, then response before request: same order
+    // as `process_line` (stdio) and `handle_incoming_message` above (#1272,
+    // #1335). This transport never sends requests, so a response arriving
+    // here is the peer's mistake; ignoring it beats answering with a parse
+    // error that names an internal type.
+    match crate::framing::classify_frame(&parsed) {
+        crate::framing::FrameClass::Notification => {
+            let method = parsed.get("method").and_then(|m| m.as_str());
+            if let Err(error) = service
+                .inspect_incoming_value(&parsed, crate::inspection::McpDirection::ClientToServer)
+            {
+                tracing::debug!(method, %error, "rejected an invalid notification");
+                return Ok(None);
+            }
+            match serde_json::from_str::<JsonRpcNotification>(text) {
+                Ok(notification) => {
+                    let mcp_notification = McpNotification::from_jsonrpc(&notification)?;
+                    router.handle_notification(mcp_notification);
+                }
+                Err(_) => tracing::debug!(method, "unparseable notification"),
+            }
             return Ok(None);
         }
-        match serde_json::from_str::<JsonRpcNotification>(text) {
-            Ok(notification) => {
-                let mcp_notification = McpNotification::from_jsonrpc(&notification)?;
-                router.handle_notification(mcp_notification);
-            }
-            Err(_) => tracing::debug!(method, "unparseable notification"),
+        crate::framing::FrameClass::Response => {
+            tracing::debug!("ignoring an unexpected JSON-RPC response frame");
+            return Ok(None);
         }
-        return Ok(None);
+        crate::framing::FrameClass::Request => {}
     }
-
-    // #1335: this path is missing the response-frame branch that
-    // `handle_incoming_message` (above) and the stdio transport both have --
-    // a response arriving here falls through to the request parse below and
-    // gets answered with a parse error instead of being ignored. Not fixed
-    // here; this extraction is a no-behavior-change base for that fix.
 
     if let Err(error) =
         service.inspect_incoming_value(&parsed, crate::inspection::McpDirection::ClientToServer)
@@ -1431,6 +1476,32 @@ mod tests {
                 .unwrap()
                 .contains("does not permit top-level JSON-RPC batches")
         );
+    }
+
+    // ========================================================================
+    // #1335: the id `handle_incoming_message` answers with if `call_message`
+    // fails after `message` already parsed.
+    //
+    // `call_message` only returns `Err` for conditions outside the ordinary
+    // request/response surface (`Error::Serialization`, the router's inner
+    // service is `Infallible`), so a live socket cannot currently drive that
+    // branch. `correlating_id` is tested directly instead of end to end.
+    // ========================================================================
+
+    #[test]
+    fn correlating_id_uses_the_single_requests_own_id() {
+        let request = JsonRpcRequest::new(7, "ping");
+        let message = JsonRpcMessage::Single(request);
+        assert_eq!(correlating_id(&message), Some(RequestId::Number(7)));
+    }
+
+    #[test]
+    fn correlating_id_has_nothing_to_correlate_for_a_batch() {
+        let message = JsonRpcMessage::Batch(vec![
+            JsonRpcRequest::new(1, "ping"),
+            JsonRpcRequest::new(2, "ping"),
+        ]);
+        assert_eq!(correlating_id(&message), None);
     }
 
     #[tokio::test]
