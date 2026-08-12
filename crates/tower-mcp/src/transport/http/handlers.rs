@@ -395,16 +395,20 @@ pub(super) async fn handle_post(
     // (#1242). Always bound, since the bridges run in every build.
     let http_extensions = parts.extensions;
 
-    // Parse the request body
-    let parsed: serde_json::Value = match serde_json::from_str(&body) {
-        Ok(v) => v,
-        Err(e) => {
-            return json_rpc_error_response(
-                None,
-                JsonRpcError::parse_error(format!("Invalid JSON: {}", e)),
-            );
-        }
-    };
+    // Parse the request body. A leading UTF-8 BOM is stripped first, the way
+    // every other receive path in the crate does (#1303, #1314) -- this was
+    // the one path still missing it, so a BOM-prefixed body used to fail the
+    // JSON parse with -32700 instead of being served.
+    let parsed: serde_json::Value =
+        match serde_json::from_str(crate::framing::clean_input_line(&body)) {
+            Ok(v) => v,
+            Err(e) => {
+                return json_rpc_error_response(
+                    None,
+                    JsonRpcError::parse_error(format!("Invalid JSON: {}", e)),
+                );
+            }
+        };
 
     // A version header supplies enough exact context to reject a batch before
     // any object-only HTTP classification runs. Legacy batches without a
@@ -600,12 +604,22 @@ pub(super) async fn handle_post(
                 return resp;
             }
 
+            // The id is captured before `parsed` is consumed below so a
+            // malformed-but-identified request can still be answered with a
+            // matching id instead of null (#1336). `extract_request_id`
+            // itself falls back to `None` when the id isn't a usable number
+            // or string, which is exactly the "genuinely no usable id" case
+            // that must still answer null.
+            let id = extract_request_id(&parsed);
             let request: JsonRpcRequest = match serde_json::from_value(parsed) {
                 Ok(r) => r,
-                Err(e) => {
+                Err(_) => {
+                    // The serde message is not surfaced: for a struct
+                    // deserialize it can name the Rust type, the same
+                    // disclosure #1284 removed from the stdio path.
                     return json_rpc_error_response(
-                        None,
-                        JsonRpcError::parse_error(format!("Invalid request: {}", e)),
+                        id,
+                        JsonRpcError::parse_error("not a valid JSON-RPC request"),
                     );
                 }
             };
@@ -830,12 +844,22 @@ pub(super) async fn handle_post(
                 return StatusCode::ACCEPTED.into_response();
             }
 
+            // The id is captured before `parsed` is consumed below so a
+            // malformed-but-identified request can still be answered with a
+            // matching id instead of null (#1336). `extract_request_id`
+            // itself falls back to `None` when the id isn't a usable number
+            // or string, which is exactly the "genuinely no usable id" case
+            // that must still answer null.
+            let id = extract_request_id(&parsed);
             let request: JsonRpcRequest = match serde_json::from_value(parsed) {
                 Ok(r) => r,
-                Err(e) => {
+                Err(_) => {
+                    // The serde message is not surfaced: for a struct
+                    // deserialize it can name the Rust type, the same
+                    // disclosure #1284 removed from the stdio path.
                     return json_rpc_error_response(
-                        None,
-                        JsonRpcError::parse_error(format!("Invalid request: {}", e)),
+                        id,
+                        JsonRpcError::parse_error("not a valid JSON-RPC request"),
                     );
                 }
             };
@@ -1262,13 +1286,22 @@ pub(super) async fn handle_post(
             None
         };
 
-    // Handle as JSON-RPC request
+    // Handle as JSON-RPC request. The id is captured before `parsed` is
+    // consumed below so a malformed-but-identified request can still be
+    // answered with a matching id instead of null (#1336).
+    // `extract_request_id` itself falls back to `None` when the id isn't a
+    // usable number or string, which is exactly the "genuinely no usable id"
+    // case that must still answer null.
+    let id = extract_request_id(&parsed);
     let request: JsonRpcRequest = match serde_json::from_value(parsed) {
         Ok(r) => r,
-        Err(e) => {
+        Err(_) => {
+            // The serde message is not surfaced: for a struct deserialize it
+            // can name the Rust type, the same disclosure #1284 removed from
+            // the stdio path.
             return json_rpc_error_response(
-                None,
-                JsonRpcError::parse_error(format!("Invalid request: {}", e)),
+                id,
+                JsonRpcError::parse_error("not a valid JSON-RPC request"),
             );
         }
     };
