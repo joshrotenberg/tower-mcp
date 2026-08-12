@@ -3,7 +3,7 @@
 
 /// The kind of capability a [`MergeConflict`] refers to.
 ///
-/// Ordered so that [`McpRouter::conflicts`] reports tools before resources
+/// Ordered so that [`McpRouter::conflicts`](super::McpRouter::conflicts) reports tools before resources
 /// before prompts, which reads more naturally than alphabetical order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MergeConflictKind {
@@ -35,7 +35,7 @@ impl std::fmt::Display for MergeConflictKind {
     }
 }
 
-/// One capability defined by both routers in a [`McpRouter::try_merge`].
+/// One capability defined by both routers in a [`McpRouter::try_merge`](super::McpRouter::try_merge).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MergeConflict {
     /// Which kind of capability collided.
@@ -59,7 +59,7 @@ impl std::fmt::Display for MergeConflict {
     }
 }
 
-/// The error returned by [`McpRouter::try_merge`].
+/// The error returned by [`McpRouter::try_merge`](super::McpRouter::try_merge).
 ///
 /// Carries every conflicting name rather than the first, so a startup check
 /// reports all the work at once.
