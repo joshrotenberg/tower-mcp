@@ -8,7 +8,7 @@
 //! Enable via the `macros` feature on `tower-mcp`:
 //!
 //! ```toml
-//! tower-mcp = { version = "0.21", features = ["macros"] }
+//! tower-mcp = { version = "0.22", features = ["macros"] }
 //! ```
 //!
 //! # Tool Example

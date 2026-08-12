@@ -66,7 +66,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! tower-mcp-types = "0.21"
+//! tower-mcp-types = "0.22"
 //! ```
 //!
 //! Parse an incoming JSON-RPC request:
@@ -97,7 +97,7 @@
 //! requires only a dependency change -- no import paths need to change:
 //!
 //! ```toml
-//! tower-mcp = { version = "0.21", features = ["http"] }
+//! tower-mcp = { version = "0.22", features = ["http"] }
 //! ```
 //!
 //! # WASM support
