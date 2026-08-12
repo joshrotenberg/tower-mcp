@@ -352,10 +352,77 @@ mod tasks {
     }
 
     async fn body_string(response: axum::response::Response) -> String {
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
+        drain(response.into_body()).await
+    }
+
+    async fn drain(body: Body) -> String {
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// Read SSE frames until `needle` appears, returning what was read and the
+    /// still-open body.
+    ///
+    /// A listen stream only terminates once `close_subscriptions()` fires, so a
+    /// test cannot collect the whole body and then assert on it: it has to
+    /// close the stream first. Reading frame by frame lets the test wait for
+    /// the notification it is asserting about, rather than sleeping long enough
+    /// to probably cover it. The router records a task's terminal state and
+    /// publishes `notifications/tasks` at two separate points, so a timed close
+    /// can land between them.
+    async fn read_until(response: axum::response::Response, needle: &str) -> (String, Body) {
+        use http_body_util::BodyExt;
+
+        let mut body = response.into_body();
+        let mut seen = String::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+
+        loop {
+            let frame = tokio::time::timeout_at(deadline, body.frame())
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for {needle:?}; saw: {seen}"));
+            match frame {
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        seen.push_str(&String::from_utf8_lossy(&data));
+                        if seen.contains(needle) {
+                            return (seen, body);
+                        }
+                    }
+                }
+                Some(Err(e)) => panic!("stream failed while waiting for {needle:?}: {e}"),
+                None => panic!("stream ended before {needle:?} arrived; saw: {seen}"),
+            }
+        }
+    }
+
+    /// Poll `tasks/get` until the task is no longer `working`.
+    ///
+    /// A test asserting that a notification did *not* reach a stream only means
+    /// something once the transition it would have announced has happened.
+    async fn await_terminal(app: &axum::Router, task_id: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let response = app
+                .clone()
+                .oneshot(final_request(
+                    "get-1",
+                    "tasks/get",
+                    serde_json::json!({ "_meta": meta(true), "taskId": task_id }),
+                ))
+                .await
+                .unwrap();
+            let value: serde_json::Value =
+                serde_json::from_str(&body_string(response).await).unwrap();
+            if value["result"]["status"] != "working" {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "task {task_id} never left `working`"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// A task subscriber sees the terminal transition even though the
@@ -401,11 +468,11 @@ mod tasks {
         assert_eq!(listen.status(), StatusCode::OK);
         assert_eq!(handle.subscription_count(), 1);
 
-        // Outlive the handler's sleep, then drain so the body terminates.
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        // Wait for the notification itself, then drain so the body terminates.
+        let (seen, rest) = read_until(listen, "notifications/tasks").await;
         assert_eq!(handle.close_subscriptions(), 1);
 
-        let body = body_string(listen).await;
+        let body = format!("{seen}{}", drain(rest).await);
         assert!(
             body.contains("notifications/subscriptions/acknowledged"),
             "stream must begin with an acknowledgment: {body}"
@@ -457,6 +524,7 @@ mod tasks {
         let task_id = created["result"]["taskId"].as_str().unwrap().to_string();
 
         let listen = app
+            .clone()
             .oneshot(final_request(
                 "listen-1",
                 "subscriptions/listen",
@@ -469,7 +537,9 @@ mod tasks {
             .unwrap();
         assert_eq!(listen.status(), StatusCode::OK);
 
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        // The task has to actually finish for its absence here to mean
+        // anything: otherwise this passes because nothing has happened yet.
+        await_terminal(&app, &task_id).await;
         handle.close_subscriptions();
 
         let body = body_string(listen).await;
