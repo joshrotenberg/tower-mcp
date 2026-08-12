@@ -17,11 +17,12 @@ use tower_mcp::async_task::{MemoryTaskStore, TaskStore};
 use tower_mcp::client::{ChannelTransport, McpClient};
 use tower_mcp::protocol::{
     ElicitAction, ElicitFormParams, ElicitFormSchema, ElicitRequestParams, ElicitResult,
-    InputRequest, InputRequests, InputResponse, TaskStatus,
+    InputRequest, InputRequests, InputRequiredResult, InputResponse, RequestOutcome, TaskStatus,
 };
 use tower_mcp::schemars::JsonSchema;
 use tower_mcp::{
-    CallToolResult, McpRouter, PanicPolicy, RequestContext, TaskContext, TaskOutcome, ToolBuilder,
+    CallToolResult, McpRouter, PanicPolicy, ProtocolSupport, RequestContext, TaskContext,
+    TaskOutcome, Tool, ToolBuilder,
 };
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -949,4 +950,357 @@ async fn require_input_still_parks_and_waits_in_one_call() {
     let (_, result, _) = store.get_task_result(&task_id).await.unwrap().unwrap();
     let text = serde_json::to_value(result.unwrap()).unwrap()["content"][0]["text"].clone();
     assert_eq!(text, "one");
+}
+
+// ============================================================================
+// Live plus fallback (#1246)
+// ============================================================================
+//
+// A `Tool` can now carry a live handler and a synchronous/MRTR fallback at
+// the same time: the live handler runs when a call is task-backed, the
+// fallback runs when it is not. One tool, one schema, one name -- the router
+// already picked between the two by how the call arrived (see `router.rs`);
+// what was missing was the ability to build a `Tool` that carries both.
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct MultiInput {
+    value: String,
+    #[serde(default)]
+    ask: bool,
+}
+
+/// Bounds an awaited client call so a routing regression that panics a
+/// connection task -- rather than returning a clean error -- fails this test
+/// instead of hanging the run. Found empirically while mutation-testing
+/// `Tool::clone`: dropping the fallback there does not surface as a client
+/// error, because the panic happens inside `ChannelTransport`'s background
+/// task and the client is left waiting on a response that will never come.
+async fn timed<F, T>(fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+        .await
+        .expect("call timed out; the connection likely panicked without responding")
+}
+
+/// One tool, a live handler and an MRTR fallback, both counted so a test can
+/// assert which side actually ran rather than only checking the result text.
+fn multi_tool(live_calls: Arc<AtomicUsize>, fallback_calls: Arc<AtomicUsize>) -> Tool {
+    ToolBuilder::new("multi")
+        .description("Live when Tasks are negotiated, MRTR/synchronous otherwise")
+        .live_task_handler(move |_task: TaskContext, input: MultiInput| {
+            let live_calls = live_calls.clone();
+            async move {
+                live_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(TaskOutcome::Completed(CallToolResult::text(format!(
+                    "live:{}",
+                    input.value
+                ))))
+            }
+        })
+        .fallback_mrtr_handler(move |ctx: RequestContext, input: MultiInput| {
+            let fallback_calls = fallback_calls.clone();
+            async move {
+                fallback_calls.fetch_add(1, Ordering::SeqCst);
+                // A non-empty request_state means this is the client's retry
+                // after answering the question below.
+                if ctx.request_state().is_some() {
+                    return Ok(RequestOutcome::Complete(CallToolResult::text(format!(
+                        "resumed:{}",
+                        input.value
+                    ))));
+                }
+                if input.ask {
+                    return Ok(RequestOutcome::input_required(
+                        InputRequiredResult::new().with_request_state("confirm"),
+                    ));
+                }
+                Ok(RequestOutcome::Complete(CallToolResult::text(format!(
+                    "sync:{}",
+                    input.value
+                ))))
+            }
+        })
+        .build()
+}
+
+/// A plain, non-task-backed `tools/call` (legacy protocol, no `task` param)
+/// must reach the fallback. The live handler has nothing to run for a call
+/// that never became a task, so it must not run at all.
+#[tokio::test]
+async fn a_live_plus_fallback_tool_serves_a_plain_call_through_the_fallback() {
+    let live_calls = Arc::new(AtomicUsize::new(0));
+    let fallback_calls = Arc::new(AtomicUsize::new(0));
+    let tool = multi_tool(live_calls.clone(), fallback_calls.clone());
+
+    let store = Arc::new(MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .server_info("multi", "1.0.0")
+        .task_store(store.clone())
+        .tool(tool)
+        .with_tasks();
+
+    let client = McpClient::connect(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+
+    let result = timed(client.call_tool("multi", json!({"value": "a"})))
+        .await
+        .expect("call");
+    assert!(!result.is_error);
+    assert_eq!(result.all_text(), "sync:a");
+    assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        live_calls.load(Ordering::SeqCst),
+        0,
+        "the live handler must not run for a plain call"
+    );
+}
+
+/// The same tool, task-requested, must reach the live handler and never the
+/// fallback -- distinguishing this from "any handler ran" is the point.
+#[tokio::test]
+async fn a_live_plus_fallback_tool_serves_a_task_backed_call_through_the_live_handler() {
+    let live_calls = Arc::new(AtomicUsize::new(0));
+    let fallback_calls = Arc::new(AtomicUsize::new(0));
+    let tool = multi_tool(live_calls.clone(), fallback_calls.clone());
+
+    let store = Arc::new(MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .server_info("multi", "1.0.0")
+        .task_store(store.clone())
+        .tool(tool)
+        .with_tasks();
+
+    let client = McpClient::connect(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+
+    let task_id = timed(client.call_tool_as_task("multi", json!({"value": "b"}), None))
+        .await
+        .expect("task created")
+        .task
+        .task_id;
+
+    await_status(&store, &task_id, TaskStatus::Completed).await;
+    let (_, result, _) = store.get_task_result(&task_id).await.unwrap().unwrap();
+    assert_eq!(result.unwrap().all_text(), "live:b");
+    assert_eq!(live_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fallback_calls.load(Ordering::SeqCst),
+        0,
+        "the fallback must not run for a task-backed call"
+    );
+}
+
+/// The same tool again, this time driving the fallback through an SEP-2322
+/// MRTR round trip. `InputRequiredResult` from a synchronous `tools/call` is
+/// only accepted by the router from a 2026-07-28 caller, so this is the one
+/// case in the file that needs the final protocol rather than legacy.
+#[tokio::test]
+async fn a_live_plus_fallback_tool_serves_an_mrtr_round_trip_through_the_fallback() {
+    let live_calls = Arc::new(AtomicUsize::new(0));
+    let fallback_calls = Arc::new(AtomicUsize::new(0));
+    let tool = multi_tool(live_calls.clone(), fallback_calls.clone());
+
+    let router = McpRouter::new()
+        .server_info("multi", "1.0.0")
+        .task_store(Arc::new(MemoryTaskStore::new()))
+        .tool(tool)
+        .with_tasks();
+
+    // Final protocol, but this client never declares Tasks, so the router
+    // never elects a task for it: every call reaches the fallback.
+    let client = McpClient::builder()
+        .protocol_support(ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+        .connect_simple(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.discover("t", "1.0.0").await.expect("discover");
+
+    let outcome =
+        timed(client.call_tool_once("multi", json!({"value": "c", "ask": true}), None, None))
+            .await
+            .expect("tools/call");
+    let required = outcome
+        .as_input_required()
+        .expect("the fallback asked for input");
+    assert_eq!(required.request_state.as_deref(), Some("confirm"));
+    assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+
+    let outcome = timed(client.call_tool_once(
+        "multi",
+        json!({"value": "c", "ask": true}),
+        None,
+        required.request_state.clone(),
+    ))
+    .await
+    .expect("tools/call retry");
+    let result = outcome.as_complete().expect("the retry completes");
+    assert_eq!(result.all_text(), "resumed:c");
+    assert_eq!(
+        fallback_calls.load(Ordering::SeqCst),
+        2,
+        "both rounds go through the fallback"
+    );
+    assert_eq!(
+        live_calls.load(Ordering::SeqCst),
+        0,
+        "the live handler must not run for a non-task call"
+    );
+}
+
+/// Regression: a live-only tool (no fallback registered) keeps its existing
+/// `TaskSupportMode::Required` contract. A plain call must still be rejected
+/// with a clear protocol error before any handler runs, not panic reaching
+/// for a synchronous or MRTR path that was never registered.
+#[tokio::test]
+async fn a_live_only_tool_still_rejects_a_plain_call_without_panicking() {
+    let tool = ToolBuilder::new("live_only")
+        .description("No fallback")
+        .live_task_handler(|_task: TaskContext, _input: NoArgs| async move {
+            Ok(TaskOutcome::Completed(CallToolResult::text(
+                "should not run",
+            )))
+        })
+        .build();
+
+    let store = Arc::new(MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .server_info("live-only", "1.0.0")
+        .task_store(store.clone())
+        .tool(tool)
+        .with_tasks();
+
+    let client = McpClient::connect(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+
+    let error = timed(client.call_tool("live_only", json!({})))
+        .await
+        .expect_err("a live-only tool has nothing to run for a plain call");
+    assert!(
+        error.to_string().contains("requires async task execution"),
+        "got: {error}"
+    );
+}
+
+/// `Tool::clone` and `Tool::with_name_prefix` must carry a live handler and a
+/// fallback together, not just whichever one #1295 already covered alone.
+/// Asserted by actually running both paths post-clone/prefix, the same
+/// discipline the #1295 tests above use: checking that a field is non-`None`
+/// would pass even if the clone were otherwise broken.
+#[tokio::test]
+async fn clone_and_prefix_carry_both_the_live_handler_and_the_fallback() {
+    let tool = ToolBuilder::new("multi")
+        .description("Live plus fallback")
+        .live_task_handler(|_task: TaskContext, input: MultiInput| async move {
+            Ok(TaskOutcome::Completed(CallToolResult::text(format!(
+                "live:{}",
+                input.value
+            ))))
+        })
+        .fallback_handler(|input: MultiInput| async move {
+            Ok(CallToolResult::text(format!("sync:{}", input.value)))
+        })
+        .build();
+
+    let cloned = tool.clone();
+    let prefixed = tool.with_name_prefix("ns");
+
+    let store = Arc::new(MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .server_info("multi", "1.0.0")
+        .task_store(store.clone())
+        .tool(cloned)
+        .tool(prefixed)
+        .with_tasks();
+
+    let client = McpClient::connect(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+
+    for name in ["multi", "ns.multi"] {
+        let result = timed(client.call_tool(name, json!({"value": "x"})))
+            .await
+            .unwrap_or_else(|e| panic!("plain call to {name} failed: {e}"));
+        assert_eq!(
+            result.all_text(),
+            "sync:x",
+            "fallback must survive for {name}"
+        );
+
+        let task_id = timed(client.call_tool_as_task(name, json!({"value": "x"}), None))
+            .await
+            .unwrap_or_else(|e| panic!("task call to {name} failed: {e}"))
+            .task
+            .task_id;
+        await_status(&store, &task_id, TaskStatus::Completed).await;
+        let (_, result, _) = store.get_task_result(&task_id).await.unwrap().unwrap();
+        assert_eq!(
+            result.unwrap().all_text(),
+            "live:x",
+            "live handler must survive for {name}"
+        );
+    }
+}
+
+/// `Tool::with_guard` on a live-plus-fallback tool must reject both paths.
+/// Before this PR's fix, `with_guard` returned after guarding whichever of
+/// `live_handler`/`service`/`mrtr_handler` it found first, which was
+/// harmless while those fields were mutually exclusive but silently left a
+/// coexisting fallback unguarded once they no longer were.
+#[tokio::test]
+async fn a_guard_on_a_live_plus_fallback_tool_rejects_both_paths() {
+    let tool = ToolBuilder::new("multi")
+        .description("Live plus fallback")
+        .live_task_handler(|_task: TaskContext, _input: NoArgs| async move {
+            Ok(TaskOutcome::Completed(CallToolResult::text(
+                "should not run (live)",
+            )))
+        })
+        .fallback_handler(|_input: NoArgs| async move {
+            Ok(CallToolResult::text("should not run (fallback)"))
+        })
+        .build()
+        .with_guard(|_req: &tower_mcp::ToolRequest| Err("nope".to_string()));
+
+    let store = Arc::new(MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .server_info("multi", "1.0.0")
+        .task_store(store.clone())
+        .tool(tool)
+        .with_tasks();
+
+    let client = McpClient::connect(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+
+    // The fallback path is rejected.
+    let result = timed(client.call_tool("multi", json!({})))
+        .await
+        .expect("call");
+    assert!(
+        result.is_error,
+        "the guard must reject the fallback path too"
+    );
+    assert!(result.all_text().contains("nope"));
+
+    // The live path is rejected too.
+    let task_id = timed(client.call_tool_as_task("multi", json!({}), None))
+        .await
+        .expect("task created")
+        .task
+        .task_id;
+    await_status(&store, &task_id, TaskStatus::Completed).await;
+    let (_, result, _) = store.get_task_result(&task_id).await.unwrap().unwrap();
+    let result = result.expect("a rejected call still produces a result");
+    assert!(result.is_error);
+    assert!(result.all_text().contains("nope"));
 }

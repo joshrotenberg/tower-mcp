@@ -1507,31 +1507,45 @@ impl Tool {
     where
         G: Fn(&ToolRequest) -> std::result::Result<(), String> + Clone + Send + Sync + 'static,
     {
-        if let Some(inner) = self.live_handler.clone() {
-            return Tool {
-                live_handler: Some(Arc::new(GuardedLiveToolHandler { guard, inner })),
-                ..self
-            };
-        }
+        // A tool can now have a live handler and a fallback at the same time
+        // (#1246), so every path that is actually present gets wrapped,
+        // rather than returning after whichever one this found first and
+        // leaving a coexisting fallback unguarded.
+        let live_handler = self.live_handler.clone().map(|inner| {
+            Arc::new(GuardedLiveToolHandler {
+                guard: guard.clone(),
+                inner,
+            }) as Arc<dyn LiveToolHandler>
+        });
 
         #[cfg(feature = "stateless")]
         if let Some(inner) = self.mrtr_handler.clone() {
             return Tool {
+                live_handler,
                 mrtr_handler: Some(Arc::new(GuardedMrtrToolHandler { guard, inner })),
                 ..self
             };
         }
 
-        let guarded = GuardService {
-            guard,
-            inner: self
-                .service
-                .expect("tool must have a complete or MRTR handler"),
-        };
-        let caught = ToolCatchError::new(guarded);
-        Tool {
-            service: Some(BoxCloneService::new(caught)),
-            ..self
+        match self.service.clone() {
+            Some(service) => {
+                let guarded = GuardService {
+                    guard,
+                    inner: service,
+                };
+                let caught = ToolCatchError::new(guarded);
+                Tool {
+                    live_handler,
+                    service: Some(BoxCloneService::new(caught)),
+                    ..self
+                }
+            }
+            // Live-only: there is no synchronous or MRTR path to guard.
+            None if live_handler.is_some() => Tool {
+                live_handler,
+                ..self
+            },
+            None => panic!("tool must have a complete, MRTR, or live handler"),
         }
     }
 
@@ -2463,6 +2477,300 @@ impl ToolBuilderWithLiveHandler {
             #[cfg(feature = "stateless")]
             mrtr_handler: None,
             live_handler: Some(self.handler),
+            input_schema: ensure_object_schema(self.input_schema),
+        }
+    }
+
+    /// Add a synchronous fallback for calls that do not negotiate Tasks.
+    ///
+    /// [`live_task_handler`](ToolBuilder::live_task_handler) alone forces
+    /// [`TaskSupportMode::Required`]: a live handler has nothing to run for a
+    /// call that never becomes a task, so the tool is invisible to a client
+    /// that has not negotiated Tasks. Adding a fallback here changes that:
+    /// the tool is registered as [`TaskSupportMode::Optional`] instead
+    /// (still overridable with
+    /// [`task_support`](ToolBuilderWithLiveAndFallback::task_support)), the
+    /// live handler runs for a task-backed call, and this fallback runs for
+    /// an ordinary one -- same schema, same name, whichever path the caller
+    /// actually used (#1246).
+    ///
+    /// ```rust,no_run
+    /// use tower_mcp::{CallToolResult, TaskContext, TaskOutcome, ToolBuilder};
+    /// use serde::Deserialize;
+    /// use tower_mcp::schemars::JsonSchema;
+    ///
+    /// #[derive(Deserialize, JsonSchema)]
+    /// struct Run { prompt: String }
+    ///
+    /// let tool = ToolBuilder::new("run")
+    ///     .description("Live when Tasks are negotiated, synchronous otherwise")
+    ///     .live_task_handler(|task: TaskContext, input: Run| async move {
+    ///         let _ = (task, input);
+    ///         Ok(TaskOutcome::Completed(CallToolResult::text("done")))
+    ///     })
+    ///     .fallback_handler(|input: Run| async move {
+    ///         Ok(CallToolResult::text(format!("synchronous: {}", input.prompt)))
+    ///     })
+    ///     .build();
+    /// ```
+    ///
+    /// # No shared handler logic
+    ///
+    /// The two closures are independent rather than one shape reused twice.
+    /// A live handler owns a future that stays alive across input rounds; a
+    /// fallback returns once. Unifying them would mean either allocating
+    /// task machinery a synchronous call never uses, or running a task to
+    /// completion inside a single request -- so this asks for both instead of
+    /// forcing a false unification.
+    pub fn fallback_handler<I, F, Fut>(self, handler: F) -> ToolBuilderWithLiveAndFallback
+    where
+        I: DeserializeOwned + Send + Sync + 'static,
+        F: Fn(I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
+    {
+        let service = ToolHandlerService::new(LiveFallbackHandler {
+            handler,
+            _phantom: std::marker::PhantomData::<fn() -> I>,
+        });
+        let caught = ToolCatchError::new(service);
+        ToolBuilderWithLiveAndFallback {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            output_schema: self.output_schema,
+            input_schema: self.input_schema,
+            icons: self.icons,
+            annotations: self.annotations,
+            task_support: TaskSupportMode::Optional,
+            live_handler: self.handler,
+            fallback: BoxCloneService::new(caught),
+        }
+    }
+
+    /// Add an SEP-2322 MRTR fallback for calls that do not negotiate Tasks.
+    ///
+    /// Same routing as [`fallback_handler`](Self::fallback_handler): this
+    /// runs when a call is not task-backed, the live handler runs when it is.
+    /// Unlike the plain fallback, this one can ask for input itself and
+    /// resume from [`RequestContext::input_responses`] on the client's
+    /// retry, which matters when the non-task caller also needs a
+    /// multi-round interaction rather than a single synchronous result.
+    ///
+    /// A [`RequestOutcome::InputRequired`] result from this fallback is only
+    /// accepted by the router from a 2026-07-28 caller (a pre-existing rule,
+    /// not new here -- see `validate_input_required_result` in `router.rs`).
+    /// A legacy 2025-11-25 caller can still reach this fallback, but only the
+    /// [`RequestOutcome::Complete`] branch is usable for it.
+    ///
+    /// ```rust,no_run
+    /// use tower_mcp::{
+    ///     CallToolResult, RequestContext, RequestOutcome, TaskContext, TaskOutcome, ToolBuilder,
+    /// };
+    /// use serde::Deserialize;
+    /// use tower_mcp::schemars::JsonSchema;
+    ///
+    /// #[derive(Deserialize, JsonSchema)]
+    /// struct Run { prompt: String }
+    ///
+    /// let tool = ToolBuilder::new("run")
+    ///     .description("Live when Tasks are negotiated, MRTR otherwise")
+    ///     .live_task_handler(|task: TaskContext, input: Run| async move {
+    ///         let _ = (task, input);
+    ///         Ok(TaskOutcome::Completed(CallToolResult::text("done")))
+    ///     })
+    ///     .fallback_mrtr_handler(|ctx: RequestContext, input: Run| async move {
+    ///         let _ = input;
+    ///         if ctx.input_responses().is_some() {
+    ///             return Ok(RequestOutcome::Complete(CallToolResult::text("resumed")));
+    ///         }
+    ///         Ok(RequestOutcome::Complete(CallToolResult::text("done")))
+    ///     })
+    ///     .build();
+    /// ```
+    #[cfg(feature = "stateless")]
+    pub fn fallback_mrtr_handler<I, F, Fut>(self, handler: F) -> ToolBuilderWithLiveAndMrtrFallback
+    where
+        I: DeserializeOwned + Send + Sync + 'static,
+        F: Fn(RequestContext, I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<RequestOutcome<CallToolResult>>> + Send + 'static,
+    {
+        ToolBuilderWithLiveAndMrtrFallback {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            output_schema: self.output_schema,
+            input_schema: self.input_schema,
+            icons: self.icons,
+            annotations: self.annotations,
+            task_support: TaskSupportMode::Optional,
+            live_handler: self.handler,
+            fallback: Arc::new(LiveFallbackMrtrHandler {
+                handler,
+                _phantom: std::marker::PhantomData::<fn() -> I>,
+            }),
+        }
+    }
+}
+
+/// A synchronous fallback for a tool that also has a live handler.
+///
+/// Unlike [`TypedHandler`], the input type does not need [`JsonSchema`]: the
+/// schema is already fixed by the live handler this fallback is attached to,
+/// so there is nothing left for this adapter to derive it from (#1246).
+struct LiveFallbackHandler<I, F> {
+    handler: F,
+    _phantom: std::marker::PhantomData<fn() -> I>,
+}
+
+impl<I, F, Fut> ToolHandler for LiveFallbackHandler<I, F>
+where
+    I: DeserializeOwned + Send + Sync + 'static,
+    F: Fn(I) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<CallToolResult>> + Send + 'static,
+{
+    fn call(&self, args: Value) -> BoxFuture<'_, Result<CallToolResult>> {
+        Box::pin(async move {
+            let input: I = match serde_json::from_value(args) {
+                Ok(input) => input,
+                Err(e) => return Ok(CallToolResult::error(format!("Invalid input: {e}"))),
+            };
+            (self.handler)(input).await
+        })
+    }
+
+    fn input_schema(&self) -> Value {
+        // Never consulted: `ToolBuilderWithLiveAndFallback::build` uses the
+        // schema already fixed by the live handler rather than asking this
+        // adapter to derive one.
+        serde_json::json!({ "type": "object" })
+    }
+}
+
+/// An MRTR fallback for a tool that also has a live handler. Same relaxed
+/// bound as [`LiveFallbackHandler`], for the same reason.
+#[cfg(feature = "stateless")]
+struct LiveFallbackMrtrHandler<I, F> {
+    handler: F,
+    _phantom: std::marker::PhantomData<fn() -> I>,
+}
+
+#[cfg(feature = "stateless")]
+impl<I, F, Fut> MrtrToolHandler for LiveFallbackMrtrHandler<I, F>
+where
+    I: DeserializeOwned + Send + Sync + 'static,
+    F: Fn(RequestContext, I) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<RequestOutcome<CallToolResult>>> + Send + 'static,
+{
+    fn call(
+        &self,
+        ctx: RequestContext,
+        args: Value,
+    ) -> BoxFuture<'_, Result<RequestOutcome<CallToolResult>>> {
+        Box::pin(async move {
+            let input: I = serde_json::from_value(args)
+                .map_err(|error| Error::invalid_params(format!("Invalid input: {error}")))?;
+            (self.handler)(ctx, input).await
+        })
+    }
+
+    fn input_schema(&self) -> Value {
+        serde_json::json!({ "type": "object" })
+    }
+}
+
+/// Builder state after a live handler and a synchronous fallback have both
+/// been set.
+///
+/// Created by [`ToolBuilderWithLiveHandler::fallback_handler`]. `task_support`
+/// defaults to [`TaskSupportMode::Optional`] because a fallback now exists;
+/// override with [`task_support`](Self::task_support) if the tool should
+/// stay [`TaskSupportMode::Required`] anyway (#1246).
+pub struct ToolBuilderWithLiveAndFallback {
+    name: String,
+    title: Option<String>,
+    description: Option<String>,
+    output_schema: Option<Value>,
+    input_schema: Value,
+    icons: Option<Vec<ToolIcon>>,
+    annotations: Option<ToolAnnotations>,
+    task_support: TaskSupportMode,
+    live_handler: Arc<dyn LiveToolHandler>,
+    fallback: BoxToolService,
+}
+
+impl ToolBuilderWithLiveAndFallback {
+    /// Override the default [`TaskSupportMode::Optional`].
+    pub fn task_support(mut self, mode: TaskSupportMode) -> Self {
+        self.task_support = mode;
+        self
+    }
+
+    /// Finish the tool.
+    pub fn build(self) -> Tool {
+        Tool {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            output_schema: self.output_schema,
+            icons: self.icons,
+            annotations: self.annotations,
+            meta: None,
+            task_support: self.task_support,
+            required_client_capabilities: None,
+            task_preparer: None,
+            service: Some(self.fallback),
+            #[cfg(feature = "stateless")]
+            mrtr_handler: None,
+            live_handler: Some(self.live_handler),
+            input_schema: ensure_object_schema(self.input_schema),
+        }
+    }
+}
+
+/// Builder state after a live handler and an MRTR fallback have both been
+/// set.
+///
+/// Created by [`ToolBuilderWithLiveHandler::fallback_mrtr_handler`]. Same
+/// `task_support` default and override as
+/// [`ToolBuilderWithLiveAndFallback`].
+#[cfg(feature = "stateless")]
+pub struct ToolBuilderWithLiveAndMrtrFallback {
+    name: String,
+    title: Option<String>,
+    description: Option<String>,
+    output_schema: Option<Value>,
+    input_schema: Value,
+    icons: Option<Vec<ToolIcon>>,
+    annotations: Option<ToolAnnotations>,
+    task_support: TaskSupportMode,
+    live_handler: Arc<dyn LiveToolHandler>,
+    fallback: Arc<dyn MrtrToolHandler>,
+}
+
+#[cfg(feature = "stateless")]
+impl ToolBuilderWithLiveAndMrtrFallback {
+    /// Override the default [`TaskSupportMode::Optional`].
+    pub fn task_support(mut self, mode: TaskSupportMode) -> Self {
+        self.task_support = mode;
+        self
+    }
+
+    /// Finish the tool.
+    pub fn build(self) -> Tool {
+        Tool {
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            output_schema: self.output_schema,
+            icons: self.icons,
+            annotations: self.annotations,
+            meta: None,
+            task_support: self.task_support,
+            required_client_capabilities: None,
+            task_preparer: None,
+            service: None,
+            mrtr_handler: Some(self.fallback),
+            live_handler: Some(self.live_handler),
             input_schema: ensure_object_schema(self.input_schema),
         }
     }
