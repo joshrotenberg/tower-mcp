@@ -150,7 +150,11 @@ impl WebSocketClientTransport {
             while let Some(message) = source.next().await {
                 match message {
                     Ok(Message::Text(text)) => {
-                        if incoming_tx.send(text.to_string()).await.is_err() {
+                        // A server whose runtime prefixes its output with a
+                        // BOM writes one here too, and the JSON parser
+                        // rejects the whole frame over it (#1303).
+                        let text = crate::framing::clean_input_line(&text).to_string();
+                        if incoming_tx.send(text).await.is_err() {
                             break;
                         }
                     }
