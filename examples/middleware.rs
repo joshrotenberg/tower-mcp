@@ -9,11 +9,16 @@
 //! Additionally, **guards** provide lightweight per-tool validation without
 //! implementing a full tower layer.
 //!
+//! It also shows the thing composition examples usually leave out: a layer
+//! that resolves a value and a handler that reads it, passed through the
+//! request extensions and pulled out with the `Extension<T>` extractor.
+//!
 //! This example demonstrates all four patterns in one server.
 //!
 //! Run with: cargo run --example middleware
 
 use std::collections::HashMap;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use schemars::JsonSchema;
@@ -21,10 +26,71 @@ use serde::Deserialize;
 use tower::ServiceBuilder;
 use tower::limit::ConcurrencyLimitLayer;
 use tower::timeout::TimeoutLayer;
+use tower_mcp::extract::Extension;
 use tower_mcp::{
     BoxError, CallToolResult, GetPromptResult, McpRouter, PromptBuilder, ReadResourceResult,
-    ResourceBuilder, ResourceContent, StdioTransport, ToolBuilder, ToolRequest,
+    ResourceBuilder, ResourceContent, RouterRequest, StdioTransport, ToolBuilder, ToolRequest,
 };
+
+// =============================================================================
+// Passing data from a layer to a handler
+// =============================================================================
+//
+// Timeouts and rate limits are the easy half of middleware: they wrap a
+// request and never speak to it. The half people actually ask about is a
+// layer that resolves something once (a tenant, a trace id, an authenticated
+// principal) and a handler that reads it.
+//
+// The channel is `RouterRequest::extensions`. A layer inserts a value, and a
+// handler pulls it out with the `Extension<T>` extractor. The type is the
+// key, so nothing is stringly-typed and a handler asking for a value no layer
+// inserted is rejected rather than silently given a default.
+
+/// What the layer below resolves for each request.
+#[derive(Debug, Clone)]
+struct Tenant {
+    id: String,
+}
+
+/// Inserts a [`Tenant`] into every request passing through it.
+///
+/// A real one would read a header or a token bridged in by the transport
+/// (`HttpTransport::bridge_extension`) rather than inventing the value.
+#[derive(Clone)]
+struct TenantLayer;
+
+impl<S> tower::Layer<S> for TenantLayer {
+    type Service = TenantService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        TenantService { inner }
+    }
+}
+
+#[derive(Clone)]
+struct TenantService<S> {
+    inner: S,
+}
+
+impl<S> tower::Service<RouterRequest> for TenantService<S>
+where
+    S: tower::Service<RouterRequest>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut request: RouterRequest) -> Self::Future {
+        request.extensions.insert(Tenant {
+            id: "acme-corp".to_string(),
+        });
+        self.inner.call(request)
+    }
+}
 
 // =============================================================================
 // Input types
@@ -88,6 +154,16 @@ async fn main() -> Result<(), BoxError> {
         })
         .layer(ConcurrencyLimitLayer::new(3))
         .layer(TimeoutLayer::new(Duration::from_secs(30)))
+        .build();
+
+    // A handler reading what the layer resolved. `Extension<Tenant>` is
+    // filled from the request extensions `TenantLayer` wrote, so the handler
+    // never knows or cares where the value came from.
+    let whoami = ToolBuilder::new("whoami")
+        .description("Reports the tenant the transport layer resolved")
+        .extractor_handler((), |Extension(tenant): Extension<Tenant>| async move {
+            Ok(CallToolResult::text(format!("tenant: {}", tenant.id)))
+        })
         .build();
 
     // =========================================================================
@@ -167,11 +243,13 @@ async fn main() -> Result<(), BoxError> {
              - data://slow-report: per-resource 5s timeout\n\
              - analyze: per-prompt 3s timeout\n\
              - write_data: guard blocks writes in read-only mode\n\
+             - whoami: reads a value the transport layer resolved\n\
              - Transport: global 60s timeout + 10 max concurrent requests",
         )
         .tool(quick_search)
         .tool(slow_operation)
         .tool(write_tool)
+        .tool(whoami)
         .resource(slow_resource)
         .prompt(slow_prompt);
 
@@ -182,6 +260,9 @@ async fn main() -> Result<(), BoxError> {
             ServiceBuilder::new()
                 .layer(TimeoutLayer::new(Duration::from_secs(60)))
                 .concurrency_limit(10)
+                // Outermost-first, so this runs before the router dispatches
+                // and `whoami` finds its value already in place.
+                .layer(TenantLayer)
                 .into_inner(),
         )
         .run()

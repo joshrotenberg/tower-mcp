@@ -5,7 +5,7 @@
 //! on the wire: duplicate ids, stale notifications, malformed envelopes,
 //! out-of-order lifecycle traffic, and handlers that misbehave.
 //!
-//! Three tests are `#[ignore]`d. Each one asserts the behaviour the code should
+//! Two tests are `#[ignore]`d. Each one asserts the behaviour the code should
 //! have and fails against the behaviour it has today; the attribute carries
 //! the reason. Run them with `cargo test --test adversarial_input -- --ignored`
 //! to reproduce every finding.
@@ -747,12 +747,11 @@ async fn a_repeated_initialized_notification_is_harmless() {
 /// server has negotiated no protocol version and learned no client
 /// capabilities, so the pre-initialize guard still has to hold.
 ///
-/// Today `SessionState::mark_initialized` accepts `Uninitialized ->
-/// Initialized` to absorb an HTTP race (#458), and nothing distinguishes that
-/// race from a client that simply never sent `initialize`. One notification
-/// unlocks the whole surface.
+/// `SessionState::mark_initialized` accepts `Uninitialized -> Initialized` to
+/// absorb an HTTP race (#458), but only once an `initialize` request has been
+/// seen for the session. Without that, one notification would unlock the whole
+/// surface (#1269).
 #[tokio::test]
-#[ignore = "BUG: SessionState::mark_initialized promotes Uninitialized straight to Initialized, so notifications/initialized alone skips the handshake"]
 async fn initialized_before_initialize_does_not_open_the_session() {
     let mut server = Server::with_router(base_router());
 

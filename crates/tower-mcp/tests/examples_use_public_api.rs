@@ -40,7 +40,10 @@ fn example_sources() -> Vec<PathBuf> {
     let mut sources = Vec::new();
     let mut pending = vec![root];
     while let Some(dir) = pending.pop() {
-        for entry in std::fs::read_dir(&dir).expect("read examples dir").flatten() {
+        for entry in std::fs::read_dir(&dir)
+            .expect("read examples dir")
+            .flatten()
+        {
             let path = entry.path();
             // Build output is not source, and it is enormous.
             if path.is_dir() && path.file_name().is_some_and(|name| name != "target") {
@@ -127,7 +130,10 @@ fn the_check_distinguishes_module_paths_from_re_exported_items() {
         module_after_crate_prefix("use tower_mcp::McpRouter;", 4),
         None
     );
-    assert_eq!(module_after_crate_prefix("let x: tower_mcp::Result<()>;", 7), None);
+    assert_eq!(
+        module_after_crate_prefix("let x: tower_mcp::Result<()>;", 7),
+        None
+    );
 
     // And the allow-list has to actually contain the modules it names.
     assert!(REEXPORTED_MODULES.contains(&"context"));

@@ -1937,7 +1937,9 @@ fn json_request_ids_match(left: &serde_json::Value, right: &serde_json::Value) -
 }
 
 fn extract_json_messages(body: &str) -> Vec<String> {
-    let trimmed = body.trim();
+    // A BOM ahead of the body would defeat both the SSE sniff below and the
+    // JSON parse after it (#1303).
+    let trimmed = crate::framing::clean_input_line(body);
     if trimmed.is_empty() {
         return Vec::new();
     }
@@ -1989,6 +1991,12 @@ struct SseParser {
     data_len: usize,
     /// Maximum buffered size for a single event.
     max_event_size: usize,
+    /// Whether any chunk has been fed yet.
+    ///
+    /// A BOM is only a BOM at the very start of the stream; the same bytes
+    /// later in it are a zero-width no-break space inside someone's data
+    /// (#1303).
+    at_stream_start: bool,
 }
 
 impl SseParser {
@@ -2007,6 +2015,7 @@ impl SseParser {
             current_retry: None,
             data_len: 0,
             max_event_size,
+            at_stream_start: true,
         }
     }
 
@@ -2016,6 +2025,13 @@ impl SseParser {
     /// single in-progress event exceed the configured limit. The parser
     /// should not be fed further after an error.
     fn feed(&mut self, text: &str) -> Result<Vec<SseEvent>> {
+        // A leading BOM would make the first field name unrecognisable, so an
+        // event whose first line is `data:` would be dropped whole (#1303).
+        let text = if std::mem::take(&mut self.at_stream_start) {
+            text.strip_prefix('\u{feff}').unwrap_or(text)
+        } else {
+            text
+        };
         self.buffer.push_str(text);
         let mut events = Vec::new();
 
@@ -2088,6 +2104,50 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, Some("1".to_string()));
         assert_eq!(events[0].data, "{\"hello\":\"world\"}");
+    }
+
+    /// #1303: a BOM ahead of the stream makes the first field name
+    /// unrecognisable, so an event opening with `data:` is dropped whole.
+    #[test]
+    fn test_parse_strips_a_bom_at_the_start_of_the_stream() {
+        let mut parser = SseParser::new();
+        let events = parser
+            .feed("\u{feff}data: {\"hello\":\"world\"}\n\n")
+            .unwrap();
+
+        assert_eq!(events.len(), 1, "the opening event must survive a BOM");
+        assert_eq!(events[0].data, "{\"hello\":\"world\"}");
+    }
+
+    /// Only at the start. The same bytes later in the stream are a zero-width
+    /// no-break space inside someone's data, and altering it would hand the
+    /// caller content the server never sent.
+    #[test]
+    fn test_parse_keeps_a_bom_inside_the_stream() {
+        let mut parser = SseParser::new();
+        assert!(parser.feed("data: first\n\n").unwrap().len() == 1);
+
+        let events = parser.feed("data: \u{feff}second\n\n").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, "\u{feff}second");
+    }
+
+    /// #1303: the same gap on the non-streaming path, where a BOM would
+    /// defeat both the SSE sniff and the JSON parse behind it.
+    #[test]
+    fn test_extract_json_messages_strips_a_leading_bom() {
+        let json = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+        assert_eq!(
+            extract_json_messages(&format!("\u{feff}{json}")),
+            vec![json.to_string()],
+        );
+
+        let sse = extract_json_messages(&format!("\u{feff}data: {json}\n\n"));
+        assert_eq!(
+            sse,
+            vec![json.to_string()],
+            "a BOM must not hide an SSE body"
+        );
     }
 
     #[test]
