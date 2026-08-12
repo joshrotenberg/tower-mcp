@@ -508,7 +508,7 @@ impl Session {
     ) -> Self {
         // Skip the Initializing intermediate state — this session was
         // already initialized on the original instance.
-        router.session().mark_initialized();
+        router.session().mark_preinitialized();
 
         let (notifications_tx, _) = broadcast::channel(100);
         let (notif_sender, mut notif_receiver) = notification_channel(256);
@@ -872,11 +872,20 @@ impl SessionRegistry {
         }
     }
 
+    /// Create a session for an incoming `initialize` request.
+    ///
+    /// Only reached from the `is_init` branch of the POST handler, so the
+    /// handshake is recorded here, before the request is dispatched. A client
+    /// whose `initialized` notification overtakes that dispatch (#458) then
+    /// still completes the handshake, while one that never sent `initialize`
+    /// has no session for the notification to open.
     async fn create(
         &self,
         router: McpRouter,
         service_factory: ServiceFactory,
     ) -> Option<Arc<Session>> {
+        router.session().mark_handshake_started();
+
         let session = {
             let mut sessions = self.sessions.write().await;
 
@@ -940,7 +949,7 @@ impl SessionRegistry {
         service_factory: ServiceFactory,
     ) -> Option<Arc<Session>> {
         // Pre-initialize the router's session state so it won't reject requests
-        router.session().mark_initialized();
+        router.session().mark_preinitialized();
 
         let session = {
             let mut sessions = self.sessions.write().await;
@@ -3239,7 +3248,7 @@ async fn handle_post(
                     let ephemeral = router
                         .with_fresh_session()
                         .with_request_notification_sender(notif_tx);
-                    ephemeral.session().mark_initialized();
+                    ephemeral.session().mark_preinitialized();
                     JsonRpcService::new(factory(ephemeral))
                 }
                 ServiceSource::Service(mutex) => JsonRpcService::new(mutex.lock().unwrap().clone()),
@@ -3446,7 +3455,7 @@ async fn handle_post(
             let mut service = match &state.service_source {
                 ServiceSource::Router { router, factory } => {
                     let ephemeral = router.with_fresh_session();
-                    ephemeral.session().mark_initialized();
+                    ephemeral.session().mark_preinitialized();
                     JsonRpcService::new(factory(ephemeral))
                 }
                 ServiceSource::Service(mutex) => JsonRpcService::new(mutex.lock().unwrap().clone()),
@@ -4455,7 +4464,7 @@ async fn handle_modern_subscriptions_listen_sse(
     let service = match &state.service_source {
         ServiceSource::Router { router, factory } => {
             let ephemeral = router.with_fresh_session();
-            ephemeral.session().mark_initialized();
+            ephemeral.session().mark_preinitialized();
             JsonRpcService::new(factory(ephemeral))
         }
         ServiceSource::Service(mutex) => JsonRpcService::new(mutex.lock().unwrap().clone()),
@@ -6544,6 +6553,92 @@ mod tests {
             json.get("result").is_some(),
             "expected tools/list result, got {json}"
         );
+    }
+
+    fn test_session_registry() -> SessionRegistry {
+        SessionRegistry::new(
+            SessionConfig::default(),
+            false,
+            Arc::new(crate::session_store::MemorySessionStore::new()),
+            Arc::new(crate::event_store::MemoryEventStore::new()),
+            ServiceSource::Router {
+                router: create_test_router(),
+                factory: crate::transport::service::identity_factory(),
+            },
+            false,
+        )
+    }
+
+    /// #458: the `initialized` notification can beat the `initialize` dispatch,
+    /// so it finds the session still `Uninitialized`. The session exists only
+    /// because an `initialize` request arrived, so the handshake completes
+    /// anyway and the follow-up list requests are served.
+    ///
+    /// This is the case the `Uninitialized -> Initialized` path exists for, and
+    /// the one #1269 had to preserve while closing the bypass.
+    #[tokio::test]
+    async fn test_early_initialized_notification_still_completes_the_handshake() {
+        let registry = test_session_registry();
+        let session = registry
+            .create(
+                create_test_router().with_fresh_session(),
+                crate::transport::service::identity_factory(),
+            )
+            .await
+            .expect("session creation");
+
+        let SessionServiceSource::Router { router, .. } = &session.service_source else {
+            panic!("expected a router-backed session");
+        };
+
+        // The dispatch has not run yet, so the phase has not advanced.
+        assert_eq!(router.session().phase(), crate::SessionPhase::Uninitialized);
+        assert!(
+            router.session().handshake_started(),
+            "creating a session for an initialize request records the handshake"
+        );
+
+        session.handle_notification(McpNotification::Initialized);
+
+        assert!(
+            router.session().is_initialized(),
+            "the notification must still complete a handshake that is in flight"
+        );
+        assert!(router.session().is_request_allowed("tools/list"));
+    }
+
+    /// #1269, the other side of the same coin: a session that no `initialize`
+    /// ever reached is not opened by the notification alone.
+    #[tokio::test]
+    async fn test_initialized_notification_alone_does_not_open_a_session() {
+        let router = create_test_router().with_fresh_session();
+        assert!(!router.session().handshake_started());
+
+        router.handle_notification(McpNotification::Initialized);
+
+        assert_eq!(router.session().phase(), crate::SessionPhase::Uninitialized);
+        assert!(!router.session().is_request_allowed("tools/list"));
+    }
+
+    /// The `optional_sessions` opt-in still serves clients that skip the
+    /// handshake entirely. That is a server-side decision, so it goes through
+    /// `mark_preinitialized` rather than riding on the #458 race allowance.
+    #[tokio::test]
+    async fn test_optional_sessions_still_serves_without_a_handshake() {
+        let registry = test_session_registry();
+        let session = registry
+            .create_initialized(
+                create_test_router().with_fresh_session(),
+                crate::transport::service::identity_factory(),
+            )
+            .await
+            .expect("session creation");
+
+        let SessionServiceSource::Router { router, .. } = &session.service_source else {
+            panic!("expected a router-backed session");
+        };
+        assert!(router.session().is_initialized());
+        assert!(router.session().is_request_allowed("tools/list"));
     }
 
     #[tokio::test]
