@@ -23,8 +23,6 @@ use tower_mcp::transport::childproc::ChildProcessTransport;
 /// not be mistaken for the response. `send_request` has to keep reading past
 /// it and return the frame whose id matches the request it sent.
 #[tokio::test]
-#[ignore = "#1334 defect 1: send_request takes the next line unconditionally \
-            and fails to parse the notification as a response"]
 async fn response_correlates_by_id_past_a_leading_notification() {
     let mut conn = ChildProcessTransport::new("sh")
         .arg("-c")
@@ -51,8 +49,6 @@ async fn response_correlates_by_id_past_a_leading_notification() {
 /// sequential calls, answered out of order, must each get their own result --
 /// the id decides which is which, not arrival order.
 #[tokio::test]
-#[ignore = "#1334 defect 1: send_request has no id correlation at all, so it \
-            returns whichever response arrives first regardless of id"]
 async fn out_of_order_responses_are_matched_by_id_not_by_arrival_order() {
     let mut conn = ChildProcessTransport::new("sh")
         .arg("-c")
@@ -88,8 +84,6 @@ async fn out_of_order_responses_are_matched_by_id_not_by_arrival_order() {
 /// only the frame it landed in. `crate::framing::FrameReader` frames over
 /// bytes precisely so this can be discarded and the connection can read on.
 #[tokio::test]
-#[ignore = "#1334 defect 2: read_line decodes before framing, so invalid \
-            UTF-8 is a fatal Error::Transport instead of a discarded frame"]
 async fn invalid_utf8_frame_is_discarded_and_the_response_still_arrives() {
     let mut conn = ChildProcessTransport::new("sh")
         .arg("-c")
@@ -112,7 +106,6 @@ async fn invalid_utf8_frame_is_discarded_and_the_response_still_arrives() {
 /// stripped, the same as every other receive path in this crate
 /// (`crate::framing::clean_input_line`, #1303).
 #[tokio::test]
-#[ignore = "#1334 defect 3: no BOM strip on the childproc receive path"]
 async fn a_leading_bom_on_the_response_is_stripped() {
     let mut conn = ChildProcessTransport::new("sh")
         .arg("-c")

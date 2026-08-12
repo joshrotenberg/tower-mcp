@@ -36,14 +36,16 @@
 //! }
 //! ```
 
+use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
 
 use crate::error::{Error, Result};
-use crate::protocol::{JsonRpcRequest, JsonRpcResponse};
+use crate::framing::{FrameReader, InputFrame, clean_input_line};
+use crate::protocol::{JsonRpcRequest, JsonRpcResponse, RequestId};
 
 /// Builder for child process transport
 pub struct ChildProcessTransport {
@@ -107,11 +109,28 @@ impl ChildProcessTransport {
 }
 
 /// Active connection to a child MCP server process
+///
+/// # Response correlation and notifications
+///
+/// `send_request` reads frames from the child's stdout until it finds the
+/// response whose id matches the request it just sent, rather than assuming
+/// the next line is the answer. A spec-compliant child may write
+/// notifications (progress, log messages, list-changed) before it answers a
+/// request; those are logged and dropped, since this connection has no
+/// channel to publish them on -- there is no background reader task or
+/// subscriber here, unlike [`crate::client::McpClient`]. A response whose id
+/// does not match the one currently being awaited is not dropped: it is set
+/// aside in a small pending map, so a later call waiting on that id can pick
+/// it up immediately instead of losing a response that arrived out of order
+/// (#1334).
 pub struct ChildProcessConnection {
     child: Child,
     stdin: tokio::process::ChildStdin,
-    stdout: BufReader<tokio::process::ChildStdout>,
+    stdout: FrameReader<tokio::process::ChildStdout>,
     request_id: AtomicI64,
+    /// Responses read ahead of the request they answer, keyed by id, waiting
+    /// for the `send_request` call that is watching for that id.
+    pending: HashMap<RequestId, JsonRpcResponse>,
 }
 
 impl ChildProcessConnection {
@@ -128,8 +147,9 @@ impl ChildProcessConnection {
         Ok(Self {
             child,
             stdin,
-            stdout: BufReader::new(stdout),
+            stdout: FrameReader::new(stdout),
             request_id: AtomicI64::new(1),
+            pending: HashMap::new(),
         })
     }
 
@@ -139,14 +159,14 @@ impl ChildProcessConnection {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value> {
-        let id = self.request_id.fetch_add(1, Ordering::Relaxed);
-        let request = JsonRpcRequest::new(id, method).with_params(params);
+        let id = RequestId::Number(self.request_id.fetch_add(1, Ordering::Relaxed));
+        let request = JsonRpcRequest::new(id.clone(), method).with_params(params);
 
         // Send request
         let request_json = serde_json::to_string(&request)
             .map_err(|e| Error::Transport(format!("Failed to serialize request: {}", e)))?;
 
-        tracing::debug!(method = %method, id = %id, "Sending request to child");
+        tracing::debug!(method = %method, id = ?id, "Sending request to child");
 
         self.stdin
             .write_all(request_json.as_bytes())
@@ -161,22 +181,94 @@ impl ChildProcessConnection {
             .await
             .map_err(|e| Error::Transport(format!("Failed to flush stdin: {}", e)))?;
 
-        // Read response
-        let mut line = String::new();
-        self.stdout
-            .read_line(&mut line)
-            .await
-            .map_err(|e| Error::Transport(format!("Failed to read from child stdout: {}", e)))?;
+        self.response_for(&id).await
+    }
 
-        if line.is_empty() {
-            return Err(Error::Transport("Child process closed stdout".to_string()));
+    /// Read frames until the response for `id` arrives.
+    ///
+    /// Notifications are logged and discarded. A response for some other id
+    /// is held in `pending` rather than discarded, since it answers a request
+    /// this connection already sent and a future call will be watching for
+    /// it. A frame that is not valid UTF-8, per [`FrameReader`], costs only
+    /// itself; the loop reads on.
+    async fn response_for(&mut self, id: &RequestId) -> Result<serde_json::Value> {
+        if let Some(response) = self.pending.remove(id) {
+            return Self::into_result(response);
         }
 
-        tracing::debug!(response = %line.trim(), "Received response from child");
+        loop {
+            let frame = self
+                .stdout
+                .next_frame()
+                .await?
+                .ok_or_else(|| Error::Transport("Child process closed stdout".to_string()))?;
 
-        let response: JsonRpcResponse = serde_json::from_str(line.trim())
-            .map_err(|e| Error::Transport(format!("Failed to parse response: {}", e)))?;
+            let line = match frame {
+                InputFrame::Line(line) => line,
+                InputFrame::Undecodable => {
+                    tracing::warn!(
+                        "invalid UTF-8 in a frame from the child, discarding it; \
+                         a response carried in it will not arrive"
+                    );
+                    continue;
+                }
+            };
 
+            let line = clean_input_line(&line);
+            if line.is_empty() {
+                continue;
+            }
+
+            tracing::debug!(response = %line, "Received frame from child");
+
+            let value: serde_json::Value = match serde_json::from_str(line) {
+                Ok(value) => value,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to parse frame from child, discarding it");
+                    continue;
+                }
+            };
+
+            // A response carries "result" or "error"; a notification (or a
+            // request, which this connection does not expect from a child)
+            // carries neither and is dropped.
+            if value.get("result").is_none() && value.get("error").is_none() {
+                tracing::debug!(
+                    method = ?value.get("method").and_then(|m| m.as_str()),
+                    "dropping a notification from the child"
+                );
+                continue;
+            }
+
+            let response: JsonRpcResponse = match serde_json::from_value(value) {
+                Ok(response) => response,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to parse response from child, discarding it");
+                    continue;
+                }
+            };
+
+            let response_id = match &response {
+                JsonRpcResponse::Result(r) => Some(r.id.clone()),
+                JsonRpcResponse::Error(e) => e.id.clone(),
+                _ => None,
+            };
+
+            match response_id {
+                Some(response_id) if &response_id == id => {
+                    return Self::into_result(response);
+                }
+                Some(response_id) => {
+                    self.pending.insert(response_id, response);
+                }
+                None => {
+                    tracing::warn!("child sent a response with no id, discarding it");
+                }
+            }
+        }
+    }
+
+    fn into_result(response: JsonRpcResponse) -> Result<serde_json::Value> {
         match response {
             JsonRpcResponse::Result(r) => Ok(r.result),
             JsonRpcResponse::Error(e) => Err(Error::JsonRpc(e.error)),
@@ -352,20 +444,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_spawn_and_communicate() {
-        // Use `cat` as a simple echo server
-        let mut conn = ChildProcessTransport::new("cat").spawn().await.unwrap();
+        // A minimal scripted server: read the request line, ignore it, and
+        // answer with a response matching the id `send_request` sent. `cat`
+        // used to stand in here, but its echoed request has no
+        // "result"/"error" field, so under the fix (#1334) it reads as a
+        // notification and is correctly dropped rather than surfaced as an
+        // error -- there is nothing left to assert without a real answer.
+        let mut conn = ChildProcessTransport::new("sh")
+            .arg("-c")
+            .arg(r#"read -r _line; printf '{"jsonrpc":"2.0","id":1,"result":{"echoed":true}}\n'"#)
+            .spawn()
+            .await
+            .unwrap();
 
         assert!(conn.is_running());
 
-        // Send a JSON-RPC request
         let response = conn
             .send_request("echo", serde_json::json!({"msg": "hello"}))
-            .await;
+            .await
+            .unwrap();
 
-        // cat will echo our request back, but it won't be a valid JSON-RPC response.
-        // That's OK - we're testing that I/O works, not protocol correctness.
-        // The response will be a parse error since cat echoes the request verbatim.
-        assert!(response.is_err());
+        assert_eq!(response, serde_json::json!({"echoed": true}));
     }
 
     #[tokio::test]
