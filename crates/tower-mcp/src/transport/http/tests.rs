@@ -2625,6 +2625,16 @@ fn test_is_not_localhost_origin() {
     assert!(!is_localhost_origin(""));
 }
 
+#[test]
+fn test_is_not_localhost_origin_embedded_loopback_strings() {
+    // These embed a loopback string without being loopback themselves.
+    // Pinned before widening the guard (#1341) so a fix cannot
+    // accidentally admit them.
+    assert!(!is_localhost_origin("http://127.0.0.1.evil.com"));
+    assert!(!is_localhost_origin("http://notlocalhost"));
+    assert!(!is_localhost_origin("http://evil.com#localhost"));
+}
+
 #[tokio::test]
 async fn test_origin_validation_rejects_cross_origin() {
     let transport = HttpTransport::new(create_test_router());
@@ -2840,6 +2850,42 @@ fn test_is_localhost_host_variants() {
     assert!(!is_localhost_host("evil.com"));
     assert!(!is_localhost_host("api.example.com:8443"));
     assert!(!is_localhost_host("10.0.0.1"));
+}
+
+#[test]
+fn test_is_not_localhost_host_embedded_loopback_strings() {
+    // Pinned before widening is_localhost_host (#1341): none of these are
+    // loopback even though each embeds a loopback string.
+    assert!(!is_localhost_host("localhost.evil.com"));
+    assert!(!is_localhost_host("127.0.0.1.evil.com"));
+    assert!(!is_localhost_host("notlocalhost"));
+    assert!(!is_localhost_host("evil.com#localhost"));
+}
+
+#[test]
+fn test_is_not_localhost_host_non_canonical_ipv4_forms() {
+    // Classic SSRF-style numeric encodings of 127.0.0.1. Rust's
+    // std::net::IpAddr parser requires canonical 4-octet dotted-decimal
+    // form and rejects all of these, so the loopback guard does not need
+    // to (and deliberately does not) special-case them.
+    assert!(!is_localhost_host("0x7f.0.0.1"));
+    assert!(!is_localhost_host("017700000001"));
+    assert!(!is_localhost_host("2130706433"));
+    // Non-canonical shorthand (2-part) IPv4 for 127.0.0.1. A conforming
+    // URL host parser would already have canonicalized this to
+    // "127.0.0.1" before it reached the wire; left deliberately rejected
+    // here rather than adding custom shorthand-IPv4 parsing.
+    assert!(!is_localhost_host("127.1"));
+}
+
+#[test]
+fn test_is_not_localhost_host_bare_ipv6_with_trailing_segment() {
+    // A bare (unbracketed) IPv6 literal has no notion of an appended
+    // port: "::1:3000" parses whole as the distinct, non-loopback
+    // address 0:0:0:0:0:0:1:3000, not as "::1" plus port 3000.
+    // Deliberately rejected: RFC 3986 requires brackets around an IPv6
+    // host whenever a port follows it.
+    assert!(!is_localhost_host("::1:3000"));
 }
 
 #[tokio::test]
