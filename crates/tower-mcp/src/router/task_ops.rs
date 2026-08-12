@@ -459,3 +459,201 @@ impl McpRouter {
         }
     }
 }
+
+// ===========================================================================
+// Task helpers
+// ===========================================================================
+//
+// Free functions whose only callers are the methods above. They sat at the top
+// of `router.rs`, above the type they serve, rather than beside the group that
+// uses them (#1256).
+
+pub(super) fn task_store_error(e: TaskStoreError) -> Error {
+    Error::JsonRpc(JsonRpcError::internal_error(format!(
+        "Task store error: {}",
+        e
+    )))
+}
+
+pub(super) async fn discard_unprepared_task(store: &Arc<dyn TaskStore>, task_id: &str) {
+    if !matches!(store.discard_task(task_id).await, Ok(true)) {
+        let _ = store
+            .cancel_task(task_id, Some("task preparation failed"))
+            .await;
+    }
+}
+
+/// Whether this request's client declared the final Tasks extension.
+///
+/// Final requests carry client capabilities per request, so negotiation is
+/// decided from the request itself rather than from session state.
+#[cfg(feature = "stateless")]
+pub(super) fn client_declares_tasks(extensions: &crate::context::Extensions) -> bool {
+    final_client_capabilities(extensions).is_some_and(|capabilities| {
+        capabilities.extensions.as_ref().is_some_and(|declared| {
+            declared.contains_key(tower_mcp_types::protocol::TASKS_EXTENSION_ID)
+        })
+    })
+}
+
+#[cfg(not(feature = "stateless"))]
+pub(super) fn client_declares_tasks(_extensions: &crate::context::Extensions) -> bool {
+    false
+}
+
+/// Decode the wire `inputResponses` map into typed responses.
+///
+/// A key whose value does not match any known response shape is dropped here
+/// rather than failing the request: the store treats an unmatched key as
+/// ignorable, and SEP-2663 requires ignoring responses that do not correspond
+/// to an outstanding request.
+pub(super) fn decode_input_responses(
+    responses: &std::collections::HashMap<String, serde_json::Value>,
+) -> crate::protocol::InputResponses {
+    responses
+        .iter()
+        .filter_map(|(key, value)| {
+            serde_json::from_value(value.clone())
+                .ok()
+                .map(|response| (key.clone(), response))
+        })
+        .collect()
+}
+
+/// Error for a task the server cannot serve.
+///
+/// Unknown and expired tasks are deliberately indistinguishable, so a caller
+/// cannot probe for the existence of a task whose retention window closed.
+/// The error an owner gets for a task the store still holds but whose TTL
+/// elapsed.
+///
+/// Deliberately distinct from [`unknown_task_error`] in its `data`, and
+/// deliberately only ever produced after the caller has been shown to own the
+/// task. A caller who does not own it gets `unknown_task_error`, which is
+/// also what a genuinely unknown id gets, so the two cannot be told apart
+/// from outside (#1249).
+fn expired_task_error(task_id: &str) -> JsonRpcError {
+    let mut error = JsonRpcError::invalid_params(format!("Task expired: {task_id}"));
+    error.data = Some(serde_json::json!({ "reason": "task_expired" }));
+    error
+}
+
+fn unknown_task_error(task_id: &str) -> JsonRpcError {
+    JsonRpcError::invalid_params(format!("Task not found: {task_id}"))
+}
+
+/// The client capability shape a server names in a `-32021` when it cannot
+/// service a request without the Tasks extension.
+pub(crate) fn tasks_client_capabilities() -> crate::protocol::ClientCapabilities {
+    crate::protocol::ClientCapabilities {
+        extensions: Some(
+            [(
+                tower_mcp_types::protocol::TASKS_EXTENSION_ID.to_string(),
+                serde_json::json!({}),
+            )]
+            .into_iter()
+            .collect(),
+        ),
+        ..Default::default()
+    }
+}
+
+#[cfg(feature = "stateless")]
+pub(super) fn validate_input_required_result(
+    extensions: &crate::context::Extensions,
+    result: &InputRequiredResult,
+) -> Result<()> {
+    result.validate().map_err(|message| {
+        Error::invalid_params(format!("invalid InputRequiredResult: {message}"))
+    })?;
+
+    let meta = extensions
+        .get::<crate::stateless::StatelessRequestMeta>()
+        .filter(|meta| {
+            meta.protocol_version.as_deref() == Some(crate::protocol::PROTOCOL_VERSION_2026_07_28)
+        })
+        .ok_or_else(|| {
+            Error::invalid_params(
+                "InputRequiredResult is only supported by the 2026-07-28 request lifecycle",
+            )
+        })?;
+    let actual = meta.client_capabilities.as_ref().ok_or_else(|| {
+        Error::invalid_params("clientCapabilities is required for InputRequiredResult")
+    })?;
+
+    if let Some(requests) = &result.input_requests {
+        for request in requests.values() {
+            let (supported, required) = match request {
+                InputRequest::CreateMessage(params) => {
+                    let requires_tools = params.tools.is_some();
+                    let requires_context = params
+                        .include_context
+                        .is_some_and(|mode| mode != IncludeContext::None);
+                    let required_sampling = SamplingCapability {
+                        tools: requires_tools.then(SamplingToolsCapability::default),
+                        context: requires_context.then(SamplingContextCapability::default),
+                        ..SamplingCapability::default()
+                    };
+                    let supported = actual.sampling.as_ref().is_some_and(|sampling| {
+                        (!requires_tools || sampling.tools.is_some())
+                            && (!requires_context || sampling.context.is_some())
+                    });
+                    (
+                        supported,
+                        ClientCapabilities {
+                            sampling: Some(required_sampling),
+                            ..ClientCapabilities::default()
+                        },
+                    )
+                }
+                InputRequest::ListRoots(_) => (
+                    actual.roots.is_some(),
+                    ClientCapabilities {
+                        roots: Some(RootsCapability::default()),
+                        ..ClientCapabilities::default()
+                    },
+                ),
+                InputRequest::Elicit(ElicitRequestParams::Form(_)) => {
+                    let supported = actual.elicitation.as_ref().is_some_and(|elicitation| {
+                        elicitation.form.is_some()
+                            || (elicitation.form.is_none() && elicitation.url.is_none())
+                    });
+                    (
+                        supported,
+                        ClientCapabilities {
+                            elicitation: Some(ElicitationCapability {
+                                form: Some(ElicitationFormCapability::default()),
+                                ..ElicitationCapability::default()
+                            }),
+                            ..ClientCapabilities::default()
+                        },
+                    )
+                }
+                InputRequest::Elicit(ElicitRequestParams::Url(_)) => (
+                    actual
+                        .elicitation
+                        .as_ref()
+                        .is_some_and(|elicitation| elicitation.url.is_some()),
+                    ClientCapabilities {
+                        elicitation: Some(ElicitationCapability {
+                            url: Some(ElicitationUrlCapability::default()),
+                            ..ElicitationCapability::default()
+                        }),
+                        ..ClientCapabilities::default()
+                    },
+                ),
+                _ => {
+                    return Err(Error::invalid_params(
+                        "unsupported input request method in InputRequiredResult",
+                    ));
+                }
+            };
+            if !supported {
+                return Err(Error::JsonRpc(
+                    JsonRpcError::missing_required_client_capability(required),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
