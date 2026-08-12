@@ -323,6 +323,111 @@ impl UnixSocketTransport {
         crate::transport::graceful::serve_with_shutdown(listener, router, signal, drain_timeout)
             .await
     }
+
+    /// Serve the transport on a listener the caller already owns, forever.
+    ///
+    /// Everything [`serve`](Self::serve) does except the two steps that
+    /// belong to whoever owns the socket: binding, and the
+    /// [`cleanup_on_bind`](Self::cleanup_on_bind) removal that precedes it.
+    ///
+    /// Use this to put a policy in front of `accept`. See
+    /// [`serve_with_listener_and_shutdown`](Self::serve_with_listener_and_shutdown)
+    /// for a peer-credential example.
+    ///
+    /// This future never resolves on its own. Use
+    /// [`serve_with_listener_and_shutdown`](Self::serve_with_listener_and_shutdown)
+    /// in any process that has to stop the server without exiting.
+    pub async fn serve_with_listener<L>(self, listener: L) -> crate::Result<()>
+    where
+        L: axum::serve::Listener,
+        L::Addr: std::fmt::Debug,
+    {
+        self.serve_with_listener_and_shutdown(listener, std::future::pending::<()>())
+            .await
+    }
+
+    /// Serve the transport on a caller-owned listener until `signal` resolves.
+    ///
+    /// The shutdown behaviour is identical to
+    /// [`serve_with_shutdown`](Self::serve_with_shutdown), including
+    /// [`drain_timeout`](Self::drain_timeout); only the listener changes
+    /// hands. Nothing here binds or removes a socket file, so the caller owns
+    /// that lifecycle end to end.
+    ///
+    /// # Peer credentials
+    ///
+    /// Checking who is on the other end is close to the point of choosing a
+    /// unix socket over TCP, and it needs the accepted stream before axum
+    /// takes it. A [`Listener`](axum::serve::Listener) wrapper is that seam:
+    /// `accept` returns no error, so a connection that fails the policy is
+    /// dropped and the loop simply waits for the next one.
+    ///
+    /// ```rust,no_run
+    /// use tokio::net::{UnixListener, UnixStream};
+    /// use tokio::net::unix::SocketAddr;
+    /// use tower_mcp::{McpRouter, UnixSocketTransport};
+    ///
+    /// /// Accepts only connections from `uid`.
+    /// struct PeerUid {
+    ///     inner: UnixListener,
+    ///     uid: u32,
+    /// }
+    ///
+    /// impl axum::serve::Listener for PeerUid {
+    ///     type Io = UnixStream;
+    ///     type Addr = SocketAddr;
+    ///
+    ///     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+    ///         loop {
+    ///             let Ok((stream, addr)) = self.inner.accept().await else {
+    ///                 continue;
+    ///             };
+    ///             match stream.peer_cred() {
+    ///                 // The peer is who we expect; hand it to axum.
+    ///                 Ok(cred) if cred.uid() == self.uid => return (stream, addr),
+    ///                 // Wrong user, or no credentials to check. Drop the
+    ///                 // connection and wait for the next one.
+    ///                 _ => continue,
+    ///             }
+    ///         }
+    ///     }
+    ///
+    ///     fn local_addr(&self) -> std::io::Result<Self::Addr> {
+    ///         self.inner.local_addr()
+    ///     }
+    /// }
+    ///
+    /// # async fn example(allowed_uid: u32) -> Result<(), tower_mcp::BoxError> {
+    /// let listener = PeerUid {
+    ///     inner: UnixListener::bind("/tmp/mcp.sock")?,
+    ///     uid: allowed_uid,
+    /// };
+    ///
+    /// let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    /// UnixSocketTransport::new(McpRouter::new())
+    ///     .serve_with_listener_and_shutdown(listener, async {
+    ///         rx.await.ok();
+    ///     })
+    ///     .await?;
+    /// # let _ = tx;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn serve_with_listener_and_shutdown<L, F>(
+        self,
+        listener: L,
+        signal: F,
+    ) -> crate::Result<()>
+    where
+        L: axum::serve::Listener,
+        L::Addr: std::fmt::Debug,
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let drain_timeout = self.drain_timeout;
+        let router = self.inner.into_router();
+        crate::transport::graceful::serve_with_shutdown(listener, router, signal, drain_timeout)
+            .await
+    }
 }
 
 /// Remove an existing socket file, ignoring "not found" errors.
@@ -345,6 +450,219 @@ fn cleanup_socket(path: &PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{UnixListener, UnixStream};
+
+    /// A socket path short enough for `sun_path`, unique per test.
+    fn socket_path() -> PathBuf {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        std::env::temp_dir().join(format!(
+            "tm-{}-{}.sock",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn test_transport() -> UnixSocketTransport {
+        UnixSocketTransport::new(McpRouter::new().server_info("unix-listener-test", "0.0.0"))
+            .disable_origin_validation()
+            .disable_host_validation()
+    }
+
+    fn initialize_frame() -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "unix-test", "version": "1.0.0"}
+            }
+        })
+        .to_string()
+    }
+
+    /// One HTTP/1.1 POST over a unix socket, returning the whole raw response.
+    /// Empty means the server hung up without answering.
+    async fn post(path: &Path, body: &str) -> String {
+        let mut stream = UnixStream::connect(path).await.expect("connect");
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+             Accept: application/json, text/event-stream\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len(),
+        );
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.expect("read");
+        response
+    }
+
+    /// #1286: a caller that binds the listener itself still gets the
+    /// transport's serve behaviour, graceful shutdown included.
+    #[tokio::test]
+    async fn serves_on_a_caller_owned_listener() {
+        let path = socket_path();
+        let listener = UnixListener::bind(&path).expect("bind");
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(test_transport().serve_with_listener_and_shutdown(
+            listener,
+            async {
+                rx.await.ok();
+            },
+        ));
+
+        let response = post(&path, &initialize_frame()).await;
+        assert!(
+            response.contains("200 OK"),
+            "expected a served response, got: {response}"
+        );
+        assert!(
+            response.contains("serverInfo"),
+            "expected an initialize result, got: {response}"
+        );
+
+        tx.send(()).ok();
+        let served = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("shutdown signal must stop the server");
+        served.expect("join").expect("serve");
+
+        cleanup_socket(&path);
+    }
+
+    /// The seam the issue asked for: a wrapper in front of `accept` decides
+    /// which connections reach the transport at all. This one refuses every
+    /// connection, which is what a peer-credential check does to a caller it
+    /// does not recognise.
+    #[tokio::test]
+    async fn a_rejecting_listener_wrapper_is_consulted() {
+        struct RefuseAll {
+            inner: UnixListener,
+            seen: Arc<AtomicUsize>,
+        }
+
+        impl axum::serve::Listener for RefuseAll {
+            type Io = UnixStream;
+            type Addr = tokio::net::unix::SocketAddr;
+
+            async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+                loop {
+                    if let Ok((stream, _addr)) = self.inner.accept().await {
+                        self.seen.fetch_add(1, Ordering::SeqCst);
+                        drop(stream);
+                    }
+                }
+            }
+
+            fn local_addr(&self) -> std::io::Result<Self::Addr> {
+                self.inner.local_addr()
+            }
+        }
+
+        let path = socket_path();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let listener = RefuseAll {
+            inner: UnixListener::bind(&path).expect("bind"),
+            seen: seen.clone(),
+        };
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(test_transport().serve_with_listener_and_shutdown(
+            listener,
+            async {
+                rx.await.ok();
+            },
+        ));
+
+        let response = post(&path, &initialize_frame()).await;
+        assert!(
+            response.is_empty(),
+            "a refused connection must not be served: {response}"
+        );
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "the wrapper must be the one accepting"
+        );
+
+        tx.send(()).ok();
+        server.abort();
+        cleanup_socket(&path);
+    }
+
+    /// The use case behind #1286, end to end: the documented `peer_cred`
+    /// filter admits a caller running as the expected uid.
+    ///
+    /// The uid to expect comes from a file this process just created, since
+    /// that is the euid the socket peer will report.
+    #[tokio::test]
+    async fn a_peer_credential_filter_admits_the_expected_uid() {
+        use std::os::unix::fs::MetadataExt;
+
+        struct PeerUid {
+            inner: UnixListener,
+            uid: u32,
+        }
+
+        impl axum::serve::Listener for PeerUid {
+            type Io = UnixStream;
+            type Addr = tokio::net::unix::SocketAddr;
+
+            async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+                loop {
+                    let Ok((stream, addr)) = self.inner.accept().await else {
+                        continue;
+                    };
+                    match stream.peer_cred() {
+                        Ok(cred) if cred.uid() == self.uid => return (stream, addr),
+                        _ => continue,
+                    }
+                }
+            }
+
+            fn local_addr(&self) -> std::io::Result<Self::Addr> {
+                self.inner.local_addr()
+            }
+        }
+
+        let marker = socket_path().with_extension("uid");
+        std::fs::write(&marker, b"").expect("write marker");
+        let uid = std::fs::metadata(&marker).expect("stat marker").uid();
+        std::fs::remove_file(&marker).ok();
+
+        let path = socket_path();
+        let listener = PeerUid {
+            inner: UnixListener::bind(&path).expect("bind"),
+            uid,
+        };
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(test_transport().serve_with_listener_and_shutdown(
+            listener,
+            async {
+                rx.await.ok();
+            },
+        ));
+
+        let response = post(&path, &initialize_frame()).await;
+        assert!(
+            response.contains("200 OK") && response.contains("serverInfo"),
+            "a peer with the expected uid must be served: {response}"
+        );
+
+        tx.send(()).ok();
+        let served = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("shutdown signal must stop the server");
+        served.expect("join").expect("serve");
+
+        cleanup_socket(&path);
+    }
 
     #[tokio::test]
     async fn delegates_runtime_protocol_configuration_to_http() {
