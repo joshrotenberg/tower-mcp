@@ -408,7 +408,7 @@ where
 /// implementation of this trait, and the router drives every prompt through
 /// it. No public constructor accepts an implementation, so a prompt written as
 /// a type rather than a closure implements [`McpPrompt`] instead.
-pub trait PromptHandler: Send + Sync {
+pub(crate) trait PromptHandler: Send + Sync {
     /// Get the prompt with the given arguments
     fn get(&self, arguments: HashMap<String, String>) -> BoxFuture<'_, Result<GetPromptResult>>;
 
@@ -432,7 +432,7 @@ pub trait PromptHandler: Send + Sync {
 
 /// Prompt handler that may return an SEP-2322 input-required continuation.
 #[cfg(feature = "stateless")]
-pub trait MrtrPromptHandler: Send + Sync {
+pub(crate) trait MrtrPromptHandler: Send + Sync {
     /// Resolve a prompt attempt with continuation values available through
     /// the request context.
     fn get(

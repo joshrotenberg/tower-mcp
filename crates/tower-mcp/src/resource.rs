@@ -327,7 +327,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// the router reads every resource through it. No public constructor accepts
 /// an implementation, so a resource written as a type rather than a closure
 /// implements [`McpResource`] instead.
-pub trait ResourceHandler: Send + Sync {
+pub(crate) trait ResourceHandler: Send + Sync {
     /// Read the resource contents
     fn read(&self) -> BoxFuture<'_, Result<ReadResourceResult>>;
 
@@ -338,16 +338,11 @@ pub trait ResourceHandler: Send + Sync {
     fn read_with_context(&self, _ctx: RequestContext) -> BoxFuture<'_, Result<ReadResourceResult>> {
         self.read()
     }
-
-    /// Returns true if this handler uses context (for optimization)
-    fn uses_context(&self) -> bool {
-        false
-    }
 }
 
 /// Resource handler that may return an SEP-2322 input-required continuation.
 #[cfg(feature = "stateless")]
-pub trait MrtrResourceHandler: Send + Sync {
+pub(crate) trait MrtrResourceHandler: Send + Sync {
     /// Read a resource attempt with continuation values in the context.
     fn read(
         &self,
@@ -1637,10 +1632,6 @@ where
     fn read_with_context(&self, ctx: RequestContext) -> BoxFuture<'_, Result<ReadResourceResult>> {
         Box::pin((self.handler)(ctx))
     }
-
-    fn uses_context(&self) -> bool {
-        true
-    }
 }
 
 #[cfg(feature = "stateless")]
@@ -1764,7 +1755,7 @@ impl<T: McpResource> ResourceHandler for McpResourceHandler<T> {
 /// Templates are built from closures through
 /// [`ResourceTemplateBuilder::handler`]; no public constructor accepts an
 /// implementation of this trait.
-pub trait ResourceTemplateHandler: Send + Sync {
+pub(crate) trait ResourceTemplateHandler: Send + Sync {
     /// Read a resource with the given URI variables extracted from the template
     fn read(
         &self,
@@ -1775,7 +1766,7 @@ pub trait ResourceTemplateHandler: Send + Sync {
 
 /// Resource-template handler that may return an SEP-2322 continuation.
 #[cfg(feature = "stateless")]
-pub trait MrtrResourceTemplateHandler: Send + Sync {
+pub(crate) trait MrtrResourceTemplateHandler: Send + Sync {
     /// Read a matched template resource with retry values in the context.
     fn read(
         &self,
