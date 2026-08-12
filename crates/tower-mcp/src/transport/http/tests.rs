@@ -5,6 +5,15 @@
 //! an integration test because they reach private items.
 
 use super::*;
+// The production code moved into child modules in #1256 phase 3; this test
+// module reaches their pub(super) items directly (private-item access is
+// exactly why it's a sibling module rather than an integration test), so it
+// needs its own glob imports rather than relying on whatever `http.rs` itself
+// happens to re-export for its own use. Nothing from `stateless_dispatch` is
+// glob-imported here: everything this file needs from it is already covered
+// by `http.rs`'s own explicit re-export, reachable through `use super::*`.
+use super::handlers::*;
+use super::session::*;
 use axum::body::Body;
 use axum::http::Request;
 use proptest::prelude::*;
