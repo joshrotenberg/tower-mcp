@@ -4489,3 +4489,168 @@ async fn strict_initialization_false_allows_tools_list_without_notification() {
         "expected success with strict_initialization=false, got: {json}"
     );
 }
+
+// =============================================================================
+// #1336: the POST body receive path never stripped a leading BOM, and three
+// "malformed but identified" sites answered with `id: null` plus a verbatim
+// serde message instead of the request's own id. Kept in its own block,
+// separate from the `is_localhost_host` / `is_localhost_origin` tests above,
+// since #1350 touches those in the same file.
+// =============================================================================
+
+/// A BOM-prefixed POST body is served rather than rejected with -32700.
+/// Every other receive path in the crate already strips a leading BOM
+/// (`clean_input_line`, #1303/#1314); this was the last one that didn't.
+#[tokio::test]
+async fn post_body_with_leading_bom_is_served() {
+    let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
+    let app = transport.into_router();
+
+    let body = format!(
+        "\u{feff}{}",
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "ping"})
+    );
+    let request = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(Body::from(body))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["id"], serde_json::json!(1), "BOM'd request: {json}");
+    assert!(
+        json.get("result").is_some(),
+        "BOM'd body must be parsed and served, not rejected: {json}"
+    );
+}
+
+/// SEP-1442 stateless dispatch (the legacy stateless site, reached with no
+/// `Mcp-Session-Id` and a supported `MCP-Protocol-Version` header) never
+/// validates the envelope before deserializing into `JsonRpcRequest`, so a
+/// malformed-but-identified request must still come back with its own id
+/// and a message that doesn't name the Rust type.
+#[tokio::test]
+#[cfg(feature = "stateless")]
+async fn stateless_malformed_request_with_readable_id_gets_a_matching_id() {
+    let transport = HttpTransport::new(create_test_router())
+        .disable_origin_validation()
+        .stateless(crate::stateless::StatelessConfig::new());
+    let app = transport.into_router();
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2025-11-25")
+        // `method` is present and the id is well formed, but the request
+        // as a whole is not valid (method must be a string).
+        .body(Body::from(r#"{"jsonrpc":"2.0","id":7,"method":42}"#))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(
+        json["id"],
+        serde_json::json!(7),
+        "the id was present and readable, so it must be echoed back: {json}"
+    );
+    assert_eq!(json["error"]["code"].as_i64().unwrap(), -32700);
+    let message = json["error"]["message"].as_str().unwrap();
+    assert!(
+        !message.contains("JsonRpcRequest") && !message.to_lowercase().contains("struct"),
+        "error message must not name the Rust type (#1284 precedent): {message}"
+    );
+}
+
+/// The same site, but the id itself is unusable (present, but neither a
+/// number nor a string). There is nothing to correlate the error against,
+/// so it must still answer with a null id.
+#[tokio::test]
+#[cfg(feature = "stateless")]
+async fn stateless_malformed_request_with_unusable_id_stays_null() {
+    let transport = HttpTransport::new(create_test_router())
+        .disable_origin_validation()
+        .stateless(crate::stateless::StatelessConfig::new());
+    let app = transport.into_router();
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2025-11-25")
+        .body(Body::from(r#"{"jsonrpc":"2.0","id":null,"method":42}"#))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert!(
+        json["id"].is_null(),
+        "no usable id was available, so the response id must be null: {json}"
+    );
+    assert_eq!(json["error"]["code"].as_i64().unwrap(), -32700);
+}
+
+/// The session-based legacy path also has a malformed-but-identified window:
+/// `initialize` requests skip the envelope inspection that runs ahead of
+/// every other request, so a structurally invalid `initialize` body (here,
+/// a non-string `jsonrpc` field) still reaches the raw `JsonRpcRequest`
+/// deserialize and must come back with its own id and a generic message.
+#[tokio::test]
+async fn legacy_initialize_with_malformed_envelope_gets_a_matching_id() {
+    let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
+    let app = transport.into_router();
+
+    let body = serde_json::json!({
+        "jsonrpc": 2.0,
+        "id": 7,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": { "name": "t", "version": "1" }
+        }
+    })
+    .to_string();
+    let request = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(Body::from(body))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(
+        json["id"],
+        serde_json::json!(7),
+        "the id was present and readable, so it must be echoed back: {json}"
+    );
+    assert_eq!(json["error"]["code"].as_i64().unwrap(), -32700);
+    let message = json["error"]["message"].as_str().unwrap();
+    assert!(
+        !message.contains("JsonRpcRequest") && !message.to_lowercase().contains("struct"),
+        "error message must not name the Rust type (#1284 precedent): {message}"
+    );
+}
