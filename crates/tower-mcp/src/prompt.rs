@@ -980,7 +980,6 @@ impl PromptBuilder {
 ///
 /// This allows either calling `.build()` to create the prompt directly,
 /// or `.layer()` to apply middleware before building.
-#[doc(hidden)]
 pub struct PromptBuilderWithHandler<F> {
     name: String,
     title: Option<String>,
@@ -990,8 +989,12 @@ pub struct PromptBuilderWithHandler<F> {
     handler: F,
 }
 
+/// Builder state after an MRTR handler is specified.
+///
+/// The multi-round-trip form of [`PromptBuilderWithHandler`], reached by
+/// [`PromptBuilder::mrtr_handler`]. Same choices from here: apply middleware
+/// with `.layer()`, or finish with `.build()`.
 #[cfg(feature = "stateless")]
-#[doc(hidden)]
 pub struct PromptBuilderWithMrtrHandler<F> {
     name: String,
     title: Option<String>,
@@ -1141,7 +1144,6 @@ where
 }
 
 /// Builder state after context-aware handler is specified
-#[doc(hidden)]
 pub struct PromptBuilderWithContextHandler<F> {
     name: String,
     title: Option<String>,

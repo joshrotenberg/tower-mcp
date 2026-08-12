@@ -120,8 +120,8 @@ use tokio::sync::Mutex;
 use crate::context::RequestContext;
 use crate::error::{Error, Result};
 use crate::protocol::{
-    ContentAnnotations, ReadResourceResult, RequestOutcome, ResourceContent, ResourceDefinition,
-    ResourceTemplateDefinition, ToolIcon,
+    ContentAnnotations, PromptArgument, ReadResourceResult, RequestOutcome, ResourceContent,
+    ResourceDefinition, ResourceTemplateDefinition, ToolIcon,
 };
 
 // =============================================================================
@@ -1162,7 +1162,6 @@ impl ResourceBuilder {
 ///
 /// This builder allows applying middleware layers via `.layer()` or building
 /// the resource directly via `.build()`.
-#[doc(hidden)]
 pub struct ResourceBuilderWithHandler<F> {
     uri: String,
     name: Option<String>,
@@ -1175,8 +1174,12 @@ pub struct ResourceBuilderWithHandler<F> {
     handler: F,
 }
 
+/// Builder state after an MRTR handler is specified.
+///
+/// The multi-round-trip form of [`ResourceBuilderWithHandler`], reached by
+/// [`ResourceBuilder::mrtr_handler`]. Same choices from here: apply
+/// middleware with `.layer()`, or finish with `.build()`.
 #[cfg(feature = "stateless")]
-#[doc(hidden)]
 pub struct ResourceBuilderWithMrtrHandler<F> {
     uri: String,
     name: Option<String>,
@@ -1189,8 +1192,12 @@ pub struct ResourceBuilderWithMrtrHandler<F> {
     handler: F,
 }
 
+/// Builder state after an MRTR handler and at least one layer.
+///
+/// Reached by calling `.layer()` on a
+/// [`ResourceBuilderWithMrtrHandler`]. Further `.layer()` calls stack onto
+/// `L`, outermost last, and `.build()` finishes.
 #[cfg(feature = "stateless")]
-#[doc(hidden)]
 pub struct ResourceBuilderWithMrtrLayer<F, L> {
     uri: String,
     name: Option<String>,
@@ -1390,7 +1397,6 @@ where
 /// Builder state after a layer has been applied to the handler.
 ///
 /// This builder allows chaining additional layers and building the final resource.
-#[doc(hidden)]
 pub struct ResourceBuilderWithLayer<F, L> {
     uri: String,
     name: Option<String>,
@@ -1467,7 +1473,6 @@ where
 }
 
 /// Builder state after context-aware handler is specified.
-#[doc(hidden)]
 pub struct ResourceBuilderWithContextHandler<F> {
     uri: String,
     name: Option<String>,
@@ -1524,7 +1529,6 @@ where
 }
 
 /// Builder state after a layer has been applied to a context-aware handler.
-#[doc(hidden)]
 pub struct ResourceBuilderWithContextLayer<F, L> {
     uri: String,
     name: Option<String>,
@@ -1835,6 +1839,11 @@ pub struct ResourceTemplate {
     pub icons: Option<Vec<ToolIcon>>,
     /// Optional annotations (audience, priority hints)
     pub annotations: Option<ContentAnnotations>,
+    /// Arguments this template accepts for URI expansion, as declared by
+    /// [`ResourceTemplateBuilder::argument`]. Empty unless declared (#1282).
+    pub arguments: Vec<PromptArgument>,
+    /// Protocol-level `_meta`, set by [`with_meta`](Self::with_meta).
+    meta: Option<Value>,
     /// Compiled regex for matching URIs
     pattern: regex::Regex,
     /// Variables declared by a form-style query expression, empty when the
@@ -1858,6 +1867,8 @@ impl Clone for ResourceTemplate {
             mime_type: self.mime_type.clone(),
             icons: self.icons.clone(),
             annotations: self.annotations.clone(),
+            arguments: self.arguments.clone(),
+            meta: self.meta.clone(),
             pattern: self.pattern.clone(),
             query_variables: self.query_variables.clone(),
             variables: self.variables.clone(),
@@ -1890,8 +1901,10 @@ impl ResourceTemplate {
 
     /// The entry this template contributes to `resources/templates/list`.
     ///
-    /// It advertises the pattern, not the variables: `arguments` is left
-    /// empty, and a client expands the pattern itself.
+    /// It advertises the pattern rather than deriving arguments from it: a
+    /// client expands the pattern itself, and `arguments` carries only what
+    /// [`ResourceTemplateBuilder::argument`] declared, which is nothing
+    /// unless the author said otherwise (#1282).
     pub fn definition(&self) -> ResourceTemplateDefinition {
         ResourceTemplateDefinition {
             uri_template: self.uri_template.clone(),
@@ -1901,9 +1914,44 @@ impl ResourceTemplate {
             mime_type: self.mime_type.clone(),
             icons: self.icons.clone(),
             annotations: self.annotations.clone(),
-            arguments: Vec::new(),
-            meta: None,
+            arguments: self.arguments.clone(),
+            meta: self.meta.clone(),
         }
+    }
+
+    /// Attach `_meta` to what `resources/templates/list` publishes for this
+    /// template.
+    ///
+    /// The counterpart of [`Resource::with_meta`], and validated the same
+    /// way: keys must satisfy the protocol's `_meta` rules, so a bad key is
+    /// rejected here rather than serialized onto the wire (#1282).
+    ///
+    /// ```rust
+    /// use serde_json::json;
+    /// use tower_mcp::ResourceTemplate;
+    ///
+    /// # fn template() -> ResourceTemplate {
+    /// ResourceTemplate::builder("file:///{path}")
+    ///     .name("files")
+    ///     .handler(|_uri: String, _vars: std::collections::HashMap<String, String>| async move {
+    ///         Ok(tower_mcp::protocol::ReadResourceResult::text("file:///a", ""))
+    ///     })
+    /// # }
+    /// let tagged = template()
+    ///     .with_meta(json!({ "example.com/audience": "internal" }))
+    ///     .expect("a valid _meta key");
+    /// assert!(tagged.definition().meta.is_some());
+    ///
+    /// // A leading slash is not a valid key, and is refused rather than sent.
+    /// assert!(template().with_meta(json!({ "/nope": true })).is_err());
+    /// ```
+    pub fn with_meta(
+        mut self,
+        meta: Value,
+    ) -> std::result::Result<Self, crate::protocol::MetaValidationError> {
+        crate::protocol::validate_meta_object(&meta)?;
+        self.meta = Some(meta);
+        Ok(self)
     }
 
     /// Match a URI against this template and extract its variables.
@@ -2157,6 +2205,7 @@ pub struct ResourceTemplateBuilder {
     mime_type: Option<String>,
     icons: Option<Vec<ToolIcon>>,
     annotations: Option<ContentAnnotations>,
+    arguments: Vec<PromptArgument>,
 }
 
 impl ResourceTemplateBuilder {
@@ -2195,6 +2244,7 @@ impl ResourceTemplateBuilder {
             mime_type: None,
             icons: None,
             annotations: None,
+            arguments: Vec::new(),
         }
     }
 
@@ -2252,6 +2302,45 @@ impl ResourceTemplateBuilder {
     /// Set annotations (audience, priority hints) for this resource template
     pub fn annotations(mut self, annotations: ContentAnnotations) -> Self {
         self.annotations = Some(annotations);
+        self
+    }
+
+    /// Declare an argument this template accepts for URI expansion.
+    ///
+    /// Arguments are advertised on `resources/templates/list`, and are for the
+    /// client's benefit rather than the router's: matching a URI still comes
+    /// from the compiled pattern, so declaring an argument neither adds a
+    /// variable nor validates one. Nothing is derived from the pattern
+    /// automatically, because a variable name alone carries no description and
+    /// no honest answer about whether it is required (#1282).
+    ///
+    /// ```rust
+    /// use tower_mcp::ResourceTemplate;
+    ///
+    /// let template = ResourceTemplate::builder("db://{table}{?limit}")
+    ///     .name("rows")
+    ///     .argument("table", Some("Table to read from"), true)
+    ///     .argument("limit", Some("Maximum rows to return"), false)
+    ///     .handler(|_uri: String, _vars: std::collections::HashMap<String, String>| async move {
+    ///         Ok(tower_mcp::protocol::ReadResourceResult::text("db://t", "[]"))
+    ///     });
+    ///
+    /// let definition = template.definition();
+    /// assert_eq!(definition.arguments.len(), 2);
+    /// assert!(definition.arguments[0].required);
+    /// assert!(!definition.arguments[1].required);
+    /// ```
+    pub fn argument(
+        mut self,
+        name: impl Into<String>,
+        description: Option<impl Into<String>>,
+        required: bool,
+    ) -> Self {
+        self.arguments.push(PromptArgument {
+            name: name.into(),
+            description: description.map(Into::into),
+            required,
+        });
         self
     }
 
@@ -2350,6 +2439,8 @@ impl ResourceTemplateBuilder {
             mime_type: self.mime_type,
             icons: self.icons,
             annotations: self.annotations,
+            arguments: self.arguments,
+            meta: None,
             pattern,
             query_variables,
             variables,
@@ -2400,6 +2491,8 @@ impl ResourceTemplateBuilder {
             mime_type: self.mime_type,
             icons: self.icons,
             annotations: self.annotations,
+            arguments: self.arguments,
+            meta: None,
             pattern,
             query_variables,
             variables,
@@ -2648,6 +2741,57 @@ mod query_expansion_tests {
                 })
             },
         )
+    }
+
+    /// #1282: a template could not carry the metadata a plain resource can,
+    /// and `definition()` emitted `arguments: []` unconditionally.
+    ///
+    /// The clone is the point of the assertion. `ResourceTemplate` implements
+    /// `Clone` by hand because of the `Arc<dyn ..>` handler, so a new field
+    /// that is not added there is dropped by every router that stores one.
+    #[test]
+    fn arguments_and_meta_reach_the_definition_and_survive_a_clone() {
+        let template = ResourceTemplateBuilder::new("db://{table}{?limit}")
+            .name("rows")
+            .argument("table", Some("Table to read"), true)
+            .argument("limit", None::<String>, false)
+            .handler(|uri: String, _vars: HashMap<String, String>| async move {
+                Ok(ReadResourceResult::text(uri, "[]"))
+            })
+            .with_meta(serde_json::json!({ "example.com/tier": "internal" }))
+            .expect("a valid _meta key");
+
+        for (label, definition) in [
+            ("original", template.definition()),
+            ("clone", template.clone().definition()),
+        ] {
+            assert_eq!(definition.arguments.len(), 2, "{label} lost its arguments");
+            assert_eq!(definition.arguments[0].name, "table");
+            assert_eq!(
+                definition.arguments[0].description.as_deref(),
+                Some("Table to read")
+            );
+            assert!(definition.arguments[0].required);
+            assert!(!definition.arguments[1].required);
+            assert!(definition.arguments[1].description.is_none());
+            assert_eq!(
+                definition
+                    .meta
+                    .as_ref()
+                    .and_then(|m| m.get("example.com/tier")),
+                Some(&serde_json::json!("internal")),
+                "{label} lost its _meta"
+            );
+        }
+    }
+
+    /// A template that declares nothing still advertises nothing, so the wire
+    /// output is unchanged for every server that has not opted in.
+    #[test]
+    fn a_template_without_declared_arguments_advertises_none() {
+        let definition = template("db://users/{id}").definition();
+        assert!(definition.arguments.is_empty());
+        assert!(definition.meta.is_none());
     }
 
     /// #1253: `{?cursor,limit}` was read as one variable literally named
