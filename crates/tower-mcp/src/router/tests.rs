@@ -3572,6 +3572,90 @@ fn declining_subscriptions_does_not_invent_a_resources_capability() {
     assert!(router.capabilities().resources.is_none());
 }
 
+/// Build a router with a tool, a resource, and a prompt registered, and
+/// optionally a notification channel attached. Used to pin the pre-#1338
+/// capability advertisement across every configuration that exists today.
+fn router_with_all_capabilities(with_notifications: bool) -> McpRouter {
+    let tool = ToolBuilder::new("test")
+        .description("test")
+        .handler(|_input: AddInput| async { Ok(CallToolResult::text("ok")) })
+        .build();
+
+    let mut router = McpRouter::new()
+        .server_info("defaults", "1.0")
+        .tool(tool)
+        .resource(
+            crate::resource::ResourceBuilder::new("mem://one")
+                .name("one")
+                .text("hi"),
+        )
+        .prompt(crate::prompt::PromptBuilder::new("greeting").user_message("hi"));
+
+    if with_notifications {
+        let (tx, _rx) = crate::context::notification_channel(16);
+        router = router.with_notification_sender(tx);
+    }
+
+    router
+}
+
+/// Regression test for #1338: before per-capability builders existed, all of
+/// `tools.listChanged`, `prompts.listChanged`, `resources.listChanged`, and
+/// `logging` were derived solely from whether a notification channel was
+/// attached. This pins that exact behavior, in every configuration that
+/// exists today, as a guard against the new builders' defaults drifting from
+/// it.
+#[test]
+fn capability_defaults_are_unchanged_by_per_capability_builders() {
+    // No notifications, nothing registered: no capability advertised at all.
+    let empty_router = McpRouter::new().server_info("empty", "1.0");
+    let empty_caps = empty_router.capabilities();
+    assert!(empty_caps.tools.is_none());
+    assert!(empty_caps.resources.is_none());
+    assert!(empty_caps.prompts.is_none());
+    assert!(empty_caps.logging.is_none());
+
+    // Notifications attached, nothing registered: only logging is advertised,
+    // since tools/resources/prompts capabilities are only present when the
+    // corresponding items are registered.
+    let (tx, _rx) = crate::context::notification_channel(16);
+    let empty_with_notifications = McpRouter::new()
+        .server_info("empty-notified", "1.0")
+        .with_notification_sender(tx);
+    let empty_notified_caps = empty_with_notifications.capabilities();
+    assert!(empty_notified_caps.tools.is_none());
+    assert!(empty_notified_caps.resources.is_none());
+    assert!(empty_notified_caps.prompts.is_none());
+    assert!(empty_notified_caps.logging.is_some());
+
+    // Everything registered, no notification channel: every capability is
+    // advertised, but every `list_changed` flag is false, and there is no
+    // logging capability.
+    let no_notifications = router_with_all_capabilities(false);
+    let no_notif_caps = no_notifications.capabilities();
+    let tools_cap = no_notif_caps.tools.expect("tool registered");
+    assert!(!tools_cap.list_changed);
+    let resources_cap = no_notif_caps.resources.expect("resource registered");
+    assert!(!resources_cap.list_changed);
+    assert!(resources_cap.subscribe, "subscribe still defaults to true");
+    let prompts_cap = no_notif_caps.prompts.expect("prompt registered");
+    assert!(!prompts_cap.list_changed);
+    assert!(no_notif_caps.logging.is_none());
+
+    // Everything registered, notification channel attached: every capability
+    // is advertised and every `list_changed` flag, plus logging, is true.
+    let with_notifications = router_with_all_capabilities(true);
+    let notif_caps = with_notifications.capabilities();
+    let tools_cap = notif_caps.tools.expect("tool registered");
+    assert!(tools_cap.list_changed);
+    let resources_cap = notif_caps.resources.expect("resource registered");
+    assert!(resources_cap.list_changed);
+    assert!(resources_cap.subscribe);
+    let prompts_cap = notif_caps.prompts.expect("prompt registered");
+    assert!(prompts_cap.list_changed);
+    assert!(notif_caps.logging.is_some());
+}
+
 #[tokio::test]
 async fn test_completion_handler() {
     let router = McpRouter::new()
