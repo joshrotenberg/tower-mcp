@@ -712,7 +712,9 @@ fn parse_cache_control_max_age(header: Option<&str>) -> Option<std::time::Durati
     let header = header?;
     for directive in header.split(',') {
         let directive = directive.trim();
-        if let Some(value) = directive.strip_prefix("max-age=")
+        // RFC 9111 section 5.2: directive names are case-insensitive tokens,
+        // so `MAX-AGE=300` asks for the same TTL as `max-age=300` (#1358).
+        if let Some(value) = crate::ascii::strip_prefix_ignore_ascii_case(directive, "max-age=")
             && let Ok(seconds) = value.trim().parse::<u64>()
         {
             return Some(std::time::Duration::from_secs(seconds));
@@ -1126,6 +1128,26 @@ mod tests {
             parse_cache_control_max_age(Some("max-age=0")),
             Some(std::time::Duration::from_secs(0))
         );
+    }
+
+    /// #1358: RFC 9111 section 5.2 makes directive names case-insensitive
+    /// tokens. Matching them by exact bytes dropped the server's TTL and fell
+    /// back to the default, silently.
+    #[cfg(feature = "jwks")]
+    #[test]
+    fn cache_control_directives_are_matched_case_insensitively() {
+        for header in [
+            "MAX-AGE=300",
+            "Max-Age=300",
+            "mAx-AgE=300",
+            "public, MAX-AGE=300, must-revalidate",
+        ] {
+            assert_eq!(
+                parse_cache_control_max_age(Some(header)),
+                Some(std::time::Duration::from_secs(300)),
+                "{header} should be honoured"
+            );
+        }
     }
 
     #[cfg(feature = "jwks")]

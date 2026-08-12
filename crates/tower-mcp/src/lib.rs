@@ -494,6 +494,7 @@
 
 #[cfg(feature = "mcp-apps")]
 pub mod apps;
+mod ascii;
 pub mod async_task;
 pub mod auth;
 pub mod client;

@@ -331,13 +331,11 @@ impl Validate for StaticBearerValidator {
 /// `pub(crate)` so [`crate::oauth::middleware`] can share this implementation
 /// rather than growing a second, divergent copy (#1337).
 pub(crate) fn strip_scheme<'a>(header: &'a str, scheme: &str) -> Option<&'a str> {
-    let rest = header.get(..scheme.len())?;
-    if !rest.eq_ignore_ascii_case(scheme) {
-        return None;
-    }
-    let after = header.get(scheme.len()..)?;
+    let after = crate::ascii::strip_prefix_ignore_ascii_case(header, scheme)?;
     // The scheme must be followed by whitespace, or `Bearerish` would match
-    // `Bearer`.
+    // `Bearer`. That requirement is why the prefix match itself is the shared
+    // helper and this is not: a cache directive is `name=value` and has no
+    // such delimiter (#1358).
     if !after.starts_with(' ') {
         return None;
     }
