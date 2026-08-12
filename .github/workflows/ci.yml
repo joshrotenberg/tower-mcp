@@ -161,7 +161,18 @@ jobs:
     name: Coverage
     runs-on: ubuntu-latest
     env:
-      COVERAGE_MIN_LINES: "80"
+      # Production code only. `cargo llvm-cov` reports a sibling `tests.rs`
+      # module as zero instrumented lines but counts an inline
+      # `#[cfg(test)] mod tests { .. }` block, which is covered by definition
+      # because running the suite executes it. So every module that carried
+      # its tests inline was inflating this number with test code covering
+      # itself.
+      #
+      # #1256 moved the last of those out, and the measurement dropped from
+      # 80.4% to 78.5% without a line of production code changing. 78 is the
+      # real figure, and was all along. Raise it by writing tests, not by
+      # putting test bodies back in front of the meter.
+      COVERAGE_MIN_LINES: "78"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
