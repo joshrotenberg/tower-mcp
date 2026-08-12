@@ -273,6 +273,10 @@ impl PanicPolicy {
     ///
     /// The tool-name switches are deliberately not consulted. They select how
     /// to name a tool, and there is no tool here to name.
+    ///
+    /// Gated with its caller. Widen the gate when a second transport adopts
+    /// [`McpRouter::transport_internal_error`].
+    #[cfg(feature = "websocket")]
     fn internal_error_message(&self, error: &dyn std::fmt::Display) -> String {
         match &self.client_message {
             ClientPanicMessage::Detailed => error.to_string(),
@@ -3025,6 +3029,11 @@ impl McpRouter {
     /// is both the behaviour these paths already had and the stance the crate
     /// takes elsewhere: a panic is not caught at all until `catch_panics` asks
     /// for it.
+    ///
+    /// Gated on `websocket` because that is where the two sites are. Widen the
+    /// gate rather than duplicating the decision when another transport needs
+    /// it, which is the whole point of it being one helper.
+    #[cfg(feature = "websocket")]
     pub(crate) fn transport_internal_error(&self, error: &dyn std::fmt::Display) -> JsonRpcError {
         match &self.inner.panic_policy {
             Some(policy) => JsonRpcError::internal_error(policy.internal_error_message(error)),
