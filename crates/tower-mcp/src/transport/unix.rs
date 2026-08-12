@@ -497,7 +497,15 @@ mod tests {
         );
         stream.write_all(request.as_bytes()).await.expect("write");
         let mut response = String::new();
-        stream.read_to_string(&mut response).await.expect("read");
+        match stream.read_to_string(&mut response).await {
+            Ok(_) => {}
+            // A peer that drops the connection with our request still unread
+            // resets it on Linux rather than closing cleanly, where macOS
+            // reports plain end-of-input. Both mean the same thing here, so
+            // keep whatever arrived and let the caller judge it.
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Err(error) => panic!("read: {error}"),
+        }
         response
     }
 
