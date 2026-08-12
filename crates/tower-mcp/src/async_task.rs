@@ -163,9 +163,9 @@
 //! created with no authenticated context, so a request that now carries a
 //! principal is a different security context rather than an upgrade of the
 //! same one. Servers mixing public and authenticated paths (see
-//! [`AuthConfig::public_path`](crate::auth::AuthConfig::public_path)) should
-//! expect a task created anonymously to be unreachable once a token is
-//! presented.
+//! [`OAuthLayer::public_path`](crate::oauth::OAuthLayer::public_path), or
+//! routing them around the layer entirely) should expect a task created
+//! anonymously to be unreachable once a token is presented.
 //!
 //! The principal comes from the OAuth `sub` claim that the HTTP and WebSocket
 //! transports bridge into request extensions. Without the `oauth` feature

@@ -82,9 +82,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 // The last row is the surprising one and is deliberate. An unowned task can
 // only exist if it was created with no authenticated context, so a request
 // that now carries a principal is a different security context rather than an
-// upgrade of the same one. Servers mixing public and authenticated paths (see
-// `AuthConfig::public_path`) should expect a task created anonymously to be
-// unreachable once a token is presented.
+// upgrade of the same one. Servers mixing public and authenticated paths
+// (`OAuthLayer::public_path`, or routing them around the layer entirely)
+// should expect a task created anonymously to be unreachable once a token is
+// presented.
 //
 // This example has no authentication, so every task is unowned and the first
 // row applies throughout. Add an `AuthLayer` or OAuth validation, as in

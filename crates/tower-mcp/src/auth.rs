@@ -627,100 +627,6 @@ fn unauthorized_response(message: &str) -> axum::response::Response {
     (StatusCode::UNAUTHORIZED, axum::Json(body)).into_response()
 }
 
-// =============================================================================
-// Helper for building auth middleware
-// =============================================================================
-
-/// Auth policy an application applies itself.
-///
-/// A container for the three settings an HTTP server usually needs to decide
-/// before it authenticates anything. Nothing in this crate reads it:
-/// [`AuthLayer`] takes its header name directly and authenticates every
-/// request it wraps, so routing public paths around it, or honoring
-/// `allow_anonymous`, is the application's own dispatch.
-///
-/// [`OAuthLayer::public_path`] is the enforced equivalent for servers on the
-/// OAuth path.
-///
-/// # Example
-///
-/// ```rust
-/// use tower_mcp::auth::AuthConfig;
-///
-/// let config = AuthConfig::new()
-///     .public_path("/health")
-///     .header_name("X-API-Key");
-///
-/// assert!(config.is_public("/health"));
-/// // Matching is by prefix, so everything under a public path is public too.
-/// assert!(config.is_public("/health/ready"));
-/// assert!(!config.is_public("/mcp"));
-///
-/// // Prefix matching does not stop at a path segment: a neighboring route
-/// // that merely starts with the same text is public as well. Name paths
-/// // that would be unsafe to expose so that no prefix of them is listed.
-/// assert!(config.is_public("/healthz-internal"));
-/// ```
-///
-/// [`OAuthLayer::public_path`]: crate::oauth::OAuthLayer::public_path
-#[derive(Clone)]
-pub struct AuthConfig {
-    /// Whether to allow unauthenticated requests to pass through
-    pub allow_anonymous: bool,
-    /// Paths that don't require authentication
-    pub public_paths: Vec<String>,
-    /// Custom header name for auth token
-    pub header_name: String,
-}
-
-impl Default for AuthConfig {
-    fn default() -> Self {
-        Self {
-            allow_anonymous: false,
-            public_paths: Vec::new(),
-            header_name: "Authorization".to_string(),
-        }
-    }
-}
-
-impl AuthConfig {
-    /// Create a new auth config
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Allow anonymous requests (no auth required)
-    pub fn allow_anonymous(mut self, allow: bool) -> Self {
-        self.allow_anonymous = allow;
-        self
-    }
-
-    /// Add paths that don't require authentication
-    ///
-    /// Read back with [`is_public`](Self::is_public), which matches by prefix.
-    pub fn public_path(mut self, path: impl Into<String>) -> Self {
-        self.public_paths.push(path.into());
-        self
-    }
-
-    /// Set the header name for auth tokens
-    ///
-    /// Recording the choice here does not apply it. The layer reads whichever
-    /// header [`AuthLayer::header_name`] names.
-    pub fn header_name(mut self, name: impl Into<String>) -> Self {
-        self.header_name = name.into();
-        self
-    }
-
-    /// Check if a path is public (doesn't require auth)
-    ///
-    /// True when the path starts with any registered prefix. See the type
-    /// documentation for what that includes and does not.
-    pub fn is_public(&self, path: &str) -> bool {
-        self.public_paths.iter().any(|p| path.starts_with(p))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -816,21 +722,6 @@ mod tests {
                 assert_eq!(err.code, "invalid_token");
             }
         }
-    }
-
-    #[test]
-    fn test_auth_config() {
-        let config = AuthConfig::new()
-            .allow_anonymous(false)
-            .public_path("/health")
-            .public_path("/metrics")
-            .header_name("X-API-Key");
-
-        assert!(!config.allow_anonymous);
-        assert!(config.is_public("/health"));
-        assert!(config.is_public("/metrics/cpu"));
-        assert!(!config.is_public("/api/tools"));
-        assert_eq!(config.header_name, "X-API-Key");
     }
 
     #[test]
