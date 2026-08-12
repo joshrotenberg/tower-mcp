@@ -119,6 +119,69 @@ pub(crate) fn clean_input_line(line: &str) -> &str {
     line.strip_prefix('\u{feff}').unwrap_or(line).trim()
 }
 
+/// Which of the three JSON-RPC frame shapes a decoded value is.
+///
+/// A batch (JSON array) is always [`FrameClass::Request`] -- neither a
+/// notification nor a response can be a top-level array, so an array skips
+/// straight to "otherwise".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrameClass {
+    /// No `id` field: nothing to answer, so nothing is sent back.
+    Notification,
+    /// An `id`, no `method`, and a `result` or `error`: a reply arriving on
+    /// a channel that never sent the matching request.
+    Response,
+    /// Everything else, single or batched. Includes the malformed case of an
+    /// `id` with no `method` and neither `result` nor `error` -- that is not
+    /// a valid request, but classifying it as one is what gets it a `-32700`
+    /// reply instead of being silently dropped as if it were a response.
+    Request,
+}
+
+/// Classify a decoded JSON-RPC value by shape alone, before any schema
+/// validation runs.
+///
+/// Order is pinned and matters: notification, then response, then request.
+/// Classifying before validating means a malformed notification cannot come
+/// back as an error the client has no id to correlate (#1272). Checking
+/// response before falling through to request means a reply frame is
+/// ignored rather than answered with a parse error naming an internal type.
+///
+/// This is the extraction of the test `process_line` in `transport::stdio`
+/// used to hand-write, now shared by every receive path that needs the full
+/// three-way split. A path that only needs the response test in isolation
+/// (for example one that establishes "has an id" some other way) should
+/// call [`is_response_frame`] directly instead -- `classify_frame` folds the
+/// id check into the ordering, so its [`FrameClass::Response`] arm is only
+/// reachable once an id is already known to be present.
+pub(crate) fn classify_frame(value: &serde_json::Value) -> FrameClass {
+    if !value.is_array() && value.get("id").is_none() {
+        return FrameClass::Notification;
+    }
+    if is_response_frame(value) {
+        return FrameClass::Response;
+    }
+    FrameClass::Request
+}
+
+/// The response half of [`classify_frame`]'s test, callable on its own.
+///
+/// A response carries no `method` and one of `result` or `error`. All three
+/// conditions here matter together: dropping the `result`/`error` check
+/// would misclassify any method-less frame as a response and silently
+/// discard it, when a method-less frame with neither is actually an invalid
+/// request that must still be refused with an error, not dropped.
+///
+/// This test alone says nothing about `id` -- callers that need "has an id
+/// AND looks like a response" (as opposed to "would be classified `Response`
+/// by [`classify_frame`]'s pinned ordering") check `id` themselves alongside
+/// this.
+pub(crate) fn is_response_frame(value: &serde_json::Value) -> bool {
+    !value.is_array()
+        && value.get("method").is_none()
+        && (value.get("result").is_some() || value.get("error").is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +304,107 @@ mod tests {
         assert_eq!(clean_input_line(""), "");
         assert_eq!(clean_input_line("\u{feff}"), "");
         assert_eq!(clean_input_line("   \n\t"), "");
+    }
+
+    // =========================================================================
+    // classify_frame / is_response_frame tests
+    // =========================================================================
+
+    #[test]
+    fn classify_frame_notification_has_no_id() {
+        let value = serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+        assert_eq!(classify_frame(&value), FrameClass::Notification);
+    }
+
+    #[test]
+    fn classify_frame_response_has_id_no_method_and_result() {
+        let value = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {}});
+        assert_eq!(classify_frame(&value), FrameClass::Response);
+    }
+
+    #[test]
+    fn classify_frame_response_has_id_no_method_and_error() {
+        let value =
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -1, "message": "x"}});
+        assert_eq!(classify_frame(&value), FrameClass::Response);
+    }
+
+    #[test]
+    fn classify_frame_request_has_id_and_method() {
+        let value = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+        assert_eq!(classify_frame(&value), FrameClass::Request);
+    }
+
+    /// A batch is always `Request`, whatever shape its members are -- a
+    /// top-level array can never be a notification or a response.
+    #[test]
+    fn classify_frame_batch_array_is_always_request() {
+        let value = serde_json::json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "a"},
+            {"jsonrpc": "2.0", "method": "b"},
+        ]);
+        assert_eq!(classify_frame(&value), FrameClass::Request);
+    }
+
+    /// The key must be *absent* to count as no id. `"id": null` still has
+    /// the key, so `get("id")` returns `Some(Null)`, not `None`.
+    #[test]
+    fn classify_frame_id_present_but_null_is_not_a_notification() {
+        let value = serde_json::json!({"jsonrpc": "2.0", "id": null, "method": "tools/list"});
+        assert_eq!(classify_frame(&value), FrameClass::Request);
+    }
+
+    /// An id-bearing, null-id response is still a response: the id key is
+    /// present, there is no method, and `result` is present.
+    #[test]
+    fn classify_frame_id_present_but_null_can_still_be_a_response() {
+        let value = serde_json::json!({"jsonrpc": "2.0", "id": null, "result": {}});
+        assert_eq!(classify_frame(&value), FrameClass::Response);
+    }
+
+    /// An id with no method and neither `result` nor `error` is not a valid
+    /// request, but it must still classify as `Request` so it gets refused
+    /// with a `-32700` reply rather than being silently dropped as if it
+    /// were a response.
+    #[test]
+    fn classify_frame_id_no_method_no_result_or_error_is_a_request_not_a_response() {
+        let value = serde_json::json!({"jsonrpc": "2.0", "id": 1});
+        assert_eq!(classify_frame(&value), FrameClass::Request);
+    }
+
+    #[test]
+    fn is_response_frame_matches_the_response_shape() {
+        assert!(is_response_frame(
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {}})
+        ));
+        assert!(is_response_frame(
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -1}})
+        ));
+    }
+
+    #[test]
+    fn is_response_frame_rejects_a_request_shape() {
+        assert!(!is_response_frame(
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        ));
+        assert!(!is_response_frame(
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1})
+        ));
+    }
+
+    /// `is_response_frame` alone does not consider `id`: it is meant to be
+    /// combined with whatever id check a caller already has, or called
+    /// after a caller has already established (as `classify_frame` does)
+    /// that the frame is not a notification.
+    #[test]
+    fn is_response_frame_does_not_itself_require_an_id() {
+        assert!(is_response_frame(&serde_json::json!({"result": {}})));
+    }
+
+    #[test]
+    fn is_response_frame_rejects_a_batch_array() {
+        assert!(!is_response_frame(&serde_json::json!([
+            {"result": {}},
+        ])));
     }
 }

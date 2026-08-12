@@ -191,8 +191,7 @@ fn is_initialize_request(body: &serde_json::Value) -> bool {
 
 /// Check if this is a response to one of our outgoing requests
 fn is_response(parsed: &serde_json::Value) -> bool {
-    parsed.get("method").is_none()
-        && (parsed.get("result").is_some() || parsed.get("error").is_some())
+    crate::framing::is_response_frame(parsed)
 }
 
 /// Resolve the selected tool's input schema when the transport owns an

@@ -354,10 +354,7 @@ impl ChannelTransport {
                 // and a result or error but no method. This must be checked
                 // before the request parse below, which such a frame cannot
                 // satisfy (JsonRpcRequest requires `method`).
-                if parsed.get("method").is_none()
-                    && parsed.get("id").is_some()
-                    && (parsed.get("result").is_some() || parsed.get("error").is_some())
-                {
+                if parsed.get("id").is_some() && crate::framing::is_response_frame(&parsed) {
                     if let Ok(id) = serde_json::from_value::<RequestId>(parsed["id"].clone()) {
                         let responder = pending.lock().ok().and_then(|mut p| p.remove(&id));
                         if let Some(responder) = responder {

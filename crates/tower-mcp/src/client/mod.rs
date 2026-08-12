@@ -2851,9 +2851,7 @@ async fn handle_incoming<T: ClientTransport, H: ClientHandler>(
     };
 
     // Case 1: Response to one of our pending requests (has result or error, no method)
-    if parsed.get("method").is_none()
-        && (parsed.get("result").is_some() || parsed.get("error").is_some())
-    {
+    if crate::framing::is_response_frame(&parsed) {
         // Check for session-level errors (id: null with -32005) that affect
         // all pending requests, not just a specific one.
         if let Some(error) = parsed.get("error") {

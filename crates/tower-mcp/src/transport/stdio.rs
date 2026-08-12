@@ -69,7 +69,10 @@ use crate::context::{
 use tower_service::Service;
 
 use crate::error::{Error, Result};
-use crate::framing::{FrameReader, InputFrame, clean_input_line, read_frame_blocking};
+use crate::framing::{
+    FrameClass, FrameReader, InputFrame, classify_frame, clean_input_line, is_response_frame,
+    read_frame_blocking,
+};
 use crate::jsonrpc::JsonRpcService;
 #[cfg(feature = "stateless")]
 use crate::protocol::{Implementation, SubscriptionFilter};
@@ -644,23 +647,8 @@ async fn process_line(
     // response, so answering one is a JSON-RPC violation whatever validation
     // would have said about it. Validating first meant a malformed
     // notification came back as an error the client could not correlate
-    // (#1272).
-    if !parsed.is_array() && parsed.get("id").is_none() {
-        let method = parsed.get("method").and_then(|m| m.as_str());
-        if let Err(error) =
-            service.inspect_incoming_value(&parsed, crate::inspection::McpDirection::ClientToServer)
-        {
-            // Still worth surfacing, just not to the client.
-            tracing::debug!(method, %error, "rejected an invalid notification");
-            return Ok(None);
-        }
-        match serde_json::from_str::<JsonRpcNotification>(line) {
-            Ok(notification) => handle_notification(router, notification)?,
-            Err(_) => tracing::debug!(method, "unparseable notification"),
-        }
-        return Ok(None);
-    }
-
+    // (#1272). See `classify_frame` for the pinned ordering this depends on.
+    //
     // A response carries an id, no method, and one of `result` or `error`.
     // All three matter: an id with no method and neither of those is an
     // invalid *request* and must still be refused. `BidirectionalStdioTransport`
@@ -669,12 +657,27 @@ async fn process_line(
     // This transport never sends requests, so a response arriving is the
     // peer's mistake. Ignoring it beats answering, which previously produced
     // a parse error naming an internal type (#1272).
-    if !parsed.is_array()
-        && parsed.get("method").is_none()
-        && (parsed.get("result").is_some() || parsed.get("error").is_some())
-    {
-        tracing::debug!("ignoring an unexpected JSON-RPC response frame");
-        return Ok(None);
+    match classify_frame(&parsed) {
+        FrameClass::Notification => {
+            let method = parsed.get("method").and_then(|m| m.as_str());
+            if let Err(error) = service
+                .inspect_incoming_value(&parsed, crate::inspection::McpDirection::ClientToServer)
+            {
+                // Still worth surfacing, just not to the client.
+                tracing::debug!(method, %error, "rejected an invalid notification");
+                return Ok(None);
+            }
+            match serde_json::from_str::<JsonRpcNotification>(line) {
+                Ok(notification) => handle_notification(router, notification)?,
+                Err(_) => tracing::debug!(method, "unparseable notification"),
+            }
+            return Ok(None);
+        }
+        FrameClass::Response => {
+            tracing::debug!("ignoring an unexpected JSON-RPC response frame");
+            return Ok(None);
+        }
+        FrameClass::Request => {}
     }
 
     if let Err(error) =
@@ -2158,9 +2161,7 @@ impl BidirectionalStdioTransport {
         }
 
         // Check if this is a response to one of our pending requests
-        if parsed.get("method").is_none()
-            && (parsed.get("result").is_some() || parsed.get("error").is_some())
-        {
+        if is_response_frame(&parsed) {
             return self.handle_response(&parsed).await;
         }
 

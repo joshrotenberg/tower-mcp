@@ -985,9 +985,7 @@ where
     }
 
     // Check if this is a response to one of our pending requests
-    if parsed.get("method").is_none()
-        && (parsed.get("result").is_some() || parsed.get("error").is_some())
-    {
+    if crate::framing::is_response_frame(&parsed) {
         return handle_response(&parsed, pending_requests).await;
     }
 
@@ -1156,6 +1154,12 @@ async fn process_message(
         }
         return Ok(None);
     }
+
+    // #1335: this path is missing the response-frame branch that
+    // `handle_incoming_message` (above) and the stdio transport both have --
+    // a response arriving here falls through to the request parse below and
+    // gets answered with a parse error instead of being ignored. Not fixed
+    // here; this extraction is a no-behavior-change base for that fix.
 
     if let Err(error) =
         service.inspect_incoming_value(&parsed, crate::inspection::McpDirection::ClientToServer)
