@@ -2616,6 +2616,20 @@ fn test_is_localhost_origin_https() {
 }
 
 #[test]
+fn test_is_localhost_origin_case_insensitive_scheme() {
+    // RFC 3986: the URI scheme is case-insensitive.
+    assert!(is_localhost_origin("HTTP://localhost"));
+    assert!(is_localhost_origin("Https://127.0.0.1"));
+    assert!(is_localhost_origin("http://LOCALHOST"));
+}
+
+#[test]
+fn test_is_localhost_origin_trailing_dot_fqdn() {
+    assert!(is_localhost_origin("http://localhost."));
+    assert!(is_localhost_origin("http://localhost.:3000"));
+}
+
+#[test]
 fn test_is_not_localhost_origin() {
     assert!(!is_localhost_origin("http://example.com"));
     assert!(!is_localhost_origin("http://evil-localhost.com"));
@@ -2850,6 +2864,36 @@ fn test_is_localhost_host_variants() {
     assert!(!is_localhost_host("evil.com"));
     assert!(!is_localhost_host("api.example.com:8443"));
     assert!(!is_localhost_host("10.0.0.1"));
+}
+
+#[test]
+fn test_is_localhost_host_case_insensitive() {
+    assert!(is_localhost_host("LOCALHOST"));
+    assert!(is_localhost_host("LOCALHOST:3000"));
+    assert!(is_localhost_host("Localhost"));
+}
+
+#[test]
+fn test_is_localhost_host_full_loopback_range() {
+    // RFC 5735: the entire 127.0.0.0/8 range is loopback, not just
+    // 127.0.0.1.
+    assert!(is_localhost_host("127.0.0.2"));
+    assert!(is_localhost_host("127.1.2.3"));
+    assert!(is_localhost_host("127.255.255.255"));
+    assert!(is_localhost_host("127.0.0.2:8080"));
+}
+
+#[test]
+fn test_is_localhost_host_trailing_dot_fqdn() {
+    assert!(is_localhost_host("localhost."));
+    assert!(is_localhost_host("localhost.:3000"));
+}
+
+#[test]
+fn test_is_localhost_host_bare_ipv6() {
+    // A bare (unbracketed, port-less) IPv6 literal is loopback too, not
+    // just the bracketed `[::1]` form.
+    assert!(is_localhost_host("::1"));
 }
 
 #[test]

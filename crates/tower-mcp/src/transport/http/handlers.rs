@@ -16,19 +16,28 @@
 //!
 //! Split out of `http.rs` in #1256 (phase 3).
 
+use std::net::IpAddr;
+
 use super::*;
 
 type AssociatedCall = Pin<Box<dyn Future<Output = Result<JsonRpcResponse>> + Send + 'static>>;
 
 pub(super) fn is_localhost_origin(origin: &str) -> bool {
-    // Parse the origin to extract the host
-    if let Some(rest) = origin
-        .strip_prefix("http://")
-        .or_else(|| origin.strip_prefix("https://"))
-    {
-        is_localhost_host(rest)
+    // Parse the origin to extract the host. RFC 3986 makes the URI scheme
+    // case-insensitive, so the prefix match must be too.
+    strip_scheme_ci(origin, "http://")
+        .or_else(|| strip_scheme_ci(origin, "https://"))
+        .is_some_and(is_localhost_host)
+}
+
+/// Case-insensitively strip an ASCII scheme prefix (e.g. `"http://"`) from
+/// `s`, returning the remainder if `s` starts with it.
+fn strip_scheme_ci<'a>(s: &'a str, scheme: &str) -> Option<&'a str> {
+    let prefix = scheme.as_bytes();
+    if s.len() >= prefix.len() && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        Some(&s[prefix.len()..])
     } else {
-        false
+        None
     }
 }
 
@@ -37,6 +46,17 @@ pub(super) fn is_localhost_origin(origin: &str) -> bool {
 /// Used by both Origin validation (after stripping the `http(s)://` scheme)
 /// and Host validation (where there's no scheme to begin with).
 pub(super) fn is_localhost_host(host: &str) -> bool {
+    // A bare (unbracketed, port-less) IPv6 literal like `::1` parses whole
+    // as an IpAddr. Check this first: the port-splitting logic below would
+    // otherwise misread one of its internal colons as a port separator.
+    // A bare IPv6 literal with a trailing segment (e.g. `::1:3000`) parses
+    // whole as a distinct, non-loopback address rather than `::1` plus a
+    // port -- RFC 3986 requires brackets around an IPv6 host whenever a
+    // port follows it, so that's the correct outcome, not a special case.
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return ip.is_loopback();
+    }
+
     let host_only = if host.starts_with('[') {
         // Bracketed IPv6: [::1]:3000 -> ::1
         host.split(']')
@@ -47,7 +67,19 @@ pub(super) fn is_localhost_host(host: &str) -> bool {
         // Strip port if present
         host.split(':').next().unwrap_or(host)
     };
-    matches!(host_only, "localhost" | "127.0.0.1" | "::1")
+
+    // `localhost`, and its RFC 3986 trailing-dot FQDN form, is
+    // case-insensitive like any DNS name.
+    if host_only.eq_ignore_ascii_case("localhost") || host_only.eq_ignore_ascii_case("localhost.") {
+        return true;
+    }
+
+    // Covers the entire 127.0.0.0/8 range and ::1 (the only IPv6 loopback
+    // address) in one shot. Rust's std parser requires canonical
+    // dotted-decimal IPv4 (rejecting shorthand and hex/octal/decimal
+    // obfuscation forms), so this doesn't widen the guard beyond the
+    // canonical numeric forms a conforming URL host parser would produce.
+    host_only.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Resolve the effective host for validation.
