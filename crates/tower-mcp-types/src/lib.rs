@@ -111,6 +111,11 @@
 //! [tower-mcp issue #777](https://github.com/joshrotenberg/tower-mcp/issues/777)
 //! for progress on client-side WASM support in the full crate.
 
+// Every public item here is documented, and this is what keeps it that way.
+// CI runs clippy with `-D warnings`, so this is a failure there; `warn`
+// rather than `deny` leaves a local build usable mid-edit.
+#![warn(missing_docs)]
+
 pub mod error;
 pub mod inspection;
 pub mod protocol;

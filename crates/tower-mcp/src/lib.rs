@@ -492,6 +492,11 @@
 //! - [SEP-2243](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2243) --
 //!   strict HTTP headers (`Mcp-Method`, `Mcp-Name`, `MCP-Protocol-Version`)
 
+// Every public item here is documented, and this is what keeps it that way.
+// CI runs clippy with `-D warnings`, so this is a failure there; `warn`
+// rather than `deny` leaves a local build usable mid-edit.
+#![warn(missing_docs)]
+
 #[cfg(feature = "mcp-apps")]
 pub mod apps;
 mod ascii;

@@ -83,6 +83,11 @@
 //! // Generates `read_file_resource_template() -> tower_mcp::resource::ResourceTemplate`
 //! ```
 
+// Every public item here is documented, and this is what keeps it that way.
+// CI runs clippy with `-D warnings`, so this is a failure there; `warn`
+// rather than `deny` leaves a local build usable mid-edit.
+#![warn(missing_docs)]
+
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{ItemFn, LitStr, Token, parse_macro_input};
