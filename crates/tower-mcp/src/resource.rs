@@ -3043,6 +3043,70 @@ mod tests {
         );
     }
 
+    // =========================================================================
+    // Clone vs. handler kind (#1340)
+    // =========================================================================
+    //
+    // `Resource::clone` (see the hand-written `impl Clone for Resource` above)
+    // is exercised incidentally by `read()`/`read_with_context()`, which clone
+    // `self` before dispatching -- so a plain-handler resource's clone was
+    // already covered by every test that calls `.read()`. `read_outcome_with_context`,
+    // which the router actually calls, does not clone `self`, only the handler
+    // behind it, so nothing here had exercised `Resource::clone` for an MRTR
+    // handler at all. `Tool::clone` dropping a field (#1298) is the reason
+    // this gets a dedicated, named test rather than staying implicit.
+
+    #[tokio::test]
+    async fn resource_clone_carries_the_plain_handler() {
+        let resource = ResourceBuilder::new("memory://cloneable")
+            .name("Cloneable")
+            .handler(|| async {
+                Ok(ReadResourceResult {
+                    contents: vec![ResourceContent {
+                        uri: "memory://cloneable".to_string(),
+                        mime_type: Some("text/plain".to_string()),
+                        text: Some("original".to_string()),
+                        blob: None,
+                        meta: None,
+                    }],
+                    meta: None,
+                    ..Default::default()
+                })
+            })
+            .build();
+
+        let cloned = resource.clone();
+        let result = cloned.read().await;
+        assert_eq!(result.contents[0].text.as_deref(), Some("original"));
+    }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn resource_clone_carries_the_mrtr_handler() {
+        let resource = ResourceBuilder::new("test://cloneable-continue")
+            .mrtr_handler(|_ctx| async move {
+                Ok(RequestOutcome::input_required(
+                    crate::protocol::InputRequiredResult::new().with_request_state("cloned-state"),
+                ))
+            })
+            .build();
+
+        let cloned = resource.clone();
+        let outcome = cloned
+            .read_outcome_with_context(RequestContext::new(crate::protocol::RequestId::Number(1)))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome
+                .as_input_required()
+                .and_then(|result| result.request_state.as_deref()),
+            Some("cloned-state"),
+            "a dropped mrtr_handler after clone would fall through to the \
+             absent `service` and panic on `.expect(...)` instead of \
+             returning this"
+        );
+    }
+
     #[cfg(feature = "stateless")]
     #[tokio::test]
     async fn mrtr_resource_composes_middleware() {

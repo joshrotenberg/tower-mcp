@@ -1140,4 +1140,59 @@ mod panics {
         assert!(!result.is_error);
         assert_eq!(result.all_text(), "ok");
     }
+
+    /// #1340: the panic boundary above (`a_panicking_tool_does_not_take_down_the_server`)
+    /// only exercises a plain, extractor-based handler. `Tool::call_outcome_with_context`
+    /// picks `mrtr_handler` over `service` when both could apply, so an MRTR
+    /// handler reaches `invoke_tool`'s boundary through a different branch,
+    /// and nothing had put a panic through it.
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn a_panicking_mrtr_tool_is_caught_on_a_plain_call() {
+        use tower_mcp::RequestContext;
+        use tower_mcp::protocol::RequestOutcome;
+
+        let boom = ToolBuilder::new("mrtr_boom")
+            .description("Panics before ever asking for input")
+            .mrtr_handler::<serde_json::Value, _, _>(|_ctx: RequestContext, _input| async move {
+                panic!("mrtr handler exploded");
+                #[allow(unreachable_code)]
+                Ok(RequestOutcome::Complete(CallToolResult::text(
+                    "unreachable",
+                )))
+            })
+            .build();
+        let fine = ToolBuilder::new("fine")
+            .description("Works")
+            .extractor_handler((), |_ctx: Context, RawArgs(_): RawArgs| async move {
+                Ok(CallToolResult::text("ok"))
+            })
+            .build();
+
+        let router = McpRouter::new()
+            .server_info("panic-mrtr", "1.0.0")
+            .tool(boom)
+            .tool(fine)
+            .catch_panics();
+        let client = McpClient::connect(ChannelTransport::new(router))
+            .await
+            .expect("connect");
+        client
+            .initialize("test", "1.0.0")
+            .await
+            .expect("initialize");
+
+        let result = client
+            .call_tool("mrtr_boom", serde_json::json!({}))
+            .await
+            .expect("the call must return, not kill the connection");
+        assert!(result.is_error, "a caught panic is an error result");
+        assert!(result.all_text().contains("panicked"));
+
+        let after = client
+            .call_tool("fine", serde_json::json!({}))
+            .await
+            .expect("the server must still be serving");
+        assert_eq!(after.all_text(), "ok");
+    }
 }

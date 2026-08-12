@@ -2028,4 +2028,34 @@ mod tests {
         let result = cloned.get(HashMap::new()).await.unwrap();
         assert_eq!(result.messages.len(), 1);
     }
+
+    /// #1340: `test_prompt_clone` above only exercises the plain-handler
+    /// field. Unlike `Resource::read`, `Prompt::get`/`get_with_context` do
+    /// not clone `self` internally, so nothing incidentally covered
+    /// `Prompt::clone` for an MRTR handler either.
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn test_prompt_clone_mrtr() {
+        let prompt = PromptBuilder::new("cloneable_continue")
+            .mrtr_handler(|_ctx, _args| async move {
+                Ok(RequestOutcome::input_required(
+                    crate::protocol::InputRequiredResult::new().with_request_state("cloned-state"),
+                ))
+            })
+            .build();
+
+        let cloned = prompt.clone();
+        let outcome = cloned
+            .get_outcome_with_context(RequestContext::new(RequestId::Number(1)), HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome
+                .as_input_required()
+                .and_then(|result| result.request_state.as_deref()),
+            Some("cloned-state"),
+            "a dropped mrtr_handler after clone would fall through to the \
+             absent plain `handler` and error instead of returning this"
+        );
+    }
 }

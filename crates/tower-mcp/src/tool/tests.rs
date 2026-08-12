@@ -1398,3 +1398,277 @@ async fn test_input_schema_override_adds_type_object_if_missing() {
     assert_eq!(schema["type"], "object");
     assert!(schema["properties"]["x"].is_object());
 }
+
+// =============================================================================
+// Clone / prefix / guard vs. handler kind (#1340)
+// =============================================================================
+//
+// #1298 found that `Tool::clone` dropped `live_handler`, and that
+// `Tool::with_guard` panicked reaching for an absent service on a live-only
+// tool. Both are fixed, but nothing had crossed every construction and
+// transformation method against every handler kind systematically. These pin
+// that matrix at the unit level, calling the handler after the
+// transformation rather than checking that a field is non-`None` -- a field
+// check would have passed even while #1298's bug was live, since the field
+// itself was untouched; only the wrong one was cloned. The combinations that
+// need a live task to actually run end-to-end through a router (clone and
+// prefix together on a live-plus-fallback tool, a guard rejecting both of a
+// tool's paths) live in `tests/live_tasks.rs`, where the router and task
+// store are already wired up; this module covers the handler kinds that
+// don't need that machinery, plus the live handler kinds invoked directly
+// through the crate-private `LiveToolHandler` trait so a test here does not
+// have to stand up a task store just to prove a field survived.
+
+#[tokio::test]
+async fn plain_tool_clone_still_runs() {
+    let tool = ToolBuilder::new("greet")
+        .description("Greet someone")
+        .handler(|input: GreetInput| async move {
+            Ok(CallToolResult::text(format!("Hello, {}!", input.name)))
+        })
+        .build();
+
+    let cloned = tool.clone();
+    let result = cloned.call(serde_json::json!({"name": "World"})).await;
+    assert!(!result.is_error);
+    assert_eq!(result.first_text().unwrap(), "Hello, World!");
+}
+
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn mrtr_tool_clone_still_runs() {
+    let tool = ToolBuilder::new("continue")
+        .mrtr_handler::<NoParams, _, _>(|_ctx, _input| async move {
+            Ok(RequestOutcome::input_required(
+                crate::protocol::InputRequiredResult::new().with_request_state("signed-state"),
+            ))
+        })
+        .build();
+
+    let cloned = tool.clone();
+    let outcome = cloned.call_outcome(serde_json::json!({})).await.unwrap();
+    assert_eq!(
+        outcome
+            .as_input_required()
+            .and_then(|result| result.request_state.as_deref()),
+        Some("signed-state"),
+        "a dropped mrtr_handler would fall through to the absent `service` \
+         and panic on `.expect(...)` in `call_outcome_with_context` instead"
+    );
+}
+
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn mrtr_tool_with_name_prefix_still_runs() {
+    let tool = ToolBuilder::new("continue")
+        .mrtr_handler::<NoParams, _, _>(|_ctx, _input| async move {
+            Ok(RequestOutcome::Complete(CallToolResult::text("done")))
+        })
+        .build();
+
+    let prefixed = tool.with_name_prefix("ns");
+    assert_eq!(prefixed.name, "ns.continue");
+
+    let outcome = prefixed.call_outcome(serde_json::json!({})).await.unwrap();
+    let result = outcome
+        .as_complete()
+        .expect("mrtr_handler must survive the prefix");
+    assert_eq!(result.first_text().unwrap(), "done");
+}
+
+/// A live handler has nothing reachable through `Tool::call`/`call_outcome`
+/// (#1329 tracks `call_outcome_with_context` panicking for a live-only tool
+/// called that way), so these invoke `LiveToolHandler::call` directly. Both
+/// the trait and the field it lives behind are crate-private, and this
+/// module is a sibling of `tool.rs` rather than an integration test
+/// specifically so it can reach them (see the module doc comment).
+fn live_ctx() -> RequestContext {
+    RequestContext::new(crate::protocol::RequestId::Number(0))
+}
+
+#[tokio::test]
+async fn live_only_tool_clone_carries_the_live_handler() {
+    let tool = ToolBuilder::new("run")
+        .description("Completes immediately")
+        .live_task_handler(|_task: TaskContext, _input: NoParams| async move {
+            Ok(TaskOutcome::Completed(CallToolResult::text("ran")))
+        })
+        .build();
+
+    let cloned = tool.clone();
+    let handler = cloned
+        .live_handler
+        .as_ref()
+        .expect("clone must carry the live handler");
+    let outcome = handler
+        .call(
+            live_ctx(),
+            TaskContext::new("t1".to_string()),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    match outcome {
+        TaskOutcome::Completed(result) => assert_eq!(result.first_text().unwrap(), "ran"),
+        other => panic!("expected Completed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn live_only_tool_with_name_prefix_carries_the_live_handler() {
+    let tool = ToolBuilder::new("run")
+        .description("Completes immediately")
+        .live_task_handler(|_task: TaskContext, _input: NoParams| async move {
+            Ok(TaskOutcome::Completed(CallToolResult::text("ran")))
+        })
+        .build();
+
+    let prefixed = tool.with_name_prefix("ns");
+    assert_eq!(prefixed.name, "ns.run");
+
+    let handler = prefixed
+        .live_handler
+        .as_ref()
+        .expect("with_name_prefix must carry the live handler");
+    let outcome = handler
+        .call(
+            live_ctx(),
+            TaskContext::new("t1".to_string()),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    match outcome {
+        TaskOutcome::Completed(result) => assert_eq!(result.first_text().unwrap(), "ran"),
+        other => panic!("expected Completed, got {other:?}"),
+    }
+}
+
+/// #1328 landed a `Tool` that carries a live handler and an MRTR fallback at
+/// the same time, the day before this matrix was written. Its clone,
+/// prefix, and guard paths had no dedicated coverage yet beyond the routing
+/// behavior in `tests/live_tasks.rs::multi_tool`.
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn live_plus_mrtr_fallback_clone_carries_both_handlers() {
+    let tool = ToolBuilder::new("multi")
+        .description("Live plus MRTR fallback")
+        .live_task_handler(|_task: TaskContext, _input: NoParams| async move {
+            Ok(TaskOutcome::Completed(CallToolResult::text("live")))
+        })
+        .fallback_mrtr_handler(|_ctx: RequestContext, _input: NoParams| async move {
+            Ok(RequestOutcome::Complete(CallToolResult::text("fallback")))
+        })
+        .build();
+
+    let cloned = tool.clone();
+
+    let outcome = cloned.call_outcome(serde_json::json!({})).await.unwrap();
+    let result = outcome
+        .as_complete()
+        .expect("mrtr fallback must survive the clone");
+    assert_eq!(result.first_text().unwrap(), "fallback");
+
+    let handler = cloned
+        .live_handler
+        .as_ref()
+        .expect("clone must carry the live handler alongside the fallback");
+    let outcome = handler
+        .call(
+            live_ctx(),
+            TaskContext::new("t1".to_string()),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    match outcome {
+        TaskOutcome::Completed(result) => assert_eq!(result.first_text().unwrap(), "live"),
+        other => panic!("expected Completed, got {other:?}"),
+    }
+}
+
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn live_plus_mrtr_fallback_with_name_prefix_carries_both_handlers() {
+    let tool = ToolBuilder::new("multi")
+        .description("Live plus MRTR fallback")
+        .live_task_handler(|_task: TaskContext, _input: NoParams| async move {
+            Ok(TaskOutcome::Completed(CallToolResult::text("live")))
+        })
+        .fallback_mrtr_handler(|_ctx: RequestContext, _input: NoParams| async move {
+            Ok(RequestOutcome::Complete(CallToolResult::text("fallback")))
+        })
+        .build();
+
+    let prefixed = tool.with_name_prefix("ns");
+    assert_eq!(prefixed.name, "ns.multi");
+
+    let outcome = prefixed.call_outcome(serde_json::json!({})).await.unwrap();
+    let result = outcome
+        .as_complete()
+        .expect("mrtr fallback must survive the prefix");
+    assert_eq!(result.first_text().unwrap(), "fallback");
+
+    let handler = prefixed
+        .live_handler
+        .as_ref()
+        .expect("with_name_prefix must carry the live handler alongside the fallback");
+    let outcome = handler
+        .call(
+            live_ctx(),
+            TaskContext::new("t1".to_string()),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    match outcome {
+        TaskOutcome::Completed(result) => assert_eq!(result.first_text().unwrap(), "live"),
+        other => panic!("expected Completed, got {other:?}"),
+    }
+}
+
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn live_plus_mrtr_fallback_with_guard_rejects_both_paths() {
+    let tool = ToolBuilder::new("multi")
+        .description("Live plus MRTR fallback")
+        .live_task_handler(|_task: TaskContext, _input: NoParams| async move {
+            Ok(TaskOutcome::Completed(CallToolResult::text(
+                "should not run (live)",
+            )))
+        })
+        .fallback_mrtr_handler(|_ctx: RequestContext, _input: NoParams| async move {
+            Ok(RequestOutcome::Complete(CallToolResult::text(
+                "should not run (fallback)",
+            )))
+        })
+        .build()
+        .with_guard(|_req: &ToolRequest| Err("nope".to_string()));
+
+    let outcome = tool.call_outcome(serde_json::json!({})).await.unwrap();
+    let result = outcome
+        .as_complete()
+        .expect("guard rejection is a complete tool error");
+    assert!(result.is_error);
+    assert_eq!(result.first_text().unwrap(), "nope");
+
+    let handler = tool
+        .live_handler
+        .as_ref()
+        .expect("with_guard must not drop the live handler");
+    let outcome = handler
+        .call(
+            live_ctx(),
+            TaskContext::new("t1".to_string()),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    match outcome {
+        TaskOutcome::Completed(result) => {
+            assert!(result.is_error);
+            assert_eq!(result.first_text().unwrap(), "nope");
+        }
+        other => panic!("expected a rejected-but-terminal Completed, got {other:?}"),
+    }
+}

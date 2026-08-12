@@ -1304,3 +1304,396 @@ async fn a_guard_on_a_live_plus_fallback_tool_rejects_both_paths() {
     assert!(result.is_error);
     assert!(result.all_text().contains("nope"));
 }
+
+// ============================================================================
+// Live plus MRTR fallback: clone, prefix, and guard (#1340)
+// ============================================================================
+//
+// The tests above pin `clone`/`with_name_prefix`/`with_guard` for a live
+// handler paired with a *synchronous* fallback. `ToolBuilderWithLiveHandler::fallback_mrtr_handler`
+// (#1246, shipped alongside `fallback_handler` in the same PR that landed
+// `multi_tool` below) is a materially different branch of `Tool::with_guard`:
+// finding an MRTR handler returns early, rather than falling through to the
+// `match self.service.clone()` the synchronous fallback goes through. Nothing
+// exercised clone/prefix/guard on that branch before.
+
+/// The same discipline as `clone_and_prefix_carry_both_the_live_handler_and_the_fallback`
+/// above, for the MRTR fallback rather than the synchronous one.
+#[tokio::test]
+async fn clone_and_prefix_carry_both_the_live_handler_and_the_mrtr_fallback() {
+    let live_calls = Arc::new(AtomicUsize::new(0));
+    let fallback_calls = Arc::new(AtomicUsize::new(0));
+    let tool = multi_tool(live_calls.clone(), fallback_calls.clone());
+
+    let cloned = tool.clone();
+    let prefixed = tool.with_name_prefix("ns");
+
+    let store = Arc::new(MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .server_info("multi", "1.0.0")
+        .task_store(store.clone())
+        .tool(cloned)
+        .tool(prefixed)
+        .with_tasks();
+
+    let client = McpClient::connect(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+
+    for name in ["multi", "ns.multi"] {
+        let result = timed(client.call_tool(name, json!({"value": "x"})))
+            .await
+            .unwrap_or_else(|e| panic!("plain call to {name} failed: {e}"));
+        assert_eq!(
+            result.all_text(),
+            "sync:x",
+            "mrtr fallback must survive for {name}"
+        );
+
+        let task_id = timed(client.call_tool_as_task(name, json!({"value": "x"}), None))
+            .await
+            .unwrap_or_else(|e| panic!("task call to {name} failed: {e}"))
+            .task
+            .task_id;
+        await_status(&store, &task_id, TaskStatus::Completed).await;
+        let (_, result, _) = store.get_task_result(&task_id).await.unwrap().unwrap();
+        assert_eq!(
+            result.unwrap().all_text(),
+            "live:x",
+            "live handler must survive for {name}"
+        );
+    }
+}
+
+/// The same discipline as `a_guard_on_a_live_plus_fallback_tool_rejects_both_paths`
+/// above, for the MRTR fallback rather than the synchronous one.
+#[tokio::test]
+async fn a_guard_on_a_live_plus_mrtr_fallback_tool_rejects_both_paths() {
+    let tool = ToolBuilder::new("multi")
+        .description("Live plus MRTR fallback")
+        .live_task_handler(|_task: TaskContext, _input: NoArgs| async move {
+            Ok(TaskOutcome::Completed(CallToolResult::text(
+                "should not run (live)",
+            )))
+        })
+        .fallback_mrtr_handler(|_ctx: RequestContext, _input: NoArgs| async move {
+            Ok(RequestOutcome::Complete(CallToolResult::text(
+                "should not run (fallback)",
+            )))
+        })
+        .build()
+        .with_guard(|_req: &tower_mcp::ToolRequest| Err("nope".to_string()));
+
+    let store = Arc::new(MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .server_info("multi", "1.0.0")
+        .task_store(store.clone())
+        .tool(tool)
+        .with_tasks();
+
+    let client = McpClient::connect(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+
+    // The fallback path is rejected.
+    let result = timed(client.call_tool("multi", json!({})))
+        .await
+        .expect("call");
+    assert!(
+        result.is_error,
+        "the guard must reject the mrtr fallback path too"
+    );
+    assert!(result.all_text().contains("nope"));
+
+    // The live path is rejected too.
+    let task_id = timed(client.call_tool_as_task("multi", json!({}), None))
+        .await
+        .expect("task created")
+        .task
+        .task_id;
+    await_status(&store, &task_id, TaskStatus::Completed).await;
+    let (_, result, _) = store.get_task_result(&task_id).await.unwrap().unwrap();
+    let result = result.expect("a rejected call still produces a result");
+    assert!(result.is_error);
+    assert!(result.all_text().contains("nope"));
+}
+
+// ============================================================================
+// Panic isolation across combined handlers (#1340)
+// ============================================================================
+//
+// #1307 established panic containment for a live-only tool: the live branch
+// gets its own `catch_unwind` boundary, independent of the one `invoke_tool`
+// gives ordinary and replayed handlers. Neither boundary had been exercised
+// on a tool that carries a live handler *and* a fallback, where a bug could
+// plausibly wire the live branch's boundary to depend on the fallback being
+// absent, or vice versa.
+
+/// A panic in the live handler must not disturb the synchronous fallback on
+/// the same tool, and a panic in the fallback must not disturb the live
+/// handler on the same tool. Two tools, each panicking on one path and fine
+/// on the other, so a failure to isolate the two shows up as the working
+/// path also failing.
+#[tokio::test]
+async fn a_panicking_live_plus_fallback_tool_isolates_each_path() {
+    let live_boom = ToolBuilder::new("live_boom")
+        .description("Live handler panics, fallback is fine")
+        .live_task_handler(|_task: TaskContext, _input: NoArgs| async move {
+            panic!("live handler exploded");
+            #[allow(unreachable_code)]
+            Ok(TaskOutcome::Completed(CallToolResult::text("unreachable")))
+        })
+        .fallback_handler(|_input: NoArgs| async move { Ok(CallToolResult::text("fallback fine")) })
+        .build();
+    let fallback_boom = ToolBuilder::new("fallback_boom")
+        .description("Fallback panics, live handler is fine")
+        .live_task_handler(|_task: TaskContext, _input: NoArgs| async move {
+            Ok(TaskOutcome::Completed(CallToolResult::text("live fine")))
+        })
+        .fallback_handler(|_input: NoArgs| async move {
+            panic!("fallback exploded");
+            #[allow(unreachable_code)]
+            Ok(CallToolResult::text("unreachable"))
+        })
+        .build();
+
+    let store = Arc::new(MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .server_info("panic-multi", "1.0.0")
+        .task_store(store.clone())
+        .tool(live_boom)
+        .tool(fallback_boom)
+        .with_tasks()
+        .catch_panics();
+
+    let client = McpClient::connect(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+
+    let task_id = timed(client.call_tool_as_task("live_boom", json!({}), None))
+        .await
+        .expect("task created")
+        .task
+        .task_id;
+    await_status(&store, &task_id, TaskStatus::Failed).await;
+
+    // The fallback on the same tool is unaffected by the live panic.
+    let result = timed(client.call_tool("live_boom", json!({})))
+        .await
+        .expect("call");
+    assert_eq!(result.all_text(), "fallback fine");
+
+    // The fallback panics on the other tool; its live path is unaffected.
+    let result = timed(client.call_tool("fallback_boom", json!({})))
+        .await
+        .expect("call");
+    assert!(
+        result.is_error,
+        "the caught fallback panic is an error result"
+    );
+    assert!(result.all_text().contains("panicked"));
+
+    let task_id = timed(client.call_tool_as_task("fallback_boom", json!({}), None))
+        .await
+        .expect("task created")
+        .task
+        .task_id;
+    await_status(&store, &task_id, TaskStatus::Completed).await;
+    let (_, result, _) = store.get_task_result(&task_id).await.unwrap().unwrap();
+    assert_eq!(result.unwrap().all_text(), "live fine");
+}
+
+/// The same isolation, for an MRTR fallback rather than a synchronous one.
+#[tokio::test]
+async fn a_panicking_live_plus_mrtr_fallback_tool_isolates_each_path() {
+    let live_boom = ToolBuilder::new("live_boom_mrtr")
+        .description("Live handler panics, MRTR fallback is fine")
+        .live_task_handler(|_task: TaskContext, _input: NoArgs| async move {
+            panic!("live handler exploded");
+            #[allow(unreachable_code)]
+            Ok(TaskOutcome::Completed(CallToolResult::text("unreachable")))
+        })
+        .fallback_mrtr_handler(|_ctx: RequestContext, _input: NoArgs| async move {
+            Ok(RequestOutcome::Complete(CallToolResult::text(
+                "fallback fine",
+            )))
+        })
+        .build();
+    let fallback_boom = ToolBuilder::new("fallback_boom_mrtr")
+        .description("MRTR fallback panics, live handler is fine")
+        .live_task_handler(|_task: TaskContext, _input: NoArgs| async move {
+            Ok(TaskOutcome::Completed(CallToolResult::text("live fine")))
+        })
+        .fallback_mrtr_handler(|_ctx: RequestContext, _input: NoArgs| async move {
+            panic!("fallback exploded");
+            #[allow(unreachable_code)]
+            Ok(RequestOutcome::Complete(CallToolResult::text(
+                "unreachable",
+            )))
+        })
+        .build();
+
+    let store = Arc::new(MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .server_info("panic-multi-mrtr", "1.0.0")
+        .task_store(store.clone())
+        .tool(live_boom)
+        .tool(fallback_boom)
+        .with_tasks()
+        .catch_panics();
+
+    let client = McpClient::connect(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+
+    let task_id = timed(client.call_tool_as_task("live_boom_mrtr", json!({}), None))
+        .await
+        .expect("task created")
+        .task
+        .task_id;
+    await_status(&store, &task_id, TaskStatus::Failed).await;
+
+    let result = timed(client.call_tool("live_boom_mrtr", json!({})))
+        .await
+        .expect("call");
+    assert_eq!(result.all_text(), "fallback fine");
+
+    let result = timed(client.call_tool("fallback_boom_mrtr", json!({})))
+        .await
+        .expect("call");
+    assert!(result.is_error);
+    assert!(result.all_text().contains("panicked"));
+
+    let task_id = timed(client.call_tool_as_task("fallback_boom_mrtr", json!({}), None))
+        .await
+        .expect("task created")
+        .task
+        .task_id;
+    await_status(&store, &task_id, TaskStatus::Completed).await;
+    let (_, result, _) = store.get_task_result(&task_id).await.unwrap().unwrap();
+    assert_eq!(result.unwrap().all_text(), "live fine");
+}
+
+// ============================================================================
+// Cancellation: outcome path and registration ordering, hardened (#1340)
+// ============================================================================
+
+/// #1304 fixed a race between the completion write and a late cancellation;
+/// `a_completion_is_not_overwritten_by_a_late_cancellation` above repeats the
+/// race many times for confidence under scheduling variance. This is the
+/// deterministic complement: with no interleaving at all, a cancellation
+/// attempted strictly after the handler has already completed and the task
+/// has reached its terminal state must never move that state.
+#[tokio::test]
+async fn cancelling_an_already_completed_task_does_not_change_its_terminal_state() {
+    let tool = ToolBuilder::new("live")
+        .description("Completes immediately")
+        .live_task_handler(|_task: TaskContext, _input: NoArgs| async move {
+            Ok(TaskOutcome::Completed(CallToolResult::text("done")))
+        })
+        .build();
+
+    let store = Arc::new(MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .server_info("live", "1.0.0")
+        .task_store(store.clone())
+        .tool(tool)
+        .with_tasks();
+
+    let client = McpClient::connect(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+
+    let task_id = client
+        .call_tool_as_task("live", json!({}), None)
+        .await
+        .expect("task created")
+        .task
+        .task_id;
+    // No race: wait for the task to fully complete (which also releases the
+    // live registration, #1305) before even attempting a cancellation.
+    await_status(&store, &task_id, TaskStatus::Completed).await;
+
+    let cancellation = client.task_cancel(&task_id, None).await;
+    assert!(
+        cancellation.is_err(),
+        "a completed task must refuse a cancellation, not silently accept one"
+    );
+
+    let task = store.get_task(&task_id).await.unwrap().unwrap();
+    assert_eq!(
+        task.status,
+        TaskStatus::Completed,
+        "the terminal state must not move once the outcome path has already \
+         written it"
+    );
+    let (_, result, _) = store.get_task_result(&task_id).await.unwrap().unwrap();
+    assert_eq!(
+        result.unwrap().all_text(),
+        "done",
+        "the original result must survive a post-terminal cancellation attempt"
+    );
+}
+
+/// #1304, startup window, hardened: `cancelling_before_the_handler_starts_is_still_observed`
+/// above documents that a single attempt passes even against the old
+/// ordering, since it does not reliably land in the gap between registering
+/// the live handle and checking the store's cancellation token. Repeating
+/// the same immediate-cancel sequence many times, each with a fresh router so
+/// the runs cannot interfere with each other, raises the odds that at least
+/// one round lands in that window without introducing a sleep that would
+/// guarantee missing it.
+#[tokio::test]
+async fn cancelling_immediately_after_creation_is_observed_across_many_rounds() {
+    for round in 0..30 {
+        let tore_down = Arc::new(AtomicUsize::new(0));
+        let counter = tore_down.clone();
+        let tool = ToolBuilder::new("live")
+            .description("Waits forever unless cancelled")
+            .live_task_handler(move |task: TaskContext, _input: NoArgs| {
+                let counter = counter.clone();
+                async move {
+                    let result = task.require_input(ask("never")).await;
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    result?;
+                    Ok(TaskOutcome::Completed(CallToolResult::text("unreachable")))
+                }
+            })
+            .build();
+
+        let store = Arc::new(MemoryTaskStore::new());
+        let router = McpRouter::new()
+            .server_info("live", "1.0.0")
+            .task_store(store.clone())
+            .tool(tool)
+            .with_tasks();
+
+        let client = McpClient::connect(ChannelTransport::new(router))
+            .await
+            .expect("connect");
+        client.initialize("t", "1.0.0").await.expect("init");
+
+        let task_id = client
+            .call_tool_as_task("live", json!({}), None)
+            .await
+            .expect("task created")
+            .task
+            .task_id;
+
+        // No sleep: cancel as soon as the handle exists.
+        client.task_cancel(&task_id, None).await.expect("cancel");
+
+        await_status(&store, &task_id, TaskStatus::Cancelled).await;
+        assert_eq!(
+            tore_down.load(Ordering::SeqCst),
+            1,
+            "round {round}: a cancel landing before registration must still \
+             be observed once the handler starts, not lost in the gap #1304 closed"
+        );
+    }
+}
