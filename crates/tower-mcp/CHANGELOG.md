@@ -2,6 +2,79 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.22.0] - 2026-08-12
+
+### Bug Fixes
+
+- **tasks:** Only resume a task when an update actually answered something ([#1247](https://github.com/joshrotenberg/tower-mcp/pull/1247))
+- **stdio:** Stop a saturated request limit from starving control traffic ([#1254](https://github.com/joshrotenberg/tower-mcp/pull/1254))
+- **tasks:** Enforce input request key uniqueness over a task's lifetime ([#1248](https://github.com/joshrotenberg/tower-mcp/pull/1248))
+- **stdio:** Keep inbound notification routing when layering or going silent ([#1257](https://github.com/joshrotenberg/tower-mcp/pull/1257))
+- **extract:** Mention bridge_extension in the missing-extension message ([#1277](https://github.com/joshrotenberg/tower-mcp/pull/1277))
+- **tool:** Re-export McpTool, McpResource, and McpPrompt from the crate root ([#1278](https://github.com/joshrotenberg/tower-mcp/pull/1278))
+- **resource:** Stop percent decoding from panicking on multibyte input ([#1279](https://github.com/joshrotenberg/tower-mcp/pull/1279))
+- **server:** Make resources.subscribe reflect configured and version support ([#1283](https://github.com/joshrotenberg/tower-mcp/pull/1283))
+- **stdio:** Never answer a notification, and stop leaking a type name ([#1284](https://github.com/joshrotenberg/tower-mcp/pull/1284))
+- **auth:** Match the authorization scheme case-insensitively ([#1289](https://github.com/joshrotenberg/tower-mcp/pull/1289))
+- **stdio:** Keep the transport alive when stdin carries invalid UTF-8 ([#1292](https://github.com/joshrotenberg/tower-mcp/pull/1292))
+- **tool:** Preserve live handlers through clone and prefix ([#1298](https://github.com/joshrotenberg/tower-mcp/pull/1298))
+- **test:** Stop the version drift scan reading gitignored paths ([#1299](https://github.com/joshrotenberg/tower-mcp/pull/1299))
+- **client:** Keep the stdio client alive when a server writes invalid UTF-8 ([#1300](https://github.com/joshrotenberg/tower-mcp/pull/1300))
+- **tasks:** Make TaskStore cancellation tokens constructible ([#1302](https://github.com/joshrotenberg/tower-mcp/pull/1302))
+- **tasks:** Close the live-task cancellation registration and outcome races ([#1304](https://github.com/joshrotenberg/tower-mcp/pull/1304))
+- **tasks:** Cover live handlers with catch_panics and clean up unconditionally ([#1307](https://github.com/joshrotenberg/tower-mcp/pull/1307))
+- **session:** Require an initialize request before initialized opens a session ([#1311](https://github.com/joshrotenberg/tower-mcp/pull/1311))
+- **client:** Strip a UTF-8 BOM on the client receive paths ([#1314](https://github.com/joshrotenberg/tower-mcp/pull/1314))
+- **resource,prompt:** Close two of the three public surface gaps ([#1315](https://github.com/joshrotenberg/tower-mcp/pull/1315))
+- **router:** Key the in-flight registry by dispatch, not request id ([#1312](https://github.com/joshrotenberg/tower-mcp/pull/1312))
+- **prompt:** Reject a prompts/get missing a required argument ([#1323](https://github.com/joshrotenberg/tower-mcp/pull/1323))
+- Error semantics change depending on how a resource or prompt is registered (closes #1280) ([#1327](https://github.com/joshrotenberg/tower-mcp/pull/1327))
+
+### Documentation
+
+- Trim the README to the essentials ([#1268](https://github.com/joshrotenberg/tower-mcp/pull/1268))
+- Worked examples for resources and prompts ([#1273](https://github.com/joshrotenberg/tower-mcp/pull/1273))
+- Worked examples for tasks, auth, and the client ([#1274](https://github.com/joshrotenberg/tower-mcp/pull/1274))
+
+### Features
+
+- **resource:** Support RFC 6570 query expansion in template matching ([#1259](https://github.com/joshrotenberg/tower-mcp/pull/1259))
+- **stdio:** Add an observable, bounded shutdown phase ([#1260](https://github.com/joshrotenberg/tower-mcp/pull/1260))
+- **tasks:** Live task execution that keeps the handler future alive ([#1288](https://github.com/joshrotenberg/tower-mcp/pull/1288))
+- **transport:** Add serve_with_shutdown to the transports that own a listener ([#1291](https://github.com/joshrotenberg/tower-mcp/pull/1291))
+- **tool:** Expose RequestContext to live task handlers ([#1308](https://github.com/joshrotenberg/tower-mcp/pull/1308))
+- **tasks:** Owner-aware task presence distinguishing expired from missing ([#1310](https://github.com/joshrotenberg/tower-mcp/pull/1310))
+- **unix:** Serve on a caller-owned listener ([#1313](https://github.com/joshrotenberg/tower-mcp/pull/1313))
+- **router:** Add configurable panic disclosure policy ([#1309](https://github.com/joshrotenberg/tower-mcp/pull/1309))
+- **tasks:** Split require_input into park_input and PendingInput::wait ([#1322](https://github.com/joshrotenberg/tower-mcp/pull/1322))
+- **tasks:** Let one tool serve a live task plus a synchronous/MRTR fallback (closes #1246) ([#1328](https://github.com/joshrotenberg/tower-mcp/pull/1328))
+
+### Miscellaneous Tasks
+
+- Run doctests, and gate the guides that need features ([#1287](https://github.com/joshrotenberg/tower-mcp/pull/1287))
+- Catch version-reference drift across the workspace ([#1290](https://github.com/joshrotenberg/tower-mcp/pull/1290))
+
+### Refactor
+
+- **router:** Move the inline test module into its own file ([#1263](https://github.com/joshrotenberg/tower-mcp/pull/1263))
+- Move the remaining inline test modules out of their sources ([#1318](https://github.com/joshrotenberg/tower-mcp/pull/1318))
+- **router:** Extract the task operations into a child module ([#1319](https://github.com/joshrotenberg/tower-mcp/pull/1319))
+- **router:** Extract logging, subscriptions, and notifications ([#1320](https://github.com/joshrotenberg/tower-mcp/pull/1320))
+- **router:** Move the task helpers beside the methods that use them ([#1321](https://github.com/joshrotenberg/tower-mcp/pull/1321))
+- **auth:** Remove AuthConfig ([#1324](https://github.com/joshrotenberg/tower-mcp/pull/1324))
+- **resource,prompt:** Make the handler traits crate-private ([#1325](https://github.com/joshrotenberg/tower-mcp/pull/1325))
+- **http:** Split transport/http.rs (phase 3 of #1256) ([#1326](https://github.com/joshrotenberg/tower-mcp/pull/1326))
+
+### Testing
+
+- Assert core stdio behaviours across every configuration ([#1262](https://github.com/joshrotenberg/tower-mcp/pull/1262))
+- Adversarial input pass for request handling ([#1266](https://github.com/joshrotenberg/tower-mcp/pull/1266))
+- Keep examples on the public API surface ([#1267](https://github.com/joshrotenberg/tower-mcp/pull/1267))
+- **examples:** Guard the public-API surface, and show a layer feeding a handler ([#1316](https://github.com/joshrotenberg/tower-mcp/pull/1316))
+- **transport:** Assert notification routing across the stdio matrix ([#1317](https://github.com/joshrotenberg/tower-mcp/pull/1317))
+
+
+
 ## [0.21.1] - 2026-08-08
 
 ### Features

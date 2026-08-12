@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.22.0] - 2026-08-12
+
+### Bug Fixes
+
+- Error semantics change depending on how a resource or prompt is registered (closes #1280) ([#1327](https://github.com/joshrotenberg/tower-mcp/pull/1327))
+
+### Documentation
+
+- Trim the README to the essentials ([#1268](https://github.com/joshrotenberg/tower-mcp/pull/1268))
+
+### Features
+
+- **tasks:** Live task execution that keeps the handler future alive ([#1288](https://github.com/joshrotenberg/tower-mcp/pull/1288))
+
+
+
 ## [0.21.1] - 2026-08-08
 
 
