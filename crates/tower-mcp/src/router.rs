@@ -3725,6 +3725,18 @@ impl McpRouter {
                     return Err(filter.denial_error(&params.name));
                 }
 
+                // Before dispatch, so every path shares one check: layered and
+                // unlayered, ordinary and MRTR. A handler never sees a request
+                // missing an argument it declared required (#1281).
+                let missing =
+                    crate::prompt::missing_required_arguments(&prompt.arguments, &params.arguments);
+                if !missing.is_empty() {
+                    return Err(Error::JsonRpc(crate::prompt::missing_arguments_error(
+                        &params.name,
+                        &missing,
+                    )));
+                }
+
                 tracing::debug!(name = %params.name, "Getting prompt");
                 let ctx = self.create_context_with_extensions(request_id, None, &extensions);
                 #[cfg(feature = "stateless")]

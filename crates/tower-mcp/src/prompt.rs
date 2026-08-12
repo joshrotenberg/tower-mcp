@@ -479,6 +479,53 @@ impl Clone for Prompt {
     }
 }
 
+/// Reject a `prompts/get` that omits an argument the prompt declares required.
+///
+/// The spec requires missing required arguments to produce `-32602`, and
+/// `prompts/list` already tells clients which ones are required, so the router
+/// was advertising a guarantee nothing provided and leaving every handler to
+/// re-implement the same check (#1281).
+///
+/// Deliberately narrow. Arguments are unvalidated strings by design, so this
+/// checks presence and nothing else:
+///
+/// - an empty string is present, since emptiness is a value the handler may
+///   legitimately want;
+/// - an omitted optional argument is fine;
+/// - unknown extra keys are accepted, because the protocol does not say prompt
+///   arguments are a closed set.
+///
+/// Missing names come back sorted, so the error is the same whichever way the
+/// map iterated.
+pub(crate) fn missing_required_arguments(
+    declared: &[PromptArgument],
+    supplied: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut missing: Vec<String> = declared
+        .iter()
+        .filter(|argument| argument.required && !supplied.contains_key(&argument.name))
+        .map(|argument| argument.name.clone())
+        .collect();
+    missing.sort();
+    missing
+}
+
+/// The `-32602` for a `prompts/get` missing required arguments.
+///
+/// The names travel in `data.missingArguments` as well as the message, so a
+/// client can act on them without parsing prose.
+pub(crate) fn missing_arguments_error(
+    name: &str,
+    missing: &[String],
+) -> crate::error::JsonRpcError {
+    crate::error::JsonRpcError::invalid_params(format!(
+        "prompt '{name}' is missing required argument{}: {}",
+        if missing.len() == 1 { "" } else { "s" },
+        missing.join(", ")
+    ))
+    .with_data(serde_json::json!({ "missingArguments": missing }))
+}
+
 impl std::fmt::Debug for Prompt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Prompt")
