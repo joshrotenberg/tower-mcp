@@ -525,6 +525,54 @@ impl Default for CancellationToken {
     }
 }
 
+/// Whether a task is present, expired, or was never known.
+///
+/// `Option` collapses the last two, so an application retaining expired
+/// tombstones cannot tell a caller "that task expired" rather than "no such
+/// task" (#1249).
+///
+/// # The owner is carried for a reason
+///
+/// `Expired` keeps the owner because authorization has to happen *before* the
+/// distinction is revealed. A present or expired task belonging to another
+/// principal must remain indistinguishable from `Missing` to that caller, or
+/// `tasks/get` becomes an existence oracle: anyone could probe ids and learn
+/// which ones belong to somebody. Only the matching owner sees `Expired`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TaskPresence {
+    /// The task exists and has not expired.
+    Present {
+        /// Principal that created it.
+        owner: TaskOwner,
+    },
+    /// The task existed and its TTL elapsed.
+    ///
+    /// Only reported by a store that retains expired records. One that drops
+    /// them answers `Missing`, which is correct for it.
+    Expired {
+        /// Principal that created it, needed to authorize before disclosing.
+        owner: TaskOwner,
+    },
+    /// No such task, or the store no longer retains it.
+    Missing,
+}
+
+impl TaskPresence {
+    /// The owner, for a task the store still knows about.
+    pub fn owner(&self) -> Option<&TaskOwner> {
+        match self {
+            Self::Present { owner } | Self::Expired { owner } => Some(owner),
+            Self::Missing => None,
+        }
+    }
+
+    /// Whether the store knows this task at all, expired or not.
+    pub fn is_known(&self) -> bool {
+        !matches!(self, Self::Missing)
+    }
+}
+
 /// Errors returned by [`TaskStore`] implementations.
 ///
 /// Encode and decode errors come from (de)serializing task state, and
@@ -632,6 +680,7 @@ pub type TaskSnapshot = (TaskObject, Option<CallToolResult>, Option<JsonRpcError
 /// use tower_mcp::async_task::{
 ///     AppliedInputResponses, CancellationToken, MemoryTaskStore, Result, TaskOwner,
 ///     TaskResumeContext, TaskSnapshot, TaskStore,
+///     TaskPresence,
 /// };
 /// use tower_mcp::error::JsonRpcError;
 /// use tower_mcp::protocol::{InputRequests, InputResponses, TaskObject, TaskStatus};
@@ -666,6 +715,12 @@ pub type TaskSnapshot = (TaskObject, Option<CallToolResult>, Option<JsonRpcError
 ///     }
 ///     async fn task_owner(&self, id: &str) -> Result<Option<TaskOwner>> {
 ///         self.inner.task_owner(id).await
+///     }
+///     // Forward this too when the wrapped store retains tombstones, or the
+///     // default turns its `Expired` into `Missing` and the decorator
+///     // silently removes the distinction (#1249).
+///     async fn task_presence(&self, id: &str) -> Result<TaskPresence> {
+///         self.inner.task_presence(id).await
 ///     }
 ///     async fn get_task(&self, id: &str) -> Result<Option<TaskObject>> {
 ///         self.inner.get_task(id).await
@@ -1008,6 +1063,36 @@ pub trait TaskStore: Send + Sync + 'static {
         task_id: &str,
         responses: InputResponses,
     ) -> Result<Option<AppliedInputResponses>>;
+
+    /// Resolve a task to present, expired, or missing, with its owner.
+    ///
+    /// The router uses this both to authorize an operation and to classify an
+    /// absent result afterwards, so a store that retains expired records can
+    /// tell its owner "that task expired" instead of "no such task" (#1249).
+    ///
+    /// Defaults to today's behaviour, treating anything `task_owner` does not
+    /// return as [`TaskPresence::Missing`], so existing stores compile and
+    /// behave unchanged. Override it when the store retains tombstones.
+    ///
+    /// # Implementing this
+    ///
+    /// Report `Expired` only for a record the store still holds; dropping
+    /// expired records and answering `Missing` is correct.
+    ///
+    /// The owner must be returned for `Expired` as well as `Present`. The
+    /// router authorizes before disclosing the difference, and it cannot do
+    /// that without knowing who owns an expired task.
+    ///
+    /// The lookup should be atomic with respect to expiry where the backend
+    /// allows it: the router resolves a second time after an operation returns
+    /// nothing, and a store whose active and tombstone lookups can disagree
+    /// may answer `Missing` for a task that expired mid-operation.
+    async fn task_presence(&self, task_id: &str) -> Result<TaskPresence> {
+        Ok(match self.task_owner(task_id).await? {
+            Some(owner) => TaskPresence::Present { owner },
+            None => TaskPresence::Missing,
+        })
+    }
 
     /// Every answer accumulated for a task so far, keyed as issued.
     ///
@@ -1393,6 +1478,25 @@ impl TaskStore for MemoryTaskStore {
                 .map(|t| t.owner.clone())
         } else {
             None
+        })
+    }
+
+    /// This store keeps expired records until `cleanup_expired` runs, so it
+    /// can tell an owner that a task expired rather than that it never
+    /// existed (#1249). One read resolves both, so expiry cannot change
+    /// between deciding presence and reading the owner.
+    async fn task_presence(&self, task_id: &str) -> Result<TaskPresence> {
+        let Ok(tasks) = self.tasks.read() else {
+            return Ok(TaskPresence::Missing);
+        };
+        Ok(match tasks.get(task_id) {
+            Some(task) if task.is_expired() => TaskPresence::Expired {
+                owner: task.owner.clone(),
+            },
+            Some(task) => TaskPresence::Present {
+                owner: task.owner.clone(),
+            },
+            None => TaskPresence::Missing,
         })
     }
 

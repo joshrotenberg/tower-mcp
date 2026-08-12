@@ -6111,3 +6111,258 @@ async fn test_discover_does_not_require_initialization() {
         resp
     );
 }
+
+/// #1249: an expired task is distinguishable from a missing one, but only to
+/// its owner. To anyone else both must answer exactly as an id that was never
+/// issued does, or `tasks/get` becomes an existence oracle: probe ids, and the
+/// ones that answer differently belong to somebody.
+///
+/// This drives the router rather than the store, which is the level the
+/// authorization decision is made at. A store-level test cannot see this bug:
+/// I wrote one first, installed an implementation that disclosed expiry before
+/// checking ownership, and the store-level test passed anyway.
+#[cfg(all(feature = "oauth", feature = "stateless"))]
+#[tokio::test]
+async fn expiry_is_disclosed_to_the_owner_and_to_nobody_else() {
+    fn as_principal(subject: &str) -> Extensions {
+        let mut extensions = tasks_client_extensions();
+        extensions.insert(crate::oauth::token::TokenClaims {
+            sub: Some(subject.to_string()),
+            iss: None,
+            aud: None,
+            exp: None,
+            scope: None,
+            client_id: None,
+            extra: HashMap::new(),
+        });
+        extensions
+    }
+
+    let store = std::sync::Arc::new(crate::async_task::MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .task_store(store.clone())
+        .tool(
+            ToolBuilder::new("optional_task")
+                .task_support(TaskSupportMode::Optional)
+                .handler(|input: AddInput| async move {
+                    Ok(CallToolResult::text(format!("{}", input.a + input.b)))
+                })
+                .build(),
+        )
+        .with_tasks();
+
+    // Alice creates a task, then it expires.
+    let McpResponse::FinalCreateTask(created) = router
+        .handle(
+            RequestId::Number(1),
+            McpRequest::CallTool(CallToolParams {
+                name: "optional_task".to_string(),
+                arguments: serde_json::json!({"a": 1, "b": 2}),
+                input_responses: None,
+                request_state: None,
+                meta: None,
+                task: None,
+            }),
+            as_principal("alice"),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("Expected a final create-task response");
+    };
+    let task_id = created.task.metadata.task_id.clone();
+    assert!(store.set_ttl(&task_id, 1).await.unwrap());
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+    let get = |id: String, who: Extensions| {
+        let router = router.clone();
+        async move {
+            router
+                .handle(
+                    RequestId::Number(9),
+                    McpRequest::GetTaskInfo(GetTaskInfoParams {
+                        task_id: id,
+                        meta: None,
+                    }),
+                    who,
+                )
+                .await
+        }
+    };
+
+    // The owner is told it expired.
+    let owner_saw = get(task_id.clone(), as_principal("alice")).await;
+    let Err(crate::error::Error::JsonRpc(owner_error)) = owner_saw else {
+        panic!("the owner must be told the task expired");
+    };
+    assert_eq!(
+        owner_error.data,
+        Some(serde_json::json!({ "reason": "task_expired" })),
+        "the owner's error must carry the expiry discriminator"
+    );
+
+    // Nobody else can tell it from an id that was never issued. Comparing the
+    // whole error, not just the code, because a discriminator in `data` or a
+    // differing message would leak just as effectively.
+    let stranger_saw = get(task_id.clone(), as_principal("bob")).await;
+    let never_issued = get("never-issued".to_string(), as_principal("bob")).await;
+    let (
+        Err(crate::error::Error::JsonRpc(stranger_error)),
+        Err(crate::error::Error::JsonRpc(missing_error)),
+    ) = (stranger_saw, never_issued)
+    else {
+        panic!("both must be refused");
+    };
+    assert_eq!(
+        stranger_error.code, missing_error.code,
+        "an unauthorized caller must not learn the task exists"
+    );
+    assert_eq!(
+        stranger_error.data, missing_error.data,
+        "nor from the error data"
+    );
+    // The message embeds the id the caller supplied, which tells them nothing
+    // they did not already know, so compare the shape with the id removed.
+    assert_eq!(
+        stranger_error.message.replace(&task_id, "<id>"),
+        missing_error.message.replace("never-issued", "<id>"),
+        "nor from the message, once the caller's own id is factored out"
+    );
+}
+
+/// #1249: a task that expires between authorization and the operation is
+/// reported to its owner as expired, not as one that never existed. The
+/// operation returning nothing is not enough to conclude "missing"; resolving
+/// a second time is what distinguishes the two.
+#[cfg(all(feature = "oauth", feature = "stateless"))]
+#[tokio::test]
+async fn an_operation_that_finds_nothing_reports_expiry_to_the_owner() {
+    fn as_principal(subject: &str) -> Extensions {
+        let mut extensions = tasks_client_extensions();
+        extensions.insert(crate::oauth::token::TokenClaims {
+            sub: Some(subject.to_string()),
+            iss: None,
+            aud: None,
+            exp: None,
+            scope: None,
+            client_id: None,
+            extra: HashMap::new(),
+        });
+        extensions
+    }
+
+    let store = std::sync::Arc::new(crate::async_task::MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .task_store(store.clone())
+        .tool(
+            ToolBuilder::new("optional_task")
+                .task_support(TaskSupportMode::Optional)
+                .handler(|input: AddInput| async move {
+                    Ok(CallToolResult::text(format!("{}", input.a + input.b)))
+                })
+                .build(),
+        )
+        .with_tasks();
+
+    let McpResponse::FinalCreateTask(created) = router
+        .handle(
+            RequestId::Number(1),
+            McpRequest::CallTool(CallToolParams {
+                name: "optional_task".to_string(),
+                arguments: serde_json::json!({"a": 1, "b": 2}),
+                input_responses: None,
+                request_state: None,
+                meta: None,
+                task: None,
+            }),
+            as_principal("alice"),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("Expected a final create-task response");
+    };
+    let task_id = created.task.metadata.task_id.clone();
+    assert!(store.set_ttl(&task_id, 1).await.unwrap());
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+    // Each of get, update, and cancel must reach the same conclusion.
+    for (offset, request) in [
+        McpRequest::GetTaskInfo(GetTaskInfoParams {
+            task_id: task_id.clone(),
+            meta: None,
+        }),
+        McpRequest::UpdateTask(UpdateTaskParams {
+            task_id: task_id.clone(),
+            input_responses: Default::default(),
+            meta: None,
+        }),
+        McpRequest::CancelTask(CancelTaskParams {
+            task_id: task_id.clone(),
+            reason: None,
+            meta: None,
+        }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let Err(crate::error::Error::JsonRpc(error)) = router
+            .handle(
+                RequestId::Number(10 + offset as i64),
+                request,
+                as_principal("alice"),
+            )
+            .await
+        else {
+            panic!("operation {offset} on an expired task must be refused");
+        };
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({ "reason": "task_expired" })),
+            "operation {offset} must tell the owner the task expired"
+        );
+    }
+}
+
+/// #1249: a late or duplicate `tasks/update` against a task the store still
+/// knows, and which has not expired, has nothing left to apply. That is an
+/// acknowledgement, not a not-found, so a client retry is idempotent.
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn a_duplicate_update_on_a_terminal_task_is_acknowledged() {
+    let store = std::sync::Arc::new(crate::async_task::MemoryTaskStore::new());
+    let (task_id, _) = store
+        .create_task("work", serde_json::json!({}), Some(60_000), None)
+        .await
+        .unwrap();
+    // Terminal, so there is nothing an update could apply.
+    assert!(
+        store
+            .complete_task(&task_id, CallToolResult::text("done"))
+            .await
+            .unwrap()
+    );
+
+    let router = McpRouter::new().task_store(store.clone()).with_tasks();
+    let response = router
+        .handle(
+            RequestId::Number(1),
+            McpRequest::UpdateTask(UpdateTaskParams {
+                task_id: task_id.clone(),
+                input_responses: Default::default(),
+                meta: None,
+            }),
+            tasks_client_extensions(),
+        )
+        .await;
+
+    // The ack's shape depends on the lifecycle; both are acknowledgements.
+    assert!(
+        matches!(
+            response,
+            Ok(McpResponse::UpdateTask(_)) | Ok(McpResponse::FinalTaskAck(_))
+        ),
+        "a known, unexpired task with nothing to apply is acknowledged, not \
+         reported missing: {response:?}"
+    );
+}

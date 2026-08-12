@@ -20,7 +20,9 @@ use tower_mcp::protocol::{
     InputRequest, InputRequests, InputResponse, TaskStatus,
 };
 use tower_mcp::schemars::JsonSchema;
-use tower_mcp::{CallToolResult, McpRouter, PanicPolicy, TaskContext, TaskOutcome, ToolBuilder};
+use tower_mcp::{
+    CallToolResult, McpRouter, PanicPolicy, RequestContext, TaskContext, TaskOutcome, ToolBuilder,
+};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct NoArgs {}
@@ -638,4 +640,135 @@ async fn a_panicking_live_handler_releases_its_registry_entry() {
             task.status
         );
     }
+}
+
+// ============================================================================
+// Request context in live handlers (#1301)
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq)]
+struct Principal(String);
+
+/// #1301: the internal trait carried the `RequestContext` from #1298, but the
+/// public closure adapter discarded it, so a live handler could not read an
+/// authenticated principal, a trace id, or anything task preparation added
+/// without keeping its own registry keyed by task id.
+#[tokio::test]
+async fn a_contextual_live_handler_sees_a_preparation_extension() {
+    let tool = ToolBuilder::new("whoami")
+        .description("Reports the prepared principal")
+        .live_task_handler_with_context(
+            |ctx: RequestContext, _task: TaskContext, _input: NoArgs| async move {
+                let who = ctx
+                    .extension::<Principal>()
+                    .map(|p| p.0.clone())
+                    .unwrap_or_else(|| "absent".to_string());
+                Ok(TaskOutcome::Completed(CallToolResult::text(who)))
+            },
+        )
+        .build()
+        .with_task_preparation(|_task: TaskContext, _args: serde_json::Value| async move {
+            Ok(tower_mcp::TaskPreparation::new()
+                .with_extension(Principal("prepared-caller".to_string())))
+        });
+
+    let store = Arc::new(MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .server_info("ctx", "1.0.0")
+        .task_store(store.clone())
+        .tool(tool)
+        .with_tasks();
+
+    let client = McpClient::connect(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+
+    let task_id = client
+        .call_tool_as_task("whoami", json!({}), None)
+        .await
+        .expect("task created")
+        .task
+        .task_id;
+    await_status(&store, &task_id, TaskStatus::Completed).await;
+
+    let (_, result, _) = store.get_task_result(&task_id).await.unwrap().unwrap();
+    assert_eq!(
+        result.unwrap().all_text(),
+        "prepared-caller",
+        "the preparation extension must reach the live handler"
+    );
+}
+
+/// #1295 was exactly this bug class for the simple form, so the contextual
+/// form is checked on the same transformation paths rather than assumed to
+/// inherit the fix.
+#[tokio::test]
+async fn a_contextual_live_handler_survives_nest_and_guard() {
+    let tool = ToolBuilder::new("run")
+        .description("Contextual")
+        .live_task_handler_with_context(
+            |_ctx: RequestContext, _task: TaskContext, _input: NoArgs| async move {
+                Ok(TaskOutcome::Completed(CallToolResult::text("ran")))
+            },
+        )
+        .build()
+        // A guard that admits everything still replaces the handler, so this
+        // exercises the guarded wrapper surviving the prefix as well.
+        .with_guard(|_req: &tower_mcp::ToolRequest| Ok(()));
+
+    let inner = McpRouter::new().server_info("inner", "1.0.0").tool(tool);
+    let store = Arc::new(MemoryTaskStore::new());
+    let outer = McpRouter::new()
+        .server_info("outer", "1.0.0")
+        .task_store(store.clone())
+        .nest("provider", inner)
+        .with_tasks();
+
+    let client = McpClient::connect(ChannelTransport::new(outer))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+
+    let task_id = client
+        .call_tool_as_task("provider.run", json!({}), None)
+        .await
+        .expect("task created")
+        .task
+        .task_id;
+    await_status(&store, &task_id, TaskStatus::Completed).await;
+
+    let (_, result, _) = store.get_task_result(&task_id).await.unwrap().unwrap();
+    assert_eq!(result.unwrap().all_text(), "ran");
+}
+
+/// The simple two-argument form stays source-compatible, which the other
+/// tests in this file already exercise; this pins it explicitly.
+#[tokio::test]
+async fn the_simple_live_form_still_compiles_and_runs() {
+    let tool = ToolBuilder::new("simple")
+        .description("Two-argument form")
+        .live_task_handler(|_task: TaskContext, _input: NoArgs| async move {
+            Ok(TaskOutcome::Completed(CallToolResult::text("simple")))
+        })
+        .build();
+
+    let store = Arc::new(MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .server_info("simple", "1.0.0")
+        .task_store(store.clone())
+        .tool(tool)
+        .with_tasks();
+
+    let client = McpClient::connect(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+    let task_id = client
+        .call_tool_as_task("simple", json!({}), None)
+        .await
+        .expect("task created")
+        .task
+        .task_id;
+    await_status(&store, &task_id, TaskStatus::Completed).await;
 }

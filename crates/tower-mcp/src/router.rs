@@ -431,6 +431,20 @@ fn request_principal(_extensions: &crate::context::Extensions) -> Option<String>
 ///
 /// Unknown and expired tasks are deliberately indistinguishable, so a caller
 /// cannot probe for the existence of a task whose retention window closed.
+/// The error an owner gets for a task the store still holds but whose TTL
+/// elapsed.
+///
+/// Deliberately distinct from [`unknown_task_error`] in its `data`, and
+/// deliberately only ever produced after the caller has been shown to own the
+/// task. A caller who does not own it gets `unknown_task_error`, which is
+/// also what a genuinely unknown id gets, so the two cannot be told apart
+/// from outside (#1249).
+fn expired_task_error(task_id: &str) -> JsonRpcError {
+    let mut error = JsonRpcError::invalid_params(format!("Task expired: {task_id}"));
+    error.data = Some(serde_json::json!({ "reason": "task_expired" }));
+    error
+}
+
 fn unknown_task_error(task_id: &str) -> JsonRpcError {
     JsonRpcError::invalid_params(format!("Task not found: {task_id}"))
 }
@@ -2797,6 +2811,36 @@ impl McpRouter {
             .contains_key(tower_mcp_types::protocol::TASKS_EXTENSION_ID)
     }
 
+    /// Classify an operation that found nothing, after authorization passed.
+    ///
+    /// The task was present when it was authorized, so an operation that then
+    /// found nothing means it expired in between. Resolving a second time
+    /// tells the owner that, rather than reporting a task that existed moments
+    /// ago as though it never had (#1249).
+    ///
+    /// Ownership is rechecked rather than assumed. The first resolution
+    /// established it, and task ids are unguessable and not reused, so this is
+    /// belt and braces; it costs one lookup and removes any argument about
+    /// whether a store could return a differently-owned record here.
+    async fn classify_absent_task(
+        &self,
+        task_id: &str,
+        extensions: &crate::context::Extensions,
+    ) -> Error {
+        let Ok(presence) = self.inner.task_store.task_presence(task_id).await else {
+            return Error::JsonRpc(unknown_task_error(task_id));
+        };
+        let owns = presence.owner().is_some_and(|owner| {
+            crate::async_task::owner_matches(owner, request_principal(extensions).as_deref())
+        });
+        match presence {
+            crate::async_task::TaskPresence::Expired { .. } if owns => {
+                Error::JsonRpc(expired_task_error(task_id))
+            }
+            _ => Error::JsonRpc(unknown_task_error(task_id)),
+        }
+    }
+
     /// Reject a final task method that was not negotiated by both peers.
     ///
     /// An unnegotiated method is reported as absent rather than forbidden:
@@ -2827,16 +2871,28 @@ impl McpRouter {
         task_id: &str,
         extensions: &crate::context::Extensions,
     ) -> Result<()> {
-        let owner = self
+        // Resolved through presence so an expired task can be reported as
+        // such to its owner. Everyone else must still see exactly what they
+        // see for an id that was never issued, so the owner check happens
+        // before any of that distinction escapes (#1249).
+        let presence = self
             .inner
             .task_store
-            .task_owner(task_id)
+            .task_presence(task_id)
             .await
-            .map_err(task_store_error)?
-            .ok_or_else(|| Error::JsonRpc(unknown_task_error(task_id)))?;
+            .map_err(task_store_error)?;
+        let Some(owner) = presence.owner() else {
+            return Err(Error::JsonRpc(unknown_task_error(task_id)));
+        };
 
-        if crate::async_task::owner_matches(&owner, request_principal(extensions).as_deref()) {
-            Ok(())
+        if crate::async_task::owner_matches(owner, request_principal(extensions).as_deref()) {
+            match presence {
+                // The owner is told the difference; nobody else reaches here.
+                crate::async_task::TaskPresence::Expired { .. } => {
+                    Err(Error::JsonRpc(expired_task_error(task_id)))
+                }
+                _ => Ok(()),
+            }
         } else {
             tracing::debug!(
                 target: "mcp::tasks",
@@ -4460,18 +4516,19 @@ impl McpRouter {
                 // `failed` includes the JSON-RPC error. This replaced the
                 // removed blocking `tasks/result` method as the way clients
                 // retrieve a task's outcome.
-                let (mut task, result, error) = self
+                let Some((mut task, result, error)) = self
                     .inner
                     .task_store
                     .get_task_result(&params.task_id)
                     .await
                     .map_err(task_store_error)?
-                    .ok_or_else(|| {
-                        Error::JsonRpc(JsonRpcError::invalid_params(format!(
-                            "Task not found: {}",
-                            params.task_id
-                        )))
-                    })?;
+                else {
+                    // Present when it was authorized, absent now, so it
+                    // expired in between (#1249).
+                    return Err(self
+                        .classify_absent_task(&params.task_id, &extensions)
+                        .await);
+                };
 
                 match task.status {
                     TaskStatus::Completed => task.result = result,
@@ -4496,7 +4553,7 @@ impl McpRouter {
                     // Partial responses are the normal case: the store
                     // consumes what matches an outstanding request and ignores
                     // unknown, already-answered, and superseded keys.
-                    let applied = self
+                    let Some(applied) = self
                         .inner
                         .task_store
                         .apply_input_responses(
@@ -4505,7 +4562,26 @@ impl McpRouter {
                         )
                         .await
                         .map_err(task_store_error)?
-                        .ok_or_else(|| Error::JsonRpc(unknown_task_error(&params.task_id)))?;
+                    else {
+                        // Nothing left to apply. A task the store still knows
+                        // and has not expired is a late or duplicate update,
+                        // so it gets the ordinary empty acknowledgement, which
+                        // makes a client retry idempotent (#1249).
+                        return match self
+                            .inner
+                            .task_store
+                            .task_presence(&params.task_id)
+                            .await
+                            .map_err(task_store_error)?
+                        {
+                            crate::async_task::TaskPresence::Present { .. } => Ok(
+                                McpResponse::FinalTaskAck(crate::tasks::TaskAcknowledgement::new()),
+                            ),
+                            _ => Err(self
+                                .classify_absent_task(&params.task_id, &extensions)
+                                .await),
+                        };
+                    };
                     // Answering the last outstanding request resumes the task,
                     // so the status a subscriber sees changes here even though
                     // the ack itself is empty.
@@ -4544,7 +4620,7 @@ impl McpRouter {
                 // every key, so dropping them wholesale left a server whose
                 // store models input requests with a working flow on
                 // 2026-07-28 and a silent stall on 2025-11-25 (#1188).
-                let applied = self
+                let Some(applied) = self
                     .inner
                     .task_store
                     .apply_input_responses(
@@ -4553,12 +4629,26 @@ impl McpRouter {
                     )
                     .await
                     .map_err(task_store_error)?
-                    .ok_or_else(|| {
-                        Error::JsonRpc(JsonRpcError::invalid_params(format!(
-                            "Task not found: {}",
-                            params.task_id
-                        )))
-                    })?;
+                else {
+                    // Nothing left to apply. A task the store still knows and
+                    // has not expired is a late or duplicate update, so it
+                    // gets the ordinary empty acknowledgement, which makes a
+                    // client retry idempotent rather than a not-found (#1249).
+                    return match self
+                        .inner
+                        .task_store
+                        .task_presence(&params.task_id)
+                        .await
+                        .map_err(task_store_error)?
+                    {
+                        crate::async_task::TaskPresence::Present { .. } => {
+                            Ok(McpResponse::UpdateTask(EmptyResult {}))
+                        }
+                        _ => Err(self
+                            .classify_absent_task(&params.task_id, &extensions)
+                            .await),
+                    };
+                };
                 // A final-protocol subscriber watching this task should see it
                 // resume regardless of which lifecycle the updating client
                 // used. Self-guards when the extension is not enabled.
@@ -4592,12 +4682,17 @@ impl McpRouter {
                     // The final ack does not require a terminal transition:
                     // cancelling an already-terminal task is acknowledged, and
                     // the observable status is polled via `tasks/get`.
-                    self.inner
+                    let cancelled = self
+                        .inner
                         .task_store
                         .cancel_task(&params.task_id, params.reason.as_deref())
                         .await
-                        .map_err(task_store_error)?
-                        .ok_or_else(|| Error::JsonRpc(unknown_task_error(&params.task_id)))?;
+                        .map_err(task_store_error)?;
+                    if cancelled.is_none() {
+                        return Err(self
+                            .classify_absent_task(&params.task_id, &extensions)
+                            .await);
+                    }
                     self.notify_task_state(&params.task_id).await;
                     return Ok(McpResponse::FinalTaskAck(
                         crate::tasks::TaskAcknowledgement::new(),
@@ -4614,18 +4709,17 @@ impl McpRouter {
                 }
 
                 // First check if the task exists and is not already terminal
-                let current = self
+                let Some(current) = self
                     .inner
                     .task_store
                     .get_task(&params.task_id)
                     .await
                     .map_err(task_store_error)?
-                    .ok_or_else(|| {
-                        Error::JsonRpc(JsonRpcError::invalid_params(format!(
-                            "Task not found: {}",
-                            params.task_id
-                        )))
-                    })?;
+                else {
+                    return Err(self
+                        .classify_absent_task(&params.task_id, &extensions)
+                        .await);
+                };
 
                 if current.status.is_terminal() {
                     return Err(Error::JsonRpc(JsonRpcError::invalid_params(format!(
@@ -4634,17 +4728,17 @@ impl McpRouter {
                     ))));
                 }
 
-                self.inner
+                let cancelled = self
+                    .inner
                     .task_store
                     .cancel_task(&params.task_id, params.reason.as_deref())
                     .await
-                    .map_err(task_store_error)?
-                    .ok_or_else(|| {
-                        Error::JsonRpc(JsonRpcError::invalid_params(format!(
-                            "Task not found: {}",
-                            params.task_id
-                        )))
-                    })?;
+                    .map_err(task_store_error)?;
+                if cancelled.is_none() {
+                    return Err(self
+                        .classify_absent_task(&params.task_id, &extensions)
+                        .await);
+                }
 
                 // SEP-2663 (final): the cancel acknowledgment MUST be an empty
                 // result. The observable status is polled via `tasks/get` and
