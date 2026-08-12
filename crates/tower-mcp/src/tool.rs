@@ -595,6 +595,7 @@ impl Eq for TaskContext {}
 /// router, which signals it once `tasks/update` has committed.
 pub(crate) struct LiveTask {
     pub(crate) store: Arc<dyn crate::async_task::TaskStore>,
+    pub(crate) error_policy: crate::router::TaskErrorPolicy,
     /// Signalled after responses are durably recorded, never before.
     pub(crate) input_ready: tokio::sync::Notify,
     pub(crate) cancelled: crate::context::CancellationToken,
@@ -762,9 +763,13 @@ impl TaskContext {
             ))
         })?;
         if requests.is_empty() {
-            return Err(crate::error::Error::Tool(crate::error::ToolError::new(
-                "require_input needs at least one request, or the task would wait for something that can never arrive",
-            )));
+            return Err(crate::error::Error::JsonRpc(
+                live.error_policy.map_internal_error(
+                    crate::router::TaskOperation::ParkInput,
+                    &self.task_id,
+                    "require_input needs at least one request, or the task would wait for something that can never arrive",
+                ),
+            ));
         }
         let asked: Vec<String> = requests.keys().cloned().collect();
 
@@ -776,15 +781,21 @@ impl TaskContext {
             .store
             .require_input(&self.task_id, requests, message.as_deref())
             .await
-            .map_err(|e| {
-                crate::error::Error::Tool(crate::error::ToolError::new(format!(
-                    "could not park the task for input: {e}"
-                )))
+            .map_err(|error| {
+                crate::error::Error::JsonRpc(live.error_policy.map_store_error(
+                    crate::router::TaskOperation::ParkInput,
+                    &self.task_id,
+                    error,
+                ))
             })?;
         if !accepted {
-            return Err(crate::error::Error::Tool(crate::error::ToolError::new(
-                "the task is already terminal, so it cannot ask for input",
-            )));
+            return Err(crate::error::Error::JsonRpc(
+                live.error_policy.map_internal_error(
+                    crate::router::TaskOperation::ParkInput,
+                    &self.task_id,
+                    "the task is already terminal, so it cannot ask for input",
+                ),
+            ));
         }
 
         Ok(PendingInput {
@@ -801,14 +812,26 @@ impl TaskContext {
                 "working needs a live task handler",
             ))
         })?;
-        live.store
+        let updated = live
+            .store
             .set_status(&self.task_id, TaskStatus::Working, Some(&message.into()))
             .await
-            .map_err(|e| {
-                crate::error::Error::Tool(crate::error::ToolError::new(format!(
-                    "could not update task status: {e}"
-                )))
+            .map_err(|error| {
+                crate::error::Error::JsonRpc(live.error_policy.map_store_error(
+                    crate::router::TaskOperation::Execute,
+                    &self.task_id,
+                    error,
+                ))
             })?;
+        if !updated {
+            return Err(crate::error::Error::JsonRpc(
+                live.error_policy.map_internal_error(
+                    crate::router::TaskOperation::Execute,
+                    &self.task_id,
+                    "the task is already terminal, so its status cannot be updated",
+                ),
+            ));
+        }
         Ok(())
     }
 
@@ -932,12 +955,25 @@ impl PendingInput {
                 .store
                 .outstanding_input_requests(&self.task_id)
                 .await
-                .map_err(|e| {
-                    crate::error::Error::Tool(crate::error::ToolError::new(format!(
-                        "could not read outstanding requests: {e}"
-                    )))
-                })?
-                .unwrap_or_default();
+                .map_err(|error| {
+                    crate::error::Error::JsonRpc(live.error_policy.map_store_error(
+                        crate::router::TaskOperation::Execute,
+                        &self.task_id,
+                        error,
+                    ))
+                })?;
+            let Some(outstanding) = outstanding else {
+                if live.cancelled.is_cancelled() {
+                    return Err(crate::error::Error::TaskCancelled);
+                }
+                return Err(crate::error::Error::JsonRpc(
+                    live.error_policy.map_internal_error(
+                        crate::router::TaskOperation::Execute,
+                        &self.task_id,
+                        "the task disappeared while waiting for input",
+                    ),
+                ));
+            };
             if !outstanding.keys().any(|key| self.asked.contains(key)) {
                 break;
             }
@@ -954,12 +990,25 @@ impl PendingInput {
             .store
             .input_responses(&self.task_id)
             .await
-            .map_err(|e| {
-                crate::error::Error::Tool(crate::error::ToolError::new(format!(
-                    "could not read input responses: {e}"
-                )))
-            })?
-            .unwrap_or_default();
+            .map_err(|error| {
+                crate::error::Error::JsonRpc(live.error_policy.map_store_error(
+                    crate::router::TaskOperation::Execute,
+                    &self.task_id,
+                    error,
+                ))
+            })?;
+        let Some(all) = all else {
+            if live.cancelled.is_cancelled() {
+                return Err(crate::error::Error::TaskCancelled);
+            }
+            return Err(crate::error::Error::JsonRpc(
+                live.error_policy.map_internal_error(
+                    crate::router::TaskOperation::Execute,
+                    &self.task_id,
+                    "the task disappeared before its input responses could be read",
+                ),
+            ));
+        };
         Ok(all
             .into_iter()
             .filter(|(key, _)| self.asked.contains(key))

@@ -664,7 +664,8 @@ pub use resource::{
 };
 pub use router::{
     McpRouter, MergeConflict, MergeConflictKind, MergeConflicts, PanicPolicy, RouterRequest,
-    RouterResponse, ToolAnnotationsMap,
+    RouterResponse, TaskErrorContext, TaskErrorPolicy, TaskFailure, TaskOperation,
+    ToolAnnotationsMap,
 };
 pub use session::{SessionPhase, SessionState};
 #[cfg(feature = "stateless")]

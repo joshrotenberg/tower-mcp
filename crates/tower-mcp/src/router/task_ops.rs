@@ -11,7 +11,70 @@
 
 use super::*;
 
+type DetailedTaskSnapshot = (
+    crate::tasks::DetailedTask,
+    Option<serde_json::Map<String, serde_json::Value>>,
+);
+
 impl McpRouter {
+    pub(super) fn task_json_rpc_error(
+        &self,
+        operation: TaskOperation,
+        task_id: Option<&str>,
+        failure: TaskFailure,
+    ) -> JsonRpcError {
+        let context = TaskErrorContext::new(operation, task_id, failure);
+        self.inner.task_error_policy.map(&context)
+    }
+
+    pub(super) fn task_error(
+        &self,
+        operation: TaskOperation,
+        task_id: Option<&str>,
+        failure: TaskFailure,
+    ) -> Error {
+        Error::JsonRpc(self.task_json_rpc_error(operation, task_id, failure))
+    }
+
+    pub(super) fn task_store_error(
+        &self,
+        operation: TaskOperation,
+        task_id: Option<&str>,
+        error: TaskStoreError,
+    ) -> Error {
+        self.task_error(operation, task_id, TaskFailure::Store(error))
+    }
+
+    pub(super) async fn task_presence(
+        &self,
+        operation: TaskOperation,
+        task_id: &str,
+    ) -> Result<crate::async_task::TaskPresence> {
+        self.inner
+            .task_store
+            .task_presence(task_id)
+            .await
+            .map_err(|error| self.task_store_error(operation, Some(task_id), error))
+    }
+
+    pub(super) fn classify_absent_presence(
+        &self,
+        operation: TaskOperation,
+        task_id: &str,
+        extensions: &crate::context::Extensions,
+        presence: crate::async_task::TaskPresence,
+    ) -> Error {
+        let owns = presence.owner().is_some_and(|owner| {
+            crate::async_task::owner_matches(owner, request_principal(extensions).as_deref())
+        });
+        match presence {
+            crate::async_task::TaskPresence::Expired { .. } if owns => {
+                self.task_error(operation, Some(task_id), TaskFailure::Expired)
+            }
+            _ => self.task_error(operation, Some(task_id), TaskFailure::NotFound),
+        }
+    }
+
     /// Classify an operation that found nothing, after authorization passed.
     ///
     /// The task was present when it was authorized, so an operation that then
@@ -25,21 +88,15 @@ impl McpRouter {
     /// whether a store could return a differently-owned record here.
     pub(super) async fn classify_absent_task(
         &self,
+        operation: TaskOperation,
         task_id: &str,
         extensions: &crate::context::Extensions,
     ) -> Error {
-        let Ok(presence) = self.inner.task_store.task_presence(task_id).await else {
-            return Error::JsonRpc(unknown_task_error(task_id));
+        let presence = match self.task_presence(operation, task_id).await {
+            Ok(presence) => presence,
+            Err(error) => return error,
         };
-        let owns = presence.owner().is_some_and(|owner| {
-            crate::async_task::owner_matches(owner, request_principal(extensions).as_deref())
-        });
-        match presence {
-            crate::async_task::TaskPresence::Expired { .. } if owns => {
-                Error::JsonRpc(expired_task_error(task_id))
-            }
-            _ => Error::JsonRpc(unknown_task_error(task_id)),
-        }
+        self.classify_absent_presence(operation, task_id, extensions, presence)
     }
 
     /// Reject a final task method that was not negotiated by both peers.
@@ -69,6 +126,7 @@ impl McpRouter {
     /// thing unguessable IDs exist to prevent.
     pub(super) async fn authorize_task(
         &self,
+        operation: TaskOperation,
         task_id: &str,
         extensions: &crate::context::Extensions,
     ) -> Result<()> {
@@ -76,21 +134,16 @@ impl McpRouter {
         // such to its owner. Everyone else must still see exactly what they
         // see for an id that was never issued, so the owner check happens
         // before any of that distinction escapes (#1249).
-        let presence = self
-            .inner
-            .task_store
-            .task_presence(task_id)
-            .await
-            .map_err(task_store_error)?;
+        let presence = self.task_presence(operation, task_id).await?;
         let Some(owner) = presence.owner() else {
-            return Err(Error::JsonRpc(unknown_task_error(task_id)));
+            return Err(self.task_error(operation, Some(task_id), TaskFailure::NotFound));
         };
 
         if crate::async_task::owner_matches(owner, request_principal(extensions).as_deref()) {
             match presence {
                 // The owner is told the difference; nobody else reaches here.
                 crate::async_task::TaskPresence::Expired { .. } => {
-                    Err(Error::JsonRpc(expired_task_error(task_id)))
+                    Err(self.task_error(operation, Some(task_id), TaskFailure::Expired))
                 }
                 _ => Ok(()),
             }
@@ -100,13 +153,21 @@ impl McpRouter {
                 task_id = %task_id,
                 "task operation refused: principal does not own the task"
             );
-            Err(Error::JsonRpc(unknown_task_error(task_id)))
+            Err(self.task_error(operation, Some(task_id), TaskFailure::NotFound))
         }
     }
 
     /// Serve a final `tasks/get` as a status-discriminated `DetailedTask`.
-    pub(super) async fn final_get_task(&self, task_id: &str) -> Result<McpResponse> {
-        let (detailed, meta) = self.detailed_task(task_id).await?;
+    pub(super) async fn final_get_task(
+        &self,
+        task_id: &str,
+        extensions: &crate::context::Extensions,
+    ) -> Result<McpResponse> {
+        let Some((detailed, meta)) = self.detailed_task(task_id).await? else {
+            return Err(self
+                .classify_absent_task(TaskOperation::Get, task_id, extensions)
+                .await);
+        };
         let mut result = crate::tasks::GetTaskResult::new(detailed);
         result.meta = meta;
         Ok(McpResponse::FinalGetTask(result))
@@ -120,74 +181,99 @@ impl McpRouter {
     pub(super) async fn detailed_task(
         &self,
         task_id: &str,
-    ) -> Result<(
-        crate::tasks::DetailedTask,
-        Option<serde_json::Map<String, serde_json::Value>>,
-    )> {
-        let (task, result, error) = self
-            .inner
-            .task_store
-            .get_task_result(task_id)
-            .await
-            .map_err(task_store_error)?
-            .ok_or_else(|| Error::JsonRpc(unknown_task_error(task_id)))?;
+    ) -> Result<Option<DetailedTaskSnapshot>> {
+        // A final Task view takes two store reads while input is outstanding:
+        // the status/result snapshot, then the requests map. `tasks/update`
+        // can move the Task back to `working` between them. Re-read once when
+        // that race produces an empty map rather than emitting the impossible
+        // wire shape `input_required` with no requests.
+        for attempt in 0..2 {
+            let Some((task, result, error)) = self
+                .inner
+                .task_store
+                .get_task_result(task_id)
+                .await
+                .map_err(|error| self.task_store_error(TaskOperation::Get, Some(task_id), error))?
+            else {
+                return Ok(None);
+            };
 
-        let mut metadata = crate::tasks::TaskMetadata::new(
-            task.task_id.clone(),
-            task.created_at.clone(),
-            task.last_updated_at.clone(),
-            task.ttl,
-        );
-        metadata.status_message = task.status_message.clone();
-        metadata.poll_interval_ms = task.poll_interval;
+            let mut metadata = crate::tasks::TaskMetadata::new(
+                task.task_id.clone(),
+                task.created_at.clone(),
+                task.last_updated_at.clone(),
+                task.ttl,
+            );
+            metadata.status_message = task.status_message.clone();
+            metadata.poll_interval_ms = task.poll_interval;
 
-        let meta = task.meta.and_then(|value| value.as_object().cloned());
-        let detailed = match task.status {
-            TaskStatus::Working => crate::tasks::DetailedTask::working(metadata),
-            TaskStatus::InputRequired => {
-                // Every request still awaiting a response, not just the most
-                // recent one.
-                let outstanding = self
-                    .inner
-                    .task_store
-                    .outstanding_input_requests(task_id)
-                    .await
-                    .map_err(task_store_error)?
-                    .unwrap_or_default();
-                crate::tasks::DetailedTask::input_required(metadata, outstanding)
-            }
-            TaskStatus::Completed => {
-                // The exact object the synchronous call would have returned,
-                // including `isError: true` results.
-                let mut object = result
-                    .map(serde_json::to_value)
-                    .transpose()
-                    .map_err(|e| {
-                        Error::JsonRpc(JsonRpcError::internal_error(format!(
-                            "failed to encode task result: {e}"
-                        )))
-                    })?
-                    .and_then(|value| value.as_object().cloned())
-                    .unwrap_or_default();
-                // This object is nested inside tasks/get, so it does not pass
-                // through the JSON-RPC response stamper that adds the final
-                // protocol's required complete discriminator.
-                object.insert(
-                    "resultType".to_string(),
-                    serde_json::Value::String("complete".to_string()),
-                );
-                crate::tasks::DetailedTask::completed(metadata, object)
-            }
-            TaskStatus::Failed => crate::tasks::DetailedTask::failed(
-                metadata,
-                error.unwrap_or_else(|| JsonRpcError::internal_error("Task failed")),
-            ),
-            TaskStatus::Cancelled => crate::tasks::DetailedTask::cancelled(metadata),
-            // `TaskStatus` is non_exhaustive. Report an unrecognized status as
-            // working rather than inventing a terminal state.
-            _ => crate::tasks::DetailedTask::working(metadata),
-        };
-        Ok((detailed, meta))
+            let meta = task.meta.and_then(|value| value.as_object().cloned());
+            let detailed = match task.status {
+                TaskStatus::Working => crate::tasks::DetailedTask::working(metadata),
+                TaskStatus::InputRequired => {
+                    // Every request still awaiting a response, not just the
+                    // most recent one.
+                    let outstanding = self
+                        .inner
+                        .task_store
+                        .outstanding_input_requests(task_id)
+                        .await
+                        .map_err(|error| {
+                            self.task_store_error(TaskOperation::Get, Some(task_id), error)
+                        })?;
+                    let Some(outstanding) = outstanding else {
+                        return Ok(None);
+                    };
+                    if outstanding.is_empty() {
+                        if attempt == 0 {
+                            continue;
+                        }
+                        return Err(self.task_error(
+                            TaskOperation::Get,
+                            Some(task_id),
+                            TaskFailure::Internal(
+                                "task store returned input_required without outstanding requests",
+                            ),
+                        ));
+                    }
+                    crate::tasks::DetailedTask::input_required(metadata, outstanding)
+                }
+                TaskStatus::Completed => {
+                    // The exact object the synchronous call would have returned,
+                    // including `isError: true` results.
+                    let mut object = result
+                        .map(serde_json::to_value)
+                        .transpose()
+                        .map_err(|_| {
+                            self.task_error(
+                                TaskOperation::Get,
+                                Some(task_id),
+                                TaskFailure::Internal("failed to encode task result"),
+                            )
+                        })?
+                        .and_then(|value| value.as_object().cloned())
+                        .unwrap_or_default();
+                    // This object is nested inside tasks/get, so it does not
+                    // pass through the JSON-RPC response stamper that adds the
+                    // final protocol's required complete discriminator.
+                    object.insert(
+                        "resultType".to_string(),
+                        serde_json::Value::String("complete".to_string()),
+                    );
+                    crate::tasks::DetailedTask::completed(metadata, object)
+                }
+                TaskStatus::Failed => crate::tasks::DetailedTask::failed(
+                    metadata,
+                    error.unwrap_or_else(|| JsonRpcError::internal_error("Task failed")),
+                ),
+                TaskStatus::Cancelled => crate::tasks::DetailedTask::cancelled(metadata),
+                // `TaskStatus` is non_exhaustive. Report an unrecognized status
+                // as working rather than inventing a terminal state.
+                _ => crate::tasks::DetailedTask::working(metadata),
+            };
+            return Ok(Some((detailed, meta)));
+        }
+        unreachable!("bounded Task snapshot retry always returns")
     }
 
     /// Park a task on the input its handler asked for.
@@ -204,9 +290,13 @@ impl McpRouter {
         if requests.is_empty() {
             // Parking here would strand the task: no `tasks/update` can ever
             // complete an empty request set.
-            let error = JsonRpcError::internal_error(
-                "handler asked for input without naming any requests, so the task has \
-                 nothing to wait for",
+            let error = self.task_json_rpc_error(
+                TaskOperation::ParkInput,
+                Some(task_id),
+                TaskFailure::Internal(
+                    "handler asked for input without naming any requests, so the task has \
+                     nothing to wait for",
+                ),
             );
             if let Err(e) = self.inner.task_store.fail_task(task_id, error).await {
                 tracing::warn!(task_id = %task_id, error = %e, "failed to record task failure");
@@ -238,16 +328,13 @@ impl McpRouter {
                 // though: an invalid transition is the handler asking for
                 // something the protocol forbids, which no retry fixes,
                 // while a backend failure is infrastructure (#1246).
-                let error = match &e {
+                match &e {
                     crate::async_task::TaskStoreError::InvalidTransition(message) => {
                         tracing::error!(
                             task_id = %task_id,
                             error = %message,
                             "handler asked for input the protocol does not allow"
                         );
-                        JsonRpcError::internal_error(format!(
-                            "handler asked for input the protocol does not allow: {message}"
-                        ))
                     }
                     other => {
                         tracing::warn!(
@@ -255,11 +342,13 @@ impl McpRouter {
                             error = %other,
                             "task store could not park the task for input"
                         );
-                        JsonRpcError::internal_error(format!(
-                            "could not park the task for input: {other}"
-                        ))
                     }
-                };
+                }
+                let error = self.task_json_rpc_error(
+                    TaskOperation::ParkInput,
+                    Some(task_id),
+                    TaskFailure::Store(e),
+                );
                 if let Err(e) = self.inner.task_store.fail_task(task_id, error).await {
                     tracing::warn!(task_id = %task_id, error = %e, "failed to record task failure");
                 }
@@ -318,6 +407,88 @@ impl McpRouter {
         }
     }
 
+    /// Persist a structured failure without exposing a store error if that
+    /// terminal write itself fails.
+    pub(super) async fn record_task_failure(&self, task_id: &str, error: JsonRpcError) -> bool {
+        match self.inner.task_store.fail_task(task_id, error).await {
+            Ok(true) => true,
+            Ok(false) => {
+                tracing::debug!(
+                    task_id = %task_id,
+                    "task failure was not applied because the task is absent or terminal"
+                );
+                false
+            }
+            Err(_) => {
+                tracing::warn!(
+                    task_id = %task_id,
+                    "failed to record task failure"
+                );
+                false
+            }
+        }
+    }
+
+    /// Persist cancellation without claiming success for an absent or
+    /// already-terminal Task and without displaying a backend error.
+    pub(super) async fn record_task_cancellation(
+        &self,
+        task_id: &str,
+        reason: Option<&str>,
+    ) -> bool {
+        match self.inner.task_store.cancel_task(task_id, reason).await {
+            Ok(Some(_)) => true,
+            Ok(None) => {
+                tracing::debug!(
+                    task_id = %task_id,
+                    "task cancellation was not applied because the task is absent"
+                );
+                false
+            }
+            Err(_) => {
+                tracing::warn!(
+                    task_id = %task_id,
+                    "failed to record task cancellation"
+                );
+                false
+            }
+        }
+    }
+
+    /// Commit a completed result, converting a backend write failure into one
+    /// bounded attempt to persist a structured, policy-mapped Task failure.
+    pub(super) async fn complete_task_or_fail(
+        &self,
+        task_id: &str,
+        result: CallToolResult,
+    ) -> bool {
+        match self.inner.task_store.complete_task(task_id, result).await {
+            Ok(true) => true,
+            Ok(false) => {
+                // A terminal outcome may have won concurrently. Never rewrite
+                // it, and do not claim this completion was applied.
+                tracing::debug!(
+                    task_id = %task_id,
+                    "task completion was not applied because the task is absent or terminal"
+                );
+                false
+            }
+            Err(error) => {
+                tracing::warn!(
+                    task_id = %task_id,
+                    "failed to record task completion; recording a task failure"
+                );
+                let error = self.task_json_rpc_error(
+                    TaskOperation::Finalize,
+                    Some(task_id),
+                    TaskFailure::Store(error),
+                );
+                self.record_task_failure(task_id, error).await;
+                false
+            }
+        }
+    }
+
     /// Re-invoke a task's handler after its input requests were answered.
     ///
     /// A task's client answers through `tasks/update` rather than by retrying
@@ -332,19 +503,28 @@ impl McpRouter {
                 // Either the task vanished, or the store predates resumption
                 // and cannot supply what a re-invocation needs. Fail loudly
                 // rather than leave the task working forever.
-                let error = JsonRpcError::internal_error(
-                    "this task store cannot resume a task after input was provided; \
+                let error = self.task_json_rpc_error(
+                    TaskOperation::Resume,
+                    Some(task_id),
+                    TaskFailure::Internal(
+                        "this task store cannot resume a task after input was provided; \
                      implement TaskStore::resume_context to support handlers that ask \
                      for input",
+                    ),
                 );
-                if let Err(e) = self.inner.task_store.fail_task(task_id, error).await {
-                    tracing::warn!(task_id = %task_id, error = %e, "failed to record task failure");
-                }
+                self.record_task_failure(task_id, error).await;
                 self.notify_task_state(task_id).await;
                 return;
             }
-            Err(e) => {
-                tracing::warn!(task_id = %task_id, error = %e, "failed to read resume context");
+            Err(error) => {
+                tracing::warn!(task_id = %task_id, "failed to read resume context");
+                let error = self.task_json_rpc_error(
+                    TaskOperation::Resume,
+                    Some(task_id),
+                    TaskFailure::Store(error),
+                );
+                self.record_task_failure(task_id, error).await;
+                self.notify_task_state(task_id).await;
                 return;
             }
         };
@@ -359,13 +539,19 @@ impl McpRouter {
                 .and_then(|d| d.get(&resume.tool_name))
         });
         let Some(tool) = tool else {
-            let error = JsonRpcError::internal_error(format!(
-                "tool '{}' is no longer registered, so the task cannot resume",
-                resume.tool_name
-            ));
-            if let Err(e) = self.inner.task_store.fail_task(task_id, error).await {
-                tracing::warn!(task_id = %task_id, error = %e, "failed to record task failure");
-            }
+            tracing::warn!(
+                task_id = %task_id,
+                tool = %resume.tool_name,
+                "task cannot resume because its tool is no longer registered"
+            );
+            let error = self.task_json_rpc_error(
+                TaskOperation::Resume,
+                Some(task_id),
+                TaskFailure::Internal(
+                    "the task cannot resume because its tool is no longer registered",
+                ),
+            );
+            self.record_task_failure(task_id, error).await;
             self.notify_task_state(task_id).await;
             return;
         };
@@ -386,7 +572,6 @@ impl McpRouter {
 
         let task_id = task_id.to_string();
         let notifier = self.clone();
-        let task_store = self.inner.task_store.clone();
         tokio::spawn(async move {
             let outcome = notifier
                 .invoke_tool(&tool, ctx, resume.arguments, &resume.tool_name)
@@ -402,9 +587,7 @@ impl McpRouter {
                 Err(error) => CallToolResult::error(error.to_string()),
             };
 
-            if let Err(e) = task_store.complete_task(&task_id, result).await {
-                tracing::warn!(task_id = %task_id, error = %e, "failed to record task completion");
-            }
+            notifier.complete_task_or_fail(&task_id, result).await;
             notifier.notify_task_state(&task_id).await;
         });
     }
@@ -423,7 +606,15 @@ impl McpRouter {
         }
 
         let (detailed, meta) = match self.detailed_task(task_id).await {
-            Ok(detailed) => detailed,
+            Ok(Some(detailed)) => detailed,
+            Ok(None) => {
+                tracing::debug!(
+                    target: "mcp::tasks",
+                    task_id = %task_id,
+                    "skipping task notification: task state no longer exists"
+                );
+                return;
+            }
             Err(error) => {
                 tracing::debug!(
                     target: "mcp::tasks",
@@ -468,13 +659,6 @@ impl McpRouter {
 // of `router.rs`, above the type they serve, rather than beside the group that
 // uses them (#1256).
 
-pub(super) fn task_store_error(e: TaskStoreError) -> Error {
-    Error::JsonRpc(JsonRpcError::internal_error(format!(
-        "Task store error: {}",
-        e
-    )))
-}
-
 pub(super) async fn discard_unprepared_task(store: &Arc<dyn TaskStore>, task_id: &str) {
     if !matches!(store.discard_task(task_id).await, Ok(true)) {
         let _ = store
@@ -503,43 +687,29 @@ pub(super) fn client_declares_tasks(_extensions: &crate::context::Extensions) ->
 
 /// Decode the wire `inputResponses` map into typed responses.
 ///
-/// A key whose value does not match any known response shape is dropped here
-/// rather than failing the request: the store treats an unmatched key as
-/// ignorable, and SEP-2663 requires ignoring responses that do not correspond
-/// to an outstanding request.
+/// Unknown, already-answered, and superseded keys remain the store's
+/// idempotency concern. A value that is not any valid protocol response shape
+/// is malformed input, however, and rejects the complete request instead of
+/// being silently reclassified as an unknown key.
 pub(super) fn decode_input_responses(
+    router: &McpRouter,
+    task_id: &str,
     responses: &std::collections::HashMap<String, serde_json::Value>,
-) -> crate::protocol::InputResponses {
+) -> Result<crate::protocol::InputResponses> {
     responses
         .iter()
-        .filter_map(|(key, value)| {
+        .map(|(key, value)| {
             serde_json::from_value(value.clone())
-                .ok()
                 .map(|response| (key.clone(), response))
+                .map_err(|_| {
+                    router.task_error(
+                        TaskOperation::Update,
+                        Some(task_id),
+                        TaskFailure::InvalidArguments("inputResponses contains a malformed value"),
+                    )
+                })
         })
         .collect()
-}
-
-/// Error for a task the server cannot serve.
-///
-/// Unknown and expired tasks are deliberately indistinguishable, so a caller
-/// cannot probe for the existence of a task whose retention window closed.
-/// The error an owner gets for a task the store still holds but whose TTL
-/// elapsed.
-///
-/// Deliberately distinct from [`unknown_task_error`] in its `data`, and
-/// deliberately only ever produced after the caller has been shown to own the
-/// task. A caller who does not own it gets `unknown_task_error`, which is
-/// also what a genuinely unknown id gets, so the two cannot be told apart
-/// from outside (#1249).
-fn expired_task_error(task_id: &str) -> JsonRpcError {
-    let mut error = JsonRpcError::invalid_params(format!("Task expired: {task_id}"));
-    error.data = Some(serde_json::json!({ "reason": "task_expired" }));
-    error
-}
-
-fn unknown_task_error(task_id: &str) -> JsonRpcError {
-    JsonRpcError::invalid_params(format!("Task not found: {task_id}"))
 }
 
 /// The client capability shape a server names in a `-32021` when it cannot

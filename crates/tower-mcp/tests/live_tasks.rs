@@ -21,8 +21,8 @@ use tower_mcp::protocol::{
 };
 use tower_mcp::schemars::JsonSchema;
 use tower_mcp::{
-    CallToolResult, McpRouter, PanicPolicy, ProtocolSupport, RequestContext, TaskContext,
-    TaskOutcome, Tool, ToolBuilder,
+    CallToolResult, Error, JsonRpcError, McpRouter, PanicPolicy, ProtocolSupport, RequestContext,
+    TaskContext, TaskErrorPolicy, TaskFailure, TaskOperation, TaskOutcome, Tool, ToolBuilder,
 };
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -594,6 +594,47 @@ async fn a_panicking_live_handler_uses_the_redacted_policy() {
         .task
         .task_id;
     await_status(&store, &next, TaskStatus::Completed).await;
+}
+
+/// Unclassified handler errors can contain provider details in their Display
+/// text. They reach the Task policy by kind, without exposing that text.
+#[tokio::test]
+async fn a_live_handler_error_flows_through_the_task_policy() {
+    const SECRET: &str = "provider stderr: token=private";
+    let broken = ToolBuilder::new("broken")
+        .description("Returns an unclassified error")
+        .live_task_handler(|_task: TaskContext, _input: NoArgs| async move {
+            Err::<TaskOutcome, _>(Error::tool(SECRET))
+        })
+        .build();
+    let store = Arc::new(MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .task_store(store.clone())
+        .tool(broken)
+        .with_tasks()
+        .task_error_policy(TaskErrorPolicy::new(|context| {
+            assert_eq!(context.operation(), TaskOperation::Execute);
+            assert!(matches!(context.failure(), TaskFailure::Handler));
+            JsonRpcError::internal_error("mapped handler failure")
+                .with_data(json!({"kind": "internal", "phase": "provider_execution"}))
+        }));
+    let client = McpClient::connect(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+
+    let task_id = client
+        .call_tool_as_task("broken", json!({}), None)
+        .await
+        .expect("task created")
+        .task
+        .task_id;
+    await_status(&store, &task_id, TaskStatus::Failed).await;
+    let (_, _, error) = store.get_task_result(&task_id).await.unwrap().unwrap();
+    let error = error.expect("a failed task carries a structured error");
+    assert_eq!(error.message, "mapped handler failure");
+    assert!(!format!("{error:?}").contains(SECRET));
+    assert_eq!(error.data.as_ref().unwrap()["phase"], "provider_execution");
 }
 
 /// The registry entry must be released however the handler leaves, so a later

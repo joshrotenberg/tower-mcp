@@ -58,7 +58,6 @@ fn encode_cursor(offset: usize) -> String {
     BASE64.encode(offset.to_string())
 }
 
-/// Map a [`TaskStoreError`] to a JSON-RPC internal error.
 /// Releases a live task's registry entry however its handler leaves.
 ///
 /// The handler can return, panic, or be dropped. Unregistering only on the
@@ -261,6 +260,227 @@ impl PanicPolicy {
 
     fn needs_payload(&self) -> bool {
         matches!(self.client_message, ClientPanicMessage::Detailed) || self.include_payload_in_logs
+    }
+}
+
+/// The Task operation whose failure is being exposed to a client.
+///
+/// A [`TaskErrorPolicy`] receives this alongside the typed failure so an
+/// application can attach stable operation-specific data without parsing an
+/// error message.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum TaskOperation {
+    /// Creating and preparing a Task from a task-augmented request.
+    Create,
+    /// Reading a Task through `tasks/get`.
+    Get,
+    /// Applying client input through `tasks/update`.
+    Update,
+    /// Requesting cancellation through `tasks/cancel`.
+    Cancel,
+    /// Persisting an input-required transition requested by a Task handler.
+    ParkInput,
+    /// Task-store work performed inside a live Task handler after creation.
+    Execute,
+    /// Reading durable state needed to resume a replayed Task handler.
+    Resume,
+    /// Persisting a terminal Task outcome after handler execution.
+    Finalize,
+}
+
+/// The typed reason a Task operation failed.
+///
+/// Store errors retain their original typed value for an explicitly installed
+/// [`TaskErrorPolicy`]. Their display text may contain backend paths, queries,
+/// or codec details and must not be copied into a client response without an
+/// application-specific disclosure review. Tower's default policy never does
+/// so.
+#[non_exhaustive]
+pub enum TaskFailure {
+    /// The Task ID is unknown or its retained tombstone was removed.
+    NotFound,
+    /// The Task is known to have expired and the caller owns it.
+    Expired,
+    /// The Task store returned an error.
+    Store(TaskStoreError),
+    /// Tower detected a safe, static Task-lifecycle invariant failure.
+    Internal(&'static str),
+    /// Client-supplied Task arguments were malformed.
+    InvalidArguments(&'static str),
+    /// A live Task handler returned an unclassified execution error.
+    ///
+    /// The underlying error is deliberately neither logged nor exposed to the
+    /// policy: its display text is application-owned and can contain provider
+    /// details.
+    Handler,
+}
+
+impl std::fmt::Debug for TaskFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => f.write_str("NotFound"),
+            Self::Expired => f.write_str("Expired"),
+            Self::Store(error) => {
+                let kind = match error {
+                    TaskStoreError::Encode(_) => "Encode",
+                    TaskStoreError::Decode(_) => "Decode",
+                    TaskStoreError::Backend(_) => "Backend",
+                    TaskStoreError::InvalidTransition(_) => "InvalidTransition",
+                };
+                write!(f, "Store({kind})")
+            }
+            Self::Internal(message) => f.debug_tuple("Internal").field(message).finish(),
+            Self::InvalidArguments(message) => {
+                f.debug_tuple("InvalidArguments").field(message).finish()
+            }
+            Self::Handler => f.write_str("Handler"),
+        }
+    }
+}
+
+/// Typed input to a [`TaskErrorPolicy`].
+///
+/// The fields are intentionally private so Tower can add context without
+/// breaking policy implementations. Inspect them through the accessors.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct TaskErrorContext {
+    operation: TaskOperation,
+    task_id: Option<String>,
+    failure: TaskFailure,
+}
+
+impl TaskErrorContext {
+    fn new(operation: TaskOperation, task_id: Option<&str>, failure: TaskFailure) -> Self {
+        Self {
+            operation,
+            task_id: task_id.map(str::to_owned),
+            failure,
+        }
+    }
+
+    /// The Task operation that failed.
+    pub const fn operation(&self) -> TaskOperation {
+        self.operation
+    }
+
+    /// The Task ID, when one had been allocated or supplied.
+    pub fn task_id(&self) -> Option<&str> {
+        self.task_id.as_deref()
+    }
+
+    /// The typed failure.
+    pub const fn failure(&self) -> &TaskFailure {
+        &self.failure
+    }
+}
+
+type TaskErrorMapper = dyn Fn(&TaskErrorContext) -> JsonRpcError + Send + Sync + 'static;
+
+/// Maps Task lifecycle failures to client-visible JSON-RPC errors.
+///
+/// The default preserves Tower's established `-32602` shapes for unknown and
+/// expired Tasks. Store failures use `-32603` with fixed text, deliberately
+/// omitting the store error's display string because it may disclose backend
+/// details.
+///
+/// A custom policy can attach an application's structured error envelope. It
+/// receives the original [`TaskStoreError`] by reference, so it must make its
+/// own explicit disclosure decision rather than forwarding `Display` text.
+#[derive(Clone)]
+pub struct TaskErrorPolicy {
+    mapper: Arc<TaskErrorMapper>,
+}
+
+impl std::fmt::Debug for TaskErrorPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskErrorPolicy").finish_non_exhaustive()
+    }
+}
+
+impl Default for TaskErrorPolicy {
+    fn default() -> Self {
+        Self::new(default_task_error)
+    }
+}
+
+impl TaskErrorPolicy {
+    /// Construct a Task error policy from a synchronous mapper.
+    ///
+    /// The mapper runs only after Tower has authorized any distinction between
+    /// an expired Task and a missing one. An unauthorized Task is passed to the
+    /// mapper as [`TaskFailure::NotFound`], exactly like a never-issued ID. It
+    /// runs synchronously on the request or handler path, so it should be fast.
+    /// Tower catches a panic and substitutes a fixed redacted internal error.
+    /// Rust's process-global panic hook still runs before the unwind is caught.
+    pub fn new<F>(mapper: F) -> Self
+    where
+        F: Fn(&TaskErrorContext) -> JsonRpcError + Send + Sync + 'static,
+    {
+        Self {
+            mapper: Arc::new(mapper),
+        }
+    }
+
+    fn map(&self, context: &TaskErrorContext) -> JsonRpcError {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.mapper)(context))) {
+            Ok(error) => error,
+            Err(_) => {
+                // The policy itself is application code. Record that it broke,
+                // but do not attach the Task ID, failure, or panic payload:
+                // this is the final redaction boundary.
+                tracing::error!(
+                    target: "mcp::tasks",
+                    "task error policy panicked; using the redacted fallback"
+                );
+                JsonRpcError::internal_error("Task error policy failed")
+            }
+        }
+    }
+
+    pub(crate) fn map_store_error(
+        &self,
+        operation: TaskOperation,
+        task_id: &str,
+        error: TaskStoreError,
+    ) -> JsonRpcError {
+        self.map(&TaskErrorContext::new(
+            operation,
+            Some(task_id),
+            TaskFailure::Store(error),
+        ))
+    }
+
+    pub(crate) fn map_internal_error(
+        &self,
+        operation: TaskOperation,
+        task_id: &str,
+        message: &'static str,
+    ) -> JsonRpcError {
+        self.map(&TaskErrorContext::new(
+            operation,
+            Some(task_id),
+            TaskFailure::Internal(message),
+        ))
+    }
+}
+
+fn default_task_error(context: &TaskErrorContext) -> JsonRpcError {
+    match context.failure() {
+        TaskFailure::NotFound => JsonRpcError::invalid_params(format!(
+            "Task not found: {}",
+            context.task_id().unwrap_or("<unknown>")
+        )),
+        TaskFailure::Expired => JsonRpcError::invalid_params(format!(
+            "Task expired: {}",
+            context.task_id().unwrap_or("<unknown>")
+        ))
+        .with_data(serde_json::json!({ "reason": "task_expired" })),
+        TaskFailure::Store(_) => JsonRpcError::internal_error("Task store operation failed"),
+        TaskFailure::Internal(message) => JsonRpcError::internal_error(*message),
+        TaskFailure::InvalidArguments(message) => JsonRpcError::invalid_params(*message),
+        TaskFailure::Handler => JsonRpcError::internal_error("Task handler failed"),
     }
 }
 
@@ -534,6 +754,8 @@ struct McpRouterInner {
     /// How to convert a panicking tool handler into an error result rather
     /// than letting it unwind out of the service (#1230, #1306).
     panic_policy: Option<PanicPolicy>,
+    /// Root-owned mapping for client-visible Task lifecycle failures.
+    task_error_policy: TaskErrorPolicy,
     auto_instructions: Option<AutoInstructionsConfig>,
     tools: HashMap<String, Arc<Tool>>,
     resources: HashMap<String, Arc<Resource>>,
@@ -727,6 +949,7 @@ impl McpRouter {
                 server_website_url: None,
                 instructions: None,
                 panic_policy: None,
+                task_error_policy: TaskErrorPolicy::default(),
                 auto_instructions: None,
                 tools: HashMap::new(),
                 resources: HashMap::new(),
@@ -844,6 +1067,23 @@ impl McpRouter {
     /// ```
     pub fn task_store(mut self, store: Arc<dyn TaskStore>) -> Self {
         Arc::make_mut(&mut self.inner).task_store = store;
+        self
+    }
+
+    /// Set the root router's client-visible Task error policy.
+    ///
+    /// The policy applies to task creation, `tasks/get`, `tasks/update`,
+    /// `tasks/cancel`, and failures while parking, executing, resuming, or
+    /// finalizing a handler. Like [`McpRouter::catch_panics_with`], it is root
+    /// configuration: merging or nesting another router imports that router's
+    /// capabilities but not its policy, so the receiving router governs the
+    /// combined catalog.
+    ///
+    /// Tower's default preserves the established missing/expired response
+    /// shapes and redacts every [`TaskStoreError`] to a fixed internal error.
+    #[must_use]
+    pub fn task_error_policy(mut self, policy: TaskErrorPolicy) -> Self {
+        Arc::make_mut(&mut self.inner).task_error_policy = policy;
         self
     }
 
@@ -2980,7 +3220,9 @@ impl McpRouter {
                             request_principal(&extensions),
                         )
                         .await
-                        .map_err(task_store_error)?;
+                        .map_err(|error| {
+                            self.task_store_error(TaskOperation::Create, None, error)
+                        })?;
 
                     tracing::info!(task_id = %task_id, tool = %params.name, "Created async task");
 
@@ -3018,14 +3260,22 @@ impl McpRouter {
                             Ok(persisted) => persisted,
                             Err(error) => {
                                 discard_unprepared_task(&task_store, &task_id).await;
-                                return Err(task_store_error(error));
+                                return Err(self.task_store_error(
+                                    TaskOperation::Create,
+                                    Some(&task_id),
+                                    error,
+                                ));
                             }
                         };
                         if !persisted {
                             discard_unprepared_task(&task_store, &task_id).await;
-                            return Err(Error::JsonRpc(JsonRpcError::internal_error(
-                                "Task store could not persist preparation metadata",
-                            )));
+                            return Err(self.task_error(
+                                TaskOperation::Create,
+                                Some(&task_id),
+                                TaskFailure::Internal(
+                                    "Task store could not persist preparation metadata",
+                                ),
+                            ));
                         }
                     }
                     ctx.extensions_mut().merge(&preparation.extensions);
@@ -3045,6 +3295,7 @@ impl McpRouter {
                         if let Some(live_handler) = tool.live_handler.clone() {
                             let handle = std::sync::Arc::new(crate::tool::LiveTask {
                                 store: task_store.clone(),
+                                error_policy: notifier.inner.task_error_policy.clone(),
                                 input_ready: tokio::sync::Notify::new(),
                                 cancelled: crate::context::CancellationToken::new(),
                             });
@@ -3110,37 +3361,49 @@ impl McpRouter {
                             let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
                             let applied = match outcome {
-                                Ok(crate::tool::TaskOutcome::Completed(result)) => task_store
-                                    .complete_task(&task_id_clone, result)
+                                Ok(crate::tool::TaskOutcome::Completed(result)) => notifier
+                                    .complete_task_or_fail(&task_id_clone, result)
                                     .await
-                                    .map(|_| "completed"),
-                                Ok(crate::tool::TaskOutcome::Failed(error)) => task_store
-                                    .fail_task(&task_id_clone, error)
+                                    .then_some("completed"),
+                                Ok(crate::tool::TaskOutcome::Failed(error)) => notifier
+                                    .record_task_failure(&task_id_clone, error)
                                     .await
-                                    .map(|_| "failed"),
-                                Ok(crate::tool::TaskOutcome::Cancelled { message }) => task_store
-                                    .cancel_task(&task_id_clone, message.as_deref())
+                                    .then_some("failed"),
+                                Ok(crate::tool::TaskOutcome::Cancelled { message }) => notifier
+                                    .record_task_cancellation(&task_id_clone, message.as_deref())
                                     .await
-                                    .map(|_| "cancelled"),
+                                    .then_some("cancelled"),
                                 // Propagating the cancellation error is the
                                 // ordinary way a live handler unwinds, so it
                                 // ends the task cancelled rather than failed.
-                                Err(crate::error::Error::TaskCancelled) => task_store
-                                    .cancel_task(
+                                Err(crate::error::Error::TaskCancelled) => notifier
+                                    .record_task_cancellation(
                                         &task_id_clone,
                                         Some("handler observed cancellation"),
                                     )
                                     .await
-                                    .map(|_| "cancelled"),
+                                    .then_some("cancelled"),
                                 // An unclassified error is an execution
                                 // failure the handler declined to describe.
-                                Err(error) => task_store
-                                    .fail_task(
-                                        &task_id_clone,
-                                        JsonRpcError::internal_error(error.to_string()),
-                                    )
+                                Err(Error::JsonRpc(error)) => notifier
+                                    .record_task_failure(&task_id_clone, error)
                                     .await
-                                    .map(|_| "failed"),
+                                    .then_some("failed"),
+                                Err(_error) => {
+                                    tracing::warn!(
+                                        task_id = %task_id_clone,
+                                        "live task handler returned an unclassified error"
+                                    );
+                                    let error = notifier.task_json_rpc_error(
+                                        TaskOperation::Execute,
+                                        Some(&task_id_clone),
+                                        TaskFailure::Handler,
+                                    );
+                                    notifier
+                                        .record_task_failure(&task_id_clone, error)
+                                        .await
+                                        .then_some("failed")
+                                }
                             };
                             // The terminal write must win before unregistering
                             // (#1294), but the dead handle must not remain
@@ -3151,7 +3414,7 @@ impl McpRouter {
                             drop(registration);
 
                             match applied {
-                                Ok(status) => tracing::info!(
+                                Some(status) => tracing::info!(
                                     target: "mcp::tools",
                                     tool = %tool_name,
                                     task_id = %task_id_clone,
@@ -3159,9 +3422,8 @@ impl McpRouter {
                                     status,
                                     "live task finished"
                                 ),
-                                Err(e) => tracing::warn!(
+                                None => tracing::warn!(
                                     task_id = %task_id_clone,
-                                    error = %e,
                                     "failed to record live task outcome"
                                 ),
                             }
@@ -3215,18 +3477,17 @@ impl McpRouter {
                                 .is_error
                                 .then(|| result.first_text().unwrap_or("Tool execution failed"))
                                 .map(str::to_string);
-                            if let Err(e) = task_store.complete_task(&task_id_clone, result).await {
-                                tracing::warn!(task_id = %task_id_clone, error = %e, "failed to record task completion");
+                            if notifier.complete_task_or_fail(&task_id_clone, result).await {
+                                tracing::info!(
+                                    target: "mcp::tools",
+                                    tool = %tool_name,
+                                    task_id = %task_id_clone,
+                                    duration_ms,
+                                    status,
+                                    error = error_msg.as_deref().unwrap_or_default(),
+                                    "tool call completed"
+                                );
                             }
-                            tracing::info!(
-                                target: "mcp::tools",
-                                tool = %tool_name,
-                                task_id = %task_id_clone,
-                                duration_ms,
-                                status,
-                                error = error_msg.as_deref().unwrap_or_default(),
-                                "tool call completed"
-                            );
                             notifier.notify_task_state(&task_id_clone).await;
                         }
                     });
@@ -3236,11 +3497,15 @@ impl McpRouter {
                         .task_store
                         .get_task(&task_id)
                         .await
-                        .map_err(task_store_error)?
+                        .map_err(|error| {
+                            self.task_store_error(TaskOperation::Create, Some(&task_id), error)
+                        })?
                         .ok_or_else(|| {
-                            Error::JsonRpc(JsonRpcError::internal_error(
-                                "Failed to retrieve created task",
-                            ))
+                            self.task_error(
+                                TaskOperation::Create,
+                                Some(&task_id),
+                                TaskFailure::Internal("Failed to retrieve created task"),
+                            )
                         })?;
 
                     // The final wire is flat with `resultType: "task"`; the
@@ -3776,10 +4041,12 @@ impl McpRouter {
             McpRequest::GetTaskInfo(params) => {
                 if is_final_protocol_request(&extensions) {
                     self.require_negotiated_tasks(&extensions, "tasks/get")?;
-                    self.authorize_task(&params.task_id, &extensions).await?;
-                    return self.final_get_task(&params.task_id).await;
+                    self.authorize_task(TaskOperation::Get, &params.task_id, &extensions)
+                        .await?;
+                    return self.final_get_task(&params.task_id, &extensions).await;
                 }
-                self.authorize_task(&params.task_id, &extensions).await?;
+                self.authorize_task(TaskOperation::Get, &params.task_id, &extensions)
+                    .await?;
 
                 // SEP-2663 DetailedTask: `tasks/get` carries the
                 // status-discriminated payload inline. `completed` includes
@@ -3792,12 +4059,14 @@ impl McpRouter {
                     .task_store
                     .get_task_result(&params.task_id)
                     .await
-                    .map_err(task_store_error)?
+                    .map_err(|error| {
+                        self.task_store_error(TaskOperation::Get, Some(&params.task_id), error)
+                    })?
                 else {
                     // Present when it was authorized, absent now, so it
                     // expired in between (#1249).
                     return Err(self
-                        .classify_absent_task(&params.task_id, &extensions)
+                        .classify_absent_task(TaskOperation::Get, &params.task_id, &extensions)
                         .await);
                 };
 
@@ -3820,7 +4089,8 @@ impl McpRouter {
             McpRequest::UpdateTask(params) => {
                 if is_final_protocol_request(&extensions) {
                     self.require_negotiated_tasks(&extensions, "tasks/update")?;
-                    self.authorize_task(&params.task_id, &extensions).await?;
+                    self.authorize_task(TaskOperation::Update, &params.task_id, &extensions)
+                        .await?;
                     // Partial responses are the normal case: the store
                     // consumes what matches an outstanding request and ignores
                     // unknown, already-answered, and superseded keys.
@@ -3829,28 +4099,34 @@ impl McpRouter {
                         .task_store
                         .apply_input_responses(
                             &params.task_id,
-                            decode_input_responses(&params.input_responses),
+                            decode_input_responses(self, &params.task_id, &params.input_responses)?,
                         )
                         .await
-                        .map_err(task_store_error)?
+                        .map_err(|error| {
+                            self.task_store_error(
+                                TaskOperation::Update,
+                                Some(&params.task_id),
+                                error,
+                            )
+                        })?
                     else {
                         // Nothing left to apply. A task the store still knows
                         // and has not expired is a late or duplicate update,
                         // so it gets the ordinary empty acknowledgement, which
                         // makes a client retry idempotent (#1249).
-                        return match self
-                            .inner
-                            .task_store
-                            .task_presence(&params.task_id)
-                            .await
-                            .map_err(task_store_error)?
-                        {
+                        let presence = self
+                            .task_presence(TaskOperation::Update, &params.task_id)
+                            .await?;
+                        return match presence {
                             crate::async_task::TaskPresence::Present { .. } => Ok(
                                 McpResponse::FinalTaskAck(crate::tasks::TaskAcknowledgement::new()),
                             ),
-                            _ => Err(self
-                                .classify_absent_task(&params.task_id, &extensions)
-                                .await),
+                            absent => Err(self.classify_absent_presence(
+                                TaskOperation::Update,
+                                &params.task_id,
+                                &extensions,
+                                absent,
+                            )),
                         };
                     };
                     // Answering the last outstanding request resumes the task,
@@ -3883,7 +4159,8 @@ impl McpRouter {
                     ));
                 }
 
-                self.authorize_task(&params.task_id, &extensions).await?;
+                self.authorize_task(TaskOperation::Update, &params.task_id, &extensions)
+                    .await?;
 
                 // Input responses reach the store on this path exactly as they
                 // do on the final path above. The spec allowance for ignoring
@@ -3896,28 +4173,30 @@ impl McpRouter {
                     .task_store
                     .apply_input_responses(
                         &params.task_id,
-                        decode_input_responses(&params.input_responses),
+                        decode_input_responses(self, &params.task_id, &params.input_responses)?,
                     )
                     .await
-                    .map_err(task_store_error)?
+                    .map_err(|error| {
+                        self.task_store_error(TaskOperation::Update, Some(&params.task_id), error)
+                    })?
                 else {
                     // Nothing left to apply. A task the store still knows and
                     // has not expired is a late or duplicate update, so it
                     // gets the ordinary empty acknowledgement, which makes a
                     // client retry idempotent rather than a not-found (#1249).
-                    return match self
-                        .inner
-                        .task_store
-                        .task_presence(&params.task_id)
-                        .await
-                        .map_err(task_store_error)?
-                    {
+                    let presence = self
+                        .task_presence(TaskOperation::Update, &params.task_id)
+                        .await?;
+                    return match presence {
                         crate::async_task::TaskPresence::Present { .. } => {
                             Ok(McpResponse::UpdateTask(EmptyResult {}))
                         }
-                        _ => Err(self
-                            .classify_absent_task(&params.task_id, &extensions)
-                            .await),
+                        absent => Err(self.classify_absent_presence(
+                            TaskOperation::Update,
+                            &params.task_id,
+                            &extensions,
+                            absent,
+                        )),
                     };
                 };
                 // A final-protocol subscriber watching this task should see it
@@ -3938,7 +4217,8 @@ impl McpRouter {
             McpRequest::CancelTask(params) => {
                 if is_final_protocol_request(&extensions) {
                     self.require_negotiated_tasks(&extensions, "tasks/cancel")?;
-                    self.authorize_task(&params.task_id, &extensions).await?;
+                    self.authorize_task(TaskOperation::Cancel, &params.task_id, &extensions)
+                        .await?;
                     // A live task is signalled and left non-terminal: its
                     // handler owns the teardown and reports when it actually
                     // stopped, so completion can still legitimately win the
@@ -3958,10 +4238,20 @@ impl McpRouter {
                         .task_store
                         .cancel_task(&params.task_id, params.reason.as_deref())
                         .await
-                        .map_err(task_store_error)?;
+                        .map_err(|error| {
+                            self.task_store_error(
+                                TaskOperation::Cancel,
+                                Some(&params.task_id),
+                                error,
+                            )
+                        })?;
                     if cancelled.is_none() {
                         return Err(self
-                            .classify_absent_task(&params.task_id, &extensions)
+                            .classify_absent_task(
+                                TaskOperation::Cancel,
+                                &params.task_id,
+                                &extensions,
+                            )
                             .await);
                     }
                     self.notify_task_state(&params.task_id).await;
@@ -3970,7 +4260,8 @@ impl McpRouter {
                     ));
                 }
 
-                self.authorize_task(&params.task_id, &extensions).await?;
+                self.authorize_task(TaskOperation::Cancel, &params.task_id, &extensions)
+                    .await?;
 
                 // Same reasoning as the final path: a live task owns its own
                 // teardown, so it is signalled and left non-terminal (#1246).
@@ -3985,10 +4276,12 @@ impl McpRouter {
                     .task_store
                     .get_task(&params.task_id)
                     .await
-                    .map_err(task_store_error)?
+                    .map_err(|error| {
+                        self.task_store_error(TaskOperation::Cancel, Some(&params.task_id), error)
+                    })?
                 else {
                     return Err(self
-                        .classify_absent_task(&params.task_id, &extensions)
+                        .classify_absent_task(TaskOperation::Cancel, &params.task_id, &extensions)
                         .await);
                 };
 
@@ -4004,10 +4297,12 @@ impl McpRouter {
                     .task_store
                     .cancel_task(&params.task_id, params.reason.as_deref())
                     .await
-                    .map_err(task_store_error)?;
+                    .map_err(|error| {
+                        self.task_store_error(TaskOperation::Cancel, Some(&params.task_id), error)
+                    })?;
                 if cancelled.is_none() {
                     return Err(self
-                        .classify_absent_task(&params.task_id, &extensions)
+                        .classify_absent_task(TaskOperation::Cancel, &params.task_id, &extensions)
                         .await);
                 }
 
@@ -4447,7 +4742,7 @@ mod notify;
 mod task_ops;
 
 use task_ops::{
-    client_declares_tasks, decode_input_responses, discard_unprepared_task, task_store_error,
+    client_declares_tasks, decode_input_responses, discard_unprepared_task,
     tasks_client_capabilities,
 };
 // Gated in `task_ops` too, so importing it unconditionally breaks the default
@@ -4457,6 +4752,9 @@ use task_ops::validate_input_required_result;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "stateless"))]
+mod task_error_tests;
 
 #[cfg(test)]
 mod cursor_property_tests;

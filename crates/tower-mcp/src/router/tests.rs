@@ -2295,9 +2295,10 @@ async fn reusing_a_spent_input_key_fails_the_task_instead_of_stranding_it() {
         }
     }
     let error = failed.expect("the task must fail rather than strand");
+    assert_eq!(error.message, "Task store operation failed");
     assert!(
-        error.message.contains("decision"),
-        "the failure must name the offending key: {}",
+        !error.message.contains("decision"),
+        "store transition details must be redacted: {}",
         error.message
     );
 }
@@ -2604,6 +2605,45 @@ async fn stable_task_update_ignores_unmatched_keys() {
     match unknown.inner {
         Err(error) => assert_eq!(error.code, -32602),
         other => panic!("expected -32602 for an unknown task, got {other:?}"),
+    }
+}
+
+/// Unknown keys are idempotently ignored only when their values are valid
+/// protocol responses. A malformed value is Invalid Params even when the key
+/// does not match an outstanding request.
+#[tokio::test]
+async fn task_update_rejects_malformed_response_values() {
+    use crate::async_task::{MemoryTaskStore, TaskStore};
+
+    let store = std::sync::Arc::new(MemoryTaskStore::new());
+    let mut router = McpRouter::new().task_store(store.clone());
+    init_router(&mut router).await;
+
+    let (task_id, _cancel) = store
+        .create_task("noop", serde_json::json!({}), None, None)
+        .await
+        .expect("create task");
+    let response = router
+        .ready()
+        .await
+        .unwrap()
+        .call(RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::UpdateTask(UpdateTaskParams {
+                task_id,
+                input_responses: [("never-issued".to_string(), serde_json::json!(42))]
+                    .into_iter()
+                    .collect(),
+                meta: None,
+            }),
+            extensions: Extensions::new(),
+        })
+        .await
+        .unwrap();
+
+    match response.inner {
+        Err(error) => assert_eq!(error.code, -32602),
+        other => panic!("expected -32602 for malformed inputResponses, got {other:?}"),
     }
 }
 

@@ -9,6 +9,201 @@ use crate::protocol::Content;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+#[derive(Default)]
+struct TerminalStatusStore {
+    outstanding: Option<InputRequests>,
+}
+
+#[async_trait::async_trait]
+impl crate::async_task::TaskStore for TerminalStatusStore {
+    async fn create_task(
+        &self,
+        _tool_name: &str,
+        _arguments: serde_json::Value,
+        _ttl: Option<u64>,
+        _owner: crate::async_task::TaskOwner,
+    ) -> crate::async_task::Result<(String, crate::async_task::CancellationToken)> {
+        unimplemented!("not used by this focused status test")
+    }
+
+    async fn task_owner(
+        &self,
+        _task_id: &str,
+    ) -> crate::async_task::Result<Option<crate::async_task::TaskOwner>> {
+        Ok(Some(None))
+    }
+
+    async fn get_task(
+        &self,
+        _task_id: &str,
+    ) -> crate::async_task::Result<Option<crate::protocol::TaskObject>> {
+        Ok(None)
+    }
+
+    async fn get_task_result(
+        &self,
+        _task_id: &str,
+    ) -> crate::async_task::Result<Option<crate::async_task::TaskSnapshot>> {
+        Ok(None)
+    }
+
+    async fn wait_for_completion(
+        &self,
+        _task_id: &str,
+    ) -> crate::async_task::Result<Option<crate::async_task::TaskSnapshot>> {
+        Ok(None)
+    }
+
+    async fn list_tasks(
+        &self,
+        _status_filter: Option<TaskStatus>,
+    ) -> crate::async_task::Result<Vec<crate::protocol::TaskObject>> {
+        Ok(Vec::new())
+    }
+
+    async fn require_input(
+        &self,
+        _task_id: &str,
+        _requests: InputRequests,
+        _message: Option<&str>,
+    ) -> crate::async_task::Result<bool> {
+        Ok(false)
+    }
+
+    async fn outstanding_input_requests(
+        &self,
+        _task_id: &str,
+    ) -> crate::async_task::Result<Option<InputRequests>> {
+        Ok(self.outstanding.clone())
+    }
+
+    async fn apply_input_responses(
+        &self,
+        _task_id: &str,
+        _responses: InputResponses,
+    ) -> crate::async_task::Result<Option<crate::async_task::AppliedInputResponses>> {
+        Ok(None)
+    }
+
+    async fn set_ttl(&self, _task_id: &str, _ttl_ms: u64) -> crate::async_task::Result<bool> {
+        Ok(false)
+    }
+
+    async fn set_status(
+        &self,
+        _task_id: &str,
+        _status: TaskStatus,
+        _message: Option<&str>,
+    ) -> crate::async_task::Result<bool> {
+        Ok(false)
+    }
+
+    async fn complete_task(
+        &self,
+        _task_id: &str,
+        _result: CallToolResult,
+    ) -> crate::async_task::Result<bool> {
+        Ok(false)
+    }
+
+    async fn fail_task(
+        &self,
+        _task_id: &str,
+        _error: crate::error::JsonRpcError,
+    ) -> crate::async_task::Result<bool> {
+        Ok(false)
+    }
+
+    async fn cancel_task(
+        &self,
+        _task_id: &str,
+        _reason: Option<&str>,
+    ) -> crate::async_task::Result<Option<crate::protocol::TaskObject>> {
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn live_working_reports_a_terminal_race_through_the_task_policy() {
+    let live = Arc::new(LiveTask {
+        store: Arc::new(TerminalStatusStore::default()),
+        error_policy: crate::router::TaskErrorPolicy::new(|context| {
+            assert_eq!(context.operation(), crate::router::TaskOperation::Execute);
+            assert!(matches!(
+                context.failure(),
+                crate::router::TaskFailure::Internal(_)
+            ));
+            crate::error::JsonRpcError::internal_error("mapped terminal race")
+        }),
+        input_ready: tokio::sync::Notify::new(),
+        cancelled: crate::context::CancellationToken::new(),
+    });
+    let context = TaskContext::with_live("task_terminal".into(), live);
+
+    let error = context
+        .working("resumed")
+        .await
+        .expect_err("a terminal Task cannot accept a progress update");
+    assert!(matches!(
+        error,
+        crate::error::Error::JsonRpc(error) if error.message == "mapped terminal race"
+    ));
+}
+
+fn mapped_live(store: TerminalStatusStore) -> Arc<LiveTask> {
+    Arc::new(LiveTask {
+        store: Arc::new(store),
+        error_policy: crate::router::TaskErrorPolicy::new(|context| {
+            assert_eq!(context.operation(), crate::router::TaskOperation::Execute);
+            assert!(matches!(
+                context.failure(),
+                crate::router::TaskFailure::Internal(_)
+            ));
+            crate::error::JsonRpcError::internal_error("mapped missing input state")
+        }),
+        input_ready: tokio::sync::Notify::new(),
+        cancelled: crate::context::CancellationToken::new(),
+    })
+}
+
+#[tokio::test]
+async fn pending_input_reports_a_disappeared_task_instead_of_empty_answers() {
+    let pending = PendingInput {
+        live: mapped_live(TerminalStatusStore::default()),
+        task_id: "task_missing".into(),
+        asked: vec!["approval".into()],
+    };
+
+    let error = pending
+        .wait()
+        .await
+        .expect_err("a missing outstanding-input snapshot must not resume the handler");
+    assert!(matches!(
+        error,
+        crate::error::Error::JsonRpc(error) if error.message == "mapped missing input state"
+    ));
+}
+
+#[tokio::test]
+async fn pending_input_reports_missing_responses_instead_of_empty_answers() {
+    let pending = PendingInput {
+        live: mapped_live(TerminalStatusStore {
+            outstanding: Some(InputRequests::default()),
+        }),
+        task_id: "task_missing".into(),
+        asked: vec!["approval".into()],
+    };
+
+    let error = pending
+        .wait()
+        .await
+        .expect_err("a missing response snapshot must not resume the handler");
+    assert!(matches!(
+        error,
+        crate::error::Error::JsonRpc(error) if error.message == "mapped missing input state"
+    ));
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 struct GreetInput {
     name: String,
