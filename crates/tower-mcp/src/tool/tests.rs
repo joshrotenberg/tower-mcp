@@ -31,6 +31,42 @@ async fn test_builder_tool() {
     assert!(!result.is_error);
 }
 
+#[tokio::test]
+async fn direct_call_to_live_only_tool_returns_an_error_without_running_it() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let tool = ToolBuilder::new("live_only")
+        .live_task_handler(move |_task: TaskContext, _input: NoParams| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(TaskOutcome::Completed(CallToolResult::text("unreachable"))) }
+        })
+        .build();
+
+    let error = tool
+        .call_outcome(serde_json::json!({}))
+        .await
+        .expect_err("a direct call cannot run a live-only handler");
+    let Error::Tool(error) = error else {
+        panic!("expected a tool error");
+    };
+    assert_eq!(
+        error.message,
+        "tool has no synchronous or MRTR handler; it can only be invoked as a task"
+    );
+
+    let result = tool.call(serde_json::json!({})).await;
+    assert!(result.is_error);
+    assert_eq!(
+        result.first_text(),
+        Some(
+            "Tool error: tool has no synchronous or MRTR handler; it can only be invoked as a task"
+        )
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
 #[cfg(feature = "stateless")]
 #[tokio::test]
 async fn test_mrtr_builder_preserves_input_required_outcome() {

@@ -1410,10 +1410,12 @@ impl Tool {
         if let Some(handler) = self.mrtr_handler.clone() {
             return Box::pin(async move { handler.call(ctx, args).await });
         }
-        let service = self
-            .service
-            .clone()
-            .expect("tool must have a complete or MRTR handler");
+        let Some(service) = self.service.clone() else {
+            let error = Error::tool(
+                "tool has no synchronous or MRTR handler; it can only be invoked as a task",
+            );
+            return Box::pin(async move { Err(error) });
+        };
         Box::pin(async move {
             let result = service.oneshot(ToolRequest::new(ctx, args)).await.unwrap();
             Ok(RequestOutcome::Complete(result))
