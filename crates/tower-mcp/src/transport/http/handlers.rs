@@ -58,11 +58,24 @@ pub(super) fn is_localhost_host(host: &str) -> bool {
     }
 
     let host_only = if host.starts_with('[') {
-        // Bracketed IPv6: [::1]:3000 -> ::1
-        host.split(']')
-            .next()
-            .unwrap_or(host)
-            .trim_start_matches('[')
+        // Bracketed IPv6: [::1]:3000 -> ::1. RFC 3986 permits nothing
+        // after the closing bracket but an optional ":port"; a missing
+        // closing bracket, or any other trailing content, makes the
+        // authority invalid and must be rejected rather than silently
+        // discarded (that was the bug: [::1]evil.com used to be read as
+        // just [::1]).
+        let Some(close) = host.find(']') else {
+            return false;
+        };
+        let after_bracket = &host[close + 1..];
+        let port_ok = after_bracket.is_empty()
+            || after_bracket
+                .strip_prefix(':')
+                .is_some_and(|port| !port.is_empty() && port.parse::<u16>().is_ok());
+        if !port_ok {
+            return false;
+        }
+        &host[1..close]
     } else {
         // Strip port if present
         host.split(':').next().unwrap_or(host)
