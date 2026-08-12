@@ -677,7 +677,7 @@ impl TaskContext {
     /// Request keys must be unique over the task's lifetime (SEP-2663), so
     /// reusing a spent key is an error rather than a fresh question.
     pub async fn require_input(&self, requests: InputRequests) -> Result<InputResponses> {
-        self.require_input_inner(requests, None).await
+        self.park_input(requests).await?.wait().await
     }
 
     /// [`require_input`](Self::require_input) with a status message for
@@ -687,15 +687,75 @@ impl TaskContext {
         requests: InputRequests,
         message: impl Into<String>,
     ) -> Result<InputResponses> {
-        self.require_input_inner(requests, Some(message.into()))
+        self.park_input_with_message(requests, message)
+            .await?
+            .wait()
             .await
     }
 
-    async fn require_input_inner(
+    /// Commit the request for input, and return without waiting for it.
+    ///
+    /// The first half of [`require_input`](Self::require_input), which is
+    /// exactly these two calls back to back:
+    ///
+    /// ```rust,no_run
+    /// # use tower_mcp::{InputRequests, InputResponses, TaskContext};
+    /// # async fn example(ctx: TaskContext, requests: InputRequests)
+    /// #     -> tower_mcp::Result<InputResponses> {
+    /// let pending = ctx.park_input(requests).await?;
+    /// // Whatever has to happen once the task is durably parked but before
+    /// // this handler suspends: release admission permits, drop a lock, hand
+    /// // a worker slot back to a scheduler.
+    /// let responses = pending.wait().await?;
+    /// # Ok(responses)
+    /// # }
+    /// ```
+    ///
+    /// The split exists because those two things are not the same moment. An
+    /// execution owner running under admission control has to release its
+    /// permits *after* the `input_required` state is durable and *before* it
+    /// suspends, and a single combined call gives it nowhere to stand
+    /// (#1246).
+    ///
+    /// # The gap is safe
+    ///
+    /// Arbitrary code runs between this returning and
+    /// [`PendingInput::wait`], including code that awaits. A response or a
+    /// cancellation arriving in that window is not lost:
+    ///
+    /// - `wait` reads outstanding requests from the store before it awaits
+    ///   anything, and the store is what `tasks/update` commits to. Answers
+    ///   that landed in the gap are already there.
+    /// - The wakeup is a [`tokio::sync::Notify`] signalled with `notify_one`,
+    ///   which stores a permit when nobody is waiting. A signal in the gap is
+    ///   held, not dropped.
+    /// - Cancellation is a flag rather than an event, so `wait` observes one
+    ///   that was set in the gap.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`require_input`](Self::require_input) for the commit half: a
+    /// replay handler, an empty request set, a task already cancelled, or a
+    /// store that refuses the transition.
+    pub async fn park_input(&self, requests: InputRequests) -> Result<PendingInput> {
+        self.park_input_inner(requests, None).await
+    }
+
+    /// [`park_input`](Self::park_input) with a status message for clients
+    /// polling the task.
+    pub async fn park_input_with_message(
+        &self,
+        requests: InputRequests,
+        message: impl Into<String>,
+    ) -> Result<PendingInput> {
+        self.park_input_inner(requests, Some(message.into())).await
+    }
+
+    async fn park_input_inner(
         &self,
         requests: InputRequests,
         message: Option<String>,
-    ) -> Result<InputResponses> {
+    ) -> Result<PendingInput> {
         let live = self.live.as_ref().ok_or_else(|| {
             crate::error::Error::Tool(crate::error::ToolError::new(
                 "require_input needs a live task handler; a replay handler returns RequestOutcome::InputRequired instead",
@@ -712,9 +772,6 @@ impl TaskContext {
             return Err(crate::error::Error::TaskCancelled);
         }
 
-        // Created before the store write, so a `tasks/update` landing between
-        // the two is not missed.
-        let woken = live.input_ready.notified();
         let accepted = live
             .store
             .require_input(&self.task_id, requests, message.as_deref())
@@ -730,52 +787,11 @@ impl TaskContext {
             )));
         }
 
-        tokio::select! {
-            _ = woken => {}
-            _ = live.cancelled.cancelled() => {
-                return Err(crate::error::Error::TaskCancelled);
-            }
-        }
-
-        // A partial answer leaves some of these outstanding. Wait for the
-        // rest rather than reissuing, which would be key reuse.
-        loop {
-            let outstanding = live
-                .store
-                .outstanding_input_requests(&self.task_id)
-                .await
-                .map_err(|e| {
-                    crate::error::Error::Tool(crate::error::ToolError::new(format!(
-                        "could not read outstanding requests: {e}"
-                    )))
-                })?
-                .unwrap_or_default();
-            if !outstanding.keys().any(|key| asked.contains(key)) {
-                break;
-            }
-            let woken = live.input_ready.notified();
-            tokio::select! {
-                _ = woken => {}
-                _ = live.cancelled.cancelled() => {
-                    return Err(crate::error::Error::TaskCancelled);
-                }
-            }
-        }
-
-        let all = live
-            .store
-            .input_responses(&self.task_id)
-            .await
-            .map_err(|e| {
-                crate::error::Error::Tool(crate::error::ToolError::new(format!(
-                    "could not read input responses: {e}"
-                )))
-            })?
-            .unwrap_or_default();
-        Ok(all
-            .into_iter()
-            .filter(|(key, _)| asked.contains(key))
-            .collect())
+        Ok(PendingInput {
+            live: live.clone(),
+            task_id: self.task_id.clone(),
+            asked,
+        })
     }
 
     /// Record a non-terminal status for clients polling this task.
@@ -825,6 +841,129 @@ impl Clone for TaskContext {
             task_id: self.task_id.clone(),
             live: self.live.clone(),
         }
+    }
+}
+
+/// A task durably parked in `input_required`, not yet waited on.
+///
+/// Returned by [`TaskContext::park_input`]. The task is already parked when
+/// this exists: the store transition has committed and a client polling
+/// `tasks/get` can already see the questions. What has not happened yet is
+/// this handler suspending, which is the point of the split (#1246).
+///
+/// Deliberately not [`Clone`]. Two holders would both wait on one set of
+/// answers and one of them would consume them, so the type makes a second
+/// waiter unrepresentable rather than leaving it to a comment.
+#[must_use = "the task is parked in `input_required` until this is awaited; \
+              dropping it leaves the task parked with nothing waiting to \
+              resume it"]
+pub struct PendingInput {
+    live: Arc<LiveTask>,
+    task_id: String,
+    /// The keys this park asked about. Answers to earlier questions stay in
+    /// the store rather than being handed over again.
+    asked: Vec<String>,
+}
+
+impl std::fmt::Debug for PendingInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingInput")
+            .field("task_id", &self.task_id)
+            .field("asked", &self.asked)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingInput {
+    /// The server-generated task identifier.
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
+    /// The request keys this park is waiting on.
+    pub fn asked(&self) -> &[String] {
+        &self.asked
+    }
+
+    /// Suspend until every request in this park is answered.
+    ///
+    /// Only the answers to the keys this park asked about come back, keyed as
+    /// they were sent. A partial answer leaves the rest outstanding and this
+    /// keeps waiting rather than reissuing, which would be key reuse
+    /// (SEP-2663).
+    ///
+    /// Takes `self`, so a park cannot be waited on twice.
+    ///
+    /// # Nothing is lost in the gap
+    ///
+    /// Arbitrary code, including code that awaits, runs between
+    /// [`TaskContext::park_input`] and this call. Three things make that
+    /// window safe, and the order below is the order they are relied on:
+    ///
+    /// 1. Cancellation is a flag, so one raised in the gap is seen here.
+    /// 2. The loop reads outstanding requests from the store *before* it
+    ///    awaits anything. `tasks/update` commits to that store, so an answer
+    ///    that landed in the gap is already visible and this returns without
+    ///    suspending at all.
+    /// 3. Within the loop the wakeup is created before the read, so an answer
+    ///    landing between the read and the suspend is not missed either. The
+    ///    wakeup is `notify_one`, which stores a permit when nobody is
+    ///    waiting, so it is held rather than dropped.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::TaskCancelled`] if the task is cancelled while
+    /// waiting, so a handler that propagates with `?` unwinds correctly
+    /// without writing a `select!`. The router maps that to
+    /// [`TaskOutcome::Cancelled`].
+    pub async fn wait(self) -> Result<InputResponses> {
+        let live = &self.live;
+
+        if live.cancelled.is_cancelled() {
+            return Err(crate::error::Error::TaskCancelled);
+        }
+
+        loop {
+            // Created before the read, so an answer landing between the two
+            // is not missed: `notify_one` holds a permit for us.
+            let woken = live.input_ready.notified();
+
+            let outstanding = live
+                .store
+                .outstanding_input_requests(&self.task_id)
+                .await
+                .map_err(|e| {
+                    crate::error::Error::Tool(crate::error::ToolError::new(format!(
+                        "could not read outstanding requests: {e}"
+                    )))
+                })?
+                .unwrap_or_default();
+            if !outstanding.keys().any(|key| self.asked.contains(key)) {
+                break;
+            }
+
+            tokio::select! {
+                _ = woken => {}
+                _ = live.cancelled.cancelled() => {
+                    return Err(crate::error::Error::TaskCancelled);
+                }
+            }
+        }
+
+        let all = live
+            .store
+            .input_responses(&self.task_id)
+            .await
+            .map_err(|e| {
+                crate::error::Error::Tool(crate::error::ToolError::new(format!(
+                    "could not read input responses: {e}"
+                )))
+            })?
+            .unwrap_or_default();
+        Ok(all
+            .into_iter()
+            .filter(|(key, _)| self.asked.contains(key))
+            .collect())
     }
 }
 

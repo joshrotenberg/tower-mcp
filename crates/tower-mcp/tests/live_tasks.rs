@@ -772,3 +772,181 @@ async fn the_simple_live_form_still_compiles_and_runs() {
         .task_id;
     await_status(&store, &task_id, TaskStatus::Completed).await;
 }
+
+// ============================================================================
+// Two-phase parking (#1246)
+// ============================================================================
+//
+// `park_input` commits the `input_required` transition and returns without
+// suspending, so an execution owner can release admission permits between the
+// commit and the wait. That opens a window in which arbitrary code runs, and
+// these two tests are the reason the window is safe to open: a response and a
+// cancellation are each delivered entirely inside it, and neither is lost.
+//
+// The handshake is deterministic rather than timed. `Notify::notify_one`
+// stores a permit when nobody is waiting, so neither side can miss the other
+// no matter which arrives first.
+
+/// An answer that lands after `park_input` and before `wait` must still be
+/// delivered. Nothing is waiting on the notification when it fires, so a
+/// design that relied on the wakeup alone would hang here forever.
+#[tokio::test]
+async fn an_answer_that_lands_before_wait_is_not_lost() {
+    let parked = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let handler_parked = parked.clone();
+    let handler_release = release.clone();
+
+    let tool = ToolBuilder::new("live")
+        .description("Parks, stands, then waits")
+        .live_task_handler(move |task: TaskContext, _input: NoArgs| {
+            let parked = handler_parked.clone();
+            let release = handler_release.clone();
+            async move {
+                let pending = task.park_input(ask("one")).await?;
+                // Durably parked, and this handler has not suspended yet.
+                // An admission-controlled owner releases its permits here.
+                parked.notify_one();
+                release.notified().await;
+
+                let answers = pending.wait().await?;
+                let keys: Vec<String> = answers.into_keys().collect();
+                Ok(TaskOutcome::Completed(CallToolResult::text(keys.join(","))))
+            }
+        })
+        .build();
+
+    let store = Arc::new(MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .server_info("live", "1.0.0")
+        .task_store(store.clone())
+        .tool(tool)
+        .with_tasks();
+
+    let client = McpClient::connect(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+    let task_id = client
+        .call_tool_as_task("live", json!({}), None)
+        .await
+        .expect("task created")
+        .task
+        .task_id;
+
+    // The park has committed, so the question is already visible to a client.
+    parked.notified().await;
+    await_status(&store, &task_id, TaskStatus::InputRequired).await;
+
+    // Answer while the handler is standing between the two calls.
+    answer(&client, &task_id, "one").await;
+
+    release.notify_one();
+    await_status(&store, &task_id, TaskStatus::Completed).await;
+
+    let (_, result, _) = store.get_task_result(&task_id).await.unwrap().unwrap();
+    let text = serde_json::to_value(result.unwrap()).unwrap()["content"][0]["text"].clone();
+    assert_eq!(
+        text, "one",
+        "the answer arrived while nothing was waiting for it, and must still be delivered"
+    );
+}
+
+/// The same window, for cancellation. `wait` checks the flag before it awaits
+/// anything, so a cancellation raised in the gap ends the task rather than
+/// leaving it parked on a question nobody will answer.
+#[tokio::test]
+async fn a_cancellation_that_lands_before_wait_is_observed() {
+    let parked = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let handler_parked = parked.clone();
+    let handler_release = release.clone();
+
+    let tool = ToolBuilder::new("live")
+        .description("Parks, stands, then waits")
+        .live_task_handler(move |task: TaskContext, _input: NoArgs| {
+            let parked = handler_parked.clone();
+            let release = handler_release.clone();
+            async move {
+                let pending = task.park_input(ask("never")).await?;
+                parked.notify_one();
+                release.notified().await;
+
+                // Propagates as TaskCancelled, which the router turns into a
+                // cancelled outcome without the handler writing a select!.
+                let _answers = pending.wait().await?;
+                Ok(TaskOutcome::Completed(CallToolResult::text("unreachable")))
+            }
+        })
+        .build();
+
+    let store = Arc::new(MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .server_info("live", "1.0.0")
+        .task_store(store.clone())
+        .tool(tool)
+        .with_tasks();
+
+    let client = McpClient::connect(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+    let task_id = client
+        .call_tool_as_task("live", json!({}), None)
+        .await
+        .expect("task created")
+        .task
+        .task_id;
+
+    parked.notified().await;
+    await_status(&store, &task_id, TaskStatus::InputRequired).await;
+
+    client
+        .task_cancel(&task_id, Some("changed my mind".to_string()))
+        .await
+        .expect("cancel accepted");
+
+    release.notify_one();
+    await_status(&store, &task_id, TaskStatus::Cancelled).await;
+}
+
+/// `require_input` is the two calls back to back, so it must keep behaving
+/// exactly as it did. This is the same round trip driven through the
+/// compatibility wrapper rather than the split.
+#[tokio::test]
+async fn require_input_still_parks_and_waits_in_one_call() {
+    let tool = ToolBuilder::new("live")
+        .description("Uses the combined call")
+        .live_task_handler(move |task: TaskContext, _input: NoArgs| async move {
+            let answers = task.require_input(ask("one")).await?;
+            let keys: Vec<String> = answers.into_keys().collect();
+            Ok(TaskOutcome::Completed(CallToolResult::text(keys.join(","))))
+        })
+        .build();
+
+    let store = Arc::new(MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .server_info("live", "1.0.0")
+        .task_store(store.clone())
+        .tool(tool)
+        .with_tasks();
+
+    let client = McpClient::connect(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+    let task_id = client
+        .call_tool_as_task("live", json!({}), None)
+        .await
+        .expect("task created")
+        .task
+        .task_id;
+
+    await_status(&store, &task_id, TaskStatus::InputRequired).await;
+    answer(&client, &task_id, "one").await;
+    await_status(&store, &task_id, TaskStatus::Completed).await;
+
+    let (_, result, _) = store.get_task_result(&task_id).await.unwrap().unwrap();
+    let text = serde_json::to_value(result.unwrap()).unwrap()["content"][0]["text"].clone();
+    assert_eq!(text, "one");
+}
