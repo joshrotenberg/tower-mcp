@@ -2649,6 +2649,16 @@ fn test_is_not_localhost_origin_embedded_loopback_strings() {
     assert!(!is_localhost_origin("http://evil.com#localhost"));
 }
 
+#[test]
+fn test_is_not_localhost_origin_bracketed_ipv6_with_suffix() {
+    // #1350, surfaced through is_localhost_origin: a suffix appended
+    // directly onto a loopback bracketed IPv6 literal in the Origin
+    // header must not be treated as loopback either.
+    assert!(!is_localhost_origin("http://[::1]evil.com"));
+    assert!(!is_localhost_origin("http://[::1]@evil.com"));
+    assert!(!is_localhost_origin("http://[::1].evil.com"));
+}
+
 #[tokio::test]
 async fn test_origin_validation_rejects_cross_origin() {
     let transport = HttpTransport::new(create_test_router());
@@ -2930,6 +2940,47 @@ fn test_is_not_localhost_host_bare_ipv6_with_trailing_segment() {
     // Deliberately rejected: RFC 3986 requires brackets around an IPv6
     // host whenever a port follows it.
     assert!(!is_localhost_host("::1:3000"));
+}
+
+#[test]
+fn test_is_not_localhost_host_bracketed_ipv6_with_suffix() {
+    // #1350: `host.split(']').next()` discarded everything after the
+    // first closing bracket without checking it, so a suffix appended
+    // directly onto a loopback bracketed IPv6 literal was silently
+    // ignored and the whole host treated as loopback. RFC 3986 permits
+    // nothing after the closing bracket but an optional ":port"; anything
+    // else makes the authority invalid.
+    assert!(!is_localhost_host("[::1]evil.com"));
+    assert!(!is_localhost_host("[::1]@evil.com"));
+    assert!(!is_localhost_host("[::1].evil.com"));
+    assert!(!is_localhost_host("[::1]]evil.com"));
+    // Missing closing bracket entirely: also invalid, not loopback.
+    assert!(!is_localhost_host("[::1"));
+}
+
+#[test]
+fn test_is_not_localhost_host_bracketed_ipv6_non_loopback_with_suffix() {
+    // A non-loopback bracketed IPv6 address with a suffix was already
+    // correctly rejected; the suffix bug only mattered when the bracketed
+    // address itself was loopback. Pinned alongside the loopback case so
+    // the two don't drift apart.
+    assert!(!is_localhost_host("[2001:db8::1]evil.com"));
+}
+
+#[test]
+fn test_is_localhost_host_bracketed_ipv6_port_boundary() {
+    assert!(is_localhost_host("[::1]"));
+    assert!(is_localhost_host("[::1]:3000"));
+    assert!(is_localhost_host("[::1]:0"));
+    assert!(is_localhost_host("[::1]:65535"));
+}
+
+#[test]
+fn test_is_not_localhost_host_bracketed_ipv6_invalid_port() {
+    assert!(!is_localhost_host("[::1]:"));
+    assert!(!is_localhost_host("[::1]:notaport"));
+    assert!(!is_localhost_host("[::1]:99999"));
+    assert!(!is_localhost_host("[::1]:65536"));
 }
 
 #[tokio::test]
