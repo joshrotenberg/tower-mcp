@@ -77,6 +77,27 @@ pub trait TokenProvider: Send + Sync + 'static {
     /// still valid. This method may be called concurrently from multiple
     /// tasks.
     async fn get_token(&self) -> Result<String, OAuthClientError>;
+
+    /// Discard any cached token, so the next [`get_token`](Self::get_token)
+    /// fetches a new one.
+    ///
+    /// Called when a server answers `401` with a Bearer challenge, which says
+    /// the token was rejected regardless of what the cache believes about it.
+    /// A token can stop working before it expires: it may be revoked, the
+    /// authorization server's keys may rotate, or the two clocks may simply
+    /// disagree. Without this the client would re-send the same rejected
+    /// token and make no progress (#1370).
+    ///
+    /// The default does nothing, which keeps every existing implementation
+    /// compiling and behaving as it did. A provider that caches should
+    /// override it; one that mints a token per call already satisfies it.
+    ///
+    /// This may be called concurrently with `get_token`, and a caller has no
+    /// way to know whether the token it is discarding is the one it was
+    /// handed. Discarding a token another task just fetched costs one extra
+    /// fetch, which is why this clears rather than takes a lock across the
+    /// retry.
+    async fn invalidate(&self) {}
 }
 
 /// Parameters from an OAuth Bearer `WWW-Authenticate` challenge.
@@ -690,6 +711,10 @@ impl TokenProvider for OAuthClientCredentials {
         *cache = Some(token);
 
         Ok(access_token)
+    }
+
+    async fn invalidate(&self) {
+        *self.inner.cache.write().await = None;
     }
 }
 

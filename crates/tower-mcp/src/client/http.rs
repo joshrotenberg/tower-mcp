@@ -152,8 +152,8 @@ struct ScopeEscalationDecision {
 
 #[cfg(feature = "oauth-client")]
 use super::oauth::{
-    OAuthClientError, OAuthScopeChallenge, OAuthScopeEscalationConfig, OAuthScopeEscalationHandler,
-    OAuthScopeEscalationRequest, TokenProvider,
+    OAuthBearerChallenge, OAuthClientError, OAuthScopeChallenge, OAuthScopeEscalationConfig,
+    OAuthScopeEscalationHandler, OAuthScopeEscalationRequest, TokenProvider,
 };
 
 /// Configuration for [`HttpClientTransport`].
@@ -935,6 +935,12 @@ async fn send_http_request(
 ) -> std::result::Result<reqwest::Response, HttpRequestSendError> {
     let mut observed_revision = initial_scope_revision;
     let mut attempts = 0;
+    // Bounded separately from scope escalation, and at one. The two are
+    // different failures: a scope challenge names what to ask for and can
+    // legitimately step up more than once, while a rejected token has exactly
+    // one remedy, and repeating it against a server that keeps saying no is a
+    // retry loop rather than a recovery (#1370).
+    let mut reauthenticated = false;
 
     loop {
         let retry_request = request.try_clone();
@@ -943,6 +949,31 @@ async fn send_http_request(
             .send()
             .await
             .map_err(HttpRequestSendError::request)?;
+
+        // A 401 says the token was rejected whatever the provider's cache
+        // believes, so the cached value is discarded before asking for
+        // another. Anything without a Bearer challenge is left alone: a bare
+        // 401 is the caller's to handle.
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            && !reauthenticated
+            && bearer_challenge(response.headers()).is_some()
+            && let Some(provider) = token_provider.as_ref()
+            // Cloned rather than taken: the scope-escalation path below needs
+            // the original if this branch does not fire.
+            && let Some(reauth_request) = retry_request.as_ref().and_then(|r| r.try_clone())
+        {
+            reauthenticated = true;
+            provider.invalidate().await;
+            let token = provider
+                .get_token()
+                .await
+                .map_err(HttpRequestSendError::oauth)?;
+            let headers = bearer_headers(&token).map_err(|message| {
+                HttpRequestSendError::oauth(OAuthClientError::ScopeEscalation(message))
+            })?;
+            request = reauth_request.headers(headers);
+            continue;
+        }
 
         let challenge = if response.status() == reqwest::StatusCode::FORBIDDEN {
             scope_challenge(response.headers())
@@ -991,6 +1022,24 @@ fn scope_challenge(headers: &reqwest::header::HeaderMap) -> Option<OAuthScopeCha
         .find_map(OAuthScopeChallenge::from_www_authenticate)
 }
 
+/// Whether the response carries any Bearer challenge at all.
+///
+/// Wider than [`scope_challenge`], deliberately. That one accepts only
+/// `insufficient_scope` with scopes attached, because a scope escalation needs
+/// to know what to ask for. A `401` names no scopes and often no error code
+/// either, and the remedy does not depend on which: the token was rejected, so
+/// fetch another. Requiring a challenge at all is what separates "the server
+/// is asking for authentication" from a bare `401` that some intermediary
+/// produced, which is not ours to retry (#1370).
+#[cfg(feature = "oauth-client")]
+fn bearer_challenge(headers: &reqwest::header::HeaderMap) -> Option<OAuthBearerChallenge> {
+    headers
+        .get_all(reqwest::header::WWW_AUTHENTICATE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(OAuthBearerChallenge::from_www_authenticate)
+}
+
 fn http_status_error(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap) -> String {
     #[cfg(feature = "oauth-client")]
     if let Some(challenge) = scope_challenge(headers) {
@@ -1002,6 +1051,19 @@ fn http_status_error(status: reqwest::StatusCode, headers: &reqwest::header::Hea
             message.push_str(&format!(" (resource metadata: {resource_metadata})"));
         }
         return message;
+    }
+
+    // A 401 that reached here survived the re-authentication retry, so the
+    // replacement token was rejected too. Whatever the server said about why
+    // is the only lead the operator has, and reporting a bare status throws
+    // it away (#1370).
+    #[cfg(feature = "oauth-client")]
+    if let Some(challenge) = bearer_challenge(headers) {
+        let detail = challenge
+            .error_description
+            .or(challenge.error)
+            .unwrap_or_else(|| "no detail supplied".to_string());
+        return format!("server returned HTTP {status}: {detail}");
     }
 
     #[cfg(not(feature = "oauth-client"))]
@@ -2089,6 +2151,196 @@ impl SseParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =========================================================================
+    // 401 re-authentication (#1370)
+    // =========================================================================
+
+    /// A provider that caches one token and only mints another after
+    /// `invalidate`, which is what a real caching provider does and what makes
+    /// re-sending a rejected token possible in the first place.
+    #[cfg(all(feature = "oauth-client", feature = "http"))]
+    #[derive(Clone, Default)]
+    struct CachingProvider {
+        minted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        invalidated: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        cached: std::sync::Arc<tokio::sync::RwLock<Option<String>>>,
+    }
+
+    #[cfg(all(feature = "oauth-client", feature = "http"))]
+    #[async_trait::async_trait]
+    impl TokenProvider for CachingProvider {
+        async fn get_token(&self) -> std::result::Result<String, OAuthClientError> {
+            use std::sync::atomic::Ordering;
+            if let Some(token) = self.cached.read().await.clone() {
+                return Ok(token);
+            }
+            let mut cached = self.cached.write().await;
+            if let Some(token) = cached.clone() {
+                return Ok(token);
+            }
+            let token = format!("token-{}", self.minted.fetch_add(1, Ordering::SeqCst));
+            *cached = Some(token.clone());
+            Ok(token)
+        }
+
+        async fn invalidate(&self) {
+            use std::sync::atomic::Ordering;
+            self.invalidated.fetch_add(1, Ordering::SeqCst);
+            *self.cached.write().await = None;
+        }
+    }
+
+    /// Stands in for a provider that has not overridden `invalidate`: it can
+    /// never replace its token, so the retry must stop rather than loop.
+    #[cfg(feature = "oauth-client")]
+    #[derive(Clone)]
+    struct StuckProvider;
+
+    #[cfg(feature = "oauth-client")]
+    #[async_trait::async_trait]
+    impl TokenProvider for StuckProvider {
+        async fn get_token(&self) -> std::result::Result<String, OAuthClientError> {
+            Ok("stale".to_string())
+        }
+    }
+
+    /// A server that rejects `token-0` and `stale` with a `401` Bearer
+    /// challenge and accepts anything else, so recovery shows up as a status
+    /// change. `challenge` controls whether the `WWW-Authenticate` header is
+    /// present at all.
+    #[cfg(all(feature = "oauth-client", feature = "http"))]
+    async fn unauthorizing_server(
+        challenge: bool,
+        seen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::response::IntoResponse;
+        use std::sync::atomic::Ordering;
+
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |headers: HeaderMap| {
+                let seen = seen.clone();
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    let accepted = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .is_some_and(|v| v != "Bearer token-0" && v != "Bearer stale");
+                    if accepted {
+                        return (StatusCode::OK, "{}").into_response();
+                    }
+                    if challenge {
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            [(
+                                "www-authenticate",
+                                r#"Bearer error="invalid_token", error_description="expired""#,
+                            )],
+                            "",
+                        )
+                            .into_response()
+                    } else {
+                        (StatusCode::UNAUTHORIZED, "").into_response()
+                    }
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (url, handle)
+    }
+
+    /// Drive `send_http_request` with an already-authorized request, the way
+    /// the transport does.
+    #[cfg(all(feature = "oauth-client", feature = "http"))]
+    async fn send_with(
+        url: &str,
+        provider: std::sync::Arc<dyn TokenProvider>,
+    ) -> reqwest::StatusCode {
+        let token = provider.get_token().await.unwrap();
+        let request = reqwest::Client::new()
+            .post(url)
+            .headers(bearer_headers(&token).unwrap());
+        match send_http_request(request, url, "tools/call", Some(provider), None, 0).await {
+            Ok(response) => response.status(),
+            Err(_) => panic!("the request itself must not fail"),
+        }
+    }
+
+    /// #1370: the reported case. An expired token is discarded and replaced
+    /// rather than re-sent.
+    #[cfg(all(feature = "oauth-client", feature = "http"))]
+    #[tokio::test]
+    async fn a_401_challenge_replaces_the_rejected_token_and_retries() {
+        use std::sync::atomic::Ordering;
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (url, _server) = unauthorizing_server(true, seen.clone()).await;
+        let provider = CachingProvider::default();
+
+        let status = send_with(&url, std::sync::Arc::new(provider.clone())).await;
+
+        assert_eq!(status, reqwest::StatusCode::OK, "the retry must succeed");
+        assert_eq!(
+            provider.invalidated.load(Ordering::SeqCst),
+            1,
+            "without discarding it, the retry re-sends the rejected token"
+        );
+        assert_eq!(provider.minted.load(Ordering::SeqCst), 2);
+        assert_eq!(seen.load(Ordering::SeqCst), 2, "exactly one retry");
+    }
+
+    /// The bound. A provider that cannot replace its token must not turn a
+    /// `401` into a retry loop.
+    #[cfg(all(feature = "oauth-client", feature = "http"))]
+    #[tokio::test]
+    async fn a_provider_that_cannot_re_authenticate_stops_after_one_retry() {
+        use std::sync::atomic::Ordering;
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (url, _server) = unauthorizing_server(true, seen.clone()).await;
+
+        let status = send_with(&url, std::sync::Arc::new(StuckProvider)).await;
+
+        assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            2,
+            "one original and one retry, and no more"
+        );
+    }
+
+    /// A bare `401` with no challenge is somebody else's, commonly an
+    /// intermediary. Retrying it would spend a token fetch on a server that
+    /// never asked for one.
+    #[cfg(all(feature = "oauth-client", feature = "http"))]
+    #[tokio::test]
+    async fn a_401_without_a_challenge_is_not_retried() {
+        use std::sync::atomic::Ordering;
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (url, _server) = unauthorizing_server(false, seen.clone()).await;
+        let provider = CachingProvider::default();
+
+        let status = send_with(&url, std::sync::Arc::new(provider.clone())).await;
+
+        assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "no retry");
+        assert_eq!(provider.invalidated.load(Ordering::SeqCst), 0);
+    }
+
+    /// `invalidate` defaults to doing nothing, so a provider written before it
+    /// existed still compiles and still behaves as it did.
+    #[cfg(feature = "oauth-client")]
+    #[tokio::test]
+    async fn invalidate_defaults_to_a_no_op() {
+        let provider = StuckProvider;
+        provider.invalidate().await;
+        assert_eq!(provider.get_token().await.unwrap(), "stale");
+    }
 
     // =========================================================================
     // SseParser tests
