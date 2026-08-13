@@ -972,6 +972,11 @@ where
 /// parsed successfully. A batch has no single id to correlate against,
 /// matching what `call_message` itself does for its own within-batch errors
 /// (see the `Err(Error::JsonRpc(error))` arm in `JsonRpcService::call_message`).
+///
+/// This is the typed half of the same question
+/// [`crate::framing::correlating_id`] answers for a frame that has not been
+/// typed yet, which is where a rejection before parsing has to read the id
+/// from (#1372). The two agree, including that a batch resolves to `None`.
 fn correlating_id(message: &JsonRpcMessage) -> Option<RequestId> {
     match message {
         JsonRpcMessage::Single(req) => Some(req.id.clone()),
@@ -1027,7 +1032,11 @@ where
     if let Err(error) =
         service.inspect_incoming_value(&parsed, crate::inspection::McpDirection::ClientToServer)
     {
-        return send_response(&sender, &JsonRpcResponse::error(None, error)).await;
+        return send_response(
+            &sender,
+            &JsonRpcResponse::error(crate::framing::error_response_id(&parsed, &error), error),
+        )
+        .await;
     }
 
     // Parse and process as a request (single or batch). The serde error is
@@ -1210,7 +1219,7 @@ async fn process_message(
         service.inspect_incoming_value(&parsed, crate::inspection::McpDirection::ClientToServer)
     {
         return Ok(Some(crate::protocol::JsonRpcResponseMessage::Single(
-            JsonRpcResponse::error(None, error),
+            JsonRpcResponse::error(crate::framing::error_response_id(&parsed, &error), error),
         )));
     }
 

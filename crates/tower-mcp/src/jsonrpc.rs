@@ -880,6 +880,9 @@ mod tests {
         };
         assert_eq!(response.error.code, -32602);
         assert!(response.error.message.contains("clientCapabilities"));
+        // As above: unasserted here, and dropped by the transport loops
+        // (#1372).
+        assert_eq!(response.id, Some(crate::protocol::RequestId::Number(1)));
     }
 
     #[cfg(feature = "stateless")]
@@ -904,6 +907,9 @@ mod tests {
             response.error.data.unwrap()["supported"],
             serde_json::json!([crate::protocol::PROTOCOL_VERSION_2026_07_28])
         );
+        // The id was asserted nowhere here, so this path could drop it
+        // silently, and the transport loops did (#1372).
+        assert_eq!(response.id, Some(crate::protocol::RequestId::Number(1)));
     }
 
     #[tokio::test]

@@ -182,6 +182,151 @@ pub(crate) fn is_response_frame(value: &serde_json::Value) -> bool {
         && (value.get("result").is_some() || value.get("error").is_some())
 }
 
+/// The id an error response should carry back, read straight off the frame.
+///
+/// A receive loop that rejects a frame before typing it still has the id
+/// sitting in front of it, and JSON-RPC 2.0 section 5 requires an error
+/// response to echo the request's id. Answering `null` anyway leaves a client
+/// with more than one request in flight unable to tell which one failed
+/// (#1372).
+///
+/// `None` for the cases where there genuinely is no single id to answer with:
+/// a batch, a notification, and an `id` that is neither of the two JSON-RPC
+/// id types. A batch is deliberately not resolved to its first element's id,
+/// because answering one member's id for a whole-batch rejection would be a
+/// worse lie than answering none.
+pub(crate) fn correlating_id(value: &serde_json::Value) -> Option<crate::protocol::RequestId> {
+    match value.get("id")? {
+        serde_json::Value::String(id) => Some(crate::protocol::RequestId::String(id.clone())),
+        serde_json::Value::Number(id) => id.as_i64().map(crate::protocol::RequestId::Number),
+        _ => None,
+    }
+}
+
+/// The id to answer `error` with, for a frame rejected before it was typed.
+///
+/// Section 5 permits a null id when "there was an error in detecting the id
+/// in the Request object (e.g. Parse error/Invalid Request)". The two halves
+/// of that sentence pull in different directions here, and the split falls on
+/// whether the envelope itself is well formed:
+///
+/// * `-32600 Invalid Request` says the envelope is not a request at all. It is
+///   named in the specification's own parenthetical, and this crate answers
+///   every malformed envelope shape uniformly with a null id whether or not an
+///   `id` happens to be readable out of it. Nothing is correlated to a frame
+///   that was never a valid request.
+/// * Anything else means the envelope parsed as a request and then failed
+///   semantic validation, `-32602` invalid params and `-32022` unsupported
+///   protocol version among them. The id was detected perfectly well, so
+///   section 5's first sentence applies and it has to be echoed (#1372).
+pub(crate) fn error_response_id(
+    value: &serde_json::Value,
+    error: &crate::error::JsonRpcError,
+) -> Option<crate::protocol::RequestId> {
+    const INVALID_REQUEST: i32 = -32600;
+    if error.code == INVALID_REQUEST {
+        return None;
+    }
+    correlating_id(value)
+}
+
+#[cfg(test)]
+mod correlating_id_tests {
+    use super::*;
+    use crate::protocol::RequestId;
+
+    #[test]
+    fn both_json_rpc_id_types_are_read_off_the_frame() {
+        assert_eq!(
+            correlating_id(&serde_json::json!({"id": 42, "method": "tools/list"})),
+            Some(RequestId::Number(42))
+        );
+        assert_eq!(
+            correlating_id(&serde_json::json!({"id": "req-1", "method": "tools/list"})),
+            Some(RequestId::String("req-1".into()))
+        );
+    }
+
+    /// A batch rejection covers every member, so borrowing the first one's id
+    /// would answer a request that may well have been fine.
+    #[test]
+    fn a_batch_has_no_single_id_to_answer_with() {
+        assert_eq!(
+            correlating_id(&serde_json::json!([{"id": 1, "method": "tools/list"}])),
+            None
+        );
+    }
+
+    #[test]
+    fn a_notification_has_no_id() {
+        assert_eq!(
+            correlating_id(&serde_json::json!({"method": "notifications/initialized"})),
+            None
+        );
+    }
+
+    /// An `id` the JSON-RPC grammar does not allow is not an id. Answering
+    /// with `null` is then correct rather than a lost correlation.
+    #[test]
+    fn an_id_of_the_wrong_type_is_not_an_id() {
+        for id in [
+            serde_json::json!(null),
+            serde_json::json!({"nested": 1}),
+            serde_json::json!([1]),
+            serde_json::json!(true),
+        ] {
+            assert_eq!(
+                correlating_id(&serde_json::json!({"id": id, "method": "tools/list"})),
+                None,
+                "{id} is not a JSON-RPC id"
+            );
+        }
+    }
+
+    /// Fractional numbers are not JSON-RPC ids either, and must not silently
+    /// truncate to a different id than the client sent.
+    #[test]
+    fn a_fractional_id_does_not_truncate() {
+        assert_eq!(
+            correlating_id(&serde_json::json!({"id": 1.5, "method": "tools/list"})),
+            None
+        );
+    }
+
+    /// The split the specification's section 5 parenthetical draws. An
+    /// envelope that was never a valid request correlates to nothing, even
+    /// with a perfectly readable id on it.
+    #[test]
+    fn an_invalid_request_answers_with_a_null_id() {
+        let frame = serde_json::json!({"jsonrpc": "2.0", "id": 6});
+        assert_eq!(
+            error_response_id(
+                &frame,
+                &crate::error::JsonRpcError::invalid_request("no method")
+            ),
+            None
+        );
+    }
+
+    /// A valid envelope that failed semantic validation is the other side of
+    /// it: the id was detected, so it has to come back.
+    #[test]
+    fn a_semantic_failure_answers_with_the_id() {
+        let frame = serde_json::json!({"jsonrpc": "2.0", "id": 6, "method": "tools/list"});
+        for error in [
+            crate::error::JsonRpcError::invalid_params("bad _meta"),
+            crate::error::JsonRpcError::internal_error("boom"),
+        ] {
+            assert_eq!(
+                error_response_id(&frame, &error),
+                Some(RequestId::Number(6)),
+                "code {} should correlate",
+                error.code
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

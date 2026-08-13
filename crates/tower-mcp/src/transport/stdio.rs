@@ -684,7 +684,7 @@ async fn process_line(
         service.inspect_incoming_value(&parsed, crate::inspection::McpDirection::ClientToServer)
     {
         return Ok(Some(JsonRpcResponseMessage::Single(
-            JsonRpcResponse::error(None, error),
+            JsonRpcResponse::error(crate::framing::error_response_id(&parsed, &error), error),
         )));
     }
 
@@ -1656,7 +1656,8 @@ where
         if let Err(error) =
             service.inspect_incoming_value(&parsed, crate::inspection::McpDirection::ClientToServer)
         {
-            let response = JsonRpcResponse::error(None, error);
+            let response =
+                JsonRpcResponse::error(crate::framing::error_response_id(&parsed, &error), error);
             let _ = out_tx.send(serde_json::to_string(&response)?);
             return Ok(());
         }
@@ -2154,7 +2155,8 @@ impl BidirectionalStdioTransport {
             .service
             .inspect_incoming_value(&parsed, crate::inspection::McpDirection::ClientToServer)
         {
-            let response = JsonRpcResponse::error(None, error);
+            let response =
+                JsonRpcResponse::error(crate::framing::error_response_id(&parsed, &error), error);
             return self
                 .write_line(&serde_json::to_string(&response)?, writer)
                 .await;
