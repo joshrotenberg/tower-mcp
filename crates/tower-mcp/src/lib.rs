@@ -491,6 +491,30 @@
 //!   stateless session model, `server/discover`, per-request `_meta`
 //! - [SEP-2243](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2243) --
 //!   strict HTTP headers (`Mcp-Method`, `Mcp-Name`, `MCP-Protocol-Version`)
+//!
+//! ## Deprecated by the specification
+//!
+//! `2026-07-28` introduced a [feature lifecycle
+//! policy](https://modelcontextprotocol.io/community/feature-lifecycle)
+//! (SEP-2596) and a [registry of what is on its way
+//! out](https://modelcontextprotocol.io/specification/2026-07-28/deprecated).
+//! These are Deprecated, meaning still part of the specification and still
+//! served here, but new code should not adopt them:
+//!
+//! | Feature | SEP | Earliest removal | Migration |
+//! |---|---|---|---|
+//! | Roots | SEP-2577 | 2027-07-28 | tool parameters, resource URIs, or server configuration |
+//! | Sampling | SEP-2577 | 2027-07-28 | integrate with an LLM provider's API directly |
+//! | Logging | SEP-2577 | 2027-07-28 | `stderr` for stdio; OpenTelemetry for observability |
+//! | Dynamic Client Registration | PR #2858 | 2027-07-28 | Client ID Metadata Documents, which this crate already prefers |
+//! | `includeContext: "thisServer"` / `"allServers"` | SEP-2596 | follows Sampling | omit, or use `"none"` |
+//! | HTTP+SSE transport | SEP-2596 | three months after SEP-2596 is Final | Streamable HTTP |
+//!
+//! "Earliest removal" is when a feature becomes *eligible* for removal from
+//! the specification, which is the first revision released on or after that
+//! date. Removal there does not oblige this crate to drop anything; that
+//! follows this crate's own release policy. Nothing here is scheduled for
+//! removal today.
 
 // Every public item here is documented, and this is what keeps it that way.
 // CI runs clippy with `-D warnings`, so this is a failure there; `warn`

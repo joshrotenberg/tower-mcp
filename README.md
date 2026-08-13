@@ -169,6 +169,15 @@ it. The 2026-07-28 build adds sessionless dispatch, `server/discover`,
 `subscriptions/listen`, per-request `_meta`, response-cache hints, Multi Round-Trip
 Requests, and the Tasks extension (opt in with `McpRouter::with_tasks`).
 
+Four of those are Deprecated by the specification as of 2026-07-28 and remain
+supported here: sampling, logging, and roots (SEP-2577), and Dynamic Client
+Registration (superseded by Client ID Metadata Documents, which this crate
+already prefers). They become eligible for removal from the specification in the
+first revision released on or after 2027-07-28. Nothing is scheduled for removal
+from this crate; see the [deprecated
+features](https://docs.rs/tower-mcp/latest/tower_mcp/#deprecated-by-the-specification)
+section for the migration paths.
+
 The [official MCP conformance suite](https://github.com/modelcontextprotocol/conformance)
 runs on every PR in
 [`conformance.yml`](https://github.com/joshrotenberg/tower-mcp/actions/workflows/conformance.yml),

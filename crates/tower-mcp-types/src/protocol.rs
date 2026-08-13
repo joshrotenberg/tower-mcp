@@ -537,7 +537,19 @@ impl std::fmt::Display for LogLevel {
     }
 }
 
-/// Parameters for logging message notification
+/// Parameters for a `notifications/message` logging notification.
+///
+/// # Deprecated in MCP 2026-07-28
+///
+/// Logging is Deprecated by
+/// [SEP-2577](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2577),
+/// with an earliest removal of the first specification revision released on
+/// or after **2027-07-28**. `logging/setLevel` is already gone from the
+/// 2026-07-28 lifecycle; a request authorizes log delivery per call through
+/// `_meta`.
+///
+/// The documented migration path is `stderr` for stdio transports, and
+/// [OpenTelemetry](https://opentelemetry.io/) for observability.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingMessageParams {
     /// Severity level of the message
@@ -1108,8 +1120,16 @@ pub struct ClientTasksElicitationCapability {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClientTasksElicitationCreateCapability {}
 
-/// Client capability for roots (filesystem access)
 /// Capabilities related to filesystem roots.
+///
+/// # Deprecated in MCP 2026-07-28
+///
+/// Roots is Deprecated by
+/// [SEP-2577](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2577),
+/// with an earliest removal of the first specification revision released on
+/// or after **2027-07-28**. The documented migration path is to pass
+/// directories or files through tool parameters, resource URIs, or server
+/// configuration instead.
 ///
 /// When `list_changed` is `true`, the client supports sending
 /// `notifications/roots/list_changed` to inform the server that the
@@ -1525,16 +1545,34 @@ impl ModelPreferences {
     }
 }
 
-/// Context inclusion mode for sampling
+/// Context inclusion mode for sampling.
+///
+/// Only [`None`](IncludeContext::None) survives the `2025-11-25`
+/// deprecation of the other two (SEP-2596). Sampling as a whole is also
+/// Deprecated as of `2026-07-28` (SEP-2577); see [`CreateMessageParams`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum IncludeContext {
-    /// Include context from all connected MCP servers
+    /// Include context from all connected MCP servers.
+    #[deprecated(
+        since = "0.23.0",
+        note = "Deprecated in MCP 2025-11-25 by SEP-2596. Omit the field or use \
+                `IncludeContext::None`. Removal follows Sampling (SEP-2577), \
+                whose earliest removal is the first revision released on or \
+                after 2027-07-28."
+    )]
     AllServers,
-    /// Include context from this server only
+    /// Include context from this server only.
+    #[deprecated(
+        since = "0.23.0",
+        note = "Deprecated in MCP 2025-11-25 by SEP-2596. Omit the field or use \
+                `IncludeContext::None`. Removal follows Sampling (SEP-2577), \
+                whose earliest removal is the first revision released on or \
+                after 2027-07-28."
+    )]
     ThisServer,
-    /// Don't include any additional context
+    /// Don't include any additional context.
     #[default]
     None,
 }
@@ -1828,7 +1866,23 @@ impl SamplingContentOrArray {
     }
 }
 
-/// Parameters for sampling/createMessage request
+/// Parameters for a `sampling/createMessage` request.
+///
+/// # Deprecated in MCP 2026-07-28
+///
+/// Sampling is Deprecated by
+/// [SEP-2577](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2577).
+/// It remains part of the specification and is still served here, but new
+/// implementations should not adopt it, and existing ones should migrate
+/// before its earliest removal: the first specification revision released on
+/// or after **2027-07-28**.
+///
+/// The documented migration path is to integrate with an LLM provider's API
+/// directly rather than asking the client to sample on the server's behalf.
+///
+/// Nothing is removed from this crate on that date. Removal from the
+/// specification does not oblige an SDK to drop a feature, and this crate's
+/// own support follows its release policy, not the specification's calendar.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateMessageParams {
@@ -6677,6 +6731,10 @@ mod tests {
         assert_eq!(prefs.cost_priority, Some(0.0)); // Clamped to min
     }
 
+    // The variants are Deprecated, not Removed: a peer may still send
+    // them and they still have to round-trip, so these keep testing
+    // them deliberately.
+    #[allow(deprecated)]
     #[test]
     fn test_include_context_serialization() {
         assert_eq!(
@@ -6734,6 +6792,10 @@ mod tests {
         assert_eq!(json["mimeType"], "image/png");
     }
 
+    // The variants are Deprecated, not Removed: a peer may still send
+    // them and they still have to round-trip, so these keep testing
+    // them deliberately.
+    #[allow(deprecated)]
     #[test]
     fn test_create_message_params() {
         let params = CreateMessageParams::new(
