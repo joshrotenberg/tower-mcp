@@ -3043,9 +3043,9 @@ dependencies = [
 
 [[package]]
 name = "tower-resilience"
-version = "0.10.1"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83953a2824612ac9d32b0abe521904f3bc71d879e6771c8e216ac42d8fc6891d"
+checksum = "5a14fccd650b08c21541bcd27031eb0609be6a852d1a0e40458d23b2186e96d1"
 dependencies = [
  "tower-resilience-bulkhead",
  "tower-resilience-circuitbreaker",
@@ -3056,9 +3056,9 @@ dependencies = [
 
 [[package]]
 name = "tower-resilience-bulkhead"
-version = "0.10.1"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "954ebc262351e20f2cbd76b916ce59d887fb32ce0e579061c8c24f17e5a68411"
+checksum = "7a078476a6fe47e0d3af6393f40530a8df855c52558e8438893e94fa86af4b69"
 dependencies = [
  "futures",
  "thiserror",
@@ -3071,9 +3071,9 @@ dependencies = [
 
 [[package]]
 name = "tower-resilience-circuitbreaker"
-version = "0.10.1"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62dfa8324283dd6ce8102ae60be686e0849ff2a0bd182c80d8ccb0f5fd55f118"
+checksum = "4ddff17a9e56f5eb6b9da3fbe7ae7565ba737d81d4a805a7dd7c77c209286ccd"
 dependencies = [
  "futures",
  "thiserror",
@@ -3084,9 +3084,9 @@ dependencies = [
 
 [[package]]
 name = "tower-resilience-coalesce"
-version = "0.10.1"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2863059c219ffbd14a36352d6dc6ae8f18a3a00d7aeaf91596fbf31f8c0eaa04"
+checksum = "2c00ecd47fbc499f7d36ebd44326b58fba61b19977acb056939285fe4c2fa8fe"
 dependencies = [
  "hashbrown",
  "parking_lot",
@@ -3099,9 +3099,9 @@ dependencies = [
 
 [[package]]
 name = "tower-resilience-core"
-version = "0.10.1"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "756171904b6fe320288e48b3741a5ea9490006f17734091b883f340d1e1e28af"
+checksum = "338ea804e90ef47f57c30c997098295cd57b124dfae147b203ee6c0a8e4c5500"
 dependencies = [
  "thiserror",
  "tokio",
@@ -3109,9 +3109,9 @@ dependencies = [
 
 [[package]]
 name = "tower-resilience-ratelimiter"
-version = "0.10.1"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f25faeefcf682ad13397b7962d6db9f1dcd079334bca2b6e1e0162f6aa45629"
+checksum = "5451c9bc07db4ae652997a5e619836207f4aadfbd5e6271d3ea41623b3c8ff00"
 dependencies = [
  "futures",
  "tokio",
