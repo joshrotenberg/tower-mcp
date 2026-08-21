@@ -557,6 +557,11 @@ impl McpRouter {
         };
 
         let mut ctx = RequestContext::new(RequestId::String(task_id.to_string()));
+        // Replay rebuilds a request context, but it is still an invocation of
+        // the same task. Restore its stable identity without a process-local
+        // live handle so MRTR handlers can correlate every input round.
+        ctx.extensions_mut()
+            .insert(crate::tool::TaskContext::new(task_id.to_string()));
         // The answers reach the handler through the same MRTR extension a
         // client retry populates. Only a `stateless` build can register an
         // `mrtr_handler`, so a build without it can never park a task and

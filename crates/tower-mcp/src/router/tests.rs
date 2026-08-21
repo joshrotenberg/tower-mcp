@@ -1923,10 +1923,10 @@ fn a_transport_error_is_not_attributed_to_a_tool() {
     assert!(!error.message.contains("provider tool"));
 }
 
-/// #1208: the full task input round trip. The handler asks, the task
+/// #1208/#1386: the full task input round trip. The handler asks, the task
 /// parks in `input_required` carrying the requests, the client answers
-/// with `tasks/update`, the router re-invokes the handler with the
-/// answers, and the task completes.
+/// with `tasks/update`, and the router re-invokes the handler with both the
+/// accumulated answers and the same non-live task identity on every round.
 #[cfg(feature = "stateless")]
 #[tokio::test]
 async fn a_task_resumes_after_its_input_is_answered() {
@@ -1936,30 +1936,52 @@ async fn a_task_resumes_after_its_input_is_answered() {
         InputRequiredResult, RequestOutcome,
     };
 
+    fn ask(key: &str, message: &str) -> InputRequests {
+        let mut requests: InputRequests = Default::default();
+        requests.insert(
+            key.to_string(),
+            InputRequest::Elicit(ElicitRequestParams::Form(ElicitFormParams {
+                mode: None,
+                message: message.to_string(),
+                requested_schema: ElicitFormSchema::new(),
+                meta: None,
+            })),
+        );
+        requests
+    }
+
+    let seen_contexts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let handler_contexts = seen_contexts.clone();
     let asks = ToolBuilder::new("asks")
         .description("Needs a decision")
         .task_support(TaskSupportMode::Optional)
-        .mrtr_handler::<serde_json::Value, _, _>(|ctx, _input| async move {
-            // Resume leg: the answers are readable exactly as a non-task
-            // MRTR handler sees them on the client's retry.
-            if let Some(responses) = ctx.input_responses()
-                && responses.contains_key("decision")
-            {
-                return Ok(RequestOutcome::Complete(CallToolResult::text("approved")));
+        .mrtr_handler::<serde_json::Value, _, _>(move |ctx, _input| {
+            let seen_contexts = handler_contexts.clone();
+            async move {
+                seen_contexts.lock().unwrap().push(
+                    ctx.extension::<crate::tool::TaskContext>()
+                        .map(|task| (task.task_id().to_string(), task.is_live())),
+                );
+
+                // Resume legs see every answer accumulated so far, exactly as
+                // a non-task MRTR handler sees them on the client's retry.
+                if ctx.input_responses().is_some_and(|responses| {
+                    responses.contains_key("decision") && responses.contains_key("reason")
+                }) {
+                    return Ok(RequestOutcome::Complete(CallToolResult::text("approved")));
+                }
+                let (key, message) = if ctx
+                    .input_responses()
+                    .is_some_and(|responses| responses.contains_key("decision"))
+                {
+                    ("reason", "why?")
+                } else {
+                    ("decision", "approve?")
+                };
+                Ok(RequestOutcome::input_required(
+                    InputRequiredResult::with_requests(ask(key, message)),
+                ))
             }
-            let mut requests: InputRequests = Default::default();
-            requests.insert(
-                "decision".to_string(),
-                InputRequest::Elicit(ElicitRequestParams::Form(ElicitFormParams {
-                    mode: None,
-                    message: "approve?".to_string(),
-                    requested_schema: ElicitFormSchema::new(),
-                    meta: None,
-                })),
-            );
-            Ok(RequestOutcome::input_required(
-                InputRequiredResult::with_requests(requests),
-            ))
         })
         .build();
 
@@ -2013,8 +2035,12 @@ async fn a_task_resumes_after_its_input_is_answered() {
         .unwrap()
         .unwrap();
     assert!(outstanding.contains_key("decision"));
+    assert_eq!(
+        seen_contexts.lock().unwrap().clone(),
+        vec![Some((task_id.clone(), false))]
+    );
 
-    // The client answers.
+    // The client answers the first round.
     let update = router
         .ready()
         .await
@@ -2037,7 +2063,56 @@ async fn a_task_resumes_after_its_input_is_answered() {
         .unwrap();
     assert!(update.inner.is_ok(), "update must be acknowledged");
 
-    // The handler runs again and the task completes with its answer.
+    // The handler runs again with the same task identity and asks a second,
+    // distinct question.
+    let mut parked_again = false;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let task = store.get_task(&task_id).await.unwrap().unwrap();
+        let outstanding = store
+            .outstanding_input_requests(&task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        if task.status == TaskStatus::InputRequired && outstanding.contains_key("reason") {
+            parked_again = true;
+            break;
+        }
+        assert_ne!(task.status, TaskStatus::Failed, "must park again, not fail");
+    }
+    assert!(parked_again, "the task must reach a second input round");
+    assert_eq!(
+        seen_contexts.lock().unwrap().clone(),
+        vec![
+            Some((task_id.clone(), false)),
+            Some((task_id.clone(), false)),
+        ]
+    );
+
+    // Answering the second round resumes the same task once more.
+    let update = router
+        .ready()
+        .await
+        .unwrap()
+        .call(RouterRequest {
+            id: RequestId::Number(3),
+            inner: McpRequest::UpdateTask(UpdateTaskParams {
+                task_id: task_id.clone(),
+                input_responses: [(
+                    "reason".to_string(),
+                    serde_json::json!({"action": "accept"}),
+                )]
+                .into_iter()
+                .collect(),
+                meta: None,
+            }),
+            extensions: tasks_client_extensions(),
+        })
+        .await
+        .unwrap();
+    assert!(update.inner.is_ok(), "update must be acknowledged");
+
+    // The third invocation completes with both answers available.
     let mut completed = None;
     for _ in 0..50 {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -2054,6 +2129,14 @@ async fn a_task_resumes_after_its_input_is_answered() {
     }
     let completed = completed.expect("the task must complete after resuming");
     assert_eq!(completed.all_text(), "approved");
+    assert_eq!(
+        seen_contexts.lock().unwrap().clone(),
+        vec![
+            Some((task_id.clone(), false)),
+            Some((task_id.clone(), false)),
+            Some((task_id, false)),
+        ]
+    );
 }
 
 /// #1306: replay uses the root router's selected panic disclosure policy,
