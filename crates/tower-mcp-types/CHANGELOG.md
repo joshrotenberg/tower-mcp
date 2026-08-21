@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.22.1] - 2026-08-21
+
+### Documentation
+
+- Enforce missing_docs on the published crates (closes #1365) ([#1366](https://github.com/joshrotenberg/tower-mcp/pull/1366))
+- Mark the features deprecated in 2026-07-28 (closes #1371) ([#1375](https://github.com/joshrotenberg/tower-mcp/pull/1375))
+
+
+
 ## [0.22.0] - 2026-08-12
 
 ### Bug Fixes

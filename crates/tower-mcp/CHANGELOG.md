@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.22.1] - 2026-08-21
+
+### Bug Fixes
+
+- **transport:** Keep the request id on inspection error responses (closes #1372) ([#1373](https://github.com/joshrotenberg/tower-mcp/pull/1373))
+- **client:** React to a 401 challenge so an expired token re-authenticates (closes #1370) ([#1374](https://github.com/joshrotenberg/tower-mcp/pull/1374))
+- **tasks:** Restore TaskContext during task replay ([#1387](https://github.com/joshrotenberg/tower-mcp/pull/1387))
+
+### Documentation
+
+- Enforce missing_docs on the published crates (closes #1365) ([#1366](https://github.com/joshrotenberg/tower-mcp/pull/1366))
+- Mark the features deprecated in 2026-07-28 (closes #1371) ([#1375](https://github.com/joshrotenberg/tower-mcp/pull/1375))
+
+### Features
+
+- **client:** Configure final per-request log level ([#1405](https://github.com/joshrotenberg/tower-mcp/pull/1405))
+
+### Refactor
+
+- **router:** Split impl McpRouter and the router-adjacent free items ([#1256](https://github.com/joshrotenberg/tower-mcp/pull/1256)) ([#1362](https://github.com/joshrotenberg/tower-mcp/pull/1362))
+- **tool:** Split the service and task types out of tool.rs ([#1256](https://github.com/joshrotenberg/tower-mcp/pull/1256)) ([#1363](https://github.com/joshrotenberg/tower-mcp/pull/1363))
+
+### Testing
+
+- **http:** Cover the stateless SSE notification fallback ([#1367](https://github.com/joshrotenberg/tower-mcp/pull/1367)) ([#1369](https://github.com/joshrotenberg/tower-mcp/pull/1369))
+
+
+
 ## [0.22.0] - 2026-08-12
 
 ### Bug Fixes
