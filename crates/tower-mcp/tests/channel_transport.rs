@@ -206,6 +206,69 @@ async fn default_constructor_delivers_router_notifications() {
 
 #[cfg(feature = "stateless")]
 #[tokio::test]
+async fn final_typed_tool_calls_follow_request_log_level_updates() {
+    use std::sync::Mutex;
+
+    use tower_mcp::ProtocolSupport;
+    use tower_mcp::extract::{Context, State};
+    use tower_mcp::protocol::LogLevel as ProtocolLogLevel;
+    use tower_mcp::stateless::LogLevel as RequestLogLevel;
+
+    #[derive(Clone, Default)]
+    struct SeenLevels(Arc<Mutex<Vec<Option<RequestLogLevel>>>>);
+
+    let seen = SeenLevels::default();
+    let tool = ToolBuilder::new("inspect_log_level")
+        .description("Records the per-request log threshold")
+        .extractor_handler(
+            seen.clone(),
+            |State(seen): State<SeenLevels>, ctx: Context, RawArgs(_): RawArgs| async move {
+                seen.0
+                    .lock()
+                    .unwrap()
+                    .push(ctx.per_request_meta().and_then(|meta| meta.log_level));
+                Ok(CallToolResult::text("ok"))
+            },
+        )
+        .build();
+    let router = McpRouter::new()
+        .server_info("log-level-test", "1.0.0")
+        .tool(tool);
+    let client = McpClient::builder()
+        .protocol_support(ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+        .connect_simple(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client
+        .discover("log-level-client", "1.0.0")
+        .await
+        .expect("discover");
+
+    client
+        .call_tool("inspect_log_level", serde_json::json!({}))
+        .await
+        .expect("unset call");
+    client
+        .set_request_log_level(Some(ProtocolLogLevel::Warning))
+        .await;
+    client
+        .call_tool("inspect_log_level", serde_json::json!({}))
+        .await
+        .expect("updated call");
+    client.set_request_log_level(None).await;
+    client
+        .call_tool("inspect_log_level", serde_json::json!({}))
+        .await
+        .expect("cleared call");
+
+    assert_eq!(
+        *seen.0.lock().unwrap(),
+        [None, Some(RequestLogLevel::Warning), None]
+    );
+}
+
+#[cfg(feature = "stateless")]
+#[tokio::test]
 async fn final_subscription_listen_filters_channel_transport_notifications() {
     use tower_mcp::ProtocolSupport;
     use tower_mcp::protocol::SubscriptionFilter;

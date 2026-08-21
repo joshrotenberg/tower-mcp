@@ -212,6 +212,7 @@ async fn final_call_tool_transparently_completes_server_created_task() {
     let client = McpClient::builder()
         .protocol_support(tower_mcp::ProtocolSupport::try_new(["2026-07-28"]).unwrap())
         .with_tasks()
+        .request_log_level(tower_mcp::protocol::LogLevel::Info)
         .connect_simple(ChannelTransport::new(task_router().with_tasks()))
         .await
         .expect("connect");

@@ -1157,6 +1157,7 @@ async fn a_live_plus_fallback_tool_serves_an_mrtr_round_trip_through_the_fallbac
     // never elects a task for it: every call reaches the fallback.
     let client = McpClient::builder()
         .protocol_support(ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+        .request_log_level(tower_mcp::protocol::LogLevel::Info)
         .connect_simple(ChannelTransport::new(router))
         .await
         .expect("connect");

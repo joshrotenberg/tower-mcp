@@ -121,7 +121,7 @@ use crate::protocol::{
     InputRequests, InputResponse, InputResponses, JsonRpcNotification, JsonRpcRequest,
     ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
     ListResourcesParams, ListResourcesResult, ListRootsResult, ListToolsParams, ListToolsResult,
-    PromptDefinition, ReadResourceParams, ReadResourceResult, RequestId, RequestMeta,
+    LogLevel, PromptDefinition, ReadResourceParams, ReadResourceResult, RequestId, RequestMeta,
     RequestOutcome, ResourceDefinition, ResourceTemplateDefinition, Root, RootsCapability,
     SamplingCapability, SubscriptionFilter, SubscriptionsAcknowledgedParams,
     SubscriptionsListenParams, SubscriptionsListenResult, TaskObject, TaskRequestParams,
@@ -449,6 +449,8 @@ pub struct McpClient {
     /// Allocator for per-request progress tokens; `None` when the client did
     /// not opt into progress.
     progress_tokens: Option<Arc<AtomicI64>>,
+    /// Default log threshold attached to future 2026-07-28 requests.
+    request_log_level: RwLock<Option<LogLevel>>,
     /// Allocator for JSON-RPC request ids, shared with the message loop so
     /// caller-issued and loop-issued ids never collide.
     next_request_id: Arc<AtomicI64>,
@@ -463,12 +465,14 @@ struct ClientSettings {
     max_mrtr_rounds: usize,
     cache_config: ClientCacheConfig,
     request_progress: bool,
+    request_log_level: Option<LogLevel>,
 }
 
 /// Builder for configuring and connecting an [`McpClient`].
 ///
-/// Everything here is settled before the connection opens, because it is what
-/// the client declares about itself during the handshake. Declaring a
+/// Most settings here are settled before the connection opens, because they
+/// describe what the client declares during the handshake. Per-request
+/// defaults may instead seed runtime-mutable client state. Declaring a
 /// capability is a promise to answer the matching server request, so pair
 /// [`with_sampling`](Self::with_sampling) and
 /// [`with_elicitation`](Self::with_elicitation) with a [`ClientHandler`] that
@@ -510,6 +514,7 @@ pub struct McpClientBuilder {
     max_mrtr_rounds: usize,
     cache_config: ClientCacheConfig,
     request_progress: bool,
+    request_log_level: Option<LogLevel>,
 }
 
 impl McpClientBuilder {
@@ -527,6 +532,7 @@ impl McpClientBuilder {
             max_mrtr_rounds: 8,
             cache_config: ClientCacheConfig::default(),
             request_progress: false,
+            request_log_level: None,
         }
     }
 
@@ -546,6 +552,20 @@ impl McpClientBuilder {
     /// [`RequestContext::report_progress`]: crate::context::RequestContext::report_progress
     pub fn request_progress(mut self) -> Self {
         self.request_progress = true;
+        self
+    }
+
+    /// Set the log threshold attached to final-protocol requests.
+    ///
+    /// This opts into the deprecated 2026-07-28 per-request logging mechanism:
+    /// each request carries `io.modelcontextprotocol/logLevel`, allowing the
+    /// server to emit matching `notifications/message` frames. The setting is
+    /// ignored by stable lifecycles and does not send `logging/setLevel`.
+    ///
+    /// The value seeds the connected client and may later be changed or
+    /// cleared with [`McpClient::set_request_log_level`]. It is off by default.
+    pub fn request_log_level(mut self, level: LogLevel) -> Self {
+        self.request_log_level = Some(level);
         self
     }
 
@@ -658,6 +678,7 @@ impl McpClientBuilder {
                 max_mrtr_rounds: self.max_mrtr_rounds,
                 cache_config: self.cache_config,
                 request_progress: self.request_progress,
+                request_log_level: self.request_log_level,
             },
         )
         .await
@@ -715,6 +736,7 @@ impl McpClient {
             max_mrtr_rounds,
             cache_config,
             request_progress,
+            request_log_level,
         } = settings;
         let supports_session_recovery = transport.supports_session_recovery();
         let (command_tx, command_rx) = mpsc::channel::<LoopCommand>(64);
@@ -759,6 +781,7 @@ impl McpClient {
             max_mrtr_rounds,
             response_cache,
             progress_tokens: request_progress.then(|| Arc::new(AtomicI64::new(1))),
+            request_log_level: RwLock::new(request_log_level),
             next_request_id,
         })
     }
@@ -795,6 +818,22 @@ impl McpClient {
     /// authenticated principal changes.
     pub async fn set_cache_partition(&self, partition: impl Into<String>) {
         self.response_cache.set_partition(partition.into()).await;
+    }
+
+    /// Set the log threshold attached to future final-protocol requests.
+    ///
+    /// Passing `Some(level)` opts subsequently prepared 2026-07-28 requests
+    /// into log delivery at that threshold. Passing `None` clears the default,
+    /// so later requests omit `io.modelcontextprotocol/logLevel` again. Stable
+    /// lifecycles are unaffected; this method does not send
+    /// `logging/setLevel`.
+    ///
+    /// Each wire request snapshots the value while its metadata is prepared.
+    /// Requests already serialized or in flight retain their previous value;
+    /// later MRTR rounds, retries, task operations, and subscription requests
+    /// take a fresh snapshot.
+    pub async fn set_request_log_level(&self, level: Option<LogLevel>) {
+        *self.request_log_level.write().await = level;
     }
 
     /// Return the number of response-cache entries held by this client.
@@ -1523,6 +1562,7 @@ impl McpClient {
             ))
         })?;
         let params = self.with_final_request_meta(params).await?;
+        let params = self.with_request_log_level(params).await;
         let (id_tx, id_rx) = oneshot::channel();
         let (acknowledgment_tx, acknowledgment_rx) = oneshot::channel();
         let (response_tx, response_rx) = oneshot::channel();
@@ -2302,6 +2342,7 @@ impl McpClient {
         let params_value = serde_json::to_value(params)
             .map_err(|e| Error::Transport(format!("Failed to serialize params: {}", e)))?;
         let params_value = self.with_final_request_meta(params_value).await?;
+        let params_value = self.with_request_log_level(params_value).await;
         let params_value = self.with_progress_token(params_value);
 
         let id = RequestId::Number(self.next_request_id.fetch_add(1, Ordering::Relaxed));
@@ -2496,6 +2537,43 @@ impl McpClient {
             let token = tokens.fetch_add(1, Ordering::Relaxed);
             meta.insert("progressToken".to_string(), serde_json::json!(token));
         }
+        params
+    }
+
+    /// Attach the client's default log threshold to one final-protocol request.
+    ///
+    /// This runs after required final metadata has been assembled, including
+    /// on the first `server/discover` request. An explicit per-call level wins.
+    /// Notifications intentionally do not pass through this helper because
+    /// `logLevel` belongs to request metadata.
+    async fn with_request_log_level(&self, mut params: serde_json::Value) -> serde_json::Value {
+        const PROTOCOL_VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+        const LOG_LEVEL_KEY: &str = "io.modelcontextprotocol/logLevel";
+
+        let should_attach = params
+            .get("_meta")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|meta| {
+                meta.get(PROTOCOL_VERSION_KEY)
+                    .and_then(serde_json::Value::as_str)
+                    == Some(crate::protocol::PROTOCOL_VERSION_2026_07_28)
+                    && !meta.contains_key(LOG_LEVEL_KEY)
+            });
+        if !should_attach {
+            return params;
+        }
+
+        let Some(level) = *self.request_log_level.read().await else {
+            return params;
+        };
+        let meta = params
+            .get_mut("_meta")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("request metadata was validated as an object");
+        meta.insert(
+            LOG_LEVEL_KEY.to_string(),
+            serde_json::to_value(level).expect("LogLevel is serializable"),
+        );
         params
     }
 

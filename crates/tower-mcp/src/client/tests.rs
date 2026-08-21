@@ -290,6 +290,10 @@ async fn final_discover_injects_metadata_on_every_request() {
             "test-client"
         );
         assert!(meta["io.modelcontextprotocol/clientCapabilities"].is_object());
+        assert!(
+            meta.get("io.modelcontextprotocol/logLevel").is_none(),
+            "final clients must not opt into logging by default"
+        );
     }
 }
 
@@ -302,6 +306,123 @@ fn final_discover_result() -> serde_json::Value {
         "ttlMs": 0,
         "cacheScope": "private"
     })
+}
+
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+#[tokio::test]
+async fn final_request_log_level_seeds_typed_calls_and_preserves_explicit_overrides() {
+    let transport = MockTransport::with_responses(vec![
+        final_discover_result(),
+        serde_json::json!({
+            "resultType": "complete",
+            "tools": [],
+            "ttlMs": 0,
+            "cacheScope": "private"
+        }),
+        serde_json::json!({
+            "resultType": "complete",
+            "content": [{"type": "text", "text": "done"}]
+        }),
+    ]);
+    let outgoing = transport.outgoing.clone();
+    let client = McpClient::builder()
+        .protocol_support(ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+        .request_log_level(LogLevel::Info)
+        .connect_simple(transport)
+        .await
+        .unwrap();
+
+    client.discover("test-client", "1.0.0").await.unwrap();
+    client.list_tools().await.unwrap();
+    let params = CallToolParams {
+        name: "work".to_string(),
+        arguments: serde_json::json!({}),
+        input_responses: None,
+        request_state: None,
+        meta: Some(RequestMeta {
+            log_level: Some(LogLevel::Warning),
+            ..Default::default()
+        }),
+        task: None,
+    };
+    let _: CallToolResult = client.request("tools/call", &params).await.unwrap();
+    client
+        .notify("notifications/custom", &serde_json::json!({}))
+        .await
+        .unwrap();
+
+    let messages: Vec<serde_json::Value> = outgoing
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|message| serde_json::from_str(message).unwrap())
+        .collect();
+    assert_eq!(messages.len(), 4);
+    assert_eq!(messages[0]["method"], "server/discover");
+    assert_eq!(messages[1]["method"], "tools/list");
+    assert_eq!(messages[2]["method"], "tools/call");
+    assert_eq!(messages[3]["method"], "notifications/custom");
+    for message in &messages[..2] {
+        assert_eq!(
+            message["params"]["_meta"]["io.modelcontextprotocol/logLevel"],
+            "info"
+        );
+    }
+    assert_eq!(
+        messages[2]["params"]["_meta"]["io.modelcontextprotocol/logLevel"], "warning",
+        "an explicit per-call threshold must override the client default"
+    );
+    assert!(
+        messages[3]["params"]["_meta"]
+            .get("io.modelcontextprotocol/logLevel")
+            .is_none(),
+        "request-only log metadata must not leak onto notifications"
+    );
+}
+
+#[tokio::test]
+async fn request_log_level_does_not_change_stable_wire() {
+    let transport = MockTransport::with_responses(vec![
+        mock_initialize_response(),
+        serde_json::json!({
+            "content": [{"type": "text", "text": "done"}]
+        }),
+    ]);
+    let outgoing = transport.outgoing.clone();
+    let client = McpClient::builder()
+        .request_log_level(LogLevel::Info)
+        .connect_simple(transport)
+        .await
+        .unwrap();
+
+    client.initialize("test-client", "1.0.0").await.unwrap();
+    client.set_request_log_level(Some(LogLevel::Warning)).await;
+    client
+        .call_tool("work", serde_json::json!({}))
+        .await
+        .unwrap();
+    client
+        .notify("notifications/custom", &serde_json::json!({}))
+        .await
+        .unwrap();
+
+    let messages: Vec<serde_json::Value> = outgoing
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|message| serde_json::from_str(message).unwrap())
+        .collect();
+    assert_eq!(messages.len(), 4);
+    assert!(
+        messages.iter().all(|message| message["params"]["_meta"]
+            .get("io.modelcontextprotocol/logLevel")
+            .is_none()),
+        "a final-only request default must not alter stable traffic: {messages:?}"
+    );
+    assert!(
+        messages[2]["params"].get("_meta").is_none(),
+        "a stable typed call must retain its ordinary params shape"
+    );
 }
 
 #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
@@ -447,6 +568,7 @@ async fn final_subscriptions_correlate_and_cancel_over_message_transport() {
 
     let client = McpClient::builder()
         .protocol_support(ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+        .request_log_level(LogLevel::Info)
         .connect(transport, RecordingHandler(received.clone()))
         .await
         .unwrap();
@@ -470,6 +592,20 @@ async fn final_subscriptions_correlate_and_cancel_over_message_transport() {
         second.acknowledged().await.unwrap().tools_list_changed,
         Some(true)
     );
+    let listen_messages: Vec<serde_json::Value> = outgoing
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|message| serde_json::from_str(message).unwrap())
+        .filter(|message: &serde_json::Value| message["method"] == "subscriptions/listen")
+        .collect();
+    assert_eq!(listen_messages.len(), 2);
+    for message in listen_messages {
+        assert_eq!(
+            message["params"]["_meta"]["io.modelcontextprotocol/logLevel"],
+            "info"
+        );
+    }
 
     for _ in 0..100 {
         if received
@@ -792,6 +928,7 @@ async fn final_tool_call_refreshes_stale_schema_and_retries_once() {
     let outgoing = transport.outgoing.clone();
     let client = McpClient::builder()
         .protocol_support(ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+        .request_log_level(LogLevel::Warning)
         .connect_simple(transport)
         .await
         .unwrap();
@@ -804,16 +941,15 @@ async fn final_tool_call_refreshes_stale_schema_and_retries_once() {
         .unwrap();
     assert_eq!(result.first_text(), Some("retried"));
 
-    let methods: Vec<String> = outgoing
+    let messages: Vec<serde_json::Value> = outgoing
         .lock()
         .unwrap()
         .iter()
-        .map(|message| {
-            serde_json::from_str::<serde_json::Value>(message).unwrap()["method"]
-                .as_str()
-                .unwrap()
-                .to_string()
-        })
+        .map(|message| serde_json::from_str(message).unwrap())
+        .collect();
+    let methods: Vec<&str> = messages
+        .iter()
+        .map(|message| message["method"].as_str().unwrap())
         .collect();
     assert_eq!(
         methods,
@@ -825,6 +961,12 @@ async fn final_tool_call_refreshes_stale_schema_and_retries_once() {
             "tools/call"
         ]
     );
+    for message in messages {
+        assert_eq!(
+            message["params"]["_meta"]["io.modelcontextprotocol/logLevel"], "warning",
+            "every request in the retry flow must retain the configured threshold"
+        );
+    }
 }
 
 #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
