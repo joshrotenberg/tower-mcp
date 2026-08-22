@@ -551,11 +551,11 @@ impl SessionRegistry {
 
     /// Persist an update to an existing session's record (upsert).
     ///
-    /// Called after the session's state changes in a way that should be
-    /// reflected in the persistent store -- notably after a successful
-    /// `initialize` so the stored record carries the client's advertised
-    /// `client_info` and `capabilities` (rather than the defaults captured
-    /// at create time). Failures are logged but non-fatal.
+    /// Called after live session activity to maintain the store's sliding
+    /// expiry, and after other state changes that should be reflected in the
+    /// persistent store -- notably a successful `initialize`, so the stored
+    /// record carries the client's advertised `client_info` and capabilities.
+    /// Failures are logged but non-fatal.
     pub(super) async fn save_record(&self, session: &Session) {
         let record = self.record_for(session).await;
         if let Err(e) = self.persistent.save(&record).await {
@@ -704,9 +704,14 @@ impl SessionRegistry {
         // Fast path: the session is live in this process.
         {
             let sessions = self.sessions.read().await;
-            if let Some(s) = sessions.get(id).cloned() {
-                s.touch().await;
-                return Some(s);
+            if let Some(session) = sessions.get(id).cloned() {
+                session.touch().await;
+                // Keep the registry read lock through the external save. A
+                // concurrent removal must acquire the write lock, so its
+                // persistent delete is ordered after this refresh and cannot
+                // be undone by it.
+                self.save_record(&session).await;
+                return Some(session);
             }
         }
 

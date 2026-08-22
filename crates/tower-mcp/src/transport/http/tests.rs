@@ -1856,6 +1856,237 @@ async fn test_custom_session_store_receives_create_and_delete() {
 }
 
 #[tokio::test]
+async fn live_session_get_refreshes_persistent_expiry() {
+    use crate::session_store::{MemorySessionStore, SessionStore};
+
+    let store = Arc::new(MemorySessionStore::new());
+    let store_dyn: Arc<dyn SessionStore> = store.clone();
+    let registry = SessionRegistry::new(
+        SessionConfig::with_ttl(Duration::from_secs(60)),
+        false,
+        store_dyn,
+        Arc::new(crate::event_store::MemoryEventStore::new()),
+        ServiceSource::Router {
+            router: create_test_router(),
+            factory: crate::transport::service::identity_factory(),
+        },
+        false,
+    );
+    let session = registry
+        .create(
+            create_test_router(),
+            crate::transport::service::identity_factory(),
+        )
+        .await
+        .expect("session should be created");
+
+    // Simulate an external backend record whose sliding expiry has not kept
+    // pace with the still-live in-process session.
+    let mut stale = store
+        .load(&session.id)
+        .await
+        .unwrap()
+        .expect("session should be persisted");
+    stale.last_accessed = std::time::SystemTime::UNIX_EPOCH;
+    stale.expires_at = std::time::SystemTime::now() + Duration::from_secs(1);
+    let stale_expiry = stale.expires_at;
+    store.save(&stale).await.unwrap();
+
+    assert!(registry.get(&session.id).await.is_some());
+
+    let refreshed = store
+        .load(&session.id)
+        .await
+        .unwrap()
+        .expect("live lookup should refresh the persistent record");
+    assert!(refreshed.last_accessed > stale.last_accessed);
+    assert!(refreshed.expires_at > stale_expiry);
+}
+
+#[derive(Clone, Default)]
+struct SaveFailingSessionStore {
+    inner: crate::session_store::MemorySessionStore,
+    save_attempts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl crate::session_store::SessionStore for SaveFailingSessionStore {
+    async fn create(
+        &self,
+        record: &mut crate::session_store::SessionRecord,
+    ) -> crate::session_store::Result<()> {
+        crate::session_store::SessionStore::create(&self.inner, record).await
+    }
+
+    async fn save(
+        &self,
+        _record: &crate::session_store::SessionRecord,
+    ) -> crate::session_store::Result<()> {
+        self.save_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Err(crate::session_store::SessionStoreError::Backend(
+            "intentional save failure".to_string(),
+        ))
+    }
+
+    async fn load(
+        &self,
+        id: &str,
+    ) -> crate::session_store::Result<Option<crate::session_store::SessionRecord>> {
+        crate::session_store::SessionStore::load(&self.inner, id).await
+    }
+
+    async fn delete(&self, id: &str) -> crate::session_store::Result<()> {
+        crate::session_store::SessionStore::delete(&self.inner, id).await
+    }
+}
+
+#[tokio::test]
+async fn live_session_get_survives_persistent_refresh_failure() {
+    let store = Arc::new(SaveFailingSessionStore::default());
+    let store_dyn: Arc<dyn crate::session_store::SessionStore> = store.clone();
+    let registry = SessionRegistry::new(
+        SessionConfig::default(),
+        false,
+        store_dyn,
+        Arc::new(crate::event_store::MemoryEventStore::new()),
+        ServiceSource::Router {
+            router: create_test_router(),
+            factory: crate::transport::service::identity_factory(),
+        },
+        false,
+    );
+    let session = registry
+        .create(
+            create_test_router(),
+            crate::transport::service::identity_factory(),
+        )
+        .await
+        .expect("session should be created");
+
+    let found = registry.get(&session.id).await;
+
+    assert!(found.is_some(), "store failure must not fail a live lookup");
+    assert_eq!(
+        store
+            .save_attempts
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "live lookup should attempt to refresh the external record"
+    );
+}
+
+#[derive(Clone)]
+struct GatedSaveSessionStore {
+    inner: crate::session_store::MemorySessionStore,
+    save_started: Arc<tokio::sync::Semaphore>,
+    allow_save: Arc<tokio::sync::Semaphore>,
+    delete_started: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for GatedSaveSessionStore {
+    fn default() -> Self {
+        Self {
+            inner: crate::session_store::MemorySessionStore::new(),
+            save_started: Arc::new(tokio::sync::Semaphore::new(0)),
+            allow_save: Arc::new(tokio::sync::Semaphore::new(0)),
+            delete_started: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::session_store::SessionStore for GatedSaveSessionStore {
+    async fn create(
+        &self,
+        record: &mut crate::session_store::SessionRecord,
+    ) -> crate::session_store::Result<()> {
+        crate::session_store::SessionStore::create(&self.inner, record).await
+    }
+
+    async fn save(
+        &self,
+        record: &crate::session_store::SessionRecord,
+    ) -> crate::session_store::Result<()> {
+        self.save_started.add_permits(1);
+        self.allow_save
+            .acquire()
+            .await
+            .expect("test semaphore should remain open")
+            .forget();
+        crate::session_store::SessionStore::save(&self.inner, record).await
+    }
+
+    async fn load(
+        &self,
+        id: &str,
+    ) -> crate::session_store::Result<Option<crate::session_store::SessionRecord>> {
+        crate::session_store::SessionStore::load(&self.inner, id).await
+    }
+
+    async fn delete(&self, id: &str) -> crate::session_store::Result<()> {
+        self.delete_started.add_permits(1);
+        crate::session_store::SessionStore::delete(&self.inner, id).await
+    }
+}
+
+#[tokio::test]
+async fn concurrent_remove_cannot_be_undone_by_live_session_refresh() {
+    use crate::session_store::SessionStore;
+
+    let store = Arc::new(GatedSaveSessionStore::default());
+    let store_dyn: Arc<dyn SessionStore> = store.clone();
+    let registry = Arc::new(SessionRegistry::new(
+        SessionConfig::default(),
+        false,
+        store_dyn,
+        Arc::new(crate::event_store::MemoryEventStore::new()),
+        ServiceSource::Router {
+            router: create_test_router(),
+            factory: crate::transport::service::identity_factory(),
+        },
+        false,
+    ));
+    let session = registry
+        .create(
+            create_test_router(),
+            crate::transport::service::identity_factory(),
+        )
+        .await
+        .expect("session should be created");
+    let session_id = session.id.clone();
+
+    let get_registry = registry.clone();
+    let get_session_id = session_id.clone();
+    let get_task = tokio::spawn(async move { get_registry.get(&get_session_id).await });
+    store
+        .save_started
+        .acquire()
+        .await
+        .expect("refresh should reach the store")
+        .forget();
+
+    let remove_registry = registry.clone();
+    let remove_session_id = session_id.clone();
+    let remove_task = tokio::spawn(async move { remove_registry.remove(&remove_session_id).await });
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), store.delete_started.acquire())
+            .await
+            .is_err(),
+        "persistent delete must wait until the in-flight refresh releases the registry read lock"
+    );
+
+    store.allow_save.add_permits(1);
+    assert!(get_task.await.unwrap().is_some());
+    assert!(remove_task.await.unwrap());
+    assert!(
+        store.inner.load(&session_id).await.unwrap().is_none(),
+        "the removal must delete after the refresh instead of being resurrected by it"
+    );
+}
+
+#[tokio::test]
 async fn test_session_store_record_carries_negotiated_protocol_version() {
     // Issue #786: stored record should reflect the negotiated protocol
     // version (taken from the initialize response), not the default the
