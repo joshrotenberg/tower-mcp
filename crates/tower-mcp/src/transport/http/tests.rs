@@ -120,6 +120,99 @@ async fn oauth_resource_server_setup_is_path_aware_and_audience_bound() {
 }
 
 #[cfg(feature = "oauth")]
+fn oauth_validate_adapter_app(audience: Option<&str>) -> axum::Router {
+    let resource = "http://localhost:3000/mcp";
+    let validator = crate::oauth::ValidateAdapter::new(crate::auth::StaticBearerValidator::new([
+        "valid-token".to_string(),
+    ]));
+    let validator = match audience {
+        Some(audience) => validator.with_audience(audience),
+        None => validator,
+    };
+    let metadata = crate::oauth::ProtectedResourceMetadata::new(resource)
+        .authorization_server("https://auth.example.com");
+
+    HttpTransport::new(create_test_router())
+        .disable_origin_validation()
+        .disable_host_validation()
+        .into_oauth_router_at(
+            "/mcp",
+            validator,
+            metadata,
+            crate::oauth::ScopePolicy::new(),
+        )
+        .unwrap()
+}
+
+#[cfg(feature = "oauth")]
+fn oauth_validate_adapter_request() -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("Authorization", "Bearer valid-token")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(initialize_body())
+        .unwrap()
+}
+
+#[cfg(feature = "oauth")]
+#[tokio::test]
+async fn oauth_validate_adapter_matching_audience_reaches_mcp_router() {
+    let response = oauth_validate_adapter_app(Some("http://localhost:3000/mcp"))
+        .oneshot(oauth_validate_adapter_request())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json.get("result").is_some(), "unexpected response: {json}");
+}
+
+#[cfg(feature = "oauth")]
+#[tokio::test]
+async fn oauth_validate_adapter_mismatched_audience_is_rejected() {
+    let response = oauth_validate_adapter_app(Some("http://localhost:3000/other"))
+        .oneshot(oauth_validate_adapter_request())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        response
+            .headers()
+            .get("WWW-Authenticate")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("audience")
+    );
+}
+
+#[cfg(feature = "oauth")]
+#[tokio::test]
+async fn oauth_validate_adapter_missing_audience_is_rejected() {
+    let response = oauth_validate_adapter_app(None)
+        .oneshot(oauth_validate_adapter_request())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        response
+            .headers()
+            .get("WWW-Authenticate")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("audience")
+    );
+}
+
+#[cfg(feature = "oauth")]
 #[test]
 fn oauth_resource_server_setup_validates_metadata() {
     let result = HttpTransport::new(create_test_router()).into_oauth_router(

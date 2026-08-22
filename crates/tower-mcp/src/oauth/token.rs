@@ -283,7 +283,18 @@ impl TokenValidator for JwtValidator {
 ///
 /// This allows reusing existing `Validate` implementations with the OAuth
 /// middleware. The adapter creates minimal `TokenClaims` from a successful
-/// validation.
+/// validation. Because [`Validate`](crate::auth::Validate) does not return a
+/// validated token audience, the adapter is audience-less by default and
+/// therefore fails closed when used with [`OAuthLayer`](super::OAuthLayer).
+/// Call [`with_audience`](Self::with_audience) to explicitly bind every
+/// credential accepted by the inner validator to one protected resource.
+///
+/// That binding is a server-side trust assertion, not validation of an `aud`
+/// claim carried by the credential. Only use it when the inner validator
+/// accepts credentials issued or provisioned exclusively for that resource.
+/// The configured value should exactly match
+/// [`ProtectedResourceMetadata::resource`](super::ProtectedResourceMetadata::resource);
+/// the outer OAuth layer still performs its independent audience check.
 ///
 /// # Example
 ///
@@ -292,17 +303,41 @@ impl TokenValidator for JwtValidator {
 /// use tower_mcp::oauth::ValidateAdapter;
 ///
 /// let bearer = StaticBearerValidator::new(vec!["token123".to_string()]);
-/// let oauth_validator = ValidateAdapter::new(bearer);
+/// let oauth_validator = ValidateAdapter::new(bearer)
+///     .with_audience("https://mcp.example.com");
 /// ```
 #[derive(Clone)]
 pub struct ValidateAdapter<V> {
     inner: V,
+    audience: Option<String>,
 }
 
 impl<V> ValidateAdapter<V> {
-    /// Create a new adapter wrapping an existing `Validate` implementation.
+    /// Create an audience-less adapter wrapping an existing `Validate`
+    /// implementation.
+    ///
+    /// Successful validations produce claims with no audience. This preserves
+    /// fail-closed behavior under [`OAuthLayer`](super::OAuthLayer), which
+    /// rejects those claims until [`with_audience`](Self::with_audience) binds
+    /// the adapter to the protected resource.
     pub fn new(inner: V) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            audience: None,
+        }
+    }
+
+    /// Bind every credential accepted by the inner validator to `audience`.
+    ///
+    /// The adapter emits this value as a single [`TokenAudience`] in the
+    /// normalized claims. It does not extract or verify an audience from the
+    /// credential itself. Treat this as a deployment-policy assertion: use it
+    /// only when every accepted credential is dedicated to this exact
+    /// protected resource, and configure the same canonical value in
+    /// [`ProtectedResourceMetadata`](super::ProtectedResourceMetadata).
+    pub fn with_audience(mut self, audience: impl Into<String>) -> Self {
+        self.audience = Some(audience.into());
+        self
     }
 }
 
@@ -313,7 +348,7 @@ impl<V: crate::auth::Validate> TokenValidator for ValidateAdapter<V> {
                 let claims = TokenClaims {
                     sub: info.as_ref().map(|i| i.client_id.clone()),
                     iss: None,
-                    aud: None,
+                    aud: self.audience.clone().map(TokenAudience::Single),
                     exp: None,
                     scope: None,
                     client_id: info.as_ref().map(|i| i.client_id.clone()),
@@ -1084,7 +1119,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_validate_adapter() {
+    async fn test_validate_adapter_is_audience_less_by_default() {
         use crate::auth::StaticBearerValidator;
 
         let bearer = StaticBearerValidator::new(vec!["valid-token".to_string()]);
@@ -1095,9 +1130,27 @@ mod tests {
 
         let claims = result.unwrap();
         assert!(claims.sub.is_some());
+        assert!(claims.aud.is_none());
+        assert!(!claims.audience_matches("https://mcp.example.com"));
 
         let result = adapter.validate_token("invalid-token").await;
         assert!(matches!(result, Err(OAuthError::InvalidToken { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_validate_adapter_binds_a_single_audience() {
+        use crate::auth::StaticBearerValidator;
+
+        let adapter = ValidateAdapter::new(StaticBearerValidator::new(["valid-token".to_string()]))
+            .with_audience("https://mcp.example.com");
+
+        let claims = adapter.validate_token("valid-token").await.unwrap();
+        assert!(matches!(
+            claims.aud.as_ref(),
+            Some(TokenAudience::Single(audience)) if audience == "https://mcp.example.com"
+        ));
+        assert!(claims.audience_matches("https://mcp.example.com"));
+        assert!(!claims.audience_matches("https://other.example.com"));
     }
 
     // JWKS-specific unit tests

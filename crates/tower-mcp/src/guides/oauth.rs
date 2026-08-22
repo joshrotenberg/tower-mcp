@@ -127,6 +127,39 @@ five-minute fallback TTL, and refreshes after an unknown key ID with a minimum
 refresh interval. Supply a custom `reqwest::Client` when the deployment needs
 specific TLS roots, proxy behavior, or tighter timeouts.
 
+### Bridge a resource-dedicated credential validator
+
+`ValidateAdapter` can reuse a header-credential
+[`Validate`](crate::auth::Validate)
+implementation when its accepted credentials are provisioned exclusively for
+one MCP resource:
+
+```rust
+use tower_mcp::auth::StaticBearerValidator;
+use tower_mcp::oauth::ValidateAdapter;
+
+let resource = "https://mcp.example.com/mcp";
+let validator = ValidateAdapter::new(StaticBearerValidator::new([
+    "dedicated-resource-token".to_string(),
+]))
+.with_audience(resource);
+```
+
+`with_audience` is a server-side binding assertion. It does not read an `aud`
+claim from the credential or prove that an authorization server issued the
+credential for that resource. Configure it with the exact same canonical URI
+as `ProtectedResourceMetadata::resource`, and use it only when the wrapped
+validator cannot accept the same credential at another resource. Credentials
+shared across services would turn that assertion into a token-substitution
+risk.
+
+`ValidateAdapter::new` deliberately emits no audience until this binding is
+configured, so `OAuthLayer` rejects its claims. Even after configuration,
+`OAuthLayer` still compares the emitted audience with the protected resource;
+the adapter does not disable or weaken that check. The adapter produces only
+minimal typed claims, so implement `TokenValidator` directly when issuer,
+expiry, scope, or other token claims must be validated and normalized.
+
 `ScopePolicy` uses exact scope matching by default. If the authorization server
 defines hierarchy, install an explicit matcher:
 
