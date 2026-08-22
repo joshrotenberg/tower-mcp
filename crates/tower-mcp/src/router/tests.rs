@@ -6702,6 +6702,75 @@ async fn expiry_is_disclosed_to_the_owner_and_to_nobody_else() {
     );
 }
 
+/// A listen filter is an existence probe over an arbitrary list of IDs, so it
+/// must not disclose even owner-visible expiry state while authorizing them.
+#[cfg(all(feature = "oauth", feature = "stateless"))]
+#[tokio::test]
+async fn task_subscription_authorization_hides_expired_and_foreign_tasks() {
+    fn as_principal(subject: &str) -> Extensions {
+        let mut extensions = tasks_client_extensions();
+        extensions.insert(crate::oauth::token::TokenClaims {
+            sub: Some(subject.to_string()),
+            iss: None,
+            aud: None,
+            exp: None,
+            scope: None,
+            client_id: None,
+            extra: HashMap::new(),
+        });
+        extensions
+    }
+
+    let store = std::sync::Arc::new(crate::async_task::MemoryTaskStore::new());
+    let (task_id, _) = store
+        .create_task("work", serde_json::json!({}), None, Some("alice".into()))
+        .await
+        .unwrap();
+    assert!(store.set_ttl(&task_id, 1).await.unwrap());
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let router = McpRouter::new().task_store(store).with_tasks();
+
+    let listen = |id: String, who: Extensions| {
+        let router = router.clone();
+        async move {
+            router
+                .handle(
+                    RequestId::Number(10),
+                    McpRequest::SubscriptionsListen(SubscriptionsListenParams {
+                        notifications: Some(SubscriptionFilter {
+                            task_ids: Some(vec![id]),
+                            ..Default::default()
+                        }),
+                        meta: None,
+                    }),
+                    who,
+                )
+                .await
+        }
+    };
+
+    let owner_saw = listen(task_id.clone(), as_principal("alice")).await;
+    let stranger_saw = listen(task_id.clone(), as_principal("bob")).await;
+    let never_issued = listen("never-issued".to_string(), as_principal("bob")).await;
+    let (
+        Err(crate::error::Error::JsonRpc(owner_error)),
+        Err(crate::error::Error::JsonRpc(stranger_error)),
+        Err(crate::error::Error::JsonRpc(missing_error)),
+    ) = (owner_saw, stranger_saw, never_issued)
+    else {
+        panic!("expired, foreign, and missing task subscriptions must all be refused");
+    };
+
+    for error in [&owner_error, &stranger_error] {
+        assert_eq!(error.code, missing_error.code);
+        assert_eq!(error.data, missing_error.data);
+        assert_eq!(
+            error.message.replace(&task_id, "<id>"),
+            missing_error.message.replace("never-issued", "<id>")
+        );
+    }
+}
+
 /// #1249: a task that expires between authorization and the operation is
 /// reported to its owner as expired, not as one that never existed. The
 /// operation returning nothing is not enough to conclude "missing"; resolving

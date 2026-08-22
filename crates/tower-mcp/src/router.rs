@@ -2790,6 +2790,14 @@ impl McpRouter {
                         ),
                     ));
                 }
+                if self.final_tasks_enabled()
+                    && let Some(task_ids) = requested.task_ids.as_deref()
+                {
+                    for task_id in task_ids {
+                        self.authorize_task_subscription(task_id, &extensions)
+                            .await?;
+                    }
+                }
                 let notifications = crate::transport::subscriptions::accepted_subscription_filter(
                     requested,
                     self.final_tasks_enabled(),

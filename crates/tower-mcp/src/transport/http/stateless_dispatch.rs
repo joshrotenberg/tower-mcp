@@ -476,6 +476,10 @@ pub(super) async fn handle_modern_subscriptions_listen_sse(
     };
     let mut ext = crate::router::Extensions::new();
     ext.insert(state.protocol_support.clone());
+    #[cfg(feature = "oauth")]
+    if let Some(claims) = http_extensions.get::<crate::oauth::token::TokenClaims>() {
+        ext.insert(claims.clone());
+    }
     stash_per_request_meta(&request, &mut ext);
     crate::transport::extension_bridge::apply_extension_bridges(
         &state.extension_bridges,

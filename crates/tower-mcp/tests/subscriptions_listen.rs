@@ -460,7 +460,7 @@ mod tasks {
                 "subscriptions/listen",
                 serde_json::json!({
                     "_meta": meta(true),
-                    "notifications": { "taskIds": [task_id, "some-other-task"] },
+                    "notifications": { "taskIds": [task_id] },
                 }),
             ))
             .await
@@ -478,7 +478,7 @@ mod tasks {
             "stream must begin with an acknowledgment: {body}"
         );
         assert!(
-            body.contains(&format!("\"taskIds\":[\"{task_id}\",\"some-other-task\"]")),
+            body.contains(&format!("\"taskIds\":[\"{task_id}\"]")),
             "the acknowledgment must echo the accepted task IDs: {body}"
         );
         assert!(
@@ -499,7 +499,7 @@ mod tasks {
         );
     }
 
-    /// A subscriber that named a different task hears nothing.
+    /// A subscriber that named a different owned task never receives this one.
     #[tokio::test]
     async fn an_unnamed_task_never_reaches_a_stream() {
         let (app, handle) = HttpTransport::new(task_router())
@@ -523,6 +523,22 @@ mod tasks {
         let created: serde_json::Value = serde_json::from_str(&body_string(create).await).unwrap();
         let task_id = created["result"]["taskId"].as_str().unwrap().to_string();
 
+        let other = app
+            .clone()
+            .oneshot(final_request(
+                "call-2",
+                "tools/call",
+                serde_json::json!({
+                    "_meta": meta(true),
+                    "name": "slow",
+                    "arguments": {},
+                }),
+            ))
+            .await
+            .unwrap();
+        let other: serde_json::Value = serde_json::from_str(&body_string(other).await).unwrap();
+        let other_task_id = other["result"]["taskId"].as_str().unwrap().to_string();
+
         let listen = app
             .clone()
             .oneshot(final_request(
@@ -530,7 +546,7 @@ mod tasks {
                 "subscriptions/listen",
                 serde_json::json!({
                     "_meta": meta(true),
-                    "notifications": { "taskIds": ["a-task-this-client-does-not-own"] },
+                    "notifications": { "taskIds": [other_task_id] },
                 }),
             ))
             .await
@@ -551,6 +567,171 @@ mod tasks {
             !body.contains(&task_id),
             "the unrelated task ID must not leak: {body}"
         );
+    }
+
+    #[cfg(feature = "oauth")]
+    fn oauth_token(subject: &str, audience: &str) -> String {
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &serde_json::json!({
+                "sub": subject,
+                "aud": audience,
+                "scope": "mcp:read",
+            }),
+            &jsonwebtoken::EncodingKey::from_secret(b"subscription-auth-test-secret"),
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "oauth")]
+    fn authenticated_final_request(
+        id: &str,
+        method: &str,
+        params: serde_json::Value,
+        token: &str,
+    ) -> Request<Body> {
+        let mut request = final_request(id, method, params);
+        request.headers_mut().insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        request
+    }
+
+    /// The protected HTTP builder must carry validated claims through the
+    /// transport-owned listen path, and the router must enforce TaskOwner
+    /// before registering the stream.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn oauth_listen_accepts_only_the_task_owner() {
+        const RESOURCE: &str = "https://mcp.example.com/subscriptions";
+
+        let metadata = tower_mcp::oauth::ProtectedResourceMetadata::new(RESOURCE)
+            .authorization_server("https://auth.example.com")
+            .scope("mcp:read");
+        let validator =
+            tower_mcp::oauth::JwtValidator::from_secret(b"subscription-auth-test-secret")
+                .disable_exp_validation();
+        let (app, handle) = HttpTransport::new(task_router())
+            .disable_origin_validation()
+            .disable_host_validation()
+            .into_oauth_router_with_handle(
+                validator,
+                metadata,
+                tower_mcp::oauth::ScopePolicy::new().default_scope("mcp:read"),
+            )
+            .unwrap();
+        let alice = oauth_token("alice", RESOURCE);
+        let bob = oauth_token("bob", RESOURCE);
+
+        let create = app
+            .clone()
+            .oneshot(authenticated_final_request(
+                "call-alice",
+                "tools/call",
+                serde_json::json!({
+                    "_meta": meta(true),
+                    "name": "slow",
+                    "arguments": {},
+                }),
+                &alice,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::OK);
+        let created: serde_json::Value = serde_json::from_str(&body_string(create).await).unwrap();
+        let task_id = created["result"]["taskId"].as_str().unwrap().to_string();
+
+        let listen_params = |task_id: &str| {
+            serde_json::json!({
+                "_meta": meta(true),
+                "notifications": { "taskIds": [task_id] },
+            })
+        };
+        let foreign = app
+            .clone()
+            .oneshot(authenticated_final_request(
+                "listen-bob",
+                "subscriptions/listen",
+                listen_params(&task_id),
+                &bob,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(foreign.status(), StatusCode::BAD_REQUEST);
+        let foreign: serde_json::Value = serde_json::from_str(&body_string(foreign).await).unwrap();
+
+        let missing_id = "task_that_was_never_issued";
+        let missing = app
+            .clone()
+            .oneshot(authenticated_final_request(
+                "listen-missing",
+                "subscriptions/listen",
+                listen_params(missing_id),
+                &bob,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        let missing: serde_json::Value = serde_json::from_str(&body_string(missing).await).unwrap();
+        assert_eq!(foreign["error"]["code"], missing["error"]["code"]);
+        assert_eq!(foreign["error"]["data"], missing["error"]["data"]);
+        assert_eq!(
+            foreign["error"]["message"]
+                .as_str()
+                .unwrap()
+                .replace(&task_id, "<id>"),
+            missing["error"]["message"]
+                .as_str()
+                .unwrap()
+                .replace(missing_id, "<id>"),
+            "a foreign task must look exactly like a missing task"
+        );
+
+        let mixed = app
+            .clone()
+            .oneshot(authenticated_final_request(
+                "listen-mixed",
+                "subscriptions/listen",
+                serde_json::json!({
+                    "_meta": meta(true),
+                    "notifications": { "taskIds": [&task_id, missing_id] },
+                }),
+                &alice,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(mixed.status(), StatusCode::BAD_REQUEST);
+        let mixed: serde_json::Value = serde_json::from_str(&body_string(mixed).await).unwrap();
+        assert_eq!(mixed["error"]["code"], missing["error"]["code"]);
+        assert_eq!(handle.subscription_count(), 0);
+
+        let anonymous = app
+            .clone()
+            .oneshot(final_request(
+                "listen-anonymous",
+                "subscriptions/listen",
+                listen_params(&task_id),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+        let owned = app
+            .oneshot(authenticated_final_request(
+                "listen-alice",
+                "subscriptions/listen",
+                listen_params(&task_id),
+                &alice,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(owned.status(), StatusCode::OK);
+        assert_eq!(handle.subscription_count(), 1);
+        assert_eq!(handle.close_subscriptions(), 1);
+        let body = body_string(owned).await;
+        assert!(body.contains("notifications/subscriptions/acknowledged"));
+        assert!(body.contains(&task_id));
     }
 
     /// SEP-2663: requesting task notifications without declaring the extension

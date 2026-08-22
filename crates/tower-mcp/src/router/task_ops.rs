@@ -157,6 +157,39 @@ impl McpRouter {
         }
     }
 
+    /// Verify the caller may subscribe to status changes for this task.
+    ///
+    /// Listen filters deliberately collapse missing, expired, and foreign
+    /// task IDs into the same not-found response. Unlike a direct task method,
+    /// a subscription request must not reveal which candidate IDs were once
+    /// valid, even to their former owner.
+    #[cfg(feature = "stateless")]
+    pub(super) async fn authorize_task_subscription(
+        &self,
+        task_id: &str,
+        extensions: &crate::context::Extensions,
+    ) -> Result<()> {
+        let owner = self
+            .inner
+            .task_store
+            .task_owner(task_id)
+            .await
+            .map_err(|error| self.task_store_error(TaskOperation::Get, Some(task_id), error))?;
+        let allowed = owner.as_ref().is_some_and(|owner| {
+            crate::async_task::owner_matches(owner, request_principal(extensions).as_deref())
+        });
+        if allowed {
+            return Ok(());
+        }
+
+        tracing::debug!(
+            target: "mcp::tasks",
+            task_id = %task_id,
+            "task subscription refused: task is absent or principal does not own it"
+        );
+        Err(self.task_error(TaskOperation::Get, Some(task_id), TaskFailure::NotFound))
+    }
+
     /// Serve a final `tasks/get` as a status-discriminated `DetailedTask`.
     pub(super) async fn final_get_task(
         &self,
