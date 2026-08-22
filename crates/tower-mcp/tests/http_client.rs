@@ -603,7 +603,7 @@ async fn test_http_client_complete_resource_uri() {
 
     // Complete with "src/" prefix
     let result = client
-        .complete_resource_uri("file:///{path}", "path", "src/")
+        .complete_resource_uri("file:///{+path}", "path", "src/")
         .await
         .unwrap();
     assert_eq!(result.completion.values.len(), 2);
@@ -617,7 +617,7 @@ async fn test_http_client_complete_resource_uri() {
 
     // Complete with "C" prefix
     let result = client
-        .complete_resource_uri("file:///{path}", "path", "C")
+        .complete_resource_uri("file:///{+path}", "path", "C")
         .await
         .unwrap();
     assert_eq!(result.completion.values, vec!["Cargo.toml"]);

@@ -127,6 +127,7 @@ use crate::protocol::{
     ListTasksParams, ListTasksResult, LogLevel, LoggingMessageParams, ProgressParams,
     ProgressToken, RequestId, TaskObject, TaskStatus,
 };
+use crate::session::SessionState;
 
 /// A notification to be sent to the client
 #[derive(Debug, Clone)]
@@ -341,6 +342,11 @@ pub struct RequestContext {
     client_requester: Option<ClientRequesterHandle>,
     /// Extensions for passing data from router/middleware to handlers
     extensions: Arc<Extensions>,
+    /// Logical MCP session for session-scoped state and authorization claims.
+    ///
+    /// Router-created contexts always attach this. Manually constructed
+    /// contexts leave it absent.
+    session: Option<SessionState>,
     /// Minimum log level set by the client (shared with router for dynamic updates)
     min_log_level: Option<Arc<RwLock<LogLevel>>>,
     /// Resource URIs subscribed by this legacy session. Router-created
@@ -440,6 +446,7 @@ impl RequestContext {
             client_requester: None,
             final_lifecycle: false,
             extensions: Arc::new(Extensions::new()),
+            session: None,
             min_log_level: None,
             resource_subscriptions: None,
         }
@@ -527,6 +534,12 @@ impl RequestContext {
         self
     }
 
+    /// Attach the logical MCP session serving this request.
+    pub(crate) fn with_session(mut self, session: SessionState) -> Self {
+        self.session = Some(session);
+        self
+    }
+
     /// Get a reference to a value from the extensions map.
     ///
     /// Returns `None` if no value of the given type has been inserted.
@@ -565,6 +578,16 @@ impl RequestContext {
     /// Get a reference to the extensions.
     pub fn extensions(&self) -> &Extensions {
         &self.extensions
+    }
+
+    /// Return the logical MCP session serving this request.
+    ///
+    /// Router-created contexts return `Some`, allowing handlers to read
+    /// session-scoped values such as authorization claims. A context created
+    /// directly with [`RequestContext::new`] has no associated session and
+    /// returns `None`.
+    pub fn session(&self) -> Option<&SessionState> {
+        self.session.as_ref()
     }
 
     /// SEP-2575 per-request `_meta` (protocol version, client info, client

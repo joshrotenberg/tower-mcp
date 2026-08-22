@@ -4713,6 +4713,11 @@ fn without_server_notifications_composes_with_explicit_overrides() {
 async fn test_completion_handler() {
     let router = McpRouter::new()
         .server_info("test", "1.0")
+        .prompt(
+            crate::prompt::PromptBuilder::new("test-prompt")
+                .description("Completion target")
+                .user_message("test"),
+        )
         .completion_handler(|params: CompleteParams| async move {
             // Return suggestions based on the argument value
             let prefix = &params.argument.value;
@@ -4785,6 +4790,457 @@ async fn test_completion_handler() {
         }
         _ => panic!("Expected Complete response"),
     }
+}
+
+async fn request_completion(
+    router: &mut McpRouter,
+    request_id: i64,
+    reference: CompletionReference,
+    extensions: Extensions,
+    meta: Option<serde_json::Value>,
+) -> std::result::Result<CompleteResult, JsonRpcError> {
+    let request = RouterRequest {
+        id: RequestId::Number(request_id),
+        inner: McpRequest::Complete(CompleteParams {
+            reference,
+            argument: CompletionArgument::new("value", "a"),
+            context: None,
+            meta,
+        }),
+        extensions,
+    };
+    let response = router.ready().await.unwrap().call(request).await.unwrap();
+    match response.inner {
+        Ok(McpResponse::Complete(result)) => Ok(result),
+        Err(error) => Err(error),
+        other => panic!("expected completion response, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn completion_handler_with_context_receives_request_state() {
+    #[derive(Clone)]
+    struct RouterState(&'static str);
+    #[derive(Clone)]
+    struct RequestState(&'static str);
+    #[derive(Clone)]
+    struct SessionClaim(&'static str);
+
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let mut router = McpRouter::new()
+        .with_state(RouterState("router"))
+        .prompt(
+            crate::prompt::PromptBuilder::new("contextual")
+                .description("Context completion target")
+                .user_message("test"),
+        )
+        .completion_handler_with_context(|ctx: RequestContext, _params| async move {
+            assert_eq!(ctx.request_id(), &RequestId::Number(41));
+            assert_eq!(ctx.extension::<RouterState>().unwrap().0, "router");
+            assert_eq!(ctx.extension::<RequestState>().unwrap().0, "request");
+            assert_eq!(
+                ctx.session()
+                    .and_then(|session| session.get::<SessionClaim>())
+                    .unwrap()
+                    .0,
+                "session"
+            );
+            assert_eq!(
+                ctx.progress_token(),
+                Some(&ProgressToken::String("completion-progress".to_string()))
+            );
+            assert!(ctx.is_cancelled());
+            assert!(ctx.negotiated_extensions().is_some());
+            Ok(CompleteResult::new(vec!["authorized".to_string()]))
+        });
+    router.session().insert(SessionClaim("session"));
+    init_router(&mut router).await;
+
+    let mut extensions = Extensions::new();
+    extensions.insert(RequestState("request"));
+    extensions.insert(cancellation);
+    let result = request_completion(
+        &mut router,
+        41,
+        CompletionReference::prompt("contextual"),
+        extensions,
+        Some(serde_json::json!({"progressToken": "completion-progress"})),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.completion.values, vec!["authorized"]);
+
+    let error = request_completion(
+        &mut router,
+        42,
+        CompletionReference::prompt("contextual"),
+        Extensions::new(),
+        Some(serde_json::json!({"progressToken": true})),
+    )
+    .await
+    .expect_err("a malformed progress token must be rejected before dispatch");
+    assert_eq!(error.code, crate::error::ErrorCode::InvalidParams as i32);
+}
+
+#[tokio::test]
+async fn completion_denies_hidden_disabled_and_unknown_prompts_before_dispatch() {
+    use crate::filter::CapabilityFilter;
+    use crate::prompt::{Prompt, PromptBuilder};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler_calls = calls.clone();
+    let mut router = McpRouter::new()
+        .prompt(PromptBuilder::new("public").user_message("public"))
+        .prompt(PromptBuilder::new("hidden").user_message("hidden"))
+        .prompt(PromptBuilder::new("disabled").user_message("disabled"))
+        .prompt_filter(CapabilityFilter::new(|_, prompt: &Prompt| {
+            prompt.name != "hidden"
+        }))
+        .completion_handler(move |_params| {
+            let calls = handler_calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(CompleteResult::new(vec!["ok".to_string()]))
+            }
+        });
+    router.disable_prompt("disabled");
+    init_router(&mut router).await;
+
+    request_completion(
+        &mut router,
+        1,
+        CompletionReference::prompt("public"),
+        Extensions::new(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    for (request_id, name) in [(2, "hidden"), (3, "disabled"), (4, "unknown")] {
+        let error = request_completion(
+            &mut router,
+            request_id,
+            CompletionReference::prompt(name),
+            Extensions::new(),
+            None,
+        )
+        .await
+        .expect_err("an inaccessible prompt must not reach completion");
+        let Error::JsonRpc(expected) = prompt_not_found(name) else {
+            unreachable!("prompt_not_found always returns JSON-RPC")
+        };
+        assert_eq!(error.code, expected.code);
+        assert_eq!(error.message, expected.message);
+        assert_eq!(error.data, expected.data);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn completion_authorizes_resources_and_templates_before_dispatch() {
+    use crate::filter::{CapabilityFilter, ResourceTemplateFilter};
+    use crate::resource::{Resource, ResourceBuilder, ResourceTemplate, ResourceTemplateBuilder};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let template = |pattern: &'static str, name: &'static str| {
+        ResourceTemplateBuilder::new(pattern)
+            .name(name)
+            .handler(|uri, _variables| async move { Ok(ReadResourceResult::text(uri, "body")) })
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler_calls = calls.clone();
+    let mut router = McpRouter::new()
+        .resource(
+            ResourceBuilder::new("memory://public")
+                .name("Public")
+                .text("public"),
+        )
+        .resource(
+            ResourceBuilder::new("memory://hidden")
+                .name("Hidden")
+                .text("hidden"),
+        )
+        .resource(
+            ResourceBuilder::new("memory://disabled")
+                .name("Disabled")
+                .text("disabled"),
+        )
+        .resource_template(template("records://public/{id}", "Public Template"))
+        .resource_template(template("records://hidden/{id}", "Hidden Template"))
+        .resource_filter(CapabilityFilter::new(|_, resource: &Resource| {
+            resource.name != "Hidden"
+        }))
+        .resource_template_filter(ResourceTemplateFilter::new(
+            |_, template: &ResourceTemplate| template.name != "Hidden Template",
+        ))
+        .completion_handler(move |_params| {
+            let calls = handler_calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(CompleteResult::new(vec!["ok".to_string()]))
+            }
+        });
+    router.disable_resource("memory://disabled");
+    init_router(&mut router).await;
+
+    for (request_id, uri) in [
+        (1, "memory://public"),
+        (2, "records://public/{id}"),
+        (3, "records://public/42"),
+    ] {
+        request_completion(
+            &mut router,
+            request_id,
+            CompletionReference::resource(uri),
+            Extensions::new(),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+    for (request_id, uri) in [
+        (4, "memory://hidden"),
+        (5, "memory://disabled"),
+        (6, "memory://unknown"),
+        (7, "records://hidden/{id}"),
+        (8, "records://hidden/42"),
+    ] {
+        let error = request_completion(
+            &mut router,
+            request_id,
+            CompletionReference::resource(uri),
+            Extensions::new(),
+            None,
+        )
+        .await
+        .expect_err("an inaccessible resource must not reach completion");
+        let expected = JsonRpcError::resource_not_found(uri);
+        assert_eq!(error.code, expected.code);
+        assert_eq!(error.message, expected.message);
+        assert_eq!(error.data, expected.data);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn completion_resource_template_fails_closed_without_template_filter() {
+    use crate::filter::CapabilityFilter;
+    use crate::resource::{Resource, ResourceTemplateBuilder};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler_calls = calls.clone();
+    let mut router = McpRouter::new()
+        .resource_template(
+            ResourceTemplateBuilder::new("vault://{id}")
+                .name("Vault")
+                .handler(
+                    |uri, _variables| async move { Ok(ReadResourceResult::text(uri, "secret")) },
+                ),
+        )
+        .resource_filter(CapabilityFilter::new(|_, _resource: &Resource| true))
+        .completion_handler(move |_params| {
+            let calls = handler_calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(CompleteResult::new(vec!["secret".to_string()]))
+            }
+        });
+    init_router(&mut router).await;
+
+    let error = request_completion(
+        &mut router,
+        1,
+        CompletionReference::resource("vault://{id}"),
+        Extensions::new(),
+        None,
+    )
+    .await
+    .expect_err("a resource filter cannot authorize a template");
+    let expected = JsonRpcError::resource_not_found("vault://{id}");
+    assert_eq!(error.code, expected.code);
+    assert_eq!(error.message, expected.message);
+    assert_eq!(error.data, expected.data);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn completion_preserves_explicit_filter_denial_behavior() {
+    use crate::filter::{CapabilityFilter, DenialBehavior};
+    use crate::prompt::{Prompt, PromptBuilder};
+    use crate::resource::{Resource, ResourceBuilder};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler_calls = calls.clone();
+    let mut router = McpRouter::new()
+        .prompt(PromptBuilder::new("premium").user_message("premium"))
+        .resource(
+            ResourceBuilder::new("vault://secret")
+                .name("Secret")
+                .text("secret"),
+        )
+        .prompt_filter(
+            CapabilityFilter::new(|_, _prompt: &Prompt| false)
+                .denial_behavior(DenialBehavior::Unauthorized),
+        )
+        .resource_filter(
+            CapabilityFilter::new(|_, _resource: &Resource| false).denial_behavior(
+                DenialBehavior::custom(|target| {
+                    Error::JsonRpc(
+                        JsonRpcError::forbidden("completion policy denied")
+                            .with_data(serde_json::json!({"target": target})),
+                    )
+                }),
+            ),
+        )
+        .completion_handler(move |_params| {
+            let calls = handler_calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(CompleteResult::new(vec![]))
+            }
+        });
+    init_router(&mut router).await;
+
+    let prompt_error = request_completion(
+        &mut router,
+        1,
+        CompletionReference::prompt("premium"),
+        Extensions::new(),
+        None,
+    )
+    .await
+    .expect_err("explicit Unauthorized must be preserved");
+    assert_eq!(prompt_error.code, -32007);
+    assert!(prompt_error.message.contains("Unauthorized"));
+
+    let resource_error = request_completion(
+        &mut router,
+        2,
+        CompletionReference::resource("vault://secret"),
+        Extensions::new(),
+        None,
+    )
+    .await
+    .expect_err("a custom denial must be preserved");
+    assert_eq!(resource_error.code, -32007);
+    assert_eq!(resource_error.message, "completion policy denied");
+    assert_eq!(
+        resource_error.data,
+        Some(serde_json::json!({"target": "vault://secret"}))
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(feature = "dynamic-tools")]
+#[tokio::test]
+async fn completion_resolves_dynamic_prompts_resources_and_templates() {
+    use crate::prompt::PromptBuilder;
+    use crate::resource::{ResourceBuilder, ResourceTemplateBuilder};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (router, prompt_registry) = McpRouter::new()
+        .resource(
+            ResourceBuilder::new("memory://shadow")
+                .name("Denied Static Shadow")
+                .text("static"),
+        )
+        .resource_filter(crate::ResourceFilter::new(|_, resource| {
+            resource.name.starts_with("Dynamic")
+        }))
+        .resource_template_filter(crate::ResourceTemplateFilter::new(|_, _template| true))
+        .with_dynamic_prompts();
+    let initializer_registry = prompt_registry.clone();
+    let router = router.dynamic_prompt_initializer(move || {
+        if !initializer_registry.contains("dynamic-prompt") {
+            initializer_registry
+                .register(PromptBuilder::new("dynamic-prompt").user_message("dynamic"));
+        }
+        Ok(())
+    });
+    let (router, resource_registry) = router.with_dynamic_resources();
+    resource_registry.register(
+        ResourceBuilder::new("memory://dynamic")
+            .name("Dynamic Resource")
+            .text("dynamic"),
+    );
+    resource_registry.register(
+        ResourceBuilder::new("memory://shadow")
+            .name("Dynamic Shadow")
+            .text("dynamic"),
+    );
+    let (router, template_registry) = router.with_dynamic_resource_templates();
+    template_registry.register(
+        ResourceTemplateBuilder::new("dynamic://{id}")
+            .name("Dynamic Template")
+            .handler(|uri, _variables| async move { Ok(ReadResourceResult::text(uri, "dynamic")) }),
+    );
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler_calls = calls.clone();
+    let mut router = router.completion_handler(move |_params| {
+        let calls = handler_calls.clone();
+        async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(CompleteResult::new(vec!["dynamic".to_string()]))
+        }
+    });
+    init_router(&mut router).await;
+
+    request_completion(
+        &mut router,
+        1,
+        CompletionReference::prompt("dynamic-prompt"),
+        Extensions::new(),
+        None,
+    )
+    .await
+    .unwrap();
+    request_completion(
+        &mut router,
+        2,
+        CompletionReference::resource("memory://dynamic"),
+        Extensions::new(),
+        None,
+    )
+    .await
+    .unwrap();
+    request_completion(
+        &mut router,
+        3,
+        CompletionReference::resource("dynamic://{id}"),
+        Extensions::new(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+    let error = request_completion(
+        &mut router,
+        4,
+        CompletionReference::resource("memory://shadow"),
+        Extensions::new(),
+        None,
+    )
+    .await
+    .expect_err("a denied static resource must not fall through to its dynamic shadow");
+    let expected = JsonRpcError::resource_not_found("memory://shadow");
+    assert_eq!(error.code, expected.code);
+    assert_eq!(error.message, expected.message);
+    assert_eq!(error.data, expected.data);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
 }
 
 #[tokio::test]

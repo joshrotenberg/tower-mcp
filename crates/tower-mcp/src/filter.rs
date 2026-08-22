@@ -329,6 +329,22 @@ impl<T: Filterable> CapabilityFilter<T> {
         self.denial.to_error(name)
     }
 
+    /// Return a canonical not-found error for the default hidden-capability
+    /// policy while preserving an explicitly configured denial response.
+    ///
+    /// Callers that have a capability-specific unknown error use this to
+    /// keep filtered and absent targets indistinguishable without overriding
+    /// an application's deliberate `Unauthorized` or `Custom` behavior.
+    pub(crate) fn denial_error_or_not_found<F>(&self, name: &str, not_found: F) -> Error
+    where
+        F: FnOnce() -> Error,
+    {
+        match &self.denial {
+            DenialBehavior::NotFound => not_found(),
+            DenialBehavior::Unauthorized | DenialBehavior::Custom(_) => self.denial.to_error(name),
+        }
+    }
+
     /// Create a filter that only shows capabilities whose names are in the list.
     ///
     /// Capabilities not in the list are hidden. This is useful for exposing

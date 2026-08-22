@@ -928,6 +928,8 @@ impl McpRouter {
     ///
     /// The handler receives `CompleteParams` containing the reference (prompt or resource)
     /// and the argument being completed, and should return completion suggestions.
+    /// The referenced prompt, resource, or resource template must be registered, enabled,
+    /// and visible to the request before this handler is invoked.
     ///
     /// # Example
     ///
@@ -957,7 +959,37 @@ impl McpRouter {
         Fut: Future<Output = Result<CompleteResult>> + Send + 'static,
     {
         Arc::make_mut(&mut self.inner).completion_handler =
-            Some(Arc::new(move |params| Box::pin(handler(params))));
+            Some(Arc::new(move |_ctx, params| Box::pin(handler(params))));
+        self
+    }
+
+    /// Register a request-aware completion handler for `completion/complete` requests.
+    ///
+    /// The [`RequestContext`] exposes router and per-request extensions, negotiated
+    /// capabilities, progress, and cancellation. As with [`Self::completion_handler`],
+    /// the referenced capability is resolved and authorized before dispatch.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::{CompleteParams, CompleteResult, McpRouter, RequestContext};
+    ///
+    /// let router = McpRouter::new().completion_handler_with_context(
+    ///     |ctx: RequestContext, params: CompleteParams| async move {
+    ///         if ctx.is_cancelled() {
+    ///             return Ok(CompleteResult::new(vec![]));
+    ///         }
+    ///         Ok(CompleteResult::new(vec![params.argument.value]))
+    ///     },
+    /// );
+    /// ```
+    pub fn completion_handler_with_context<F, Fut>(mut self, handler: F) -> Self
+    where
+        F: Fn(RequestContext, CompleteParams) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<CompleteResult>> + Send + 'static,
+    {
+        Arc::make_mut(&mut self.inner).completion_handler =
+            Some(Arc::new(move |ctx, params| Box::pin(handler(ctx, params))));
         self
     }
 

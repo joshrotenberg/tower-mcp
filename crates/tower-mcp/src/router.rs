@@ -38,10 +38,19 @@ use crate::tool::Tool;
 
 /// Type alias for completion handler function
 pub(crate) type CompletionHandler = Arc<
-    dyn Fn(CompleteParams) -> Pin<Box<dyn Future<Output = Result<CompleteResult>> + Send>>
+    dyn Fn(
+            RequestContext,
+            CompleteParams,
+        ) -> Pin<Box<dyn Future<Output = Result<CompleteResult>> + Send>>
         + Send
         + Sync,
 >;
+
+fn prompt_not_found(name: &str) -> Error {
+    Error::JsonRpc(JsonRpcError::method_not_found(&format!(
+        "Prompt not found: {name}"
+    )))
+}
 
 /// Releases a live task's registry entry however its handler leaves.
 ///
@@ -314,6 +323,31 @@ impl McpRouter {
         Ok(())
     }
 
+    /// Authorize a resource-template completion without disclosing whether
+    /// the referenced template exists under the default denial policy.
+    fn authorize_completion_resource_template(
+        &self,
+        context: &CapabilityFilterContext<'_>,
+        template: &ResourceTemplate,
+        target: &str,
+    ) -> Result<()> {
+        if let Some(filter) = &self.inner.resource_template_filter {
+            if !filter.is_visible_with_context(context, template) {
+                return Err(filter.denial_error_or_not_found(target, || {
+                    Error::JsonRpc(JsonRpcError::resource_not_found(target))
+                }));
+            }
+        } else if let Some(filter) = &self.inner.resource_filter {
+            // An exact-resource filter cannot authorize a template. Match
+            // resources/read's fail-closed policy, but use the completion
+            // reference's canonical unknown response for default NotFound.
+            return Err(filter.denial_error_or_not_found(target, || {
+                Error::JsonRpc(JsonRpcError::resource_not_found(target))
+            }));
+        }
+        Ok(())
+    }
+
     /// Authorize access to an exact statically registered resource.
     ///
     /// Legacy resource subscriptions deliberately retain their existing
@@ -347,6 +381,146 @@ impl McpRouter {
         }
 
         Ok(())
+    }
+
+    /// Authorize the capability named by a completion request.
+    ///
+    /// Completion is a second access path to prompts and resources, so it
+    /// must resolve and authorize the same winning registration as the
+    /// ordinary get/read paths before the application handler sees the
+    /// request. In particular, a denied static registration must not fall
+    /// through to a dynamic registration with the same name or URI.
+    fn authorize_completion_reference(
+        &self,
+        request_extensions: &Extensions,
+        reference: &CompletionReference,
+    ) -> Result<()> {
+        match reference {
+            CompletionReference::Prompt { name } => {
+                #[cfg(feature = "dynamic-tools")]
+                if let Some(initializer) = &self.inner.prompt_initializer {
+                    initializer()?;
+                }
+
+                if self.inner.disabled_prompts.read().unwrap().contains(name) {
+                    return Err(prompt_not_found(name));
+                }
+
+                let prompt = self.inner.prompts.get(name).cloned();
+                #[cfg(feature = "dynamic-tools")]
+                let prompt = prompt.or_else(|| {
+                    self.inner
+                        .dynamic_prompts
+                        .as_ref()
+                        .and_then(|dynamic| dynamic.get(name))
+                });
+                let prompt = prompt.ok_or_else(|| prompt_not_found(name))?;
+
+                let context = self.capability_filter_context(
+                    request_extensions,
+                    CapabilityOperation::Access { target: name },
+                );
+                if let Some(filter) = &self.inner.prompt_filter
+                    && !filter.is_visible_with_context(&context, &prompt)
+                {
+                    return Err(filter.denial_error_or_not_found(name, || prompt_not_found(name)));
+                }
+                Ok(())
+            }
+            CompletionReference::Resource { uri } => {
+                if self.inner.disabled_resources.read().unwrap().contains(uri) {
+                    return Err(Error::JsonRpc(JsonRpcError::resource_not_found(uri)));
+                }
+
+                let context = self.capability_filter_context(
+                    request_extensions,
+                    CapabilityOperation::Access { target: uri },
+                );
+
+                // Exact resources take precedence over templates, matching
+                // resources/read. Static resources likewise shadow dynamic
+                // resources with the same URI.
+                if let Some(resource) = self.inner.resources.get(uri) {
+                    if let Some(filter) = &self.inner.resource_filter
+                        && !filter.is_visible_with_context(&context, resource)
+                    {
+                        return Err(filter.denial_error_or_not_found(uri, || {
+                            Error::JsonRpc(JsonRpcError::resource_not_found(uri))
+                        }));
+                    }
+                    return Ok(());
+                }
+                #[cfg(feature = "dynamic-tools")]
+                if let Some(resource) = self
+                    .inner
+                    .dynamic_resources
+                    .as_ref()
+                    .and_then(|dynamic| dynamic.get(uri))
+                {
+                    if let Some(filter) = &self.inner.resource_filter
+                        && !filter.is_visible_with_context(&context, &resource)
+                    {
+                        return Err(filter.denial_error_or_not_found(uri, || {
+                            Error::JsonRpc(JsonRpcError::resource_not_found(uri))
+                        }));
+                    }
+                    return Ok(());
+                }
+
+                // A completion reference may contain either a resource URI
+                // or the registered URI-template pattern. Check exact
+                // patterns before treating the value as a concrete URI so a
+                // template definition authorizes its own completion request.
+                if let Some(template) = self
+                    .inner
+                    .resource_templates
+                    .iter()
+                    .find(|template| template.uri_template == *uri)
+                {
+                    return self.authorize_completion_resource_template(&context, template, uri);
+                }
+                #[cfg(feature = "dynamic-tools")]
+                if let Some(template) =
+                    self.inner
+                        .dynamic_resource_templates
+                        .as_ref()
+                        .and_then(|dynamic| {
+                            dynamic
+                                .list()
+                                .into_iter()
+                                .find(|template| template.uri_template == *uri)
+                        })
+                {
+                    return self.authorize_completion_resource_template(&context, &template, uri);
+                }
+
+                // Concrete URIs produced by a template are resource
+                // references too. Preserve resources/read's first-match and
+                // static-before-dynamic routing semantics.
+                if let Some(template) = self
+                    .inner
+                    .resource_templates
+                    .iter()
+                    .find(|template| template.match_uri(uri).is_some())
+                {
+                    return self.authorize_completion_resource_template(&context, template, uri);
+                }
+                #[cfg(feature = "dynamic-tools")]
+                if let Some((template, _variables)) = self
+                    .inner
+                    .dynamic_resource_templates
+                    .as_ref()
+                    .and_then(|dynamic| dynamic.match_uri(uri))
+                {
+                    return self.authorize_completion_resource_template(&context, &template, uri);
+                }
+
+                Err(Error::JsonRpc(JsonRpcError::resource_not_found(uri)))
+            }
+            _ => Err(Error::JsonRpc(JsonRpcError::invalid_params(
+                "Unsupported completion reference",
+            ))),
+        }
     }
 
     /// Generate request-filtered instructions from registered capabilities.
@@ -1038,7 +1212,9 @@ impl McpRouter {
             ctx
         };
 
-        let ctx = ctx.with_extensions(Arc::new(merged));
+        let ctx = ctx
+            .with_extensions(Arc::new(merged))
+            .with_session(self.session.clone());
 
         // Set up log level filtering
         let ctx = ctx.with_min_log_level(self.inner.min_log_level.clone());
@@ -2552,10 +2728,7 @@ impl McpRouter {
                     .unwrap()
                     .contains(&params.name)
                 {
-                    return Err(Error::JsonRpc(JsonRpcError::method_not_found(&format!(
-                        "Prompt not found: {}",
-                        params.name
-                    ))));
+                    return Err(prompt_not_found(&params.name));
                 }
 
                 // Look up static prompts first, then dynamic
@@ -2567,12 +2740,7 @@ impl McpRouter {
                         .as_ref()
                         .and_then(|d| d.get(&params.name))
                 });
-                let prompt = prompt.ok_or_else(|| {
-                    Error::JsonRpc(JsonRpcError::method_not_found(&format!(
-                        "Prompt not found: {}",
-                        params.name
-                    )))
-                })?;
+                let prompt = prompt.ok_or_else(|| prompt_not_found(&params.name))?;
 
                 // Check prompt filter if configured
                 let filter_context = self.capability_filter_context(
@@ -2926,7 +3094,24 @@ impl McpRouter {
 
                 // Delegate to registered completion handler if available
                 if let Some(ref handler) = self.inner.completion_handler {
-                    let result = handler(params).await?;
+                    self.authorize_completion_reference(&extensions, &params.reference)?;
+                    let progress_token = params
+                        .meta
+                        .as_ref()
+                        .and_then(|meta| meta.get("progressToken"))
+                        .map(|token| serde_json::from_value(token.clone()))
+                        .transpose()
+                        .map_err(|error| {
+                            Error::invalid_params(format!(
+                                "Invalid completion progress token: {error}"
+                            ))
+                        })?;
+                    let ctx = self.create_context_with_extensions(
+                        request_id,
+                        progress_token,
+                        &extensions,
+                    );
+                    let result = handler(ctx, params).await?;
                     Ok(McpResponse::Complete(result))
                 } else {
                     // No completion handler registered, return empty completions
