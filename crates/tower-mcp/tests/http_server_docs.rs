@@ -18,14 +18,18 @@ const HTTP_SERVER_SOURCE: &str = include_str!("../../../examples/http_server.rs"
 const HTTP_AUTH_SOURCE: &str = include_str!("../../../examples/http_auth.rs");
 
 fn documented_final_request_bodies() -> Vec<Value> {
-    let (_, final_section) = HTTP_SERVER_SOURCE
+    documented_final_request_bodies_from(HTTP_SERVER_SOURCE)
+}
+
+fn documented_final_request_bodies_from(source: &str) -> Vec<Value> {
+    let (_, final_section) = source
         .split_once("//! ## 2026-07-28 stateless flow")
         .expect("http_server example must retain its final-protocol section");
     let (_, command_block) = final_section
-        .split_once("//! ```bash\n")
+        .split_once("//! ```bash")
         .expect("final-protocol section must contain a bash block");
     let (command_block, _) = command_block
-        .split_once("//! ```\n")
+        .split_once("//! ```")
         .expect("final-protocol bash block must be closed");
 
     command_block
@@ -38,6 +42,15 @@ fn documented_final_request_bodies() -> Vec<Value> {
             serde_json::from_str(body).expect("documented curl body must be valid JSON")
         })
         .collect()
+}
+
+#[test]
+fn documented_request_extraction_accepts_windows_line_endings() {
+    let windows_source = HTTP_SERVER_SOURCE.lines().collect::<Vec<_>>().join("\r\n");
+    assert_eq!(
+        documented_final_request_bodies_from(&windows_source),
+        documented_final_request_bodies()
+    );
 }
 
 fn documented_auth_final_request_body() -> Value {
