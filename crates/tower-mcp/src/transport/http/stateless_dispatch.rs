@@ -25,11 +25,148 @@ pub(super) fn stash_per_request_meta(req: &JsonRpcRequest, ext: &mut crate::rout
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) enum SubscriptionPrincipal {
+    #[cfg(feature = "oauth")]
+    OAuthSubject {
+        issuer: Option<String>,
+        subject: String,
+    },
+    #[cfg(feature = "oauth")]
+    OAuthClient {
+        issuer: Option<String>,
+        client_id: String,
+    },
+    AuthClient(String),
+}
+
+pub(super) fn subscription_principal(
+    extensions: &axum::http::Extensions,
+) -> Option<SubscriptionPrincipal> {
+    #[cfg(feature = "oauth")]
+    if let Some(claims) = extensions.get::<crate::oauth::token::TokenClaims>()
+        && let Some(subject) = claims.sub.as_ref()
+        && !subject.trim().is_empty()
+    {
+        return Some(SubscriptionPrincipal::OAuthSubject {
+            issuer: claims.iss.clone(),
+            subject: subject.clone(),
+        });
+    }
+    #[cfg(feature = "oauth")]
+    if let Some(claims) = extensions.get::<crate::oauth::token::TokenClaims>()
+        && let Some(client_id) = claims.client_id.as_ref()
+        && !client_id.trim().is_empty()
+    {
+        return Some(SubscriptionPrincipal::OAuthClient {
+            issuer: claims.iss.clone(),
+            client_id: client_id.clone(),
+        });
+    }
+
+    extensions
+        .get::<crate::auth::AuthInfo>()
+        .map(|info| info.client_id.as_str())
+        .filter(|client_id| !client_id.trim().is_empty())
+        .map(|client_id| SubscriptionPrincipal::AuthClient(client_id.to_string()))
+}
+
+pub(super) struct QueuedSubscriptionMessage {
+    json: String,
+    buffered_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    byte_len: usize,
+}
+
+impl QueuedSubscriptionMessage {
+    #[cfg(test)]
+    pub(super) fn as_str(&self) -> &str {
+        &self.json
+    }
+
+    fn into_json(mut self) -> String {
+        std::mem::take(&mut self.json)
+    }
+}
+
+impl Drop for QueuedSubscriptionMessage {
+    fn drop(&mut self) {
+        self.buffered_bytes
+            .fetch_sub(self.byte_len, Ordering::AcqRel);
+    }
+}
+
+pub(super) enum SubscriptionTerminal {
+    BufferOverflow(String),
+    Drained(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SubscriptionAdmissionError {
+    GlobalLimit,
+    PrincipalLimit,
+    MetadataTooLarge,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubscriptionQueueError {
+    BufferOverflow,
+    Disconnected,
+}
+
+pub(super) struct ModernSubscriptionRegistration {
+    pub(super) notifications: mpsc::Receiver<QueuedSubscriptionMessage>,
+    pub(super) terminal: oneshot::Receiver<SubscriptionTerminal>,
+    pub(super) guard: ModernSubscriptionGuard,
+}
+
 pub(super) struct ModernSubscription {
     subscription_id: RequestId,
     filter: SubscriptionFilter,
-    tx: mpsc::UnboundedSender<String>,
+    principal: Option<SubscriptionPrincipal>,
+    tx: mpsc::Sender<QueuedSubscriptionMessage>,
+    terminal_tx: Option<oneshot::Sender<SubscriptionTerminal>>,
+    buffered_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    max_buffered_messages: usize,
+    max_buffered_bytes: usize,
     started: std::time::Instant,
+}
+
+impl ModernSubscription {
+    fn try_enqueue(&self, json: String) -> std::result::Result<(), SubscriptionQueueError> {
+        if self.max_buffered_messages == 0 {
+            return Err(SubscriptionQueueError::BufferOverflow);
+        }
+
+        let byte_len = json.len();
+        let reserved = self
+            .buffered_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current
+                    .checked_add(byte_len)
+                    .filter(|next| *next <= self.max_buffered_bytes)
+            })
+            .is_ok();
+        if !reserved {
+            return Err(SubscriptionQueueError::BufferOverflow);
+        }
+
+        let message = QueuedSubscriptionMessage {
+            json,
+            buffered_bytes: self.buffered_bytes.clone(),
+            byte_len,
+        };
+        match self.tx.try_send(message) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(message)) => {
+                drop(message);
+                Err(SubscriptionQueueError::BufferOverflow)
+            }
+            Err(mpsc::error::TrySendError::Closed(message)) => {
+                drop(message);
+                Err(SubscriptionQueueError::Disconnected)
+            }
+        }
+    }
 }
 
 /// Process-local registry for sessionless final-protocol subscriptions.
@@ -39,18 +176,21 @@ pub(super) struct ModernSubscription {
 pub(super) struct ModernSubscriptionRegistry {
     next_key: AtomicU64,
     pub(super) subscriptions: std::sync::Mutex<HashMap<u64, ModernSubscription>>,
+    limits: SubscriptionLimits,
     server_info: Option<Implementation>,
     observer: Option<Arc<dyn crate::transport::subscriptions::SubscriptionObserver>>,
 }
 
 impl ModernSubscriptionRegistry {
     pub(super) fn new(
+        limits: SubscriptionLimits,
         server_info: Option<Implementation>,
         observer: Option<Arc<dyn crate::transport::subscriptions::SubscriptionObserver>>,
     ) -> Self {
         Self {
             next_key: AtomicU64::new(0),
             subscriptions: std::sync::Mutex::new(HashMap::new()),
+            limits,
             server_info,
             observer,
         }
@@ -70,29 +210,68 @@ impl ModernSubscriptionRegistry {
         }
     }
 
-    pub(super) fn register(
+    pub(super) fn try_register(
         self: &Arc<Self>,
         subscription_id: RequestId,
         filter: SubscriptionFilter,
-    ) -> (mpsc::UnboundedReceiver<String>, ModernSubscriptionGuard) {
+        principal: Option<SubscriptionPrincipal>,
+    ) -> std::result::Result<ModernSubscriptionRegistration, SubscriptionAdmissionError> {
+        let metadata_bytes = serde_json::to_vec(&subscription_id)
+            .map(|serialized| serialized.len())
+            .unwrap_or(usize::MAX)
+            .saturating_add(
+                serde_json::to_vec(&filter)
+                    .map(|serialized| serialized.len())
+                    .unwrap_or(usize::MAX),
+            );
+        if metadata_bytes > self.limits.max_metadata_bytes {
+            return Err(SubscriptionAdmissionError::MetadataTooLarge);
+        }
+
+        let mut subscriptions = self.subscriptions.lock().unwrap();
+        if subscriptions.len() >= self.limits.max_active {
+            return Err(SubscriptionAdmissionError::GlobalLimit);
+        }
+        if let (Some(principal), Some(max)) =
+            (principal.as_ref(), self.limits.max_active_per_principal)
+            && subscriptions
+                .values()
+                .filter(|subscription| subscription.principal.as_ref() == Some(principal))
+                .count()
+                >= max
+        {
+            return Err(SubscriptionAdmissionError::PrincipalLimit);
+        }
+
         let key = self.next_key.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.subscriptions.lock().unwrap().insert(
+        let channel_capacity = self
+            .limits
+            .max_buffered_messages
+            .clamp(1, tokio::sync::Semaphore::MAX_PERMITS);
+        let (tx, notifications) = mpsc::channel(channel_capacity);
+        let (terminal_tx, terminal) = oneshot::channel();
+        subscriptions.insert(
             key,
             ModernSubscription {
                 subscription_id,
                 filter,
+                principal,
                 tx,
+                terminal_tx: Some(terminal_tx),
+                buffered_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                max_buffered_messages: self.limits.max_buffered_messages,
+                max_buffered_bytes: self.limits.max_buffered_bytes,
                 started: std::time::Instant::now(),
             },
         );
-        (
-            rx,
-            ModernSubscriptionGuard {
+        Ok(ModernSubscriptionRegistration {
+            notifications,
+            terminal,
+            guard: ModernSubscriptionGuard {
                 key,
                 registry: self.clone(),
             },
-        )
+        })
     }
 
     /// Route subscription-scoped notifications and return whether the
@@ -110,31 +289,58 @@ impl ModernSubscriptionRegistry {
             return false;
         }
 
-        let mut subscriptions = self.subscriptions.lock().unwrap();
-        tracing::trace!(
-            active_subscriptions = subscriptions.len(),
-            notification = ?notification,
-            "Routing final-protocol subscription notification"
-        );
-        subscriptions.retain(|_, subscription| {
-            let keep = if subscription_matches(notification, &subscription.filter)
-                && let Some(json) =
+        let removed = {
+            let mut subscriptions = self.subscriptions.lock().unwrap();
+            tracing::trace!(
+                active_subscriptions = subscriptions.len(),
+                notification = ?notification,
+                "Routing final-protocol subscription notification"
+            );
+            let mut removals = Vec::new();
+            for (key, subscription) in subscriptions.iter() {
+                let result = if subscription_matches(notification, &subscription.filter) {
                     tagged_subscription_notification(notification, &subscription.subscription_id)
-            {
-                subscription.tx.send(json).is_ok()
-            } else {
-                !subscription.tx.is_closed()
-            };
-            if !keep {
-                // Detected here rather than at guard drop: the entry is
-                // removed exactly once, so the close is reported exactly once.
-                self.observe_close(
-                    subscription,
-                    crate::transport::subscriptions::SubscriptionCloseReason::Disconnected,
-                );
+                        .map(|json| subscription.try_enqueue(json))
+                        .unwrap_or(Ok(()))
+                } else if subscription.tx.is_closed() {
+                    Err(SubscriptionQueueError::Disconnected)
+                } else {
+                    Ok(())
+                };
+                if let Err(error) = result {
+                    removals.push((*key, error));
+                }
             }
-            keep
-        });
+            removals
+                .into_iter()
+                .filter_map(|(key, error)| {
+                    subscriptions
+                        .remove(&key)
+                        .map(|subscription| (subscription, error))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for (mut subscription, error) in removed {
+            let reason = match error {
+                SubscriptionQueueError::BufferOverflow => {
+                    let response = JsonRpcResponse::error(
+                        Some(subscription.subscription_id.clone()),
+                        JsonRpcError::internal_error("Subscription notification buffer exceeded"),
+                    );
+                    if let Ok(json) = serde_json::to_string(&response)
+                        && let Some(terminal_tx) = subscription.terminal_tx.take()
+                    {
+                        let _ = terminal_tx.send(SubscriptionTerminal::BufferOverflow(json));
+                    }
+                    crate::transport::subscriptions::SubscriptionCloseReason::BufferOverflow
+                }
+                SubscriptionQueueError::Disconnected => {
+                    crate::transport::subscriptions::SubscriptionCloseReason::Disconnected
+                }
+            };
+            self.observe_close(&subscription, reason);
+        }
         true
     }
 
@@ -152,7 +358,7 @@ impl ModernSubscriptionRegistry {
                 .collect::<Vec<_>>()
         };
         let count = subscriptions.len();
-        for subscription in subscriptions {
+        for mut subscription in subscriptions {
             self.observe_close(
                 &subscription,
                 crate::transport::subscriptions::SubscriptionCloseReason::Drained,
@@ -161,8 +367,10 @@ impl ModernSubscriptionRegistry {
                 subscription.subscription_id,
                 self.server_info.clone(),
             );
-            if let Ok(json) = serde_json::to_string(&response) {
-                let _ = subscription.tx.send(json);
+            if let Ok(json) = serde_json::to_string(&response)
+                && let Some(terminal_tx) = subscription.terminal_tx.take()
+            {
+                let _ = terminal_tx.send(SubscriptionTerminal::Drained(json));
             }
         }
         count
@@ -171,7 +379,7 @@ impl ModernSubscriptionRegistry {
 
 impl Default for ModernSubscriptionRegistry {
     fn default() -> Self {
-        Self::new(None, None)
+        Self::new(SubscriptionLimits::default(), None, None)
     }
 }
 
@@ -536,9 +744,20 @@ pub(super) async fn handle_modern_subscriptions_listen_sse(
         }
     };
 
-    let (rx, guard) = state
-        .modern_subscriptions
-        .register(subscription_id.clone(), accepted.clone());
+    let registration = match state.modern_subscriptions.try_register(
+        subscription_id.clone(),
+        accepted.clone(),
+        subscription_principal(http_extensions),
+    ) {
+        Ok(registration) => registration,
+        Err(_) => {
+            return json_rpc_error_response_with_status(
+                Some(subscription_id),
+                JsonRpcError::internal_error("Subscription limit reached"),
+                StatusCode::OK,
+            );
+        }
+    };
     let acknowledgment = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "notifications/subscriptions/acknowledged",
@@ -553,25 +772,100 @@ pub(super) async fn handle_modern_subscriptions_listen_sse(
 
     struct ModernListenStream {
         first: Option<String>,
-        rx: mpsc::UnboundedReceiver<String>,
+        notifications: mpsc::Receiver<QueuedSubscriptionMessage>,
+        terminal: Option<oneshot::Receiver<SubscriptionTerminal>>,
+        graceful_completion: Option<String>,
+        done: bool,
         _guard: ModernSubscriptionGuard,
     }
 
     let stream = futures::stream::unfold(
         ModernListenStream {
             first: Some(acknowledgment),
-            rx,
-            _guard: guard,
+            notifications: registration.notifications,
+            terminal: Some(registration.terminal),
+            graceful_completion: None,
+            done: false,
+            _guard: registration.guard,
         },
         |mut state| async move {
-            let message = match state.first.take() {
-                Some(first) => Some(first),
-                None => state.rx.recv().await,
-            }?;
-            Some((
-                Ok::<_, Infallible>(Event::default().event(SSE_MESSAGE_EVENT).data(message)),
-                state,
-            ))
+            if state.done {
+                return None;
+            }
+            if let Some(first) = state.first.take() {
+                return Some((
+                    Ok::<_, Infallible>(Event::default().event(SSE_MESSAGE_EVENT).data(first)),
+                    state,
+                ));
+            }
+
+            loop {
+                if let Some(completion) = state.graceful_completion.as_ref() {
+                    if let Some(message) = state.notifications.recv().await {
+                        return Some((
+                            Ok(Event::default()
+                                .event(SSE_MESSAGE_EVENT)
+                                .data(message.into_json())),
+                            state,
+                        ));
+                    }
+                    let completion = completion.clone();
+                    state.graceful_completion = None;
+                    state.done = true;
+                    return Some((
+                        Ok(Event::default().event(SSE_MESSAGE_EVENT).data(completion)),
+                        state,
+                    ));
+                }
+
+                let Some(mut terminal) = state.terminal.take() else {
+                    let message = state.notifications.recv().await?;
+                    return Some((
+                        Ok(Event::default()
+                            .event(SSE_MESSAGE_EVENT)
+                            .data(message.into_json())),
+                        state,
+                    ));
+                };
+
+                tokio::select! {
+                    biased;
+                    terminal_result = &mut terminal => {
+                        match terminal_result {
+                            Ok(SubscriptionTerminal::BufferOverflow(error)) => {
+                                state.notifications.close();
+                                while state.notifications.try_recv().is_ok() {}
+                                state.done = true;
+                                return Some((
+                                    Ok(Event::default().event(SSE_MESSAGE_EVENT).data(error)),
+                                    state,
+                                ));
+                            }
+                            Ok(SubscriptionTerminal::Drained(completion)) => {
+                                state.graceful_completion = Some(completion);
+                            }
+                            Err(_) => {
+                                // No terminal control remains. Drain any data
+                                // the sender queued before it disconnected.
+                            }
+                        }
+                    }
+                    message = state.notifications.recv() => {
+                        state.terminal = Some(terminal);
+                        if let Some(message) = message {
+                            return Some((
+                                Ok(Event::default()
+                                    .event(SSE_MESSAGE_EVENT)
+                                    .data(message.into_json())),
+                                state,
+                            ));
+                        }
+                        // The sender can close immediately after sending its
+                        // out-of-band terminal control. Loop once so the
+                        // terminal receiver wins before ending the stream.
+                    }
+                }
+            }
         },
     );
 

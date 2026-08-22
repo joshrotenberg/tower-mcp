@@ -31,6 +31,59 @@ fn app() -> axum::Router {
         .into_router()
 }
 
+#[cfg(feature = "stateless")]
+fn final_request(id: &str, method: &str, params: serde_json::Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("Mcp-Protocol-Version", "2026-07-28")
+        .header("Mcp-Method", method)
+        .body(Body::from(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params,
+            })
+            .to_string(),
+        ))
+        .unwrap()
+}
+
+#[cfg(feature = "stateless")]
+fn final_meta() -> serde_json::Value {
+    serde_json::json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {},
+    })
+}
+
+#[cfg(feature = "stateless")]
+async fn response_text(response: axum::response::Response) -> String {
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+#[cfg(feature = "stateless")]
+async fn next_body_data(body: &mut Body) -> String {
+    use http_body_util::BodyExt;
+
+    loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(10), body.frame())
+            .await
+            .expect("timed out waiting for SSE data")
+            .expect("SSE stream ended early")
+            .expect("SSE stream failed");
+        if let Ok(data) = frame.into_data() {
+            return String::from_utf8(data.to_vec()).unwrap();
+        }
+    }
+}
+
 /// POST a `subscriptions/listen` request with the given protocol version.
 async fn post_subscriptions_listen(protocol_version: Option<&str>) -> axum::response::Response {
     let mut builder = Request::builder()
@@ -214,6 +267,253 @@ async fn subscriptions_listen_requires_notification_filter() {
 
 #[cfg(feature = "stateless")]
 #[tokio::test]
+async fn subscription_capacity_rejects_n_plus_one_without_blocking_other_requests() {
+    let (app, handle) = HttpTransport::new(router())
+        .subscription_limits(tower_mcp::SubscriptionLimits::default().max_active(1))
+        .disable_origin_validation()
+        .disable_host_validation()
+        .into_router_with_handle();
+    let listen_params = || {
+        serde_json::json!({
+            "_meta": final_meta(),
+            "notifications": { "resourceSubscriptions": ["file:///wanted"] },
+        })
+    };
+
+    let first = app
+        .clone()
+        .oneshot(final_request(
+            "listen-capacity-1",
+            "subscriptions/listen",
+            listen_params(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(handle.subscription_count(), 1);
+
+    let rejected = app
+        .clone()
+        .oneshot(final_request(
+            "listen-capacity-2",
+            "subscriptions/listen",
+            listen_params(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::OK);
+    let rejected: serde_json::Value = serde_json::from_str(&response_text(rejected).await).unwrap();
+    assert_eq!(rejected["id"], "listen-capacity-2");
+    assert_eq!(rejected["error"]["code"], -32603);
+    assert_eq!(rejected["error"]["message"], "Subscription limit reached");
+    assert_eq!(handle.subscription_count(), 1);
+
+    let tools = app
+        .clone()
+        .oneshot(final_request(
+            "tools-while-full",
+            "tools/list",
+            serde_json::json!({ "_meta": final_meta() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(tools.status(), StatusCode::OK);
+    let tools: serde_json::Value = serde_json::from_str(&response_text(tools).await).unwrap();
+    assert_eq!(tools["id"], "tools-while-full");
+    assert_eq!(tools["result"]["tools"][0]["name"], "echo");
+
+    drop(first);
+    assert_eq!(handle.subscription_count(), 0);
+
+    let reopened = app
+        .oneshot(final_request(
+            "listen-capacity-3",
+            "subscriptions/listen",
+            listen_params(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(reopened.status(), StatusCode::OK);
+    assert_eq!(handle.subscription_count(), 1);
+    drop(reopened);
+    assert_eq!(handle.subscription_count(), 0);
+}
+
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn authenticated_principal_capacity_isolated_on_the_http_path() {
+    use tower_mcp::SubscriptionLimits;
+    use tower_mcp::auth::{ApiKeyValidator, AuthLayer};
+
+    let (transport, handle) = HttpTransport::new(router())
+        .subscription_limits(
+            SubscriptionLimits::default()
+                .max_active(3)
+                .max_active_per_principal(1),
+        )
+        .disable_origin_validation()
+        .disable_host_validation()
+        .into_router_with_handle();
+    let app = transport.layer(AuthLayer::new(ApiKeyValidator::new([
+        "alice-key-1".to_string(),
+        "bob-key-1".to_string(),
+    ])));
+    let params = || {
+        serde_json::json!({
+            "_meta": final_meta(),
+            "notifications": { "toolsListChanged": true },
+        })
+    };
+    let request = |id: &str, key: &'static str| {
+        let mut request = final_request(id, "subscriptions/listen", params());
+        request
+            .headers_mut()
+            .insert("Authorization", axum::http::HeaderValue::from_static(key));
+        request
+    };
+
+    let alice = app
+        .clone()
+        .oneshot(request("alice-1", "alice-key-1"))
+        .await
+        .unwrap();
+    assert_eq!(alice.status(), StatusCode::OK);
+    assert_eq!(handle.subscription_count(), 1);
+
+    let alice_rejected = app
+        .clone()
+        .oneshot(request("alice-2", "alice-key-1"))
+        .await
+        .unwrap();
+    assert_eq!(alice_rejected.status(), StatusCode::OK);
+    let error: serde_json::Value =
+        serde_json::from_str(&response_text(alice_rejected).await).unwrap();
+    assert_eq!(error["id"], "alice-2");
+    assert_eq!(error["error"]["code"], -32603);
+
+    let bob = app.oneshot(request("bob-1", "bob-key-1")).await.unwrap();
+    assert_eq!(bob.status(), StatusCode::OK);
+    assert_eq!(handle.subscription_count(), 2);
+
+    drop(alice);
+    drop(bob);
+    assert_eq!(handle.subscription_count(), 0);
+}
+
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn notification_overflow_closes_only_the_slow_subscription() {
+    use std::sync::{Arc, Mutex};
+    use tower_mcp::{
+        SubscriptionClose, SubscriptionCloseReason, SubscriptionLimits, SubscriptionObserver,
+    };
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        closes: Mutex<Vec<SubscriptionClose>>,
+    }
+    impl SubscriptionObserver for RecordingObserver {
+        fn on_close(&self, close: SubscriptionClose) {
+            self.closes.lock().unwrap().push(close);
+        }
+    }
+
+    let observer = Arc::new(RecordingObserver::default());
+    let router = router().with_subscription_observer(observer.clone());
+    let publisher = router.clone();
+    let (app, handle) = HttpTransport::new(router)
+        .subscription_limits(
+            SubscriptionLimits::default()
+                .max_active(2)
+                .max_buffered_messages(1),
+        )
+        .disable_origin_validation()
+        .disable_host_validation()
+        .into_router_with_handle();
+    let listen_params = || {
+        serde_json::json!({
+            "_meta": final_meta(),
+            "notifications": { "resourceSubscriptions": ["file:///wanted"] },
+        })
+    };
+
+    let slow = app
+        .clone()
+        .oneshot(final_request(
+            "listen-slow",
+            "subscriptions/listen",
+            listen_params(),
+        ))
+        .await
+        .unwrap();
+    let healthy = app
+        .oneshot(final_request(
+            "listen-healthy",
+            "subscriptions/listen",
+            listen_params(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(handle.subscription_count(), 2);
+
+    let mut healthy_body = healthy.into_body();
+    let acknowledgment = next_body_data(&mut healthy_body).await;
+    assert!(acknowledgment.contains("notifications/subscriptions/acknowledged"));
+
+    assert!(publisher.notify_resource_updated("file:///wanted"));
+    let first = next_body_data(&mut healthy_body).await;
+    assert!(first.contains("notifications/resources/updated"));
+
+    // The unread stream still has its first notification buffered, while the
+    // healthy stream has made room. A second publish must evict only the slow
+    // subscriber.
+    assert!(publisher.notify_resource_updated("file:///wanted"));
+    assert_eq!(handle.subscription_count(), 1);
+    let second = next_body_data(&mut healthy_body).await;
+    assert!(second.contains("notifications/resources/updated"));
+
+    let slow = response_text(slow).await;
+    let acknowledged = slow
+        .find("notifications/subscriptions/acknowledged")
+        .expect("overflowed stream must still acknowledge first");
+    let terminal = slow
+        .find("\"code\":-32603")
+        .expect("overflowed stream must end with an internal JSON-RPC error");
+    assert!(
+        acknowledged < terminal,
+        "acknowledgment must precede error: {slow}"
+    );
+    assert!(slow.contains("Subscription notification buffer exceeded"));
+    assert!(
+        !slow.contains("notifications/resources/updated"),
+        "queued data is discarded when a stream overflows: {slow}"
+    );
+
+    {
+        let closes = observer.closes.lock().unwrap();
+        let overflows: Vec<_> = closes
+            .iter()
+            .filter(|close| {
+                close.subscription_id == tower_mcp::RequestId::String("listen-slow".into())
+            })
+            .collect();
+        assert_eq!(overflows.len(), 1, "overflow is observed exactly once");
+        assert_eq!(overflows[0].reason, SubscriptionCloseReason::BufferOverflow);
+    }
+
+    assert_eq!(handle.close_subscriptions(), 1);
+    let rest = axum::body::to_bytes(healthy_body, usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8(rest.to_vec())
+            .unwrap()
+            .contains("\"resultType\":\"complete\"")
+    );
+}
+
+#[cfg(feature = "stateless")]
+#[tokio::test]
 async fn server_gracefully_drains_http_subscription_streams() {
     let router = router();
     let publisher = router.clone();
@@ -248,10 +548,14 @@ async fn server_gracefully_drains_http_subscription_streams() {
     let acknowledgment = body
         .find("notifications/subscriptions/acknowledged")
         .expect("stream must begin with an acknowledgment");
+    let notification = body
+        .find("notifications/resources/updated")
+        .expect("queued notifications must be drained");
     let completion = body
         .find("\"resultType\":\"complete\"")
         .expect("stream must end with a graceful result");
-    assert!(acknowledgment < completion);
+    assert!(acknowledgment < notification);
+    assert!(notification < completion);
     assert!(body.contains("\"id\":\"graceful-http\""));
     assert!(body.contains("\"io.modelcontextprotocol/subscriptionId\":\"graceful-http\""));
     assert!(body.contains("\"io.modelcontextprotocol/serverInfo\""));
@@ -497,6 +801,92 @@ mod tasks {
             body.contains("\"io.modelcontextprotocol/subscriptionId\":\"listen-1\""),
             "the notification must be tagged with the subscription: {body}"
         );
+    }
+
+    /// Closing an overloaded notification stream must not affect the task
+    /// store: clients can reconnect and recover the authoritative state with
+    /// `tasks/get`.
+    #[tokio::test]
+    async fn task_state_remains_available_after_subscription_buffer_overflow() {
+        let delayed = ToolBuilder::new("delayed")
+            .description("Complete after the listen stream has been registered")
+            .task_support(TaskSupportMode::Optional)
+            .handler(|_: serde_json::Value| async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                Ok(CallToolResult::text("done"))
+            })
+            .build();
+        let task_router = McpRouter::new()
+            .server_info("listen-test-server", "1.0.0")
+            .tool(delayed)
+            .with_tasks();
+        let (app, handle) = HttpTransport::new(task_router)
+            .subscription_limits(tower_mcp::SubscriptionLimits::default().max_buffered_messages(0))
+            .disable_origin_validation()
+            .disable_host_validation()
+            .into_router_with_handle();
+
+        let create = app
+            .clone()
+            .oneshot(final_request(
+                "call-overflow",
+                "tools/call",
+                serde_json::json!({
+                    "_meta": meta(true),
+                    "name": "delayed",
+                    "arguments": {},
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::OK);
+        let created: serde_json::Value = serde_json::from_str(&body_string(create).await).unwrap();
+        let task_id = created["result"]["taskId"].as_str().unwrap().to_string();
+
+        let listen = app
+            .clone()
+            .oneshot(final_request(
+                "listen-overflow",
+                "subscriptions/listen",
+                serde_json::json!({
+                    "_meta": meta(true),
+                    "notifications": { "taskIds": [&task_id] },
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(listen.status(), StatusCode::OK);
+        assert_eq!(handle.subscription_count(), 1);
+
+        let body = tokio::time::timeout(Duration::from_secs(10), body_string(listen))
+            .await
+            .expect("task completion must overflow and close the listen stream");
+        let acknowledgment = body
+            .find("notifications/subscriptions/acknowledged")
+            .expect("overflowed stream must acknowledge first");
+        let terminal = body
+            .find("\"code\":-32603")
+            .expect("overflowed stream must end with an internal JSON-RPC error");
+        assert!(acknowledgment < terminal);
+        assert!(body.contains("Subscription notification buffer exceeded"));
+        assert_eq!(handle.subscription_count(), 0);
+
+        let mut get_request = final_request(
+            "get-after-overflow",
+            "tasks/get",
+            serde_json::json!({ "_meta": meta(true), "taskId": &task_id }),
+        );
+        get_request
+            .headers_mut()
+            .insert("Mcp-Name", task_id.parse().unwrap());
+        let get = app.oneshot(get_request).await.unwrap();
+        let status = get.status();
+        let get_body = body_string(get).await;
+        assert_eq!(status, StatusCode::OK, "unexpected tasks/get: {get_body}");
+        let get: serde_json::Value = serde_json::from_str(&get_body).unwrap();
+        assert_eq!(get["id"], "get-after-overflow");
+        assert_eq!(get["result"]["taskId"], task_id);
+        assert_eq!(get["result"]["status"], "completed");
     }
 
     /// A subscriber that named a different owned task never receives this one.

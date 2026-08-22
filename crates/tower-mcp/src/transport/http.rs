@@ -320,6 +320,78 @@ pub const MCP_PARAM_HEADER_PREFIX: &str = "mcp-param-";
 /// See [`HttpTransport::max_body_size`].
 pub const DEFAULT_MAX_BODY_SIZE: usize = 4 * 1024 * 1024;
 
+/// Resource limits for final-protocol `subscriptions/listen` streams.
+///
+/// These limits apply only to sessionless HTTP subscriptions negotiated with
+/// the 2026-07-28 protocol. They bound both the number of live streams and the
+/// notification backlog retained for a client that stops reading.
+///
+/// Defaults are deliberately finite: 256 active streams per transport, 64 KiB
+/// of serialized request identity/filter metadata, 64 queued notifications,
+/// and 256 KiB of serialized notification data per stream. Per-principal
+/// admission is optional and disabled by default.
+#[cfg(feature = "stateless")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SubscriptionLimits {
+    /// Maximum active final subscriptions across this transport.
+    pub max_active: usize,
+    /// Optional maximum active subscriptions for one authenticated principal.
+    pub max_active_per_principal: Option<usize>,
+    /// Maximum combined serialized request-ID and negotiated-filter bytes.
+    pub max_metadata_bytes: usize,
+    /// Maximum queued notifications for one stream.
+    pub max_buffered_messages: usize,
+    /// Maximum serialized notification bytes queued for one stream.
+    pub max_buffered_bytes: usize,
+}
+
+#[cfg(feature = "stateless")]
+impl Default for SubscriptionLimits {
+    fn default() -> Self {
+        Self {
+            max_active: 256,
+            max_active_per_principal: None,
+            max_metadata_bytes: 64 * 1024,
+            max_buffered_messages: 64,
+            max_buffered_bytes: 256 * 1024,
+        }
+    }
+}
+
+#[cfg(feature = "stateless")]
+impl SubscriptionLimits {
+    /// Set the process-local active subscription limit.
+    pub fn max_active(mut self, max: usize) -> Self {
+        self.max_active = max;
+        self
+    }
+
+    /// Set the active subscription limit for each authenticated principal.
+    pub fn max_active_per_principal(mut self, max: usize) -> Self {
+        self.max_active_per_principal = Some(max);
+        self
+    }
+
+    /// Set the serialized request-ID and negotiated-filter budget per stream.
+    pub fn max_metadata_bytes(mut self, max: usize) -> Self {
+        self.max_metadata_bytes = max;
+        self
+    }
+
+    /// Set the queued notification count limit for each stream.
+    pub fn max_buffered_messages(mut self, max: usize) -> Self {
+        self.max_buffered_messages = max;
+        self
+    }
+
+    /// Set the serialized queued-notification byte limit for each stream.
+    pub fn max_buffered_bytes(mut self, max: usize) -> Self {
+        self.max_buffered_bytes = max;
+        self
+    }
+}
+
 /// SSE event type for JSON-RPC messages
 const SSE_MESSAGE_EVENT: &str = "message";
 
@@ -428,6 +500,9 @@ pub struct HttpTransport {
     external_notifications: Option<NotificationReceiver>,
     #[cfg(feature = "stateless")]
     stateless_config: Option<crate::stateless::StatelessConfig>,
+    /// Admission and buffering policy for final subscription streams.
+    #[cfg(feature = "stateless")]
+    subscription_limits: SubscriptionLimits,
     /// When true, 2026-07-28 stateless responses carry server identity in
     /// `_meta["io.modelcontextprotocol/serverInfo"]`.
     ///
@@ -474,6 +549,8 @@ impl HttpTransport {
             external_notifications: None,
             #[cfg(feature = "stateless")]
             stateless_config: None,
+            #[cfg(feature = "stateless")]
+            subscription_limits: SubscriptionLimits::default(),
             #[cfg(feature = "stateless")]
             stamp_server_info: true,
             #[cfg(feature = "oauth")]
@@ -576,6 +653,8 @@ impl HttpTransport {
             external_notifications: None,
             #[cfg(feature = "stateless")]
             stateless_config: None,
+            #[cfg(feature = "stateless")]
+            subscription_limits: SubscriptionLimits::default(),
             #[cfg(feature = "stateless")]
             stamp_server_info: true,
             #[cfg(feature = "oauth")]
@@ -808,6 +887,33 @@ impl HttpTransport {
     #[cfg(feature = "stateless")]
     pub fn stamp_server_info(mut self, enabled: bool) -> Self {
         self.stamp_server_info = enabled;
+        self
+    }
+
+    /// Configure admission and buffering limits for final subscriptions.
+    ///
+    /// The policy is process-local to this transport. A stream that exceeds
+    /// either buffering budget is closed with an observable terminal error;
+    /// clients can reconnect and use `tasks/get` for authoritative task state.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use tower_mcp::{HttpTransport, McpRouter, SubscriptionLimits};
+    ///
+    /// let limits = SubscriptionLimits::default()
+    ///     .max_active(128)
+    ///     .max_active_per_principal(8)
+    ///     .max_metadata_bytes(32 * 1024)
+    ///     .max_buffered_messages(32)
+    ///     .max_buffered_bytes(128 * 1024);
+    /// let transport = HttpTransport::new(McpRouter::new())
+    ///     .subscription_limits(limits);
+    /// # let _ = transport;
+    /// ```
+    #[cfg(feature = "stateless")]
+    pub fn subscription_limits(mut self, limits: SubscriptionLimits) -> Self {
+        self.subscription_limits = limits;
         self
     }
 
@@ -1196,6 +1302,7 @@ impl HttpTransport {
     fn build_state(&self) -> Arc<AppState> {
         #[cfg(feature = "stateless")]
         let modern_subscriptions = Arc::new(ModernSubscriptionRegistry::new(
+            self.subscription_limits,
             match &self.service_source {
                 ServiceSource::Router { router, .. } if self.stamp_server_info => {
                     Some(router.implementation())

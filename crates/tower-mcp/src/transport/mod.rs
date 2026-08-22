@@ -43,6 +43,9 @@ pub use stdio::{
 #[cfg(feature = "http")]
 pub use http::{HttpTransport, SessionHandle, SessionInfo};
 
+#[cfg(all(feature = "http", feature = "stateless"))]
+pub use http::SubscriptionLimits;
+
 #[cfg(feature = "websocket")]
 pub use websocket::WebSocketTransport;
 

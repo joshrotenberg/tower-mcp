@@ -717,6 +717,9 @@ pub use transport::subscriptions::{
 #[cfg(feature = "http")]
 pub use transport::{HttpTransport, SessionHandle, SessionInfo};
 
+#[cfg(all(feature = "http", feature = "stateless"))]
+pub use transport::SubscriptionLimits;
+
 #[cfg(feature = "websocket")]
 pub use transport::WebSocketTransport;
 

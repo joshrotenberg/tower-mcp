@@ -97,6 +97,8 @@ pub enum SubscriptionCloseReason {
     Cancelled,
     /// The client connection or response stream dropped.
     Disconnected,
+    /// The stream's bounded notification backlog was exceeded.
+    BufferOverflow,
     /// The server drained the stream gracefully (shutdown or an explicit
     /// close), sending the terminal `SubscriptionsListenResult` first where
     /// the transport still could.

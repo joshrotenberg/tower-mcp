@@ -141,6 +141,36 @@ The default session TTL is 30 minutes and the default cleanup interval is one
 minute. There is no default maximum; set one to bound per-process session
 memory. The built-in session and event stores are in-memory.
 
+Final `subscriptions/listen` streams have a separate, bounded policy because
+they do not consume legacy session slots. By default, a transport admits up to
+256 active final subscriptions. Each stream accepts at most 64 KiB of combined
+request-ID/filter metadata and retains 64 notifications or 256 KiB of
+serialized notification data.
+Configure lower host-specific and per-principal limits where appropriate:
+
+```rust,no_run
+# #[cfg(feature = "stateless")]
+# {
+use tower_mcp::{HttpTransport, McpRouter, SubscriptionLimits};
+
+let limits = SubscriptionLimits::default()
+    .max_active(128)
+    .max_active_per_principal(8)
+    .max_metadata_bytes(32 * 1024)
+    .max_buffered_messages(32)
+    .max_buffered_bytes(128 * 1024);
+let transport = HttpTransport::new(McpRouter::new())
+    .subscription_limits(limits);
+# let _ = transport;
+# }
+```
+
+Admission beyond a configured stream limit returns a JSON-RPC error without
+opening an SSE response. If a reader falls behind either per-stream buffer
+budget, only that stream closes with an in-band terminal error. The client can
+reconnect; for asynchronous tools, `tasks/get` remains the authoritative way
+to recover current task state.
+
 The method named `stateless(StatelessConfig)` controls a historical SEP-1442
 compatibility path. It does **not** enable the released 2026-07-28 lifecycle.
 For new deployments, enable `protocol-2026-07-28` and select versions with

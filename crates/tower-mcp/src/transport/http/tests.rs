@@ -244,6 +244,7 @@ fn final_result_fields_preserve_explicit_values_and_legacy_wire_shape() {
 #[tokio::test]
 #[cfg(feature = "stateless")]
 async fn modern_subscription_registry_reports_closes() {
+    use super::stateless_dispatch::SubscriptionTerminal;
     use crate::transport::subscriptions::{
         SubscriptionClose, SubscriptionCloseReason, SubscriptionObserver,
     };
@@ -260,29 +261,38 @@ async fn modern_subscription_registry_reports_closes() {
 
     let observer = Arc::new(RecordingObserver::default());
     let registry = Arc::new(ModernSubscriptionRegistry::new(
+        SubscriptionLimits::default(),
         None,
         Some(observer.clone()),
     ));
 
     // A dropped guard is a client disconnect.
-    let (_rx, guard) = registry.register(
-        RequestId::String("disconnects".into()),
-        SubscriptionFilter {
-            tools_list_changed: Some(true),
-            ..SubscriptionFilter::default()
-        },
-    );
-    drop(guard);
+    let disconnected = registry
+        .try_register(
+            RequestId::String("disconnects".into()),
+            SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            },
+            None,
+        )
+        .unwrap();
+    drop(disconnected.guard);
 
     // A drained registry is a graceful server-side close.
-    let (_rx2, guard2) = registry.register(
-        RequestId::String("drains".into()),
-        SubscriptionFilter::default(),
-    );
+    let drained = registry
+        .try_register(
+            RequestId::String("drains".into()),
+            SubscriptionFilter::default(),
+            None,
+        )
+        .unwrap();
     assert_eq!(registry.close_all(), 1);
+    let terminal = drained.terminal.await.unwrap();
+    assert!(matches!(terminal, SubscriptionTerminal::Drained(_)));
     // The entry is already gone, so the later guard drop must not
     // produce a second record.
-    drop(guard2);
+    drop(drained.guard);
 
     let closes = observer.closes.lock().unwrap();
     assert_eq!(closes.len(), 2, "one record per stream: {closes:?}");
@@ -302,31 +312,301 @@ async fn modern_subscription_registry_reports_closes() {
 #[cfg(feature = "stateless")]
 async fn modern_subscription_registry_filters_and_tags_notifications() {
     let registry = Arc::new(ModernSubscriptionRegistry::default());
-    let (mut rx, guard) = registry.register(
-        RequestId::String("listen-1".to_string()),
-        SubscriptionFilter {
-            tools_list_changed: Some(true),
-            ..SubscriptionFilter::default()
-        },
-    );
+    let mut registration = registry
+        .try_register(
+            RequestId::String("listen-1".to_string()),
+            SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            },
+            None,
+        )
+        .unwrap();
 
     assert!(registry.publish(&ServerNotification::PromptsListChanged));
     assert!(matches!(
-        rx.try_recv(),
+        registration.notifications.try_recv(),
         Err(mpsc::error::TryRecvError::Empty)
     ));
 
     assert!(registry.publish(&ServerNotification::ToolsListChanged));
-    let message = rx.recv().await.expect("matching notification");
-    let json: serde_json::Value = serde_json::from_str(&message).unwrap();
+    let message = registration
+        .notifications
+        .recv()
+        .await
+        .expect("matching notification");
+    let json: serde_json::Value = serde_json::from_str(message.as_str()).unwrap();
     assert_eq!(json["method"], "notifications/tools/list_changed");
     assert_eq!(
         json["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
         "listen-1"
     );
 
-    drop(guard);
+    drop(registration.guard);
     assert!(registry.subscriptions.lock().unwrap().is_empty());
+}
+
+#[test]
+#[cfg(feature = "stateless")]
+fn modern_subscription_registry_enforces_global_and_principal_limits() {
+    use super::stateless_dispatch::{SubscriptionAdmissionError, SubscriptionPrincipal};
+
+    let global = Arc::new(ModernSubscriptionRegistry::new(
+        SubscriptionLimits::default().max_active(1),
+        None,
+        None,
+    ));
+    let first = global
+        .try_register(
+            RequestId::String("global-1".into()),
+            SubscriptionFilter::default(),
+            None,
+        )
+        .unwrap();
+    let rejected = global.try_register(
+        RequestId::String("global-2".into()),
+        SubscriptionFilter::default(),
+        None,
+    );
+    assert!(matches!(
+        rejected,
+        Err(SubscriptionAdmissionError::GlobalLimit)
+    ));
+    drop(first.guard);
+    let reopened = global
+        .try_register(
+            RequestId::String("global-3".into()),
+            SubscriptionFilter::default(),
+            None,
+        )
+        .expect("dropping a guard must reopen the global slot");
+    drop(reopened.guard);
+
+    let per_principal = Arc::new(ModernSubscriptionRegistry::new(
+        SubscriptionLimits::default()
+            .max_active(4)
+            .max_active_per_principal(1),
+        None,
+        None,
+    ));
+    let alice = Some(SubscriptionPrincipal::AuthClient("alice".into()));
+    let bob = Some(SubscriptionPrincipal::AuthClient("bob".into()));
+    let alice_first = per_principal
+        .try_register(
+            RequestId::String("alice-1".into()),
+            SubscriptionFilter::default(),
+            alice.clone(),
+        )
+        .unwrap();
+    let alice_rejected = per_principal.try_register(
+        RequestId::String("alice-2".into()),
+        SubscriptionFilter::default(),
+        alice,
+    );
+    assert!(matches!(
+        alice_rejected,
+        Err(SubscriptionAdmissionError::PrincipalLimit)
+    ));
+    let bob_allowed = per_principal
+        .try_register(
+            RequestId::String("bob-1".into()),
+            SubscriptionFilter::default(),
+            bob,
+        )
+        .expect("one principal must not consume another principal's quota");
+    drop(alice_first.guard);
+    drop(bob_allowed.guard);
+
+    let bounded_metadata = Arc::new(ModernSubscriptionRegistry::new(
+        SubscriptionLimits::default().max_metadata_bytes(8),
+        None,
+        None,
+    ));
+    let oversized = bounded_metadata.try_register(
+        RequestId::String("filter-too-large".into()),
+        SubscriptionFilter {
+            resource_subscriptions: Some(vec!["file:///a-long-resource-name".into()]),
+            ..SubscriptionFilter::default()
+        },
+        None,
+    );
+    assert!(matches!(
+        oversized,
+        Err(SubscriptionAdmissionError::MetadataTooLarge)
+    ));
+    assert_eq!(bounded_metadata.len(), 0);
+
+    let empty_filter_bytes = serde_json::to_vec(&SubscriptionFilter::default())
+        .unwrap()
+        .len();
+    let bounded_id = Arc::new(ModernSubscriptionRegistry::new(
+        SubscriptionLimits::default().max_metadata_bytes(empty_filter_bytes + 8),
+        None,
+        None,
+    ));
+    let oversized_id = bounded_id.try_register(
+        RequestId::String("x".repeat(64)),
+        SubscriptionFilter::default(),
+        None,
+    );
+    assert!(matches!(
+        oversized_id,
+        Err(SubscriptionAdmissionError::MetadataTooLarge)
+    ));
+    assert_eq!(bounded_id.len(), 0);
+    let small_id = bounded_id
+        .try_register(RequestId::Number(1), SubscriptionFilter::default(), None)
+        .expect("the same filter with a compact ID must fit the metadata budget");
+    drop(small_id.guard);
+
+    let oversized_message_limit = Arc::new(ModernSubscriptionRegistry::new(
+        SubscriptionLimits::default().max_buffered_messages(usize::MAX),
+        None,
+        None,
+    ));
+    let registration = oversized_message_limit
+        .try_register(
+            RequestId::String("large-host-setting".into()),
+            SubscriptionFilter::default(),
+            None,
+        )
+        .expect("an oversized host setting must be clamped, not panic remotely");
+    drop(registration.guard);
+}
+
+#[test]
+#[cfg(all(feature = "stateless", feature = "oauth"))]
+fn modern_subscription_principal_prefers_oauth_and_supports_client_credentials() {
+    use super::stateless_dispatch::{SubscriptionPrincipal, subscription_principal};
+
+    let mut extensions = axum::http::Extensions::new();
+    extensions.insert(crate::auth::AuthInfo {
+        client_id: "generic-client".into(),
+        claims: None,
+    });
+    extensions.insert(crate::oauth::token::TokenClaims {
+        sub: Some("alice".into()),
+        iss: Some("https://issuer.example".into()),
+        aud: None,
+        exp: None,
+        scope: None,
+        client_id: Some("oauth-client".into()),
+        extra: std::collections::HashMap::new(),
+    });
+    assert_eq!(
+        subscription_principal(&extensions),
+        Some(SubscriptionPrincipal::OAuthSubject {
+            issuer: Some("https://issuer.example".into()),
+            subject: "alice".into(),
+        })
+    );
+
+    extensions.insert(crate::oauth::token::TokenClaims {
+        sub: None,
+        iss: Some("https://issuer.example".into()),
+        aud: None,
+        exp: None,
+        scope: None,
+        client_id: Some("oauth-client".into()),
+        extra: std::collections::HashMap::new(),
+    });
+    assert_eq!(
+        subscription_principal(&extensions),
+        Some(SubscriptionPrincipal::OAuthClient {
+            issuer: Some("https://issuer.example".into()),
+            client_id: "oauth-client".into(),
+        })
+    );
+}
+
+#[tokio::test]
+#[cfg(feature = "stateless")]
+async fn modern_subscription_registry_bounds_messages_and_reports_overflow_once() {
+    use super::stateless_dispatch::SubscriptionTerminal;
+    use crate::transport::subscriptions::{
+        SubscriptionClose, SubscriptionCloseReason, SubscriptionObserver,
+    };
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        closes: std::sync::Mutex<Vec<SubscriptionClose>>,
+    }
+    impl SubscriptionObserver for RecordingObserver {
+        fn on_close(&self, close: SubscriptionClose) {
+            self.closes.lock().unwrap().push(close);
+        }
+    }
+
+    let observer = Arc::new(RecordingObserver::default());
+    let registry = Arc::new(ModernSubscriptionRegistry::new(
+        SubscriptionLimits::default().max_buffered_messages(1),
+        None,
+        Some(observer.clone()),
+    ));
+    let registration = registry
+        .try_register(
+            RequestId::String("overflow".into()),
+            SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            },
+            None,
+        )
+        .unwrap();
+
+    assert!(registry.publish(&ServerNotification::ToolsListChanged));
+    assert_eq!(registry.len(), 1);
+    assert!(registry.publish(&ServerNotification::ToolsListChanged));
+    assert_eq!(registry.len(), 0);
+
+    let terminal = registration.terminal.await.unwrap();
+    let SubscriptionTerminal::BufferOverflow(json) = terminal else {
+        panic!("message overflow must terminate with an error");
+    };
+    let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(json["id"], "overflow");
+    assert_eq!(json["error"]["code"], -32603);
+
+    drop(registration.guard);
+    let closes = observer.closes.lock().unwrap();
+    assert_eq!(
+        closes.len(),
+        1,
+        "guard drop must not double-report overflow"
+    );
+    assert_eq!(closes[0].reason, SubscriptionCloseReason::BufferOverflow);
+}
+
+#[tokio::test]
+#[cfg(feature = "stateless")]
+async fn modern_subscription_registry_enforces_the_byte_budget() {
+    use super::stateless_dispatch::SubscriptionTerminal;
+
+    let registry = Arc::new(ModernSubscriptionRegistry::new(
+        SubscriptionLimits::default()
+            .max_buffered_messages(4)
+            .max_buffered_bytes(1),
+        None,
+        None,
+    ));
+    let registration = registry
+        .try_register(
+            RequestId::String("byte-overflow".into()),
+            SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            },
+            None,
+        )
+        .unwrap();
+
+    assert!(registry.publish(&ServerNotification::ToolsListChanged));
+    assert_eq!(registry.len(), 0);
+    assert!(matches!(
+        registration.terminal.await.unwrap(),
+        SubscriptionTerminal::BufferOverflow(_)
+    ));
+    drop(registration.guard);
 }
 
 #[tokio::test]
