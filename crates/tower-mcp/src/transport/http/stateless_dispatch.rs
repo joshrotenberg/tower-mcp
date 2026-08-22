@@ -132,6 +132,9 @@ pub(super) struct ModernSubscription {
 }
 
 impl ModernSubscription {
+    // `fetch_update` is available on our MSRV; Rust 1.99 renames it to
+    // `try_update`, which cannot be used until the MSRV advances.
+    #[allow(deprecated)]
     fn try_enqueue(&self, json: String) -> std::result::Result<(), SubscriptionQueueError> {
         if self.max_buffered_messages == 0 {
             return Err(SubscriptionQueueError::BufferOverflow);
