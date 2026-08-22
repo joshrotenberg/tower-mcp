@@ -472,6 +472,39 @@ pub struct TaskResumeContext {
     pub input_responses: InputResponses,
 }
 
+impl TaskResumeContext {
+    /// Create the context needed to resume a task handler.
+    ///
+    /// External [`TaskStore`] implementations use this when reconstructing a
+    /// task from durable state in [`TaskStore::resume_context`].
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::async_task::TaskResumeContext;
+    ///
+    /// let resume = TaskResumeContext::new(
+    ///     "build_report",
+    ///     serde_json::json!({"format": "pdf"}),
+    ///     Default::default(),
+    /// );
+    ///
+    /// assert_eq!(resume.tool_name, "build_report");
+    /// ```
+    #[must_use]
+    pub fn new(
+        tool_name: impl Into<String>,
+        arguments: serde_json::Value,
+        input_responses: InputResponses,
+    ) -> Self {
+        Self {
+            tool_name: tool_name.into(),
+            arguments,
+            input_responses,
+        }
+    }
+}
+
 impl AppliedInputResponses {
     /// Whether every outstanding request has now been answered.
     pub fn is_complete(&self) -> bool {
@@ -1710,10 +1743,12 @@ impl TaskStore for MemoryTaskStore {
         Ok(tasks
             .get(task_id)
             .filter(|task| !task.is_expired())
-            .map(|task| TaskResumeContext {
-                tool_name: task.tool_name.clone(),
-                arguments: task.arguments.clone(),
-                input_responses: task.input_responses.clone(),
+            .map(|task| {
+                TaskResumeContext::new(
+                    task.tool_name.clone(),
+                    task.arguments.clone(),
+                    task.input_responses.clone(),
+                )
             }))
     }
 
@@ -1918,6 +1953,30 @@ mod tests {
     use crate::protocol::{
         ElicitAction, ElicitResult, InputRequest, InputResponse, ListRootsParams,
     };
+
+    #[test]
+    fn task_resume_context_constructor_preserves_every_field() {
+        let input_responses = InputResponses::from([(
+            "approval".to_string(),
+            InputResponse::Elicit(ElicitResult {
+                action: ElicitAction::Accept,
+                content: None,
+                meta: None,
+            }),
+        )]);
+        let context = TaskResumeContext::new(
+            "build_report",
+            serde_json::json!({"format": "pdf"}),
+            input_responses.clone(),
+        );
+
+        assert_eq!(context.tool_name, "build_report");
+        assert_eq!(context.arguments, serde_json::json!({"format": "pdf"}));
+        assert_eq!(
+            serde_json::to_value(&context.input_responses).unwrap(),
+            serde_json::to_value(&input_responses).unwrap()
+        );
+    }
 
     #[tokio::test]
     async fn test_create_task() {

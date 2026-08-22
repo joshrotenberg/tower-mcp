@@ -6,6 +6,10 @@
 //! `E0451` and there was nothing else to hand back, which made the whole trait
 //! closed despite existing for exactly this purpose.
 //!
+//! #1409 found the same downstream boundary on resumption:
+//! `TaskResumeContext` is non-exhaustive, so an external store needs its public
+//! constructor to implement `TaskStore::resume_context`.
+//!
 //! This file deliberately uses only the public API. If any part of the trait
 //! becomes unimplementable from outside again, this stops compiling, which is
 //! the real assertion. Asserting a constructor exists would not catch the trait
@@ -19,7 +23,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde_json::json;
 use tower_mcp::async_task::{
-    CancellationToken, Result as TaskResult, TaskOwner, TaskSnapshot, TaskStore, TaskStoreError,
+    CancellationToken, Result as TaskResult, TaskOwner, TaskResumeContext, TaskSnapshot, TaskStore,
+    TaskStoreError,
 };
 use tower_mcp::client::{ChannelTransport, McpClient};
 use tower_mcp::protocol::{CallToolResult, InputRequests, InputResponses, TaskObject, TaskStatus};
@@ -33,6 +38,9 @@ struct ExternalStore {
 }
 
 struct Record {
+    tool_name: String,
+    arguments: serde_json::Value,
+    input_responses: InputResponses,
     object: TaskObject,
     owner: TaskOwner,
     result: Option<CallToolResult>,
@@ -50,8 +58,8 @@ impl ExternalStore {
 impl TaskStore for ExternalStore {
     async fn create_task(
         &self,
-        _tool_name: &str,
-        _arguments: serde_json::Value,
+        tool_name: &str,
+        arguments: serde_json::Value,
         ttl: Option<u64>,
         owner: TaskOwner,
     ) -> TaskResult<(String, CancellationToken)> {
@@ -73,6 +81,9 @@ impl TaskStore for ExternalStore {
         self.tasks.lock().unwrap().insert(
             id.clone(),
             Record {
+                tool_name: tool_name.to_string(),
+                arguments,
+                input_responses: InputResponses::default(),
                 object,
                 owner,
                 result: None,
@@ -186,6 +197,16 @@ impl TaskStore for ExternalStore {
         self.get_task_result(task_id).await
     }
 
+    async fn resume_context(&self, task_id: &str) -> TaskResult<Option<TaskResumeContext>> {
+        Ok(self.with(task_id, |record| {
+            TaskResumeContext::new(
+                record.tool_name.clone(),
+                record.arguments.clone(),
+                record.input_responses.clone(),
+            )
+        }))
+    }
+
     async fn set_task_meta(&self, task_id: &str, meta: serde_json::Value) -> TaskResult<bool> {
         Ok(self.with(task_id, |r| r.object.meta = Some(meta)).is_some())
     }
@@ -255,4 +276,19 @@ async fn a_constructed_token_carries_cancellation() {
         "every clone observes the same flag, which is what the store relies on"
     );
     assert!(CancellationToken::default().is_cancelled().eq(&false));
+}
+
+/// The non-exhaustive resume context remains constructible downstream.
+#[tokio::test]
+async fn an_external_store_can_construct_a_resume_context() {
+    let store = ExternalStore::default();
+    let (task_id, _) = store
+        .create_task("build_report", json!({"format": "pdf"}), None, None)
+        .await
+        .unwrap();
+
+    let resume = store.resume_context(&task_id).await.unwrap().unwrap();
+    assert_eq!(resume.tool_name, "build_report");
+    assert_eq!(resume.arguments, json!({"format": "pdf"}));
+    assert!(resume.input_responses.is_empty());
 }
