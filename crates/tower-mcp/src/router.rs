@@ -104,6 +104,12 @@ fn is_final_protocol_request(_extensions: &crate::context::Extensions) -> bool {
 pub struct McpRouter {
     inner: Arc<McpRouterInner>,
     session: SessionState,
+    /// Legacy `resources/subscribe` membership for this logical session.
+    ///
+    /// Ordinary router clones share this state because transports clone a
+    /// session router for each request. [`Self::with_fresh_session`] replaces
+    /// it so one client's membership cannot affect another client.
+    subscriptions: Arc<RwLock<HashSet<String>>>,
 }
 
 impl std::fmt::Debug for McpRouter {
@@ -207,8 +213,6 @@ struct McpRouterInner {
     client_requester: Option<ClientRequesterHandle>,
     /// Task store for async operations
     task_store: Arc<dyn TaskStore>,
-    /// Subscribed resource URIs
-    subscriptions: Arc<RwLock<HashSet<String>>>,
     /// Handler for completion requests
     completion_handler: Option<CompletionHandler>,
     /// Filter for tools based on session state
@@ -307,6 +311,41 @@ impl McpRouter {
             // an explicit ResourceTemplateFilter (#1399).
             return Err(filter.denial_error(concrete_uri));
         }
+        Ok(())
+    }
+
+    /// Authorize access to an exact statically registered resource.
+    ///
+    /// Legacy resource subscriptions deliberately retain their existing
+    /// exact-static scope. This helper gives subscribe and unsubscribe the
+    /// same disabled/filter policy and concrete-target denial behavior as a
+    /// static resource read without expanding the accepted URI universe to
+    /// dynamic resources or templates.
+    fn authorize_static_resource_subscription(
+        &self,
+        request_extensions: &Extensions,
+        uri: &str,
+    ) -> Result<()> {
+        let disabled = self.inner.disabled_resources.read().unwrap().contains(uri);
+        if disabled {
+            return Err(Error::JsonRpc(JsonRpcError::resource_not_found(uri)));
+        }
+
+        let resource = self
+            .inner
+            .resources
+            .get(uri)
+            .ok_or_else(|| Error::JsonRpc(JsonRpcError::resource_not_found(uri)))?;
+        let context = self.capability_filter_context(
+            request_extensions,
+            CapabilityOperation::Access { target: uri },
+        );
+        if let Some(filter) = &self.inner.resource_filter
+            && !filter.is_visible_with_context(&context, resource)
+        {
+            return Err(filter.denial_error(uri));
+        }
+
         Ok(())
     }
 
@@ -475,7 +514,6 @@ impl McpRouter {
                 subscription_observer: Arc::new(RwLock::new(None)),
                 client_requester: None,
                 task_store: Arc::new(MemoryTaskStore::new()),
-                subscriptions: Arc::new(RwLock::new(HashSet::new())),
                 extensions: Arc::new(crate::context::Extensions::new()),
                 protocol_extensions: HashMap::new(),
                 completion_handler: None,
@@ -504,6 +542,7 @@ impl McpRouter {
                 dynamic_resource_templates: None,
             }),
             session: SessionState::new(),
+            subscriptions: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -511,13 +550,15 @@ impl McpRouter {
     ///
     /// Use this when creating a new logical session (e.g., per HTTP connection).
     /// The router configuration (tools, resources, prompts) is shared, but the
-    /// session state (phase, extensions) is independent.
+    /// session state (phase, extensions) and legacy resource subscriptions are
+    /// independent.
     ///
     /// This is typically called by transports when establishing a new client session.
     pub fn with_fresh_session(&self) -> Self {
         Self {
             inner: self.inner.clone(),
             session: SessionState::new(),
+            subscriptions: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -972,6 +1013,11 @@ impl McpRouter {
         // restricted requests stay on their associated response channel.
         let final_lifecycle = is_final_protocol_request(per_request);
         let ctx = ctx.with_final_lifecycle(final_lifecycle);
+        let ctx = if final_lifecycle {
+            ctx
+        } else {
+            ctx.with_resource_subscriptions(self.subscriptions.clone())
+        };
         let ctx = if !final_lifecycle
             && let Some(requester) = merged
                 .get::<ClientRequesterHandle>()
@@ -2421,12 +2467,7 @@ impl McpRouter {
             }
 
             McpRequest::SubscribeResource(params) => {
-                // Verify the resource exists
-                if !self.inner.resources.contains_key(&params.uri) {
-                    return Err(Error::JsonRpc(JsonRpcError::resource_not_found(
-                        &params.uri,
-                    )));
-                }
+                self.authorize_static_resource_subscription(&extensions, &params.uri)?;
 
                 tracing::debug!(uri = %params.uri, "Subscribing to resource");
                 self.subscribe(&params.uri);
@@ -2435,15 +2476,13 @@ impl McpRouter {
             }
 
             McpRequest::UnsubscribeResource(params) => {
-                // Verify the resource exists
-                if !self.inner.resources.contains_key(&params.uri) {
-                    return Err(Error::JsonRpc(JsonRpcError::resource_not_found(
-                        &params.uri,
-                    )));
-                }
+                // Authorize before consulting or mutating membership. Otherwise
+                // success for an existing subscription and denial for an
+                // unowned URI would disclose session state for hidden resources.
+                self.authorize_static_resource_subscription(&extensions, &params.uri)?;
+                self.unsubscribe(&params.uri);
 
                 tracing::debug!(uri = %params.uri, "Unsubscribing from resource");
-                self.unsubscribe(&params.uri);
 
                 Ok(McpResponse::UnsubscribeResource(EmptyResult {}))
             }

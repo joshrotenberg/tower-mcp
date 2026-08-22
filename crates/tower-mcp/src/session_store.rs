@@ -4,10 +4,12 @@
 //! - **Persistent metadata** ([`SessionRecord`]) -- serializable, can be stored
 //!   in Redis, Postgres, etc. Persisted via the [`SessionStore`] trait.
 //! - **Runtime state** -- broadcast channels, pending request handles, service
-//!   instances. Held in-memory per server instance; cannot be serialized.
-//!   This includes legacy server-to-client requests associated with an
-//!   originating HTTP POST. Shared session metadata does not make those live
-//!   exchanges portable; use session affinity while they are in flight.
+//!   instances, and legacy `resources/subscribe` memberships. Held in-memory
+//!   per server instance; cannot be serialized. This includes legacy
+//!   server-to-client requests associated with an originating HTTP POST.
+//!   Shared session metadata does not make those live exchanges portable; use
+//!   session affinity while they are in flight. A restored session starts with
+//!   no legacy resource subscriptions, so clients must resubscribe.
 //!
 //! By default transports use [`MemorySessionStore`], which keeps metadata in an
 //! in-process `HashMap` (behavior identical to earlier versions). External
@@ -41,9 +43,11 @@ use crate::protocol::{ClientCapabilities, Implementation};
 
 /// Serializable session metadata persisted by a [`SessionStore`].
 ///
-/// Contains everything needed to reconstruct a session after a restart or
-/// across server instances. Does **not** contain runtime state (channels,
-/// pending requests) -- those are rebuilt locally on restore.
+/// Contains the persistent metadata needed to reconstruct a session after a
+/// restart or across server instances. Does **not** contain runtime state
+/// (channels, pending requests, or legacy `resources/subscribe` memberships) --
+/// those are rebuilt locally on restore. In particular, a restored session has
+/// no legacy resource subscriptions until the client resubscribes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct SessionRecord {

@@ -165,10 +165,11 @@ impl Session {
     ///
     /// The router is pre-marked initialized and the protocol version is
     /// restored from the record. Runtime state (broadcast channels,
-    /// pending-request table) is freshly allocated — in-flight state from
-    /// before the rebuild is not recovered. The `event_counter` is left at
-    /// zero; the [`SessionRegistry`] seeds it from the event store so
-    /// future event IDs don't collide with buffered ones.
+    /// pending-request table, and legacy resource subscription memberships) is
+    /// freshly allocated — in-flight state from before the rebuild is not
+    /// recovered. Clients must resubscribe to resources after restoration. The
+    /// `event_counter` is left at zero; the [`SessionRegistry`] seeds it from
+    /// the event store so future event IDs don't collide with buffered ones.
     fn restored(
         record: &crate::session_store::SessionRecord,
         router: McpRouter,
@@ -276,6 +277,23 @@ impl Session {
                     "Notification received on service-based session (not forwarded)"
                 );
             }
+        }
+    }
+
+    /// Whether an externally supplied notification belongs on this session's
+    /// legacy SSE stream.
+    ///
+    /// Router-backed resource updates honor the exact URI memberships created
+    /// by `resources/subscribe`. A boxed service exposes no router state for
+    /// the transport to inspect, so it retains the caller-owned broadcast
+    /// behavior that [`HttpTransport::from_service`] has always provided.
+    fn accepts_external_notification(&self, notification: &ServerNotification) -> bool {
+        match (notification, &self.service_source) {
+            (
+                ServerNotification::ResourceUpdated { uri },
+                SessionServiceSource::Router { router, .. },
+            ) => router.is_subscribed(uri),
+            _ => true,
         }
     }
 
@@ -723,9 +741,10 @@ impl SessionRegistry {
     ///
     /// The caller must ensure the record's ID is not already live locally;
     /// on success the session is inserted into the local registry, the
-    /// event counter is seeded so new event IDs don't collide with
-    /// buffered ones, and the record's `last_accessed` is refreshed and
-    /// saved back to the store.
+    /// event counter is seeded so new event IDs don't collide with buffered
+    /// ones, and the record's `last_accessed` is refreshed and saved back to
+    /// the store. Legacy resource subscription memberships are not persisted;
+    /// the restored session starts empty and the client must resubscribe.
     async fn restore_from_record(
         &self,
         record: crate::session_store::SessionRecord,
@@ -842,16 +861,23 @@ impl SessionRegistry {
         removed
     }
 
-    /// Send a pre-serialized JSON notification to every live session's SSE
-    /// broadcast channel.
+    /// Route a pre-serialized external notification to live session SSE
+    /// broadcast channels.
     ///
-    /// Used by the external-notification fan-out task. Failures to send
-    /// (no SSE subscribers attached to a session yet) are silent — the
-    /// broadcast channel drops the message naturally.
-    pub(super) async fn broadcast_to_all(&self, json: &str) {
+    /// Resource updates are limited to subscribed router-backed sessions;
+    /// other notification kinds and service-backed sessions preserve the
+    /// existing broadcast behavior. Failures to send (no SSE receiver
+    /// attached to a session yet) are silent.
+    pub(super) async fn broadcast_external_notification(
+        &self,
+        notification: &ServerNotification,
+        json: &str,
+    ) {
         let sessions = self.sessions.read().await;
         for session in sessions.values() {
-            let _ = session.notifications_tx.send(json.to_string());
+            if session.accepts_external_notification(notification) {
+                let _ = session.notifications_tx.send(json.to_string());
+            }
         }
     }
 

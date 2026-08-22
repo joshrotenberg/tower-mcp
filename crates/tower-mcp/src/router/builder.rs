@@ -1005,7 +1005,11 @@ impl McpRouter {
     /// The filter receives the current session state and each resource, returning
     /// `true` if the resource should be visible to this session. Resources that
     /// don't pass the filter will not appear in `resources/list` responses and will
-    /// return an error if read directly.
+    /// return an error if read directly. The same policy authorizes exact static
+    /// resources for `resources/subscribe` and `resources/unsubscribe`; contextual
+    /// filters receive a [`CapabilityOperation::Access`] whose target is the
+    /// requested URI. Authorization runs before subscription membership is read or
+    /// changed, so hidden resources cannot disclose whether a session subscribed.
     ///
     /// Resource templates require a separate
     /// [`resource_template_filter`](Self::resource_template_filter), because
@@ -1145,9 +1149,11 @@ impl McpRouter {
 
     /// Disable a resource by concrete URI. Disabled resources are hidden from
     /// `resources/list` and return a not-found error from `resources/read`,
-    /// including when the URI would otherwise resolve through a template. A
-    /// disabled concrete URI does not hide the template definition or disable
-    /// sibling URIs served by the same template.
+    /// `resources/subscribe`, and `resources/unsubscribe`, including when the URI
+    /// would otherwise resolve through a template. Existing subscription membership
+    /// remains inaccessible until the resource is re-enabled, or is discarded when
+    /// the session ends. A disabled concrete URI does not hide the template
+    /// definition or disable sibling URIs served by the same template.
     pub fn disable_resource(&self, uri: impl Into<String>) {
         let mut set = self.inner.disabled_resources.write().unwrap();
         set.insert(uri.into());

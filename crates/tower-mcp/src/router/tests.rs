@@ -3969,6 +3969,245 @@ async fn test_get_nonexistent_task() {
 // Resource Subscription Tests
 // =========================================================================
 
+async fn subscribe_resource(
+    router: &McpRouter,
+    id: i64,
+    uri: &str,
+    extensions: Extensions,
+) -> Result<McpResponse> {
+    router
+        .handle(
+            RequestId::Number(id),
+            McpRequest::SubscribeResource(SubscribeResourceParams {
+                uri: uri.to_string(),
+                meta: None,
+            }),
+            extensions,
+        )
+        .await
+}
+
+async fn unsubscribe_resource(
+    router: &McpRouter,
+    id: i64,
+    uri: &str,
+    extensions: Extensions,
+) -> Result<McpResponse> {
+    router
+        .handle(
+            RequestId::Number(id),
+            McpRequest::UnsubscribeResource(UnsubscribeResourceParams {
+                uri: uri.to_string(),
+                meta: None,
+            }),
+            extensions,
+        )
+        .await
+}
+
+#[test]
+fn resource_subscription_state_is_shared_by_logical_session_clones() {
+    let router = McpRouter::new();
+    let clone = router.clone();
+
+    assert!(router.subscribe("file:///shared.txt"));
+    assert!(clone.is_subscribed("file:///shared.txt"));
+    assert!(clone.unsubscribe("file:///shared.txt"));
+    assert!(!router.is_subscribed("file:///shared.txt"));
+}
+
+#[test]
+fn resource_subscription_state_isolated_between_fresh_sessions() {
+    let base = McpRouter::new();
+    let first = base.with_fresh_session();
+    let second = base.with_fresh_session();
+
+    assert!(first.subscribe("file:///private.txt"));
+    assert!(first.is_subscribed("file:///private.txt"));
+    assert!(!base.is_subscribed("file:///private.txt"));
+    assert!(!second.is_subscribed("file:///private.txt"));
+}
+
+#[tokio::test]
+async fn fresh_sessions_unsubscribe_independently() {
+    use crate::resource::ResourceBuilder;
+
+    let base = McpRouter::new().resource(
+        ResourceBuilder::new("file:///shared.txt")
+            .name("Shared")
+            .text("shared"),
+    );
+    let mut first = base.with_fresh_session();
+    let mut second = base.with_fresh_session();
+    init_router(&mut first).await;
+    init_router(&mut second).await;
+
+    subscribe_resource(&first, 1, "file:///shared.txt", Extensions::new())
+        .await
+        .unwrap();
+    subscribe_resource(&second, 2, "file:///shared.txt", Extensions::new())
+        .await
+        .unwrap();
+    unsubscribe_resource(&second, 3, "file:///shared.txt", Extensions::new())
+        .await
+        .unwrap();
+
+    assert!(first.is_subscribed("file:///shared.txt"));
+    assert!(!second.is_subscribed("file:///shared.txt"));
+}
+
+#[tokio::test]
+async fn disabled_resource_cannot_be_subscribed() {
+    use crate::resource::ResourceBuilder;
+
+    let mut router = McpRouter::new().resource(
+        ResourceBuilder::new("file:///disabled.txt")
+            .name("Disabled")
+            .text("hidden"),
+    );
+    router.disable_resource("file:///disabled.txt");
+    init_router(&mut router).await;
+
+    let error = subscribe_resource(&router, 1, "file:///disabled.txt", Extensions::new())
+        .await
+        .expect_err("disabled resources must not be subscribable");
+
+    assert!(matches!(error, Error::JsonRpc(error) if error.code == -32602));
+    assert!(!router.is_subscribed("file:///disabled.txt"));
+}
+
+#[derive(Clone)]
+struct SubscriptionPrincipal(&'static str);
+
+fn subscription_principal(principal: &'static str) -> Extensions {
+    let mut extensions = Extensions::new();
+    extensions.insert(SubscriptionPrincipal(principal));
+    extensions
+}
+
+#[tokio::test]
+async fn resource_filter_authorizes_subscribe_with_request_context() {
+    use crate::filter::{CapabilityFilter, DenialBehavior};
+    use crate::resource::{Resource, ResourceBuilder};
+
+    let mut router = McpRouter::new()
+        .resource(
+            ResourceBuilder::new("file:///filtered.txt")
+                .name("Filtered")
+                .text("filtered"),
+        )
+        .resource_filter(
+            CapabilityFilter::new_with_context(|context, resource: &Resource| {
+                matches!(
+                    context.operation(),
+                    CapabilityOperation::Access { target } if target == resource.uri
+                ) && context
+                    .extension::<SubscriptionPrincipal>()
+                    .is_some_and(|principal| principal.0 == "allowed")
+            })
+            .denial_behavior(DenialBehavior::custom(|target| {
+                Error::JsonRpc(JsonRpcError::forbidden(format!(
+                    "subscription denied for {target}"
+                )))
+            })),
+        );
+    init_router(&mut router).await;
+
+    let denied = subscribe_resource(
+        &router,
+        1,
+        "file:///filtered.txt",
+        subscription_principal("denied"),
+    )
+    .await
+    .expect_err("the per-request principal must be enforced");
+    assert!(matches!(
+        denied,
+        Error::JsonRpc(error)
+            if error.code == -32007 && error.message.contains("file:///filtered.txt")
+    ));
+    assert!(!router.is_subscribed("file:///filtered.txt"));
+
+    subscribe_resource(
+        &router,
+        2,
+        "file:///filtered.txt",
+        subscription_principal("allowed"),
+    )
+    .await
+    .expect("the allowed principal should subscribe");
+    assert!(router.is_subscribed("file:///filtered.txt"));
+}
+
+#[tokio::test]
+async fn hidden_unsubscribe_denial_does_not_disclose_or_mutate_membership() {
+    use crate::filter::{CapabilityFilter, DenialBehavior};
+    use crate::resource::{Resource, ResourceBuilder};
+
+    let base = McpRouter::new()
+        .resource(
+            ResourceBuilder::new("file:///revoked.txt")
+                .name("Revoked")
+                .text("revoked"),
+        )
+        .resource_filter(
+            CapabilityFilter::new_with_context(|context, _resource: &Resource| {
+                context
+                    .extension::<SubscriptionPrincipal>()
+                    .is_some_and(|principal| principal.0 == "allowed")
+            })
+            .denial_behavior(DenialBehavior::custom(|target| {
+                Error::JsonRpc(JsonRpcError::forbidden(format!(
+                    "unsubscribe denied for {target}"
+                )))
+            })),
+        );
+    let mut subscribed = base.with_fresh_session();
+    let mut unowned = base.with_fresh_session();
+    init_router(&mut subscribed).await;
+    init_router(&mut unowned).await;
+
+    subscribe_resource(
+        &subscribed,
+        1,
+        "file:///revoked.txt",
+        subscription_principal("allowed"),
+    )
+    .await
+    .unwrap();
+
+    let subscribed_denial = unsubscribe_resource(
+        &subscribed,
+        2,
+        "file:///revoked.txt",
+        subscription_principal("denied"),
+    )
+    .await
+    .expect_err("a hidden subscribed URI must be denied before membership mutation");
+
+    let unowned_denial = unsubscribe_resource(
+        &unowned,
+        3,
+        "file:///revoked.txt",
+        subscription_principal("denied"),
+    )
+    .await
+    .expect_err("an unowned hidden URI must receive the same denial");
+
+    let Error::JsonRpc(subscribed_denial) = subscribed_denial else {
+        panic!("expected JSON-RPC denial for subscribed URI");
+    };
+    let Error::JsonRpc(unowned_denial) = unowned_denial else {
+        panic!("expected JSON-RPC denial for unowned URI");
+    };
+    assert_eq!(subscribed_denial.code, -32007);
+    assert_eq!(subscribed_denial.code, unowned_denial.code);
+    assert_eq!(subscribed_denial.message, unowned_denial.message);
+    assert_eq!(subscribed_denial.data, unowned_denial.data);
+    assert!(subscribed.is_subscribed("file:///revoked.txt"));
+    assert!(!unowned.is_subscribed("file:///revoked.txt"));
+}
+
 #[tokio::test]
 async fn test_subscribe_to_resource() {
     use crate::resource::ResourceBuilder;

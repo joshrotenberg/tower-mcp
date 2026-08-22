@@ -3389,7 +3389,18 @@ fn test_effective_host_returns_none_when_both_missing() {
 // External notification fan-out
 // =========================================================================
 
-/// Initialize a session against `app` and return its session id.
+const EXTERNAL_RESOURCE_URI: &str = "claude://chats/abc";
+
+fn external_notification_router() -> McpRouter {
+    create_test_router().resource(
+        crate::ResourceBuilder::new(EXTERNAL_RESOURCE_URI)
+            .name("External notification test resource")
+            .text("test"),
+    )
+}
+
+/// Initialize a session against `app`, complete the legacy handshake, and
+/// return its session id.
 async fn init_session(app: &Router) -> String {
     let req = Request::builder()
         .method("POST")
@@ -3412,43 +3423,233 @@ async fn init_session(app: &Router) -> String {
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    resp.headers()
+    let session_id = resp
+        .headers()
         .get(MCP_SESSION_ID_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
-        .expect("initialize must return a session id")
+        .expect("initialize must return a session id");
+    send_initialized(app, &session_id).await;
+    session_id
+}
+
+async fn set_resource_subscription(
+    app: &Router,
+    session_id: &str,
+    subscribe: bool,
+    request_id: i64,
+) {
+    let method = if subscribe {
+        "resources/subscribe"
+    } else {
+        "resources/unsubscribe"
+    };
+    let request = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header(MCP_SESSION_ID_HEADER, session_id)
+        .body(Body::from(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+                "params": { "uri": EXTERNAL_RESOURCE_URI }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["id"], request_id);
+    assert!(
+        json.get("result").is_some(),
+        "{method} failed for session {session_id}: {json}"
+    );
+}
+
+async fn session_broadcast_receiver(
+    session_handle: &SessionHandle,
+    session_id: &str,
+) -> broadcast::Receiver<String> {
+    let sessions = session_handle.store.sessions.read().await;
+    sessions
+        .get(session_id)
+        .expect("session should be registered")
+        .notifications_tx
+        .subscribe()
+}
+
+async fn router_session_is_subscribed(
+    session_handle: &SessionHandle,
+    session_id: &str,
+    uri: &str,
+) -> bool {
+    let sessions = session_handle.store.sessions.read().await;
+    let session = sessions
+        .get(session_id)
+        .expect("session should be registered");
+    match &session.service_source {
+        SessionServiceSource::Router { router, .. } => router.is_subscribed(uri),
+        SessionServiceSource::Boxed(_) => panic!("expected a router-backed session"),
+    }
 }
 
 #[tokio::test]
-async fn test_external_notification_reaches_single_session() {
+async fn external_resource_updates_follow_each_router_sessions_subscriptions() {
     let (notif_tx, notif_rx) = notification_channel(8);
-    let transport = HttpTransport::with_notifications(create_test_router(), notif_rx);
+    let transport = HttpTransport::with_notifications(external_notification_router(), notif_rx);
     let (app, session_handle) = transport.into_router_with_handle();
 
-    let session_id = init_session(&app).await;
+    let session_a = init_session(&app).await;
+    let session_b = init_session(&app).await;
+    assert_ne!(session_a, session_b);
 
-    // Subscribe to the session's broadcast channel before firing.
-    let mut rx = {
-        let sessions = session_handle.store.sessions.read().await;
-        let session = sessions
-            .get(&session_id)
-            .expect("session should be registered");
-        session.notifications_tx.subscribe()
-    };
+    set_resource_subscription(&app, &session_a, true, 10).await;
+
+    let mut rx_a = session_broadcast_receiver(&session_handle, &session_a).await;
+    let mut rx_b = session_broadcast_receiver(&session_handle, &session_b).await;
 
     notif_tx
         .send(crate::context::ServerNotification::ResourceUpdated {
-            uri: "claude://chats/abc".to_string(),
+            uri: EXTERNAL_RESOURCE_URI.to_string(),
         })
         .await
         .unwrap();
 
-    let json = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+    let json_a = tokio::time::timeout(Duration::from_secs(1), rx_a.recv())
         .await
-        .expect("notification should arrive within timeout")
+        .expect("subscribed session A should receive the update")
         .expect("broadcast channel closed");
-    assert!(json.contains("notifications/resources/updated"));
-    assert!(json.contains("claude://chats/abc"));
+    assert!(json_a.contains("notifications/resources/updated"));
+    assert!(json_a.contains(EXTERNAL_RESOURCE_URI));
+    assert!(matches!(
+        rx_b.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    ));
+
+    // The same URI can be owned independently: B subscribing and A
+    // unsubscribing must not change the other session's membership.
+    set_resource_subscription(&app, &session_b, true, 11).await;
+    set_resource_subscription(&app, &session_a, false, 12).await;
+    notif_tx
+        .send(crate::context::ServerNotification::ResourceUpdated {
+            uri: EXTERNAL_RESOURCE_URI.to_string(),
+        })
+        .await
+        .unwrap();
+
+    let json_b = tokio::time::timeout(Duration::from_secs(1), rx_b.recv())
+        .await
+        .expect("subscribed session B should receive the update")
+        .expect("broadcast channel closed");
+    assert!(json_b.contains("notifications/resources/updated"));
+    assert!(matches!(
+        rx_a.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
+async fn terminated_router_session_subscription_is_not_inherited() {
+    let (notif_tx, notif_rx) = notification_channel(8);
+    let transport = HttpTransport::with_notifications(external_notification_router(), notif_rx);
+    let (app, session_handle) = transport.into_router_with_handle();
+
+    let old_session = init_session(&app).await;
+    set_resource_subscription(&app, &old_session, true, 20).await;
+    assert!(session_handle.terminate_session(&old_session).await);
+
+    let new_session = init_session(&app).await;
+    let mut new_rx = session_broadcast_receiver(&session_handle, &new_session).await;
+
+    // The list-changed notification is an ordered barrier: it always fans out
+    // and proves the preceding resource update was processed. If the new
+    // session inherited the old membership, the resource update arrives first.
+    notif_tx
+        .send(crate::context::ServerNotification::ResourceUpdated {
+            uri: EXTERNAL_RESOURCE_URI.to_string(),
+        })
+        .await
+        .unwrap();
+    notif_tx
+        .send(crate::context::ServerNotification::ResourcesListChanged)
+        .await
+        .unwrap();
+
+    let json = tokio::time::timeout(Duration::from_secs(1), new_rx.recv())
+        .await
+        .expect("list-changed barrier should reach the new session")
+        .expect("broadcast channel closed");
+    assert!(
+        json.contains("notifications/resources/list_changed"),
+        "{json}"
+    );
+    assert!(matches!(
+        new_rx.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
+async fn restored_router_session_does_not_restore_legacy_subscriptions() {
+    use crate::session_store::{MemorySessionStore, SessionStore};
+
+    let store = Arc::new(MemorySessionStore::new());
+    let store_dyn: Arc<dyn SessionStore> = store.clone();
+
+    // First instance: establish a persisted session and a runtime-only legacy
+    // subscription, then drop the instance while retaining its store record.
+    let session_id = {
+        let transport = HttpTransport::new(external_notification_router())
+            .disable_origin_validation()
+            .session_store(store_dyn.clone());
+        let (app, session_handle) = transport.into_router_with_handle();
+        let session_id = init_session(&app).await;
+        set_resource_subscription(&app, &session_id, true, 30).await;
+        assert!(
+            router_session_is_subscribed(&session_handle, &session_id, EXTERNAL_RESOURCE_URI).await
+        );
+        session_id
+    };
+
+    assert!(
+        store.load(&session_id).await.unwrap().is_some(),
+        "persistent session record should survive the first instance"
+    );
+
+    // Second instance: the first request restores the session from its record.
+    let transport = HttpTransport::new(external_notification_router())
+        .disable_origin_validation()
+        .session_store(store_dyn);
+    let (app, session_handle) = transport.into_router_with_handle();
+    let request = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header(MCP_SESSION_ID_HEADER, &session_id)
+        .body(Body::from(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 31,
+                "method": "resources/list"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert!(
+        !router_session_is_subscribed(&session_handle, &session_id, EXTERNAL_RESOURCE_URI).await,
+        "restored sessions must start with empty legacy subscription membership"
+    );
 }
 
 #[tokio::test]
@@ -3486,6 +3687,37 @@ async fn test_external_notification_fans_out_to_all_sessions() {
         .unwrap();
     assert!(json_a.contains("notifications/resources/list_changed"));
     assert!(json_b.contains("notifications/resources/list_changed"));
+}
+
+#[tokio::test]
+async fn service_backed_external_resource_updates_preserve_broadcast_behavior() {
+    let (notif_tx, notif_rx) = notification_channel(8);
+    let transport =
+        HttpTransport::from_service(create_test_router()).external_notifications(notif_rx);
+    let (app, session_handle) = transport.into_router_with_handle();
+
+    let session_a = init_session(&app).await;
+    let session_b = init_session(&app).await;
+    let mut rx_a = session_broadcast_receiver(&session_handle, &session_a).await;
+    let mut rx_b = session_broadcast_receiver(&session_handle, &session_b).await;
+
+    // A boxed service exposes no router subscription state to HttpTransport,
+    // so caller-supplied notifications retain the compatibility broadcast.
+    notif_tx
+        .send(crate::context::ServerNotification::ResourceUpdated {
+            uri: EXTERNAL_RESOURCE_URI.to_string(),
+        })
+        .await
+        .unwrap();
+
+    for rx in [&mut rx_a, &mut rx_b] {
+        let json = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("service-backed session should receive the broadcast")
+            .expect("broadcast channel closed");
+        assert!(json.contains("notifications/resources/updated"));
+        assert!(json.contains(EXTERNAL_RESOURCE_URI));
+    }
 }
 
 #[tokio::test]

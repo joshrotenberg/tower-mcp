@@ -113,6 +113,7 @@
 //! }
 //! ```
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -342,6 +343,11 @@ pub struct RequestContext {
     extensions: Arc<Extensions>,
     /// Minimum log level set by the client (shared with router for dynamic updates)
     min_log_level: Option<Arc<RwLock<LogLevel>>>,
+    /// Resource URIs subscribed by this legacy session. Router-created
+    /// contexts attach the shared set so handlers cannot notify a session
+    /// about resources it did not subscribe to. Manually created contexts
+    /// leave this unset and retain the historical best-effort behavior.
+    resource_subscriptions: Option<Arc<RwLock<HashSet<String>>>>,
     /// Whether this request arrived on the 2026-07-28 lifecycle, where the
     /// server never initiates JSON-RPC requests. Distinguishes "the protocol
     /// has no route for this" from "a transport did not wire one up", which
@@ -435,6 +441,7 @@ impl RequestContext {
             final_lifecycle: false,
             extensions: Arc::new(Extensions::new()),
             min_log_level: None,
+            resource_subscriptions: None,
         }
     }
 
@@ -461,11 +468,26 @@ impl RequestContext {
 
     /// Mark this context as serving a 2026-07-28 request.
     ///
-    /// Only affects diagnostics: the final lifecycle has no server-initiated
-    /// requests, so the router does not attach a requester, and this lets the
-    /// resulting error say why rather than blaming configuration.
+    /// The final lifecycle has no server-initiated requests, so the router
+    /// does not attach a requester, and this lets the resulting error say why
+    /// rather than blaming configuration. It also keeps resource update
+    /// notifications eligible for final `subscriptions/listen` routing rather
+    /// than applying the legacy session subscription set.
     pub(crate) fn with_final_lifecycle(mut self, final_lifecycle: bool) -> Self {
         self.final_lifecycle = final_lifecycle;
+        self
+    }
+
+    /// Attach the resource subscription set for a legacy session.
+    ///
+    /// The set is shared with the router so subscribe and unsubscribe requests
+    /// take effect for subsequent handler notifications without rebuilding the
+    /// context.
+    pub(crate) fn with_resource_subscriptions(
+        mut self,
+        subscriptions: Arc<RwLock<HashSet<String>>>,
+    ) -> Self {
+        self.resource_subscriptions = Some(subscriptions);
         self
     }
 
@@ -726,9 +748,25 @@ impl RequestContext {
     }
 
     /// Notify subscribed clients that one resource changed.
+    ///
+    /// Router-created legacy contexts send only when this session subscribed
+    /// to the exact URI. Manually created contexts retain the historical
+    /// best-effort send behavior because they have no subscription set. Final
+    /// 2026-07-28 contexts always enqueue the notification here; their
+    /// `subscriptions/listen` routing applies the final subscription policy.
     pub fn notify_resource_updated(&self, uri: impl Into<String>) -> bool {
+        let uri = uri.into();
+        if !self.final_lifecycle
+            && let Some(subscriptions) = &self.resource_subscriptions
+            && !subscriptions
+                .read()
+                .is_ok_and(|subscribed| subscribed.contains(&uri))
+        {
+            return false;
+        }
+
         self.notification_tx.as_ref().is_some_and(|tx| {
-            tx.try_send(ServerNotification::ResourceUpdated { uri: uri.into() })
+            tx.try_send(ServerNotification::ResourceUpdated { uri })
                 .is_ok()
         })
     }
@@ -1300,6 +1338,72 @@ mod tests {
 
         // Channel should be empty
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn legacy_resource_update_is_sent_for_a_subscribed_uri() {
+        let (tx, mut rx) = notification_channel(10);
+        let subscriptions = Arc::new(RwLock::new(HashSet::from([
+            "file:///subscribed.txt".to_string()
+        ])));
+        let ctx = RequestContext::new(RequestId::Number(1))
+            .with_notification_sender(tx)
+            .with_resource_subscriptions(subscriptions);
+
+        assert!(ctx.notify_resource_updated("file:///subscribed.txt"));
+        match rx.try_recv().expect("subscribed update should be sent") {
+            ServerNotification::ResourceUpdated { uri } => {
+                assert_eq!(uri, "file:///subscribed.txt");
+            }
+            notification => panic!("expected resource update, got {notification:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_resource_update_is_suppressed_for_an_unsubscribed_uri() {
+        let (tx, mut rx) = notification_channel(10);
+        let subscriptions = Arc::new(RwLock::new(HashSet::from([
+            "file:///subscribed.txt".to_string()
+        ])));
+        let ctx = RequestContext::new(RequestId::Number(1))
+            .with_notification_sender(tx)
+            .with_resource_subscriptions(subscriptions);
+
+        assert!(!ctx.notify_resource_updated("file:///other.txt"));
+        assert!(
+            rx.try_recv().is_err(),
+            "unsubscribed update must not be enqueued"
+        );
+    }
+
+    #[test]
+    fn final_resource_update_bypasses_the_legacy_subscription_guard() {
+        let (tx, mut rx) = notification_channel(10);
+        let subscriptions = Arc::new(RwLock::new(HashSet::new()));
+        let ctx = RequestContext::new(RequestId::Number(1))
+            .with_notification_sender(tx)
+            .with_resource_subscriptions(subscriptions)
+            .with_final_lifecycle(true);
+
+        assert!(ctx.notify_resource_updated("file:///final.txt"));
+        match rx.try_recv().expect("final update should be routed") {
+            ServerNotification::ResourceUpdated { uri } => {
+                assert_eq!(uri, "file:///final.txt");
+            }
+            notification => panic!("expected resource update, got {notification:?}"),
+        }
+    }
+
+    #[test]
+    fn manually_created_context_preserves_resource_update_behavior() {
+        let (tx, mut rx) = notification_channel(10);
+        let ctx = RequestContext::new(RequestId::Number(1)).with_notification_sender(tx);
+
+        assert!(ctx.notify_resource_updated("file:///manual.txt"));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerNotification::ResourceUpdated { uri }) if uri == "file:///manual.txt"
+        ));
     }
 
     #[test]

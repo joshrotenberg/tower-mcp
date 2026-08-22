@@ -78,17 +78,23 @@ impl McpRouter {
         ))
     }
 
-    /// Check if a resource URI is currently subscribed
+    /// Check whether this logical session subscribed to a resource URI.
+    ///
+    /// Ordinary [`McpRouter`] clones share the same logical session and
+    /// subscription state. Routers created with
+    /// [`McpRouter::with_fresh_session`] have independent membership.
     pub fn is_subscribed(&self, uri: &str) -> bool {
-        if let Ok(subs) = self.inner.subscriptions.read() {
+        if let Ok(subs) = self.subscriptions.read() {
             return subs.contains(uri);
         }
         false
     }
 
-    /// Get a list of all subscribed resource URIs
+    /// Get this logical session's subscribed resource URIs.
+    ///
+    /// This is not an aggregate across HTTP or other transport sessions.
     pub fn subscribed_uris(&self) -> Vec<String> {
-        if let Ok(subs) = self.inner.subscriptions.read() {
+        if let Ok(subs) = self.subscriptions.read() {
             return subs.iter().cloned().collect();
         }
         Vec::new()
@@ -96,7 +102,7 @@ impl McpRouter {
 
     /// Subscribe to a resource URI
     pub(super) fn subscribe(&self, uri: &str) -> bool {
-        if let Ok(mut subs) = self.inner.subscriptions.write() {
+        if let Ok(mut subs) = self.subscriptions.write() {
             return subs.insert(uri.to_string());
         }
         false
@@ -104,7 +110,7 @@ impl McpRouter {
 
     /// Unsubscribe from a resource URI
     pub(super) fn unsubscribe(&self, uri: &str) -> bool {
-        if let Ok(mut subs) = self.inner.subscriptions.write() {
+        if let Ok(mut subs) = self.subscriptions.write() {
             return subs.remove(uri);
         }
         false

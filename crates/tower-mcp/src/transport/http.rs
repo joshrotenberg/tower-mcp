@@ -263,7 +263,6 @@ use tokio::sync::{Mutex, RwLock, broadcast, oneshot};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
-#[cfg(feature = "stateless")]
 use crate::context::ServerNotification;
 use crate::context::{
     ChannelClientRequester, ClientRequesterHandle, NotificationReceiver, OutgoingRequest,
@@ -495,8 +494,9 @@ pub struct HttpTransport {
     event_store: Arc<dyn crate::event_store::EventStore>,
     auto_reinit_sessions: bool,
     /// Caller-owned receiver for notifications pushed from outside any
-    /// request handler. Drained by a background task and fanned out to
-    /// every live session's SSE stream.
+    /// request handler. Drained by a background task and routed to live
+    /// session SSE streams. Legacy resource updates honor each router-backed
+    /// session's `resources/subscribe` membership.
     external_notifications: Option<NotificationReceiver>,
     #[cfg(feature = "stateless")]
     stateless_config: Option<crate::stateless::StatelessConfig>,
@@ -606,7 +606,11 @@ impl HttpTransport {
     ///
     /// This accepts any `Service<RouterRequest>` implementation, such as
     /// [`McpProxy`](crate::proxy::McpProxy). The service is cloned for each
-    /// HTTP session.
+    /// HTTP session, but the transport cannot make arbitrary service-internal
+    /// state session-local. In particular, passing an [`McpRouter`] directly
+    /// here shares that router's logical-session state, including legacy
+    /// `resources/subscribe` membership. Use [`HttpTransport::new`] for an
+    /// `McpRouter`; it creates a fresh, isolated router session per client.
     ///
     /// Notification bridging and sampling are **not** set up automatically.
     /// The caller should configure these on the service before passing it in.
@@ -667,7 +671,7 @@ impl HttpTransport {
     }
 
     /// Create an HTTP transport that drains a caller-owned notification
-    /// channel and fans the items out to every live session's SSE stream.
+    /// channel and routes the items to live session SSE streams.
     ///
     /// This mirrors [`GenericStdioTransport::with_notifications`](crate::transport::stdio::GenericStdioTransport::with_notifications)
     /// and is the supported way to push server-originated notifications
@@ -677,13 +681,15 @@ impl HttpTransport {
     ///
     /// Per-session notification channels (in-handler `ctx.send_log()`,
     /// progress updates) are unaffected. The external channel runs in
-    /// parallel and broadcasts to every active session; MCP clients are
-    /// expected to ignore notifications they didn't subscribe to.
+    /// parallel. For legacy router-backed sessions,
+    /// [`ServerNotification::ResourceUpdated`] is delivered only to sessions
+    /// that successfully called `resources/subscribe` for that exact URI.
+    /// Other notification kinds continue to reach every active session.
     ///
     /// # Example
     ///
     /// ```rust,no_run
-    /// use tower_mcp::{BoxError, McpRouter};
+    /// use tower_mcp::{BoxError, McpRouter, ResourceBuilder};
     /// use tower_mcp::context::{ServerNotification, notification_channel};
     /// use tower_mcp::transport::http::HttpTransport;
     ///
@@ -691,7 +697,13 @@ impl HttpTransport {
     /// async fn main() -> Result<(), BoxError> {
     ///     let (notif_tx, notif_rx) = notification_channel(256);
     ///
-    ///     let router = McpRouter::new().server_info("my-server", "1.0.0");
+    ///     let router = McpRouter::new()
+    ///         .server_info("my-server", "1.0.0")
+    ///         .resource(
+    ///             ResourceBuilder::new("claude://chats/123")
+    ///                 .name("Chat 123")
+    ///                 .text("chat contents"),
+    ///         );
     ///
     ///     // Hold onto notif_tx in your application state so background tasks
     ///     // can push notifications. tx is `Clone`.
@@ -718,8 +730,13 @@ impl HttpTransport {
     ///
     /// Useful when wrapping a pre-built service via
     /// [`from_service`](Self::from_service), where setting a sender on the
-    /// router isn't part of the flow. See [`with_notifications`](Self::with_notifications)
-    /// for the typical router-based path.
+    /// router isn't part of the flow. A service-backed session exposes no
+    /// router whose resource subscriptions the transport can inspect, so all
+    /// external notifications retain the caller-owned broadcast behavior in
+    /// that mode. Filter the supplied channel before sending when a custom
+    /// service needs narrower delivery. See
+    /// [`with_notifications`](Self::with_notifications) for the typical
+    /// router-based path.
     pub fn external_notifications(mut self, notification_rx: NotificationReceiver) -> Self {
         self.external_notifications = Some(notification_rx);
         self
@@ -1067,9 +1084,11 @@ impl HttpTransport {
     /// supply an external store (Redis, Postgres, etc.) to share session
     /// metadata across server instances behind a load balancer.
     ///
-    /// Runtime state (broadcast channels, pending requests, service
-    /// instances) is always kept per-instance; only persistent metadata is
-    /// mirrored to the store.
+    /// Runtime state (broadcast channels, pending requests, service instances,
+    /// and legacy `resources/subscribe` memberships) is always kept
+    /// per-instance; only persistent metadata is mirrored to the store. A
+    /// client whose session is restored on another instance must resubscribe to
+    /// resources.
     ///
     /// # Example
     ///
@@ -1573,8 +1592,8 @@ impl HttpTransport {
 }
 
 /// Check if an origin is a localhost origin (safe from DNS rebinding).
-/// Drain a caller-supplied notification channel and fan items out to every
-/// live session's SSE broadcast.
+/// Drain a caller-supplied notification channel and route items to live
+/// session SSE broadcasts.
 ///
 /// No-op when `rx` is `None`. When present, spawns a long-running task that
 /// runs for the lifetime of the transport (until the channel closes).
@@ -1591,7 +1610,9 @@ fn spawn_external_notification_fanout(
             #[cfg(feature = "stateless")]
             modern_subscriptions.publish(&notification);
             if let Some(json) = crate::transport::stdio::serialize_notification(&notification) {
-                sessions.broadcast_to_all(&json).await;
+                sessions
+                    .broadcast_external_notification(&notification, &json)
+                    .await;
             }
         }
         tracing::debug!("External notification channel closed; fan-out task exiting");
