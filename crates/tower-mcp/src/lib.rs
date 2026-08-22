@@ -635,7 +635,8 @@ pub use error::{
 };
 pub use extension::{ExtensionDeclaration, NegotiatedExtension, NegotiatedExtensions};
 pub use filter::{
-    CapabilityFilter, DenialBehavior, Filterable, PromptFilter, ResourceFilter, ToolFilter,
+    CapabilityFilter, CapabilityFilterContext, CapabilityOperation, DenialBehavior, Filterable,
+    PromptFilter, ResourceFilter, ResourceTemplateFilter, ToolFilter,
 };
 pub use jsonrpc::{JsonRpcLayer, JsonRpcService};
 pub use middleware::{

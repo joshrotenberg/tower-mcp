@@ -435,6 +435,20 @@ impl DynamicResourceTemplatesInner {
 /// when handling `resources/templates/list` and `resources/read` requests.
 /// Static templates are checked before dynamic ones.
 ///
+/// Protocol requests are subject to the router's
+/// [`resource_template_filter`](crate::McpRouter::resource_template_filter).
+/// That policy is evaluated again for every request, including against the
+/// concrete URI selected by `resources/read`. If the router has a
+/// [`resource_filter`](crate::McpRouter::resource_filter) but no resource
+/// template filter, templates fail closed: they are omitted from protocol
+/// listings and cannot be read.
+///
+/// The registry handle is an application-management view, not a client-scoped
+/// protocol view. Its [`list`](Self::list) and [`contains`](Self::contains)
+/// methods deliberately do not apply router filters; do not use their results
+/// as an authorization decision or expose them directly to an untrusted
+/// client.
+///
 /// When a template is registered or unregistered, all connected sessions
 /// receive a `notifications/resources/list_changed` notification.
 ///
@@ -494,11 +508,17 @@ impl DynamicResourceTemplateRegistry {
     }
 
     /// List all currently registered dynamic resource templates.
+    ///
+    /// This is an unfiltered application-management view. Visibility filters
+    /// are applied only when the router handles protocol requests.
     pub fn list(&self) -> Vec<Arc<crate::resource::ResourceTemplate>> {
         self.inner.list()
     }
 
     /// Check if a template with the given URI pattern is registered.
+    ///
+    /// This reports registry state without consulting client visibility
+    /// filters.
     pub fn contains(&self, uri_template: &str) -> bool {
         let templates = self.inner.templates.read().unwrap();
         templates.iter().any(|t| t.uri_template == uri_template)

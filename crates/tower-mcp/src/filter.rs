@@ -36,15 +36,16 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::context::Extensions;
 use crate::error::{Error, JsonRpcError};
 use crate::prompt::Prompt;
-use crate::resource::Resource;
+use crate::resource::{Resource, ResourceTemplate};
 use crate::session::SessionState;
 use crate::tool::Tool;
 
 /// Trait for capabilities that can be filtered by session.
 ///
-/// Implemented for [`Tool`], [`Resource`], and [`Prompt`].
+/// Implemented for [`Tool`], [`Resource`], [`ResourceTemplate`], and [`Prompt`].
 pub trait Filterable: Send + Sync {
     /// Returns the name of this capability.
     fn name(&self) -> &str;
@@ -57,6 +58,12 @@ impl Filterable for Tool {
 }
 
 impl Filterable for Resource {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl Filterable for ResourceTemplate {
     fn name(&self) -> &str {
         &self.name
     }
@@ -123,6 +130,83 @@ impl DenialBehavior {
     }
 }
 
+/// The operation for which a capability policy is being evaluated.
+///
+/// List operations decide whether a definition may be disclosed. Access
+/// operations authorize a concrete target before its handler is invoked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CapabilityOperation<'a> {
+    /// The capability is being considered for a list or generated catalog.
+    List,
+    /// The capability is being accessed directly.
+    Access {
+        /// The concrete client-supplied target, such as a tool name or
+        /// resolved resource URI.
+        target: &'a str,
+    },
+}
+
+/// Request-aware context supplied to contextual capability filters.
+///
+/// This is intentionally lighter than [`crate::RequestContext`]: evaluating a
+/// visibility policy must not register cancellation or in-flight request
+/// state. Router-level extensions are merged with per-request extensions, and
+/// per-request values win when the same type is present in both maps.
+pub struct CapabilityFilterContext<'a> {
+    session: &'a SessionState,
+    extensions: Extensions,
+    operation: CapabilityOperation<'a>,
+}
+
+impl<'a> CapabilityFilterContext<'a> {
+    pub(crate) fn new(
+        session: &'a SessionState,
+        router_extensions: &Extensions,
+        request_extensions: &Extensions,
+        operation: CapabilityOperation<'a>,
+    ) -> Self {
+        let mut extensions = router_extensions.clone();
+        extensions.merge(request_extensions);
+        Self {
+            session,
+            extensions,
+            operation,
+        }
+    }
+
+    /// Return the logical MCP session being evaluated.
+    pub fn session(&self) -> &SessionState {
+        self.session
+    }
+
+    /// Return a typed router- or request-level extension.
+    ///
+    /// If both scopes contain the same type, the per-request value is
+    /// returned.
+    pub fn extension<T: Send + Sync + 'static>(&self) -> Option<&T> {
+        self.extensions.get::<T>()
+    }
+
+    /// Return all merged extensions visible to the policy.
+    pub fn extensions(&self) -> &Extensions {
+        &self.extensions
+    }
+
+    /// Return the operation being authorized.
+    pub fn operation(&self) -> CapabilityOperation<'a> {
+        self.operation
+    }
+
+    /// Return the concrete target for an access operation.
+    pub fn target(&self) -> Option<&'a str> {
+        match self.operation {
+            CapabilityOperation::List => None,
+            CapabilityOperation::Access { target } => Some(target),
+        }
+    }
+}
+
 /// A filter for capabilities based on session state.
 ///
 /// Use this to control which tools, resources, or prompts are visible
@@ -145,7 +229,7 @@ impl DenialBehavior {
 /// ```
 pub struct CapabilityFilter<T: Filterable> {
     #[allow(clippy::type_complexity)]
-    filter: Arc<dyn Fn(&SessionState, &T) -> bool + Send + Sync>,
+    filter: Arc<dyn for<'a> Fn(&CapabilityFilterContext<'a>, &T) -> bool + Send + Sync>,
     denial: DenialBehavior,
 }
 
@@ -187,6 +271,19 @@ impl<T: Filterable> CapabilityFilter<T> {
     where
         F: Fn(&SessionState, &T) -> bool + Send + Sync + 'static,
     {
+        Self::new_with_context(move |context, capability| filter(context.session(), capability))
+    }
+
+    /// Create a request-aware capability filter.
+    ///
+    /// The policy can inspect the logical session, router or per-request
+    /// extensions, and whether it is evaluating catalog disclosure or direct
+    /// access. For resource templates, an access operation's target is the
+    /// concrete resolved URI rather than the template pattern.
+    pub fn new_with_context<F>(filter: F) -> Self
+    where
+        F: for<'a> Fn(&CapabilityFilterContext<'a>, &T) -> bool + Send + Sync + 'static,
+    {
         Self {
             filter: Arc::new(filter),
             denial: DenialBehavior::default(),
@@ -212,7 +309,19 @@ impl<T: Filterable> CapabilityFilter<T> {
 
     /// Check if the given capability is visible to the session.
     pub fn is_visible(&self, session: &SessionState, capability: &T) -> bool {
-        (self.filter)(session, capability)
+        let empty = Extensions::new();
+        let context =
+            CapabilityFilterContext::new(session, &empty, &empty, CapabilityOperation::List);
+        self.is_visible_with_context(&context, capability)
+    }
+
+    /// Check whether the capability is visible for a request-aware operation.
+    pub fn is_visible_with_context(
+        &self,
+        context: &CapabilityFilterContext<'_>,
+        capability: &T,
+    ) -> bool {
+        (self.filter)(context, capability)
     }
 
     /// Get the error to return when access is denied.
@@ -303,6 +412,9 @@ pub type ToolFilter = CapabilityFilter<Tool>;
 /// Type alias for resource filters.
 pub type ResourceFilter = CapabilityFilter<Resource>;
 
+/// Type alias for resource template filters.
+pub type ResourceTemplateFilter = CapabilityFilter<ResourceTemplate>;
+
 /// Type alias for prompt filters.
 pub type PromptFilter = CapabilityFilter<Prompt>;
 
@@ -310,6 +422,8 @@ pub type PromptFilter = CapabilityFilter<Prompt>;
 mod tests {
     use super::*;
     use crate::CallToolResult;
+    use crate::protocol::ReadResourceResult;
+    use crate::resource::ResourceTemplateBuilder;
     use crate::tool::ToolBuilder;
 
     fn make_test_tool(name: &str) -> Tool {
@@ -317,6 +431,12 @@ mod tests {
             .description("Test tool")
             .handler(|_: serde_json::Value| async { Ok(CallToolResult::text("ok")) })
             .build()
+    }
+
+    fn make_test_template(name: &str) -> ResourceTemplate {
+        ResourceTemplateBuilder::new(format!("test://{name}/{{id}}"))
+            .name(name)
+            .handler(|uri, _variables| async move { Ok(ReadResourceResult::text(uri, "ok")) })
     }
 
     #[test]
@@ -328,6 +448,50 @@ mod tests {
 
         assert!(filter.is_visible(&session, &allowed));
         assert!(!filter.is_visible(&session, &blocked));
+    }
+
+    #[test]
+    fn contextual_filter_sees_session_operation_and_request_extension_precedence() {
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct Role(&'static str);
+        #[derive(Debug, PartialEq, Eq)]
+        struct Identity(&'static str);
+
+        let session = SessionState::new();
+        session.insert(Role("admin"));
+        let mut router_extensions = Extensions::new();
+        router_extensions.insert(Identity("router"));
+        let mut request_extensions = Extensions::new();
+        request_extensions.insert(Identity("request"));
+        let tool = make_test_tool("inspect");
+
+        let filter = CapabilityFilter::new_with_context(
+            |context: &CapabilityFilterContext<'_>, tool: &Tool| {
+                context.session().get::<Role>() == Some(Role("admin"))
+                    && context.extension::<Identity>() == Some(&Identity("request"))
+                    && context.extensions().contains::<Identity>()
+                    && context.operation() == (CapabilityOperation::Access { target: "inspect" })
+                    && context.target() == Some("inspect")
+                    && tool.name() == "inspect"
+            },
+        );
+        let context = CapabilityFilterContext::new(
+            &session,
+            &router_extensions,
+            &request_extensions,
+            CapabilityOperation::Access { target: "inspect" },
+        );
+
+        assert!(filter.is_visible_with_context(&context, &tool));
+    }
+
+    #[test]
+    fn resource_template_filter_uses_the_template_name() {
+        let session = SessionState::new();
+        let filter = ResourceTemplateFilter::allow_list(&["public"]);
+
+        assert!(filter.is_visible(&session, &make_test_template("public")));
+        assert!(!filter.is_visible(&session, &make_test_template("private")));
     }
 
     #[test]

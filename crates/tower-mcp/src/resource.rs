@@ -1823,6 +1823,28 @@ pub(crate) trait MrtrResourceTemplateHandler: Send + Sync {
 /// [`match_uri`](Self::match_uri) documents the matching rules and shows them
 /// running.
 ///
+/// # Router authorization
+///
+/// Registering a template on an [`McpRouter`](crate::McpRouter) lets a
+/// [`ResourceTemplateFilter`](crate::ResourceTemplateFilter) control both its
+/// definition in `resources/templates/list` and reads resolved through it. For
+/// a read, [`CapabilityFilterContext::target`](crate::CapabilityFilterContext::target)
+/// is the concrete URI rather than the URI pattern, so a policy can expose a
+/// template while protecting particular members of the resource family. The
+/// router performs this check before either an ordinary or an MRTR handler is
+/// invoked.
+///
+/// A router with a [`ResourceFilter`](crate::ResourceFilter) but no resource
+/// template filter fails closed for templates. Configure
+/// [`McpRouter::resource_template_filter`](crate::McpRouter::resource_template_filter)
+/// explicitly when such a server intends to expose templates. With neither
+/// filter configured, templates retain their default public behavior.
+///
+/// [`McpRouter::disable_resource`](crate::McpRouter::disable_resource) is
+/// evaluated against the concrete requested URI before template matching. It
+/// therefore blocks that URI without hiding the template definition or
+/// disabling sibling URIs that the same template serves.
+///
 /// # Example
 ///
 /// ```rust
@@ -2134,6 +2156,11 @@ impl ResourceTemplate {
     /// A template built with `mrtr_handler` has no plain handler to call and
     /// reports that as an error here; use
     /// [`read_outcome_with_context`](Self::read_outcome_with_context).
+    ///
+    /// This is a direct application call and does not pass through an
+    /// [`McpRouter`](crate::McpRouter), so it does not evaluate the router's
+    /// resource-template filter. Callers using a template outside the router
+    /// are responsible for their own authorization.
     pub fn read(
         &self,
         uri: &str,
@@ -2150,6 +2177,11 @@ impl ResourceTemplate {
     }
 
     /// Read a matched resource while preserving an SEP-2322 continuation.
+    ///
+    /// Calling this method directly does not evaluate an
+    /// [`McpRouter`](crate::McpRouter) resource-template filter. The router
+    /// performs that authorization before invoking this method; other callers
+    /// must enforce their own policy.
     pub fn read_outcome_with_context(
         &self,
         ctx: RequestContext,

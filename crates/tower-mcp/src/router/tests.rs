@@ -1682,6 +1682,575 @@ async fn test_capabilities_include_resources_with_only_templates() {
     }
 }
 
+mod resource_template_filtering_tests {
+    use super::*;
+    use crate::filter::{
+        CapabilityFilter, CapabilityOperation, DenialBehavior, ResourceTemplateFilter,
+    };
+    use crate::resource::{Resource, ResourceTemplate, ResourceTemplateBuilder};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct TemplatePrincipal(&'static str);
+
+    #[cfg(feature = "stateless")]
+    fn final_principal_extensions(principal: &'static str) -> Extensions {
+        let mut extensions = final_extensions(ClientCapabilities::default());
+        extensions.insert(TemplatePrincipal(principal));
+        extensions
+    }
+
+    fn counted_template(
+        uri_template: &str,
+        name: &str,
+        calls: Arc<AtomicUsize>,
+        body: &'static str,
+    ) -> ResourceTemplate {
+        ResourceTemplateBuilder::new(uri_template)
+            .name(name)
+            .handler(move |uri: String, _variables: HashMap<String, String>| {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(ReadResourceResult::text(uri, body))
+                }
+            })
+    }
+
+    async fn list_templates(
+        router: &mut McpRouter,
+        request_id: i64,
+    ) -> ListResourceTemplatesResult {
+        let request = RouterRequest {
+            id: RequestId::Number(request_id),
+            inner: McpRequest::ListResourceTemplates(ListResourceTemplatesParams::default()),
+            extensions: Extensions::new(),
+        };
+        let response = router.ready().await.unwrap().call(request).await.unwrap();
+        match response.inner {
+            Ok(McpResponse::ListResourceTemplates(result)) => result,
+            other => panic!("expected resource template list, got {other:?}"),
+        }
+    }
+
+    async fn read_template(
+        router: &mut McpRouter,
+        request_id: i64,
+        uri: &str,
+    ) -> std::result::Result<ReadResourceResult, JsonRpcError> {
+        let request = RouterRequest {
+            id: RequestId::Number(request_id),
+            inner: McpRequest::ReadResource(ReadResourceParams {
+                input_responses: None,
+                request_state: None,
+                uri: uri.to_string(),
+                meta: None,
+            }),
+            extensions: Extensions::new(),
+        };
+        let response = router.ready().await.unwrap().call(request).await.unwrap();
+        match response.inner {
+            Ok(McpResponse::ReadResource(result)) => Ok(result),
+            Err(error) => Err(error),
+            other => panic!("expected resource read response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_template_filter_hides_static_template_and_blocks_handler() {
+        let public_calls = Arc::new(AtomicUsize::new(0));
+        let protected_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = McpRouter::new()
+            .resource_template(counted_template(
+                "docs://public/{id}",
+                "Public Documents",
+                public_calls.clone(),
+                "public",
+            ))
+            .resource_template(counted_template(
+                "docs://protected/{id}",
+                "Protected Documents",
+                protected_calls.clone(),
+                "protected",
+            ))
+            .resource_template_filter(ResourceTemplateFilter::new_with_context(
+                |_context, template| template.name != "Protected Documents",
+            ));
+        init_router(&mut router).await;
+
+        let listed = list_templates(&mut router, 1).await;
+        assert_eq!(listed.resource_templates.len(), 1);
+        assert_eq!(
+            listed.resource_templates[0].uri_template,
+            "docs://public/{id}"
+        );
+
+        let denied = read_template(&mut router, 2, "docs://protected/42")
+            .await
+            .expect_err("a hidden template must not be readable");
+        assert_eq!(denied.code, -32601);
+        assert_eq!(protected_calls.load(Ordering::SeqCst), 0);
+
+        let allowed = read_template(&mut router, 3, "docs://public/42")
+            .await
+            .expect("the visible template should remain readable");
+        assert_eq!(allowed.contents[0].text.as_deref(), Some("public"));
+        assert_eq!(public_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stable_template_filter_isolated_between_fresh_sessions() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let base = McpRouter::new()
+            .resource_template(counted_template(
+                "tenant://{id}",
+                "Tenant Data",
+                calls.clone(),
+                "tenant",
+            ))
+            .resource_template_filter(ResourceTemplateFilter::new(|session, _template| {
+                session
+                    .get::<TemplatePrincipal>()
+                    .is_some_and(|principal| principal.0 == "allowed")
+            }));
+        let mut allowed = base.with_fresh_session();
+        allowed.session().insert(TemplatePrincipal("allowed"));
+        let mut denied = base.with_fresh_session();
+        denied.session().insert(TemplatePrincipal("denied"));
+        init_router(&mut allowed).await;
+        init_router(&mut denied).await;
+
+        assert_eq!(
+            list_templates(&mut allowed, 1)
+                .await
+                .resource_templates
+                .len(),
+            1
+        );
+        assert!(
+            list_templates(&mut denied, 2)
+                .await
+                .resource_templates
+                .is_empty()
+        );
+        read_template(&mut denied, 3, "tenant://42")
+            .await
+            .expect_err("the denied session must not read the template");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        read_template(&mut allowed, 4, "tenant://42")
+            .await
+            .expect("the allowed session should read the template");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn final_template_filter_uses_per_request_principal() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = McpRouter::new()
+            .with_extension(TemplatePrincipal("router-denied"))
+            .resource_template(counted_template(
+                "final://{id}",
+                "Final Data",
+                calls.clone(),
+                "final",
+            ))
+            .resource_template_filter(ResourceTemplateFilter::new_with_context(
+                |context, _template| {
+                    context
+                        .extension::<TemplatePrincipal>()
+                        .is_some_and(|principal| principal.0 == "allowed")
+                },
+            ));
+        let McpResponse::ListResourceTemplates(allowed_list) = router
+            .handle(
+                RequestId::Number(1),
+                McpRequest::ListResourceTemplates(ListResourceTemplatesParams::default()),
+                final_principal_extensions("allowed"),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected template list");
+        };
+        assert_eq!(allowed_list.resource_templates.len(), 1);
+
+        let McpResponse::ListResourceTemplates(denied_list) = router
+            .handle(
+                RequestId::Number(2),
+                McpRequest::ListResourceTemplates(ListResourceTemplatesParams::default()),
+                final_principal_extensions("denied"),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected template list");
+        };
+        assert!(denied_list.resource_templates.is_empty());
+
+        let denied = router
+            .handle(
+                RequestId::Number(3),
+                McpRequest::ReadResource(ReadResourceParams {
+                    input_responses: None,
+                    request_state: None,
+                    uri: "final://42".to_string(),
+                    meta: None,
+                }),
+                final_principal_extensions("denied"),
+            )
+            .await
+            .expect_err("the denied request must not read the template");
+        assert!(matches!(denied, Error::JsonRpc(error) if error.code == -32601));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let McpResponse::ReadResource(allowed_read) = router
+            .handle(
+                RequestId::Number(4),
+                McpRequest::ReadResource(ReadResourceParams {
+                    input_responses: None,
+                    request_state: None,
+                    uri: "final://42".to_string(),
+                    meta: None,
+                }),
+                final_principal_extensions("allowed"),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected resource read");
+        };
+        assert_eq!(allowed_read.contents[0].text.as_deref(), Some("final"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn resource_template_filter_authorizes_the_concrete_uri() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut router = McpRouter::new()
+            .resource_template(counted_template(
+                "records://{visibility}/{id}",
+                "Records",
+                calls.clone(),
+                "record",
+            ))
+            .resource_template_filter(
+                ResourceTemplateFilter::new_with_context(|context, _template| {
+                    match context.operation() {
+                        CapabilityOperation::List => true,
+                        CapabilityOperation::Access { target } => {
+                            target.starts_with("records://public/")
+                        }
+                    }
+                })
+                .denial_behavior(DenialBehavior::custom(|target| {
+                    Error::JsonRpc(JsonRpcError::forbidden(format!(
+                        "template policy denied {target}"
+                    )))
+                })),
+            );
+        init_router(&mut router).await;
+
+        let listed = list_templates(&mut router, 1).await;
+        assert_eq!(listed.resource_templates.len(), 1);
+
+        let denied = read_template(&mut router, 2, "records://private/42")
+            .await
+            .expect_err("the policy must see and deny the resolved private URI");
+        assert_eq!(denied.code, -32007);
+        assert!(denied.message.contains("records://private/42"));
+        assert!(!denied.message.contains("records://{visibility}/{id}"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let allowed = read_template(&mut router, 3, "records://public/42")
+            .await
+            .expect("the policy should allow the resolved public URI");
+        assert_eq!(allowed.contents[0].text.as_deref(), Some("record"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn resource_filter_without_template_filter_fails_closed() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut router = McpRouter::new()
+            .resource_template(counted_template(
+                "secrets://{id}",
+                "Secrets",
+                calls.clone(),
+                "secret",
+            ))
+            .resource_filter(
+                CapabilityFilter::new(|_, _resource: &Resource| true)
+                    .denial_behavior(DenialBehavior::Unauthorized),
+            );
+        init_router(&mut router).await;
+
+        let listed = list_templates(&mut router, 1).await;
+        assert!(listed.resource_templates.is_empty());
+
+        let denied = read_template(&mut router, 2, "secrets://42")
+            .await
+            .expect_err("an exact-resource policy cannot implicitly authorize templates");
+        assert_eq!(denied.code, -32007);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn explicit_template_filter_overrides_resource_filter_fallback() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut router = McpRouter::new()
+            .resource_template(counted_template(
+                "intentional://{id}",
+                "Intentional Template",
+                calls.clone(),
+                "template",
+            ))
+            .resource_filter(CapabilityFilter::new(|_, _resource: &Resource| false))
+            .resource_template_filter(ResourceTemplateFilter::new_with_context(
+                |_context, _template| true,
+            ));
+        init_router(&mut router).await;
+
+        let listed = list_templates(&mut router, 1).await;
+        assert_eq!(listed.resource_templates.len(), 1);
+        let read = read_template(&mut router, 2, "intentional://42")
+            .await
+            .expect("an explicit template policy should replace the secure fallback");
+        assert_eq!(read.contents[0].text.as_deref(), Some("template"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn resource_template_filter_runs_before_pagination() {
+        let mut router = McpRouter::new()
+            .page_size(1)
+            .resource_template(counted_template(
+                "a-hidden://{id}",
+                "Hidden",
+                Arc::new(AtomicUsize::new(0)),
+                "hidden",
+            ))
+            .resource_template(counted_template(
+                "z-visible://{id}",
+                "Visible",
+                Arc::new(AtomicUsize::new(0)),
+                "visible",
+            ))
+            .resource_template_filter(ResourceTemplateFilter::new_with_context(
+                |_context, template| template.name == "Visible",
+            ));
+        init_router(&mut router).await;
+
+        let listed = list_templates(&mut router, 1).await;
+        assert_eq!(listed.resource_templates.len(), 1);
+        assert_eq!(
+            listed.resource_templates[0].uri_template,
+            "z-visible://{id}"
+        );
+        assert!(
+            listed.next_cursor.is_none(),
+            "a hidden template must not create another observable page"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_concrete_uri_blocks_template_without_hiding_definition() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut router = McpRouter::new()
+            .resource_template(counted_template(
+                "vault://items/{id}",
+                "Vault Items",
+                calls.clone(),
+                "item",
+            ))
+            .resource_template_filter(ResourceTemplateFilter::new_with_context(
+                |_context, _template| true,
+            ));
+        router.disable_resource("vault://items/blocked");
+        init_router(&mut router).await;
+
+        let listed = list_templates(&mut router, 1).await;
+        assert_eq!(listed.resource_templates.len(), 1);
+
+        let denied = read_template(&mut router, 2, "vault://items/blocked")
+            .await
+            .expect_err("a disabled concrete URI must not reach its template");
+        assert_eq!(denied.code, -32602);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let allowed = read_template(&mut router, 3, "vault://items/allowed")
+            .await
+            .expect("disabling one URI must not disable its template siblings");
+        assert_eq!(allowed.contents[0].text.as_deref(), Some("item"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn denied_first_overlapping_template_does_not_fall_through() {
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = McpRouter::new()
+            .resource_template(counted_template(
+                "overlap://{id}",
+                "Denied First",
+                first_calls.clone(),
+                "first",
+            ))
+            .resource_template(counted_template(
+                "overlap://{+path}",
+                "Allowed Fallback",
+                fallback_calls.clone(),
+                "fallback",
+            ))
+            .resource_template_filter(ResourceTemplateFilter::new_with_context(
+                |_context, template| template.name == "Allowed Fallback",
+            ));
+        init_router(&mut router).await;
+
+        let listed = list_templates(&mut router, 1).await;
+        assert_eq!(listed.resource_templates.len(), 1);
+        assert_eq!(
+            listed.resource_templates[0].uri_template,
+            "overlap://{+path}"
+        );
+
+        let denied = read_template(&mut router, 2, "overlap://42")
+            .await
+            .expect_err("denial of the first route candidate must be final");
+        assert_eq!(denied.code, -32601);
+        assert_eq!(first_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(all(feature = "stateless", feature = "dynamic-tools"))]
+    #[tokio::test]
+    async fn final_dynamic_template_filter_uses_per_request_principal() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (router, registry) = McpRouter::new()
+            .with_extension(TemplatePrincipal("router-denied"))
+            .resource_template_filter(ResourceTemplateFilter::new_with_context(
+                |context, _template| {
+                    context
+                        .extension::<TemplatePrincipal>()
+                        .is_some_and(|principal| principal.0 == "allowed")
+                },
+            ))
+            .with_dynamic_resource_templates();
+        registry.register(counted_template(
+            "dynamic-final://{id}",
+            "Dynamic Final",
+            calls.clone(),
+            "dynamic-final",
+        ));
+
+        let McpResponse::ListResourceTemplates(allowed_list) = router
+            .handle(
+                RequestId::Number(1),
+                McpRequest::ListResourceTemplates(ListResourceTemplatesParams::default()),
+                final_principal_extensions("allowed"),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected template list");
+        };
+        assert_eq!(allowed_list.resource_templates.len(), 1);
+
+        let McpResponse::ListResourceTemplates(denied_list) = router
+            .handle(
+                RequestId::Number(2),
+                McpRequest::ListResourceTemplates(ListResourceTemplatesParams::default()),
+                final_principal_extensions("denied"),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected template list");
+        };
+        assert!(denied_list.resource_templates.is_empty());
+
+        let denied = router
+            .handle(
+                RequestId::Number(3),
+                McpRequest::ReadResource(ReadResourceParams {
+                    input_responses: None,
+                    request_state: None,
+                    uri: "dynamic-final://42".to_string(),
+                    meta: None,
+                }),
+                final_principal_extensions("denied"),
+            )
+            .await
+            .expect_err("the denied request must not invoke the dynamic handler");
+        assert!(matches!(denied, Error::JsonRpc(error) if error.code == -32601));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let McpResponse::ReadResource(allowed_read) = router
+            .handle(
+                RequestId::Number(4),
+                McpRequest::ReadResource(ReadResourceParams {
+                    input_responses: None,
+                    request_state: None,
+                    uri: "dynamic-final://42".to_string(),
+                    meta: None,
+                }),
+                final_principal_extensions("allowed"),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected dynamic resource read");
+        };
+        assert_eq!(
+            allowed_read.contents[0].text.as_deref(),
+            Some("dynamic-final")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "dynamic-tools")]
+    #[tokio::test]
+    async fn hidden_static_template_shadows_dynamic_without_fallthrough() {
+        let static_calls = Arc::new(AtomicUsize::new(0));
+        let dynamic_calls = Arc::new(AtomicUsize::new(0));
+        let (router, registry) = McpRouter::new()
+            .resource_template(counted_template(
+                "shadow://{id}",
+                "Hidden Static",
+                static_calls.clone(),
+                "static",
+            ))
+            .resource_template_filter(ResourceTemplateFilter::new_with_context(
+                |_context, template| template.name == "Visible Dynamic",
+            ))
+            .with_dynamic_resource_templates();
+        registry.register(counted_template(
+            "shadow://{id}",
+            "Visible Dynamic",
+            dynamic_calls.clone(),
+            "dynamic",
+        ));
+        let mut router = router;
+        init_router(&mut router).await;
+
+        let listed = list_templates(&mut router, 1).await;
+        assert!(
+            listed.resource_templates.is_empty(),
+            "filtering the winning static entry must not reveal its shadowed dynamic twin"
+        );
+        assert_eq!(registry.list().len(), 1);
+
+        let denied = read_template(&mut router, 2, "shadow://42")
+            .await
+            .expect_err("denying the first match must not fall through to a shadowed template");
+        assert_eq!(denied.code, -32601);
+        assert_eq!(static_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(dynamic_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
 // =========================================================================
 // Logging Notification Tests
 // =========================================================================
@@ -5020,6 +5589,99 @@ async fn test_auto_instructions_with_resource_templates() {
 
     assert!(instructions.contains("## Resources"));
     assert!(instructions.contains("- **file:///{path}**: Read a file by path"));
+}
+
+#[tokio::test]
+async fn auto_instructions_do_not_enumerate_filtered_templates() {
+    use crate::filter::CapabilityFilter;
+    use crate::resource::{ResourceTemplate, ResourceTemplateBuilder};
+
+    let template = |pattern: &str, name: &str| {
+        ResourceTemplateBuilder::new(pattern)
+            .name(name)
+            .handler(|uri, _variables| async move {
+                Ok(crate::ReadResourceResult::text(uri, "content"))
+            })
+    };
+    let mut router = McpRouter::new()
+        .auto_instructions()
+        .resource_template(template("public://{id}", "public"))
+        .resource_template(template("secret://{id}", "secret"))
+        .resource_template_filter(CapabilityFilter::new(
+            |_session, template: &ResourceTemplate| template.name == "public",
+        ));
+
+    let result = send_initialize(&mut router).await;
+    let instructions = result.instructions.expect("auto instructions");
+    assert!(instructions.contains("public://{id}"));
+    assert!(!instructions.contains("secret://{id}"));
+}
+
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn final_auto_instructions_use_per_request_template_policy_context() {
+    use crate::filter::CapabilityFilter;
+    use crate::resource::{ResourceTemplate, ResourceTemplateBuilder};
+
+    #[derive(Clone)]
+    struct TemplateAccess(bool);
+
+    let template = ResourceTemplateBuilder::new("vault://{id}")
+        .name("vault")
+        .handler(
+            |uri, _variables| async move { Ok(crate::ReadResourceResult::text(uri, "content")) },
+        );
+    let router = McpRouter::new()
+        .auto_instructions()
+        .with_extension(TemplateAccess(false))
+        .resource_template(template)
+        .resource_template_filter(CapabilityFilter::new_with_context(
+            |context, _template: &ResourceTemplate| {
+                context
+                    .extension::<TemplateAccess>()
+                    .is_some_and(|access| access.0)
+            },
+        ));
+
+    let mut allowed_extensions = final_extensions(ClientCapabilities::default());
+    allowed_extensions.insert(TemplateAccess(true));
+    let McpResponse::Discover(allowed) = router
+        .handle(
+            RequestId::Number(1),
+            McpRequest::Discover(DiscoverParams::default()),
+            allowed_extensions,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected discover response");
+    };
+    assert!(
+        allowed
+            .instructions
+            .as_deref()
+            .is_some_and(|instructions| instructions.contains("vault://{id}"))
+    );
+
+    let mut denied_extensions = final_extensions(ClientCapabilities::default());
+    denied_extensions.insert(TemplateAccess(false));
+    let McpResponse::Discover(denied) = router
+        .handle(
+            RequestId::Number(2),
+            McpRequest::Discover(DiscoverParams::default()),
+            denied_extensions,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected discover response");
+    };
+    assert!(
+        denied
+            .instructions
+            .as_deref()
+            .is_some_and(|instructions| !instructions.contains("vault://{id}"))
+    );
 }
 
 #[tokio::test]

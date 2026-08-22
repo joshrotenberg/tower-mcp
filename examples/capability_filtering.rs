@@ -1,6 +1,6 @@
 //! Capability filtering example - name-based and role-based access control
 //!
-//! This example demonstrates two approaches to capability filtering:
+//! This example demonstrates three aspects of capability filtering:
 //!
 //! ## 1. Name-Based Filtering
 //! Capabilities prefixed with `admin_` or `internal_` are hidden by default.
@@ -17,6 +17,20 @@
 //! In a real application, auth middleware would validate credentials and store
 //! claims in the session using `session.insert(UserClaims { ... })`. The filter
 //! functions then check these claims to decide visibility.
+//!
+//! ## 3. Context-Aware Resource Template Filtering
+//! A resource-template filter receives both the template definition and a
+//! `CapabilityFilterContext`. For discovery, the context identifies a list
+//! operation. For a read, `context.target()` contains the concrete URI, so one
+//! visible template can still protect sensitive members of its URI family.
+//! `context.extension::<T>()` also exposes router- and request-level state,
+//! with request values taking precedence. That is the usual bridge for OAuth
+//! claims on the stateless protocol, where there is no long-lived session to
+//! mutate.
+//!
+//! A router that configures `resource_filter` but not
+//! `resource_template_filter` fails closed for templates. Servers that expose
+//! both exact resources and templates should configure both policies.
 //!
 //! Run with: cargo run --example capability_filtering --features http
 //!
@@ -45,11 +59,29 @@
 //!   -H "MCP-Session-Id: <session-id-from-init>" \
 //!   -d '{"jsonrpc":"2.0","id":4,"method":"resources/list","params":{}}'
 //!
+//! # List resource templates (the project-files template is visible)
+//! curl -X POST http://localhost:3000/ \
+//!   -H "Content-Type: application/json" \
+//!   -H "MCP-Session-Id: <session-id-from-init>" \
+//!   -d '{"jsonrpc":"2.0","id":5,"method":"resources/templates/list","params":{}}'
+//!
+//! # Read a public member of the template family
+//! curl -X POST http://localhost:3000/ \
+//!   -H "Content-Type: application/json" \
+//!   -H "MCP-Session-Id: <session-id-from-init>" \
+//!   -d '{"jsonrpc":"2.0","id":6,"method":"resources/read","params":{"uri":"files:///public/guide.md"}}'
+//!
+//! # Anonymous users cannot resolve files:///private/... through the template
+//! curl -X POST http://localhost:3000/ \
+//!   -H "Content-Type: application/json" \
+//!   -H "MCP-Session-Id: <session-id-from-init>" \
+//!   -d '{"jsonrpc":"2.0","id":7,"method":"resources/read","params":{"uri":"files:///private/credentials.txt"}}'
+//!
 //! # List prompts (admin/internal prompts are hidden)
 //! curl -X POST http://localhost:3000/ \
 //!   -H "Content-Type: application/json" \
 //!   -H "MCP-Session-Id: <session-id-from-init>" \
-//!   -d '{"jsonrpc":"2.0","id":5,"method":"prompts/list","params":{}}'
+//!   -d '{"jsonrpc":"2.0","id":8,"method":"prompts/list","params":{}}'
 //! ```
 //!
 //! The curl examples above use the 2025-11-25 session-based flow. The 2026-07-28
@@ -59,8 +91,9 @@
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tower_mcp::{
-    CallToolResult, CapabilityFilter, DenialBehavior, Filterable, HttpTransport, McpRouter, Prompt,
-    PromptBuilder, Resource, ResourceBuilder, SessionState, Tool, ToolBuilder,
+    CallToolResult, CapabilityFilter, CapabilityFilterContext, DenialBehavior, Filterable,
+    HttpTransport, McpRouter, Prompt, PromptBuilder, ReadResourceResult, Resource, ResourceBuilder,
+    ResourceTemplate, ResourceTemplateBuilder, SessionState, Tool, ToolBuilder,
 };
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -141,6 +174,25 @@ fn is_visible_resource(session: &SessionState, resource: &Resource) -> bool {
 
 fn is_visible_prompt(session: &SessionState, prompt: &Prompt) -> bool {
     is_visible(session, prompt.name())
+}
+
+fn is_visible_resource_template(
+    context: &CapabilityFilterContext<'_>,
+    template: &ResourceTemplate,
+) -> bool {
+    // The template definition itself follows the same name/role policy as the
+    // other capability kinds.
+    if !is_visible(context.session(), template.name()) {
+        return false;
+    }
+
+    // `target()` is None for resources/templates/list and contains the
+    // concrete requested URI for resources/read. Keep the family discoverable,
+    // but require an elevated role for its private members.
+    context.target().is_none_or(|uri| {
+        !uri.starts_with("files:///private/")
+            || is_visible(context.session(), "admin_private_project_files")
+    })
 }
 
 #[tokio::main]
@@ -226,6 +278,18 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .description("Internal metrics data")
         .text("requests_per_second: 1247\nerror_rate: 0.02%");
 
+    // The template definition is public, while the context-aware filter below
+    // applies an additional rule to concrete files:///private/... reads.
+    let project_files = ResourceTemplateBuilder::new("files:///{+path}")
+        .name("project_files")
+        .description("Project files, with private paths restricted to admins")
+        .handler(|uri: String, _variables| async move {
+            Ok(ReadResourceResult::text(
+                uri,
+                "Example project-file content",
+            ))
+        });
+
     // === PROMPTS ===
 
     let greeting = PromptBuilder::new("greeting")
@@ -275,6 +339,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         .resource(api_reference)
         .resource(admin_config)
         .resource(internal_metrics)
+        .resource_template(project_files)
         // Prompts
         .prompt(greeting)
         .prompt(code_review)
@@ -291,6 +356,12 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
                 // Unauthorized - hint that auth might help (useful for debugging)
                 .denial_behavior(DenialBehavior::Unauthorized),
         )
+        // Because this router also has a ResourceFilter, omitting an explicit
+        // template filter would intentionally hide and deny every template.
+        .resource_template_filter(
+            CapabilityFilter::new_with_context(is_visible_resource_template)
+                .denial_behavior(DenialBehavior::NotFound),
+        )
         .prompt_filter(CapabilityFilter::new(is_visible_prompt));
 
     // Create HTTP transport
@@ -302,10 +373,10 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     tracing::info!("");
     tracing::info!("Access control by role:");
     tracing::info!(
-        "  Anonymous/User: echo, get_time, readme, api_reference, greeting, code_review"
+        "  Anonymous/User: echo, get_time, readme, api_reference, public project files, greeting, code_review"
     );
     tracing::info!(
-        "  Admin: + admin_get_stats, admin_delete_user, admin_system_config, admin_debug_assistant"
+        "  Admin: + admin_get_stats, admin_delete_user, admin_system_config, private project files, admin_debug_assistant"
     );
     tracing::info!("  Developer: + internal_debug_info, internal_metrics, internal_test_prompt");
     tracing::info!("");

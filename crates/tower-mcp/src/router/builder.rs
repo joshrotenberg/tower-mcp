@@ -1007,6 +1007,14 @@ impl McpRouter {
     /// don't pass the filter will not appear in `resources/list` responses and will
     /// return an error if read directly.
     ///
+    /// Resource templates require a separate
+    /// [`resource_template_filter`](Self::resource_template_filter), because
+    /// their policy must evaluate both a template definition and each concrete
+    /// URI it resolves. If this resource filter is configured without a
+    /// resource template filter, all templates fail closed: they are omitted
+    /// from `resources/templates/list` and matching reads are denied with this
+    /// filter's denial behavior.
+    ///
     /// # Example
     ///
     /// ```rust
@@ -1032,6 +1040,39 @@ impl McpRouter {
     /// ```
     pub fn resource_filter(mut self, filter: ResourceFilter) -> Self {
         Arc::make_mut(&mut self.inner).resource_filter = Some(filter);
+        self
+    }
+
+    /// Set a filter for resource template discovery and resolved reads.
+    ///
+    /// A contextual filter receives [`CapabilityOperation::List`] while a
+    /// template definition is being listed, and an access operation whose
+    /// target is the concrete requested URI before the matched handler runs.
+    /// Denial stops at that matched template and never falls through to a later
+    /// overlapping template.
+    ///
+    /// ```rust
+    /// use tower_mcp::{
+    ///     CapabilityFilter, McpRouter, ReadResourceResult, ResourceTemplate,
+    ///     ResourceTemplateBuilder,
+    /// };
+    ///
+    /// let template = ResourceTemplateBuilder::new("vault://{area}/{id}")
+    ///     .name("vault")
+    ///     .handler(|uri, _variables| async move {
+    ///         Ok(ReadResourceResult::text(uri, "contents"))
+    ///     });
+    ///
+    /// let router = McpRouter::new()
+    ///     .resource_template(template)
+    ///     .resource_template_filter(CapabilityFilter::new_with_context(
+    ///         |context, _template: &ResourceTemplate| {
+    ///             context.target().is_none_or(|uri| !uri.starts_with("vault://private/"))
+    ///         },
+    ///     ));
+    /// ```
+    pub fn resource_template_filter(mut self, filter: ResourceTemplateFilter) -> Self {
+        Arc::make_mut(&mut self.inner).resource_template_filter = Some(filter);
         self
     }
 
@@ -1102,8 +1143,11 @@ impl McpRouter {
         !self.inner.disabled_tools.read().unwrap().contains(name)
     }
 
-    /// Disable a resource by URI. Disabled resources are hidden from
-    /// `resources/list` and return a not-found error from `resources/read`.
+    /// Disable a resource by concrete URI. Disabled resources are hidden from
+    /// `resources/list` and return a not-found error from `resources/read`,
+    /// including when the URI would otherwise resolve through a template. A
+    /// disabled concrete URI does not hide the template definition or disable
+    /// sibling URIs served by the same template.
     pub fn disable_resource(&self, uri: impl Into<String>) {
         let mut set = self.inner.disabled_resources.write().unwrap();
         set.insert(uri.into());

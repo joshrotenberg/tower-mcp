@@ -20,7 +20,10 @@ use crate::context::{
     ServerNotification,
 };
 use crate::error::{Error, JsonRpcError, Result};
-use crate::filter::{PromptFilter, ResourceFilter, ToolFilter};
+use crate::filter::{
+    CapabilityFilterContext, CapabilityOperation, PromptFilter, ResourceFilter,
+    ResourceTemplateFilter, ToolFilter,
+};
 use crate::prompt::Prompt;
 use crate::protocol::*;
 #[cfg(feature = "dynamic-tools")]
@@ -212,6 +215,8 @@ struct McpRouterInner {
     tool_filter: Option<ToolFilter>,
     /// Filter for resources based on session state
     resource_filter: Option<ResourceFilter>,
+    /// Filter for resource templates and their concrete resolved URIs
+    resource_template_filter: Option<ResourceTemplateFilter>,
     /// Filter for prompts based on session state
     prompt_filter: Option<PromptFilter>,
     /// Router-level extensions (for state and middleware data)
@@ -261,19 +266,80 @@ struct McpRouterInner {
     dynamic_resource_templates: Option<Arc<DynamicResourceTemplatesInner>>,
 }
 
-impl McpRouterInner {
-    /// Generate instructions text from registered tools, resources, and prompts.
-    fn generate_instructions(&self, config: &AutoInstructionsConfig) -> String {
+impl McpRouter {
+    fn capability_filter_context<'a>(
+        &'a self,
+        request_extensions: &Extensions,
+        operation: CapabilityOperation<'a>,
+    ) -> CapabilityFilterContext<'a> {
+        CapabilityFilterContext::new(
+            &self.session,
+            &self.inner.extensions,
+            request_extensions,
+            operation,
+        )
+    }
+
+    fn resource_template_is_visible(
+        &self,
+        context: &CapabilityFilterContext<'_>,
+        template: &ResourceTemplate,
+    ) -> bool {
+        match &self.inner.resource_template_filter {
+            Some(filter) => filter.is_visible_with_context(context, template),
+            None => self.inner.resource_filter.is_none(),
+        }
+    }
+
+    fn authorize_resource_template(
+        &self,
+        context: &CapabilityFilterContext<'_>,
+        template: &ResourceTemplate,
+        concrete_uri: &str,
+    ) -> Result<()> {
+        if let Some(filter) = &self.inner.resource_template_filter {
+            if !filter.is_visible_with_context(context, template) {
+                return Err(filter.denial_error(concrete_uri));
+            }
+        } else if let Some(filter) = &self.inner.resource_filter {
+            // A ResourceFilter cannot safely evaluate a template. Existing
+            // filtered deployments therefore fail closed until they opt into
+            // an explicit ResourceTemplateFilter (#1399).
+            return Err(filter.denial_error(concrete_uri));
+        }
+        Ok(())
+    }
+
+    /// Generate request-filtered instructions from registered capabilities.
+    fn generate_instructions(
+        &self,
+        config: &AutoInstructionsConfig,
+        request_extensions: &Extensions,
+    ) -> String {
         let mut parts = Vec::new();
+        let context = self.capability_filter_context(request_extensions, CapabilityOperation::List);
 
         if let Some(prefix) = &config.prefix {
             parts.push(prefix.clone());
         }
 
         // Tools section
-        if !self.tools.is_empty() {
+        let disabled_tools = self.inner.disabled_tools.read().unwrap().clone();
+        let mut tools: Vec<_> = self
+            .inner
+            .tools
+            .values()
+            .filter(|tool| {
+                !disabled_tools.contains(&tool.name)
+                    && self
+                        .inner
+                        .tool_filter
+                        .as_ref()
+                        .is_none_or(|filter| filter.is_visible_with_context(&context, tool))
+            })
+            .collect();
+        if !tools.is_empty() {
             let mut lines = vec!["## Tools".to_string(), String::new()];
-            let mut tools: Vec<_> = self.tools.values().collect();
             tools.sort_by(|a, b| a.name.cmp(&b.name));
             for tool in tools {
                 let desc = tool.description.as_deref().unwrap_or("No description");
@@ -288,15 +354,33 @@ impl McpRouterInner {
         }
 
         // Resources section
-        if !self.resources.is_empty() || !self.resource_templates.is_empty() {
+        let disabled_resources = self.inner.disabled_resources.read().unwrap().clone();
+        let mut resources: Vec<_> = self
+            .inner
+            .resources
+            .values()
+            .filter(|resource| {
+                !disabled_resources.contains(&resource.uri)
+                    && self
+                        .inner
+                        .resource_filter
+                        .as_ref()
+                        .is_none_or(|filter| filter.is_visible_with_context(&context, resource))
+            })
+            .collect();
+        let mut templates: Vec<_> = self
+            .inner
+            .resource_templates
+            .iter()
+            .filter(|template| self.resource_template_is_visible(&context, template))
+            .collect();
+        if !resources.is_empty() || !templates.is_empty() {
             let mut lines = vec!["## Resources".to_string(), String::new()];
-            let mut resources: Vec<_> = self.resources.values().collect();
             resources.sort_by(|a, b| a.uri.cmp(&b.uri));
             for resource in resources {
                 let desc = resource.description.as_deref().unwrap_or("No description");
                 lines.push(format!("- **{}**: {}", resource.uri, desc));
             }
-            let mut templates: Vec<_> = self.resource_templates.iter().collect();
             templates.sort_by(|a, b| a.uri_template.cmp(&b.uri_template));
             for template in templates {
                 let desc = template.description.as_deref().unwrap_or("No description");
@@ -306,9 +390,22 @@ impl McpRouterInner {
         }
 
         // Prompts section
-        if !self.prompts.is_empty() {
+        let disabled_prompts = self.inner.disabled_prompts.read().unwrap().clone();
+        let mut prompts: Vec<_> = self
+            .inner
+            .prompts
+            .values()
+            .filter(|prompt| {
+                !disabled_prompts.contains(&prompt.name)
+                    && self
+                        .inner
+                        .prompt_filter
+                        .as_ref()
+                        .is_none_or(|filter| filter.is_visible_with_context(&context, prompt))
+            })
+            .collect();
+        if !prompts.is_empty() {
             let mut lines = vec!["## Prompts".to_string(), String::new()];
-            let mut prompts: Vec<_> = self.prompts.values().collect();
             prompts.sort_by(|a, b| a.name.cmp(&b.name));
             for prompt in prompts {
                 let desc = prompt.description.as_deref().unwrap_or("No description");
@@ -384,6 +481,7 @@ impl McpRouter {
                 completion_handler: None,
                 tool_filter: None,
                 resource_filter: None,
+                resource_template_filter: None,
                 prompt_filter: None,
                 min_log_level: Arc::new(RwLock::new(LogLevel::Debug)),
                 page_size: None,
@@ -1391,7 +1489,7 @@ impl McpRouter {
                     capabilities,
                     server_info: self.implementation(),
                     instructions: if let Some(config) = &self.inner.auto_instructions {
-                        Some(self.inner.generate_instructions(config))
+                        Some(self.generate_instructions(config, &extensions))
                     } else {
                         self.inner.instructions.clone()
                     },
@@ -1429,7 +1527,7 @@ impl McpRouter {
                     ttl_ms: None,
                     cache_scope: None,
                     instructions: if let Some(config) = &self.inner.auto_instructions {
-                        Some(self.inner.generate_instructions(config))
+                        Some(self.generate_instructions(config, &extensions))
                     } else {
                         self.inner.instructions.clone()
                     },
@@ -1444,6 +1542,8 @@ impl McpRouter {
                 let final_tasks_negotiated = final_protocol
                     && self.final_tasks_enabled()
                     && client_declares_tasks(&extensions);
+                let filter_context =
+                    self.capability_filter_context(&extensions, CapabilityOperation::List);
                 let filter = self.inner.tool_filter.as_ref();
                 let disabled = self.inner.disabled_tools.read().unwrap().clone();
                 let is_visible = |t: &Tool| {
@@ -1452,7 +1552,7 @@ impl McpRouter {
                             && matches!(t.task_support, TaskSupportMode::Required)
                             && !final_tasks_negotiated)
                         && filter
-                            .map(|f| f.is_visible(&self.session, t))
+                            .map(|f| f.is_visible_with_context(&filter_context, t))
                             .unwrap_or(true)
                 };
                 let definition = |t: &Tool| {
@@ -1540,8 +1640,14 @@ impl McpRouter {
                 };
 
                 // Check tool filter if configured
+                let filter_context = self.capability_filter_context(
+                    &extensions,
+                    CapabilityOperation::Access {
+                        target: &params.name,
+                    },
+                );
                 if let Some(filter) = &self.inner.tool_filter
-                    && !filter.is_visible(&self.session, &tool)
+                    && !filter.is_visible_with_context(&filter_context, &tool)
                 {
                     tracing::info!(
                         target: "mcp::tools",
@@ -2013,6 +2119,8 @@ impl McpRouter {
             }
 
             McpRequest::ListResources(params) => {
+                let filter_context =
+                    self.capability_filter_context(&extensions, CapabilityOperation::List);
                 let disabled = self.inner.disabled_resources.read().unwrap().clone();
                 let is_visible = |r: &Resource| -> bool {
                     !disabled.contains(&r.uri)
@@ -2020,7 +2128,7 @@ impl McpRouter {
                             .inner
                             .resource_filter
                             .as_ref()
-                            .map(|f| f.is_visible(&self.session, r))
+                            .map(|f| f.is_visible_with_context(&filter_context, r))
                             .unwrap_or(true)
                 };
 
@@ -2059,22 +2167,32 @@ impl McpRouter {
             }
 
             McpRequest::ListResourceTemplates(params) => {
+                let filter_context =
+                    self.capability_filter_context(&extensions, CapabilityOperation::List);
+                #[cfg(feature = "dynamic-tools")]
+                let static_patterns: HashSet<String> = self
+                    .inner
+                    .resource_templates
+                    .iter()
+                    .map(|template| template.uri_template.clone())
+                    .collect();
                 let mut resource_templates: Vec<ResourceTemplateDefinition> = self
                     .inner
                     .resource_templates
                     .iter()
+                    .filter(|template| self.resource_template_is_visible(&filter_context, template))
                     .map(|t| t.definition())
                     .collect();
 
-                // Merge dynamic resource templates (static win on collision)
+                // Resolve static/dynamic precedence before filtering. A hidden
+                // static template still shadows a dynamic template with the
+                // same pattern, so policy denial cannot reveal a fallback.
                 #[cfg(feature = "dynamic-tools")]
                 if let Some(ref dynamic) = self.inner.dynamic_resource_templates {
-                    let static_patterns: HashSet<String> = resource_templates
-                        .iter()
-                        .map(|t| t.uri_template.clone())
-                        .collect();
                     for t in dynamic.list() {
-                        if !static_patterns.contains(&t.uri_template) {
+                        if !static_patterns.contains(&t.uri_template)
+                            && self.resource_template_is_visible(&filter_context, &t)
+                        {
                             resource_templates.push(t.definition());
                         }
                     }
@@ -2112,12 +2230,18 @@ impl McpRouter {
                         &params.uri,
                     )));
                 }
+                let filter_context = self.capability_filter_context(
+                    &extensions,
+                    CapabilityOperation::Access {
+                        target: &params.uri,
+                    },
+                );
 
                 // First, try to find a static resource
                 if let Some(resource) = self.inner.resources.get(&params.uri) {
                     // Check resource filter if configured
                     if let Some(filter) = &self.inner.resource_filter
-                        && !filter.is_visible(&self.session, resource)
+                        && !filter.is_visible_with_context(&filter_context, resource)
                     {
                         return Err(filter.denial_error(&params.uri));
                     }
@@ -2160,7 +2284,7 @@ impl McpRouter {
                 if let Some(ref dynamic) = self.inner.dynamic_resources {
                     if let Some(resource) = dynamic.get(&params.uri) {
                         if let Some(filter) = &self.inner.resource_filter
-                            && !filter.is_visible(&self.session, &resource)
+                            && !filter.is_visible_with_context(&filter_context, &resource)
                         {
                             return Err(filter.denial_error(&params.uri));
                         }
@@ -2201,6 +2325,7 @@ impl McpRouter {
                 // Try static templates
                 for template in &self.inner.resource_templates {
                     if let Some(variables) = template.match_uri(&params.uri) {
+                        self.authorize_resource_template(&filter_context, template, &params.uri)?;
                         tracing::debug!(
                             uri = %params.uri,
                             template = %template.uri_template,
@@ -2247,6 +2372,7 @@ impl McpRouter {
                 #[allow(clippy::collapsible_if)]
                 if let Some(ref dynamic) = self.inner.dynamic_resource_templates {
                     if let Some((template, variables)) = dynamic.match_uri(&params.uri) {
+                        self.authorize_resource_template(&filter_context, &template, &params.uri)?;
                         tracing::debug!(
                             uri = %params.uri,
                             template = %template.uri_template,
@@ -2327,6 +2453,8 @@ impl McpRouter {
                 if let Some(initializer) = &self.inner.prompt_initializer {
                     initializer()?;
                 }
+                let filter_context =
+                    self.capability_filter_context(&extensions, CapabilityOperation::List);
                 let disabled = self.inner.disabled_prompts.read().unwrap().clone();
                 let is_visible = |p: &Prompt| -> bool {
                     !disabled.contains(&p.name)
@@ -2334,7 +2462,7 @@ impl McpRouter {
                             .inner
                             .prompt_filter
                             .as_ref()
-                            .map(|f| f.is_visible(&self.session, p))
+                            .map(|f| f.is_visible_with_context(&filter_context, p))
                             .unwrap_or(true)
                 };
 
@@ -2408,8 +2536,14 @@ impl McpRouter {
                 })?;
 
                 // Check prompt filter if configured
+                let filter_context = self.capability_filter_context(
+                    &extensions,
+                    CapabilityOperation::Access {
+                        target: &params.name,
+                    },
+                );
                 if let Some(filter) = &self.inner.prompt_filter
-                    && !filter.is_visible(&self.session, &prompt)
+                    && !filter.is_visible_with_context(&filter_context, &prompt)
                 {
                     return Err(filter.denial_error(&params.name));
                 }
