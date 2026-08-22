@@ -19,6 +19,29 @@ use axum::http::Request;
 use proptest::prelude::*;
 use tower::ServiceExt;
 
+#[cfg(feature = "stateless")]
+#[derive(Clone, Default)]
+struct TraceCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+#[cfg(feature = "stateless")]
+impl std::io::Write for TraceCapture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "stateless")]
+impl TraceCapture {
+    fn contents(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
 #[cfg(feature = "oauth")]
 fn oauth_test_token(audience: &str, scope: &str) -> String {
     jsonwebtoken::encode(
@@ -437,6 +460,64 @@ async fn modern_subscription_registry_filters_and_tags_notifications() {
 
     drop(registration.guard);
     assert!(registry.subscriptions.lock().unwrap().is_empty());
+}
+
+#[test]
+#[cfg(feature = "stateless")]
+fn modern_subscription_registry_traces_only_bounded_notification_metadata() {
+    const SENTINEL: &str = "private-task-result-1396";
+
+    let captured = TraceCapture::default();
+    let trace_output = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(move || captured.clone())
+        .finish();
+
+    let registry = Arc::new(ModernSubscriptionRegistry::default());
+    let _registration = registry
+        .try_register(
+            RequestId::String("listen-1".into()),
+            SubscriptionFilter {
+                task_ids: Some(vec!["task-1".into()]),
+                ..SubscriptionFilter::default()
+            },
+            None,
+        )
+        .unwrap();
+    let notification =
+        ServerNotification::FinalTaskStatusChanged(crate::tasks::TaskStatusNotificationParams {
+            task: crate::tasks::DetailedTask::completed(
+                crate::tasks::TaskMetadata::new(
+                    "task-1",
+                    "2026-07-28T00:00:00Z",
+                    "2026-07-28T00:00:01Z",
+                    Some(60_000),
+                ),
+                serde_json::Map::from_iter([(
+                    "structuredContent".to_string(),
+                    serde_json::json!({ "secret": SENTINEL }),
+                )]),
+            ),
+            meta: None,
+        });
+
+    tracing::subscriber::with_default(subscriber, || {
+        assert!(registry.publish(&notification));
+    });
+
+    let traces = trace_output.contents();
+    assert!(
+        traces.contains("notification_kind=notifications/tasks"),
+        "notification kind missing: {traces}"
+    );
+    assert!(
+        traces.contains("active_subscriptions=1"),
+        "active subscription count missing: {traces}"
+    );
+    assert!(!traces.contains(SENTINEL), "task result leaked: {traces}");
 }
 
 #[test]

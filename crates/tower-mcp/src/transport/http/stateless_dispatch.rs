@@ -280,23 +280,30 @@ impl ModernSubscriptionRegistry {
     /// Route subscription-scoped notifications and return whether the
     /// notification belongs exclusively on listen streams.
     pub(super) fn publish(&self, notification: &ServerNotification) -> bool {
-        let subscription_scoped = matches!(
-            notification,
-            ServerNotification::ResourceUpdated { .. }
-                | ServerNotification::ResourcesListChanged
-                | ServerNotification::ToolsListChanged
-                | ServerNotification::PromptsListChanged
-                | ServerNotification::FinalTaskStatusChanged(_)
-        );
-        if !subscription_scoped {
-            return false;
-        }
+        let notification_kind = match notification {
+            ServerNotification::ResourceUpdated { .. } => {
+                crate::protocol::notifications::RESOURCE_UPDATED
+            }
+            ServerNotification::ResourcesListChanged => {
+                crate::protocol::notifications::RESOURCES_LIST_CHANGED
+            }
+            ServerNotification::ToolsListChanged => {
+                crate::protocol::notifications::TOOLS_LIST_CHANGED
+            }
+            ServerNotification::PromptsListChanged => {
+                crate::protocol::notifications::PROMPTS_LIST_CHANGED
+            }
+            ServerNotification::FinalTaskStatusChanged(_) => {
+                crate::protocol::notifications::TASK_STATUS_CHANGED
+            }
+            _ => return false,
+        };
 
         let removed = {
             let mut subscriptions = self.subscriptions.lock().unwrap();
             tracing::trace!(
                 active_subscriptions = subscriptions.len(),
-                notification = ?notification,
+                notification_kind = %notification_kind,
                 "Routing final-protocol subscription notification"
             );
             let mut removals = Vec::new();

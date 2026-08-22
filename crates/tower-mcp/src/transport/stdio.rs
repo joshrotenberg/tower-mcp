@@ -93,6 +93,58 @@ use crate::{ProtocolSupport, ProtocolSupportError};
 // Shared helpers
 // ============================================================================
 
+#[derive(Clone, Copy)]
+enum StdioFrameDirection {
+    Inbound,
+    Outbound,
+}
+
+impl StdioFrameDirection {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inbound => "inbound",
+            Self::Outbound => "outbound",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StdioFrameKind {
+    Message,
+    Notification,
+    Request,
+    Response,
+    #[cfg(feature = "stateless")]
+    SubscriptionNotification,
+}
+
+impl StdioFrameKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Message => "message",
+            Self::Notification => "notification",
+            Self::Request => "request",
+            Self::Response => "response",
+            #[cfg(feature = "stateless")]
+            Self::SubscriptionNotification => "subscription_notification",
+        }
+    }
+}
+
+/// Log bounded metadata for one UTF-8 JSON-RPC frame.
+///
+/// Deliberately accepts only closed enums and a byte count: callers cannot
+/// accidentally attach the frame body, method, or request ID to this event.
+fn trace_stdio_frame(direction: StdioFrameDirection, kind: StdioFrameKind, utf8_bytes: usize) {
+    tracing::debug!(
+        transport = "stdio",
+        direction = direction.as_str(),
+        frame_kind = kind.as_str(),
+        utf8_bytes,
+        "JSON-RPC frame"
+    );
+}
+
 enum StdioControl {
     #[cfg(feature = "stateless")]
     CloseSubscription(RequestId),
@@ -310,7 +362,7 @@ impl StdioSubscriptions {
             if let Some(request_id) = params.request_id
                 && let Some(subscription) = self.active.remove(&request_id)
             {
-                tracing::debug!(?request_id, "Cancelled stdio subscription");
+                tracing::debug!("Cancelled stdio subscription");
                 self.observe_close(
                     request_id,
                     subscription.started,
@@ -659,17 +711,17 @@ async fn process_line(
     // a parse error naming an internal type (#1272).
     match classify_frame(&parsed) {
         FrameClass::Notification => {
-            let method = parsed.get("method").and_then(|m| m.as_str());
-            if let Err(error) = service
+            if service
                 .inspect_incoming_value(&parsed, crate::inspection::McpDirection::ClientToServer)
+                .is_err()
             {
                 // Still worth surfacing, just not to the client.
-                tracing::debug!(method, %error, "rejected an invalid notification");
+                tracing::debug!("Rejected an invalid notification");
                 return Ok(None);
             }
             match serde_json::from_str::<JsonRpcNotification>(line) {
                 Ok(notification) => handle_notification(router, notification)?,
-                Err(_) => tracing::debug!(method, "unparseable notification"),
+                Err(_) => tracing::debug!("Unparseable notification"),
             }
             return Ok(None);
         }
@@ -1120,7 +1172,11 @@ impl StdioTransport {
                         continue;
                     }
 
-                    tracing::debug!(input = %trimmed, "Received message");
+                    trace_stdio_frame(
+                        StdioFrameDirection::Inbound,
+                        StdioFrameKind::Message,
+                        trimmed.len(),
+                    );
 
                     #[cfg(feature = "stateless")]
                     {
@@ -1165,7 +1221,11 @@ impl StdioTransport {
                         match process_line(&mut service, &router, &owned).await {
                             Ok(Some(response)) => match serde_json::to_string(&response) {
                                 Ok(json) => {
-                                    tracing::debug!(output = %json, "Sending response");
+                                    trace_stdio_frame(
+                                        StdioFrameDirection::Outbound,
+                                        StdioFrameKind::Response,
+                                        json.len(),
+                                    );
                                     Some(json)
                                 }
                                 Err(e) => {
@@ -1205,13 +1265,21 @@ impl StdioTransport {
                     #[cfg(feature = "stateless")]
                     if let Some(frames) = subscriptions.route_notification(&notification) {
                         for json in frames {
-                            tracing::debug!(output = %json, "Sending subscription notification");
+                            trace_stdio_frame(
+                                StdioFrameDirection::Outbound,
+                                StdioFrameKind::SubscriptionNotification,
+                                json.len(),
+                            );
                             write_line_to_stdout(&mut writer, &json).await?;
                         }
                         continue;
                     }
                     if let Some(json) = serialize_notification(&notification) {
-                        tracing::debug!(output = %json, "Sending notification");
+                        trace_stdio_frame(
+                            StdioFrameDirection::Outbound,
+                            StdioFrameKind::Notification,
+                            json.len(),
+                        );
                         write_line_to_stdout(&mut writer, &json).await?;
                     }
                 }
@@ -1517,13 +1585,21 @@ where
                         #[cfg(feature = "stateless")]
                         if let Some(frames) = subscriptions.route_notification(&notification) {
                             for json in frames {
-                                tracing::debug!(output = %json, "Sending subscription notification");
+                                trace_stdio_frame(
+                                    StdioFrameDirection::Outbound,
+                                    StdioFrameKind::SubscriptionNotification,
+                                    json.len(),
+                                );
                                 write_line_to_stdout(&mut writer, &json).await?;
                             }
                             continue;
                         }
                         if let Some(json) = serialize_notification(&notification) {
-                            tracing::debug!(output = %json, "Sending notification");
+                            trace_stdio_frame(
+                                StdioFrameDirection::Outbound,
+                                StdioFrameKind::Notification,
+                                json.len(),
+                            );
                             write_line_to_stdout(&mut writer, &json).await?;
                         }
                     }
@@ -1618,7 +1694,11 @@ where
             return Ok(());
         }
 
-        tracing::debug!(input = %trimmed, "Received message");
+        trace_stdio_frame(
+            StdioFrameDirection::Inbound,
+            StdioFrameKind::Message,
+            trimmed.len(),
+        );
 
         // Check if it's a notification (no id field)
         let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
@@ -1673,15 +1753,11 @@ where
                     .and_then(|n| McpNotification::from_jsonrpc(&n).ok())
                 {
                     Some(notification) => handler(notification),
-                    None => tracing::debug!(
-                        method = parsed.get("method").and_then(|m| m.as_str()),
-                        "Unrecognized notification"
-                    ),
+                    None => tracing::debug!("Unrecognized notification"),
                 },
-                None => tracing::debug!(
-                    method = parsed.get("method").and_then(|m| m.as_str()),
-                    "Received notification but no handler is configured"
-                ),
+                None => {
+                    tracing::debug!("Received notification but no handler is configured");
+                }
             }
             return Ok(());
         }
@@ -1702,7 +1778,11 @@ where
             match service.call_message(message).await {
                 Ok(response) => match serde_json::to_string(&response) {
                     Ok(json) => {
-                        tracing::debug!(output = %json, "Sending response");
+                        trace_stdio_frame(
+                            StdioFrameDirection::Outbound,
+                            StdioFrameKind::Response,
+                            json.len(),
+                        );
                         Some(json)
                     }
                     Err(e) => {
@@ -1816,16 +1896,24 @@ impl SyncStdioTransport {
 
     /// Run the transport synchronously using a tokio runtime
     pub fn run_blocking(&mut self) -> Result<()> {
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| Error::Transport(format!("Failed to create runtime: {}", e)))?;
-
         let stdin = io::stdin();
         let mut input = stdin.lock();
         let mut stdout = io::stdout();
 
+        self.run_blocking_with_streams(&mut input, &mut stdout)
+    }
+
+    fn run_blocking_with_streams<R, W>(&mut self, input: &mut R, stdout: &mut W) -> Result<()>
+    where
+        R: io::BufRead,
+        W: Write,
+    {
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| Error::Transport(format!("Failed to create runtime: {}", e)))?;
+
         tracing::info!("Sync stdio transport started");
 
-        while let Some(frame) = read_frame_blocking(&mut input)? {
+        while let Some(frame) = read_frame_blocking(input)? {
             let line = match frame {
                 InputFrame::Line(line) => line,
                 InputFrame::Undecodable => {
@@ -1844,14 +1932,22 @@ impl SyncStdioTransport {
                 continue;
             }
 
-            tracing::debug!(input = %trimmed, "Received message");
+            trace_stdio_frame(
+                StdioFrameDirection::Inbound,
+                StdioFrameKind::Message,
+                trimmed.len(),
+            );
 
             match rt.block_on(process_line(&mut self.service, &self.router, trimmed)) {
                 Ok(Some(response)) => {
                     let response_json = serde_json::to_string(&response).map_err(|e| {
                         Error::Transport(format!("Failed to serialize response: {}", e))
                     })?;
-                    tracing::debug!(output = %response_json, "Sending response");
+                    trace_stdio_frame(
+                        StdioFrameDirection::Outbound,
+                        StdioFrameKind::Response,
+                        response_json.len(),
+                    );
                     writeln!(stdout, "{}", response_json).map_err(|e| {
                         Error::Transport(format!("Failed to write to stdout: {}", e))
                     })?;
@@ -2088,13 +2184,21 @@ impl BidirectionalStdioTransport {
                     #[cfg(feature = "stateless")]
                     if let Some(frames) = subscriptions.route_notification(&notification) {
                         for json in frames {
-                            tracing::debug!(output = %json, "Sending subscription notification");
+                            trace_stdio_frame(
+                                StdioFrameDirection::Outbound,
+                                StdioFrameKind::SubscriptionNotification,
+                                json.len(),
+                            );
                             self.write_line(&json, writer.clone()).await?;
                         }
                         continue;
                     }
                     if let Some(json) = serialize_notification(&notification) {
-                        tracing::debug!(output = %json, "Sending notification");
+                        trace_stdio_frame(
+                            StdioFrameDirection::Outbound,
+                            StdioFrameKind::Notification,
+                            json.len(),
+                        );
                         self.write_line(&json, writer.clone()).await?;
                     }
                 }
@@ -2138,7 +2242,11 @@ impl BidirectionalStdioTransport {
     where
         W: tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        tracing::debug!(input = %line, "Received message");
+        trace_stdio_frame(
+            StdioFrameDirection::Inbound,
+            StdioFrameKind::Message,
+            line.len(),
+        );
 
         // Malformed JSON must produce a JSON-RPC parse error response, not
         // tear down the run loop. Per the spec, id is null when the request
@@ -2222,7 +2330,11 @@ impl BidirectionalStdioTransport {
             };
             match response_json {
                 Ok(json) => {
-                    tracing::debug!(output = %json, "Sending response");
+                    trace_stdio_frame(
+                        StdioFrameDirection::Outbound,
+                        StdioFrameKind::Response,
+                        json.len(),
+                    );
                     if let Err(e) = write_line_locked(&writer, &json).await {
                         tracing::error!(error = %e, "Failed to write response to stdout");
                     }
@@ -2292,7 +2404,7 @@ impl BidirectionalStdioTransport {
                 let _ = pending.response_tx.send(result);
             }
             None => {
-                tracing::warn!(id = ?id, "Received response for unknown request");
+                tracing::warn!("Received response for unknown request");
             }
         }
 
@@ -2319,7 +2431,11 @@ impl BidirectionalStdioTransport {
         let request_json = serde_json::to_string(&request)
             .map_err(|e| Error::Transport(format!("Failed to serialize request: {}", e)))?;
 
-        tracing::debug!(output = %request_json, "Sending request to client");
+        trace_stdio_frame(
+            StdioFrameDirection::Outbound,
+            StdioFrameKind::Request,
+            request_json.len(),
+        );
 
         // Store pending request
         {
@@ -2380,6 +2496,74 @@ mod tests {
         LogLevel, LoggingMessageParams, ProgressParams, ProgressToken, TaskStatus, TaskStatusParams,
     };
     use tower_mcp_types::testing::assert_jsonrpc_error_response;
+
+    #[derive(Clone, Default)]
+    struct TraceWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for TraceWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("trace capture lock")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl TraceWriter {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().expect("trace capture lock").clone())
+                .expect("tracing output is UTF-8")
+        }
+    }
+
+    #[test]
+    fn sync_stdio_traces_frame_metadata_without_bodies() {
+        const SECRET: &str = "sync-frame-secret-9df387";
+
+        let frame = format!(r#"{{"jsonrpc":"2.0","id":"{SECRET}","method":"ping"}}"#);
+        let mut input = io::Cursor::new(format!("{frame}\n").into_bytes());
+        let mut output = Vec::new();
+
+        let captured = TraceWriter::default();
+        let trace_output = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || captured.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+
+        SyncStdioTransport::new(make_router())
+            .run_blocking_with_streams(&mut input, &mut output)
+            .expect("sync stdio loop");
+
+        let response = String::from_utf8(output).expect("response is UTF-8");
+        assert!(
+            response.contains(SECRET),
+            "the wire response must still correlate the request: {response}"
+        );
+
+        let traces = trace_output.contents();
+        assert!(!traces.contains(SECRET), "frame body leaked: {traces}");
+        assert!(traces.contains("direction=\"inbound\""), "{traces}");
+        assert!(traces.contains("direction=\"outbound\""), "{traces}");
+        assert!(traces.contains("frame_kind=\"message\""), "{traces}");
+        assert!(traces.contains("frame_kind=\"response\""), "{traces}");
+        assert!(
+            traces.contains(&format!("utf8_bytes={}", frame.len())),
+            "{traces}"
+        );
+        assert!(
+            traces.contains(&format!("utf8_bytes={}", response.trim().len())),
+            "{traces}"
+        );
+    }
 
     // =========================================================================
     // parse_error_response tests -- wire-format invariants on the stdio
