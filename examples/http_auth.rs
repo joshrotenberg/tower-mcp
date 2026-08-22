@@ -51,13 +51,16 @@
 //! call or `MCP-Session-Id` is required in stateless mode:
 //!
 //! ```bash
+//! # Start the API-key server with final-protocol support enabled:
+//! # cargo run --example http_auth --features "oauth,protocol-2026-07-28" -- --auth apikey
+//!
 //! # Stateless request with API key auth (2026-07-28)
 //! curl -X POST http://localhost:3000/ \
 //!   -H "Content-Type: application/json" \
 //!   -H "Authorization: Bearer sk-test-key-123" \
 //!   -H "MCP-Protocol-Version: 2026-07-28" \
 //!   -H "Mcp-Method: tools/list" \
-//!   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+//!   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"curl","version":"1.0"},"io.modelcontextprotocol/clientCapabilities":{}}}}'
 //! ```
 //!
 //! See `http_server.rs` for the full 2026-07-28 stateless walkthrough.

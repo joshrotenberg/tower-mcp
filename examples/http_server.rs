@@ -1,6 +1,6 @@
 //! HTTP server example for tower-mcp
 //!
-//! This transport supports two MCP protocol versions:
+//! This walkthrough demonstrates two MCP lifecycle styles:
 //!
 //! - **2025-11-25** (session-based): clients initialize once, receive a
 //!   `MCP-Session-Id`, and attach it to subsequent requests. SSE notifications
@@ -10,7 +10,8 @@
 //!   and the SEP-2243 `Mcp-Method` header. Use `server/discover` for capability
 //!   discovery and `subscriptions/listen` for server-push notifications.
 //!
-//! Run with: cargo run --example http_server --features http
+//! Run with:
+//! cargo run --example http_server --features "http,protocol-2026-07-28"
 //!
 //! ## 2025-11-25 session-based flow
 //!
@@ -74,16 +75,28 @@
 //!   -H "Accept: application/json" \
 //!   -H "MCP-Protocol-Version: 2026-07-28" \
 //!   -H "Mcp-Method: server/discover" \
-//!   -d '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{}}'
+//!   -d '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"curl","version":"1.0"},"io.modelcontextprotocol/clientCapabilities":{}}}}'
 //!
-//! # Server responds with its capabilities (no session created):
+//! # Server response includes (abridged; no session created):
 //! # {
 //! #   "jsonrpc": "2.0",
 //! #   "id": 1,
 //! #   "result": {
-//! #     "protocolVersion": "2026-07-28",
-//! #     "serverInfo": { "name": "http-example", "version": "1.0.0" },
-//! #     "capabilities": { "tools": {}, "resources": {}, "prompts": {} }
+//! #     "resultType": "complete",
+//! #     "supportedVersions": ["2026-07-28", "2025-11-25", "2025-03-26"],
+//! #     "capabilities": {
+//! #       "tools": { "listChanged": true },
+//! #       "resources": { "subscribe": false, "listChanged": true },
+//! #       "prompts": { "listChanged": true },
+//! #       "logging": {}
+//! #     },
+//! #     "ttlMs": 0,
+//! #     "cacheScope": "private",
+//! #     "_meta": {
+//! #       "io.modelcontextprotocol/serverInfo": {
+//! #         "name": "http-example", "version": "1.0.0"
+//! #       }
+//! #     }
 //! #   }
 //! # }
 //!
@@ -92,7 +105,7 @@
 //!   -H "Content-Type: application/json" \
 //!   -H "MCP-Protocol-Version: 2026-07-28" \
 //!   -H "Mcp-Method: tools/list" \
-//!   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+//!   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"curl","version":"1.0"},"io.modelcontextprotocol/clientCapabilities":{}}}}'
 //!
 //! # Call a tool -- Mcp-Name is required when calling tools (SEP-2243)
 //! curl -X POST http://localhost:3000/ \
@@ -100,22 +113,21 @@
 //!   -H "MCP-Protocol-Version: 2026-07-28" \
 //!   -H "Mcp-Method: tools/call" \
 //!   -H "Mcp-Name: add" \
-//!   -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"add","arguments":{"a":10,"b":32}}}'
+//!   -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"add","arguments":{"a":10,"b":32},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"curl","version":"1.0"},"io.modelcontextprotocol/clientCapabilities":{}}}}'
 //!
 //! # Open a server-push notification stream -- replaces per-session SSE.
-//! # The server delivers notifications (progress, logs, etc.) for requests
-//! # whose progressToken matches a subscription. Each SSE event carries an
-//! # ID for potential resumption (SEP-1699).
+//! # The required notifications filter opts into specific server events; this
+//! # example asks for tool-list changes. The first event acknowledges the
+//! # accepted filter and carries this request's subscription ID.
 //! #
-//! #   id: 0
 //! #   event: message
-//! #   data: {"jsonrpc":"2.0","method":"notifications/progress",...}
+//! #   data: {"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged",...}
 //! curl -N -X POST http://localhost:3000/ \
 //!   -H "Content-Type: application/json" \
 //!   -H "Accept: text/event-stream" \
 //!   -H "MCP-Protocol-Version: 2026-07-28" \
 //!   -H "Mcp-Method: subscriptions/listen" \
-//!   -d '{"jsonrpc":"2.0","id":4,"method":"subscriptions/listen","params":{}}'
+//!   -d '{"jsonrpc":"2.0","id":4,"method":"subscriptions/listen","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"curl","version":"1.0"},"io.modelcontextprotocol/clientCapabilities":{}},"notifications":{"toolsListChanged":true}}}'
 //! ```
 
 use std::time::Duration;
