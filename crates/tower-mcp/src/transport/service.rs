@@ -118,7 +118,9 @@ where
 /// wrapper converts it into a JSON-RPC internal error response using the
 /// request ID from the original request. This allows error information to
 /// flow through the normal response path rather than requiring special
-/// error handling at the transport level.
+/// error handling at the transport level. Both readiness and call errors are
+/// converted; inner readiness and backpressure are awaited inside the
+/// response future, once the request ID is available.
 pub struct CatchError<S> {
     inner: S,
 }
@@ -186,17 +188,20 @@ where
 {
     type Response = RouterResponse;
     type Error = Infallible;
-    type Future = CatchErrorFuture<S::Future>;
+    type Future = CatchErrorFuture<tower::util::Oneshot<S, RouterRequest>>;
 
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx).map_err(|_| unreachable!())
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // Readiness errors need the request ID in order to become correlated
+        // JSON-RPC responses. Poll the inner service from `call` instead,
+        // where the request is available, and await its backpressure there.
+        Poll::Ready(Ok(()))
     }
 
     fn call(&mut self, req: RouterRequest) -> Self::Future {
         // Capture the request ID before passing the request to the inner service.
         // We need this to build a proper JSON-RPC error response if the middleware fails.
         let request_id = req.id.clone();
-        let fut = self.inner.call(req);
+        let fut = tower::ServiceExt::oneshot(self.inner.clone(), req);
 
         CatchErrorFuture {
             inner: fut,
@@ -208,10 +213,40 @@ where
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
-    use crate::protocol::{CallToolParams, CallToolResult, RequestId, ToolAnnotations};
+    use crate::jsonrpc::JsonRpcService;
+    use crate::protocol::{
+        CallToolParams, CallToolResult, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
+        JsonRpcResponseMessage, RequestId, ToolAnnotations,
+    };
     use crate::router::McpRouter;
+
+    #[derive(Clone)]
+    struct RejectReadinessOnce {
+        inner: McpRouter,
+        reject_next: Arc<AtomicBool>,
+    }
+
+    impl Service<RouterRequest> for RejectReadinessOnce {
+        type Response = RouterResponse;
+        type Error = std::io::Error;
+        type Future =
+            Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+
+        fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            if self.reject_next.swap(false, Ordering::SeqCst) {
+                return Poll::Ready(Err(std::io::Error::other("middleware was not ready")));
+            }
+            Service::poll_ready(&mut self.inner, cx).map_err(|never| match never {})
+        }
+
+        fn call(&mut self, request: RouterRequest) -> Self::Future {
+            let future = Service::call(&mut self.inner, request);
+            Box::pin(async move { Ok(future.await.expect("MCP router service is infallible")) })
+        }
+    }
 
     #[test]
     #[cfg(any(feature = "http", feature = "websocket"))]
@@ -236,6 +271,85 @@ mod tests {
         assert!(result.is_ok());
         let response = result.unwrap();
         assert!(response.inner.is_ok());
+    }
+
+    #[tokio::test]
+    async fn readiness_error_is_correlated_once_through_jsonrpc_service() {
+        let router = McpRouter::new().server_info("test", "1.0.0");
+        let reject_next = Arc::new(AtomicBool::new(true));
+        let mut service = JsonRpcService::new(CatchError::new(RejectReadinessOnce {
+            inner: router,
+            reject_next,
+        }));
+
+        std::future::poll_fn(|cx| Service::<JsonRpcRequest>::poll_ready(&mut service, cx))
+            .await
+            .expect("adapter is infallible");
+        let first = Service::<JsonRpcRequest>::call(&mut service, JsonRpcRequest::new(1, "ping"))
+            .await
+            .expect("JSON-RPC service call");
+        let JsonRpcResponse::Error(first) = first else {
+            panic!("readiness failure must become an error response")
+        };
+        assert_eq!(first.id, Some(RequestId::Number(1)));
+        assert_eq!(first.error.code, -32603);
+        assert_eq!(first.error.message, "middleware was not ready");
+
+        std::future::poll_fn(|cx| Service::<JsonRpcRequest>::poll_ready(&mut service, cx))
+            .await
+            .expect("adapter remains infallible");
+        let second = Service::<JsonRpcRequest>::call(&mut service, JsonRpcRequest::new(2, "ping"))
+            .await
+            .expect("JSON-RPC service call after readiness failure");
+        let JsonRpcResponse::Result(second) = second else {
+            panic!("readiness failure must be consumed exactly once")
+        };
+        assert_eq!(second.id, RequestId::Number(2));
+    }
+
+    #[tokio::test]
+    async fn readiness_error_is_not_duplicated_across_a_jsonrpc_batch() {
+        let router = McpRouter::new().server_info("test", "1.0.0");
+        let reject_next = Arc::new(AtomicBool::new(true));
+        let mut service = JsonRpcService::new(CatchError::new(RejectReadinessOnce {
+            inner: router,
+            reject_next,
+        }))
+        .protocol_versions(["2025-03-26"])
+        .expect("stable-only protocol support");
+
+        std::future::poll_fn(|cx| Service::<JsonRpcMessage>::poll_ready(&mut service, cx))
+            .await
+            .expect("adapter is infallible");
+        let response = Service::<JsonRpcMessage>::call(
+            &mut service,
+            JsonRpcMessage::Batch(vec![
+                JsonRpcRequest::new(1, "ping"),
+                JsonRpcRequest::new(2, "ping"),
+                JsonRpcRequest::new(3, "ping"),
+            ]),
+        )
+        .await
+        .expect("JSON-RPC batch call");
+        let JsonRpcResponseMessage::Batch(responses) = response else {
+            panic!("valid stable batch must return a response batch")
+        };
+
+        assert_eq!(responses.len(), 3);
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| matches!(response, JsonRpcResponse::Error(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| matches!(response, JsonRpcResponse::Result(_)))
+                .count(),
+            2
+        );
     }
 
     #[test]

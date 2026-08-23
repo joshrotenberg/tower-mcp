@@ -2029,10 +2029,10 @@ struct PendingRequest {
 ///     Ok(())
 /// }
 /// ```
-pub struct BidirectionalStdioTransport {
+pub struct BidirectionalStdioTransport<S = McpRouter> {
     /// Fires when the read loop ends (#1252).
     stopping: tokio::sync::watch::Sender<bool>,
-    service: JsonRpcService<McpRouter>,
+    service: JsonRpcService<S>,
     router: McpRouter,
     /// Channel for receiving outgoing requests to send to the client
     request_rx: OutgoingRequestReceiver,
@@ -2046,7 +2046,7 @@ pub struct BidirectionalStdioTransport {
     control_rx: mpsc::UnboundedReceiver<StdioControl>,
 }
 
-impl BidirectionalStdioTransport {
+impl BidirectionalStdioTransport<McpRouter> {
     /// Create a new bidirectional stdio transport
     pub fn new(router: McpRouter) -> Self {
         let (request_tx, request_rx) = outgoing_request_channel(32);
@@ -2074,6 +2074,71 @@ impl BidirectionalStdioTransport {
         }
     }
 
+    /// Apply a tower middleware layer to inbound MCP requests.
+    ///
+    /// The transport installs its legacy client requester before the layer is
+    /// applied, so sampling and elicitation remain available from handler
+    /// contexts. Notification routing, final subscriptions, protocol support,
+    /// and response multiplexing are preserved as well.
+    ///
+    /// Use [`tower::ServiceBuilder`] to compose multiple layers:
+    ///
+    /// ```rust,no_run
+    /// use std::time::Duration;
+    /// use tower::ServiceBuilder;
+    /// use tower::timeout::TimeoutLayer;
+    /// use tower_mcp::{BidirectionalStdioTransport, BoxError, McpRouter};
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), BoxError> {
+    ///     let router = McpRouter::new().server_info("my-server", "1.0.0");
+    ///     let mut transport = BidirectionalStdioTransport::new(router).layer(
+    ///         ServiceBuilder::new()
+    ///             .layer(TimeoutLayer::new(Duration::from_secs(5)))
+    ///             .into_inner(),
+    ///     );
+    ///
+    ///     transport.run().await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn layer<L>(
+        self,
+        layer: L,
+    ) -> BidirectionalStdioTransport<InjectAnnotations<CatchError<L::Service>>>
+    where
+        L: tower::Layer<McpRouter>,
+        L::Service: Service<RouterRequest, Response = RouterResponse> + Clone + Send + 'static,
+        <L::Service as Service<RouterRequest>>::Error: std::fmt::Display + Send,
+        <L::Service as Service<RouterRequest>>::Future: Send,
+    {
+        let protocol_support = self.service.configured_protocol_support().clone();
+        let annotations = self.router.tool_annotations_map();
+        let wrapped = layer.layer(self.router.clone());
+        let service = InjectAnnotations::new(CatchError::new(wrapped), annotations);
+
+        BidirectionalStdioTransport {
+            stopping: self.stopping,
+            service: JsonRpcService::new(service).protocol_support(protocol_support),
+            router: self.router,
+            request_rx: self.request_rx,
+            client_requester: self.client_requester,
+            pending_requests: self.pending_requests,
+            notification_rx: self.notification_rx,
+            control_tx: self.control_tx,
+            control_rx: self.control_rx,
+        }
+    }
+}
+
+impl<S> BidirectionalStdioTransport<S>
+where
+    S: Service<RouterRequest, Response = RouterResponse, Error = std::convert::Infallible>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send,
+{
     /// Return a cloneable handle for graceful subscription closure or server
     /// shutdown while [`Self::run`] is active.
     pub fn handle(&self) -> StdioTransportHandle {

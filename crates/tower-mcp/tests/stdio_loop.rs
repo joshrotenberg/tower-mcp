@@ -733,6 +733,50 @@ async fn stdio_runtime_protocol_allow_list_is_exact() {
     );
 }
 
+/// Converting bidirectional stdio to a layered service must not reset the
+/// runtime protocol policy configured before `.layer()`.
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn bidi_layer_preserves_runtime_protocol_allow_list() {
+    let mut transport = BidirectionalStdioTransport::new(modern_router())
+        .protocol_support(ProtocolSupport::stable())
+        .layer(tower::layer::util::Identity::new());
+    let (mut stdin_writer, server_stdin) = tokio::io::duplex(4096);
+    let (server_stdout, server_stdout_reader) = tokio::io::duplex(4096);
+    let handle = tokio::spawn(async move {
+        transport
+            .run_with_streams(server_stdin, server_stdout)
+            .await
+    });
+
+    let request = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+        "params": {
+            "_meta": final_meta(tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28)
+        }
+    });
+    stdin_writer
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .unwrap();
+    stdin_writer.flush().await.unwrap();
+    let mut reader = BufReader::new(server_stdout_reader);
+    let response = timeout(Duration::from_secs(2), read_frame(&mut reader))
+        .await
+        .expect("layered protocol rejection");
+    assert_eq!(response["error"]["code"], -32022);
+    assert_eq!(
+        response["error"]["data"]["requested"],
+        tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28
+    );
+
+    drop(stdin_writer);
+    handle
+        .await
+        .expect("transport task join")
+        .expect("run_with_streams ok");
+}
+
 #[cfg(feature = "stateless")]
 fn subscription_router() -> McpRouter {
     let emit = ToolBuilder::new("emit_changes")
@@ -1150,7 +1194,8 @@ async fn middleware_wrapped_stdio_preserves_subscription_routing() {
 #[cfg(feature = "stateless")]
 #[tokio::test]
 async fn bidi_stdio_preserves_subscription_routing() {
-    let mut transport = BidirectionalStdioTransport::new(subscription_router());
+    let mut transport = BidirectionalStdioTransport::new(subscription_router())
+        .layer(tower::layer::util::Identity::new());
     let control = transport.handle();
     let (mut server_stdin_writer, server_stdin) = tokio::io::duplex(8192);
     let (server_stdout, server_stdout_reader) = tokio::io::duplex(8192);
@@ -1182,6 +1227,40 @@ async fn bidi_stdio_preserves_subscription_routing() {
         71
     );
 
+    let emit = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 72,
+        "method": "tools/call",
+        "params": {
+            "name": "emit_changes",
+            "arguments": {},
+            "_meta": final_meta(tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28)
+        }
+    });
+    server_stdin_writer
+        .write_all(format!("{emit}\n").as_bytes())
+        .await
+        .unwrap();
+    server_stdin_writer.flush().await.unwrap();
+    let deliveries = [
+        timeout(Duration::from_secs(2), read_frame(&mut reader))
+            .await
+            .expect("bidirectional subscription delivery"),
+        timeout(Duration::from_secs(2), read_frame(&mut reader))
+            .await
+            .expect("bidirectional tool response"),
+    ];
+    let notification = deliveries
+        .iter()
+        .find(|frame| frame.get("method").is_some())
+        .expect("tagged notification must share the bidirectional stream");
+    assert_eq!(notification["method"], "notifications/tools/list_changed");
+    assert_eq!(
+        notification["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+        71
+    );
+    assert!(deliveries.iter().any(|frame| frame["id"] == 72));
+
     control
         .close_subscription(tower_mcp::RequestId::Number(71))
         .unwrap();
@@ -1203,7 +1282,8 @@ async fn bidi_stdio_preserves_subscription_routing() {
 #[cfg(feature = "stateless")]
 #[tokio::test]
 async fn bidi_final_handlers_cannot_initiate_client_requests() {
-    let mut transport = BidirectionalStdioTransport::new(modern_router());
+    let mut transport = BidirectionalStdioTransport::new(modern_router())
+        .layer(tower::layer::util::Identity::new());
     let (server_stdin_writer, server_stdin) = tokio::io::duplex(8192);
     let (server_stdout, server_stdout_reader) = tokio::io::duplex(8192);
     let handle = tokio::spawn(async move {
@@ -1459,7 +1539,8 @@ async fn bidi_transport_elicitation_round_trip() {
     let router = McpRouter::new()
         .server_info("bidi-elicit-test", "0.0.0")
         .tool(confirm);
-    let mut transport = BidirectionalStdioTransport::new(router);
+    let mut transport =
+        BidirectionalStdioTransport::new(router).layer(tower::layer::util::Identity::new());
 
     let (server_stdin_writer, server_stdin) = tokio::io::duplex(8192);
     let (server_stdout, server_stdout_reader) = tokio::io::duplex(8192);
@@ -1521,6 +1602,237 @@ async fn bidi_transport_elicitation_round_trip() {
         .await
         .expect("elicitation round-trip over bidirectional stdio timed out (deadlock)");
     let _ = timeout(Duration::from_secs(2), handle).await;
+}
+
+/// Bidirectional stdio used to have no service seam at all. A layer now sees
+/// accepted inbound requests while the transport continues to own the
+/// client-requester, validation, and framing machinery.
+#[tokio::test]
+async fn bidi_layer_observes_an_inbound_tool_request() {
+    use std::sync::{Arc, Mutex};
+    use tower::ServiceExt as _;
+    use tower_mcp::router::RouterRequest;
+
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let layer = tower::layer::layer_fn({
+        let observed = observed.clone();
+        move |inner: McpRouter| {
+            let observed = observed.clone();
+            tower::service_fn(move |request: RouterRequest| {
+                let inner = inner.clone();
+                let observed = observed.clone();
+                async move {
+                    observed
+                        .lock()
+                        .expect("observation lock")
+                        .push(request.inner.method_name().to_string());
+                    inner.oneshot(request).await
+                }
+            })
+        }
+    });
+    let tool = ToolBuilder::new("observed")
+        .description("Return a fixed result")
+        .handler(|_: serde_json::Value| async { Ok(CallToolResult::text("seen")) })
+        .build();
+    let router = McpRouter::new()
+        .server_info("bidi-layer-test", "0.0.0")
+        .tool(tool);
+    let mut transport = BidirectionalStdioTransport::new(router).layer(layer);
+
+    let (mut stdin_writer, server_stdin) = tokio::io::duplex(8192);
+    let (server_stdout, server_stdout_reader) = tokio::io::duplex(8192);
+    let task = tokio::spawn(async move {
+        transport
+            .run_with_streams(server_stdin, server_stdout)
+            .await
+    });
+    let mut reader = BufReader::new(server_stdout_reader);
+
+    stdin_writer
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}\n")
+        .await
+        .unwrap();
+    stdin_writer.flush().await.unwrap();
+    let init = timeout(Duration::from_secs(2), read_frame(&mut reader))
+        .await
+        .expect("layered initialize response");
+    assert_eq!(init["id"], 1);
+
+    stdin_writer
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+        .await
+        .unwrap();
+    stdin_writer
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"observed\",\"arguments\":{}}}\n")
+        .await
+        .unwrap();
+    stdin_writer.flush().await.unwrap();
+    let call = timeout(Duration::from_secs(2), read_frame(&mut reader))
+        .await
+        .expect("layered tool response");
+    assert_eq!(call["id"], 2);
+    assert_eq!(call["result"]["content"][0]["text"], "seen");
+
+    drop(stdin_writer);
+    task.await
+        .expect("transport task join")
+        .expect("run_with_streams ok");
+    assert_eq!(
+        *observed.lock().expect("observation lock"),
+        ["initialize", "tools/call"]
+    );
+}
+
+#[derive(Clone)]
+struct RejectFirstReadiness {
+    inner: McpRouter,
+    reject_next: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl tower::Service<tower_mcp::router::RouterRequest> for RejectFirstReadiness {
+    type Response = tower_mcp::router::RouterResponse;
+    type Error = std::io::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        use std::sync::atomic::Ordering;
+
+        if self.reject_next.swap(false, Ordering::SeqCst) {
+            return std::task::Poll::Ready(Err(std::io::Error::other("middleware was not ready")));
+        }
+        tower::Service::poll_ready(&mut self.inner, cx).map_err(|never| match never {})
+    }
+
+    fn call(&mut self, request: tower_mcp::router::RouterRequest) -> Self::Future {
+        let future = tower::Service::call(&mut self.inner, request);
+        Box::pin(async move { Ok(future.await.expect("MCP router service is infallible")) })
+    }
+}
+
+/// A readiness failure occurs before middleware receives the request, but it
+/// must still become an ID-preserving response and leave stdout usable.
+#[tokio::test]
+async fn bidi_layer_readiness_errors_become_framed_jsonrpc_errors() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let reject_next = Arc::new(AtomicBool::new(true));
+    let layer = tower::layer::layer_fn(move |inner: McpRouter| RejectFirstReadiness {
+        inner,
+        reject_next: reject_next.clone(),
+    });
+    let mut transport = BidirectionalStdioTransport::new(router()).layer(layer);
+    let (mut stdin_writer, server_stdin) = tokio::io::duplex(4096);
+    let (server_stdout, server_stdout_reader) = tokio::io::duplex(4096);
+    let task = tokio::spawn(async move {
+        transport
+            .run_with_streams(server_stdin, server_stdout)
+            .await
+    });
+    let mut reader = BufReader::new(server_stdout_reader);
+
+    stdin_writer
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"}\n")
+        .await
+        .unwrap();
+    stdin_writer.flush().await.unwrap();
+    let response = timeout(Duration::from_secs(2), read_frame(&mut reader))
+        .await
+        .expect("layer readiness error response");
+    assert_jsonrpc_error_response(&response);
+    assert_eq!(response["id"], 7);
+    assert_eq!(response["error"]["code"], -32603);
+    assert_eq!(response["error"]["message"], "middleware was not ready");
+
+    stdin_writer
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"ping\"}\n")
+        .await
+        .unwrap();
+    stdin_writer.flush().await.unwrap();
+    let response = timeout(Duration::from_secs(2), read_frame(&mut reader))
+        .await
+        .expect("request after layer readiness error response");
+    assert_eq!(response["id"], 8);
+    assert!(response.get("result").is_some());
+
+    drop(stdin_writer);
+    task.await
+        .expect("transport task join")
+        .expect("run_with_streams ok");
+}
+
+/// Middleware failures stay inside the JSON-RPC response path instead of
+/// escaping it or corrupting the newline-delimited stream.
+#[tokio::test]
+async fn bidi_layer_errors_become_framed_jsonrpc_errors() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tower::ServiceExt as _;
+    use tower_mcp::router::{RouterRequest, RouterResponse};
+
+    let reject_next = Arc::new(AtomicBool::new(true));
+    let layer = tower::layer::layer_fn(move |inner: McpRouter| {
+        let reject_next = reject_next.clone();
+        tower::service_fn(move |request: RouterRequest| {
+            let inner = inner.clone();
+            let reject = reject_next.swap(false, Ordering::SeqCst);
+            async move {
+                if reject {
+                    return Err::<RouterResponse, _>(std::io::Error::other(
+                        "middleware rejected request",
+                    ));
+                }
+                Ok(inner
+                    .oneshot(request)
+                    .await
+                    .expect("MCP router service is infallible"))
+            }
+        })
+    });
+    let mut transport = BidirectionalStdioTransport::new(router()).layer(layer);
+    let (mut stdin_writer, server_stdin) = tokio::io::duplex(4096);
+    let (server_stdout, server_stdout_reader) = tokio::io::duplex(4096);
+    let task = tokio::spawn(async move {
+        transport
+            .run_with_streams(server_stdin, server_stdout)
+            .await
+    });
+    let mut reader = BufReader::new(server_stdout_reader);
+
+    stdin_writer
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"ping\"}\n")
+        .await
+        .unwrap();
+    stdin_writer.flush().await.unwrap();
+    let response = timeout(Duration::from_secs(2), read_frame(&mut reader))
+        .await
+        .expect("layer error response");
+    assert_jsonrpc_error_response(&response);
+    assert_eq!(response["id"], 9);
+    assert_eq!(response["error"]["code"], -32603);
+    assert_eq!(response["error"]["message"], "middleware rejected request");
+
+    stdin_writer
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"ping\"}\n")
+        .await
+        .unwrap();
+    stdin_writer.flush().await.unwrap();
+    let response = timeout(Duration::from_secs(2), read_frame(&mut reader))
+        .await
+        .expect("request after layer error response");
+    assert_eq!(response["id"], 10);
+    assert!(response.get("result").is_some());
+
+    drop(stdin_writer);
+    task.await
+        .expect("transport task join")
+        .expect("run_with_streams ok");
 }
 
 // =============================================================================
