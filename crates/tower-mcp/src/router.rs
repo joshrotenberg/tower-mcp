@@ -166,6 +166,8 @@ struct McpRouterInner {
     panic_policy: Option<PanicPolicy>,
     /// Root-owned mapping for client-visible Task lifecycle failures.
     task_error_policy: TaskErrorPolicy,
+    /// Root-owned mapping from request extensions to a durable Task owner.
+    task_owner_resolver: TaskOwnerResolver,
     auto_instructions: Option<AutoInstructionsConfig>,
     tools: HashMap<String, Arc<Tool>>,
     resources: HashMap<String, Arc<Resource>>,
@@ -668,6 +670,7 @@ impl McpRouter {
                 instructions: None,
                 panic_policy: None,
                 task_error_policy: TaskErrorPolicy::default(),
+                task_owner_resolver: default_task_owner_resolver(),
                 auto_instructions: None,
                 tools: HashMap::new(),
                 resources: HashMap::new(),
@@ -793,6 +796,76 @@ impl McpRouter {
     pub fn task_store(mut self, store: Arc<dyn TaskStore>) -> Self {
         Arc::make_mut(&mut self.inner).task_store = store;
         self
+    }
+
+    /// Resolve the authenticated principal used for Task ownership.
+    ///
+    /// The resolver runs for Task creation and every later Task operation. It
+    /// receives the request's transport- and middleware-supplied extensions
+    /// and returns a durable owner key, or `None` for an anonymous request.
+    /// Owned and anonymous callers remain strictly distinct: neither can act
+    /// on the other's Tasks.
+    ///
+    /// Owner keys become authorization data in the configured [`TaskStore`].
+    /// They must be deterministic, nonempty, and collision-resistant across
+    /// every issuer and tenant that can reach the store. Include that
+    /// qualification in the returned value. Never return a bearer token, API
+    /// key, session cookie, or other credential.
+    ///
+    /// Empty or whitespace-only values and panics fail closed. Creation is
+    /// rejected, while an existing Task is reported as absent. Rust's
+    /// process-global panic hook still runs before a panic is caught.
+    ///
+    /// Installing a resolver replaces the default OAuth `TokenClaims.sub`
+    /// mapping. Configure this on the root router: [`merge`](Self::merge) and
+    /// [`nest`](Self::nest) import capabilities, not router policy.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tower_mcp::{Extensions, McpRouter};
+    ///
+    /// #[derive(Clone)]
+    /// struct Principal {
+    ///     issuer: String,
+    ///     subject: String,
+    /// }
+    ///
+    /// let router = McpRouter::new().task_owner_resolver(|extensions: &Extensions| {
+    ///     extensions
+    ///         .get::<Principal>()
+    ///         .map(|principal| format!("{}:{}", principal.issuer, principal.subject))
+    /// });
+    /// # let _ = router;
+    /// ```
+    #[must_use]
+    pub fn task_owner_resolver<F>(mut self, resolver: F) -> Self
+    where
+        F: Fn(&crate::context::Extensions) -> Option<String> + Send + Sync + 'static,
+    {
+        Arc::make_mut(&mut self.inner).task_owner_resolver = custom_task_owner_resolver(resolver);
+        self
+    }
+
+    /// Resolve Task owners from one request extension type.
+    ///
+    /// This is the convenient counterpart to [`task_owner_resolver`](Self::task_owner_resolver)
+    /// for extensions registered with
+    /// [`HttpTransport::bridge_extension`](crate::HttpTransport::bridge_extension)
+    /// or inserted by Tower middleware. A request without `T` is anonymous;
+    /// the mapping only runs when the extension is present.
+    ///
+    /// The returned value has the same durability and secrecy requirements as
+    /// [`task_owner_resolver`](Self::task_owner_resolver).
+    #[must_use]
+    pub fn task_owner_from_extension<T>(
+        self,
+        map: impl Fn(&T) -> String + Send + Sync + 'static,
+    ) -> Self
+    where
+        T: Send + Sync + 'static,
+    {
+        self.task_owner_resolver(move |extensions| extensions.get::<T>().map(&map))
     }
 
     /// Set the root router's client-visible Task error policy.
@@ -1953,6 +2026,15 @@ impl McpRouter {
                 }
 
                 if let Some(task_ttl) = task_ttl {
+                    let owner = (self.inner.task_owner_resolver)(&extensions)
+                        .into_owner()
+                        .ok_or_else(|| {
+                            self.task_error(
+                                TaskOperation::Create,
+                                None,
+                                TaskFailure::Internal("Task owner resolver failed"),
+                            )
+                        })?;
                     // Create the task
                     let (task_id, cancellation_token) = self
                         .inner
@@ -1969,7 +2051,7 @@ impl McpRouter {
                                 params.arguments.clone()
                             },
                             task_ttl,
-                            request_principal(&extensions),
+                            owner,
                         )
                         .await
                         .map_err(|error| {
@@ -3536,7 +3618,10 @@ mod pagination;
 mod policy;
 mod task_ops;
 
-use capabilities::{final_client_capabilities, request_principal};
+use capabilities::{
+    TaskOwnerResolver, custom_task_owner_resolver, default_task_owner_resolver,
+    final_client_capabilities,
+};
 use pagination::paginate;
 use policy::panic_message;
 

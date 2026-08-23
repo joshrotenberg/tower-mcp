@@ -6,21 +6,89 @@
 
 use super::*;
 
-/// The authenticated principal for this request, if any.
+pub(super) type TaskOwnerResolver =
+    Arc<dyn Fn(&crate::context::Extensions) -> TaskOwnerResolution + Send + Sync + 'static>;
+
+/// The result of resolving the caller that owns a Task.
 ///
-/// Sourced from the OAuth `sub` claim that the HTTP and WebSocket transports
-/// bridge into MCP extensions. Without the `oauth` feature there is no
-/// principal, so tasks are unowned and behave as they did before ownership
-/// existed.
+/// `Invalid` is deliberately distinct from anonymous. Collapsing a broken
+/// application resolver to `None` would let it match an unowned Task and turn
+/// an authentication failure into authorization.
+pub(super) enum TaskOwnerResolution {
+    Resolved(crate::async_task::TaskOwner),
+    Invalid,
+}
+
+impl TaskOwnerResolution {
+    pub(super) fn into_owner(self) -> Option<crate::async_task::TaskOwner> {
+        match self {
+            Self::Resolved(owner) => Some(owner),
+            Self::Invalid => None,
+        }
+    }
+
+    pub(super) fn matches(&self, owner: &crate::async_task::TaskOwner) -> bool {
+        match self {
+            Self::Resolved(principal) => {
+                crate::async_task::owner_matches(owner, principal.as_deref())
+            }
+            Self::Invalid => false,
+        }
+    }
+}
+
+/// Build the source-compatible default Task owner resolver.
+///
+/// OAuth subjects are deliberately copied verbatim. Existing deployments may
+/// persist those strings outside this process, so prefixing or normalizing
+/// them here would strand their Tasks.
+pub(super) fn default_task_owner_resolver() -> TaskOwnerResolver {
+    Arc::new(|extensions| TaskOwnerResolution::Resolved(oauth_task_owner(extensions)))
+}
+
+/// Wrap application mapping code in the Task authorization boundary.
+pub(super) fn custom_task_owner_resolver<F>(resolver: F) -> TaskOwnerResolver
+where
+    F: Fn(&crate::context::Extensions) -> Option<String> + Send + Sync + 'static,
+{
+    Arc::new(move |extensions| {
+        let resolved =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| resolver(extensions)));
+        match resolved {
+            Ok(Some(owner)) if !owner.trim().is_empty() => {
+                TaskOwnerResolution::Resolved(Some(owner))
+            }
+            Ok(Some(_)) => {
+                tracing::error!(
+                    target: "mcp::tasks",
+                    "task owner resolver returned an empty owner; denying the operation"
+                );
+                TaskOwnerResolution::Invalid
+            }
+            Ok(None) => TaskOwnerResolution::Resolved(None),
+            Err(_) => {
+                // Do not log the panic payload or extensions. Either may
+                // contain credentials supplied to the application resolver.
+                tracing::error!(
+                    target: "mcp::tasks",
+                    "task owner resolver panicked; denying the operation"
+                );
+                TaskOwnerResolution::Invalid
+            }
+        }
+    })
+}
+
+/// The default authenticated Task owner for this request, if any.
 #[cfg(feature = "oauth")]
-pub(super) fn request_principal(extensions: &crate::context::Extensions) -> Option<String> {
+fn oauth_task_owner(extensions: &crate::context::Extensions) -> Option<String> {
     extensions
         .get::<crate::oauth::token::TokenClaims>()
         .and_then(|claims| claims.sub.clone())
 }
 
 #[cfg(not(feature = "oauth"))]
-pub(super) fn request_principal(_extensions: &crate::context::Extensions) -> Option<String> {
+fn oauth_task_owner(_extensions: &crate::context::Extensions) -> Option<String> {
     None
 }
 

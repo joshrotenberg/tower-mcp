@@ -64,9 +64,10 @@ impl McpRouter {
         extensions: &crate::context::Extensions,
         presence: crate::async_task::TaskPresence,
     ) -> Error {
-        let owns = presence.owner().is_some_and(|owner| {
-            crate::async_task::owner_matches(owner, request_principal(extensions).as_deref())
-        });
+        let principal = (self.inner.task_owner_resolver)(extensions);
+        let owns = presence
+            .owner()
+            .is_some_and(|owner| principal.matches(owner));
         match presence {
             crate::async_task::TaskPresence::Expired { .. } if owns => {
                 self.task_error(operation, Some(task_id), TaskFailure::Expired)
@@ -139,7 +140,7 @@ impl McpRouter {
             return Err(self.task_error(operation, Some(task_id), TaskFailure::NotFound));
         };
 
-        if crate::async_task::owner_matches(owner, request_principal(extensions).as_deref()) {
+        if (self.inner.task_owner_resolver)(extensions).matches(owner) {
             match presence {
                 // The owner is told the difference; nobody else reaches here.
                 crate::async_task::TaskPresence::Expired { .. } => {
@@ -175,9 +176,8 @@ impl McpRouter {
             .task_owner(task_id)
             .await
             .map_err(|error| self.task_store_error(TaskOperation::Get, Some(task_id), error))?;
-        let allowed = owner.as_ref().is_some_and(|owner| {
-            crate::async_task::owner_matches(owner, request_principal(extensions).as_deref())
-        });
+        let principal = (self.inner.task_owner_resolver)(extensions);
+        let allowed = owner.as_ref().is_some_and(|owner| principal.matches(owner));
         if allowed {
             return Ok(());
         }

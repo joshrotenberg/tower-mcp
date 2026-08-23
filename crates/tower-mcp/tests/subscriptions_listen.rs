@@ -1124,6 +1124,120 @@ mod tasks {
         assert!(body.contains(&task_id));
     }
 
+    #[derive(Clone)]
+    struct ApplicationPrincipal(String);
+
+    async fn attach_application_principal(
+        mut request: Request<Body>,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        if let Some(subject) = request
+            .headers()
+            .get("x-test-principal")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+        {
+            request
+                .extensions_mut()
+                .insert(ApplicationPrincipal(subject));
+        }
+        next.run(request).await
+    }
+
+    fn application_request(
+        id: &str,
+        method: &str,
+        params: serde_json::Value,
+        subject: Option<&str>,
+    ) -> Request<Body> {
+        let mut request = final_request(id, method, params);
+        if let Some(subject) = subject {
+            request
+                .headers_mut()
+                .insert("x-test-principal", subject.parse().unwrap());
+        }
+        request
+    }
+
+    /// A host-authenticated extension crosses the HTTP bridge for both
+    /// creation and the transport-owned subscription path.
+    #[tokio::test]
+    async fn application_principal_listen_accepts_only_the_task_owner() {
+        let router = task_router().task_owner_from_extension::<ApplicationPrincipal>(|principal| {
+            format!("https://identity.example#{}", principal.0)
+        });
+        let (app, handle) = HttpTransport::new(router)
+            .disable_origin_validation()
+            .disable_host_validation()
+            .bridge_extension::<ApplicationPrincipal>()
+            .into_router_with_handle();
+        let app = app.layer(axum::middleware::from_fn(attach_application_principal));
+
+        let create = app
+            .clone()
+            .oneshot(application_request(
+                "call-alice",
+                "tools/call",
+                serde_json::json!({
+                    "_meta": meta(true),
+                    "name": "slow",
+                    "arguments": {},
+                }),
+                Some("alice"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::OK);
+        let created: serde_json::Value = serde_json::from_str(&body_string(create).await).unwrap();
+        let task_id = created["result"]["taskId"].as_str().unwrap().to_string();
+
+        let listen_params = || {
+            serde_json::json!({
+                "_meta": meta(true),
+                "notifications": { "taskIds": [&task_id] },
+            })
+        };
+        for (id, subject) in [("listen-bob", Some("bob")), ("listen-anon", None)] {
+            let denied = app
+                .clone()
+                .oneshot(application_request(
+                    id,
+                    "subscriptions/listen",
+                    listen_params(),
+                    subject,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
+            let denied: serde_json::Value =
+                serde_json::from_str(&body_string(denied).await).unwrap();
+            assert_eq!(denied["error"]["code"], -32602);
+            assert!(
+                denied["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not found")
+            );
+        }
+        assert_eq!(handle.subscription_count(), 0);
+
+        let owned = app
+            .oneshot(application_request(
+                "listen-alice",
+                "subscriptions/listen",
+                listen_params(),
+                Some("alice"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(owned.status(), StatusCode::OK);
+        assert_eq!(handle.subscription_count(), 1);
+        assert_eq!(handle.close_subscriptions(), 1);
+        let body = body_string(owned).await;
+        assert!(body.contains("notifications/subscriptions/acknowledged"));
+        assert!(body.contains(&task_id));
+    }
+
     /// SEP-2663: requesting task notifications without declaring the extension
     /// is answered with the missing-capability error, not a silent drop.
     #[tokio::test]
