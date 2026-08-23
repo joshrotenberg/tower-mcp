@@ -1,6 +1,7 @@
 # tower-mcp
 
 [![Crates.io](https://img.shields.io/crates/v/tower-mcp.svg)](https://crates.io/crates/tower-mcp)
+[![Crates.io downloads](https://img.shields.io/crates/d/tower-mcp.svg)](https://crates.io/crates/tower-mcp)
 [![Documentation](https://docs.rs/tower-mcp/badge.svg)](https://docs.rs/tower-mcp)
 [![CI](https://github.com/joshrotenberg/tower-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/joshrotenberg/tower-mcp/actions/workflows/ci.yml)
 [![License](https://img.shields.io/crates/l/tower-mcp.svg)](https://github.com/joshrotenberg/tower-mcp#license)
