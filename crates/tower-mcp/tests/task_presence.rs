@@ -67,12 +67,15 @@ async fn another_principals_tasks_are_indistinguishable_from_missing() {
 #[tokio::test]
 async fn the_owner_can_tell_expired_from_missing() {
     let store = MemoryTaskStore::new();
-    let (expired, _) = store
-        .create_task("work", json!({}), Some(1), Some("alice".into()))
-        .await
-        .expect("create");
     let (present, _) = store
         .create_task("work", json!({}), Some(60_000), Some("alice".into()))
+        .await
+        .expect("create");
+    // Task admission may reclaim expired tombstones, so create the short-lived
+    // record last. Otherwise crossing its 1 ms deadline during the second
+    // create makes this assertion depend on scheduler timing.
+    let (expired, _) = store
+        .create_task("work", json!({}), Some(1), Some("alice".into()))
         .await
         .expect("create");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
