@@ -2,6 +2,39 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.22.2] - 2026-08-23
+
+### Bug Fixes
+
+- **http:** Authorize final task subscriptions ([#1406](https://github.com/joshrotenberg/tower-mcp/pull/1406))
+- **http:** Bound final subscription streams ([#1408](https://github.com/joshrotenberg/tower-mcp/pull/1408))
+- **router:** Authorize resource template access ([#1410](https://github.com/joshrotenberg/tower-mcp/pull/1410))
+- **http:** Isolate legacy resource subscriptions ([#1411](https://github.com/joshrotenberg/tower-mcp/pull/1411))
+- **oauth:** Bind validate adapter audience ([#1413](https://github.com/joshrotenberg/tower-mcp/pull/1413))
+- **tracing:** Redact protocol frame payloads ([#1414](https://github.com/joshrotenberg/tower-mcp/pull/1414))
+- **router:** Authorize completion references ([#1415](https://github.com/joshrotenberg/tower-mcp/pull/1415))
+- **http:** Refresh live session expiry ([#1416](https://github.com/joshrotenberg/tower-mcp/pull/1416))
+
+### Documentation
+
+- **http:** Fix final curl examples ([#1417](https://github.com/joshrotenberg/tower-mcp/pull/1417))
+- Add crates.io downloads badge ([#1424](https://github.com/joshrotenberg/tower-mcp/pull/1424))
+
+### Features
+
+- **tasks:** Construct task resume contexts ([#1412](https://github.com/joshrotenberg/tower-mcp/pull/1412))
+- **stdio:** Layer bidirectional transport ([#1418](https://github.com/joshrotenberg/tower-mcp/pull/1418))
+- **tasks:** Add task owner resolver ([#1419](https://github.com/joshrotenberg/tower-mcp/pull/1419))
+- **tasks:** Add live execution lifecycle handle ([#1420](https://github.com/joshrotenberg/tower-mcp/pull/1420))
+- **tasks:** Add configurable TTL and expiry cleanup ([#1421](https://github.com/joshrotenberg/tower-mcp/pull/1421))
+- **tasks:** Bound in-memory task retention ([#1422](https://github.com/joshrotenberg/tower-mcp/pull/1422))
+
+### Testing
+
+- Eliminate task presence timing race ([#1423](https://github.com/joshrotenberg/tower-mcp/pull/1423))
+
+
+
 ## [0.22.1] - 2026-08-21
 
 ### Bug Fixes

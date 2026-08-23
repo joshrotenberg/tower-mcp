@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.22.2] - 2026-08-23
+
+### Documentation
+
+- Add crates.io downloads badge ([#1424](https://github.com/joshrotenberg/tower-mcp/pull/1424))
+
+
+
 ## [0.22.1] - 2026-08-21
 
 ### Documentation
