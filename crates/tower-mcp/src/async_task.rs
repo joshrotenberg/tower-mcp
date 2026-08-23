@@ -8,10 +8,11 @@
 //! Task state lives behind the pluggable [`TaskStore`] trait, mirroring the
 //! shape of [`crate::session_store`] and [`crate::event_store`]: a trait, an
 //! error enum, and an in-memory default. By default routers use
-//! [`MemoryTaskStore`], which keeps tasks in an in-process map (behavior
-//! identical to earlier versions). External stores (Redis, Postgres, etc.) can
-//! be plugged in so `tasks/get` works on any instance behind a load balancer
-//! in the sessionless 2026-07-28 flows (SEP-2663).
+//! [`MemoryTaskStore`], which keeps tasks in an in-process map and
+//! automatically signals and reclaims expired records. External stores
+//! (Redis, Postgres, etc.) can be plugged in so `tasks/get` works on any
+//! instance behind a load balancer in the sessionless 2026-07-28 flows
+//! (SEP-2663).
 //!
 //! Nothing here is advertised until a server asks for it:
 //! [`McpRouter::with_tasks`](crate::McpRouter::with_tasks) is the runtime
@@ -60,7 +61,10 @@
 //! task can expire while still working. Past that point every read returns
 //! `None` and every transition returns `Ok(false)`, whether or not the entry
 //! has been reclaimed: an expired task is indistinguishable from one that
-//! never existed.
+//! never existed. Reaching the deadline also raises the task's
+//! [`CancellationToken`] and wakes completion/input waiters, so invisible work
+//! is not left suspended. [`MemoryTaskStore`] schedules this automatically;
+//! external stores must bridge their expiry mechanism to the returned token.
 //!
 //! ```rust
 //! use tower_mcp::CallToolResult;
@@ -212,8 +216,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -221,14 +224,122 @@ use async_trait::async_trait;
 use crate::error::JsonRpcError;
 use crate::protocol::{CallToolResult, InputRequests, InputResponses, TaskObject, TaskStatus};
 
-/// Default time-to-live for a task (5 minutes, in milliseconds).
+/// Cancellation signal shared by a task store and the work it owns.
+///
+/// Cloned tokens share the same underlying signal: cancelling any clone
+/// cancels them all. The token is backed by
+/// [`tokio_util::sync::CancellationToken`], so it can be checked synchronously
+/// or awaited. A store must raise the same signal for explicit cancellation
+/// and expiry; see [`TaskStore::create_task`].
+///
+/// This task-lifecycle token is intentionally a separate type from
+/// [`crate::context::CancellationToken`], which belongs to the originating
+/// request.
+#[derive(Clone, Debug, Default)]
+pub struct CancellationToken {
+    inner: tokio_util::sync::CancellationToken,
+}
+
+impl CancellationToken {
+    /// Create a new, un-cancelled token.
+    ///
+    /// [`TaskStore::create_task`] has to return one of these, so the public
+    /// constructor lets external task stores create the process-local signal
+    /// they bridge to durable cancellation and expiry state.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Check whether cancellation or expiry has been signalled.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
+
+    /// Signal cancellation or expiry to every clone and waiter.
+    pub fn cancel(&self) {
+        self.inner.cancel();
+    }
+
+    /// Wait until cancellation or expiry is signalled.
+    ///
+    /// Completes immediately if the token was already signalled.
+    pub async fn cancelled(&self) {
+        self.inner.cancelled().await;
+    }
+}
+
+/// Default time-to-live for a task (5 minutes).
 ///
 /// Per SEP-2663 the TTL runs from task creation, not from the moment the task
 /// reaches a terminal state.
-const DEFAULT_TTL_MS: u64 = 300_000;
+const DEFAULT_TASK_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// Default interval between physical reclamation passes.
+const DEFAULT_TASK_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Default poll interval suggestion (2 seconds, in milliseconds)
 const DEFAULT_POLL_INTERVAL_MS: u64 = 2_000;
+
+/// Runtime policy for the in-memory task store.
+///
+/// The default task TTL remains five minutes for source and behavior
+/// compatibility. Final-protocol clients cannot choose a TTL, so
+/// [`default_ttl`](Self::default_ttl) is the server's retention and execution
+/// bound for those tasks. Legacy clients that send an explicit TTL continue
+/// to use that value.
+///
+/// Expiry signalling is scheduled independently of
+/// [`cleanup_interval`](Self::cleanup_interval). The interval controls only
+/// when expired records are physically removed from memory; at the TTL
+/// deadline the task has already become invisible and its cancellation token
+/// and completion waiters have already been woken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryTaskStoreConfig {
+    /// TTL used when [`TaskStore::create_task`] receives `None`.
+    pub default_ttl: Duration,
+    /// Interval between automatic physical cleanup passes.
+    pub cleanup_interval: Duration,
+}
+
+impl MemoryTaskStoreConfig {
+    /// Create the default five-minute TTL, one-minute cleanup policy.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the TTL used for tasks that do not provide one.
+    #[must_use]
+    pub fn default_ttl(mut self, ttl: Duration) -> Self {
+        self.default_ttl = ttl;
+        self
+    }
+
+    /// Set how frequently expired task records are physically reclaimed.
+    ///
+    /// A zero interval is accepted and treated as one millisecond to avoid a
+    /// busy cleanup loop.
+    #[must_use]
+    pub fn cleanup_interval(mut self, interval: Duration) -> Self {
+        self.cleanup_interval = interval;
+        self
+    }
+}
+
+impl Default for MemoryTaskStoreConfig {
+    fn default() -> Self {
+        Self {
+            default_ttl: DEFAULT_TASK_TTL,
+            cleanup_interval: DEFAULT_TASK_CLEANUP_INTERVAL,
+        }
+    }
+}
+
+fn duration_millis_saturated(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
 
 /// Internal task representation with full state
 ///
@@ -253,7 +364,7 @@ pub struct Task {
     pub created_at_str: String,
     /// ISO 8601 timestamp of last state change
     pub last_updated_at_str: String,
-    /// Time-to-live in milliseconds (for cleanup after completion)
+    /// Time-to-live in milliseconds, measured from creation
     pub ttl: u64,
     /// Suggested polling interval in milliseconds
     pub poll_interval: u64,
@@ -302,10 +413,9 @@ impl Task {
         id: String,
         tool_name: String,
         arguments: serde_json::Value,
-        ttl: Option<u64>,
+        ttl: u64,
         owner: TaskOwner,
     ) -> Self {
-        let cancelled = Arc::new(AtomicBool::new(false));
         let now_str = chrono_now_iso8601();
         Self {
             id,
@@ -315,7 +425,7 @@ impl Task {
             created_at: Instant::now(),
             created_at_str: now_str.clone(),
             last_updated_at_str: now_str,
-            ttl: ttl.unwrap_or(DEFAULT_TTL_MS),
+            ttl,
             poll_interval: DEFAULT_POLL_INTERVAL_MS,
             status_message: Some("Task started".to_string()),
             meta: None,
@@ -326,7 +436,7 @@ impl Task {
             answered_input_keys: BTreeSet::new(),
             input_responses: InputResponses::new(),
             superseded_input_keys: BTreeSet::new(),
-            cancellation_token: CancellationToken { cancelled },
+            cancellation_token: CancellationToken::new(),
             completed_at: None,
             completion_notify: Arc::new(tokio::sync::Notify::new()),
         }
@@ -360,7 +470,15 @@ impl Task {
     /// `ttlMs` bounds how long the server retains the task, not how long it
     /// lingers after finishing.
     pub fn is_expired(&self) -> bool {
-        self.created_at.elapsed() > Duration::from_millis(self.ttl)
+        self.is_expired_at(Instant::now())
+    }
+
+    fn expires_at(&self) -> Option<Instant> {
+        self.created_at.checked_add(Duration::from_millis(self.ttl))
+    }
+
+    fn is_expired_at(&self, now: Instant) -> bool {
+        self.expires_at().is_some_and(|deadline| now >= deadline)
     }
 
     /// Outstanding input requests, if the task is waiting on the client.
@@ -371,6 +489,50 @@ impl Task {
     /// Check if the task has been cancelled
     pub fn is_cancelled(&self) -> bool {
         self.cancellation_token.is_cancelled()
+    }
+}
+
+/// Memory-store-only lifecycle bookkeeping around the public task record.
+///
+/// Keeping expiry signalling state here avoids adding a field to [`Task`],
+/// whose public fields historically allowed downstream struct literals.
+#[derive(Debug)]
+struct StoredTask {
+    task: Task,
+    expiry_signalled: bool,
+}
+
+impl StoredTask {
+    fn new(task: Task) -> Self {
+        Self {
+            task,
+            expiry_signalled: false,
+        }
+    }
+
+    /// Raise the persistent expiry signals exactly once.
+    fn signal_expiry(&mut self) -> bool {
+        if self.expiry_signalled {
+            return false;
+        }
+        self.expiry_signalled = true;
+        self.task.cancellation_token.cancel();
+        self.task.completion_notify.notify_waiters();
+        true
+    }
+}
+
+impl std::ops::Deref for StoredTask {
+    type Target = Task;
+
+    fn deref(&self) -> &Self::Target {
+        &self.task
+    }
+}
+
+impl std::ops::DerefMut for StoredTask {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.task
     }
 }
 
@@ -470,13 +632,28 @@ pub struct TaskResumeContext {
     pub arguments: serde_json::Value,
     /// Every answer accumulated so far, keyed as the requests were issued.
     pub input_responses: InputResponses,
+    /// Cancellation and expiry signal for the resumed execution, when the
+    /// store attached one.
+    ///
+    /// External stores should provide a clone of the token returned by
+    /// [`TaskStore::create_task`], or another token wired to the same durable
+    /// cancellation and expiry source, via
+    /// [`with_cancellation_token`](Self::with_cancellation_token).
+    /// The router fails the replay loudly when this is `None`, because a
+    /// disconnected handler could otherwise run beyond the task deadline.
+    pub cancellation_token: Option<CancellationToken>,
 }
 
 impl TaskResumeContext {
     /// Create the context needed to resume a task handler.
     ///
     /// External [`TaskStore`] implementations use this when reconstructing a
-    /// task from durable state in [`TaskStore::resume_context`].
+    /// task from durable state in [`TaskStore::resume_context`]. This keeps
+    /// the original three-argument constructor source-compatible, but leaves
+    /// [`cancellation_token`](Self::cancellation_token) as `None`; attach the
+    /// task's lifecycle token with
+    /// [`with_cancellation_token`](Self::with_cancellation_token) before
+    /// returning it to the router.
     ///
     /// # Example
     ///
@@ -501,7 +678,20 @@ impl TaskResumeContext {
             tool_name: tool_name.into(),
             arguments,
             input_responses,
+            cancellation_token: None,
         }
+    }
+
+    /// Attach the cancellation and expiry signal for replayed execution.
+    ///
+    /// [`Self::new`] intentionally keeps its original three arguments for
+    /// source compatibility. Stores that support resumption should call this
+    /// builder with the token associated with the task so expiry can stop a
+    /// replayed handler even when that handler does not poll cooperatively.
+    #[must_use]
+    pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.cancellation_token = Some(token);
+        self
     }
 }
 
@@ -509,52 +699,6 @@ impl AppliedInputResponses {
     /// Whether every outstanding request has now been answered.
     pub fn is_complete(&self) -> bool {
         self.still_outstanding.is_empty()
-    }
-}
-
-/// A shareable cancellation token for task management
-///
-/// Handed back by [`TaskStore::create_task`] and raised by
-/// [`TaskStore::cancel_task`]. It is cooperative: setting it does not
-/// interrupt anything, so long-running work has to check it between steps to
-/// notice. Every clone observes the same flag, and it is never lowered again.
-#[derive(Debug, Clone)]
-pub struct CancellationToken {
-    cancelled: Arc<AtomicBool>,
-}
-
-impl CancellationToken {
-    /// Create a new, un-cancelled token.
-    ///
-    /// [`TaskStore::create_task`] has to return one of these, so without a
-    /// public constructor the trait could not be implemented outside this
-    /// crate at all: a struct literal fails with `E0451` and there is nothing
-    /// else to hand back. A SQLite, Redis, or Postgres store is exactly the
-    /// case the trait exists for (#1293).
-    ///
-    /// What an implementor can rely on: the token is cooperative, so raising
-    /// it interrupts nothing by itself; every clone observes the same flag;
-    /// and it is never lowered once raised.
-    pub fn new() -> Self {
-        Self {
-            cancelled: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    /// Check if cancellation has been requested
-    pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Relaxed)
-    }
-
-    /// Request cancellation
-    pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Relaxed);
-    }
-}
-
-impl Default for CancellationToken {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -682,10 +826,14 @@ pub type TaskSnapshot = (TaskObject, Option<CallToolResult>, Option<JsonRpcError
 ///   `None` once `ttlMs` has elapsed since creation, whether or not the entry
 ///   has actually been reclaimed, so callers cannot probe for the existence of
 ///   a task whose retention window has closed.
-/// - [`cancel_task`](Self::cancel_task) must signal the task's
-///   [`CancellationToken`] even if the task is already terminal.
+/// - [`cancel_task`](Self::cancel_task) and TTL expiry must signal the task's
+///   [`CancellationToken`] even if the task is already terminal. The token is
+///   a persistent signal and may be awaited, so it must be the same
+///   cancellation domain returned from creation and carried through
+///   [`TaskResumeContext`].
 /// - [`wait_for_completion`](Self::wait_for_completion) blocks until the task
-///   reaches a terminal state; how an implementation waits (notification,
+///   reaches a terminal state or expires. Expiry wakes an existing waiter,
+///   which then returns `None`; how an implementation waits (notification,
 ///   polling, pub/sub) is an implementation detail and must not leak into the
 ///   trait.
 ///
@@ -831,6 +979,10 @@ pub trait TaskStore: Send + Sync + 'static {
     /// Create and store a new task owned by `owner`.
     ///
     /// Returns the task ID and a cancellation token for the spawned work.
+    /// The token is awaitable and must be raised both by explicit cancellation
+    /// and when the task's TTL elapses. An external store backed by a remote
+    /// database is responsible for bridging its durable expiry signal to this
+    /// process-local token.
     /// `owner` is the authenticated principal responsible for the task, or
     /// `None` when the request carried no authenticated context.
     async fn create_task(
@@ -875,8 +1027,8 @@ pub trait TaskStore: Send + Sync + 'static {
     /// Wait for a task to reach a terminal state, then return its snapshot.
     ///
     /// If the task is already terminal, returns immediately. Otherwise blocks
-    /// until the task completes, fails, or is cancelled. Returns `None` if
-    /// the task is unknown.
+    /// until the task completes, fails, is cancelled, or expires. Returns
+    /// `None` if the task is unknown or expires while waiting.
     async fn wait_for_completion(&self, task_id: &str) -> Result<Option<TaskSnapshot>>;
 
     /// List all tasks, optionally filtered by status.
@@ -1165,6 +1317,12 @@ pub trait TaskStore: Send + Sync + 'static {
     /// before resumption existed keeps compiling and fails loudly instead of
     /// hanging; implement it to support the flow (#1208).
     ///
+    /// The returned context must also carry the task's cancellation/expiry
+    /// signal. Construct it with [`TaskResumeContext::new`] and attach the
+    /// token with [`TaskResumeContext::with_cancellation_token`]. Reusing the
+    /// signal returned from [`create_task`](Self::create_task) lets the router
+    /// stop a replayed handler exactly when the task expires.
+    ///
     /// # Example
     ///
     /// The answers accumulate across rounds, because the handler is re-run
@@ -1366,16 +1524,191 @@ pub trait TaskStore: Send + Sync + 'static {
     async fn cancel_task(&self, task_id: &str, reason: Option<&str>) -> Result<Option<TaskObject>>;
 }
 
+#[derive(Debug, Default)]
+struct WorkerSignalState {
+    generation: u64,
+    shutdown: bool,
+}
+
+/// Condvar used only to reschedule or stop the memory-store worker.
+///
+/// It is deliberately separate from [`MemoryTaskStoreState`]. The worker may
+/// hold this strongly while it sleeps, but holds only a [`Weak`] reference to
+/// the actual task state, so dropping the final store clone is enough to stop
+/// and release the state.
+#[derive(Debug, Default)]
+struct WorkerSignal {
+    state: Mutex<WorkerSignalState>,
+    changed: Condvar,
+}
+
+impl WorkerSignal {
+    fn generation(&self) -> Option<u64> {
+        let state = self.state.lock().ok()?;
+        (!state.shutdown).then_some(state.generation)
+    }
+
+    fn wake(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.generation = state.generation.wrapping_add(1);
+            self.changed.notify_one();
+        }
+    }
+
+    fn shutdown(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.shutdown = true;
+            state.generation = state.generation.wrapping_add(1);
+            self.changed.notify_all();
+        }
+    }
+
+    /// Returns true when shutdown was requested.
+    fn wait_for_change(&self, generation: u64, timeout: Duration) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return true;
+        };
+        if state.shutdown {
+            return true;
+        }
+        if state.generation != generation {
+            return false;
+        }
+        match self.changed.wait_timeout(state, timeout) {
+            Ok((state, _)) => state.shutdown,
+            Err(_) => true,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Retirement {
+    signalled: usize,
+    removed: usize,
+}
+
+#[derive(Debug)]
+struct MemoryTaskStoreState {
+    tasks: RwLock<HashMap<String, StoredTask>>,
+    config: MemoryTaskStoreConfig,
+    worker_signal: Arc<WorkerSignal>,
+    worker_started: OnceLock<std::result::Result<(), String>>,
+}
+
+impl MemoryTaskStoreState {
+    fn retire_expired(&self, remove: bool) -> Retirement {
+        let Ok(mut tasks) = self.tasks.write() else {
+            return Retirement::default();
+        };
+        let now = Instant::now();
+        let mut retirement = Retirement::default();
+        for task in tasks.values_mut() {
+            if task.is_expired_at(now) && task.signal_expiry() {
+                retirement.signalled += 1;
+            }
+        }
+        if remove {
+            let before = tasks.len();
+            tasks.retain(|_, task| !task.is_expired_at(now));
+            retirement.removed = before - tasks.len();
+        }
+        retirement
+    }
+
+    fn next_expiry(&self) -> Option<Instant> {
+        self.tasks
+            .read()
+            .ok()?
+            .values()
+            .filter_map(|task| {
+                (!task.expiry_signalled)
+                    .then(|| task.expires_at())
+                    .flatten()
+            })
+            .min()
+    }
+}
+
+impl Drop for MemoryTaskStoreState {
+    fn drop(&mut self) {
+        self.worker_signal.shutdown();
+    }
+}
+
+fn next_deadline(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+        (None, None) => None,
+    }
+}
+
+fn memory_task_store_worker(state: Weak<MemoryTaskStoreState>, signal: Arc<WorkerSignal>) {
+    const MAX_SLEEP: Duration = Duration::from_secs(60 * 60);
+
+    let Some(initial) = state.upgrade() else {
+        return;
+    };
+    let cleanup_interval = if initial.config.cleanup_interval.is_zero() {
+        Duration::from_millis(1)
+    } else {
+        initial.config.cleanup_interval
+    };
+    let mut cleanup_at = Instant::now().checked_add(cleanup_interval);
+    drop(initial);
+
+    loop {
+        let Some(state) = state.upgrade() else {
+            break;
+        };
+        let Some(generation) = signal.generation() else {
+            break;
+        };
+
+        let now = Instant::now();
+        if cleanup_at.is_some_and(|deadline| now >= deadline) {
+            state.retire_expired(true);
+            // Measure the cadence from the end of the pass. With a short
+            // interval and a large map, measuring from `now` above could make
+            // an O(n) pass immediately overdue and keep the worker hot.
+            cleanup_at = Instant::now().checked_add(cleanup_interval);
+        } else {
+            // Expiry signalling is independent from physical cleanup.
+            state.retire_expired(false);
+        }
+
+        let deadline = next_deadline(cleanup_at, state.next_expiry());
+        let timeout = deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(MAX_SLEEP)
+            .min(MAX_SLEEP);
+        drop(state);
+
+        // Comparing generations under the condvar lock closes the gap between
+        // computing `deadline` and beginning the wait: create_task/set_ttl
+        // cannot deliver a notification that gets lost in that window.
+        if signal.wait_for_change(generation, timeout) {
+            break;
+        }
+    }
+}
+
 /// In-memory [`TaskStore`] backed by a `HashMap`.
 ///
 /// This is the default store. Suitable for single-instance deployments. For
 /// horizontal scaling, use an external store that shares state across
-/// instances. Completion wakeups for
+/// instances. A lazy background worker signals task expiry at its exact TTL
+/// deadline and physically removes expired records at the configured cleanup
+/// interval. It uses a standard thread rather than assuming construction
+/// happens inside a Tokio runtime, and holds only weak task state while
+/// sleeping.
+///
+/// Completion wakeups for
 /// [`wait_for_completion`](TaskStore::wait_for_completion) use a per-task
 /// [`tokio::sync::Notify`], which is an implementation detail of this store.
 #[derive(Debug, Clone)]
 pub struct MemoryTaskStore {
-    tasks: Arc<RwLock<HashMap<String, Task>>>,
+    state: Arc<MemoryTaskStoreState>,
 }
 
 impl Default for MemoryTaskStore {
@@ -1385,20 +1718,48 @@ impl Default for MemoryTaskStore {
 }
 
 impl MemoryTaskStore {
-    /// Create a new task store
+    /// Create a task store with the five-minute default TTL and one-minute
+    /// cleanup interval.
     pub fn new() -> Self {
+        Self::with_config(MemoryTaskStoreConfig::default())
+    }
+
+    /// Create a task store with an explicit lifecycle policy.
+    pub fn with_config(config: MemoryTaskStoreConfig) -> Self {
         Self {
-            tasks: Arc::new(RwLock::new(HashMap::new())),
+            state: Arc::new(MemoryTaskStoreState {
+                tasks: RwLock::new(HashMap::new()),
+                config,
+                worker_signal: Arc::new(WorkerSignal::default()),
+                worker_started: OnceLock::new(),
+            }),
         }
     }
 
-    /// Remove expired tasks (call periodically for cleanup).
+    fn ensure_worker(&self) -> Result<()> {
+        let weak = Arc::downgrade(&self.state);
+        let signal = self.state.worker_signal.clone();
+        match self.state.worker_started.get_or_init(|| {
+            std::thread::Builder::new()
+                .name("tower-mcp-task-expiry".to_string())
+                .spawn(move || memory_task_store_worker(weak, signal))
+                .map(drop)
+                .map_err(|error| format!("failed to start task expiry worker: {error}"))
+        }) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(TaskStoreError::Backend(error.clone())),
+        }
+    }
+
+    /// Remove expired tasks immediately.
     ///
     /// Returns the number removed. Not part of the [`TaskStore`] trait;
     /// external backends typically expire entries natively (e.g. Redis TTL).
     ///
-    /// Calling this is an optimization, not a correctness requirement: reads
-    /// already treat an expired task as absent.
+    /// The configured worker already calls this retirement path periodically;
+    /// applications may call it to reclaim memory sooner. Calling it is an
+    /// optimization, not a correctness requirement: expiry has already
+    /// cancelled work, woken waiters, and made the task read as absent.
     ///
     /// # Example
     ///
@@ -1426,19 +1787,13 @@ impl MemoryTaskStore {
     /// # }
     /// ```
     pub fn cleanup_expired(&self) -> usize {
-        if let Ok(mut tasks) = self.tasks.write() {
-            let before = tasks.len();
-            tasks.retain(|_, t| !t.is_expired());
-            before - tasks.len()
-        } else {
-            0
-        }
+        self.state.retire_expired(true).removed
     }
 
     /// Get the number of tasks in the store
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        if let Ok(tasks) = self.tasks.read() {
+        if let Ok(tasks) = self.state.tasks.read() {
             tasks.len()
         } else {
             0
@@ -1461,19 +1816,23 @@ impl TaskStore for MemoryTaskStore {
         ttl: Option<u64>,
         owner: TaskOwner,
     ) -> Result<(String, CancellationToken)> {
+        self.ensure_worker()?;
         let id = generate_task_id();
+        let ttl = ttl.unwrap_or_else(|| duration_millis_saturated(self.state.config.default_ttl));
         let task = Task::new(id.clone(), tool_name.to_string(), arguments, ttl, owner);
         let token = task.cancellation_token.clone();
 
-        if let Ok(mut tasks) = self.tasks.write() {
-            tasks.insert(id.clone(), task);
+        if let Ok(mut tasks) = self.state.tasks.write() {
+            tasks.insert(id.clone(), StoredTask::new(task));
         }
+        self.state.worker_signal.wake();
 
         Ok((id, token))
     }
 
     async fn get_task(&self, task_id: &str) -> Result<Option<TaskObject>> {
-        Ok(if let Ok(tasks) = self.tasks.read() {
+        self.state.retire_expired(false);
+        Ok(if let Ok(tasks) = self.state.tasks.read() {
             tasks
                 .get(task_id)
                 .filter(|t| !t.is_expired())
@@ -1484,7 +1843,8 @@ impl TaskStore for MemoryTaskStore {
     }
 
     async fn set_task_meta(&self, task_id: &str, meta: serde_json::Value) -> Result<bool> {
-        let Ok(mut tasks) = self.tasks.write() else {
+        self.state.retire_expired(false);
+        let Ok(mut tasks) = self.state.tasks.write() else {
             return Ok(false);
         };
         let Some(task) = tasks.get_mut(task_id).filter(|task| !task.is_expired()) else {
@@ -1496,6 +1856,7 @@ impl TaskStore for MemoryTaskStore {
 
     async fn discard_task(&self, task_id: &str) -> Result<bool> {
         Ok(self
+            .state
             .tasks
             .write()
             .ok()
@@ -1504,7 +1865,8 @@ impl TaskStore for MemoryTaskStore {
     }
 
     async fn task_owner(&self, task_id: &str) -> Result<Option<TaskOwner>> {
-        Ok(if let Ok(tasks) = self.tasks.read() {
+        self.state.retire_expired(false);
+        Ok(if let Ok(tasks) = self.state.tasks.read() {
             tasks
                 .get(task_id)
                 .filter(|t| !t.is_expired())
@@ -1519,7 +1881,8 @@ impl TaskStore for MemoryTaskStore {
     /// existed (#1249). One read resolves both, so expiry cannot change
     /// between deciding presence and reading the owner.
     async fn task_presence(&self, task_id: &str) -> Result<TaskPresence> {
-        let Ok(tasks) = self.tasks.read() else {
+        self.state.retire_expired(false);
+        let Ok(tasks) = self.state.tasks.read() else {
             return Ok(TaskPresence::Missing);
         };
         Ok(match tasks.get(task_id) {
@@ -1534,7 +1897,8 @@ impl TaskStore for MemoryTaskStore {
     }
 
     async fn get_task_result(&self, task_id: &str) -> Result<Option<TaskSnapshot>> {
-        Ok(if let Ok(tasks) = self.tasks.read() {
+        self.state.retire_expired(false);
+        Ok(if let Ok(tasks) = self.state.tasks.read() {
             tasks
                 .get(task_id)
                 .filter(|t| !t.is_expired())
@@ -1545,9 +1909,11 @@ impl TaskStore for MemoryTaskStore {
     }
 
     async fn wait_for_completion(&self, task_id: &str) -> Result<Option<TaskSnapshot>> {
-        // First check if already terminal and get the notify handle
-        let notify = {
-            let Ok(tasks) = self.tasks.read() else {
+        self.state.retire_expired(false);
+        // Register the wait while holding the read lock, so a transition
+        // cannot notify between the state check and waiter registration.
+        let (mut notified, cancellation) = {
+            let Ok(tasks) = self.state.tasks.read() else {
                 return Ok(None);
             };
             let Some(task) = tasks.get(task_id).filter(|t| !t.is_expired()) else {
@@ -1560,18 +1926,38 @@ impl TaskStore for MemoryTaskStore {
                     task.error.clone(),
                 )));
             }
-            task.completion_notify.clone()
+            let mut notified = Box::pin(task.completion_notify.clone().notified_owned());
+            let _ = notified.as_mut().enable();
+            (notified, task.cancellation_token.clone())
         };
 
-        // Wait for completion notification
-        notify.notified().await;
+        let cancellation_fired = tokio::select! {
+            _ = &mut notified => false,
+            _ = cancellation.cancelled() => true,
+        };
+
+        if cancellation_fired {
+            match self.get_task_result(task_id).await? {
+                // A live handler receives the store token directly and owns
+                // cooperative teardown. Explicit cancellation can therefore
+                // raise the token before the handler confirms a terminal
+                // state. Keep waiting on the already-enabled notification in
+                // that case; expiry returned `None` above and terminal
+                // cancellation returned a terminal snapshot.
+                Some((task, _, _)) if !task.status.is_terminal() => {
+                    notified.await;
+                }
+                snapshot => return Ok(snapshot),
+            }
+        }
 
         // Read the result
         self.get_task_result(task_id).await
     }
 
     async fn list_tasks(&self, status_filter: Option<TaskStatus>) -> Result<Vec<TaskObject>> {
-        Ok(if let Ok(tasks) = self.tasks.read() {
+        self.state.retire_expired(false);
+        Ok(if let Ok(tasks) = self.state.tasks.read() {
             tasks
                 .values()
                 .filter(|t| !t.is_expired())
@@ -1589,7 +1975,8 @@ impl TaskStore for MemoryTaskStore {
         requests: InputRequests,
         message: Option<&str>,
     ) -> Result<bool> {
-        let Ok(mut tasks) = self.tasks.write() else {
+        self.state.retire_expired(false);
+        let Ok(mut tasks) = self.state.tasks.write() else {
             return Ok(false);
         };
         let Some(task) = tasks.get_mut(task_id).filter(|t| !t.is_expired()) else {
@@ -1658,7 +2045,8 @@ impl TaskStore for MemoryTaskStore {
     }
 
     async fn outstanding_input_requests(&self, task_id: &str) -> Result<Option<InputRequests>> {
-        Ok(if let Ok(tasks) = self.tasks.read() {
+        self.state.retire_expired(false);
+        Ok(if let Ok(tasks) = self.state.tasks.read() {
             tasks
                 .get(task_id)
                 .filter(|t| !t.is_expired())
@@ -1673,7 +2061,8 @@ impl TaskStore for MemoryTaskStore {
         task_id: &str,
         responses: InputResponses,
     ) -> Result<Option<AppliedInputResponses>> {
-        let Ok(mut tasks) = self.tasks.write() else {
+        self.state.retire_expired(false);
+        let Ok(mut tasks) = self.state.tasks.write() else {
             return Ok(None);
         };
         let Some(task) = tasks.get_mut(task_id).filter(|t| !t.is_expired()) else {
@@ -1719,7 +2108,8 @@ impl TaskStore for MemoryTaskStore {
                 "set_status is for non-terminal progress; use complete_task, fail_task, or cancel_task to reach {status:?}"
             )));
         }
-        let Ok(mut tasks) = self.tasks.write() else {
+        self.state.retire_expired(false);
+        let Ok(mut tasks) = self.state.tasks.write() else {
             return Ok(false);
         };
         let Some(task) = tasks.get_mut(task_id).filter(|t| !t.is_expired()) else {
@@ -1737,7 +2127,8 @@ impl TaskStore for MemoryTaskStore {
     }
 
     async fn resume_context(&self, task_id: &str) -> Result<Option<TaskResumeContext>> {
-        let Ok(tasks) = self.tasks.read() else {
+        self.state.retire_expired(false);
+        let Ok(tasks) = self.state.tasks.read() else {
             return Ok(None);
         };
         Ok(tasks
@@ -1749,23 +2140,34 @@ impl TaskStore for MemoryTaskStore {
                     task.arguments.clone(),
                     task.input_responses.clone(),
                 )
+                .with_cancellation_token(task.cancellation_token.clone())
             }))
     }
 
     async fn set_ttl(&self, task_id: &str, ttl_ms: u64) -> Result<bool> {
-        let Ok(mut tasks) = self.tasks.write() else {
+        let Ok(mut tasks) = self.state.tasks.write() else {
             return Ok(false);
         };
-        let Some(task) = tasks.get_mut(task_id).filter(|t| !t.is_expired()) else {
+        let Some(task) = tasks.get_mut(task_id) else {
             return Ok(false);
         };
+        if task.is_expired() {
+            task.signal_expiry();
+            return Ok(false);
+        }
         task.ttl = ttl_ms;
         task.last_updated_at_str = chrono_now_iso8601();
+        if task.is_expired() {
+            task.signal_expiry();
+        }
+        drop(tasks);
+        self.state.worker_signal.wake();
         Ok(true)
     }
 
     async fn complete_task(&self, task_id: &str, result: CallToolResult) -> Result<bool> {
-        let Ok(mut tasks) = self.tasks.write() else {
+        self.state.retire_expired(false);
+        let Ok(mut tasks) = self.state.tasks.write() else {
             return Ok(false);
         };
         let Some(task) = tasks.get_mut(task_id).filter(|t| !t.is_expired()) else {
@@ -1785,7 +2187,8 @@ impl TaskStore for MemoryTaskStore {
     }
 
     async fn fail_task(&self, task_id: &str, error: JsonRpcError) -> Result<bool> {
-        let Ok(mut tasks) = self.tasks.write() else {
+        self.state.retire_expired(false);
+        let Ok(mut tasks) = self.state.tasks.write() else {
             return Ok(false);
         };
         let Some(task) = tasks.get_mut(task_id).filter(|t| !t.is_expired()) else {
@@ -1805,7 +2208,8 @@ impl TaskStore for MemoryTaskStore {
     }
 
     async fn cancel_task(&self, task_id: &str, reason: Option<&str>) -> Result<Option<TaskObject>> {
-        let Ok(mut tasks) = self.tasks.write() else {
+        self.state.retire_expired(false);
+        let Ok(mut tasks) = self.state.tasks.write() else {
             return Ok(None);
         };
         let Some(task) = tasks.get_mut(task_id).filter(|t| !t.is_expired()) else {
@@ -1972,6 +2376,7 @@ mod tests {
 
         assert_eq!(context.tool_name, "build_report");
         assert_eq!(context.arguments, serde_json::json!({"format": "pdf"}));
+        assert!(context.cancellation_token.is_none());
         assert_eq!(
             serde_json::to_value(&context.input_responses).unwrap(),
             serde_json::to_value(&input_responses).unwrap()
@@ -1996,6 +2401,187 @@ mod tests {
             .expect("task should exist");
         assert_eq!(info.task_id, id);
         assert_eq!(info.status, TaskStatus::Working);
+        assert_eq!(info.ttl, Some(300_000));
+    }
+
+    #[tokio::test]
+    async fn configured_default_ttl_is_used_when_creation_omits_one() {
+        let store = MemoryTaskStore::with_config(
+            MemoryTaskStoreConfig::default().default_ttl(Duration::from_secs(42)),
+        );
+        let (id, _) = store
+            .create_task("test-tool", serde_json::json!({}), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.get_task(&id).await.unwrap().unwrap().ttl,
+            Some(42_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn working_task_expiry_cancels_and_wakes_completion_waiter() {
+        let store = MemoryTaskStore::with_config(
+            MemoryTaskStoreConfig::default()
+                .default_ttl(Duration::from_secs(60))
+                .cleanup_interval(Duration::from_secs(60)),
+        );
+        let (id, cancellation) = store
+            .create_task("test-tool", serde_json::json!({}), None, None)
+            .await
+            .unwrap();
+
+        let waiting_store = store.clone();
+        let waiting_id = id.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_store
+                .wait_for_completion(&waiting_id)
+                .await
+                .unwrap()
+        });
+
+        // Poll the waiter to pending while the long initial TTL guarantees
+        // that expiry cannot win setup under a stalled CI process.
+        let mut waiter = waiter;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiter)
+                .await
+                .is_err()
+        );
+        assert!(store.set_ttl(&id, 0).await.unwrap());
+
+        tokio::time::timeout(Duration::from_secs(2), cancellation.cancelled())
+            .await
+            .expect("expiry did not cancel the task token");
+        let snapshot = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("expiry did not wake the completion waiter")
+            .unwrap();
+        assert!(
+            snapshot.is_none(),
+            "an expired task has no visible snapshot"
+        );
+        assert!(matches!(
+            store.task_presence(&id).await.unwrap(),
+            TaskPresence::Expired { .. }
+        ));
+        assert!(
+            !store
+                .complete_task(&id, CallToolResult::text("late"))
+                .await
+                .unwrap(),
+            "a terminal write must not resurrect an expired task"
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_cleanup_physically_reclaims_expired_tasks() {
+        let store = MemoryTaskStore::with_config(
+            MemoryTaskStoreConfig::default()
+                .default_ttl(Duration::from_secs(60))
+                .cleanup_interval(Duration::from_millis(25)),
+        );
+        let (id, _) = store
+            .create_task("test-tool", serde_json::json!({}), None, None)
+            .await
+            .unwrap();
+        assert_eq!(store.len(), 1);
+        assert!(store.set_ttl(&id, 0).await.unwrap());
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !store.is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("automatic cleanup did not reclaim the expired record");
+    }
+
+    #[tokio::test]
+    async fn shortening_ttl_reschedules_expiry_from_creation() {
+        let store = MemoryTaskStore::with_config(
+            MemoryTaskStoreConfig::default()
+                .default_ttl(Duration::from_secs(60))
+                .cleanup_interval(Duration::from_secs(60)),
+        );
+        let (id, cancellation) = store
+            .create_task("test-tool", serde_json::json!({}), None, None)
+            .await
+            .unwrap();
+
+        assert!(store.set_ttl(&id, 250).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(3), cancellation.cancelled())
+            .await
+            .expect("shorter TTL did not reschedule the expiry wakeup");
+        assert!(store.get_task(&id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn manual_and_scheduled_retirement_signal_expiry_only_once() {
+        let store = MemoryTaskStore::with_config(
+            MemoryTaskStoreConfig::default()
+                .default_ttl(Duration::from_secs(60))
+                .cleanup_interval(Duration::from_secs(60)),
+        );
+        let (id, cancellation) = store
+            .create_task("test-tool", serde_json::json!({}), None, None)
+            .await
+            .unwrap();
+
+        // Mutate under the private store lock without waking the worker. This
+        // makes the two retirement passes deterministic while exercising the
+        // same one-shot path used by both manual and scheduled cleanup.
+        store.state.tasks.write().unwrap().get_mut(&id).unwrap().ttl = 0;
+        let first = store.state.retire_expired(false);
+        let second = store.state.retire_expired(false);
+        assert_eq!(first.signalled + second.signalled, 1);
+        assert!(cancellation.is_cancelled());
+        assert_eq!(store.cleanup_expired(), 1);
+        assert_eq!(store.cleanup_expired(), 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_last_store_clone_releases_worker_state() {
+        let store = MemoryTaskStore::with_config(
+            MemoryTaskStoreConfig::default().cleanup_interval(Duration::from_secs(60)),
+        );
+        store
+            .create_task("test-tool", serde_json::json!({}), None, None)
+            .await
+            .unwrap();
+        let weak = Arc::downgrade(&store.state);
+        drop(store);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the expiry worker retained the store's task state");
+    }
+
+    #[test]
+    fn creating_a_task_does_not_require_a_tokio_runtime() {
+        let store = MemoryTaskStore::with_config(
+            MemoryTaskStoreConfig::default()
+                .default_ttl(Duration::from_secs(60))
+                .cleanup_interval(Duration::from_secs(60)),
+        );
+        let (id, token) = futures::executor::block_on(store.create_task(
+            "test-tool",
+            serde_json::json!({}),
+            None,
+            None,
+        ))
+        .expect("the standard-thread worker should start without Tokio");
+
+        assert!(!token.is_cancelled());
+        assert!(
+            futures::executor::block_on(store.get_task(&id))
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -2185,6 +2771,36 @@ mod tests {
         assert_eq!(task_obj.status, TaskStatus::Completed);
         assert!(result.is_some());
         assert!(error.is_none());
+    }
+
+    #[tokio::test]
+    async fn wait_for_completion_does_not_treat_live_cancellation_signal_as_terminal() {
+        let store = MemoryTaskStore::new();
+        let (id, cancellation) = store
+            .create_task("test-tool", serde_json::json!({}), None, None)
+            .await
+            .unwrap();
+        let waiter_store = store.clone();
+        let waiter_id = id.clone();
+        let mut waiter =
+            tokio::spawn(
+                async move { waiter_store.wait_for_completion(&waiter_id).await.unwrap() },
+            );
+
+        cancellation.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiter)
+                .await
+                .is_err(),
+            "the cooperative signal alone must not return a working snapshot"
+        );
+
+        store
+            .cancel_task(&id, Some("teardown complete"))
+            .await
+            .unwrap();
+        let (task, _, _) = waiter.await.unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Cancelled);
     }
 
     #[tokio::test]

@@ -6,7 +6,7 @@
 //! to an application cancellation policy.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use crate::context::CancellationToken;
 
@@ -98,6 +98,9 @@ impl LiveTaskExecutionHandle {
 
 pub(crate) struct LiveTaskCancellation {
     token: CancellationToken,
+    /// Store-owned cancellation/expiry signal, attached after the durable
+    /// task record is created and before preparation begins.
+    task_lifecycle: OnceLock<crate::async_task::CancellationToken>,
     state: Mutex<CancellationState>,
 }
 
@@ -111,16 +114,34 @@ impl LiveTaskCancellation {
     pub(crate) fn new() -> Self {
         Self {
             token: CancellationToken::new(),
+            task_lifecycle: OnceLock::new(),
             state: Mutex::new(CancellationState::default()),
         }
     }
 
+    pub(crate) fn attach_task_lifecycle(&self, token: crate::async_task::CancellationToken) {
+        let attached = self.task_lifecycle.set(token).is_ok();
+        debug_assert!(attached, "a live execution has one task lifecycle token");
+    }
+
     pub(crate) fn is_cancelled(&self) -> bool {
         self.token.is_cancelled()
+            || self
+                .task_lifecycle
+                .get()
+                .is_some_and(crate::async_task::CancellationToken::is_cancelled)
     }
 
     pub(crate) async fn cancelled(&self) {
-        self.token.cancelled().await;
+        match self.task_lifecycle.get() {
+            Some(task_lifecycle) => {
+                tokio::select! {
+                    _ = self.token.cancelled() => {}
+                    _ = task_lifecycle.cancelled() => {}
+                }
+            }
+            None => self.token.cancelled().await,
+        }
     }
 
     pub(crate) fn cancel(&self, reason: Option<String>) {

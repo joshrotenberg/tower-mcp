@@ -638,37 +638,73 @@ async fn resume_store_failures_are_mapped_and_persisted_without_backend_details(
 }
 
 #[tokio::test]
-async fn absent_resume_state_and_missing_tools_use_typed_safe_failures() {
+async fn absent_resume_state_token_and_tools_use_typed_safe_failures() {
     const SECRET_TOOL: &str = "private.provider.secret-tool";
+    let handler_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let invoked = handler_calls.clone();
+    let registered = ToolBuilder::new("registered-but-tokenless")
+        .handler(move |_input: serde_json::Value| {
+            let invoked = invoked.clone();
+            async move {
+                invoked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(CallToolResult::text("must not run"))
+            }
+        })
+        .build();
     let store = Arc::new(
         ScriptedTaskStore::default()
             .with_resumes([
                 Ok(None),
-                Ok(Some(crate::async_task::TaskResumeContext {
-                    tool_name: SECRET_TOOL.to_string(),
-                    arguments: serde_json::json!({}),
-                    input_responses: Default::default(),
-                })),
+                Ok(Some(crate::async_task::TaskResumeContext::new(
+                    "registered-but-tokenless",
+                    serde_json::json!({}),
+                    Default::default(),
+                ))),
+                Ok(Some(
+                    crate::async_task::TaskResumeContext::new(
+                        SECRET_TOOL,
+                        serde_json::json!({}),
+                        Default::default(),
+                    )
+                    .with_cancellation_token(crate::async_task::CancellationToken::new()),
+                )),
             ])
-            .with_failure_results([Ok(true), Ok(true)]),
+            .with_failure_results([Ok(true), Ok(true), Ok(true)]),
     );
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let tokenless_failures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let recorded = calls.clone();
+    let recorded_tokenless = tokenless_failures.clone();
     let router = McpRouter::new()
+        .tool(registered)
         .task_store(store.clone())
         .task_error_policy(TaskErrorPolicy::new(move |context| {
             recorded.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             assert_eq!(context.operation(), TaskOperation::Resume);
             assert!(matches!(context.failure(), TaskFailure::Internal(_)));
+            if matches!(
+                context.failure(),
+                TaskFailure::Internal(message)
+                    if message.contains("cancellation and expiry token")
+            ) {
+                recorded_tokenless.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             JsonRpcError::internal_error("mapped safe resume failure")
         }));
 
     router.resume_task("task_scripted").await;
     router.resume_task("task_scripted").await;
+    router.resume_task("task_scripted").await;
+    tokio::task::yield_now().await;
 
-    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(
+        tokenless_failures.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(handler_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     let failures = store.recorded_failures.lock().unwrap();
-    assert_eq!(failures.len(), 2);
+    assert_eq!(failures.len(), 3);
     assert!(
         failures
             .iter()

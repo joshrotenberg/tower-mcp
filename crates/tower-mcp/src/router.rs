@@ -758,19 +758,25 @@ impl McpRouter {
 
     /// Configure a pluggable [`TaskStore`] for async task state.
     ///
-    /// The default is an in-process [`MemoryTaskStore`]. Supply an external
-    /// store (Redis, Postgres, etc.) to share task state across server
-    /// instances behind a load balancer, so `tasks/get` works regardless of
-    /// which instance created the task (SEP-2663).
+    /// The default is an in-process [`MemoryTaskStore`] with a five-minute task
+    /// TTL and one-minute cleanup cadence. Supply a configured memory store to
+    /// choose the final-protocol task lifetime, or an external store (Redis,
+    /// Postgres, etc.) to share task state across server instances behind a
+    /// load balancer, so `tasks/get` works regardless of which instance
+    /// created the task (SEP-2663).
     ///
     /// # Example
     ///
     /// ```rust
     /// use std::sync::Arc;
+    /// use std::time::Duration;
     /// use tower_mcp::McpRouter;
-    /// use tower_mcp::async_task::{MemoryTaskStore, TaskStore};
+    /// use tower_mcp::async_task::{MemoryTaskStore, MemoryTaskStoreConfig, TaskStore};
     ///
-    /// let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    /// let config = MemoryTaskStoreConfig::default()
+    ///     .default_ttl(Duration::from_secs(30 * 60))
+    ///     .cleanup_interval(Duration::from_secs(30));
+    /// let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::with_config(config));
     /// let router = McpRouter::new().task_store(store);
     /// ```
     pub fn task_store(mut self, store: Arc<dyn TaskStore>) -> Self {
@@ -2079,6 +2085,16 @@ impl McpRouter {
 
                     tracing::info!(task_id = %task_id, tool = %params.name, "Created async task");
 
+                    // Host/client cancellation keeps its first-wins reason in
+                    // the live-execution registry. Store expiry is a separate
+                    // persistent signal with no reason; observe both without
+                    // letting expiry overwrite that cancellation policy.
+                    if let Some(admission) = live_admission.as_ref() {
+                        admission
+                            .cancellation()
+                            .attach_task_lifecycle(cancellation_token.clone());
+                    }
+
                     // Create a context for the async task execution
                     let progress_token = params.meta.and_then(|m| m.progress_token);
                     let ctx = self.create_context_with_extensions(
@@ -2097,10 +2113,22 @@ impl McpRouter {
                     };
                     let mut ctx = ctx;
                     ctx.extensions_mut().insert(task_context.clone());
-                    let preparation = match tool
-                        .prepare_task(task_context, params.arguments.clone())
-                        .await
-                    {
+                    let preparation = match tokio::select! {
+                        biased;
+                        _ = cancellation_token.cancelled() => {
+                            discard_unprepared_task(&task_store, &task_id).await;
+                            return Err(self.task_error(
+                                TaskOperation::Create,
+                                Some(&task_id),
+                                TaskFailure::Internal(
+                                    "Task cancellation or expiry interrupted preparation",
+                                ),
+                            ));
+                        }
+                        preparation = tool.prepare_task(task_context, params.arguments.clone()) => {
+                            preparation
+                        }
+                    } {
                         Ok(preparation) => preparation,
                         Err(error) => {
                             discard_unprepared_task(&task_store, &task_id).await;
@@ -2157,9 +2185,6 @@ impl McpRouter {
                             input_ready: tokio::sync::Notify::new(),
                             cancellation: cancellation.clone(),
                         });
-                        if cancellation_token.is_cancelled() {
-                            cancellation.cancel(None);
-                        }
                         // Promotion replaces the anonymous preparation
                         // reservation with an ID-bearing registration under a
                         // single lock. It happens before spawn, so close +
@@ -2311,10 +2336,27 @@ impl McpRouter {
                         // answers with `tasks/update` and the router resumes
                         // it (#1208).
                         let start = std::time::Instant::now();
-                        let outcome = notifier
-                            .invoke_tool(&tool, ctx, arguments, &tool_name)
-                            .await;
+                        // Ordinary task handlers do not own a cooperative
+                        // teardown contract. Race the invocation against the
+                        // persistent store token so expiry (and explicit
+                        // cancellation) drops even a handler that never polls.
+                        let outcome = tokio::select! {
+                            biased;
+                            _ = cancellation_token.cancelled() => None,
+                            outcome = notifier.invoke_tool(&tool, ctx, arguments, &tool_name) => {
+                                Some(outcome)
+                            }
+                        };
                         let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+                        let Some(outcome) = outcome else {
+                            tracing::debug!(
+                                task_id = %task_id_clone,
+                                "Task execution stopped by cancellation or expiry"
+                            );
+                            notifier.notify_task_state(&task_id_clone).await;
+                            return;
+                        };
 
                         let result = match outcome {
                             Ok(crate::protocol::RequestOutcome::Complete(result)) => result,

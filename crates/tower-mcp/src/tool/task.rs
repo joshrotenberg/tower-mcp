@@ -132,10 +132,11 @@ impl TaskContext {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::TaskCancelled`] if the
-    /// task is cancelled while waiting, so a handler that propagates with `?`
+    /// Returns [`crate::Error::TaskCancelled`] if the task is cancelled or its
+    /// TTL expires while waiting, so a handler that propagates with `?`
     /// unwinds correctly without writing a `select!`. The router maps that
-    /// error to [`TaskOutcome::Cancelled`].
+    /// error to [`TaskOutcome::Cancelled`]; an expired record remains expired
+    /// and cannot be resurrected by that terminal write.
     ///
     /// Request keys must be unique over the task's lifetime (SEP-2663), so
     /// reusing a spent key is an error rather than a fresh question.
@@ -297,7 +298,7 @@ impl TaskContext {
         Ok(())
     }
 
-    /// Whether this task has been asked to cancel.
+    /// Whether this task has been asked to cancel or has expired.
     ///
     /// Available during live-task preparation as well as handler execution.
     /// A live task stays non-terminal until its handler returns, so this being
@@ -320,7 +321,7 @@ impl TaskContext {
             .and_then(|cancellation| cancellation.reason())
     }
 
-    /// Resolves when this task is asked to cancel.
+    /// Resolves when this task is asked to cancel or reaches its TTL.
     ///
     /// A live handler uses this when it interleaves teardown with its own
     /// work. Task preparation receives the same signal, so a cooperative
@@ -416,10 +417,10 @@ impl PendingInput {
     ///
     /// # Errors
     ///
-    /// [`crate::Error::TaskCancelled`] if the task is cancelled while
-    /// waiting, so a handler that propagates with `?` unwinds correctly
+    /// [`crate::Error::TaskCancelled`] if the task is cancelled or expires
+    /// while waiting, so a handler that propagates with `?` unwinds correctly
     /// without writing a `select!`. The router maps that to
-    /// [`TaskOutcome::Cancelled`].
+    /// [`TaskOutcome::Cancelled`]; an expired store record stays absent.
     pub async fn wait(self) -> Result<InputResponses> {
         let live = &self.live;
 

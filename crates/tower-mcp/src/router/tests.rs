@@ -2708,6 +2708,253 @@ async fn a_task_resumes_after_its_input_is_answered() {
     );
 }
 
+/// #1389: an ordinary task handler may never poll RequestContext. The router
+/// owns that future, so it must drop it when the store's TTL token fires rather
+/// than leaving unreachable work running forever.
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn expiry_stops_an_ordinary_task_handler_that_never_polls() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::async_task::{MemoryTaskStore, MemoryTaskStoreConfig, TaskPresence, TaskStore};
+
+    struct CountDrop(std::sync::Arc<AtomicUsize>);
+    impl Drop for CountDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let started = std::sync::Arc::new(AtomicUsize::new(0));
+    let dropped = std::sync::Arc::new(AtomicUsize::new(0));
+    let handler_started = started.clone();
+    let handler_dropped = dropped.clone();
+    let hangs = ToolBuilder::new("hangs")
+        .description("Never returns or polls cancellation")
+        .task_support(TaskSupportMode::Optional)
+        .handler(move |_input: serde_json::Value| {
+            let started = handler_started.clone();
+            let dropped = handler_dropped.clone();
+            async move {
+                let _drop = CountDrop(dropped);
+                started.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+                Ok(CallToolResult::text("unreachable"))
+            }
+        })
+        .build();
+
+    let store = std::sync::Arc::new(MemoryTaskStore::with_config(
+        MemoryTaskStoreConfig::default()
+            .default_ttl(std::time::Duration::from_secs(60))
+            .cleanup_interval(std::time::Duration::from_secs(60)),
+    ));
+    let mut router = McpRouter::new()
+        .task_store(store.clone())
+        .tool(hangs)
+        .with_tasks();
+    init_router(&mut router).await;
+
+    let response = router
+        .ready()
+        .await
+        .unwrap()
+        .call(RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::CallTool(CallToolParams {
+                input_responses: None,
+                request_state: None,
+                name: "hangs".to_string(),
+                arguments: serde_json::json!({}),
+                meta: None,
+                task: None,
+            }),
+            extensions: tasks_client_extensions(),
+        })
+        .await
+        .unwrap();
+    let task_id = match response.inner {
+        Ok(McpResponse::FinalCreateTask(result)) => result.task.metadata.task_id,
+        other => panic!("expected a created task, got {other:?}"),
+    };
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while started.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("ordinary handler never started");
+    assert!(store.set_ttl(&task_id, 0).await.unwrap());
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while dropped.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("expiry did not drop the ordinary handler future");
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    assert!(store.get_task(&task_id).await.unwrap().is_none());
+    assert!(matches!(
+        store.task_presence(&task_id).await.unwrap(),
+        TaskPresence::Expired { .. }
+    ));
+}
+
+/// #1389: the cancellation source survives a park/resume boundary. A replayed
+/// handler that never polls must still be dropped at the original task TTL.
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn expiry_stops_a_replayed_task_handler_that_never_polls() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::async_task::{MemoryTaskStore, MemoryTaskStoreConfig, TaskPresence, TaskStore};
+    use crate::protocol::{
+        ElicitFormParams, ElicitFormSchema, ElicitRequestParams, InputRequest, InputRequests,
+        InputRequiredResult, RequestOutcome,
+    };
+
+    struct CountDrop(std::sync::Arc<AtomicUsize>);
+    impl Drop for CountDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let replay_started = std::sync::Arc::new(AtomicUsize::new(0));
+    let replay_dropped = std::sync::Arc::new(AtomicUsize::new(0));
+    let handler_started = replay_started.clone();
+    let handler_dropped = replay_dropped.clone();
+    let asks_then_hangs = ToolBuilder::new("asks_then_hangs")
+        .description("Parks once, then never returns")
+        .task_support(TaskSupportMode::Optional)
+        .mrtr_handler::<serde_json::Value, _, _>(move |ctx, _input| {
+            let started = handler_started.clone();
+            let dropped = handler_dropped.clone();
+            async move {
+                if ctx.input_responses().is_some() {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    let _drop = CountDrop(dropped);
+                    std::future::pending::<()>().await;
+                    return Ok(RequestOutcome::Complete(CallToolResult::text(
+                        "unreachable",
+                    )));
+                }
+
+                let mut requests: InputRequests = Default::default();
+                requests.insert(
+                    "decision".to_string(),
+                    InputRequest::Elicit(ElicitRequestParams::Form(ElicitFormParams {
+                        mode: None,
+                        message: "approve?".to_string(),
+                        requested_schema: ElicitFormSchema::new(),
+                        meta: None,
+                    })),
+                );
+                Ok(RequestOutcome::input_required(
+                    InputRequiredResult::with_requests(requests),
+                ))
+            }
+        })
+        .build();
+
+    let store = std::sync::Arc::new(MemoryTaskStore::with_config(
+        MemoryTaskStoreConfig::default()
+            .default_ttl(std::time::Duration::from_secs(60))
+            .cleanup_interval(std::time::Duration::from_secs(60)),
+    ));
+    let mut router = McpRouter::new()
+        .task_store(store.clone())
+        .tool(asks_then_hangs)
+        .with_tasks();
+    init_router(&mut router).await;
+
+    let response = router
+        .ready()
+        .await
+        .unwrap()
+        .call(RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::CallTool(CallToolParams {
+                input_responses: None,
+                request_state: None,
+                name: "asks_then_hangs".to_string(),
+                arguments: serde_json::json!({}),
+                meta: None,
+                task: None,
+            }),
+            extensions: tasks_client_extensions(),
+        })
+        .await
+        .unwrap();
+    let task_id = match response.inner {
+        Ok(McpResponse::FinalCreateTask(result)) => result.task.metadata.task_id,
+        other => panic!("expected a created task, got {other:?}"),
+    };
+
+    for _ in 0..50 {
+        if store
+            .get_task(&task_id)
+            .await
+            .unwrap()
+            .is_some_and(|task| task.status == TaskStatus::InputRequired)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        store.get_task(&task_id).await.unwrap().unwrap().status,
+        TaskStatus::InputRequired
+    );
+
+    let update = router
+        .ready()
+        .await
+        .unwrap()
+        .call(RouterRequest {
+            id: RequestId::Number(2),
+            inner: McpRequest::UpdateTask(UpdateTaskParams {
+                task_id: task_id.clone(),
+                input_responses: [(
+                    "decision".to_string(),
+                    serde_json::json!({"action": "accept"}),
+                )]
+                .into_iter()
+                .collect(),
+                meta: None,
+            }),
+            extensions: tasks_client_extensions(),
+        })
+        .await
+        .unwrap();
+    assert!(update.inner.is_ok());
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while replay_started.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the replay handler never started");
+    assert!(store.set_ttl(&task_id, 0).await.unwrap());
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while replay_dropped.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("expiry did not drop the replay handler future");
+
+    assert_eq!(replay_started.load(Ordering::SeqCst), 1);
+    assert_eq!(replay_dropped.load(Ordering::SeqCst), 1);
+    assert!(store.get_task(&task_id).await.unwrap().is_none());
+    assert!(matches!(
+        store.task_presence(&task_id).await.unwrap(),
+        TaskPresence::Expired { .. }
+    ));
+}
+
 /// #1306: replay uses the root router's selected panic disclosure policy,
 /// just like an ordinary call. The existing replay contract still records a
 /// caught panic as a completed tool error rather than changing task semantics.

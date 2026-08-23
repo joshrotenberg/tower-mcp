@@ -204,6 +204,7 @@ impl TaskStore for ExternalStore {
                 record.arguments.clone(),
                 record.input_responses.clone(),
             )
+            .with_cancellation_token(record.token.clone())
         }))
     }
 
@@ -270,7 +271,13 @@ async fn a_constructed_token_carries_cancellation() {
     let token = CancellationToken::new();
     let clone = token.clone();
     assert!(!token.is_cancelled());
-    clone.cancel();
+    tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        clone.cancel();
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), token.cancelled())
+        .await
+        .expect("an external store must be able to await its task token");
     assert!(
         token.is_cancelled(),
         "every clone observes the same flag, which is what the store relies on"
@@ -282,7 +289,7 @@ async fn a_constructed_token_carries_cancellation() {
 #[tokio::test]
 async fn an_external_store_can_construct_a_resume_context() {
     let store = ExternalStore::default();
-    let (task_id, _) = store
+    let (task_id, token) = store
         .create_task("build_report", json!({"format": "pdf"}), None, None)
         .await
         .unwrap();
@@ -291,4 +298,9 @@ async fn an_external_store_can_construct_a_resume_context() {
     assert_eq!(resume.tool_name, "build_report");
     assert_eq!(resume.arguments, json!({"format": "pdf"}));
     assert!(resume.input_responses.is_empty());
+    let replay_token = resume
+        .cancellation_token
+        .expect("external store attached the task lifecycle token");
+    token.cancel();
+    assert!(replay_token.is_cancelled());
 }

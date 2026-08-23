@@ -544,6 +544,21 @@ impl McpRouter {
             }
         };
 
+        let Some(cancellation_token) = resume.cancellation_token.clone() else {
+            let error = self.task_json_rpc_error(
+                TaskOperation::Resume,
+                Some(task_id),
+                TaskFailure::Internal(
+                    "this task store returned a resume context without the task's \
+                     cancellation and expiry token; attach it with \
+                     TaskResumeContext::with_cancellation_token",
+                ),
+            );
+            self.record_task_failure(task_id, error).await;
+            self.notify_task_state(task_id).await;
+            return;
+        };
+
         // Static tools first, then dynamic, matching `tools/call`.
         let tool = self.inner.tools.get(&resume.tool_name).cloned();
         #[cfg(feature = "dynamic-tools")]
@@ -593,9 +608,24 @@ impl McpRouter {
         let task_id = task_id.to_string();
         let notifier = self.clone();
         tokio::spawn(async move {
-            let outcome = notifier
-                .invoke_tool(&tool, ctx, resume.arguments, &resume.tool_name)
-                .await;
+            // A replay is ordinary execution, not a live handler with a
+            // cooperative teardown contract. Expiry must therefore win even
+            // when the re-invoked handler never polls its RequestContext.
+            let outcome = tokio::select! {
+                biased;
+                _ = cancellation_token.cancelled() => None,
+                outcome = notifier.invoke_tool(&tool, ctx, resume.arguments, &resume.tool_name) => {
+                    Some(outcome)
+                }
+            };
+            let Some(outcome) = outcome else {
+                tracing::debug!(
+                    task_id = %task_id,
+                    "replayed task execution stopped by cancellation or expiry"
+                );
+                notifier.notify_task_state(&task_id).await;
+                return;
+            };
             let result = match outcome {
                 Ok(crate::protocol::RequestOutcome::Complete(result)) => result,
                 // A handler may ask again; each round parks and resumes the

@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::Deserialize;
 use serde_json::json;
-use tower_mcp::async_task::{MemoryTaskStore, TaskStore};
+use tower_mcp::async_task::{MemoryTaskStore, MemoryTaskStoreConfig, TaskPresence, TaskStore};
 use tower_mcp::client::{ChannelTransport, McpClient};
 use tower_mcp::protocol::{
     ElicitAction, ElicitFormParams, ElicitFormSchema, ElicitRequestParams, ElicitResult,
@@ -1254,6 +1254,76 @@ async fn a_cancellation_that_lands_before_wait_is_observed() {
 
     release.notify_one();
     await_status(&store, &task_id, TaskStatus::Cancelled).await;
+}
+
+/// #1389: expiry uses the store token that backs the live TaskContext. A task
+/// parked on input therefore unwinds at its TTL deadline even though the
+/// expired id can no longer be updated or cancelled by a client.
+#[tokio::test]
+async fn expiry_wakes_a_live_handler_parked_for_input() {
+    struct CountDrop(Arc<AtomicUsize>);
+    impl Drop for CountDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let tore_down = Arc::new(AtomicUsize::new(0));
+    let handler_tore_down = tore_down.clone();
+    let tool = ToolBuilder::new("expiring_live")
+        .description("Parks until its server-selected TTL expires")
+        .live_task_handler(move |task: TaskContext, _input: NoArgs| {
+            let tore_down = handler_tore_down.clone();
+            async move {
+                let _drop = CountDrop(tore_down);
+                task.require_input(ask("never")).await?;
+                Ok(TaskOutcome::Completed(CallToolResult::text("unreachable")))
+            }
+        })
+        .build();
+
+    let store = Arc::new(MemoryTaskStore::with_config(
+        MemoryTaskStoreConfig::default()
+            .default_ttl(std::time::Duration::from_secs(60))
+            .cleanup_interval(std::time::Duration::from_secs(60)),
+    ));
+    let router = McpRouter::new()
+        .server_info("live-expiry", "1.0.0")
+        .task_store(store.clone())
+        .tool(tool)
+        .with_tasks();
+    let client = McpClient::connect(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+
+    let task_id = client
+        .call_tool_as_task("expiring_live", json!({}), None)
+        .await
+        .expect("task created")
+        .task
+        .task_id;
+    await_status(&store, &task_id, TaskStatus::InputRequired).await;
+    assert!(store.set_ttl(&task_id, 0).await.unwrap());
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while tore_down.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("expiry did not wake and unwind the input waiter");
+
+    assert!(store.get_task(&task_id).await.unwrap().is_none());
+    assert!(matches!(
+        store.task_presence(&task_id).await.unwrap(),
+        TaskPresence::Expired { .. }
+    ));
+    assert_eq!(
+        tore_down.load(Ordering::SeqCst),
+        1,
+        "expiry must signal the live execution only once"
+    );
 }
 
 /// `require_input` is the two calls back to back, so it must keep behaving

@@ -597,7 +597,7 @@ pub use apps::{
     McpUiResourceCsp, McpUiResourceMeta, McpUiToolMeta, McpUiToolVisibility, mcp_app_tool_result,
     mcp_apps_extension,
 };
-pub use async_task::{MemoryTaskStore, Task, TaskPresence, TaskStore};
+pub use async_task::{MemoryTaskStore, MemoryTaskStoreConfig, Task, TaskPresence, TaskStore};
 pub use client::{
     ChannelTransport, ClientHandler, ClientTransport, McpClient, McpClientBuilder,
     NotificationHandler, StdioClientTransport,

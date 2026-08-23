@@ -16,11 +16,15 @@
 //! in still returns a normal synchronous result to a client that did not, so
 //! adding `with_tasks()` never changes behavior for existing clients.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tower_mcp::{CallToolResult, McpRouter, StdioTransport, TaskSupportMode, ToolBuilder};
+use tower_mcp::{
+    CallToolResult, McpRouter, MemoryTaskStore, MemoryTaskStoreConfig, StdioTransport,
+    TaskSupportMode, ToolBuilder,
+};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ReportInput {
@@ -46,8 +50,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .build();
 
+    // Final-protocol clients do not choose a TTL. The server owns that policy;
+    // here tasks may run for thirty minutes, while expired records are
+    // physically reclaimed at most thirty seconds later. The built-in defaults
+    // remain five minutes and one minute respectively.
+    let task_store = Arc::new(MemoryTaskStore::with_config(
+        MemoryTaskStoreConfig::default()
+            .default_ttl(Duration::from_secs(30 * 60))
+            .cleanup_interval(Duration::from_secs(30)),
+    ));
+
     let router = McpRouter::new()
         .server_info("tasks-example", env!("CARGO_PKG_VERSION"))
+        .task_store(task_store)
         .tool(build_report)
         // The runtime opt-in. Without it, registering a task-capable tool
         // advertises nothing and no task is ever created.
@@ -136,4 +151,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //
 // Expiry follows the same rule. `ttlMs` runs from creation, and once it
 // elapses the task reads as absent rather than as expired, so a retention
-// window cannot be probed either.
+// window cannot be probed either. The in-memory store raises the task's
+// cancellation signal at that deadline (including while it waits for input)
+// and reclaims the record on its configured cleanup cadence.

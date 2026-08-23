@@ -6,14 +6,14 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Map, json};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tower_mcp::client::{ChannelTransport, McpClient, NotificationHandler};
 use tower_mcp::extract::{Extension, Json};
 use tower_mcp::protocol::TaskStatus;
 use tower_mcp::schemars::JsonSchema;
 use tower_mcp::{
-    CallToolResult, McpRouter, ProtocolSupport, TaskContext, TaskPreparation, TaskStore,
-    TaskSupportMode, ToolBuilder,
+    CallToolResult, McpRouter, MemoryTaskStore, MemoryTaskStoreConfig, ProtocolSupport,
+    TaskContext, TaskPreparation, TaskStore, TaskSupportMode, ToolBuilder,
 };
 
 const PREPARED_META: &str = "dev.tower-mcp/prepared";
@@ -201,6 +201,94 @@ async fn preparation_error_discards_the_task_and_skips_background_execution() {
         .expect_err("preparation must reject the call");
     assert!(error.to_string().contains("preparation rejected"));
     assert_eq!(preparation_count.load(Ordering::SeqCst), 1);
+    assert_eq!(handler_count.load(Ordering::SeqCst), 0);
+    assert!(store.list_tasks(None).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn task_expiry_interrupts_preparation_and_discards_the_task() {
+    struct DropSignal(Arc<AtomicUsize>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let preparation_started = Arc::new(AtomicUsize::new(0));
+    let preparation_dropped = Arc::new(AtomicUsize::new(0));
+    let handler_count = Arc::new(AtomicUsize::new(0));
+    let preparation_entered = Arc::new(Notify::new());
+    let prepare_starts = preparation_started.clone();
+    let prepare_drops = preparation_dropped.clone();
+    let prepare_entered = preparation_entered.clone();
+    let handler_calls = handler_count.clone();
+    let store = Arc::new(MemoryTaskStore::with_config(
+        MemoryTaskStoreConfig::new()
+            .default_ttl(Duration::from_secs(60))
+            .cleanup_interval(Duration::from_secs(60)),
+    ));
+
+    let tool = ToolBuilder::new("expiring-preparation")
+        .task_support(TaskSupportMode::Required)
+        .handler(move |_input: Input| {
+            let handler_calls = handler_calls.clone();
+            async move {
+                handler_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(CallToolResult::text("should not run"))
+            }
+        })
+        .task_preparation(move |_task, _input| {
+            let prepare_starts = prepare_starts.clone();
+            let prepare_drops = prepare_drops.clone();
+            let prepare_entered = prepare_entered.clone();
+            async move {
+                let _drop_signal = DropSignal(prepare_drops);
+                prepare_starts.fetch_add(1, Ordering::SeqCst);
+                prepare_entered.notify_one();
+                std::future::pending::<tower_mcp::Result<TaskPreparation>>().await
+            }
+        })
+        .build();
+    let router = McpRouter::new()
+        .server_info("task-preparation-test", "1.0.0")
+        .tool(tool)
+        .task_store(store.clone())
+        .with_tasks();
+    let client = McpClient::builder()
+        .protocol_support(ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+        .with_tasks()
+        .connect_simple(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client
+        .discover("task-preparation-client", "1.0.0")
+        .await
+        .expect("discover");
+
+    let call = client.call_tool_as_task("expiring-preparation", json!({"value": 1}), None);
+    tokio::pin!(call);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::select! {
+            result = &mut call => panic!("preparation returned before expiry: {result:?}"),
+            _ = preparation_entered.notified() => {}
+        }
+    })
+    .await
+    .expect("preparation never started");
+
+    let tasks = store.list_tasks(None).await.unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert!(store.set_ttl(&tasks[0].task_id, 0).await.unwrap());
+
+    let error = tokio::time::timeout(Duration::from_secs(2), &mut call)
+        .await
+        .expect("preparation must stop at the task deadline")
+        .expect_err("expired preparation must reject the task call");
+
+    assert!(error.to_string().contains("interrupted preparation"));
+    assert_eq!(preparation_started.load(Ordering::SeqCst), 1);
+    assert_eq!(preparation_dropped.load(Ordering::SeqCst), 1);
     assert_eq!(handler_count.load(Ordering::SeqCst), 0);
     assert!(store.list_tasks(None).await.unwrap().is_empty());
 }

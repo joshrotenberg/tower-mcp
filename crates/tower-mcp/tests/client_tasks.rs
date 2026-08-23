@@ -264,3 +264,36 @@ async fn final_task_aware_call_exposes_direct_lifecycle() {
         Some("the answer is 42")
     );
 }
+
+/// Final task creation has no client TTL input, so the configured store
+/// default must be the value advertised on the server-created task.
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn final_task_uses_the_server_configured_default_ttl() {
+    use std::sync::Arc;
+
+    use tower_mcp::client::TaskAwareCallToolOutcome;
+    use tower_mcp::{MemoryTaskStore, MemoryTaskStoreConfig};
+
+    let store = Arc::new(MemoryTaskStore::with_config(
+        MemoryTaskStoreConfig::default().default_ttl(Duration::from_secs(42)),
+    ));
+    let client = McpClient::builder()
+        .protocol_support(tower_mcp::ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+        .with_tasks()
+        .connect_simple(ChannelTransport::new(
+            task_router().task_store(store).with_tasks(),
+        ))
+        .await
+        .expect("connect");
+    client.discover("test", "1.0.0").await.expect("discover");
+
+    let outcome = client
+        .call_tool_once_task_aware("compute", serde_json::json!({}), None, None)
+        .await
+        .expect("tools/call");
+    let TaskAwareCallToolOutcome::Task(created) = outcome else {
+        panic!("expected server-created task")
+    };
+    assert_eq!(created.task.metadata.ttl_ms, Some(42_000));
+}
