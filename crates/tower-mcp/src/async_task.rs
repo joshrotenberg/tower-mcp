@@ -216,6 +216,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
+use std::io;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -279,8 +280,124 @@ const DEFAULT_TASK_TTL: Duration = Duration::from_secs(5 * 60);
 /// Default interval between physical reclamation passes.
 const DEFAULT_TASK_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Default maximum number of task records retained by [`MemoryTaskStore`].
+const DEFAULT_MAX_RETAINED_TASKS: usize = 1_024;
+
+/// Default maximum compact-JSON size of one accepted task payload (4 MiB).
+const DEFAULT_MAX_TASK_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+
+/// Default maximum compact-JSON charge retained across all tasks (64 MiB).
+const DEFAULT_MAX_RETAINED_TASK_BYTES: usize = 64 * 1024 * 1024;
+
 /// Default poll interval suggestion (2 seconds, in milliseconds)
 const DEFAULT_POLL_INTERVAL_MS: u64 = 2_000;
+
+/// Byte and record limits for [`MemoryTaskStore`].
+///
+/// Defaults are deliberately finite: 1,024 retained task records, 4 MiB for
+/// any one accepted identity, arguments, metadata, input, status-message,
+/// result, or error payload, and 64 MiB of aggregate retained payload charge. Use
+/// [`unbounded`](Self::unbounded) only when a host provides an equivalent
+/// bound outside this store.
+///
+/// Byte sizes are the compact JSON encoding produced by `serde_json`. The
+/// aggregate charge covers the retained tool name, owner, arguments,
+/// metadata, status message, input requests and their spent keys,
+/// accumulated input responses, result, and structured error. It deliberately
+/// excludes `HashMap` allocation overhead and fixed lifecycle machinery such
+/// as IDs, timestamps, cancellation tokens, and waiter handles; the task-count
+/// limit bounds that fixed per-record overhead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TaskRetentionLimits {
+    /// Maximum task records physically retained, including expired tombstones.
+    pub max_tasks: usize,
+    /// Maximum compact-JSON bytes for one accepted payload.
+    pub max_payload_bytes: usize,
+    /// Maximum aggregate retained and reserved compact-JSON bytes.
+    pub max_retained_bytes: usize,
+}
+
+impl TaskRetentionLimits {
+    /// Create the default finite retention policy.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Disable the in-memory store's count and byte limits.
+    ///
+    /// Prefer the finite [`Default`] unless another layer enforces equivalent
+    /// process-memory limits.
+    #[must_use]
+    pub const fn unbounded() -> Self {
+        Self {
+            max_tasks: usize::MAX,
+            max_payload_bytes: usize::MAX,
+            max_retained_bytes: usize::MAX,
+        }
+    }
+
+    /// Set the maximum number of physically retained task records.
+    #[must_use]
+    pub const fn max_tasks(mut self, max: usize) -> Self {
+        self.max_tasks = max;
+        self
+    }
+
+    /// Set the compact-JSON limit for one accepted payload.
+    #[must_use]
+    pub const fn max_payload_bytes(mut self, max: usize) -> Self {
+        self.max_payload_bytes = max;
+        self
+    }
+
+    /// Set the aggregate retained-and-reserved compact-JSON byte limit.
+    #[must_use]
+    pub const fn max_retained_bytes(mut self, max: usize) -> Self {
+        self.max_retained_bytes = max;
+        self
+    }
+}
+
+impl Default for TaskRetentionLimits {
+    fn default() -> Self {
+        Self {
+            max_tasks: DEFAULT_MAX_RETAINED_TASKS,
+            max_payload_bytes: DEFAULT_MAX_TASK_PAYLOAD_BYTES,
+            max_retained_bytes: DEFAULT_MAX_RETAINED_TASK_BYTES,
+        }
+    }
+}
+
+/// Content-free resource gauges for [`MemoryTaskStore`].
+///
+/// `reserved_bytes` is headroom held for replacing every live record with a
+/// small, fixed retention-limit failure. The aggregate quota applies to
+/// `retained_bytes + reserved_bytes`; the split lets operators distinguish
+/// actual stored payload from safety headroom without exposing task contents.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TaskStoreUsage {
+    /// Number of task records physically retained, including tombstones.
+    pub task_count: usize,
+    /// Compact-JSON bytes currently charged to retained task payloads.
+    pub retained_bytes: usize,
+    /// Bytes reserved for bounded terminal retention failures.
+    pub reserved_bytes: usize,
+}
+
+impl TaskStoreUsage {
+    /// Aggregate bytes charged against [`TaskRetentionLimits::max_retained_bytes`].
+    ///
+    /// Snapshots returned by [`MemoryTaskStore::usage`] cannot overflow. This
+    /// accessor saturates only if a caller manually mutates the public gauge
+    /// fields into a value no store can produce.
+    #[must_use]
+    pub fn charged_bytes(self) -> usize {
+        self.retained_bytes.saturating_add(self.reserved_bytes)
+    }
+}
 
 /// Runtime policy for the in-memory task store.
 ///
@@ -348,7 +465,7 @@ fn duration_millis_saturated(duration: Duration) -> u64 {
 /// [`TaskStore::create_task`], and an external store is free to persist an
 /// entirely different shape as long as it answers the trait's methods the same
 /// way.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Task {
     /// Unique task identifier
     pub id: String,
@@ -490,23 +607,43 @@ impl Task {
     pub fn is_cancelled(&self) -> bool {
         self.cancellation_token.is_cancelled()
     }
+
+    /// Replace all application payload with one fixed, content-free failure.
+    fn fail_retention_limit(&mut self) {
+        self.arguments = serde_json::Value::Null;
+        self.status = TaskStatus::Failed;
+        self.status_message = Some(RETENTION_FAILURE_STATUS.to_string());
+        self.meta = None;
+        self.result = None;
+        self.error = Some(JsonRpcError::internal_error(RETENTION_FAILURE_MESSAGE));
+        self.input_requests = InputRequests::new();
+        self.answered_input_keys = BTreeSet::new();
+        self.input_responses = InputResponses::new();
+        self.superseded_input_keys = BTreeSet::new();
+        self.completed_at = Some(Instant::now());
+        self.last_updated_at_str = chrono_now_iso8601();
+    }
 }
 
 /// Memory-store-only lifecycle bookkeeping around the public task record.
 ///
 /// Keeping expiry signalling state here avoids adding a field to [`Task`],
 /// whose public fields historically allowed downstream struct literals.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct StoredTask {
     task: Task,
     expiry_signalled: bool,
+    retained_bytes: usize,
+    reserved_bytes: usize,
 }
 
 impl StoredTask {
-    fn new(task: Task) -> Self {
+    fn new(task: Task, retained_bytes: usize, reserved_bytes: usize) -> Self {
         Self {
             task,
             expiry_signalled: false,
+            retained_bytes,
+            reserved_bytes,
         }
     }
 
@@ -519,6 +656,21 @@ impl StoredTask {
         self.task.cancellation_token.cancel();
         self.task.completion_notify.notify_waiters();
         true
+    }
+
+    /// Drop payload allocations that can no longer be observed after expiry.
+    fn scrub_expired_payload(&mut self) {
+        self.task.tool_name = String::new();
+        self.task.arguments = serde_json::Value::Null;
+        self.task.status_message = None;
+        self.task.meta = None;
+        self.task.result = None;
+        self.task.error = None;
+        self.task.input_requests = InputRequests::new();
+        self.task.answered_input_keys = BTreeSet::new();
+        self.task.input_responses = InputResponses::new();
+        self.task.superseded_input_keys = BTreeSet::new();
+        self.reserved_bytes = 0;
     }
 }
 
@@ -534,6 +686,149 @@ impl std::ops::DerefMut for StoredTask {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.task
     }
+}
+
+fn charged_bytes(retained: usize, reserved: usize, limit: usize) -> Result<usize> {
+    retained
+        .checked_add(reserved)
+        .filter(|charged| *charged <= limit)
+        .ok_or(TaskStoreError::RetentionLimitExceeded {
+            kind: TaskRetentionLimitKind::AggregateBytes,
+            limit,
+        })
+}
+
+fn prepare_stored_task(task: Task, limits: TaskRetentionLimits) -> Result<StoredTask> {
+    let retained_bytes = retained_payload_size(&task, limits.max_retained_bytes)?;
+    let reserved_bytes = if task.status.is_terminal() {
+        0
+    } else {
+        // The candidate is already bounded before this clone is made. Keeping
+        // exact headroom for its fixed failure replacement means an oversized
+        // terminal payload can always produce a visible, wakeable outcome.
+        let mut fallback = task.clone();
+        fallback.fail_retention_limit();
+        let fallback_bytes = retained_payload_size(&fallback, limits.max_retained_bytes)?;
+        fallback_bytes.saturating_sub(retained_bytes)
+    };
+    charged_bytes(retained_bytes, reserved_bytes, limits.max_retained_bytes)?;
+    Ok(StoredTask::new(task, retained_bytes, reserved_bytes))
+}
+
+fn replace_stored_task(
+    data: &mut MemoryTaskStoreData,
+    task_id: &str,
+    replacement: StoredTask,
+    limit: usize,
+) -> Result<bool> {
+    let Some(current) = data.tasks.get(task_id) else {
+        return Ok(false);
+    };
+    let (retained_bytes, reserved_bytes) = replacement_totals(
+        data,
+        current.retained_bytes,
+        current.reserved_bytes,
+        replacement.retained_bytes,
+        replacement.reserved_bytes,
+        limit,
+    )?;
+
+    data.retained_bytes = retained_bytes;
+    data.reserved_bytes = reserved_bytes;
+    data.tasks.insert(task_id.to_string(), replacement);
+    Ok(true)
+}
+
+fn replacement_totals(
+    data: &MemoryTaskStoreData,
+    old_retained: usize,
+    old_reserved: usize,
+    new_retained: usize,
+    new_reserved: usize,
+    limit: usize,
+) -> Result<(usize, usize)> {
+    let retained_bytes = data
+        .retained_bytes
+        .checked_sub(old_retained)
+        .and_then(|bytes| bytes.checked_add(new_retained))
+        .ok_or(TaskStoreError::RetentionLimitExceeded {
+            kind: TaskRetentionLimitKind::AggregateBytes,
+            limit,
+        })?;
+    let reserved_bytes = data
+        .reserved_bytes
+        .checked_sub(old_reserved)
+        .and_then(|bytes| bytes.checked_add(new_reserved))
+        .ok_or(TaskStoreError::RetentionLimitExceeded {
+            kind: TaskRetentionLimitKind::AggregateBytes,
+            limit,
+        })?;
+    charged_bytes(retained_bytes, reserved_bytes, limit)?;
+    Ok((retained_bytes, reserved_bytes))
+}
+
+fn commit_removed_task(
+    data: &mut MemoryTaskStoreData,
+    task_id: &str,
+    replacement: StoredTask,
+    old_retained: usize,
+    old_reserved: usize,
+    limit: usize,
+) -> Result<()> {
+    let (retained_bytes, reserved_bytes) = replacement_totals(
+        data,
+        old_retained,
+        old_reserved,
+        replacement.retained_bytes,
+        replacement.reserved_bytes,
+        limit,
+    )?;
+    data.retained_bytes = retained_bytes;
+    data.reserved_bytes = reserved_bytes;
+    data.tasks.insert(task_id.to_string(), replacement);
+    Ok(())
+}
+
+fn commit_retention_failure(
+    data: &mut MemoryTaskStoreData,
+    task_id: &str,
+    mut task: StoredTask,
+    old_retained: usize,
+    old_reserved: usize,
+    limits: TaskRetentionLimits,
+) {
+    task.task.fail_retention_limit();
+    task.retained_bytes = retained_payload_size(&task.task, limits.max_retained_bytes)
+        .expect("reserved retention failure must fit the aggregate byte limit");
+    task.reserved_bytes = 0;
+    let notify = task.completion_notify.clone();
+    commit_removed_task(
+        data,
+        task_id,
+        task,
+        old_retained,
+        old_reserved,
+        limits.max_retained_bytes,
+    )
+    .expect("reserved retention failure must fit global task-store accounting");
+    notify.notify_waiters();
+}
+
+fn cancel_with_bounded_status(task: &mut Task, status: &'static str, scrub: bool) {
+    if scrub {
+        task.arguments = serde_json::Value::Null;
+        task.meta = None;
+        task.result = None;
+        task.error = None;
+        task.answered_input_keys = BTreeSet::new();
+        task.input_responses = InputResponses::new();
+        task.superseded_input_keys = BTreeSet::new();
+    }
+    task.input_requests = InputRequests::new();
+    task.status = TaskStatus::Cancelled;
+    task.status_message = Some(status.to_string());
+    task.completed_at = Some(Instant::now());
+    task.last_updated_at_str = chrono_now_iso8601();
 }
 
 /// Generate an unguessable task identifier.
@@ -782,6 +1077,40 @@ pub enum TaskStoreError {
     /// failure. Reusing an input request key is the current instance (#1246).
     #[error("invalid task transition: {0}")]
     InvalidTransition(String),
+    /// A configured task-retention limit rejected a mutation.
+    ///
+    /// The error carries only the limit category and numeric bound. It never
+    /// includes the rejected arguments, input, result, or error payload, so it
+    /// is safe to map, log, or expose through a host's error policy.
+    #[error("task retention {kind} limit exceeded (maximum {limit})")]
+    RetentionLimitExceeded {
+        /// Limit that rejected the operation.
+        kind: TaskRetentionLimitKind,
+        /// Configured maximum for that limit.
+        limit: usize,
+    },
+}
+
+/// Which [`TaskRetentionLimits`] bound rejected a store operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TaskRetentionLimitKind {
+    /// Maximum physically retained task count.
+    TaskCount,
+    /// Maximum compact-JSON size of one accepted payload.
+    PayloadBytes,
+    /// Maximum aggregate retained and reserved compact-JSON bytes.
+    AggregateBytes,
+}
+
+impl std::fmt::Display for TaskRetentionLimitKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::TaskCount => "task-count",
+            Self::PayloadBytes => "payload-bytes",
+            Self::AggregateBytes => "aggregate-bytes",
+        })
+    }
 }
 
 /// Whether two input requests are the same question.
@@ -803,6 +1132,144 @@ fn same_input_request(
 
 /// Result alias for task store operations.
 pub type Result<T> = std::result::Result<T, TaskStoreError>;
+
+const RETENTION_FAILURE_MESSAGE: &str = "Task payload exceeded configured retention limits";
+const RETENTION_FAILURE_STATUS: &str = "Task failed: retention limit exceeded";
+
+/// Writer that counts serialized bytes without allocating a second buffer.
+struct CountingWriter {
+    written: usize,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl CountingWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            written: 0,
+            limit,
+            exceeded: false,
+        }
+    }
+}
+
+impl io::Write for CountingWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let Some(next) = self.written.checked_add(bytes.len()) else {
+            self.exceeded = true;
+            return Err(io::Error::other("encoded task payload exceeds byte limit"));
+        };
+        if next > self.limit {
+            self.exceeded = true;
+            return Err(io::Error::other("encoded task payload exceeds byte limit"));
+        }
+        self.written = next;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encoded_size<T: serde::Serialize + ?Sized>(
+    value: &T,
+    limit: usize,
+    kind: TaskRetentionLimitKind,
+) -> Result<usize> {
+    let mut writer = CountingWriter::new(limit);
+    match serde_json::to_writer(&mut writer, value) {
+        Ok(()) => Ok(writer.written),
+        Err(_) if writer.exceeded => Err(TaskStoreError::RetentionLimitExceeded { kind, limit }),
+        Err(error) => Err(TaskStoreError::Encode(error.to_string())),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct RetainedTaskPayload<'a> {
+    tool_name: &'a str,
+    arguments: &'a serde_json::Value,
+    status_message: &'a Option<String>,
+    meta: &'a Option<serde_json::Value>,
+    result: &'a Option<CallToolResult>,
+    error: &'a Option<JsonRpcError>,
+    owner: &'a TaskOwner,
+    input_requests: &'a InputRequests,
+    answered_input_keys: &'a BTreeSet<String>,
+    input_responses: &'a InputResponses,
+    superseded_input_keys: &'a BTreeSet<String>,
+}
+
+fn retained_payload_size(task: &Task, limit: usize) -> Result<usize> {
+    encoded_size(
+        &RetainedTaskPayload {
+            tool_name: &task.tool_name,
+            arguments: &task.arguments,
+            status_message: &task.status_message,
+            meta: &task.meta,
+            result: &task.result,
+            error: &task.error,
+            owner: &task.owner,
+            input_requests: &task.input_requests,
+            answered_input_keys: &task.answered_input_keys,
+            input_responses: &task.input_responses,
+            superseded_input_keys: &task.superseded_input_keys,
+        },
+        limit,
+        TaskRetentionLimitKind::AggregateBytes,
+    )
+}
+
+fn validate_payload<T: serde::Serialize + ?Sized>(
+    payload: &T,
+    limits: TaskRetentionLimits,
+) -> Result<usize> {
+    let (limit, kind) = if limits.max_payload_bytes <= limits.max_retained_bytes {
+        (
+            limits.max_payload_bytes,
+            TaskRetentionLimitKind::PayloadBytes,
+        )
+    } else {
+        (
+            limits.max_retained_bytes,
+            TaskRetentionLimitKind::AggregateBytes,
+        )
+    };
+    encoded_size(payload, limit, kind)
+}
+
+fn validate_prefixed_string(
+    value: &str,
+    prefix: &str,
+    limits: TaskRetentionLimits,
+) -> Result<usize> {
+    fn check(
+        value: &str,
+        prefix: &str,
+        limit: usize,
+        kind: TaskRetentionLimitKind,
+    ) -> Result<usize> {
+        let Some(value_limit) = limit.checked_sub(prefix.len()) else {
+            return Err(TaskStoreError::RetentionLimitExceeded { kind, limit });
+        };
+        encoded_size(value, value_limit, kind)?
+            .checked_add(prefix.len())
+            .ok_or(TaskStoreError::RetentionLimitExceeded { kind, limit })
+    }
+
+    let (limit, kind) = if limits.max_payload_bytes <= limits.max_retained_bytes {
+        (
+            limits.max_payload_bytes,
+            TaskRetentionLimitKind::PayloadBytes,
+        )
+    } else {
+        (
+            limits.max_retained_bytes,
+            TaskRetentionLimitKind::AggregateBytes,
+        )
+    };
+    check(value, prefix, limit, kind)
+}
 
 /// A task's current snapshot: the task object plus any result or error
 /// captured so far.
@@ -1405,6 +1872,14 @@ pub trait TaskStore: Send + Sync + 'static {
     /// Returns `Ok(false)` if the task is unknown, expired, or already
     /// terminal.
     ///
+    /// [`MemoryTaskStore`] returns
+    /// [`TaskStoreError::RetentionLimitExceeded`] for an oversized result
+    /// only after atomically replacing the live record with a fixed,
+    /// content-free `failed` snapshot and waking completion waiters. The
+    /// rejected result is not retained. External stores may choose a
+    /// different recovery policy, so generic callers should still handle the
+    /// error rather than assuming every implementation terminalized.
+    ///
     /// # Example
     ///
     /// A tool that ran and reported a problem is a completed task, and the
@@ -1439,6 +1914,11 @@ pub trait TaskStore: Send + Sync + 'static {
     ///
     /// Returns `Ok(false)` if the task is unknown, expired, or already
     /// terminal.
+    ///
+    /// [`MemoryTaskStore`] returns
+    /// [`TaskStoreError::RetentionLimitExceeded`] for an oversized error only
+    /// after atomically storing its fixed, content-free `failed` snapshot and
+    /// waking completion waiters. The rejected diagnostic is not retained.
     ///
     /// Reserved for a call that never produced a result at all. A tool that
     /// ran and reported a problem completes instead, carrying an `isError`
@@ -1587,38 +2067,110 @@ struct Retirement {
     removed: usize,
 }
 
+#[derive(Debug, Default)]
+struct MemoryTaskStoreData {
+    tasks: HashMap<String, StoredTask>,
+    retained_bytes: usize,
+    reserved_bytes: usize,
+}
+
+impl MemoryTaskStoreData {
+    fn usage(&self) -> TaskStoreUsage {
+        TaskStoreUsage {
+            task_count: self.tasks.len(),
+            retained_bytes: self.retained_bytes,
+            reserved_bytes: self.reserved_bytes,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct MemoryTaskStoreState {
-    tasks: RwLock<HashMap<String, StoredTask>>,
+    data: RwLock<MemoryTaskStoreData>,
     config: MemoryTaskStoreConfig,
+    retention_limits: TaskRetentionLimits,
     worker_signal: Arc<WorkerSignal>,
     worker_started: OnceLock<std::result::Result<(), String>>,
 }
 
 impl MemoryTaskStoreState {
     fn retire_expired(&self, remove: bool) -> Retirement {
-        let Ok(mut tasks) = self.tasks.write() else {
+        let Ok(mut data) = self.data.write() else {
             return Retirement::default();
         };
         let now = Instant::now();
         let mut retirement = Retirement::default();
-        for task in tasks.values_mut() {
+        let mut retired_old_retained = 0usize;
+        let mut retired_new_retained = 0usize;
+        let mut retired_old_reserved = 0usize;
+        for task in data.tasks.values_mut() {
             if task.is_expired_at(now) && task.signal_expiry() {
                 retirement.signalled += 1;
+                let old_retained = task.retained_bytes;
+                let old_reserved = task.reserved_bytes;
+                task.scrub_expired_payload();
+                task.retained_bytes = retained_payload_size(&task.task, usize::MAX)
+                    .expect("built-in task payload serialization is infallible");
+                retired_old_retained = retired_old_retained
+                    .checked_add(old_retained)
+                    .expect("task-store retained-byte accounting overflowed");
+                retired_new_retained = retired_new_retained
+                    .checked_add(task.retained_bytes)
+                    .expect("task-store retained-byte accounting overflowed");
+                retired_old_reserved = retired_old_reserved
+                    .checked_add(old_reserved)
+                    .expect("task-store reserved-byte accounting overflowed");
             }
         }
+        data.retained_bytes = data
+            .retained_bytes
+            .checked_sub(retired_old_retained)
+            .and_then(|bytes| bytes.checked_add(retired_new_retained))
+            .expect("task-store retained-byte accounting invariant violated");
+        data.reserved_bytes = data
+            .reserved_bytes
+            .checked_sub(retired_old_reserved)
+            .expect("task-store reserved-byte accounting invariant violated");
+        charged_bytes(
+            data.retained_bytes,
+            data.reserved_bytes,
+            self.retention_limits.max_retained_bytes,
+        )
+        .expect("expiry scrubbing exceeded the task-store aggregate-byte invariant");
         if remove {
-            let before = tasks.len();
-            tasks.retain(|_, task| !task.is_expired_at(now));
-            retirement.removed = before - tasks.len();
+            let before = data.tasks.len();
+            let mut removed_retained = 0usize;
+            let mut removed_reserved = 0usize;
+            data.tasks.retain(|_, task| {
+                let keep = !task.is_expired_at(now);
+                if !keep {
+                    removed_retained = removed_retained
+                        .checked_add(task.retained_bytes)
+                        .expect("task-store retained-byte accounting overflowed");
+                    removed_reserved = removed_reserved
+                        .checked_add(task.reserved_bytes)
+                        .expect("task-store reserved-byte accounting overflowed");
+                }
+                keep
+            });
+            data.retained_bytes = data
+                .retained_bytes
+                .checked_sub(removed_retained)
+                .expect("task-store retained-byte accounting invariant violated");
+            data.reserved_bytes = data
+                .reserved_bytes
+                .checked_sub(removed_reserved)
+                .expect("task-store reserved-byte accounting invariant violated");
+            retirement.removed = before - data.tasks.len();
         }
         retirement
     }
 
     fn next_expiry(&self) -> Option<Instant> {
-        self.tasks
+        self.data
             .read()
             .ok()?
+            .tasks
             .values()
             .filter_map(|task| {
                 (!task.expiry_signalled)
@@ -1718,18 +2270,36 @@ impl Default for MemoryTaskStore {
 }
 
 impl MemoryTaskStore {
-    /// Create a task store with the five-minute default TTL and one-minute
-    /// cleanup interval.
+    /// Create a task store with the default lifecycle and retention policy.
+    ///
+    /// That is a five-minute TTL, one-minute cleanup interval, and the finite
+    /// [`TaskRetentionLimits::default`] byte/count bounds.
     pub fn new() -> Self {
         Self::with_config(MemoryTaskStoreConfig::default())
     }
 
-    /// Create a task store with an explicit lifecycle policy.
+    /// Create a task store with an explicit lifecycle policy and the default
+    /// finite retention limits.
     pub fn with_config(config: MemoryTaskStoreConfig) -> Self {
+        Self::with_config_and_retention(config, TaskRetentionLimits::default())
+    }
+
+    /// Create a task store with the default lifecycle policy and explicit
+    /// record and encoded-payload limits.
+    pub fn with_retention_limits(retention_limits: TaskRetentionLimits) -> Self {
+        Self::with_config_and_retention(MemoryTaskStoreConfig::default(), retention_limits)
+    }
+
+    /// Create a task store with explicit lifecycle and retention policies.
+    pub fn with_config_and_retention(
+        config: MemoryTaskStoreConfig,
+        retention_limits: TaskRetentionLimits,
+    ) -> Self {
         Self {
             state: Arc::new(MemoryTaskStoreState {
-                tasks: RwLock::new(HashMap::new()),
+                data: RwLock::new(MemoryTaskStoreData::default()),
                 config,
+                retention_limits,
                 worker_signal: Arc::new(WorkerSignal::default()),
                 worker_started: OnceLock::new(),
             }),
@@ -1790,11 +2360,23 @@ impl MemoryTaskStore {
         self.state.retire_expired(true).removed
     }
 
+    /// Return content-free count and encoded-byte gauges.
+    ///
+    /// The snapshot is taken under the same lock as task mutations, so its
+    /// count and both byte totals always describe one committed store state.
+    #[must_use]
+    pub fn usage(&self) -> TaskStoreUsage {
+        match self.state.data.read() {
+            Ok(data) => data.usage(),
+            Err(poisoned) => poisoned.into_inner().usage(),
+        }
+    }
+
     /// Get the number of tasks in the store
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        if let Ok(tasks) = self.state.tasks.read() {
-            tasks.len()
+        if let Ok(data) = self.state.data.read() {
+            data.tasks.len()
         } else {
             0
         }
@@ -1817,14 +2399,48 @@ impl TaskStore for MemoryTaskStore {
         owner: TaskOwner,
     ) -> Result<(String, CancellationToken)> {
         self.ensure_worker()?;
+        let limits = self.state.retention_limits;
+        validate_payload(tool_name, limits)?;
+        validate_payload(&arguments, limits)?;
+        validate_payload(&owner, limits)?;
         let id = generate_task_id();
         let ttl = ttl.unwrap_or_else(|| duration_millis_saturated(self.state.config.default_ttl));
         let task = Task::new(id.clone(), tool_name.to_string(), arguments, ttl, owner);
         let token = task.cancellation_token.clone();
+        let stored = prepare_stored_task(task, limits)?;
 
-        if let Ok(mut tasks) = self.state.tasks.write() {
-            tasks.insert(id.clone(), StoredTask::new(task));
+        // Count admission reclaims expired tombstones first. The retirement
+        // and the following admission each hold the same data lock; concurrent
+        // creators can never both observe and consume one remaining slot.
+        self.state.retire_expired(true);
+        let mut data = self.state.data.write().map_err(|_| {
+            TaskStoreError::Backend("in-memory task store lock poisoned".to_string())
+        })?;
+        if data.tasks.len() >= limits.max_tasks {
+            return Err(TaskStoreError::RetentionLimitExceeded {
+                kind: TaskRetentionLimitKind::TaskCount,
+                limit: limits.max_tasks,
+            });
         }
+        let retained_bytes = data
+            .retained_bytes
+            .checked_add(stored.retained_bytes)
+            .ok_or(TaskStoreError::RetentionLimitExceeded {
+                kind: TaskRetentionLimitKind::AggregateBytes,
+                limit: limits.max_retained_bytes,
+            })?;
+        let reserved_bytes = data
+            .reserved_bytes
+            .checked_add(stored.reserved_bytes)
+            .ok_or(TaskStoreError::RetentionLimitExceeded {
+                kind: TaskRetentionLimitKind::AggregateBytes,
+                limit: limits.max_retained_bytes,
+            })?;
+        charged_bytes(retained_bytes, reserved_bytes, limits.max_retained_bytes)?;
+        data.retained_bytes = retained_bytes;
+        data.reserved_bytes = reserved_bytes;
+        data.tasks.insert(id.clone(), stored);
+        drop(data);
         self.state.worker_signal.wake();
 
         Ok((id, token))
@@ -1832,8 +2448,8 @@ impl TaskStore for MemoryTaskStore {
 
     async fn get_task(&self, task_id: &str) -> Result<Option<TaskObject>> {
         self.state.retire_expired(false);
-        Ok(if let Ok(tasks) = self.state.tasks.read() {
-            tasks
+        Ok(if let Ok(data) = self.state.data.read() {
+            data.tasks
                 .get(task_id)
                 .filter(|t| !t.is_expired())
                 .map(|t| t.to_task_object())
@@ -1844,30 +2460,42 @@ impl TaskStore for MemoryTaskStore {
 
     async fn set_task_meta(&self, task_id: &str, meta: serde_json::Value) -> Result<bool> {
         self.state.retire_expired(false);
-        let Ok(mut tasks) = self.state.tasks.write() else {
+        let Ok(mut data) = self.state.data.write() else {
             return Ok(false);
         };
-        let Some(task) = tasks.get_mut(task_id).filter(|task| !task.is_expired()) else {
+        let Some(current) = data.tasks.get(task_id).filter(|task| !task.is_expired()) else {
             return Ok(false);
         };
+        let limits = self.state.retention_limits;
+        validate_payload(&meta, limits)?;
+        let mut task = current.task.clone();
         task.meta = Some(meta);
-        Ok(true)
+        let replacement = prepare_stored_task(task, limits)?;
+        replace_stored_task(&mut data, task_id, replacement, limits.max_retained_bytes)
     }
 
     async fn discard_task(&self, task_id: &str) -> Result<bool> {
-        Ok(self
-            .state
-            .tasks
-            .write()
-            .ok()
-            .and_then(|mut tasks| tasks.remove(task_id))
-            .is_some())
+        let Ok(mut data) = self.state.data.write() else {
+            return Ok(false);
+        };
+        let Some(removed) = data.tasks.remove(task_id) else {
+            return Ok(false);
+        };
+        data.retained_bytes = data
+            .retained_bytes
+            .checked_sub(removed.retained_bytes)
+            .expect("task-store retained-byte accounting invariant violated");
+        data.reserved_bytes = data
+            .reserved_bytes
+            .checked_sub(removed.reserved_bytes)
+            .expect("task-store reserved-byte accounting invariant violated");
+        Ok(true)
     }
 
     async fn task_owner(&self, task_id: &str) -> Result<Option<TaskOwner>> {
         self.state.retire_expired(false);
-        Ok(if let Ok(tasks) = self.state.tasks.read() {
-            tasks
+        Ok(if let Ok(data) = self.state.data.read() {
+            data.tasks
                 .get(task_id)
                 .filter(|t| !t.is_expired())
                 .map(|t| t.owner.clone())
@@ -1882,10 +2510,10 @@ impl TaskStore for MemoryTaskStore {
     /// between deciding presence and reading the owner.
     async fn task_presence(&self, task_id: &str) -> Result<TaskPresence> {
         self.state.retire_expired(false);
-        let Ok(tasks) = self.state.tasks.read() else {
+        let Ok(data) = self.state.data.read() else {
             return Ok(TaskPresence::Missing);
         };
-        Ok(match tasks.get(task_id) {
+        Ok(match data.tasks.get(task_id) {
             Some(task) if task.is_expired() => TaskPresence::Expired {
                 owner: task.owner.clone(),
             },
@@ -1898,8 +2526,8 @@ impl TaskStore for MemoryTaskStore {
 
     async fn get_task_result(&self, task_id: &str) -> Result<Option<TaskSnapshot>> {
         self.state.retire_expired(false);
-        Ok(if let Ok(tasks) = self.state.tasks.read() {
-            tasks
+        Ok(if let Ok(data) = self.state.data.read() {
+            data.tasks
                 .get(task_id)
                 .filter(|t| !t.is_expired())
                 .map(|t| (t.to_task_object(), t.result.clone(), t.error.clone()))
@@ -1913,10 +2541,10 @@ impl TaskStore for MemoryTaskStore {
         // Register the wait while holding the read lock, so a transition
         // cannot notify between the state check and waiter registration.
         let (mut notified, cancellation) = {
-            let Ok(tasks) = self.state.tasks.read() else {
+            let Ok(data) = self.state.data.read() else {
                 return Ok(None);
             };
-            let Some(task) = tasks.get(task_id).filter(|t| !t.is_expired()) else {
+            let Some(task) = data.tasks.get(task_id).filter(|t| !t.is_expired()) else {
                 return Ok(None);
             };
             if task.status.is_terminal() {
@@ -1957,8 +2585,8 @@ impl TaskStore for MemoryTaskStore {
 
     async fn list_tasks(&self, status_filter: Option<TaskStatus>) -> Result<Vec<TaskObject>> {
         self.state.retire_expired(false);
-        Ok(if let Ok(tasks) = self.state.tasks.read() {
-            tasks
+        Ok(if let Ok(data) = self.state.data.read() {
+            data.tasks
                 .values()
                 .filter(|t| !t.is_expired())
                 .filter(|t| status_filter.is_none() || status_filter == Some(t.status))
@@ -1976,15 +2604,21 @@ impl TaskStore for MemoryTaskStore {
         message: Option<&str>,
     ) -> Result<bool> {
         self.state.retire_expired(false);
-        let Ok(mut tasks) = self.state.tasks.write() else {
+        let Ok(mut data) = self.state.data.write() else {
             return Ok(false);
         };
-        let Some(task) = tasks.get_mut(task_id).filter(|t| !t.is_expired()) else {
+        let Some(current) = data.tasks.get(task_id).filter(|task| !task.is_expired()) else {
             return Ok(false);
         };
-        if task.status.is_terminal() {
+        if current.status.is_terminal() {
             return Ok(false);
         }
+        let limits = self.state.retention_limits;
+        validate_payload(&requests, limits)?;
+        if let Some(message) = message {
+            validate_payload(message, limits)?;
+        }
+        let mut task = current.task.clone();
 
         // SEP-2663: "Each request key in `inputRequests` MUST be unique over
         // the lifetime of a single task. A server MUST NOT reuse a key for a
@@ -2041,13 +2675,14 @@ impl TaskStore for MemoryTaskStore {
                 .unwrap_or_else(|| "Awaiting client input".to_string()),
         );
         task.last_updated_at_str = chrono_now_iso8601();
-        Ok(true)
+        let replacement = prepare_stored_task(task, limits)?;
+        replace_stored_task(&mut data, task_id, replacement, limits.max_retained_bytes)
     }
 
     async fn outstanding_input_requests(&self, task_id: &str) -> Result<Option<InputRequests>> {
         self.state.retire_expired(false);
-        Ok(if let Ok(tasks) = self.state.tasks.read() {
-            tasks
+        Ok(if let Ok(data) = self.state.data.read() {
+            data.tasks
                 .get(task_id)
                 .filter(|t| !t.is_expired())
                 .map(|t| t.input_requests.clone())
@@ -2062,15 +2697,26 @@ impl TaskStore for MemoryTaskStore {
         responses: InputResponses,
     ) -> Result<Option<AppliedInputResponses>> {
         self.state.retire_expired(false);
-        let Ok(mut tasks) = self.state.tasks.write() else {
+        let Ok(mut data) = self.state.data.write() else {
             return Ok(None);
         };
-        let Some(task) = tasks.get_mut(task_id).filter(|t| !t.is_expired()) else {
+        let Some(current) = data.tasks.get(task_id).filter(|task| !task.is_expired()) else {
             return Ok(None);
         };
-        if task.status.is_terminal() {
+        if current.status.is_terminal() {
             return Ok(None);
         }
+        let limits = self.state.retention_limits;
+        let accepted_payload: std::collections::BTreeMap<&str, &crate::protocol::InputResponse> =
+            responses
+                .iter()
+                .filter(|(key, _)| current.input_requests.contains_key(*key))
+                .map(|(key, response)| (key.as_str(), response))
+                .collect();
+        if !accepted_payload.is_empty() {
+            validate_payload(&accepted_payload, limits)?;
+        }
+        let mut task = current.task.clone();
 
         let mut applied = AppliedInputResponses::default();
         for (key, response) in responses {
@@ -2094,7 +2740,13 @@ impl TaskStore for MemoryTaskStore {
             task.status = TaskStatus::Working;
             task.status_message = Some("Task resumed".to_string());
         }
-        Ok(Some(applied))
+
+        let replacement = prepare_stored_task(task, limits)?;
+        if replace_stored_task(&mut data, task_id, replacement, limits.max_retained_bytes)? {
+            Ok(Some(applied))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn set_status(
@@ -2109,29 +2761,36 @@ impl TaskStore for MemoryTaskStore {
             )));
         }
         self.state.retire_expired(false);
-        let Ok(mut tasks) = self.state.tasks.write() else {
+        let Ok(mut data) = self.state.data.write() else {
             return Ok(false);
         };
-        let Some(task) = tasks.get_mut(task_id).filter(|t| !t.is_expired()) else {
+        let Some(current) = data.tasks.get(task_id).filter(|task| !task.is_expired()) else {
             return Ok(false);
         };
-        if task.status.is_terminal() {
+        if current.status.is_terminal() {
             return Ok(false);
         }
+        let limits = self.state.retention_limits;
+        if let Some(message) = message {
+            validate_payload(message, limits)?;
+        }
+        let mut task = current.task.clone();
         task.status = status;
         if let Some(message) = message {
             task.status_message = Some(message.to_string());
         }
         task.last_updated_at_str = chrono_now_iso8601();
-        Ok(true)
+        let replacement = prepare_stored_task(task, limits)?;
+        replace_stored_task(&mut data, task_id, replacement, limits.max_retained_bytes)
     }
 
     async fn resume_context(&self, task_id: &str) -> Result<Option<TaskResumeContext>> {
         self.state.retire_expired(false);
-        let Ok(tasks) = self.state.tasks.read() else {
+        let Ok(data) = self.state.data.read() else {
             return Ok(None);
         };
-        Ok(tasks
+        Ok(data
+            .tasks
             .get(task_id)
             .filter(|task| !task.is_expired())
             .map(|task| {
@@ -2145,94 +2804,277 @@ impl TaskStore for MemoryTaskStore {
     }
 
     async fn set_ttl(&self, task_id: &str, ttl_ms: u64) -> Result<bool> {
-        let Ok(mut tasks) = self.state.tasks.write() else {
+        let Ok(mut data) = self.state.data.write() else {
             return Ok(false);
         };
-        let Some(task) = tasks.get_mut(task_id) else {
+        let Some(task) = data.tasks.get_mut(task_id) else {
             return Ok(false);
         };
         if task.is_expired() {
-            task.signal_expiry();
+            drop(data);
+            self.state.retire_expired(false);
             return Ok(false);
         }
         task.ttl = ttl_ms;
         task.last_updated_at_str = chrono_now_iso8601();
-        if task.is_expired() {
-            task.signal_expiry();
-        }
-        drop(tasks);
+        drop(data);
+        self.state.retire_expired(false);
         self.state.worker_signal.wake();
         Ok(true)
     }
 
     async fn complete_task(&self, task_id: &str, result: CallToolResult) -> Result<bool> {
         self.state.retire_expired(false);
-        let Ok(mut tasks) = self.state.tasks.write() else {
+        let Ok(mut data) = self.state.data.write() else {
             return Ok(false);
         };
-        let Some(task) = tasks.get_mut(task_id).filter(|t| !t.is_expired()) else {
+        let Some(mut task) = data.tasks.remove(task_id) else {
             return Ok(false);
         };
         if task.status.is_terminal() {
+            data.tasks.insert(task_id.to_string(), task);
             return Ok(false);
+        }
+        if task.is_expired() {
+            data.tasks.insert(task_id.to_string(), task);
+            drop(data);
+            self.state.retire_expired(false);
+            return Ok(false);
+        }
+        let limits = self.state.retention_limits;
+        let old_retained = task.retained_bytes;
+        let old_reserved = task.reserved_bytes;
+        if let Err(error) = validate_payload(&result, limits) {
+            drop(result);
+            commit_retention_failure(&mut data, task_id, task, old_retained, old_reserved, limits);
+            return Err(error);
         }
         task.status = TaskStatus::Completed;
         task.status_message = Some("Task completed".to_string());
         task.result = Some(result);
-        task.input_requests.clear();
+        task.input_requests = InputRequests::new();
         task.completed_at = Some(Instant::now());
         task.last_updated_at_str = chrono_now_iso8601();
-        task.completion_notify.notify_waiters();
+        task.retained_bytes = match retained_payload_size(&task.task, limits.max_retained_bytes) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                commit_retention_failure(
+                    &mut data,
+                    task_id,
+                    task,
+                    old_retained,
+                    old_reserved,
+                    limits,
+                );
+                return Err(error);
+            }
+        };
+        task.reserved_bytes = 0;
+        let (retained_bytes, reserved_bytes) = match replacement_totals(
+            &data,
+            old_retained,
+            old_reserved,
+            task.retained_bytes,
+            0,
+            limits.max_retained_bytes,
+        ) {
+            Ok(totals) => totals,
+            Err(error) => {
+                commit_retention_failure(
+                    &mut data,
+                    task_id,
+                    task,
+                    old_retained,
+                    old_reserved,
+                    limits,
+                );
+                return Err(error);
+            }
+        };
+        let notify = task.completion_notify.clone();
+        data.retained_bytes = retained_bytes;
+        data.reserved_bytes = reserved_bytes;
+        data.tasks.insert(task_id.to_string(), task);
+        notify.notify_waiters();
         Ok(true)
     }
 
     async fn fail_task(&self, task_id: &str, error: JsonRpcError) -> Result<bool> {
         self.state.retire_expired(false);
-        let Ok(mut tasks) = self.state.tasks.write() else {
+        let Ok(mut data) = self.state.data.write() else {
             return Ok(false);
         };
-        let Some(task) = tasks.get_mut(task_id).filter(|t| !t.is_expired()) else {
+        let Some(mut task) = data.tasks.remove(task_id) else {
             return Ok(false);
         };
         if task.status.is_terminal() {
+            data.tasks.insert(task_id.to_string(), task);
             return Ok(false);
         }
+        if task.is_expired() {
+            data.tasks.insert(task_id.to_string(), task);
+            drop(data);
+            self.state.retire_expired(false);
+            return Ok(false);
+        }
+        let limits = self.state.retention_limits;
+        let old_retained = task.retained_bytes;
+        let old_reserved = task.reserved_bytes;
+        let error_validation = validate_payload(&error, limits);
+        if let Err(retention_error) = error_validation {
+            drop(error);
+            commit_retention_failure(&mut data, task_id, task, old_retained, old_reserved, limits);
+            return Err(retention_error);
+        }
+        if let Err(retention_error) =
+            validate_prefixed_string(&error.message, "Task failed: ", limits)
+        {
+            drop(error);
+            commit_retention_failure(&mut data, task_id, task, old_retained, old_reserved, limits);
+            return Err(retention_error);
+        }
+        let status_message = format!("Task failed: {}", error.message);
         task.status = TaskStatus::Failed;
-        task.status_message = Some(format!("Task failed: {}", error.message));
+        task.status_message = Some(status_message);
         task.error = Some(error);
-        task.input_requests.clear();
+        task.input_requests = InputRequests::new();
         task.completed_at = Some(Instant::now());
         task.last_updated_at_str = chrono_now_iso8601();
-        task.completion_notify.notify_waiters();
+        task.retained_bytes = match retained_payload_size(&task.task, limits.max_retained_bytes) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                commit_retention_failure(
+                    &mut data,
+                    task_id,
+                    task,
+                    old_retained,
+                    old_reserved,
+                    limits,
+                );
+                return Err(error);
+            }
+        };
+        task.reserved_bytes = 0;
+        let (retained_bytes, reserved_bytes) = match replacement_totals(
+            &data,
+            old_retained,
+            old_reserved,
+            task.retained_bytes,
+            0,
+            limits.max_retained_bytes,
+        ) {
+            Ok(totals) => totals,
+            Err(error) => {
+                commit_retention_failure(
+                    &mut data,
+                    task_id,
+                    task,
+                    old_retained,
+                    old_reserved,
+                    limits,
+                );
+                return Err(error);
+            }
+        };
+        let notify = task.completion_notify.clone();
+        data.retained_bytes = retained_bytes;
+        data.reserved_bytes = reserved_bytes;
+        data.tasks.insert(task_id.to_string(), task);
+        notify.notify_waiters();
         Ok(true)
     }
 
     async fn cancel_task(&self, task_id: &str, reason: Option<&str>) -> Result<Option<TaskObject>> {
         self.state.retire_expired(false);
-        let Ok(mut tasks) = self.state.tasks.write() else {
+        let Ok(mut data) = self.state.data.write() else {
             return Ok(None);
         };
-        let Some(task) = tasks.get_mut(task_id).filter(|t| !t.is_expired()) else {
+        let Some(mut task) = data.tasks.remove(task_id) else {
             return Ok(None);
         };
+        if task.is_expired() {
+            data.tasks.insert(task_id.to_string(), task);
+            drop(data);
+            self.state.retire_expired(false);
+            return Ok(None);
+        }
 
         // Signal cancellation
         task.cancellation_token.cancel();
 
         // If not already terminal, mark as cancelled
         if !task.status.is_terminal() {
-            task.input_requests.clear();
-            task.status = TaskStatus::Cancelled;
-            task.status_message = Some(
-                reason
-                    .map(|r| format!("Cancelled: {}", r))
-                    .unwrap_or_else(|| "Task cancelled".to_string()),
-            );
-            task.completed_at = Some(Instant::now());
-            task.last_updated_at_str = chrono_now_iso8601();
-            task.completion_notify.notify_waiters();
+            let limits = self.state.retention_limits;
+            let old_retained = task.retained_bytes;
+            let old_reserved = task.reserved_bytes;
+            let bounded_reason = match reason {
+                Some(reason) => validate_prefixed_string(reason, "Cancelled: ", limits).is_ok(),
+                None => validate_payload("Task cancelled", limits).is_ok(),
+            };
+            if bounded_reason {
+                let requested_status = reason
+                    .map(|reason| format!("Cancelled: {reason}"))
+                    .unwrap_or_else(|| "Task cancelled".to_string());
+                task.input_requests = InputRequests::new();
+                task.status = TaskStatus::Cancelled;
+                task.status_message = Some(requested_status);
+                task.completed_at = Some(Instant::now());
+                task.last_updated_at_str = chrono_now_iso8601();
+            } else {
+                cancel_with_bounded_status(
+                    &mut task.task,
+                    "Task cancelled: retention limit exceeded",
+                    true,
+                );
+            }
+
+            let candidate_bytes = retained_payload_size(&task.task, limits.max_retained_bytes);
+            let totals = candidate_bytes.and_then(|bytes| {
+                replacement_totals(
+                    &data,
+                    old_retained,
+                    old_reserved,
+                    bytes,
+                    0,
+                    limits.max_retained_bytes,
+                )
+                .map(|totals| (bytes, totals))
+            });
+            let (new_retained, (retained_bytes, reserved_bytes)) = match totals {
+                Ok(totals) => totals,
+                Err(_) => {
+                    cancel_with_bounded_status(
+                        &mut task.task,
+                        "Task cancelled: retention limit exceeded",
+                        true,
+                    );
+                    let bytes = retained_payload_size(&task.task, limits.max_retained_bytes)
+                        .expect("bounded cancellation must fit the aggregate byte limit");
+                    let totals = replacement_totals(
+                        &data,
+                        old_retained,
+                        old_reserved,
+                        bytes,
+                        0,
+                        limits.max_retained_bytes,
+                    )
+                    .expect("bounded cancellation must fit reserved global accounting");
+                    (bytes, totals)
+                }
+            };
+            task.retained_bytes = new_retained;
+            task.reserved_bytes = 0;
+            let notify = task.completion_notify.clone();
+            data.retained_bytes = retained_bytes;
+            data.reserved_bytes = reserved_bytes;
+            let object = task.to_task_object();
+            data.tasks.insert(task_id.to_string(), task);
+            notify.notify_waiters();
+            return Ok(Some(object));
         }
-        Ok(Some(task.to_task_object()))
+        let object = task.to_task_object();
+        data.tasks.insert(task_id.to_string(), task);
+        Ok(Some(object))
     }
 }
 
@@ -2355,7 +3197,8 @@ fn is_leap_year(year: i32) -> bool {
 mod tests {
     use super::*;
     use crate::protocol::{
-        ElicitAction, ElicitResult, InputRequest, InputResponse, ListRootsParams,
+        ElicitAction, ElicitFieldValue, ElicitFormParams, ElicitFormSchema, ElicitRequestParams,
+        ElicitResult, InputRequest, InputResponse, ListRootsParams,
     };
 
     #[test]
@@ -2532,7 +3375,15 @@ mod tests {
         // Mutate under the private store lock without waking the worker. This
         // makes the two retirement passes deterministic while exercising the
         // same one-shot path used by both manual and scheduled cleanup.
-        store.state.tasks.write().unwrap().get_mut(&id).unwrap().ttl = 0;
+        store
+            .state
+            .data
+            .write()
+            .unwrap()
+            .tasks
+            .get_mut(&id)
+            .unwrap()
+            .ttl = 0;
         let first = store.state.retire_expired(false);
         let second = store.state.retire_expired(false);
         assert_eq!(first.signalled + second.signalled, 1);
@@ -2643,7 +3494,10 @@ mod tests {
 
         let info = store.get_task(&id).await.unwrap().unwrap();
         assert_eq!(info.status, TaskStatus::Failed);
-        assert!(info.status_message.as_ref().unwrap().contains("failed"));
+        assert_eq!(
+            info.status_message.as_deref(),
+            Some("Task failed: Something went wrong")
+        );
     }
 
     #[tokio::test]
@@ -3351,5 +4205,665 @@ mod tests {
                 "{label} task accepted a late input response"
             );
         }
+    }
+
+    fn store_with_limits(limits: TaskRetentionLimits) -> MemoryTaskStore {
+        MemoryTaskStore::with_retention_limits(limits)
+    }
+
+    fn assert_accounting(store: &MemoryTaskStore) {
+        let data = store.state.data.read().unwrap();
+        let retained_bytes = data
+            .tasks
+            .values()
+            .map(|task| {
+                let measured = retained_payload_size(&task.task, usize::MAX).unwrap();
+                assert_eq!(task.retained_bytes, measured);
+                measured
+            })
+            .sum::<usize>();
+        let reserved_bytes = data
+            .tasks
+            .values()
+            .map(|task| task.reserved_bytes)
+            .sum::<usize>();
+        assert_eq!(data.retained_bytes, retained_bytes);
+        assert_eq!(data.reserved_bytes, reserved_bytes);
+        let expected = data.usage();
+        drop(data);
+        assert_eq!(store.usage(), expected);
+        assert!(store.usage().charged_bytes() <= store.state.retention_limits.max_retained_bytes);
+    }
+
+    fn large_request(key: &str, message: String) -> InputRequests {
+        [(
+            key.to_string(),
+            InputRequest::Elicit(ElicitRequestParams::Form(ElicitFormParams {
+                mode: None,
+                message,
+                requested_schema: ElicitFormSchema::new(),
+                meta: None,
+            })),
+        )]
+        .into_iter()
+        .collect()
+    }
+
+    fn accept_text(key: &str, value: String) -> (String, InputResponse) {
+        (
+            key.to_string(),
+            InputResponse::Elicit(ElicitResult::accept(std::collections::HashMap::from([(
+                "value".to_string(),
+                ElicitFieldValue::String(value),
+            )]))),
+        )
+    }
+
+    #[test]
+    fn retention_policy_defaults_are_finite_and_unbounded_is_explicit() {
+        assert_eq!(TaskRetentionLimits::new(), TaskRetentionLimits::default());
+        let limits = TaskRetentionLimits::default();
+        assert_eq!(limits.max_tasks, 1_024);
+        assert_eq!(limits.max_payload_bytes, 4 * 1024 * 1024);
+        assert_eq!(limits.max_retained_bytes, 64 * 1024 * 1024);
+
+        let unbounded = TaskRetentionLimits::unbounded();
+        assert_eq!(unbounded.max_tasks, usize::MAX);
+        assert_eq!(unbounded.max_payload_bytes, usize::MAX);
+        assert_eq!(unbounded.max_retained_bytes, usize::MAX);
+
+        let synthetic_overflow = TaskStoreUsage {
+            retained_bytes: usize::MAX,
+            reserved_bytes: 1,
+            ..TaskStoreUsage::default()
+        };
+        assert_eq!(synthetic_overflow.charged_bytes(), usize::MAX);
+
+        // Keep the lifecycle config's original two-field struct-literal API.
+        let config = MemoryTaskStoreConfig {
+            default_ttl: Duration::from_secs(30),
+            cleanup_interval: Duration::from_secs(10),
+        };
+        let default_limited = MemoryTaskStore::with_config(config);
+        assert_eq!(
+            default_limited.state.retention_limits,
+            TaskRetentionLimits::default()
+        );
+        let explicitly_unbounded =
+            MemoryTaskStore::with_config_and_retention(config, TaskRetentionLimits::unbounded());
+        assert_eq!(
+            explicitly_unbounded.state.retention_limits,
+            TaskRetentionLimits::unbounded()
+        );
+    }
+
+    #[test]
+    fn payload_validation_uses_one_stricter_counting_pass() {
+        struct Counted<'a>(&'a std::sync::atomic::AtomicUsize);
+
+        impl serde::Serialize for Counted<'_> {
+            fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                serializer.serialize_str("payload")
+            }
+        }
+
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let limits = TaskRetentionLimits::unbounded().max_retained_bytes(64);
+        assert_eq!(validate_payload(&Counted(&calls), limits).unwrap(), 9);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        let tied = TaskRetentionLimits::unbounded()
+            .max_payload_bytes(1)
+            .max_retained_bytes(1);
+        assert!(matches!(
+            validate_payload("x", tied),
+            Err(TaskStoreError::RetentionLimitExceeded {
+                kind: TaskRetentionLimitKind::PayloadBytes,
+                limit: 1
+            })
+        ));
+        let aggregate_is_stricter = TaskRetentionLimits::unbounded().max_retained_bytes(4);
+        assert!(matches!(
+            validate_prefixed_string("x", "prefix: ", aggregate_is_stricter),
+            Err(TaskStoreError::RetentionLimitExceeded {
+                kind: TaskRetentionLimitKind::AggregateBytes,
+                limit: 4
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn payload_limit_accepts_exact_boundary_and_rejects_without_mutation() {
+        let arguments = serde_json::json!({"data": "abcd"});
+        let exact = serde_json::to_vec(&arguments).unwrap().len();
+        let store = store_with_limits(TaskRetentionLimits::unbounded().max_payload_bytes(exact));
+        store
+            .create_task("tool", arguments.clone(), None, None)
+            .await
+            .expect("the exact encoded-byte boundary is inclusive");
+        let before = store.usage();
+
+        let error = store
+            .create_task("tool", serde_json::json!({"data": "abcde"}), None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            TaskStoreError::RetentionLimitExceeded {
+                kind: TaskRetentionLimitKind::PayloadBytes,
+                limit
+            } if limit == exact
+        ));
+        assert_eq!(store.usage(), before);
+        assert_accounting(&store);
+
+        let zero = store_with_limits(TaskRetentionLimits::unbounded().max_payload_bytes(0));
+        assert!(matches!(
+            zero.create_task("tool", serde_json::Value::Null, None, None)
+                .await,
+            Err(TaskStoreError::RetentionLimitExceeded {
+                kind: TaskRetentionLimitKind::PayloadBytes,
+                limit: 0
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn oversized_owner_rejects_create_atomically() {
+        let store = store_with_limits(
+            TaskRetentionLimits::unbounded()
+                .max_payload_bytes(64)
+                .max_retained_bytes(4 * 1024),
+        );
+        let error = store
+            .create_task(
+                "tool",
+                serde_json::Value::Null,
+                None,
+                Some("owner-secret".repeat(128)),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            TaskStoreError::RetentionLimitExceeded {
+                kind: TaskRetentionLimitKind::PayloadBytes,
+                limit: 64
+            }
+        ));
+        assert_eq!(store.usage(), TaskStoreUsage::default());
+        assert_accounting(&store);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_task_count_admission_never_overshoots() {
+        let store = store_with_limits(TaskRetentionLimits::unbounded().max_tasks(1));
+        let barrier = Arc::new(tokio::sync::Barrier::new(17));
+        let mut creates = Vec::new();
+        for _ in 0..16 {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            creates.push(tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .create_task("tool", serde_json::json!({}), None, None)
+                    .await
+            }));
+        }
+        barrier.wait().await;
+
+        let mut accepted = 0;
+        for create in creates {
+            match create.await.unwrap() {
+                Ok(_) => accepted += 1,
+                Err(TaskStoreError::RetentionLimitExceeded {
+                    kind: TaskRetentionLimitKind::TaskCount,
+                    limit: 1,
+                }) => {}
+                Err(other) => panic!("unexpected create error: {other}"),
+            }
+        }
+        assert_eq!(accepted, 1);
+        assert_eq!(store.usage().task_count, 1);
+        assert_accounting(&store);
+    }
+
+    #[tokio::test]
+    async fn replacement_and_input_accumulation_account_exactly() {
+        let store = store_with_limits(TaskRetentionLimits::unbounded());
+        let id = working_task(&store, None).await;
+        let initial = store.usage();
+
+        assert!(
+            store
+                .set_task_meta(&id, serde_json::json!({"note": "x".repeat(2_000)}))
+                .await
+                .unwrap()
+        );
+        let large_meta = store.usage();
+        assert!(large_meta.retained_bytes > initial.retained_bytes);
+        assert_accounting(&store);
+
+        assert!(
+            store
+                .set_task_meta(&id, serde_json::json!({"note": "small"}))
+                .await
+                .unwrap()
+        );
+        let small_meta = store.usage();
+        assert!(small_meta.retained_bytes < large_meta.retained_bytes);
+
+        store
+            .require_input(&id, large_request("first", "question".repeat(20)), None)
+            .await
+            .unwrap();
+        let requested = store.usage();
+        assert!(requested.retained_bytes > small_meta.retained_bytes);
+        store
+            .apply_input_responses(
+                &id,
+                [accept_text("first", "answer".repeat(30))]
+                    .into_iter()
+                    .collect(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let first_answer = store.usage();
+        assert_accounting(&store);
+
+        store
+            .require_input(&id, large_request("second", "next".repeat(20)), None)
+            .await
+            .unwrap();
+        store
+            .apply_input_responses(
+                &id,
+                [accept_text("second", "more".repeat(40))]
+                    .into_iter()
+                    .collect(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(store.usage().retained_bytes > first_answer.retained_bytes);
+        assert_accounting(&store);
+    }
+
+    #[tokio::test]
+    async fn rejected_payload_mutations_are_atomic_and_ignored_input_is_not_charged() {
+        let limits = TaskRetentionLimits::unbounded().max_payload_bytes(256);
+        let store = store_with_limits(limits);
+        let id = working_task(&store, None).await;
+
+        let before_meta = store.usage();
+        assert!(matches!(
+            store
+                .set_task_meta(&id, serde_json::json!({"secret": "m".repeat(1_024)}))
+                .await,
+            Err(TaskStoreError::RetentionLimitExceeded {
+                kind: TaskRetentionLimitKind::PayloadBytes,
+                ..
+            })
+        ));
+        assert_eq!(store.usage(), before_meta);
+
+        assert!(matches!(
+            store
+                .require_input(&id, large_request("large", "q".repeat(1_024)), None)
+                .await,
+            Err(TaskStoreError::RetentionLimitExceeded {
+                kind: TaskRetentionLimitKind::PayloadBytes,
+                ..
+            })
+        ));
+        assert_eq!(
+            store.get_task(&id).await.unwrap().unwrap().status,
+            TaskStatus::Working
+        );
+
+        store
+            .require_input(&id, requests(&["approval"]), None)
+            .await
+            .unwrap();
+        let accepted = store
+            .apply_input_responses(
+                &id,
+                [
+                    accept("approval"),
+                    accept_text("ignored", "never-retained".repeat(1_024)),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(accepted.accepted, ["approval".to_string()].into());
+        assert_eq!(accepted.ignored, ["ignored".to_string()].into());
+        assert_accounting(&store);
+
+        let other = working_task(&store, None).await;
+        store
+            .require_input(&other, requests(&["approval"]), None)
+            .await
+            .unwrap();
+        let before_response = store.usage();
+        assert!(matches!(
+            store
+                .apply_input_responses(
+                    &other,
+                    [accept_text("approval", "secret".repeat(1_024))]
+                        .into_iter()
+                        .collect(),
+                )
+                .await,
+            Err(TaskStoreError::RetentionLimitExceeded {
+                kind: TaskRetentionLimitKind::PayloadBytes,
+                ..
+            })
+        ));
+        assert_eq!(store.usage(), before_response);
+        assert_eq!(
+            store
+                .outstanding_input_requests(&other)
+                .await
+                .unwrap()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_accounting(&store);
+    }
+
+    #[tokio::test]
+    async fn oversized_terminal_result_records_bounded_failure_and_wakes_waiter() {
+        let store = store_with_limits(
+            TaskRetentionLimits::unbounded()
+                .max_payload_bytes(256)
+                .max_retained_bytes(8 * 1024),
+        );
+        let id = working_task(&store, None).await;
+        let waiting_store = store.clone();
+        let waiting_id = id.clone();
+        let mut waiter = tokio::spawn(async move {
+            waiting_store
+                .wait_for_completion(&waiting_id)
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiter)
+                .await
+                .is_err()
+        );
+
+        let secret = "terminal-secret".repeat(1_024);
+        let error = store
+            .complete_task(&id, CallToolResult::text(&secret))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            TaskStoreError::RetentionLimitExceeded {
+                kind: TaskRetentionLimitKind::PayloadBytes,
+                limit: 256
+            }
+        ));
+
+        let (task, result, error) = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("bounded failure did not wake completion waiter")
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(
+            task.status_message.as_deref(),
+            Some(RETENTION_FAILURE_STATUS)
+        );
+        assert!(result.is_none());
+        assert_eq!(error.unwrap().message, RETENTION_FAILURE_MESSAGE);
+        let data = store.state.data.read().unwrap();
+        let stored = data.tasks.get(&id).unwrap();
+        assert_eq!(stored.reserved_bytes, 0);
+        assert!(!format!("{:?}", stored.task).contains("terminal-secret"));
+        drop(data);
+        assert_accounting(&store);
+    }
+
+    #[tokio::test]
+    async fn oversized_failure_and_cancel_reason_store_only_bounded_terminal_state() {
+        let store = store_with_limits(
+            TaskRetentionLimits::unbounded()
+                .max_payload_bytes(128)
+                .max_retained_bytes(8 * 1024),
+        );
+        let failed = working_task(&store, None).await;
+        let secret = "diagnostic-secret".repeat(1_024);
+        assert!(matches!(
+            store
+                .fail_task(&failed, JsonRpcError::internal_error(&secret))
+                .await,
+            Err(TaskStoreError::RetentionLimitExceeded { .. })
+        ));
+        let (task, _, error) = store.get_task_result(&failed).await.unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(error.unwrap().message, RETENTION_FAILURE_MESSAGE);
+
+        let cancelled = working_task(&store, None).await;
+        let object = store
+            .cancel_task(&cancelled, Some(&secret))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(object.status, TaskStatus::Cancelled);
+        assert_eq!(
+            object.status_message.as_deref(),
+            Some("Task cancelled: retention limit exceeded")
+        );
+        let data = store.state.data.read().unwrap();
+        assert!(
+            !format!("{:?}", data.tasks.get(&failed).unwrap().task).contains("diagnostic-secret")
+        );
+        assert!(
+            !format!("{:?}", data.tasks.get(&cancelled).unwrap().task)
+                .contains("diagnostic-secret")
+        );
+        drop(data);
+        assert_accounting(&store);
+    }
+
+    fn working_charge(tool: &str, arguments: serde_json::Value) -> usize {
+        let limits = TaskRetentionLimits::unbounded();
+        let task = Task::new(
+            "prototype".to_string(),
+            tool.to_string(),
+            arguments,
+            60_000,
+            None,
+        );
+        let stored = prepare_stored_task(task, limits).unwrap();
+        stored.retained_bytes + stored.reserved_bytes
+    }
+
+    #[tokio::test]
+    async fn aggregate_capacity_recovers_after_deletion_and_expiry() {
+        let charge = working_charge("tool", serde_json::json!({}));
+        let limits = TaskRetentionLimits::unbounded()
+            .max_tasks(2)
+            .max_retained_bytes(charge);
+        let store = store_with_limits(limits);
+        let first = working_task(&store, None).await;
+        assert_eq!(store.usage().charged_bytes(), charge);
+        assert!(matches!(
+            store
+                .create_task("tool", serde_json::json!({}), None, None)
+                .await,
+            Err(TaskStoreError::RetentionLimitExceeded {
+                kind: TaskRetentionLimitKind::AggregateBytes,
+                limit
+            }) if limit == charge
+        ));
+        assert_accounting(&store);
+        assert!(store.discard_task(&first).await.unwrap());
+        assert_eq!(store.usage(), TaskStoreUsage::default());
+
+        let expired = working_task(&store, None).await;
+        let before_expiry = store.usage();
+        assert!(matches!(
+            store
+                .create_task("tool", serde_json::json!({}), None, None)
+                .await,
+            Err(TaskStoreError::RetentionLimitExceeded {
+                kind: TaskRetentionLimitKind::AggregateBytes,
+                limit
+            }) if limit == charge
+        ));
+        assert_accounting(&store);
+        assert!(store.set_ttl(&expired, 0).await.unwrap());
+        let tombstone = store.usage();
+        assert_eq!(tombstone.task_count, 1);
+        assert_eq!(tombstone.reserved_bytes, 0);
+        assert!(tombstone.retained_bytes < before_expiry.retained_bytes);
+        assert!(matches!(
+            store.task_presence(&expired).await.unwrap(),
+            TaskPresence::Expired { .. }
+        ));
+        assert_accounting(&store);
+
+        let replacement = working_task(&store, None).await;
+        assert_ne!(replacement, expired);
+        assert!(matches!(
+            store.task_presence(&expired).await.unwrap(),
+            TaskPresence::Missing
+        ));
+        assert_eq!(store.usage().task_count, 1);
+        assert_eq!(store.usage().charged_bytes(), charge);
+        assert_accounting(&store);
+    }
+
+    #[tokio::test]
+    async fn expiry_accounting_allows_scrubbed_encoding_to_grow() {
+        let store = MemoryTaskStore::with_config_and_retention(
+            MemoryTaskStoreConfig::default().cleanup_interval(Duration::from_secs(60)),
+            TaskRetentionLimits::unbounded(),
+        );
+        let (id, _) = store
+            .create_task("x", serde_json::Value::Null, None, None)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .set_status(&id, TaskStatus::Working, Some(""))
+                .await
+                .unwrap()
+        );
+        let before_expiry = store.usage();
+
+        assert!(store.set_ttl(&id, 0).await.unwrap());
+        let after_expiry = store.usage();
+        assert_eq!(after_expiry.task_count, 1);
+        assert_eq!(after_expiry.reserved_bytes, 0);
+        assert_eq!(
+            after_expiry.retained_bytes,
+            before_expiry.retained_bytes + 1,
+            "the empty status encodes two bytes smaller than None, while the one-byte tool name is scrubbed"
+        );
+        assert!(matches!(
+            store.task_presence(&id).await.unwrap(),
+            TaskPresence::Expired { .. }
+        ));
+        assert_accounting(&store);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_completions_atomically_enforce_aggregate_limit() {
+        let result_text = "r".repeat(2_048);
+        let unbounded = TaskRetentionLimits::unbounded();
+        let working = prepare_stored_task(
+            Task::new(
+                "prototype".to_string(),
+                "tool".to_string(),
+                serde_json::json!({}),
+                60_000,
+                None,
+            ),
+            unbounded,
+        )
+        .unwrap();
+        let mut completed = Task::new(
+            "prototype".to_string(),
+            "tool".to_string(),
+            serde_json::json!({}),
+            60_000,
+            None,
+        );
+        completed.status = TaskStatus::Completed;
+        completed.status_message = Some("Task completed".to_string());
+        completed.result = Some(CallToolResult::text(&result_text));
+        completed.completed_at = Some(Instant::now());
+        let completed = prepare_stored_task(completed, unbounded).unwrap();
+        let working_charge = working.retained_bytes + working.reserved_bytes;
+        assert!(completed.retained_bytes > working_charge);
+        let cap = completed.retained_bytes + working_charge;
+        let store = store_with_limits(
+            TaskRetentionLimits::unbounded()
+                .max_tasks(2)
+                .max_payload_bytes(4 * 1024)
+                .max_retained_bytes(cap),
+        );
+        let first = working_task(&store, None).await;
+        let second = working_task(&store, None).await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let mut completions = Vec::new();
+        for id in [first.clone(), second.clone()] {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            let result_text = result_text.clone();
+            completions.push(tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .complete_task(&id, CallToolResult::text(result_text))
+                    .await
+            }));
+        }
+        barrier.wait().await;
+
+        let mut completed_count = 0;
+        let mut rejected_count = 0;
+        for completion in completions {
+            match completion.await.unwrap() {
+                Ok(true) => completed_count += 1,
+                Err(TaskStoreError::RetentionLimitExceeded {
+                    kind: TaskRetentionLimitKind::AggregateBytes,
+                    limit,
+                }) if limit == cap => rejected_count += 1,
+                other => panic!("unexpected completion outcome: {other:?}"),
+            }
+        }
+        assert_eq!((completed_count, rejected_count), (1, 1));
+        let states = [
+            store.get_task(&first).await.unwrap().unwrap().status,
+            store.get_task(&second).await.unwrap().unwrap().status,
+        ];
+        assert_eq!(
+            states
+                .iter()
+                .filter(|status| **status == TaskStatus::Completed)
+                .count(),
+            1
+        );
+        assert_eq!(
+            states
+                .iter()
+                .filter(|status| **status == TaskStatus::Failed)
+                .count(),
+            1
+        );
+        assert_accounting(&store);
     }
 }

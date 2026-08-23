@@ -756,3 +756,43 @@ async fn completion_write_failures_become_one_policy_mapped_task_failure() {
     assert_eq!(failures[0].data.as_ref().unwrap()["phase"], "finalize");
     assert!(!format!("{:?}", failures[0]).contains(SECRET));
 }
+
+#[tokio::test]
+async fn external_retention_rejection_still_records_one_policy_mapped_failure() {
+    use crate::async_task::{TaskRetentionLimitKind, TaskStoreError};
+
+    let store = Arc::new(
+        ScriptedTaskStore::default()
+            .with_completions([Err(TaskStoreError::RetentionLimitExceeded {
+                kind: TaskRetentionLimitKind::AggregateBytes,
+                limit: 1_024,
+            })])
+            .with_failure_results([Ok(true)]),
+    );
+    let policy_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let recorded_calls = policy_calls.clone();
+    let router = McpRouter::new()
+        .task_store(store.clone())
+        .task_error_policy(TaskErrorPolicy::new(move |context| {
+            recorded_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(context.operation(), TaskOperation::Finalize);
+            assert!(matches!(
+                context.failure(),
+                TaskFailure::Store(TaskStoreError::RetentionLimitExceeded {
+                    kind: TaskRetentionLimitKind::AggregateBytes,
+                    limit: 1_024,
+                })
+            ));
+            JsonRpcError::internal_error("mapped retention failure")
+        }));
+
+    assert!(
+        !router
+            .complete_task_or_fail("task_scripted", CallToolResult::text("done"))
+            .await
+    );
+    assert_eq!(policy_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let failures = store.recorded_failures.lock().unwrap();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].message, "mapped retention failure");
+}

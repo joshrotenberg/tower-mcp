@@ -266,6 +266,7 @@ impl std::fmt::Debug for TaskFailure {
                     TaskStoreError::Decode(_) => "Decode",
                     TaskStoreError::Backend(_) => "Backend",
                     TaskStoreError::InvalidTransition(_) => "InvalidTransition",
+                    TaskStoreError::RetentionLimitExceeded { .. } => "RetentionLimitExceeded",
                 };
                 write!(f, "Store({kind})")
             }

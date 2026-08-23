@@ -2381,10 +2381,6 @@ impl McpRouter {
                             // error. SEP-2663 reserves `failed` for execution
                             // failures, which surface as a JSON-RPC error.
                             let status = if result.is_error { "error" } else { "success" };
-                            let error_msg = result
-                                .is_error
-                                .then(|| result.first_text().unwrap_or("Tool execution failed"))
-                                .map(str::to_string);
                             if notifier.complete_task_or_fail(&task_id_clone, result).await {
                                 tracing::info!(
                                     target: "mcp::tools",
@@ -2392,7 +2388,6 @@ impl McpRouter {
                                     task_id = %task_id_clone,
                                     duration_ms,
                                     status,
-                                    error = error_msg.as_deref().unwrap_or_default(),
                                     "tool call completed"
                                 );
                             }

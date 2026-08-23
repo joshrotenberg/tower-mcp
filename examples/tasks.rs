@@ -23,7 +23,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tower_mcp::{
     CallToolResult, McpRouter, MemoryTaskStore, MemoryTaskStoreConfig, StdioTransport,
-    TaskSupportMode, ToolBuilder,
+    TaskRetentionLimits, TaskSupportMode, ToolBuilder,
 };
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -52,12 +52,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Final-protocol clients do not choose a TTL. The server owns that policy;
     // here tasks may run for thirty minutes, while expired records are
-    // physically reclaimed at most thirty seconds later. The built-in defaults
-    // remain five minutes and one minute respectively.
-    let task_store = Arc::new(MemoryTaskStore::with_config(
+    // physically reclaimed at most thirty seconds later. The retention policy
+    // bounds both record count and compact-JSON payload charge; its built-in
+    // defaults are 1,024 tasks, 4 MiB per payload, and 64 MiB aggregate.
+    let task_store = Arc::new(MemoryTaskStore::with_config_and_retention(
         MemoryTaskStoreConfig::default()
             .default_ttl(Duration::from_secs(30 * 60))
             .cleanup_interval(Duration::from_secs(30)),
+        TaskRetentionLimits::default()
+            .max_tasks(2_048)
+            .max_retained_bytes(128 * 1024 * 1024),
     ));
 
     let router = McpRouter::new()
