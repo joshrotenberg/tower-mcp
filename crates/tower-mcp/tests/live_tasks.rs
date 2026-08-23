@@ -227,7 +227,7 @@ async fn cancellation_is_confirmed_by_the_handler_rather_than_imposed() {
     await_status(&store, &task_id, TaskStatus::InputRequired).await;
 
     client
-        .task_cancel(&task_id, None)
+        .task_cancel(&task_id, Some("client stopped".to_string()))
         .await
         .expect("cancel accepted");
 
@@ -237,6 +237,310 @@ async fn cancellation_is_confirmed_by_the_handler_rather_than_imposed() {
         1,
         "the handler ran its teardown rather than being abandoned"
     );
+    let task = store.get_task(&task_id).await.unwrap().unwrap();
+    assert_eq!(
+        task.status_message.as_deref(),
+        Some("Cancelled: client stopped"),
+        "a live cancellation must preserve the client's reason"
+    );
+}
+
+// ============================================================================
+// Host lifecycle control (#1398)
+// ============================================================================
+
+/// The public handle reports ID-bearing executions and does not finish its
+/// drain until the handler has settled and its terminal state is durable.
+#[tokio::test]
+async fn live_execution_handle_reports_ids_and_drains_after_terminal_write() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let handler_started = started.clone();
+    let handler_release = release.clone();
+    let tool = ToolBuilder::new("live")
+        .description("Waits for the test to release it")
+        .live_task_handler(move |_task: TaskContext, _input: NoArgs| {
+            let started = handler_started.clone();
+            let release = handler_release.clone();
+            async move {
+                started.notify_one();
+                release.notified().await;
+                Ok(TaskOutcome::Completed(CallToolResult::text("done")))
+            }
+        })
+        .build();
+
+    let store = Arc::new(MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .server_info("live", "1.0.0")
+        .task_store(store.clone())
+        .tool(tool)
+        .with_tasks();
+    let executions = router.live_task_execution_handle();
+    let client = McpClient::connect(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+
+    let task_id = client
+        .call_tool_as_task("live", json!({}), None)
+        .await
+        .expect("task created")
+        .task
+        .task_id;
+    started.notified().await;
+
+    assert_eq!(executions.active_count(), 1);
+    assert_eq!(executions.active_task_ids(), vec![task_id.clone()]);
+
+    let drain_handle = executions.clone();
+    let mut drain = tokio::spawn(async move { drain_handle.drained().await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(30), &mut drain)
+            .await
+            .is_err(),
+        "drain must remain pending while the handler owns its execution"
+    );
+
+    release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+        .await
+        .expect("drain timed out")
+        .expect("drain task panicked");
+
+    assert_eq!(executions.active_count(), 0);
+    assert!(executions.active_task_ids().is_empty());
+    let task = store.get_task(&task_id).await.unwrap().unwrap();
+    assert_eq!(
+        task.status,
+        TaskStatus::Completed,
+        "terminal state must be durable before drained resolves"
+    );
+}
+
+/// Host cancellation reaches the handler, permits observable cleanup, and
+/// supplies the reason used when the handler returns no more-specific one.
+#[tokio::test]
+async fn host_cancel_all_propagates_reason_and_waits_for_cleanup() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let handler_started = started.clone();
+    let cleaned_up = Arc::new(AtomicUsize::new(0));
+    let handler_cleaned_up = cleaned_up.clone();
+    let tool = ToolBuilder::new("live")
+        .description("Cleans up after host cancellation")
+        .live_task_handler(move |task: TaskContext, _input: NoArgs| {
+            let started = handler_started.clone();
+            let cleaned_up = handler_cleaned_up.clone();
+            async move {
+                started.notify_one();
+                task.cancelled().await;
+                assert_eq!(
+                    task.cancellation_reason().as_deref(),
+                    Some("deployment shutdown")
+                );
+                cleaned_up.fetch_add(1, Ordering::SeqCst);
+                Ok(TaskOutcome::Cancelled { message: None })
+            }
+        })
+        .build();
+
+    let store = Arc::new(MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .server_info("live", "1.0.0")
+        .task_store(store.clone())
+        .tool(tool)
+        .with_tasks();
+    let executions = router.live_task_execution_handle();
+    let client = McpClient::connect(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+    let task_id = client
+        .call_tool_as_task("live", json!({}), None)
+        .await
+        .expect("task created")
+        .task
+        .task_id;
+    started.notified().await;
+
+    executions.close_admission();
+    assert_eq!(executions.cancel_all("deployment shutdown"), 1);
+    tokio::time::timeout(std::time::Duration::from_secs(5), executions.drained())
+        .await
+        .expect("live execution did not drain");
+
+    assert_eq!(cleaned_up.load(Ordering::SeqCst), 1);
+    let task = store.get_task(&task_id).await.unwrap().unwrap();
+    assert_eq!(task.status, TaskStatus::Cancelled);
+    assert_eq!(
+        task.status_message.as_deref(),
+        Some("Cancelled: deployment shutdown")
+    );
+}
+
+/// Preparation is inside the lifecycle boundary even though no ID has yet
+/// been published. Cancellation cannot be lost when that reservation promotes
+/// to a registered task immediately before spawning the handler.
+#[tokio::test]
+async fn close_cancel_and_drain_cover_a_blocked_task_preparation() {
+    let preparing = Arc::new(tokio::sync::Notify::new());
+    let prepare_started = preparing.clone();
+    let preparation_cleaned_up = Arc::new(AtomicUsize::new(0));
+    let prepare_cleaned_up = preparation_cleaned_up.clone();
+    let tool = ToolBuilder::new("live")
+        .description("Blocks in preparation")
+        .live_task_handler(|task: TaskContext, _input: NoArgs| async move {
+            // A cancellation raised against the anonymous reservation must be
+            // present as soon as the ID-bearing handler begins.
+            task.require_input(ask("never")).await?;
+            Ok(TaskOutcome::Completed(CallToolResult::text("unreachable")))
+        })
+        .build()
+        .with_task_preparation(move |task: TaskContext, _args: serde_json::Value| {
+            let started = prepare_started.clone();
+            let cleaned_up = prepare_cleaned_up.clone();
+            async move {
+                started.notify_one();
+                // Host cancellation must reach the anonymous reservation, not
+                // wait until preparation happens to finish on its own.
+                task.cancelled().await;
+                assert_eq!(
+                    task.cancellation_reason().as_deref(),
+                    Some("shutdown during preparation")
+                );
+                cleaned_up.fetch_add(1, Ordering::SeqCst);
+                Ok(tower_mcp::TaskPreparation::new())
+            }
+        });
+
+    let store = Arc::new(MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .server_info("live", "1.0.0")
+        .task_store(store.clone())
+        .tool(tool)
+        .with_tasks();
+    let executions = router.live_task_execution_handle();
+    let client = McpClient::connect(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+
+    let call = tokio::spawn(async move { client.call_tool_as_task("live", json!({}), None).await });
+    preparing.notified().await;
+    assert_eq!(executions.active_count(), 1);
+    assert!(
+        executions.active_task_ids().is_empty(),
+        "a preparation reservation has no public task ID yet"
+    );
+
+    let drain_handle = executions.clone();
+    let mut drain = tokio::spawn(async move { drain_handle.drained().await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(30), &mut drain)
+            .await
+            .is_err(),
+        "a blocked preparation reservation must hold the drain open"
+    );
+
+    executions.close_admission();
+    assert_eq!(executions.cancel_all("shutdown during preparation"), 1);
+    let task_id = call
+        .await
+        .expect("call task panicked")
+        .expect("task created")
+        .task
+        .task_id;
+    tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+        .await
+        .expect("drain timed out")
+        .expect("drain task panicked");
+
+    assert_eq!(preparation_cleaned_up.load(Ordering::SeqCst), 1);
+    let task = store.get_task(&task_id).await.unwrap().unwrap();
+    assert_eq!(task.status, TaskStatus::Cancelled);
+    assert_eq!(
+        task.status_message.as_deref(),
+        Some("Cancelled: shutdown during preparation")
+    );
+}
+
+/// Closing admission fails before task allocation and does not affect any
+/// other router operation.
+#[tokio::test]
+async fn closed_live_admission_rejects_without_creating_a_task() {
+    let handler_calls = Arc::new(AtomicUsize::new(0));
+    let calls = handler_calls.clone();
+    let tool = ToolBuilder::new("live")
+        .description("Must never start")
+        .live_task_handler(move |_task: TaskContext, _input: NoArgs| {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(TaskOutcome::Completed(CallToolResult::text("unexpected")))
+            }
+        })
+        .build();
+
+    let store = Arc::new(MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .server_info("live", "1.0.0")
+        .task_store(store.clone())
+        .tool(tool)
+        .with_tasks();
+    let executions = router.live_task_execution_handle();
+    executions.close_admission();
+
+    let client = McpClient::connect(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+    let error = client
+        .call_tool_as_task("live", json!({}), None)
+        .await
+        .expect_err("closed admission must reject the call");
+    assert!(
+        error.to_string().contains("admission is closed"),
+        "rejection should be a clean protocol error: {error}"
+    );
+    assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+    assert!(store.list_tasks(None).await.unwrap().is_empty());
+    assert_eq!(executions.active_count(), 0);
+    tokio::time::timeout(std::time::Duration::from_secs(1), executions.drained())
+        .await
+        .expect("an empty registry drains immediately");
+}
+
+/// The host handle is deliberately not a proxy for all TaskStore activity.
+/// Closing it must leave the replay-based task executor unchanged.
+#[tokio::test]
+async fn closed_live_admission_does_not_reject_replay_tasks() {
+    let tool = ToolBuilder::new("replay")
+        .description("Uses the replay task path")
+        .task_support(tower_mcp::TaskSupportMode::Required)
+        .handler(|_input: NoArgs| async move { Ok(CallToolResult::text("done")) })
+        .build();
+    let store = Arc::new(MemoryTaskStore::new());
+    let router = McpRouter::new()
+        .server_info("replay", "1.0.0")
+        .task_store(store.clone())
+        .tool(tool)
+        .with_tasks();
+    let executions = router.live_task_execution_handle();
+    executions.close_admission();
+
+    let client = McpClient::connect(ChannelTransport::new(router))
+        .await
+        .expect("connect");
+    client.initialize("t", "1.0.0").await.expect("init");
+    let task_id = client
+        .call_tool_as_task("replay", json!({}), None)
+        .await
+        .expect("replay task remains admitted")
+        .task
+        .task_id;
+    await_status(&store, &task_id, TaskStatus::Completed).await;
+    assert_eq!(executions.active_count(), 0);
+    assert!(executions.active_task_ids().is_empty());
 }
 
 // ============================================================================

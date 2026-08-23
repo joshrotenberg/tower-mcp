@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 
 use tower_service::Service;
@@ -50,23 +50,6 @@ fn prompt_not_found(name: &str) -> Error {
     Error::JsonRpc(JsonRpcError::method_not_found(&format!(
         "Prompt not found: {name}"
     )))
-}
-
-/// Releases a live task's registry entry however its handler leaves.
-///
-/// The handler can return, panic, or be dropped. Unregistering only on the
-/// return path left a panicking handler's entry installed, so a later
-/// `tasks/cancel` found a handle nobody was reading and took the live path
-/// instead of the store one (#1305).
-struct LiveTaskRegistration {
-    router: McpRouter,
-    task_id: String,
-}
-
-impl Drop for LiveTaskRegistration {
-    fn drop(&mut self) {
-        self.router.unregister_live_task(&self.task_id);
-    }
 }
 
 /// Whether this request is using the final, stateless 2026-07-28 lifecycle.
@@ -193,12 +176,9 @@ struct McpRouterInner {
     /// `None` derives from whether a notification channel is attached, which
     /// is what this router has always advertised (#1338).
     advertise_mcp_logging: Option<bool>,
-    /// Live tasks currently running, keyed by task id (#1246).
-    ///
-    /// A live handler parks inside its own future rather than returning, so
-    /// the router needs a handle to wake it when `tasks/update` commits and
-    /// to signal it when `tasks/cancel` arrives.
-    live_tasks: Arc<Mutex<HashMap<String, Arc<crate::tool::LiveTask>>>>,
+    /// Admission, cancellation, and drain boundary for built-in live task
+    /// handlers. Shared by every clone and fresh logical session.
+    live_task_executions: crate::LiveTaskExecutionHandle,
     /// In-flight requests for cancellation tracking (shared across clones).
     ///
     /// Keyed by request id for lookup, but each id holds one entry per
@@ -681,7 +661,7 @@ impl McpRouter {
                 advertise_prompts_list_changed: None,
                 advertise_resources_list_changed: None,
                 advertise_mcp_logging: None,
-                live_tasks: Arc::new(Mutex::new(HashMap::new())),
+                live_task_executions: crate::LiveTaskExecutionHandle::new(),
                 in_flight: Arc::new(RwLock::new(HashMap::new())),
                 next_dispatch: Arc::new(AtomicU64::new(0)),
                 notification_tx: None,
@@ -866,6 +846,21 @@ impl McpRouter {
         T: Send + Sync + 'static,
     {
         self.task_owner_resolver(move |extensions| extensions.get::<T>().map(&map))
+    }
+
+    /// Return host-side lifecycle control for built-in live Task executions.
+    ///
+    /// Clone this handle before moving the router into a transport. It can
+    /// close live-handler admission, inspect active execution IDs, request
+    /// cancellation, and wait for settlement during graceful shutdown.
+    /// Replay task handlers and durable [`TaskStore`] records are not tracked.
+    ///
+    /// The handle is shared by all clones and fresh sessions of this router.
+    /// Transport shutdown remains separate: the application chooses when to
+    /// close admission, whether to cancel, and how long to await
+    /// [`crate::LiveTaskExecutionHandle::drained`].
+    pub fn live_task_execution_handle(&self) -> crate::LiveTaskExecutionHandle {
+        self.inner.live_task_executions.clone()
     }
 
     /// Set the root router's client-visible Task error policy.
@@ -2035,6 +2030,30 @@ impl McpRouter {
                                 TaskFailure::Internal("Task owner resolver failed"),
                             )
                         })?;
+
+                    // Reserve a live-execution slot before allocating durable
+                    // Task state. The reservation spans creation and
+                    // preparation, so close + drain cannot miss an invocation
+                    // in the gap before its task ID is registered (#1398).
+                    let mut live_admission = if tool.live_handler.is_some() {
+                        Some(
+                            self.inner
+                                .live_task_executions
+                                .registry
+                                .admit()
+                                .ok_or_else(|| {
+                                    self.task_error(
+                                        TaskOperation::Create,
+                                        None,
+                                        TaskFailure::Internal(
+                                            "Live task execution admission is closed",
+                                        ),
+                                    )
+                                })?,
+                        )
+                    } else {
+                        None
+                    };
                     // Create the task
                     let (task_id, cancellation_token) = self
                         .inner
@@ -2069,7 +2088,13 @@ impl McpRouter {
                     );
 
                     let task_store = self.inner.task_store.clone();
-                    let task_context = crate::tool::TaskContext::new(task_id.clone());
+                    let task_context = match live_admission.as_ref() {
+                        Some(admission) => crate::tool::TaskContext::with_cancellation(
+                            task_id.clone(),
+                            admission.cancellation(),
+                        ),
+                        None => crate::tool::TaskContext::new(task_id.clone()),
+                    };
                     let mut ctx = ctx;
                     ctx.extensions_mut().insert(task_context.clone());
                     let preparation = match tool
@@ -2121,40 +2146,36 @@ impl McpRouter {
 
                     let tool_name = params.name.clone();
                     let notifier = self.clone();
+                    let live_execution = tool.live_handler.clone().map(|live_handler| {
+                        let admission = live_admission
+                            .take()
+                            .expect("a live handler reserved execution admission");
+                        let cancellation = admission.cancellation();
+                        let handle = std::sync::Arc::new(crate::tool::LiveTask {
+                            store: task_store.clone(),
+                            error_policy: notifier.inner.task_error_policy.clone(),
+                            input_ready: tokio::sync::Notify::new(),
+                            cancellation: cancellation.clone(),
+                        });
+                        if cancellation_token.is_cancelled() {
+                            cancellation.cancel(None);
+                        }
+                        // Promotion replaces the anonymous preparation
+                        // reservation with an ID-bearing registration under a
+                        // single lock. It happens before spawn, so close +
+                        // drain cannot observe an empty registry between the
+                        // two lifecycle phases (#1398).
+                        let registration = admission.promote(task_id_clone.clone(), handle.clone());
+                        (live_handler, handle, cancellation, registration)
+                    });
                     tokio::spawn(async move {
                         // A live handler owns its execution: it parks inside
                         // its own future rather than returning, so it is never
                         // replayed and nothing else writes its terminal state
                         // (#1246).
-                        if let Some(live_handler) = tool.live_handler.clone() {
-                            let handle = std::sync::Arc::new(crate::tool::LiveTask {
-                                store: task_store.clone(),
-                                error_policy: notifier.inner.task_error_policy.clone(),
-                                input_ready: tokio::sync::Notify::new(),
-                                cancelled: crate::context::CancellationToken::new(),
-                            });
-                            // Register before inspecting the store token, not
-                            // after. A `tasks/cancel` landing between the two
-                            // used to find no live handle, take the store path,
-                            // terminalize, and acknowledge, after which the
-                            // handle was registered uncancelled and the handler
-                            // ran on against an already-cancelled task (#1294).
-                            //
-                            // In this order a cancel before registration is
-                            // caught by the check below, and one after it
-                            // signals the handle directly. There is no ordering
-                            // left where cancellation selects the store path
-                            // while live execution is running and cannot see it.
-                            notifier.register_live_task(&task_id_clone, handle.clone());
-                            // Released on drop, so the entry goes whether the
-                            // handler returns, panics, or is dropped (#1305).
-                            let registration = LiveTaskRegistration {
-                                router: notifier.clone(),
-                                task_id: task_id_clone.clone(),
-                            };
-                            if cancellation_token.is_cancelled() {
-                                handle.cancelled.cancel();
-                            }
+                        if let Some((live_handler, handle, cancellation, registration)) =
+                            live_execution
+                        {
                             let live_ctx =
                                 crate::tool::TaskContext::with_live(task_id_clone.clone(), handle);
 
@@ -2203,20 +2224,31 @@ impl McpRouter {
                                     .record_task_failure(&task_id_clone, error)
                                     .await
                                     .then_some("failed"),
-                                Ok(crate::tool::TaskOutcome::Cancelled { message }) => notifier
-                                    .record_task_cancellation(&task_id_clone, message.as_deref())
-                                    .await
-                                    .then_some("cancelled"),
+                                Ok(crate::tool::TaskOutcome::Cancelled { message }) => {
+                                    let message = message.or_else(|| cancellation.reason());
+                                    notifier
+                                        .record_task_cancellation(
+                                            &task_id_clone,
+                                            message.as_deref(),
+                                        )
+                                        .await
+                                        .then_some("cancelled")
+                                }
                                 // Propagating the cancellation error is the
                                 // ordinary way a live handler unwinds, so it
                                 // ends the task cancelled rather than failed.
-                                Err(crate::error::Error::TaskCancelled) => notifier
-                                    .record_task_cancellation(
-                                        &task_id_clone,
-                                        Some("handler observed cancellation"),
-                                    )
-                                    .await
-                                    .then_some("cancelled"),
+                                Err(crate::error::Error::TaskCancelled) => {
+                                    let reason = cancellation.reason();
+                                    notifier
+                                        .record_task_cancellation(
+                                            &task_id_clone,
+                                            reason
+                                                .as_deref()
+                                                .or(Some("handler observed cancellation")),
+                                        )
+                                        .await
+                                        .then_some("cancelled")
+                                }
                                 // An unclassified error is an execution
                                 // failure the handler declined to describe.
                                 Err(Error::JsonRpc(error)) => notifier
@@ -3071,7 +3103,7 @@ impl McpRouter {
                     // stopped, so completion can still legitimately win the
                     // race. SEP-2663 describes cancellation as eventually
                     // consistent, which is exactly this (#1246).
-                    if self.signal_live_cancellation(&params.task_id) {
+                    if self.signal_live_cancellation(&params.task_id, params.reason.as_deref()) {
                         self.notify_task_state(&params.task_id).await;
                         return Ok(McpResponse::FinalTaskAck(
                             crate::tasks::TaskAcknowledgement::new(),
@@ -3112,7 +3144,7 @@ impl McpRouter {
 
                 // Same reasoning as the final path: a live task owns its own
                 // teardown, so it is signalled and left non-terminal (#1246).
-                if self.signal_live_cancellation(&params.task_id) {
+                if self.signal_live_cancellation(&params.task_id, params.reason.as_deref()) {
                     self.notify_task_state(&params.task_id).await;
                     return Ok(McpResponse::CancelTask(EmptyResult {}));
                 }

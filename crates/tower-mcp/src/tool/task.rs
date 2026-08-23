@@ -14,6 +14,7 @@ use super::*;
 pub struct TaskContext {
     task_id: String,
     live: Option<Arc<LiveTask>>,
+    cancellation: Option<Arc<crate::task_execution::LiveTaskCancellation>>,
 }
 
 impl std::fmt::Debug for TaskContext {
@@ -21,6 +22,7 @@ impl std::fmt::Debug for TaskContext {
         f.debug_struct("TaskContext")
             .field("task_id", &self.task_id)
             .field("live", &self.live.is_some())
+            .field("cancellable", &self.cancellation.is_some())
             .finish()
     }
 }
@@ -43,7 +45,7 @@ pub(crate) struct LiveTask {
     pub(crate) error_policy: crate::router::TaskErrorPolicy,
     /// Signalled after responses are durably recorded, never before.
     pub(crate) input_ready: tokio::sync::Notify,
-    pub(crate) cancelled: crate::context::CancellationToken,
+    pub(crate) cancellation: Arc<crate::task_execution::LiveTaskCancellation>,
 }
 
 /// How a live task ended.
@@ -67,7 +69,8 @@ pub enum TaskOutcome {
     ///
     /// Returned by the handler rather than imposed by the store, so a task
     /// stays non-terminal between the `tasks/cancel` acknowledgement and the
-    /// worker confirming it stopped.
+    /// worker confirming it stopped. If `message` is absent, the router uses
+    /// the reason from the first client or host cancellation request.
     Cancelled {
         /// Optional detail for the task's status message.
         message: Option<String>,
@@ -79,13 +82,27 @@ impl TaskContext {
         Self {
             task_id,
             live: None,
+            cancellation: None,
+        }
+    }
+
+    pub(crate) fn with_cancellation(
+        task_id: String,
+        cancellation: Arc<crate::task_execution::LiveTaskCancellation>,
+    ) -> Self {
+        Self {
+            task_id,
+            live: None,
+            cancellation: Some(cancellation),
         }
     }
 
     pub(crate) fn with_live(task_id: String, live: Arc<LiveTask>) -> Self {
+        let cancellation = live.cancellation.clone();
         Self {
             task_id,
             live: Some(live),
+            cancellation: Some(cancellation),
         }
     }
 
@@ -218,7 +235,7 @@ impl TaskContext {
         }
         let asked: Vec<String> = requests.keys().cloned().collect();
 
-        if live.cancelled.is_cancelled() {
+        if live.cancellation.is_cancelled() {
             return Err(crate::error::Error::TaskCancelled);
         }
 
@@ -282,22 +299,40 @@ impl TaskContext {
 
     /// Whether this task has been asked to cancel.
     ///
+    /// Available during live-task preparation as well as handler execution.
     /// A live task stays non-terminal until its handler returns, so this being
     /// true means the request arrived, not that the task is over.
     pub fn is_cancelled(&self) -> bool {
-        self.live
+        self.cancellation
             .as_ref()
-            .is_some_and(|live| live.cancelled.is_cancelled())
+            .is_some_and(|cancellation| cancellation.is_cancelled())
+    }
+
+    /// Return the reason supplied with the first cancellation request.
+    ///
+    /// Both client `tasks/cancel` reasons and host reasons from
+    /// [`crate::LiveTaskExecutionHandle::cancel_all`] reach this method. The
+    /// returned string is a snapshot because cancellation state is shared
+    /// across the handler and host control handle.
+    pub fn cancellation_reason(&self) -> Option<String> {
+        self.cancellation
+            .as_ref()
+            .and_then(|cancellation| cancellation.reason())
     }
 
     /// Resolves when this task is asked to cancel.
     ///
-    /// Only needed by a handler that interleaves teardown with its own work.
+    /// A live handler uses this when it interleaves teardown with its own
+    /// work. Task preparation receives the same signal, so a cooperative
+    /// preparer can release resources and return when a host cancels its
+    /// anonymous admission reservation. Replay contexts have no live
+    /// cancellation source and wait forever here.
+    ///
     /// A handler that awaits [`require_input`](Self::require_input) gets
-    /// correct behaviour from the error it returns.
+    /// correct behaviour from the error it returns without calling this.
     pub async fn cancelled(&self) {
-        match self.live.as_ref() {
-            Some(live) => live.cancelled.cancelled().await,
+        match self.cancellation.as_ref() {
+            Some(cancellation) => cancellation.cancelled().await,
             None => std::future::pending().await,
         }
     }
@@ -308,6 +343,7 @@ impl Clone for TaskContext {
         Self {
             task_id: self.task_id.clone(),
             live: self.live.clone(),
+            cancellation: self.cancellation.clone(),
         }
     }
 }
@@ -387,7 +423,7 @@ impl PendingInput {
     pub async fn wait(self) -> Result<InputResponses> {
         let live = &self.live;
 
-        if live.cancelled.is_cancelled() {
+        if live.cancellation.is_cancelled() {
             return Err(crate::error::Error::TaskCancelled);
         }
 
@@ -408,7 +444,7 @@ impl PendingInput {
                     ))
                 })?;
             let Some(outstanding) = outstanding else {
-                if live.cancelled.is_cancelled() {
+                if live.cancellation.is_cancelled() {
                     return Err(crate::error::Error::TaskCancelled);
                 }
                 return Err(crate::error::Error::JsonRpc(
@@ -425,7 +461,7 @@ impl PendingInput {
 
             tokio::select! {
                 _ = woken => {}
-                _ = live.cancelled.cancelled() => {
+                _ = live.cancellation.cancelled() => {
                     return Err(crate::error::Error::TaskCancelled);
                 }
             }
@@ -443,7 +479,7 @@ impl PendingInput {
                 ))
             })?;
         let Some(all) = all else {
-            if live.cancelled.is_cancelled() {
+            if live.cancellation.is_cancelled() {
                 return Err(crate::error::Error::TaskCancelled);
             }
             return Err(crate::error::Error::JsonRpc(

@@ -348,6 +348,51 @@ unbounded by default, and a client holding an SSE notification stream open
 counts as in flight, so a server that has to stop within a deadline should
 set it.
 
+A Task-backed `tools/call` stops counting as an HTTP request after its Task
+object has been returned, while a built-in live handler can continue running.
+Use the router's live-execution handle when shutdown must also settle those
+detached futures:
+
+```rust,no_run
+use std::time::Duration;
+
+use tower_mcp::{BoxError, HttpTransport, McpRouter};
+
+#[tokio::main]
+async fn main() -> Result<(), BoxError> {
+    let router = McpRouter::new();
+    let executions = router.live_task_execution_handle();
+    let shutdown_executions = executions.clone();
+
+    HttpTransport::new(router)
+        .drain_timeout(Duration::from_secs(10))
+        .serve_with_shutdown("0.0.0.0:3000", async move {
+            let _ = tokio::signal::ctrl_c().await;
+            // Shares the same registry as every transport-owned router clone.
+            shutdown_executions.close_admission();
+        })
+        .await?;
+
+    // This policy chooses cancellation after HTTP and subscription drain.
+    // Cancelling earlier, or allowing natural settlement, is also a valid
+    // application choice.
+    executions.cancel_all("server shutting down");
+    if tokio::time::timeout(Duration::from_secs(20), executions.drained())
+        .await
+        .is_err()
+    {
+        tracing::warn!("live task execution drain timed out");
+    }
+    Ok(())
+}
+```
+
+The handle covers `live_task_handler` executions, including task preparation;
+it does not treat every durable `TaskStore` record as in-process work. The
+transport deliberately does not call `cancel_all` or choose a live-execution
+deadline. Close admission before cancellation so an execution cannot arrive
+after the cancellation pass, and keep timeout/escalation policy in the host.
+
 Own the axum lifecycle instead when the MCP endpoint is one route among
 several, or is mounted somewhere other than the root:
 
@@ -384,7 +429,7 @@ metric labels.
 - [ ] Decide whether legacy sessions are optional or required.
 - [ ] Use affinity and/or shared stores according to the legacy features in use.
 - [ ] Disable proxy buffering and set stream-aware idle timeouts.
-- [ ] Bound bodies, sessions, handler execution, and graceful drain time.
+- [ ] Bound bodies, sessions, handler execution, HTTP drain, and live Task drain time.
 - [ ] Test JSON responses, POST SSE, legacy GET SSE/resumption if supported,
       final `subscriptions/listen`, 202 notifications, and error bodies.
 - [ ] Separate liveness from dependency-aware readiness.

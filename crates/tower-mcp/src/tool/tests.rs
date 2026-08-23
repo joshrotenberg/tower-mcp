@@ -136,7 +136,7 @@ async fn live_working_reports_a_terminal_race_through_the_task_policy() {
             crate::error::JsonRpcError::internal_error("mapped terminal race")
         }),
         input_ready: tokio::sync::Notify::new(),
-        cancelled: crate::context::CancellationToken::new(),
+        cancellation: Arc::new(crate::task_execution::LiveTaskCancellation::new()),
     });
     let context = TaskContext::with_live("task_terminal".into(), live);
 
@@ -162,7 +162,7 @@ fn mapped_live(store: TerminalStatusStore) -> Arc<LiveTask> {
             crate::error::JsonRpcError::internal_error("mapped missing input state")
         }),
         input_ready: tokio::sync::Notify::new(),
-        cancelled: crate::context::CancellationToken::new(),
+        cancellation: Arc::new(crate::task_execution::LiveTaskCancellation::new()),
     })
 }
 

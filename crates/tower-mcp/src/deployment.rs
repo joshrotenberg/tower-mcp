@@ -119,6 +119,15 @@
 //! If you serve the router yourself with `into_router()`, the equivalent of
 //! all this is `axum::serve(..).with_graceful_shutdown(..)`.
 //!
+//! A built-in live Task handler is detached after its `tools/call` returns a
+//! Task object, so transport request drain does not wait for that handler.
+//! Obtain [`McpRouter::live_task_execution_handle`](crate::McpRouter::live_task_execution_handle)
+//! before moving the router, close its admission when shutdown begins, and
+//! then either await natural settlement or call
+//! [`cancel_all`](crate::LiveTaskExecutionHandle::cancel_all) before a
+//! caller-bounded [`drained`](crate::LiveTaskExecutionHandle::drained) wait.
+//! The transport intentionally does not choose that cancellation policy.
+//!
 //! # Health Checks
 //!
 //! [`HttpTransport`] exposes `GET /health` returning `200 OK` with a JSON

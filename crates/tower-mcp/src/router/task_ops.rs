@@ -395,10 +395,7 @@ impl McpRouter {
     /// Returns false when the task is not live, which is how the caller knows
     /// to fall back to replay (#1246).
     pub(super) fn wake_live_task(&self, task_id: &str) -> bool {
-        let Ok(live) = self.inner.live_tasks.lock() else {
-            return false;
-        };
-        match live.get(task_id) {
+        match self.inner.live_task_executions.registry.get(task_id) {
             Some(handle) => {
                 // `notify_one`, not `notify_waiters`: a waiter only registers
                 // when its future is polled, so a `notify_waiters` landing
@@ -415,28 +412,13 @@ impl McpRouter {
     ///
     /// The task stays non-terminal: its handler decides when it has finished
     /// unwinding and says so by returning `TaskOutcome::Cancelled`.
-    pub(super) fn signal_live_cancellation(&self, task_id: &str) -> bool {
-        let Ok(live) = self.inner.live_tasks.lock() else {
-            return false;
-        };
-        match live.get(task_id) {
+    pub(super) fn signal_live_cancellation(&self, task_id: &str, reason: Option<&str>) -> bool {
+        match self.inner.live_task_executions.registry.get(task_id) {
             Some(handle) => {
-                handle.cancelled.cancel();
+                handle.cancellation.cancel(reason.map(str::to_owned));
                 true
             }
             None => false,
-        }
-    }
-
-    pub(super) fn register_live_task(&self, task_id: &str, handle: Arc<crate::tool::LiveTask>) {
-        if let Ok(mut live) = self.inner.live_tasks.lock() {
-            live.insert(task_id.to_string(), handle);
-        }
-    }
-
-    pub(super) fn unregister_live_task(&self, task_id: &str) {
-        if let Ok(mut live) = self.inner.live_tasks.lock() {
-            live.remove(task_id);
         }
     }
 

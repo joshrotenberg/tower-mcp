@@ -562,6 +562,7 @@ pub mod session;
 pub mod session_store;
 #[cfg(feature = "stateless")]
 pub mod stateless;
+mod task_execution;
 pub mod tasks;
 #[cfg(feature = "testing")]
 pub mod testing;
@@ -699,6 +700,7 @@ pub use router::{
     ToolAnnotationsMap,
 };
 pub use session::{SessionPhase, SessionState};
+pub use task_execution::LiveTaskExecutionHandle;
 #[cfg(feature = "stateless")]
 pub use tool::MrtrToolHandler;
 pub use tool::{
