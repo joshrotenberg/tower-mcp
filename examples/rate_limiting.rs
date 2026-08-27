@@ -54,7 +54,7 @@ async fn main() -> Result<(), BoxError> {
                 input.query
             )))
         })
-        .layer(RateLimiterLayer::per_second(10).build())
+        .layer(RateLimiterLayer::per_second(10).build()?)
         .build();
 
     // Tool 2: Email sending with strict rate limit
@@ -68,7 +68,7 @@ async fn main() -> Result<(), BoxError> {
                 input.message.chars().take(50).collect::<String>()
             )))
         })
-        .layer(RateLimiterLayer::per_minute(2).build())
+        .layer(RateLimiterLayer::per_minute(2).build()?)
         .build();
 
     // Tool 3: Database query with combined middleware
@@ -86,7 +86,7 @@ async fn main() -> Result<(), BoxError> {
             )))
         })
         // Layers wrap outside-in: request hits rate limit -> concurrency -> timeout -> handler
-        .layer(RateLimiterLayer::per_second(5).build())
+        .layer(RateLimiterLayer::per_second(5).build()?)
         .layer(ConcurrencyLimitLayer::new(3))
         .layer(TimeoutLayer::new(Duration::from_secs(10)))
         .build();
@@ -101,7 +101,7 @@ async fn main() -> Result<(), BoxError> {
                 input.query
             )))
         })
-        .layer(RateLimiterLayer::burst(20, 30).build())
+        .layer(RateLimiterLayer::burst(20, 30).build()?)
         .build();
 
     // Tool 5: Unrestricted tool for comparison
