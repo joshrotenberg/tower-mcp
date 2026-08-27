@@ -2708,6 +2708,311 @@ async fn a_task_resumes_after_its_input_is_answered() {
     );
 }
 
+/// #1426: a client answering an elicitation with `decline` or `cancel` is
+/// answering it, not failing it. The task has to resume and the handler has
+/// to see which action came back.
+///
+/// `ElicitResult::content` is optional, so these decode as ordinary responses,
+/// but nothing pinned that: every `ElicitAction` in the crate outside the type
+/// definition was `Accept`. rmcp shipped a bug on this exact path (rmcp
+/// #1151), which is why it is worth an assertion rather than an argument from
+/// the types.
+#[cfg(feature = "stateless")]
+async fn task_answered_with(answer: serde_json::Value) -> String {
+    use crate::async_task::{MemoryTaskStore, TaskStore};
+    use crate::protocol::{
+        ElicitFormParams, ElicitFormSchema, ElicitRequestParams, InputRequest, InputRequests,
+        InputRequiredResult, InputResponse, RequestOutcome,
+    };
+
+    fn ask() -> InputRequests {
+        let mut requests: InputRequests = Default::default();
+        requests.insert(
+            "decision".to_string(),
+            InputRequest::Elicit(ElicitRequestParams::Form(ElicitFormParams {
+                mode: None,
+                message: "approve?".to_string(),
+                requested_schema: ElicitFormSchema::new(),
+                meta: None,
+            })),
+        );
+        requests
+    }
+
+    // Reports the action it observed, so the assertion proves the handler saw
+    // the answer rather than merely that the task finished.
+    let asks = ToolBuilder::new("asks")
+        .description("Needs a decision")
+        .task_support(TaskSupportMode::Optional)
+        .mrtr_handler::<serde_json::Value, _, _>(move |ctx, _input| async move {
+            let observed = ctx.input_responses().and_then(|responses| {
+                responses.get("decision").map(|response| match response {
+                    InputResponse::Elicit(result) => format!("{:?}", result.action),
+                    other => format!("unexpected response: {other:?}"),
+                })
+            });
+            match observed {
+                Some(action) => Ok(RequestOutcome::Complete(CallToolResult::text(action))),
+                None => Ok(RequestOutcome::input_required(
+                    InputRequiredResult::with_requests(ask()),
+                )),
+            }
+        })
+        .build();
+
+    let store = std::sync::Arc::new(MemoryTaskStore::new());
+    let mut router = McpRouter::new()
+        .task_store(store.clone())
+        .tool(asks)
+        .with_tasks();
+    init_router(&mut router).await;
+
+    let resp = router
+        .ready()
+        .await
+        .unwrap()
+        .call(RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::CallTool(CallToolParams {
+                input_responses: None,
+                request_state: None,
+                name: "asks".to_string(),
+                arguments: serde_json::json!({}),
+                meta: None,
+                task: None,
+            }),
+            extensions: tasks_client_extensions(),
+        })
+        .await
+        .unwrap();
+    let task_id = match resp.inner {
+        Ok(McpResponse::FinalCreateTask(result)) => result.task.metadata.task_id,
+        other => panic!("expected a created task, got {other:?}"),
+    };
+
+    let mut parked = false;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let task = store.get_task(&task_id).await.unwrap().unwrap();
+        if task.status == TaskStatus::InputRequired {
+            parked = true;
+            break;
+        }
+        assert_ne!(task.status, TaskStatus::Failed, "must park, not fail");
+    }
+    assert!(parked, "the task must reach input_required");
+
+    let update = router
+        .ready()
+        .await
+        .unwrap()
+        .call(RouterRequest {
+            id: RequestId::Number(2),
+            inner: McpRequest::UpdateTask(UpdateTaskParams {
+                task_id: task_id.clone(),
+                input_responses: [("decision".to_string(), answer)].into_iter().collect(),
+                meta: None,
+            }),
+            extensions: tasks_client_extensions(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        update.inner.is_ok(),
+        "answering is answering, whatever the action: {:?}",
+        update.inner
+    );
+
+    let mut completed = None;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let (task, result, _) = store.get_task_result(&task_id).await.unwrap().unwrap();
+        if task.status == TaskStatus::Completed {
+            completed = result;
+            break;
+        }
+        assert_ne!(
+            task.status,
+            TaskStatus::Failed,
+            "a declined answer must resume the task, not fail it"
+        );
+    }
+    completed
+        .expect("the task must complete after resuming")
+        .all_text()
+}
+
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn a_declined_input_response_resumes_the_task() {
+    assert_eq!(
+        task_answered_with(serde_json::json!({"action": "decline"})).await,
+        "Decline"
+    );
+}
+
+/// Dismissing without choosing is still an answer, and a distinct one: a
+/// handler that treats cancel as decline is making a decision the user did
+/// not.
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn a_cancelled_input_response_resumes_the_task() {
+    assert_eq!(
+        task_answered_with(serde_json::json!({"action": "cancel"})).await,
+        "Cancel"
+    );
+}
+
+/// MRTR can ask several things at once, so a decline arrives alongside an
+/// accept rather than alone. Both have to survive the same decode: dropping
+/// the declined one would silently answer a question the user did answer.
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn a_declined_answer_survives_alongside_an_accepted_one() {
+    use crate::async_task::{MemoryTaskStore, TaskStore};
+    use crate::protocol::{
+        ElicitFormParams, ElicitFormSchema, ElicitRequestParams, InputRequest, InputRequests,
+        InputRequiredResult, InputResponse, RequestOutcome,
+    };
+
+    fn ask_both() -> InputRequests {
+        let mut requests: InputRequests = Default::default();
+        for (key, message) in [("decision", "approve?"), ("reason", "why?")] {
+            requests.insert(
+                key.to_string(),
+                InputRequest::Elicit(ElicitRequestParams::Form(ElicitFormParams {
+                    mode: None,
+                    message: message.to_string(),
+                    requested_schema: ElicitFormSchema::new(),
+                    meta: None,
+                })),
+            );
+        }
+        requests
+    }
+
+    let asks = ToolBuilder::new("asks")
+        .description("Needs two decisions")
+        .task_support(TaskSupportMode::Optional)
+        .mrtr_handler::<serde_json::Value, _, _>(move |ctx, _input| async move {
+            let Some(responses) = ctx.input_responses() else {
+                return Ok(RequestOutcome::input_required(
+                    InputRequiredResult::with_requests(ask_both()),
+                ));
+            };
+            // Reported in key order so the assertion sees both, and sees
+            // which action landed against which question.
+            let mut seen: Vec<String> = responses
+                .iter()
+                .map(|(key, response)| match response {
+                    InputResponse::Elicit(result) => format!("{key}={:?}", result.action),
+                    other => format!("{key}=unexpected({other:?})"),
+                })
+                .collect();
+            seen.sort();
+            Ok(RequestOutcome::Complete(CallToolResult::text(
+                seen.join(","),
+            )))
+        })
+        .build();
+
+    let store = std::sync::Arc::new(MemoryTaskStore::new());
+    let mut router = McpRouter::new()
+        .task_store(store.clone())
+        .tool(asks)
+        .with_tasks();
+    init_router(&mut router).await;
+
+    let resp = router
+        .ready()
+        .await
+        .unwrap()
+        .call(RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::CallTool(CallToolParams {
+                input_responses: None,
+                request_state: None,
+                name: "asks".to_string(),
+                arguments: serde_json::json!({}),
+                meta: None,
+                task: None,
+            }),
+            extensions: tasks_client_extensions(),
+        })
+        .await
+        .unwrap();
+    let task_id = match resp.inner {
+        Ok(McpResponse::FinalCreateTask(result)) => result.task.metadata.task_id,
+        other => panic!("expected a created task, got {other:?}"),
+    };
+
+    let mut parked = false;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        if store.get_task(&task_id).await.unwrap().unwrap().status == TaskStatus::InputRequired {
+            parked = true;
+            break;
+        }
+    }
+    assert!(parked, "the task must reach input_required");
+
+    let update = router
+        .ready()
+        .await
+        .unwrap()
+        .call(RouterRequest {
+            id: RequestId::Number(2),
+            inner: McpRequest::UpdateTask(UpdateTaskParams {
+                task_id: task_id.clone(),
+                input_responses: [
+                    (
+                        "decision".to_string(),
+                        serde_json::json!({"action": "accept", "content": {}}),
+                    ),
+                    (
+                        "reason".to_string(),
+                        serde_json::json!({"action": "decline"}),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                meta: None,
+            }),
+            extensions: tasks_client_extensions(),
+        })
+        .await
+        .unwrap();
+    assert!(update.inner.is_ok(), "{:?}", update.inner);
+
+    let mut completed = None;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let (task, result, _) = store.get_task_result(&task_id).await.unwrap().unwrap();
+        if task.status == TaskStatus::Completed {
+            completed = result;
+            break;
+        }
+        assert_ne!(task.status, TaskStatus::Failed, "must resume, not fail");
+    }
+    assert_eq!(
+        completed
+            .expect("the task must complete after resuming")
+            .all_text(),
+        "decision=Accept,reason=Decline"
+    );
+}
+
+/// The accept case through the same path, so a failure in the two above is
+/// about the action and not about the harness.
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn an_accepted_input_response_resumes_the_task() {
+    assert_eq!(
+        task_answered_with(serde_json::json!({"action": "accept", "content": {}})).await,
+        "Accept"
+    );
+}
+
 /// #1389: an ordinary task handler may never poll RequestContext. The router
 /// owns that future, so it must drop it when the store's TTL token fires rather
 /// than leaving unreachable work running forever.
