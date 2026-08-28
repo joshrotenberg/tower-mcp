@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.22.3] - 2026-08-28
+
+### Testing
+
+- **tasks:** Pin declined and cancelled elicitation responses (closes #1426) ([#1434](https://github.com/joshrotenberg/tower-mcp/pull/1434))
+- **stdio:** Isolate the frame-tracing tests into their own binary (closes #1435) ([#1436](https://github.com/joshrotenberg/tower-mcp/pull/1436))
+
+
+
 ## [0.22.2] - 2026-08-23
 
 ### Bug Fixes
