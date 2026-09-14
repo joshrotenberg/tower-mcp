@@ -60,6 +60,7 @@ use std::sync::Arc;
 
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
+use tokio::task::JoinSet;
 
 use crate::context::{
     ChannelClientRequester, ClientRequesterHandle, NotificationReceiver, NotificationSender,
@@ -2030,8 +2031,10 @@ struct PendingRequest {
 /// }
 /// ```
 pub struct BidirectionalStdioTransport<S = McpRouter> {
-    /// Fires when the read loop ends (#1252).
+    /// Fires when the read loop ends, before draining responses (#1252).
     stopping: tokio::sync::watch::Sender<bool>,
+    /// How long to wait for in-flight requests after input ends.
+    drain_timeout: Option<std::time::Duration>,
     service: JsonRpcService<S>,
     router: McpRouter,
     /// Channel for receiving outgoing requests to send to the client
@@ -2069,6 +2072,7 @@ impl BidirectionalStdioTransport<McpRouter> {
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             notification_rx,
             stopping: stopping_signal(),
+            drain_timeout: None,
             control_tx,
             control_rx,
         }
@@ -2119,6 +2123,7 @@ impl BidirectionalStdioTransport<McpRouter> {
 
         BidirectionalStdioTransport {
             stopping: self.stopping,
+            drain_timeout: self.drain_timeout,
             service: JsonRpcService::new(service).protocol_support(protocol_support),
             router: self.router,
             request_rx: self.request_rx,
@@ -2139,6 +2144,18 @@ where
         + 'static,
     S::Future: Send,
 {
+    /// Bound how long the transport waits for in-flight requests after input
+    /// ends or [`StdioTransportHandle::shutdown`] is called.
+    ///
+    /// By default, all dispatched requests are allowed to finish writing their
+    /// responses. A deadline aborts any dispatches still running when it expires.
+    /// Pair this with [`StdioTransportHandle::stopping`] to let the application
+    /// release handlers as soon as the read loop ends.
+    pub fn drain_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.drain_timeout = Some(timeout);
+        self
+    }
+
     /// Return a cloneable handle for graceful subscription closure or server
     /// shutdown while [`Self::run`] is active.
     pub fn handle(&self) -> StdioTransportHandle {
@@ -2197,6 +2214,11 @@ where
     /// paths can share it with the incoming-message branch -- the same
     /// concurrency model `run()` has always used, just with the streams
     /// supplied by the caller.
+    ///
+    /// When input ends, outstanding server-to-client requests fail because
+    /// their responses can no longer be read. Dispatched inbound requests finish
+    /// writing their responses before this returns, subject to
+    /// [`Self::drain_timeout`].
     pub async fn run_with_streams<R, W>(&mut self, reader: R, writer: W) -> Result<()>
     where
         R: tokio::io::AsyncRead + Unpin + Send,
@@ -2204,6 +2226,7 @@ where
     {
         let writer = Arc::new(Mutex::new(writer));
         let mut frames = FrameReader::new(reader);
+        let mut in_flight = JoinSet::new();
         #[cfg(feature = "stateless")]
         let mut subscriptions = StdioSubscriptions {
             server_info: Some(self.router.implementation()),
@@ -2234,6 +2257,7 @@ where
                     self.handle_incoming_message(
                         trimmed,
                         writer.clone(),
+                        &mut in_flight,
                         #[cfg(feature = "stateless")]
                         &mut subscriptions,
                     ).await?;
@@ -2242,6 +2266,13 @@ where
                 // Handle outgoing requests to send to the client
                 Some(outgoing) = self.request_rx.recv() => {
                     self.send_outgoing_request(outgoing, writer.clone()).await?;
+                }
+
+                // Reap completed dispatches while the connection stays open.
+                Some(result) = in_flight.join_next(), if !in_flight.is_empty() => {
+                    if let Err(error) = result {
+                        tracing::error!(%error, "Request dispatch task failed");
+                    }
                 }
 
                 // Forward server notifications to the client
@@ -2290,6 +2321,32 @@ where
 
         let _ = self.stopping.send(true);
 
+        // No more client responses can arrive. Release both queued and already
+        // sent requests so elicitation/sampling cannot deadlock the drain.
+        self.request_rx.close();
+        while self.request_rx.try_recv().is_ok() {}
+        self.pending_requests.lock().await.clear();
+
+        let drain = async {
+            while let Some(result) = in_flight.join_next().await {
+                if let Err(error) = result {
+                    tracing::error!(%error, "Request dispatch task failed");
+                }
+            }
+        };
+        match self.drain_timeout {
+            None => drain.await,
+            Some(limit) => {
+                if tokio::time::timeout(limit, drain).await.is_err() {
+                    tracing::warn!(
+                        timeout_ms = limit.as_millis() as u64,
+                        "drain timed out; aborting in-flight requests"
+                    );
+                    in_flight.shutdown().await;
+                }
+            }
+        }
+
         // The read loop is over: any streams still registered die with
         // the connection and cannot receive a terminal frame.
         #[cfg(feature = "stateless")]
@@ -2302,6 +2359,7 @@ where
         &mut self,
         line: &str,
         writer: Arc<Mutex<W>>,
+        in_flight: &mut JoinSet<()>,
         #[cfg(feature = "stateless")] subscriptions: &mut StdioSubscriptions,
     ) -> Result<()>
     where
@@ -2385,7 +2443,7 @@ where
         // handler awaits the client's response, but that response can only be
         // read by this same loop (#923).
         let mut service = self.service.clone();
-        tokio::spawn(async move {
+        in_flight.spawn(async move {
             let response_json = match service.call_message(message).await {
                 Ok(response) => serde_json::to_string(&response),
                 Err(e) => {
