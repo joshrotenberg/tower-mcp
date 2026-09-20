@@ -176,8 +176,8 @@ mod rmcp_server {
 
     #[tool_handler]
     impl ServerHandler for EchoServer {
-        fn get_info(&self) -> ServerInfo {
-            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
                 .with_server_info(Implementation::new("rmcp-compat-test", "0.1.0"))
                 .with_protocol_version(ProtocolVersion::V_2025_11_25)
         }
@@ -326,8 +326,8 @@ mod rmcp_server {
             Some(requested.clone())
         }
 
-        fn get_info(&self) -> ServerInfo {
-            ServerInfo::new(
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(
                 ServerCapabilities::builder()
                     .enable_tools()
                     .enable_tool_list_changed()
