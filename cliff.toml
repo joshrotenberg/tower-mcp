@@ -17,7 +17,8 @@ body = """
 {% for group, commits in commits | group_by(attribute="group") %}
     ### {{ group | striptags | trim | upper_first }}
     {% for commit in commits %}
-        - {% if commit.scope %}**{{ commit.scope }}:** {% endif %}\
+        - {% if commit.breaking %}[**breaking**] {% endif %}\
+            {% if commit.scope %}**{{ commit.scope }}:** {% endif %}\
             {{ commit.message | upper_first }}\
     {% endfor %}
 {% endfor %}\n
@@ -43,7 +44,10 @@ commit_parsers = [
     { message = "^chore|^ci", group = "Miscellaneous Tasks" },
     { body = ".*security", group = "Security" },
 ]
-protect_breaking_commits = false
+# A breaking commit is never skipped, even by a parser that would skip it.
+# `chore(deps)` is skipped below, and a dependency bump that changes a
+# re-exported type is still a breaking change a user has to read about.
+protect_breaking_commits = true
 filter_commits = false
 topo_order = false
 sort_commits = "oldest"
