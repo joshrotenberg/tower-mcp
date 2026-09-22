@@ -24,16 +24,34 @@
 //! | `RateLimiterLayer` | `RateLimiterHandle` | Rate limiting |
 //! | `BulkheadLayer` | `BulkheadHandle` | Concurrency limiting |
 //!
-//! Use `build_with_handle()` on any builder to get both a layer and a handle:
+//! Use `build_with_handle()` on any builder to get both a layer and a handle.
 //!
-//! ```rust,ignore
-//! use tower_mcp::middleware::CircuitBreakerLayer;
+//! Every builder validates its configuration when it is built, so `build()`
+//! and `build_with_handle()` return a `Result`. This changed in 0.23.0, which
+//! moved to tower-resilience 0.13; before that they returned the layer
+//! directly. A configuration that cannot work, such as a zero-capacity
+//! bulkhead, is now an error at construction rather than a layer that rejects
+//! every call.
 //!
-//! let (layer, handle) = CircuitBreakerLayer::builder()
+//! ```rust
+//! # #[cfg(feature = "resilience")]
+//! # fn main() -> Result<(), tower_mcp::BoxError> {
+//! use tower_mcp::middleware::{BulkheadLayer, CircuitBreakerLayer, RateLimiterLayer};
+//!
+//! let (breaker, breaker_handle) = CircuitBreakerLayer::builder()
 //!     .failure_rate_threshold(0.5)
-//!     .build_with_handle();
+//!     .build_with_handle()?;
+//! let (limiter, limiter_handle) = RateLimiterLayer::per_second(10).build_with_handle()?;
+//! let (bulkhead, bulkhead_handle) = BulkheadLayer::builder()
+//!     .max_concurrent_calls(4)
+//!     .build_with_handle()?;
 //!
-//! // handle.state(), handle.health_status(), handle.metrics().await
+//! // breaker_handle.state(), limiter_handle, bulkhead_handle, ... for monitoring
+//! # let _ = (breaker, breaker_handle, limiter, limiter_handle, bulkhead, bulkhead_handle);
+//! # Ok(())
+//! # }
+//! # #[cfg(not(feature = "resilience"))]
+//! # fn main() {}
 //! ```
 //!
 //! Errors from resilience layers are automatically converted to JSON-RPC
