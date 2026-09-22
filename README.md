@@ -24,7 +24,7 @@ covers installation and a first server.
 
 ```toml
 [dependencies]
-tower-mcp = "0.22"
+tower-mcp = "0.23"
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
@@ -128,7 +128,7 @@ validators. `tower-mcp` re-exports all of it, so there is no duplication if you 
 
 ```toml
 [dependencies]
-tower-mcp-types = "0.22"
+tower-mcp-types = "0.23"
 ```
 
 ## Documentation
