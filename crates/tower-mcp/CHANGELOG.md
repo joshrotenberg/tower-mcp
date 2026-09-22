@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.23.0] - 2026-09-22
+
+### Bug Fixes
+
+- **stdio:** Drain bidirectional responses before shutdown ([#1457](https://github.com/joshrotenberg/tower-mcp/pull/1457))
+
+### Documentation
+
+- [**breaking**] **middleware:** Document the fallible tower-resilience 0.13 builders ([#1458](https://github.com/joshrotenberg/tower-mcp/pull/1458))
+
+### Testing
+
+- **tasks:** Pin declined and cancelled elicitation responses (closes #1426) ([#1434](https://github.com/joshrotenberg/tower-mcp/pull/1434))
+- **stdio:** Isolate the frame-tracing tests into their own binary (closes #1435) ([#1436](https://github.com/joshrotenberg/tower-mcp/pull/1436))
+
+
+
 ## [0.22.2] - 2026-08-23
 
 ### Bug Fixes
