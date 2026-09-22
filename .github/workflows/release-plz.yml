@@ -9,6 +9,18 @@ on:
     branches:
       - main
 
+# Merges close together used to start runs in parallel, and whichever
+# finished last force-pushed the release PR. When that was the run for the
+# older commit, the PR described a main that no longer existed: merging
+# two PRs six seconds apart left the release PR at 0.22.3 without the second
+# one. Queueing makes the newest state the last one written.
+#
+# Not cancelled: this job also publishes to crates.io, and a publish must
+# never be stopped partway through.
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release-plz:
     name: Release-plz
