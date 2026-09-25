@@ -9,11 +9,28 @@ All notable changes to this project will be documented in this file.
 - **stdio:** Drain bidirectional responses before shutdown ([#1457](https://github.com/joshrotenberg/tower-mcp/pull/1457))
 - **types:** Reject a JSON-RPC response carrying both result and error (closes #1481) ([#1495](https://github.com/joshrotenberg/tower-mcp/pull/1495))
 - **http:** Answer handler-produced protocol errors with HTTP 400 on 2026-07-28 (closes #1477) ([#1494](https://github.com/joshrotenberg/tower-mcp/pull/1494))
+
+  On the 2026-07-28 path, a header mismatch (-32020), unsupported protocol
+  version (-32022), or invalid params (-32602) error produced by the router, a
+  handler, or a tower layer is now sent with HTTP 400 instead of 200. The
+  JSON-RPC body is unchanged.
 - **client:** Validate the protocol version the server selects (closes #1473) ([#1493](https://github.com/joshrotenberg/tower-mcp/pull/1493))
 - **docs:** Gate the 2026-07-28 protocol_versions examples on the feature (closes #1490) ([#1492](https://github.com/joshrotenberg/tower-mcp/pull/1492))
 - **framing:** Bound newline-delimited frame length (closes #1470) ([#1488](https://github.com/joshrotenberg/tower-mcp/pull/1488))
+
+  A newline-delimited frame larger than the limit now fails the connection
+  for that peer instead of buffering without bound. The default is 4 MiB for
+  the stdio server transports and 16 MiB for `StdioClientTransport` and the
+  child-process transport, which read responses; each exposes
+  `max_frame_len(bytes)` to change it.
 - **client:** Deliver an error when an HTTP response carries no reply to the request (closes #1465) ([#1484](https://github.com/joshrotenberg/tower-mcp/pull/1484))
 - [**breaking**] **websocket:** Validate Origin on the WebSocket upgrade (closes #1464) ([#1485](https://github.com/joshrotenberg/tower-mcp/pull/1485))
+
+  `WebSocketTransport` now applies the same `Origin` check as `HttpTransport`
+  before upgrading. Requests without an `Origin` header and localhost origins
+  are accepted; a browser client served from any other origin needs that
+  origin in `WebSocketTransport::allowed_origins`, or
+  `disable_origin_validation()`, or its handshake is answered with 403.
 - **http:** Reject duplicate singleton MCP headers (closes #1468) ([#1487](https://github.com/joshrotenberg/tower-mcp/pull/1487))
 - **oauth-client:** Reauthorize when a stored refresh token is rejected (closes #1463) ([#1486](https://github.com/joshrotenberg/tower-mcp/pull/1486))
 - **client:** Stop tracking replies to server requests as client requests (closes #1466) ([#1497](https://github.com/joshrotenberg/tower-mcp/pull/1497))
@@ -24,6 +41,14 @@ All notable changes to this project will be documented in this file.
 - **http:** Route initialize to the session path regardless of its body version (closes #1474) ([#1502](https://github.com/joshrotenberg/tower-mcp/pull/1502))
 - **oauth-client:** Coordinate refreshes across flows that share a token store (closes #1472) ([#1503](https://github.com/joshrotenberg/tower-mcp/pull/1503))
 - [**breaking**] **client:** Stop following cross-origin redirects with credentials attached (closes #1475) ([#1504](https://github.com/joshrotenberg/tower-mcp/pull/1504))
+
+  The HTTP client follows same-origin redirects only and never follows an
+  https-to-http downgrade. A server that redirects to another origin now fails
+  the request with an error naming the target. Set
+  `HttpClientConfig::follow_cross_origin_redirects` to restore cross-origin
+  redirects; reqwest then forwards custom headers and `mcp-session-id` to the
+  new origin. A client passed through `HttpClientTransport::with_client` keeps
+  its own redirect policy.
 - **oauth-client:** Do not follow redirects on client-credentials token requests (closes #1506) ([#1507](https://github.com/joshrotenberg/tower-mcp/pull/1507))
 - **client:** Honor cancellation of server-initiated requests (closes #1483) ([#1505](https://github.com/joshrotenberg/tower-mcp/pull/1505))
 - **client:** Abort background tasks when the HTTP client transport is dropped (closes #1479) ([#1509](https://github.com/joshrotenberg/tower-mcp/pull/1509))
@@ -36,6 +61,12 @@ All notable changes to this project will be documented in this file.
 ### Features
 
 - **mrtr:** Support request-state key rotation (closes #1471) ([#1489](https://github.com/joshrotenberg/tower-mcp/pull/1489))
+
+  New request-state tokens use a `v2` format carrying a key id; `v1` tokens
+  still decode. During a rolling upgrade from 0.22, replicas still on 0.22
+  reject `v2` tokens as `UnsupportedVersion`, so an MRTR exchange that moves
+  between old and new replicas in that window fails once and is retried from
+  the start.
 - **oauth-client:** Allow an explicit resource indicator on the auth-code flows (closes #1480) ([#1508](https://github.com/joshrotenberg/tower-mcp/pull/1508))
 
 ### Testing
