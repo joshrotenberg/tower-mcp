@@ -1174,7 +1174,9 @@ impl TokenProvider for OAuthAuthorizationFlow {
         }
         let refresh_token = active.token.refresh_token.as_deref().ok_or_else(|| {
             OAuthClientError::TokenRequest(
-                "OAuth access token expired and no refresh token is available".to_string(),
+                "OAuth access token expired and no refresh token is available; call authorize() \
+                 or begin() again to reauthorize"
+                    .to_string(),
             )
         })?;
         let mut fields = vec![
@@ -1218,6 +1220,28 @@ impl TokenProvider for OAuthAuthorizationFlow {
         let access_token = token.access_token.clone();
         *self.inner.current.write().await = Some(ActiveToken { token, ..active });
         Ok(access_token)
+    }
+
+    /// Mark the current access token unusable while keeping the refresh
+    /// token, so the next [`get_token`](Self::get_token) call refreshes
+    /// instead of re-sending a token the server just rejected.
+    ///
+    /// This only touches the in-memory `current` token; nothing is written
+    /// to the token store here. `get_token`'s refresh path already persists
+    /// the replacement the same way an ordinary pre-expiry refresh does, so
+    /// there is nothing left to do once that refresh lands. With no refresh
+    /// token, the next `get_token` call reports that reauthorization is
+    /// needed instead of retrying a token that cannot be renewed.
+    ///
+    /// A concurrent refresh can race this: `get_token` may already be
+    /// mid-refresh under `refresh_lock` and overwrite `current` with a fresh
+    /// token right after this write. That costs one wasted refresh at worst,
+    /// not correctness, so this does not take `refresh_lock` itself (nor
+    /// hold `current`'s write lock across an await).
+    async fn invalidate(&self) {
+        if let Some(active) = self.inner.current.write().await.as_mut() {
+            active.token.expires_at = 0;
+        }
     }
 }
 
@@ -2540,6 +2564,65 @@ mod tests {
         let error = restored.begin(["challenge.scope"]).await.unwrap_err();
         assert!(matches!(error, OAuthClientError::TokenRequest(_)));
         assert!(tokens.load(&binding).await.unwrap().is_some());
+    }
+
+    /// #1467: `invalidate` previously inherited the no-op default, so a 401
+    /// on a token that had not yet expired retried the same rejected token
+    /// forever. It must mark the token unusable so the next `get_token`
+    /// refreshes even though nothing about expiry has changed.
+    #[tokio::test]
+    async fn invalidate_forces_a_refresh_of_a_still_valid_token() {
+        let http = MockOAuthHttp::new(RegistrationMode::Dynamic);
+        let flow = flow_builder(
+            http,
+            dynamic_options(),
+            AutomaticAuthorizationHandler::default(),
+        )
+        .build()
+        .unwrap();
+        flow.authorize(["challenge.scope"]).await.unwrap();
+        assert_eq!(flow.get_token().await.unwrap(), "access-token-0");
+
+        flow.invalidate().await;
+
+        assert_eq!(
+            flow.get_token().await.unwrap(),
+            "refreshed-token",
+            "invalidate() must mark the access token unusable so the next \
+             get_token() refreshes instead of returning the same token"
+        );
+    }
+
+    /// #1467: with no refresh token to fall back on, `invalidate` must leave
+    /// `get_token` reporting that reauthorization is needed rather than
+    /// silently handing back the same now-unusable token.
+    #[tokio::test]
+    async fn invalidate_without_a_refresh_token_reports_reauthorization_is_needed() {
+        let http = MockOAuthHttp::new(RegistrationMode::Dynamic);
+        let flow = flow_builder(
+            http,
+            dynamic_options(),
+            AutomaticAuthorizationHandler::default(),
+        )
+        .build()
+        .unwrap();
+        flow.authorize(["challenge.scope"]).await.unwrap();
+
+        // Simulate a token issued without a refresh token (no offline_access
+        // grant), which the mock token endpoint above does not produce.
+        {
+            let mut current = flow.inner.current.write().await;
+            current.as_mut().unwrap().token.refresh_token = None;
+        }
+
+        flow.invalidate().await;
+
+        let error = flow.get_token().await.unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("reauthorize"),
+            "expected the error to say reauthorization is needed, got: {message}"
+        );
     }
 
     #[tokio::test]
