@@ -62,7 +62,7 @@ impl ChildProcessTransport {
             program: program.into(),
             args: Vec::new(),
             envs: Vec::new(),
-            max_frame_len: crate::framing::DEFAULT_MAX_FRAME_LEN,
+            max_frame_len: crate::framing::DEFAULT_MAX_RESPONSE_FRAME_LEN,
         }
     }
 
@@ -95,7 +95,8 @@ impl ChildProcessTransport {
     /// grow the frame buffer without bound -- the case this connection is
     /// most exposed to, since a child process is often less trusted than a
     /// parent. Once the cap is crossed, reading fails with a transport error
-    /// the same way any other stdout read failure does. Default: 4 MiB.
+    /// the same way any other stdout read failure does. Default: 16 MiB, the
+    /// same per-message cap the HTTP client applies to SSE events.
     ///
     /// ```rust,no_run
     /// use tower_mcp::transport::childproc::ChildProcessTransport;

@@ -25,6 +25,14 @@ use crate::error::{Error, Result};
 /// client's POST body.
 pub(crate) const DEFAULT_MAX_FRAME_LEN: usize = 4 * 1024 * 1024;
 
+/// Default maximum size of one frame read from a server, in bytes (16 MiB).
+///
+/// Used by the stdio client and child-process transports, which read
+/// responses rather than requests. A tool result carrying a large resource
+/// or image can legitimately exceed [`DEFAULT_MAX_FRAME_LEN`], so this
+/// matches the HTTP client's per-event cap, `DEFAULT_MAX_SSE_EVENT_SIZE`.
+pub(crate) const DEFAULT_MAX_RESPONSE_FRAME_LEN: usize = 16 * 1024 * 1024;
+
 /// One newline-delimited frame read from an input stream.
 ///
 /// Framing happens over bytes, not over decoded text. `0x0A` cannot appear
@@ -81,6 +89,7 @@ where
     R: tokio::io::AsyncRead + Unpin,
 {
     /// Create a reader bounded by [`DEFAULT_MAX_FRAME_LEN`].
+    #[cfg(test)]
     pub(crate) fn new(reader: R) -> Self {
         Self::with_max_len(reader, DEFAULT_MAX_FRAME_LEN)
     }

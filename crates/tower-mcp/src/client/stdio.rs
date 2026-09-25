@@ -120,7 +120,10 @@ impl StdioClientTransport {
         Ok(Self {
             child: Some(child),
             stdin: Some(stdin),
-            stdout: FrameReader::new(stdout),
+            stdout: FrameReader::with_max_len(
+                stdout,
+                crate::framing::DEFAULT_MAX_RESPONSE_FRAME_LEN,
+            ),
         })
     }
 
@@ -133,7 +136,7 @@ impl StdioClientTransport {
     /// the parent process is usually trusted. Once the cap is crossed,
     /// [`ClientTransport::recv`] fails with a transport error, the same
     /// outcome any other stdout read failure already produces. Default:
-    /// 4 MiB.
+    /// 16 MiB, the same per-message cap the HTTP client applies to SSE events.
     ///
     /// ```rust,no_run
     /// use tower_mcp::client::StdioClientTransport;
@@ -176,7 +179,10 @@ impl StdioClientTransport {
         Ok(Self {
             child: Some(child),
             stdin: Some(stdin),
-            stdout: FrameReader::new(stdout),
+            stdout: FrameReader::with_max_len(
+                stdout,
+                crate::framing::DEFAULT_MAX_RESPONSE_FRAME_LEN,
+            ),
         })
     }
 }
