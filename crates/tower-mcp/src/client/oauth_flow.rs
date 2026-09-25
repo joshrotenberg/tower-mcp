@@ -1172,6 +1172,26 @@ impl TokenProvider for OAuthAuthorizationFlow {
         if token_is_valid(&active.token, self.inner.refresh_buffer) {
             return Ok(active.token.access_token);
         }
+
+        // Another flow instance, in this process or another, may share this
+        // binding's token store. If it already refreshed, our in-memory
+        // copy is stale; reload the store before spending a network round
+        // trip. Adopting a different, still-valid stored token here also
+        // avoids handing an authorization server that rotates refresh
+        // tokens on use a refresh token it has already consumed, which it
+        // would answer with invalid_grant (#1472).
+        if let Some(stored) = self.inner.token_store.load(&active.binding).await?
+            && tokens_differ(&stored, &active.token)
+            && token_is_valid(&stored, self.inner.refresh_buffer)
+        {
+            let access_token = stored.access_token.clone();
+            *self.inner.current.write().await = Some(ActiveToken {
+                token: stored,
+                ..active
+            });
+            return Ok(access_token);
+        }
+
         let refresh_token = active.token.refresh_token.as_deref().ok_or_else(|| {
             OAuthClientError::TokenRequest(
                 "OAuth access token expired and no refresh token is available; call authorize() \
@@ -1200,13 +1220,43 @@ impl TokenProvider for OAuthAuthorizationFlow {
         let response = match response {
             Ok(response) => response,
             Err(error @ OAuthClientError::TokenRefreshRejected(_)) => {
+                // The refresh token we sent may already have been consumed
+                // by another flow sharing this store: an authorization
+                // server that rotates refresh tokens on use accepts only
+                // the first use and answers invalid_grant to the rest.
+                // Reload once before giving up; if the store now holds a
+                // different, valid token for this binding, adopt it instead
+                // of discarding and forcing reauthorization (#1472).
+                let restored = self.inner.token_store.load(&active.binding).await?;
+                if let Some(stored) = &restored
+                    && tokens_differ(stored, &active.token)
+                    && token_is_valid(stored, self.inner.refresh_buffer)
+                {
+                    let access_token = stored.access_token.clone();
+                    *self.inner.current.write().await = Some(ActiveToken {
+                        token: stored.clone(),
+                        ..active
+                    });
+                    return Ok(access_token);
+                }
                 // The authorization server revoked or expired the refresh
-                // token. Discard it so the next begin() reauthorizes instead
-                // of retrying a dead token on every call. Other failures
+                // token, and the store does not hold a newer one either.
+                // Discard it so the next begin() reauthorizes instead of
+                // retrying a dead token on every call. Other failures
                 // (network errors, 5xx) are left in place; they may be
                 // transient.
                 *self.inner.current.write().await = None;
-                self.inner.token_store.remove(&active.binding).await?;
+                // Only remove the store entry if it still matches the token
+                // we just tried; a concurrent flow may already have saved a
+                // fresh one there, and removing it here would discard a
+                // token that is still good out from under it.
+                let discard = match &restored {
+                    Some(stored) => !tokens_differ(stored, &active.token),
+                    None => true,
+                };
+                if discard {
+                    self.inner.token_store.remove(&active.binding).await?;
+                }
                 return Err(error);
             }
             Err(error) => return Err(error),
@@ -1801,6 +1851,22 @@ fn token_is_valid(token: &OAuthStoredToken, buffer: Duration) -> bool {
     unix_time().saturating_add(buffer.as_secs()) < token.expires_at
 }
 
+/// Whether `a` and `b` are different credentials rather than the same token
+/// persisted twice.
+///
+/// The access token is what identifies a token issuance; a refresh always
+/// mints a new one, so comparing it is enough to detect that another flow
+/// rotated the token. `expires_at` must not decide this: `invalidate()`
+/// (#1467) zeroes the in-memory token's `expires_at` without touching the
+/// store or the refresh token, so comparing full structs (or the refresh
+/// token, which `invalidate()` deliberately leaves untouched to reuse for
+/// the coming refresh) would treat a reload of that same, still-unrevoked
+/// store entry as a genuinely newer token and adopt back the very token
+/// `invalidate()` just marked unusable.
+fn tokens_differ(a: &OAuthStoredToken, b: &OAuthStoredToken) -> bool {
+    a.access_token != b.access_token
+}
+
 fn scopes_are_covered(requested: &[String], granted: &[String]) -> bool {
     requested
         .iter()
@@ -2008,6 +2074,17 @@ mod tests {
         ServerError,
     }
 
+    /// State for a mock authorization server that rotates the refresh token
+    /// on every successful refresh (single use) and rejects a refresh token
+    /// that has already been consumed with RFC 6749 `invalid_grant`. Used to
+    /// simulate an AS that two flows sharing one token store can race
+    /// (#1472).
+    #[derive(Default)]
+    struct RotatingRefresh {
+        valid_refresh_token: String,
+        generation: usize,
+    }
+
     #[derive(Clone)]
     struct MockOAuthHttp {
         mode: RegistrationMode,
@@ -2015,6 +2092,7 @@ mod tests {
         token_requests: Arc<AtomicUsize>,
         expire_initial_token: bool,
         refresh_failure: Option<RefreshFailure>,
+        rotating_refresh: Option<Arc<Mutex<RotatingRefresh>>>,
     }
 
     impl MockOAuthHttp {
@@ -2025,6 +2103,7 @@ mod tests {
                 token_requests: Arc::new(AtomicUsize::new(0)),
                 expire_initial_token: false,
                 refresh_failure: None,
+                rotating_refresh: None,
             }
         }
 
@@ -2042,6 +2121,17 @@ mod tests {
         /// The token endpoint fails a refresh with a transient HTTP 500.
         fn refresh_server_error(mut self) -> Self {
             self.refresh_failure = Some(RefreshFailure::ServerError);
+            self
+        }
+
+        /// The token endpoint issues a single-use refresh token and rotates
+        /// it on every successful refresh, rejecting reuse of a consumed one
+        /// with `invalid_grant`.
+        fn rotating_refresh_tokens(mut self) -> Self {
+            self.rotating_refresh = Some(Arc::new(Mutex::new(RotatingRefresh {
+                valid_refresh_token: "refresh-token-0".to_string(),
+                generation: 0,
+            })));
             self
         }
 
@@ -2137,6 +2227,45 @@ mod tests {
                             }
                         });
                     if grant == "refresh_token" {
+                        if let Some(state) = &self.rotating_refresh {
+                            let refresh_token = fields
+                                .iter()
+                                .find(|(name, _)| name == "refresh_token")
+                                .map(|(_, value)| value.as_str())
+                                .unwrap();
+                            let mut state = state.lock().await;
+                            return if refresh_token == state.valid_refresh_token {
+                                state.generation += 1;
+                                let new_refresh_token =
+                                    format!("refresh-token-{}", state.generation);
+                                state.valid_refresh_token = new_refresh_token.clone();
+                                Ok(Self::response(
+                                    200,
+                                    serde_json::json!({
+                                        "access_token": format!(
+                                            "rotated-access-token-{}",
+                                            state.generation
+                                        ),
+                                        "token_type": "Bearer",
+                                        "expires_in": 3600,
+                                        "refresh_token": new_refresh_token,
+                                        "scope": scope
+                                    }),
+                                ))
+                            } else {
+                                // This refresh token was already consumed by
+                                // an earlier rotation; a real AS answers
+                                // reuse of a single-use refresh token with
+                                // invalid_grant.
+                                Ok(Self::response(
+                                    400,
+                                    serde_json::json!({
+                                        "error": "invalid_grant",
+                                        "error_description": "refresh token already used"
+                                    }),
+                                ))
+                            };
+                        }
                         match self.refresh_failure {
                             Some(RefreshFailure::InvalidGrant) => Ok(Self::response(
                                 400,
@@ -2161,13 +2290,17 @@ mod tests {
                             )),
                         }
                     } else {
+                        let refresh_token = match &self.rotating_refresh {
+                            Some(state) => state.lock().await.valid_refresh_token.clone(),
+                            None => "refresh-token".to_string(),
+                        };
                         Ok(Self::response(
                             200,
                             serde_json::json!({
                                 "access_token": format!("access-token-{request_number}"),
                                 "token_type": "Bearer",
                                 "expires_in": if self.expire_initial_token { 0 } else { 3600 },
-                                "refresh_token": "refresh-token",
+                                "refresh_token": refresh_token,
                                 "scope": scope
                             }),
                         ))
@@ -2623,6 +2756,192 @@ mod tests {
             message.contains("reauthorize"),
             "expected the error to say reauthorization is needed, got: {message}"
         );
+    }
+
+    /// #1472: two flows share one token store and the authorization server
+    /// rotates refresh tokens on use (single-use). Flow A refreshes first,
+    /// rotating R0 -> R1 and saving R1 to the shared store. Flow B still
+    /// holds R0 in memory with an expired access token; if it refreshed with
+    /// R0 the AS would already have consumed it and answer invalid_grant.
+    /// Flow B must instead notice the store already holds a newer, valid
+    /// token and adopt it rather than failing or requiring reauthorization.
+    #[tokio::test]
+    async fn two_flows_sharing_a_store_survive_a_rotated_refresh_token() {
+        let http = MockOAuthHttp::new(RegistrationMode::Dynamic)
+            .expiring()
+            .rotating_refresh_tokens();
+        let tokens = MemoryOAuthTokenStore::new();
+        let registrations = super::super::oauth_authcode::MemoryOAuthClientRegistrationStore::new();
+
+        let flow_a = flow_builder(
+            http.clone(),
+            dynamic_options(),
+            AutomaticAuthorizationHandler::default(),
+        )
+        .registration_store(registrations.clone())
+        .token_store(tokens.clone())
+        .refresh_buffer(Duration::ZERO)
+        .build()
+        .unwrap();
+        flow_a.authorize(["challenge.scope"]).await.unwrap();
+
+        let flow_b = flow_builder(
+            http,
+            dynamic_options(),
+            AutomaticAuthorizationHandler::default(),
+        )
+        .registration_store(registrations)
+        .token_store(tokens.clone())
+        .refresh_buffer(Duration::ZERO)
+        .build()
+        .unwrap();
+        // Give flow B the same starting token flow A had, as if it had
+        // loaded it from the shared store before flow A's refresh ran.
+        {
+            let active = flow_a.inner.current.read().await.clone().unwrap();
+            *flow_b.inner.current.write().await = Some(active);
+        }
+
+        // Flow A refreshes first: R0 -> R1, persisted to the shared store.
+        assert_eq!(flow_a.get_token().await.unwrap(), "rotated-access-token-1");
+
+        // Flow B still holds R0, which the AS has already consumed. It must
+        // end up with a valid token instead of failing.
+        let token = flow_b
+            .get_token()
+            .await
+            .expect("flow B must recover instead of failing when another flow already rotated the refresh token");
+        assert_eq!(token, "rotated-access-token-1");
+
+        let binding = OAuthTokenBinding {
+            resource: "https://mcp.example.com/mcp".to_string(),
+            issuer: "https://auth.example.com/issuer".to_string(),
+            client_id: "dynamic-client".to_string(),
+        };
+        let stored = tokens.load(&binding).await.unwrap().unwrap();
+        assert!(token_is_valid(&stored, Duration::ZERO));
+    }
+
+    /// #1472: when the shared store already holds a different, valid token
+    /// for this binding, `get_token` must adopt it instead of spending a
+    /// network round trip on a refresh.
+    #[tokio::test]
+    async fn get_token_adopts_a_newer_stored_token_without_refreshing() {
+        let http = MockOAuthHttp::new(RegistrationMode::Dynamic).expiring();
+        let tokens = MemoryOAuthTokenStore::new();
+        let flow = flow_builder(
+            http.clone(),
+            dynamic_options(),
+            AutomaticAuthorizationHandler::default(),
+        )
+        .token_store(tokens.clone())
+        .refresh_buffer(Duration::ZERO)
+        .build()
+        .unwrap();
+        flow.authorize(["challenge.scope"]).await.unwrap();
+        let requests_before = http.token_requests.load(Ordering::SeqCst);
+
+        let binding = OAuthTokenBinding {
+            resource: "https://mcp.example.com/mcp".to_string(),
+            issuer: "https://auth.example.com/issuer".to_string(),
+            client_id: "dynamic-client".to_string(),
+        };
+        let newer = OAuthStoredToken {
+            access_token: "externally-refreshed-token".to_string(),
+            refresh_token: Some("externally-refreshed-refresh-token".to_string()),
+            expires_at: unix_time() + 3600,
+            scopes: vec!["challenge.scope".to_string()],
+        };
+        tokens.save(&binding, &newer).await.unwrap();
+
+        let token = flow.get_token().await.unwrap();
+        assert_eq!(token, "externally-refreshed-token");
+        assert_eq!(
+            http.token_requests.load(Ordering::SeqCst),
+            requests_before,
+            "adopting a newer stored token must not perform a refresh request"
+        );
+    }
+
+    /// #1472: an authorization server can reject a refresh with
+    /// invalid_grant for a reason unrelated to permanent revocation: another
+    /// flow sharing this store consumed the refresh token an instant before
+    /// this request reached the server. Reloading the store once after the
+    /// rejection, before discarding, must find that newer token and adopt
+    /// it instead of forcing reauthorization.
+    #[tokio::test]
+    async fn invalid_grant_recovers_when_store_gained_a_newer_token_mid_refresh() {
+        struct RaceOnRefreshHttp {
+            inner: MockOAuthHttp,
+            tokens: MemoryOAuthTokenStore,
+            binding: OAuthTokenBinding,
+            winner: OAuthStoredToken,
+            injected: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl OAuthHttpClient for RaceOnRefreshHttp {
+            async fn execute(
+                &self,
+                request: OAuthHttpRequest,
+            ) -> Result<OAuthHttpResponse, OAuthClientError> {
+                let is_refresh_request = request.url.ends_with("/token")
+                    && matches!(
+                        &request.body,
+                        OAuthHttpBody::Form(fields)
+                            if fields.iter().any(|(name, value)| name == "grant_type" && value == "refresh_token")
+                    );
+                if is_refresh_request && self.injected.fetch_add(1, Ordering::SeqCst) == 0 {
+                    // Simulate another flow's rotation landing in the window
+                    // between this flow's pre-refresh store reload and the
+                    // authorization server actually answering this request.
+                    self.tokens.save(&self.binding, &self.winner).await.unwrap();
+                }
+                self.inner.execute(request).await
+            }
+        }
+
+        let tokens = MemoryOAuthTokenStore::new();
+        let binding = OAuthTokenBinding {
+            resource: "https://mcp.example.com/mcp".to_string(),
+            issuer: "https://auth.example.com/issuer".to_string(),
+            client_id: "dynamic-client".to_string(),
+        };
+        let winner = OAuthStoredToken {
+            access_token: "winner-access-token".to_string(),
+            refresh_token: Some("winner-refresh-token".to_string()),
+            expires_at: unix_time() + 3600,
+            scopes: vec!["challenge.scope".to_string()],
+        };
+        let http = RaceOnRefreshHttp {
+            inner: MockOAuthHttp::new(RegistrationMode::Dynamic)
+                .expiring()
+                .refresh_rejected(),
+            tokens: tokens.clone(),
+            binding: binding.clone(),
+            winner: winner.clone(),
+            injected: Arc::new(AtomicUsize::new(0)),
+        };
+        let flow = OAuthAuthorizationFlow::builder("https://mcp.example.com/mcp")
+            .http_client(http)
+            .redirect_policy(OAuthRedirectPolicy::fixed(
+                "http://127.0.0.1:23456/callback",
+            ))
+            .registration_options(dynamic_options())
+            .authorization_handler(AutomaticAuthorizationHandler::default())
+            .token_store(tokens.clone())
+            .refresh_buffer(Duration::ZERO)
+            .build()
+            .unwrap();
+        flow.authorize(["challenge.scope"]).await.unwrap();
+
+        let token = flow
+            .get_token()
+            .await
+            .expect("must adopt the winner's token instead of failing on invalid_grant");
+        assert_eq!(token, winner.access_token);
+        let stored = tokens.load(&binding).await.unwrap().unwrap();
+        assert_eq!(stored.access_token, winner.access_token);
     }
 
     #[tokio::test]
