@@ -503,30 +503,28 @@ pub(super) async fn handle_post(
     // SEP-2575 / SEP-2567: version-gated stateless mode for 2026-07-28+ clients.
     //
     // When the requested (or carried) protocol version is >= 2026-07-28 and the
-    // request has no mcp-session-id, every request -- including `initialize` --
-    // is served without creating or looking up a session. Each request is fully
-    // self-contained; client identity and capabilities flow through per-request
-    // `_meta` rather than a session handshake.
+    // request has no mcp-session-id, every request is served without creating
+    // or looking up a session. Each request is fully self-contained; client
+    // identity and capabilities flow through per-request `_meta` rather than a
+    // session handshake.
     //
     // This block runs before the legacy SEP-1442 stateless path so that
     // 2026-07-28 requests are handled here regardless of whether
     // `stateless_config` is set on the transport.
     #[cfg(feature = "stateless")]
     {
-        let version_in_play: Option<String> = if is_init && !modern_request {
-            // For `initialize`, read the version the client is requesting from
-            // the params object.
-            parsed
-                .get("params")
-                .and_then(|p| p.get("protocolVersion"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        } else {
-            // For non-init requests, only the HTTP-level `MCP-Protocol-Version`
-            // header gates stateless mode. Body-level `_meta.protocolVersion` is
-            // plumbed to handlers via `stash_per_request_meta` in both paths.
-            protocol_version_header.clone()
-        };
+        // `initialize` does not exist in 2026-07-28 (SEP-2575 removed the
+        // handshake), so it is never routed here by its own body content: a
+        // client sending it is on the legacy lifecycle and belongs on the
+        // session path below, which negotiates it down to a legacy version
+        // the same way the router and stdio already do (#1474). Only the
+        // HTTP-level `MCP-Protocol-Version` header gates stateless mode; a
+        // genuine 2026-07-28 request carries that header (and is already
+        // handled as a modern request above, before this block runs) rather
+        // than a body-level `protocolVersion` field. Body-level
+        // `_meta.protocolVersion` is plumbed to handlers via
+        // `stash_per_request_meta` in both paths.
+        let version_in_play: Option<String> = protocol_version_header.clone();
 
         if let Some(ref version) = version_in_play
             && is_stateless_protocol_version(version)
@@ -1110,23 +1108,14 @@ pub(super) async fn handle_post(
     // SEP-2243-inclusion version; otherwise present headers are still
     // checked for body consistency but missing headers are allowed.
     //
-    // For `initialize` requests the session's protocol version hasn't
-    // been negotiated yet, so we fall back to the version the client
-    // requested in the body. For all other requests we use the session's
-    // negotiated version (which is also reflected back in the response
-    // `Mcp-Protocol-Version` header).
-    let sep_2243_version = if is_init {
-        match parsed
-            .get("params")
-            .and_then(|p| p.get("protocolVersion"))
-            .and_then(|v| v.as_str())
-        {
-            Some(v) => v.to_string(),
-            None => session.protocol_version.read().await.clone(),
-        }
-    } else {
-        session.protocol_version.read().await.clone()
-    };
+    // This is always the session's protocol version (also reflected back
+    // in the response `Mcp-Protocol-Version` header). Before negotiation,
+    // that's a freshly-created session's default, always a legacy
+    // version, so `initialize` is always lenient here regardless of what
+    // version its body requests: `initialize` doesn't exist in 2026-07-28
+    // (SEP-2575, #1474), so the version it's requesting is never the
+    // dialect of the request itself.
+    let sep_2243_version = session.protocol_version.read().await.clone();
     let sep_2243_mode = crate::transport::http_headers::mode_for_version(&sep_2243_version);
     if let Err(err) = crate::transport::http_headers::validate_with_tool_schema(
         &headers,
@@ -1360,6 +1349,7 @@ pub(super) async fn handle_post(
     // on the live session, and persist the now-complete record to the session
     // store so a restore from a peer instance sees the original client info
     // instead of defaults.
+    let is_successful_init = is_init && matches!(response, JsonRpcResponse::Result(_));
     if is_init && let JsonRpcResponse::Result(ref result) = response {
         if let Some(version) = result
             .result
@@ -1392,7 +1382,10 @@ pub(super) async fn handle_post(
         axum::Json(response).into_response()
     };
 
-    if is_init {
+    // A failed initialize (e.g. -32022 when no legacy version is enabled,
+    // #1474) must not hand out a session id for a session the client was
+    // never actually admitted to.
+    if is_successful_init {
         resp.headers_mut().insert(
             MCP_SESSION_ID_HEADER,
             HeaderValue::from_str(&session.id).unwrap(),

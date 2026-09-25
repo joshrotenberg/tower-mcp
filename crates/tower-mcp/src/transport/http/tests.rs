@@ -1298,13 +1298,22 @@ async fn sep_2243_lenient_mode_validates_present_headers() {
     assert_eq!(json["id"], 2);
 }
 
-/// tools/call with matching Mcp-Method + Mcp-Name passes validation
-/// even in strict mode. Driven via initialize with the upcoming
-/// 2026-07-28 protocol version so we exercise the strict branch.
+/// tools/call with matching Mcp-Method + Mcp-Name passes validation.
+/// Driven via initialize requesting the 2026-07-28 protocol version, which
+/// the router negotiates down to a legacy version since `initialize`
+/// doesn't exist in 2026-07-28 (#1474). SEP-2243 mode for `initialize`
+/// itself is therefore always lenient, so this exercises the lenient
+/// branch with present, matching headers rather than the strict one.
 ///
-/// Gated to `not(stateless)` because with the stateless feature enabled,
-/// initialize requests for 2026-07-28 are handled without a session (chunk 5).
-/// The stateless-mode equivalent is `stateless_v2026_tools_call_without_session_succeeds`.
+/// Gated to `not(stateless)` for historical reasons: this test predates
+/// #1474, when a stateless build intercepted a body-only 2026-07-28
+/// initialize before it ever reached the session path below. The scenario
+/// now behaves identically with the feature on or off. The stateless-mode
+/// equivalent for the tools/call step is
+/// `stateless_v2026_tools_call_without_session_succeeds`, and #1474 added
+/// `stateless_v2026_body_only_initialize_negotiates_legacy_session` to
+/// cover this exact body-only-2026-07-28-initialize shape under
+/// `stateless`.
 #[tokio::test]
 #[cfg(not(feature = "stateless"))]
 async fn sep_2243_strict_mode_tools_call_with_matching_headers() {
@@ -4455,6 +4464,130 @@ async fn stateless_v2026_initialize_is_method_not_found() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["id"], 1);
     assert_eq!(json["error"]["code"], ErrorCode::MethodNotFound.code());
+}
+
+/// #1474: `initialize` carrying `params.protocolVersion: "2026-07-28"` in its
+/// body -- with no `MCP-Protocol-Version` header and no `_meta` -- is not a
+/// modern request (SEP-2575 removed `initialize` from 2026-07-28), so it must
+/// take the legacy session path and be negotiated down like any other
+/// `initialize`, not be dispatched statelessly off its body content.
+#[tokio::test]
+#[cfg(feature = "stateless")]
+async fn stateless_v2026_body_only_initialize_negotiates_legacy_session() {
+    let transport = HttpTransport::new(create_test_router())
+        .disable_origin_validation()
+        .disable_host_validation();
+    let app = transport.into_router();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(Body::from(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2026-07-28",
+                    "capabilities": {},
+                    "clientInfo": { "name": "t", "version": "0" }
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let session_id = response
+        .headers()
+        .get(MCP_SESSION_ID_HEADER)
+        .expect("initialize on the session path must issue a session id")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let negotiated_version = response
+        .headers()
+        .get(MCP_PROTOCOL_VERSION_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap()
+        .to_string();
+    assert_eq!(negotiated_version, "2025-11-25");
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["result"]["protocolVersion"], "2025-11-25");
+
+    send_initialized(&app, &session_id).await;
+
+    // A follow-up request using the negotiated session succeeds.
+    let follow_up = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header(MCP_SESSION_ID_HEADER, &session_id)
+        .header(MCP_PROTOCOL_VERSION_HEADER, &negotiated_version)
+        .body(Body::from(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let follow_up_response = app.oneshot(follow_up).await.unwrap();
+    assert_eq!(follow_up_response.status(), StatusCode::OK);
+}
+
+/// Same body-only initialize shape as above, but with `ProtocolSupport`
+/// narrowed to 2026-07-28 only: the router has no legacy version to
+/// negotiate down to, so it returns -32022 rather than a stateless success.
+#[tokio::test]
+#[cfg(feature = "stateless")]
+async fn stateless_v2026_body_only_initialize_with_no_legacy_support_is_unsupported_version() {
+    let transport = HttpTransport::new(create_test_router())
+        .disable_origin_validation()
+        .disable_host_validation()
+        .protocol_versions([PROTOCOL_VERSION_2026_07_28])
+        .unwrap();
+    let app = transport.into_router();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(Body::from(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2026-07-28",
+                    "capabilities": {},
+                    "clientInfo": { "name": "t", "version": "0" }
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    assert!(
+        !response.headers().contains_key(MCP_SESSION_ID_HEADER),
+        "a version that can't be negotiated must not create a session"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["id"], 1);
+    assert_eq!(
+        json["error"]["code"],
+        McpErrorCode::UnsupportedProtocolVersion.code()
+    );
 }
 
 #[tokio::test]
