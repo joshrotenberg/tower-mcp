@@ -1228,6 +1228,16 @@ impl OAuthAuthorizationCode {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
+            // RFC 6749 §5.2: `invalid_grant` means the refresh token itself
+            // is dead (revoked or expired at the AS), not that this request
+            // failed transiently. Surface that distinctly so the caller can
+            // discard it instead of retrying it on every call.
+            if status == reqwest::StatusCode::BAD_REQUEST && is_invalid_grant(&body) {
+                return Err(OAuthClientError::TokenRefreshRejected(format!(
+                    "Refresh HTTP {}: {}",
+                    status, body
+                )));
+            }
             return Err(OAuthClientError::TokenRequest(format!(
                 "Refresh HTTP {}: {}",
                 status, body
@@ -1307,6 +1317,18 @@ async fn send_token_request(
         .map_err(|error| OAuthClientError::TokenRequest(error.to_string()))
 }
 
+/// RFC 6749 §5.2 token error response, e.g. `{"error": "invalid_grant"}`.
+#[derive(serde::Deserialize)]
+struct TokenErrorResponse {
+    error: String,
+}
+
+/// Whether a token endpoint error body is RFC 6749 §5.2 `invalid_grant`.
+fn is_invalid_grant(body: &str) -> bool {
+    serde_json::from_str::<TokenErrorResponse>(body)
+        .is_ok_and(|error| error.error == "invalid_grant")
+}
+
 fn to_cached_token(response: TokenResponse) -> CachedAuthCodeToken {
     let expires_in = Duration::from_secs(response.expires_in.unwrap_or(3600));
     CachedAuthCodeToken {
@@ -1356,6 +1378,13 @@ impl TokenProvider for OAuthAuthorizationCode {
                     let access = new_token.access_token.clone();
                     *cache = Some(new_token);
                     return Ok(access);
+                }
+                Err(e @ OAuthClientError::TokenRefreshRejected(_)) => {
+                    tracing::warn!(error = %e, "Refresh token rejected; discarding cached token");
+                    // Discard the dead refresh token so it is not retried on
+                    // every call. Other failures (network errors, 5xx) leave
+                    // the cache in place; they may be transient.
+                    *cache = None;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "Token refresh failed");
@@ -2356,5 +2385,102 @@ mod tests {
             expires_at: Instant::now() + Duration::from_secs(10),
         };
         assert!(!is_token_valid(&expiring, Duration::from_secs(30)));
+    }
+
+    /// A local token endpoint that always rejects the refresh grant with
+    /// RFC 6749 `invalid_grant`. Returns the base URL and a counter of how
+    /// many requests it received.
+    async fn spawn_invalid_grant_token_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 1024];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk[..read]);
+                    if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let body = serde_json::json!({
+                    "error": "invalid_grant",
+                    "error_description": "refresh token expired or revoked"
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (base, requests)
+    }
+
+    /// Build an `OAuthAuthorizationCode` directly with a pre-populated,
+    /// already-expired cached token, bypassing the interactive `start()`
+    /// flow.
+    fn test_provider_with_cached_token(
+        token_endpoint: String,
+        cache: CachedAuthCodeToken,
+    ) -> OAuthAuthorizationCode {
+        OAuthAuthorizationCode {
+            inner: Arc::new(OAuthAuthCodeInner {
+                authorization_url: "https://auth.example.com/authorize".to_string(),
+                token_endpoint,
+                client_id: "test-client".to_string(),
+                client_secret: None,
+                token_endpoint_auth_method: OAuthTokenEndpointAuthMethod::None,
+                resource: "https://mcp.example.com".to_string(),
+                code_verifier: "verifier".to_string(),
+                state: "state".to_string(),
+                redirect_uri: "http://127.0.0.1:0/callback".to_string(),
+                scopes: None,
+                refresh_buffer: Duration::from_secs(30),
+                client: reqwest::Client::new(),
+                cache: RwLock::new(Some(cache)),
+                callback_rx: Mutex::new(None),
+                _callback_task: tokio::spawn(async {}),
+                expected_issuer: None,
+                iss_required: false,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_refresh_token_is_discarded_and_not_reused() {
+        use std::sync::atomic::Ordering;
+
+        let (token_endpoint, requests) = spawn_invalid_grant_token_server().await;
+        let provider = test_provider_with_cached_token(
+            format!("{token_endpoint}/token"),
+            CachedAuthCodeToken {
+                access_token: "expired-access-token".to_string(),
+                refresh_token: Some("dead-refresh-token".to_string()),
+                expires_at: Instant::now() - Duration::from_secs(1),
+            },
+        );
+
+        assert!(TokenProvider::get_token(&provider).await.is_err());
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert!(provider.inner.cache.read().await.is_none());
+
+        // The dead refresh token must not be retried on a subsequent call.
+        assert!(TokenProvider::get_token(&provider).await.is_err());
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 }

@@ -1001,16 +1001,29 @@ impl OAuthAuthorizationFlow {
             *self.inner.current.write().await = Some(ActiveToken {
                 binding,
                 token: token.clone(),
-                token_endpoint: metadata.token_endpoint,
-                registration,
+                token_endpoint: metadata.token_endpoint.clone(),
+                registration: registration.clone(),
                 auth_method,
             });
-            if !token_is_valid(&token, self.inner.refresh_buffer) {
-                TokenProvider::get_token(self).await?;
+            if token_is_valid(&token, self.inner.refresh_buffer) {
+                return Ok(OAuthAuthorizationStart::Authorized {
+                    scopes: token.scopes,
+                });
             }
-            return Ok(OAuthAuthorizationStart::Authorized {
-                scopes: token.scopes,
-            });
+            match TokenProvider::get_token(self).await {
+                Ok(_) => {
+                    return Ok(OAuthAuthorizationStart::Authorized {
+                        scopes: token.scopes,
+                    });
+                }
+                Err(OAuthClientError::TokenRefreshRejected(_)) => {
+                    // get_token() already cleared `current` and removed the
+                    // stored token; treat the stored token as unusable and
+                    // fall through to a new authorization request instead of
+                    // failing begin() on every subsequent call.
+                }
+                Err(error) => return Err(error),
+            }
         }
 
         let pending_state = OAuthPendingAuthorizationState {
@@ -1181,7 +1194,21 @@ impl TokenProvider for OAuthAuthorizationFlow {
             fields,
             self.inner.assertion_signer.as_deref(),
         )
-        .await?;
+        .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error @ OAuthClientError::TokenRefreshRejected(_)) => {
+                // The authorization server revoked or expired the refresh
+                // token. Discard it so the next begin() reauthorizes instead
+                // of retrying a dead token on every call. Other failures
+                // (network errors, 5xx) are left in place; they may be
+                // transient.
+                *self.inner.current.write().await = None;
+                self.inner.token_store.remove(&active.binding).await?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         let token = token_from_response(
             response,
             &active.token.scopes,
@@ -1607,6 +1634,20 @@ fn validate_cimd_url(client_id: &str) -> Result<(), OAuthClientError> {
     Ok(())
 }
 
+/// RFC 6749 §5.2 token error response, e.g. `{"error": "invalid_grant"}`.
+#[derive(serde::Deserialize)]
+struct TokenErrorResponse {
+    error: String,
+}
+
+/// Return the RFC 6749 §5.2 `error` code from a token endpoint error
+/// response, if the body parses as one.
+fn token_error_code(response: &OAuthHttpResponse) -> Option<String> {
+    serde_json::from_slice::<TokenErrorResponse>(&response.body)
+        .ok()
+        .map(|error| error.error)
+}
+
 async fn send_token_request(
     http: &dyn OAuthHttpClient,
     token_endpoint: &str,
@@ -1616,6 +1657,9 @@ async fn send_token_request(
     mut fields: Vec<(String, String)>,
     assertion_signer: Option<&dyn OAuthClientAssertionSigner>,
 ) -> Result<OAuthHttpResponse, OAuthClientError> {
+    let is_refresh = fields
+        .iter()
+        .any(|(name, value)| name == "grant_type" && value == "refresh_token");
     let mut request = OAuthHttpRequest::post_form(token_endpoint, Vec::new());
     match method {
         OAuthTokenEndpointAuthMethod::None => {
@@ -1671,6 +1715,19 @@ async fn send_token_request(
     request.body = OAuthHttpBody::Form(fields);
     let response = http.execute(request).await?;
     if !response.is_success() {
+        // RFC 6749 §5.2: `invalid_grant` on a refresh means the refresh
+        // token itself is dead (revoked or expired at the AS), not that
+        // this particular request failed transiently. Surface that
+        // distinctly so callers can discard the token instead of retrying
+        // it forever.
+        if is_refresh
+            && response.status == 400
+            && token_error_code(&response).as_deref() == Some("invalid_grant")
+        {
+            return Err(OAuthClientError::TokenRefreshRejected(
+                response.error_body(),
+            ));
+        }
         return Err(OAuthClientError::TokenRequest(format!(
             "token endpoint returned HTTP {}: {}",
             response.status,
@@ -1921,12 +1978,19 @@ mod tests {
         PrivateKeyJwt,
     }
 
+    #[derive(Debug, Clone, Copy)]
+    enum RefreshFailure {
+        InvalidGrant,
+        ServerError,
+    }
+
     #[derive(Clone)]
     struct MockOAuthHttp {
         mode: RegistrationMode,
         requests: Arc<Mutex<Vec<OAuthHttpRequest>>>,
         token_requests: Arc<AtomicUsize>,
         expire_initial_token: bool,
+        refresh_failure: Option<RefreshFailure>,
     }
 
     impl MockOAuthHttp {
@@ -1936,11 +2000,24 @@ mod tests {
                 requests: Arc::new(Mutex::new(Vec::new())),
                 token_requests: Arc::new(AtomicUsize::new(0)),
                 expire_initial_token: false,
+                refresh_failure: None,
             }
         }
 
         fn expiring(mut self) -> Self {
             self.expire_initial_token = true;
+            self
+        }
+
+        /// The token endpoint rejects a refresh with RFC 6749 `invalid_grant`.
+        fn refresh_rejected(mut self) -> Self {
+            self.refresh_failure = Some(RefreshFailure::InvalidGrant);
+            self
+        }
+
+        /// The token endpoint fails a refresh with a transient HTTP 500.
+        fn refresh_server_error(mut self) -> Self {
+            self.refresh_failure = Some(RefreshFailure::ServerError);
             self
         }
 
@@ -2036,15 +2113,29 @@ mod tests {
                             }
                         });
                     if grant == "refresh_token" {
-                        Ok(Self::response(
-                            200,
-                            serde_json::json!({
-                                "access_token": "refreshed-token",
-                                "token_type": "Bearer",
-                                "expires_in": 3600,
-                                "scope": scope
+                        match self.refresh_failure {
+                            Some(RefreshFailure::InvalidGrant) => Ok(Self::response(
+                                400,
+                                serde_json::json!({
+                                    "error": "invalid_grant",
+                                    "error_description": "refresh token expired or revoked"
+                                }),
+                            )),
+                            Some(RefreshFailure::ServerError) => Ok(OAuthHttpResponse {
+                                status: 500,
+                                headers: Vec::new(),
+                                body: b"internal server error".to_vec(),
                             }),
-                        ))
+                            None => Ok(Self::response(
+                                200,
+                                serde_json::json!({
+                                    "access_token": "refreshed-token",
+                                    "token_type": "Bearer",
+                                    "expires_in": 3600,
+                                    "scope": scope
+                                }),
+                            )),
+                        }
                     } else {
                         Ok(Self::response(
                             200,
@@ -2366,6 +2457,89 @@ mod tests {
         assert!(matches!(start, OAuthAuthorizationStart::Authorized { .. }));
         assert_eq!(restored_calls.load(Ordering::SeqCst), 0);
         assert_eq!(restored.get_token().await.unwrap(), "refreshed-token");
+    }
+
+    #[tokio::test]
+    async fn rejected_refresh_of_persisted_token_reauthorizes_and_discards_it() {
+        let http = MockOAuthHttp::new(RegistrationMode::Dynamic).expiring();
+        let tokens = MemoryOAuthTokenStore::new();
+        let registrations = super::super::oauth_authcode::MemoryOAuthClientRegistrationStore::new();
+        let first_handler = AutomaticAuthorizationHandler::default();
+
+        let first = flow_builder(http.clone(), dynamic_options(), first_handler)
+            .registration_store(registrations.clone())
+            .token_store(tokens.clone())
+            .refresh_buffer(Duration::ZERO)
+            .build()
+            .unwrap();
+        first.authorize(["challenge.scope"]).await.unwrap();
+
+        let binding = OAuthTokenBinding {
+            resource: "https://mcp.example.com/mcp".to_string(),
+            issuer: "https://auth.example.com/issuer".to_string(),
+            client_id: "dynamic-client".to_string(),
+        };
+        assert!(tokens.load(&binding).await.unwrap().is_some());
+
+        // Rebuild the flow against an AS that now rejects the refresh token
+        // (revoked or expired since the token was persisted).
+        let rejecting_http = MockOAuthHttp::new(RegistrationMode::Dynamic).refresh_rejected();
+        let restored_handler = AutomaticAuthorizationHandler::default();
+        let restored_calls = restored_handler.calls.clone();
+        let restored = flow_builder(rejecting_http, dynamic_options(), restored_handler)
+            .registration_store(registrations)
+            .token_store(tokens.clone())
+            .refresh_buffer(Duration::ZERO)
+            .build()
+            .unwrap();
+
+        let start = restored.begin(["challenge.scope"]).await.unwrap();
+        assert!(matches!(start, OAuthAuthorizationStart::Pending(_)));
+        // begin() only returns a pending request; it never drives the
+        // authorization handler itself.
+        assert_eq!(restored_calls.load(Ordering::SeqCst), 0);
+        assert!(tokens.load(&binding).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn transient_refresh_failure_keeps_persisted_token() {
+        let http = MockOAuthHttp::new(RegistrationMode::Dynamic).expiring();
+        let tokens = MemoryOAuthTokenStore::new();
+        let registrations = super::super::oauth_authcode::MemoryOAuthClientRegistrationStore::new();
+        let first_handler = AutomaticAuthorizationHandler::default();
+
+        let first = flow_builder(http.clone(), dynamic_options(), first_handler)
+            .registration_store(registrations.clone())
+            .token_store(tokens.clone())
+            .refresh_buffer(Duration::ZERO)
+            .build()
+            .unwrap();
+        first.authorize(["challenge.scope"]).await.unwrap();
+
+        let binding = OAuthTokenBinding {
+            resource: "https://mcp.example.com/mcp".to_string(),
+            issuer: "https://auth.example.com/issuer".to_string(),
+            client_id: "dynamic-client".to_string(),
+        };
+        assert!(tokens.load(&binding).await.unwrap().is_some());
+
+        // A transient failure (HTTP 500, not RFC 6749 invalid_grant) must
+        // propagate as an error and must not discard the persisted token.
+        let failing_http = MockOAuthHttp::new(RegistrationMode::Dynamic).refresh_server_error();
+        let restored = flow_builder(
+            failing_http,
+            dynamic_options(),
+            AutomaticAuthorizationHandler::default(),
+        )
+        .registration_store(registrations)
+        .token_store(tokens.clone())
+        .refresh_buffer(Duration::ZERO)
+        .build()
+        .unwrap();
+
+        let error = restored.begin(["challenge.scope"]).await.unwrap_err();
+        assert!(matches!(error, OAuthClientError::TokenRequest(_)));
+        assert!(tokens.load(&binding).await.unwrap().is_some());
     }
 
     #[tokio::test]

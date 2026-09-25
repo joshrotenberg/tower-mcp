@@ -447,6 +447,10 @@ pub enum OAuthClientError {
     Discovery(String),
     /// Failed to request a token from the token endpoint.
     TokenRequest(String),
+    /// The authorization server rejected a refresh token with `invalid_grant`
+    /// (RFC 6749 §5.2). The caller should discard the token; it will not
+    /// start working again on retry.
+    TokenRefreshRejected(String),
     /// Failed to register an OAuth client.
     Registration(String),
     /// Failed to load, save, or remove persisted OAuth client credentials.
@@ -471,6 +475,9 @@ impl fmt::Display for OAuthClientError {
             Self::Http(msg) => write!(f, "OAuth HTTP error: {}", msg),
             Self::Discovery(msg) => write!(f, "OAuth discovery error: {}", msg),
             Self::TokenRequest(msg) => write!(f, "OAuth token request error: {}", msg),
+            Self::TokenRefreshRejected(msg) => {
+                write!(f, "OAuth refresh token rejected: {}", msg)
+            }
             Self::Registration(msg) => write!(f, "OAuth client registration error: {}", msg),
             Self::CredentialStore(msg) => write!(f, "OAuth credential store error: {}", msg),
             Self::TokenStore(msg) => write!(f, "OAuth token store error: {}", msg),
