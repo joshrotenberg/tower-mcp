@@ -20,7 +20,7 @@ use super::oauth::{
 use super::oauth_authcode::{
     OAuthAuthorizationServerMetadata, OAuthClientRegistration, OAuthClientRegistrationMethod,
     OAuthClientRegistrationOptions, OAuthClientRegistrationStore, OAuthProtectedResourceMetadata,
-    validate_resource_override,
+    discovery_reason, validate_resource_identifier, validate_resource_override,
 };
 
 /// HTTP method used by an OAuth protocol request.
@@ -1390,26 +1390,8 @@ async fn discover_with_http(
                 .find_map(OAuthBearerChallenge::from_www_authenticate)
         }
     };
-    let protected_resource = if let Some(url) = challenge
-        .as_ref()
-        .and_then(|challenge| challenge.resource_metadata.as_deref())
-    {
-        fetch_json(http, url).await?
-    } else {
-        let mut discovered: Option<OAuthProtectedResourceMetadata> = None;
-        for url in protected_resource_metadata_urls(resource_url)? {
-            if let Ok(metadata) = fetch_json(http, &url).await {
-                discovered = Some(metadata);
-                break;
-            }
-        }
-        discovered.ok_or_else(|| {
-            OAuthClientError::Discovery(format!(
-                "could not discover Protected Resource Metadata for `{resource_url}`"
-            ))
-        })?
-    };
-    validate_resource_identifier(resource_url, &protected_resource.resource)?;
+    let protected_resource =
+        discover_protected_resource_metadata(resource_url, &challenge, http).await?;
     if protected_resource.authorization_servers.is_empty() {
         return Err(OAuthClientError::Discovery(
             "protected resource metadata omitted authorization_servers".to_string(),
@@ -1437,6 +1419,76 @@ async fn discover_with_http(
         authorization_servers,
         challenge,
     })
+}
+
+/// Discover Protected Resource Metadata for `resource_url`, trying
+/// candidates in order and skipping any that fail to fetch, fail to parse,
+/// or whose `resource` does not cover `resource_url` (see
+/// [`validate_resource_identifier`]):
+///
+/// 1. The challenge's `resource_metadata` URL, when present. Rejecting this
+///    candidate does not fail discovery; it falls through to the well-known
+///    candidates below instead.
+/// 2. The final path-aware RFC 9728 well-known location.
+/// 3. The origin root well-known location, for compatibility.
+///
+/// If every candidate is rejected, the returned error names each candidate
+/// URL tried and why it was rejected.
+async fn discover_protected_resource_metadata(
+    resource_url: &str,
+    challenge: &Option<OAuthBearerChallenge>,
+    http: &dyn OAuthHttpClient,
+) -> Result<OAuthProtectedResourceMetadata, OAuthClientError> {
+    let mut attempts = Vec::new();
+
+    if let Some(url) = challenge
+        .as_ref()
+        .and_then(|challenge| challenge.resource_metadata.as_deref())
+    {
+        match fetch_matching_protected_resource(http, url, resource_url).await {
+            Ok(metadata) => return Ok(metadata),
+            Err(reason) => {
+                tracing::debug!(
+                    %url,
+                    %reason,
+                    "OAuth protected-resource metadata from challenge failed; falling back to well-known candidates"
+                );
+                attempts.push(format!("`{url}` (from challenge): {reason}"));
+            }
+        }
+    }
+
+    for url in protected_resource_metadata_urls(resource_url)? {
+        match fetch_matching_protected_resource(http, &url, resource_url).await {
+            Ok(metadata) => return Ok(metadata),
+            Err(reason) => {
+                tracing::debug!(%url, %reason, "OAuth protected-resource metadata candidate failed");
+                attempts.push(format!("`{url}`: {reason}"));
+            }
+        }
+    }
+
+    Err(OAuthClientError::Discovery(format!(
+        "could not discover Protected Resource Metadata for `{resource_url}`; tried {}",
+        attempts.join(", ")
+    )))
+}
+
+/// Fetch one Protected Resource Metadata candidate and confirm its
+/// `resource` covers `resource_url` per [`validate_resource_identifier`].
+/// Returns a plain-text rejection reason rather than [`OAuthClientError`] so
+/// [`discover_protected_resource_metadata`] can fold several attempts into
+/// one aggregate discovery error.
+async fn fetch_matching_protected_resource(
+    http: &dyn OAuthHttpClient,
+    url: &str,
+    resource_url: &str,
+) -> Result<OAuthProtectedResourceMetadata, String> {
+    let metadata = fetch_json::<OAuthProtectedResourceMetadata>(http, url)
+        .await
+        .map_err(discovery_reason)?;
+    validate_resource_identifier(resource_url, &metadata.resource).map_err(discovery_reason)?;
+    Ok(metadata)
 }
 
 async fn discover_authorization_server(
@@ -1513,39 +1565,6 @@ fn authorization_server_metadata_urls(issuer: &str) -> Result<Vec<String>, OAuth
     }
     urls.dedup();
     Ok(urls)
-}
-
-fn validate_resource_identifier(expected: &str, actual: &str) -> Result<(), OAuthClientError> {
-    let expected = reqwest::Url::parse(expected)
-        .map_err(|error| OAuthClientError::Discovery(error.to_string()))?;
-    let actual = reqwest::Url::parse(actual)
-        .map_err(|error| OAuthClientError::Discovery(error.to_string()))?;
-    // An origin-level canonical resource may cover a more specific MCP
-    // endpoint on that origin (for example resource `https://example.com`
-    // with endpoint `https://example.com/mcp`). A non-root resource path must
-    // be an exact path-segment prefix, never a merely textual prefix.
-    let expected_path = expected.path();
-    let actual_path = actual.path();
-    let path_matches = actual_path == "/"
-        || expected_path == actual_path
-        || (actual_path.ends_with('/') && expected_path.starts_with(actual_path))
-        || expected_path
-            .strip_prefix(actual_path)
-            .is_some_and(|suffix| suffix.starts_with('/'));
-    let query_matches = actual.query().is_none() || actual.query() == expected.query();
-    let matches = actual.fragment().is_none()
-        && expected.scheme() == actual.scheme()
-        && expected.host_str() == actual.host_str()
-        && expected.port_or_known_default() == actual.port_or_known_default()
-        && path_matches
-        && query_matches;
-    if matches {
-        Ok(())
-    } else {
-        Err(OAuthClientError::Discovery(format!(
-            "protected resource mismatch: expected `{expected}`, got `{actual}`"
-        )))
-    }
 }
 
 fn select_authorization_server(
@@ -3366,5 +3385,142 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// Minimal [`OAuthHttpClient`] used only to test PRM candidate handling:
+    /// maps a request path to a canned `(status, body)` response. A path
+    /// with no entry panics, so an unexpected candidate request is caught
+    /// immediately rather than hanging or silently mismatching.
+    struct MockDiscoveryHttp {
+        responses: HashMap<&'static str, (u16, String)>,
+    }
+
+    #[async_trait]
+    impl OAuthHttpClient for MockDiscoveryHttp {
+        async fn execute(
+            &self,
+            request: OAuthHttpRequest,
+        ) -> Result<OAuthHttpResponse, OAuthClientError> {
+            let path = reqwest::Url::parse(&request.url)
+                .unwrap()
+                .path()
+                .to_string();
+            let (status, body) = self
+                .responses
+                .get(path.as_str())
+                .unwrap_or_else(|| panic!("unexpected request path: {path}"));
+            Ok(OAuthHttpResponse {
+                status: *status,
+                headers: Vec::new(),
+                body: body.clone().into_bytes(),
+            })
+        }
+    }
+
+    fn no_challenge_metadata() -> Option<OAuthBearerChallenge> {
+        Some(OAuthBearerChallenge {
+            error: None,
+            scopes: Vec::new(),
+            resource_metadata: None,
+            error_description: None,
+        })
+    }
+
+    fn authorization_server_metadata_json(issuer: &str) -> String {
+        serde_json::json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{issuer}/authorize"),
+            "token_endpoint": format!("{issuer}/token"),
+            "code_challenge_methods_supported": ["S256"],
+            "token_endpoint_auth_methods_supported": ["none"]
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn discover_with_http_skips_a_mismatched_candidate_and_uses_the_next_one() {
+        let http = MockDiscoveryHttp {
+            responses: HashMap::from([
+                (
+                    "/.well-known/oauth-protected-resource/mcp",
+                    (
+                        200,
+                        serde_json::json!({
+                            "resource": "https://mcp.example.com/catch-all",
+                            "authorization_servers": ["https://auth.example.com/issuer"]
+                        })
+                        .to_string(),
+                    ),
+                ),
+                (
+                    "/.well-known/oauth-protected-resource",
+                    (
+                        200,
+                        serde_json::json!({
+                            "resource": "https://mcp.example.com/mcp",
+                            "authorization_servers": ["https://auth.example.com/issuer"]
+                        })
+                        .to_string(),
+                    ),
+                ),
+                (
+                    "/.well-known/oauth-authorization-server/issuer",
+                    (
+                        200,
+                        authorization_server_metadata_json("https://auth.example.com/issuer"),
+                    ),
+                ),
+            ]),
+        };
+
+        let discovery = discover_with_http(
+            "https://mcp.example.com/mcp",
+            no_challenge_metadata(),
+            &http,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(discovery.resource, "https://mcp.example.com/mcp");
+    }
+
+    #[tokio::test]
+    async fn discover_with_http_falls_back_to_well_known_when_the_challenge_url_404s() {
+        let http = MockDiscoveryHttp {
+            responses: HashMap::from([
+                ("/challenge-metadata", (404, String::new())),
+                (
+                    "/.well-known/oauth-protected-resource/mcp",
+                    (
+                        200,
+                        serde_json::json!({
+                            "resource": "https://mcp.example.com/mcp",
+                            "authorization_servers": ["https://auth.example.com/issuer"]
+                        })
+                        .to_string(),
+                    ),
+                ),
+                (
+                    "/.well-known/oauth-authorization-server/issuer",
+                    (
+                        200,
+                        authorization_server_metadata_json("https://auth.example.com/issuer"),
+                    ),
+                ),
+            ]),
+        };
+
+        let challenge = Some(OAuthBearerChallenge {
+            error: None,
+            scopes: Vec::new(),
+            resource_metadata: Some("https://mcp.example.com/challenge-metadata".to_string()),
+            error_description: None,
+        });
+
+        let discovery = discover_with_http("https://mcp.example.com/mcp", challenge, &http)
+            .await
+            .unwrap();
+
+        assert_eq!(discovery.resource, "https://mcp.example.com/mcp");
     }
 }
