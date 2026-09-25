@@ -2153,11 +2153,19 @@ pub struct DiscoverResult {
     pub capabilities: ServerCapabilities,
     /// SEP-2549: client-cache TTL in milliseconds for this response.
     /// `None` means "no opinion -- client policy decides".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_lenient_ttl_ms"
+    )]
     pub ttl_ms: Option<u64>,
     /// SEP-2549: scope the cached result applies to. `None` means scope is
     /// unspecified.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_lenient_cache_scope"
+    )]
     pub cache_scope: Option<CacheScope>,
     /// Optional instructions describing how to use this server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2412,6 +2420,37 @@ pub enum CacheScope {
     Private,
 }
 
+/// Deserialize an optional [`CacheScope`] leniently (#1482).
+///
+/// `cacheScope` is advisory caching metadata (SEP-2549); a server sending an
+/// empty string, an unrecognized value, or a non-string value should not make
+/// the whole result -- `tools/list`, `resources/read`, etc. -- fail to
+/// deserialize over a hint the client can simply ignore. Anything that does
+/// not parse as `CacheScope` becomes `None`, same as if the field had been
+/// absent. Serialization is untouched: `CacheScope`'s own `Deserialize` stays
+/// strict for values this crate produces and re-parses itself.
+fn deserialize_lenient_cache_scope<'de, D>(deserializer: D) -> Result<Option<CacheScope>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value::<CacheScope>(value).ok()))
+}
+
+/// Deserialize an optional cache TTL in milliseconds leniently (#1482).
+///
+/// `ttlMs` accompanies `cacheScope` on the same cacheable results (SEP-2549).
+/// A negative or non-integer value is malformed advisory metadata, not a
+/// reason to fail the whole result; it becomes `None`, same as an absent
+/// field.
+fn deserialize_lenient_ttl_ms<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value::<u64>(value).ok()))
+}
+
 /// Deprecation metadata for spec features and capabilities.
 ///
 /// Per SEP-2577 + SEP-2596, the spec now has a formal Active/Deprecated/
@@ -2472,11 +2511,19 @@ pub struct ListToolsResult {
     pub next_cursor: Option<String>,
     /// SEP-2549: client-cache TTL in milliseconds for this list response.
     /// `None` means "no opinion -- client policy decides".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_lenient_ttl_ms"
+    )]
     pub ttl_ms: Option<u64>,
     /// SEP-2549: scope the cached result applies to. `None` means
     /// scope is unspecified.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_lenient_cache_scope"
+    )]
     pub cache_scope: Option<CacheScope>,
     /// Optional protocol-level metadata
     #[serde(
@@ -3320,10 +3367,18 @@ pub struct ListResourcesResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
     /// SEP-2549: client-cache TTL in milliseconds for this list response.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_lenient_ttl_ms"
+    )]
     pub ttl_ms: Option<u64>,
     /// SEP-2549: scope the cached result applies to.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_lenient_cache_scope"
+    )]
     pub cache_scope: Option<CacheScope>,
     /// Optional protocol-level metadata
     #[serde(
@@ -3410,14 +3465,20 @@ pub struct ReadResourceResult {
     /// SEP-2549: client-cache TTL in milliseconds for this read response.
     /// The 2026-07-28 draft requires caching hints on `resources/read`
     /// results; on older protocol versions the field is simply extra data.
-    #[serde(rename = "ttlMs", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "ttlMs",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_lenient_ttl_ms"
+    )]
     pub ttl_ms: Option<u64>,
     /// SEP-2549: scope the cached result applies to. `None` means
     /// unspecified (clients treat it conservatively).
     #[serde(
         rename = "cacheScope",
         default,
-        skip_serializing_if = "Option::is_none"
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_lenient_cache_scope"
     )]
     pub cache_scope: Option<CacheScope>,
     /// Optional protocol-level metadata
@@ -3715,10 +3776,18 @@ pub struct ListResourceTemplatesResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
     /// SEP-2549: client-cache TTL in milliseconds for this list response.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_lenient_ttl_ms"
+    )]
     pub ttl_ms: Option<u64>,
     /// SEP-2549: scope the cached result applies to.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_lenient_cache_scope"
+    )]
     pub cache_scope: Option<CacheScope>,
     /// Optional protocol-level metadata
     #[serde(
@@ -3810,10 +3879,18 @@ pub struct ListPromptsResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
     /// SEP-2549: client-cache TTL in milliseconds for this list response.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_lenient_ttl_ms"
+    )]
     pub ttl_ms: Option<u64>,
     /// SEP-2549: scope the cached result applies to.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_lenient_cache_scope"
+    )]
     pub cache_scope: Option<CacheScope>,
     /// Optional protocol-level metadata
     #[serde(
@@ -6205,6 +6282,126 @@ mod tests {
             let back: CacheScope = serde_json::from_value(s).unwrap();
             assert_eq!(back, scope);
         }
+    }
+
+    // =========================================================================
+    // #1482 (lenient cacheScope / ttlMs deserialization)
+    // =========================================================================
+
+    #[test]
+    fn discover_result_accepts_bad_cache_scope_as_none() {
+        for cache_scope_json in ["\"\"", "\"bogus\"", "42"] {
+            let json = format!(
+                r#"{{"supportedVersions":["2026-07-28"],"capabilities":{{}},"cacheScope":{cache_scope_json}}}"#
+            );
+            let r: DiscoverResult = serde_json::from_str(&json).unwrap_or_else(|e| {
+                panic!("cacheScope {cache_scope_json} should not fail deserialization: {e}")
+            });
+            assert_eq!(r.cache_scope, None);
+            assert_eq!(r.supported_versions, vec!["2026-07-28".to_string()]);
+        }
+    }
+
+    #[test]
+    fn list_tools_result_accepts_bad_cache_scope_as_none() {
+        for cache_scope_json in ["\"\"", "\"bogus\"", "42"] {
+            let json = format!(r#"{{"tools":[],"cacheScope":{cache_scope_json}}}"#);
+            let r: ListToolsResult = serde_json::from_str(&json).unwrap_or_else(|e| {
+                panic!("cacheScope {cache_scope_json} should not fail deserialization: {e}")
+            });
+            assert_eq!(r.cache_scope, None);
+            assert!(r.tools.is_empty());
+        }
+    }
+
+    #[test]
+    fn list_resources_result_accepts_bad_cache_scope_as_none() {
+        for cache_scope_json in ["\"\"", "\"bogus\"", "42"] {
+            let json = format!(r#"{{"resources":[],"cacheScope":{cache_scope_json}}}"#);
+            let r: ListResourcesResult = serde_json::from_str(&json).unwrap_or_else(|e| {
+                panic!("cacheScope {cache_scope_json} should not fail deserialization: {e}")
+            });
+            assert_eq!(r.cache_scope, None);
+            assert!(r.resources.is_empty());
+        }
+    }
+
+    #[test]
+    fn read_resource_result_accepts_bad_cache_scope_as_none() {
+        for cache_scope_json in ["\"\"", "\"bogus\"", "42"] {
+            let json = format!(r#"{{"contents":[],"cacheScope":{cache_scope_json}}}"#);
+            let r: ReadResourceResult = serde_json::from_str(&json).unwrap_or_else(|e| {
+                panic!("cacheScope {cache_scope_json} should not fail deserialization: {e}")
+            });
+            assert_eq!(r.cache_scope, None);
+            assert!(r.contents.is_empty());
+        }
+    }
+
+    #[test]
+    fn list_resource_templates_result_accepts_bad_cache_scope_as_none() {
+        for cache_scope_json in ["\"\"", "\"bogus\"", "42"] {
+            let json = format!(r#"{{"resourceTemplates":[],"cacheScope":{cache_scope_json}}}"#);
+            let r: ListResourceTemplatesResult = serde_json::from_str(&json).unwrap_or_else(|e| {
+                panic!("cacheScope {cache_scope_json} should not fail deserialization: {e}")
+            });
+            assert_eq!(r.cache_scope, None);
+            assert!(r.resource_templates.is_empty());
+        }
+    }
+
+    #[test]
+    fn list_prompts_result_accepts_bad_cache_scope_as_none() {
+        for cache_scope_json in ["\"\"", "\"bogus\"", "42"] {
+            let json = format!(r#"{{"prompts":[],"cacheScope":{cache_scope_json}}}"#);
+            let r: ListPromptsResult = serde_json::from_str(&json).unwrap_or_else(|e| {
+                panic!("cacheScope {cache_scope_json} should not fail deserialization: {e}")
+            });
+            assert_eq!(r.cache_scope, None);
+            assert!(r.prompts.is_empty());
+        }
+    }
+
+    #[test]
+    fn cache_scope_valid_values_still_deserialize_and_serialize_unchanged() {
+        for (wire, scope) in [
+            ("public", CacheScope::Public),
+            ("private", CacheScope::Private),
+        ] {
+            let json = format!(r#"{{"tools":[],"cacheScope":"{wire}"}}"#);
+            let r: ListToolsResult = serde_json::from_str(&json).unwrap();
+            assert_eq!(r.cache_scope, Some(scope));
+            let out = serde_json::to_value(&r).unwrap();
+            assert_eq!(out["cacheScope"], wire);
+        }
+    }
+
+    #[test]
+    fn ttl_ms_accepts_negative_or_non_integer_as_none() {
+        for ttl_ms_json in ["-1", "1.5", "\"60000\""] {
+            let json = format!(r#"{{"tools":[],"ttlMs":{ttl_ms_json}}}"#);
+            let r: ListToolsResult = serde_json::from_str(&json).unwrap_or_else(|e| {
+                panic!("ttlMs {ttl_ms_json} should not fail deserialization: {e}")
+            });
+            assert_eq!(r.ttl_ms, None);
+        }
+
+        // Also cover the struct that renames the field explicitly instead of
+        // relying on a struct-level rename_all = "camelCase".
+        for ttl_ms_json in ["-1", "1.5"] {
+            let json = format!(r#"{{"contents":[],"ttlMs":{ttl_ms_json}}}"#);
+            let r: ReadResourceResult = serde_json::from_str(&json).unwrap_or_else(|e| {
+                panic!("ttlMs {ttl_ms_json} should not fail deserialization: {e}")
+            });
+            assert_eq!(r.ttl_ms, None);
+        }
+    }
+
+    #[test]
+    fn ttl_ms_valid_value_still_deserializes() {
+        let json = r#"{"tools":[],"ttlMs":60000}"#;
+        let r: ListToolsResult = serde_json::from_str(json).unwrap();
+        assert_eq!(r.ttl_ms, Some(60_000));
     }
 
     // =========================================================================
