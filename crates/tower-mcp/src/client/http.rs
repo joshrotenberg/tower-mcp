@@ -1321,15 +1321,20 @@ impl ClientTransport for HttpClientTransport {
                     // "server-error", on anything but the session-level
                     // -32005 signal), inject it so the awaiting caller is
                     // woken by this error instead of hanging. A response has
-                    // no `reply_id`, so its error body is forwarded exactly
-                    // as received, with no id rewrite performed on its
-                    // behalf.
+                    // no `reply_id`: its error body is forwarded only for the
+                    // session signal, since any id it carries is the server's
+                    // and could match one of the client's own pending
+                    // requests.
                     if !body.is_empty()
                         && let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&body)
                         && is_jsonrpc_error_response(&v)
                     {
                         let is_session_signal =
                             v.pointer("/error/code").and_then(|c| c.as_i64()) == Some(-32005);
+                        if reply_id.is_none() && !is_session_signal {
+                            tracing::warn!(status = %status, body = %body, "reply POST returned a JSON-RPC error body");
+                            return;
+                        }
                         if !is_session_signal
                             && let Some(id) = &reply_id
                             && !v
@@ -1337,9 +1342,6 @@ impl ClientTransport for HttpClientTransport {
                                 .is_some_and(|actual| json_request_ids_match(actual, id))
                         {
                             v["id"] = id.clone();
-                        }
-                        if reply_id.is_none() {
-                            tracing::warn!(status = %status, "reply POST returned a JSON-RPC error body");
                         }
                         let _ = tx.send(v.to_string()).await;
                         return;

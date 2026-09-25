@@ -3924,6 +3924,25 @@ async fn discover_rejected_with_a_foreign_error_id_fails() {
 /// completion instead.
 #[tokio::test]
 async fn server_request_colliding_with_client_id_reply_failure_does_not_fail_client_request() {
+    colliding_reply_rejection_case(|_| raw_response("500 Internal Server Error", "", "")).await;
+}
+
+/// As above, but the reply POST is rejected with a JSON-RPC error body that
+/// echoes the server request's id, which equals the client request's id. The
+/// body must not be forwarded as if it answered the client's request.
+#[tokio::test]
+async fn reply_rejected_with_an_error_body_does_not_fail_the_colliding_client_request() {
+    colliding_reply_rejection_case(|req| {
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":{},"error":{{"code":-32600,"message":"reply rejected"}}}}"#,
+            raw_request_id(req)
+        );
+        raw_response("400 Bad Request", RAW_JSON, &body)
+    })
+    .await;
+}
+
+async fn colliding_reply_rejection_case(reject_reply: fn(&str) -> String) {
     use tokio::io::AsyncWriteExt;
 
     fn sse_chunk(data: &str) -> String {
@@ -3984,7 +4003,7 @@ async fn server_request_colliding_with_client_id_reply_failure_does_not_fail_cli
                         // The client's reply to the pushed `ping`: an id with
                         // no method. Reject it, then release the withheld
                         // `tools/list` completion.
-                        let response = raw_response("500 Internal Server Error", "", "");
+                        let response = reject_reply(&req);
                         let _ = stream.write_all(response.as_bytes()).await;
                         let _ = stream.flush().await;
                         reply_handled.notify_one();
