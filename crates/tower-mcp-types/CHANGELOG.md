@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.23.0] - 2026-09-25
+
+### Bug Fixes
+
+- **types:** Reject a JSON-RPC response carrying both result and error (closes #1481) ([#1495](https://github.com/joshrotenberg/tower-mcp/pull/1495))
+- **types:** Treat an empty or unknown cacheScope as absent (closes #1482) ([#1491](https://github.com/joshrotenberg/tower-mcp/pull/1491))
+- **framing:** Bound newline-delimited frame length (closes #1470) ([#1488](https://github.com/joshrotenberg/tower-mcp/pull/1488))
+
+
+
 ## [0.22.2] - 2026-08-23
 
 ### Documentation

@@ -2,6 +2,50 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.23.0] - 2026-09-25
+
+### Bug Fixes
+
+- **stdio:** Drain bidirectional responses before shutdown ([#1457](https://github.com/joshrotenberg/tower-mcp/pull/1457))
+- **types:** Reject a JSON-RPC response carrying both result and error (closes #1481) ([#1495](https://github.com/joshrotenberg/tower-mcp/pull/1495))
+- **http:** Answer handler-produced protocol errors with HTTP 400 on 2026-07-28 (closes #1477) ([#1494](https://github.com/joshrotenberg/tower-mcp/pull/1494))
+- **client:** Validate the protocol version the server selects (closes #1473) ([#1493](https://github.com/joshrotenberg/tower-mcp/pull/1493))
+- **docs:** Gate the 2026-07-28 protocol_versions examples on the feature (closes #1490) ([#1492](https://github.com/joshrotenberg/tower-mcp/pull/1492))
+- **framing:** Bound newline-delimited frame length (closes #1470) ([#1488](https://github.com/joshrotenberg/tower-mcp/pull/1488))
+- **client:** Deliver an error when an HTTP response carries no reply to the request (closes #1465) ([#1484](https://github.com/joshrotenberg/tower-mcp/pull/1484))
+- [**breaking**] **websocket:** Validate Origin on the WebSocket upgrade (closes #1464) ([#1485](https://github.com/joshrotenberg/tower-mcp/pull/1485))
+- **http:** Reject duplicate singleton MCP headers (closes #1468) ([#1487](https://github.com/joshrotenberg/tower-mcp/pull/1487))
+- **oauth-client:** Reauthorize when a stored refresh token is rejected (closes #1463) ([#1486](https://github.com/joshrotenberg/tower-mcp/pull/1486))
+- **client:** Stop tracking replies to server requests as client requests (closes #1466) ([#1497](https://github.com/joshrotenberg/tower-mcp/pull/1497))
+- **transport:** Normalize Origin allowlist entries (closes #1476) ([#1498](https://github.com/joshrotenberg/tower-mcp/pull/1498))
+- **docs:** Compile the deployment module only with http (closes #1499) ([#1500](https://github.com/joshrotenberg/tower-mcp/pull/1500))
+- **oauth-client:** Implement invalidate() for the auth-code providers (closes #1467) ([#1496](https://github.com/joshrotenberg/tower-mcp/pull/1496))
+- **client:** Bound buffered HTTP response bodies (closes #1469) ([#1501](https://github.com/joshrotenberg/tower-mcp/pull/1501))
+- **http:** Route initialize to the session path regardless of its body version (closes #1474) ([#1502](https://github.com/joshrotenberg/tower-mcp/pull/1502))
+- **oauth-client:** Coordinate refreshes across flows that share a token store (closes #1472) ([#1503](https://github.com/joshrotenberg/tower-mcp/pull/1503))
+- [**breaking**] **client:** Stop following cross-origin redirects with credentials attached (closes #1475) ([#1504](https://github.com/joshrotenberg/tower-mcp/pull/1504))
+- **oauth-client:** Do not follow redirects on client-credentials token requests (closes #1506) ([#1507](https://github.com/joshrotenberg/tower-mcp/pull/1507))
+- **client:** Honor cancellation of server-initiated requests (closes #1483) ([#1505](https://github.com/joshrotenberg/tower-mcp/pull/1505))
+- **client:** Abort background tasks when the HTTP client transport is dropped (closes #1479) ([#1509](https://github.com/joshrotenberg/tower-mcp/pull/1509))
+- **oauth-client:** Make PRM discovery skip mismatched candidates and match resources consistently (closes #1478) ([#1511](https://github.com/joshrotenberg/tower-mcp/pull/1511))
+
+### Documentation
+
+- [**breaking**] **middleware:** Document the fallible tower-resilience 0.13 builders ([#1458](https://github.com/joshrotenberg/tower-mcp/pull/1458))
+
+### Features
+
+- **mrtr:** Support request-state key rotation (closes #1471) ([#1489](https://github.com/joshrotenberg/tower-mcp/pull/1489))
+- **oauth-client:** Allow an explicit resource indicator on the auth-code flows (closes #1480) ([#1508](https://github.com/joshrotenberg/tower-mcp/pull/1508))
+
+### Testing
+
+- **tasks:** Pin declined and cancelled elicitation responses (closes #1426) ([#1434](https://github.com/joshrotenberg/tower-mcp/pull/1434))
+- **stdio:** Isolate the frame-tracing tests into their own binary (closes #1435) ([#1436](https://github.com/joshrotenberg/tower-mcp/pull/1436))
+- **tasks:** Keep the expiry worker out of the retirement signalling test ([#1510](https://github.com/joshrotenberg/tower-mcp/pull/1510))
+
+
+
 ## [0.22.2] - 2026-08-23
 
 ### Bug Fixes
