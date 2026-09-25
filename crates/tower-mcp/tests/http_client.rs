@@ -3697,3 +3697,208 @@ async fn stalled_initialized_notification_does_not_freeze_client() {
         "error should name the handshake step, got: {error}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Responses that carry no reply to the request (#1465)
+// ---------------------------------------------------------------------------
+
+const RAW_JSON: &str = "Content-Type: application/json\r\n";
+
+/// A raw HTTP/1.1 server that answers every request with `respond(request)`,
+/// one connection per request, so malformed replies reach the client exactly
+/// as written.
+async fn spawn_raw_server<F>(respond: F) -> String
+where
+    F: Fn(&str) -> String + Send + Sync + 'static,
+{
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let respond = Arc::new(respond);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let respond = respond.clone();
+            tokio::spawn(async move {
+                let Some(req) = read_http_request(&mut stream).await else {
+                    return;
+                };
+                let _ = stream.write_all(respond(&req).as_bytes()).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+fn raw_response(status: &str, headers: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// The JSON-RPC id of a raw HTTP request, as serialized JSON.
+fn raw_request_id(req: &str) -> String {
+    req.split_once("\r\n\r\n")
+        .and_then(|(_, body)| serde_json::from_str::<serde_json::Value>(body).ok())
+        .and_then(|value| value.get("id").cloned())
+        .unwrap_or(serde_json::Value::Null)
+        .to_string()
+}
+
+fn raw_is(req: &str, method: &str) -> bool {
+    req.contains(&format!("\"method\":\"{method}\""))
+}
+
+/// The session-establishing reply to `initialize`.
+fn raw_initialize_ok(req: &str) -> String {
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":{},"result":{{"protocolVersion":"2025-11-25","capabilities":{{}},"serverInfo":{{"name":"raw","version":"0"}}}}}}"#,
+        raw_request_id(req)
+    );
+    raw_response(
+        "200 OK",
+        &format!("{RAW_JSON}mcp-session-id: raw-session\r\nmcp-protocol-version: 2025-11-25\r\n"),
+        &body,
+    )
+}
+
+fn raw_client_config() -> HttpClientConfig {
+    HttpClientConfig {
+        auto_sse: false,
+        request_timeout: Duration::from_secs(5),
+        ..Default::default()
+    }
+}
+
+/// On an established session, each response below used to leave `list_tools`
+/// parked forever. It must fail instead, and the transport must stay usable:
+/// a bad reply to one request is not a broken connection.
+#[tokio::test]
+async fn session_request_without_a_reply_fails_and_client_stays_usable() {
+    // (case, status, headers, body); `{id}` in the body becomes the request id.
+    let cases = [
+        ("202 Accepted", "202 Accepted", "", "", None),
+        ("empty JSON object", "200 OK", RAW_JSON, "{}", None),
+        ("non-JSON body", "200 OK", RAW_JSON, "hello", None),
+        (
+            "error with a foreign id",
+            "400 Bad Request",
+            RAW_JSON,
+            r#"{"jsonrpc":"2.0","id":"server-error","error":{"code":-32600,"message":"rejected by gateway"}}"#,
+            Some("rejected by gateway"),
+        ),
+        (
+            "error with the request id",
+            "400 Bad Request",
+            RAW_JSON,
+            r#"{"jsonrpc":"2.0","id":{id},"error":{"code":-32600,"message":"rejected by server"}}"#,
+            Some("rejected by server"),
+        ),
+    ];
+
+    for (case, status, headers, body, expected_message) in cases {
+        let url = spawn_raw_server(move |req| {
+            if raw_is(req, "initialize") {
+                raw_initialize_ok(req)
+            } else if raw_is(req, "notifications/initialized") {
+                raw_response("202 Accepted", "", "")
+            } else if raw_is(req, "tools/list") {
+                raw_response(status, headers, &body.replace("{id}", &raw_request_id(req)))
+            } else {
+                let reply = format!(
+                    r#"{{"jsonrpc":"2.0","id":{},"result":{{}}}}"#,
+                    raw_request_id(req)
+                );
+                raw_response("200 OK", RAW_JSON, &reply)
+            }
+        })
+        .await;
+
+        let client = McpClient::connect(HttpClientTransport::with_config(url, raw_client_config()))
+            .await
+            .unwrap();
+        client.initialize("raw-client", "1.0.0").await.unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(3), client.list_tools())
+            .await
+            .unwrap_or_else(|_| panic!("{case}: list_tools hung"));
+        let error = result.expect_err(case).to_string();
+        if let Some(expected) = expected_message {
+            assert!(
+                error.contains(expected),
+                "{case}: the server's error should surface, got: {error}"
+            );
+        }
+
+        tokio::time::timeout(Duration::from_secs(3), client.ping())
+            .await
+            .unwrap_or_else(|_| panic!("{case}: ping after the bad reply hung"))
+            .unwrap_or_else(|error| panic!("{case}: client unusable after the bad reply: {error}"));
+    }
+}
+
+/// Before a session exists, requests go through the synchronous path, which
+/// had the same dead ends for `initialize`.
+#[tokio::test]
+async fn pre_session_request_without_a_reply_fails() {
+    let cases = [
+        ("202 Accepted", "202 Accepted", "", ""),
+        ("empty JSON object", "200 OK", RAW_JSON, "{}"),
+        ("empty body", "200 OK", RAW_JSON, ""),
+    ];
+
+    for (case, status, headers, body) in cases {
+        let url = spawn_raw_server(move |_| raw_response(status, headers, body)).await;
+        let client = McpClient::connect(HttpClientTransport::with_config(url, raw_client_config()))
+            .await
+            .unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.initialize("raw-client", "1.0.0"),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{case}: initialize hung"));
+        assert!(result.is_err(), "{case}: expected an error, got {result:?}");
+    }
+}
+
+/// Gateways and the Python SDK reject `server/discover` with a JSON-RPC error
+/// whose id is a literal string rather than the request's id.
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn discover_rejected_with_a_foreign_error_id_fails() {
+    let url = spawn_raw_server(|_| {
+        raw_response(
+            "400 Bad Request",
+            RAW_JSON,
+            r#"{"jsonrpc":"2.0","id":"server-error","error":{"code":-32600,"message":"discover not supported"}}"#,
+        )
+    })
+    .await;
+    let client = McpClient::builder()
+        .protocol_support(tower_mcp::ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+        .connect(
+            HttpClientTransport::with_config(url, raw_client_config()),
+            NotificationHandler::new(),
+        )
+        .await
+        .unwrap();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.discover("raw-client", "1.0.0"),
+    )
+    .await
+    .expect("discover hung on an error with a foreign id");
+    let error = result.expect_err("discover should fail").to_string();
+    assert!(
+        error.contains("discover not supported"),
+        "the server's error should surface, got: {error}"
+    );
+}

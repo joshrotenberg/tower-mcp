@@ -692,6 +692,14 @@ impl HttpClientTransport {
         parsed.to_string()
     }
 
+    /// Queue a frame for [`recv`](ClientTransport::recv).
+    async fn queue_incoming(&self, frame: String) -> Result<()> {
+        self.incoming_tx
+            .send(frame)
+            .await
+            .map_err(|_| Error::Transport("Internal channel closed".to_string()))
+    }
+
     /// Start the SSE background stream after session is established.
     fn start_sse_stream(&mut self) {
         let url = self.url.clone();
@@ -1118,6 +1126,14 @@ impl ClientTransport for HttpClientTransport {
             .as_ref()
             .and_then(|value| value.get("method"))
             .and_then(serde_json::Value::as_str);
+        // Only a request (a frame with both `method` and `id`) is owed a
+        // response. The client's replies to server requests also pass through
+        // here, and must not have error frames injected on their behalf.
+        let reply_id = parsed_message
+            .as_ref()
+            .filter(|value| value.get("method").is_some())
+            .and_then(|value| value.get("id"))
+            .cloned();
         let operation = operation_label(parsed_message.as_ref());
         let outbound_version = parsed_message
             .as_ref()
@@ -1238,6 +1254,7 @@ impl ClientTransport for HttpClientTransport {
                 .clone()
                 .and_then(|value| serde_json::from_value(value).ok());
             let is_subscription = method == Some("subscriptions/listen");
+            let reply_id = reply_id.clone();
             let connected = self.connected.clone();
             let last_event_id = self.last_event_id.clone();
             let sse_retry_delay = self.sse_retry_delay.clone();
@@ -1279,8 +1296,14 @@ impl ClientTransport for HttpClientTransport {
 
                 let status = response.status();
 
-                // 202 Accepted = notification acknowledged, no body
+                // 202 Accepted acknowledges a notification or a reply, never a
+                // request, which is owed a JSON-RPC response.
                 if status == reqwest::StatusCode::ACCEPTED {
+                    if let Some(id) = &reply_id {
+                        let _ = tx
+                            .send(transport_error_frame(id, ACCEPTED_WITHOUT_RESPONSE))
+                            .await;
+                    }
                     return;
                 }
 
@@ -1291,9 +1314,10 @@ impl ClientTransport for HttpClientTransport {
                     // Forward a JSON-RPC error body so the message loop can
                     // detect -32005 (SessionNotFound) and trigger session
                     // recovery. If the server did not echo our request id (a
-                    // null/absent id that is not the session-level -32005
-                    // signal), inject it so the awaiting caller is woken by
-                    // this error instead of hanging.
+                    // null, absent, or foreign id such as a gateway's
+                    // "server-error", on anything but the session-level
+                    // -32005 signal), inject it so the awaiting caller is
+                    // woken by this error instead of hanging.
                     if !body.is_empty()
                         && let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&body)
                         && is_jsonrpc_error_response(&v)
@@ -1301,8 +1325,10 @@ impl ClientTransport for HttpClientTransport {
                         let is_session_signal =
                             v.pointer("/error/code").and_then(|c| c.as_i64()) == Some(-32005);
                         if !is_session_signal
-                            && v.get("id").is_none_or(|id| id.is_null())
                             && let Some(id) = &req_id
+                            && !v
+                                .get("id")
+                                .is_some_and(|actual| json_request_ids_match(actual, id))
                         {
                             v["id"] = id.clone();
                         }
@@ -1522,8 +1548,18 @@ impl ClientTransport for HttpClientTransport {
                                         .await;
                                 }
                             } else {
+                                // A `{}` or non-JSON body still yields one
+                                // "frame", which the message loop drops.
+                                let answered = reply_id
+                                    .as_ref()
+                                    .is_none_or(|id| frames_answer_request(&msgs, id));
                                 for msg in msgs {
                                     let _ = tx.send(msg).await;
+                                }
+                                if !answered && let Some(id) = &reply_id {
+                                    let _ = tx
+                                        .send(transport_error_frame(id, NO_RESPONSE_IN_BODY))
+                                        .await;
                                 }
                             }
                         }
@@ -1600,6 +1636,11 @@ impl ClientTransport for HttpClientTransport {
             if let Some(pv) = new_protocol_version {
                 self.protocol_version = Some(pv);
             }
+            // A request is owed a response; a 202 leaves its caller waiting.
+            if let Some(id) = &reply_id {
+                self.queue_incoming(transport_error_frame(id, ACCEPTED_WITHOUT_RESPONSE))
+                    .await?;
+            }
             return Ok(());
         }
 
@@ -1611,15 +1652,14 @@ impl ClientTransport for HttpClientTransport {
                 && let Ok(mut error) = serde_json::from_str::<serde_json::Value>(&body)
                 && is_jsonrpc_error_response(&error)
             {
-                if error.get("id").is_none_or(serde_json::Value::is_null)
-                    && let Some(id) = parsed_message.as_ref().and_then(|value| value.get("id"))
+                if let Some(id) = parsed_message.as_ref().and_then(|value| value.get("id"))
+                    && !error
+                        .get("id")
+                        .is_some_and(|actual| json_request_ids_match(actual, id))
                 {
                     error["id"] = id.clone();
                 }
-                self.incoming_tx
-                    .send(error.to_string())
-                    .await
-                    .map_err(|_| Error::Transport("Internal channel closed".to_string()))?;
+                self.queue_incoming(error.to_string()).await?;
                 return Ok(());
             }
             // 404 only signals an expired session once a session exists.
@@ -1673,11 +1713,23 @@ impl ClientTransport for HttpClientTransport {
             .await
             .map_err(|e| Error::Transport(format!("Failed to read response: {}", e)))?;
 
-        for msg in extract_json_messages(&body) {
-            self.incoming_tx
-                .send(msg)
-                .await
-                .map_err(|_| Error::Transport("Internal channel closed".to_string()))?;
+        let msgs = extract_json_messages(&body);
+        let answered = reply_id
+            .as_ref()
+            .is_none_or(|id| frames_answer_request(&msgs, id));
+        let no_reply = if msgs.is_empty() {
+            "server returned an empty response body"
+        } else {
+            NO_RESPONSE_IN_BODY
+        };
+        for msg in msgs {
+            self.queue_incoming(msg).await?;
+        }
+        // Wake the caller rather than leave it parked on a reply that is not
+        // coming. The transport itself is still healthy.
+        if !answered && let Some(id) = &reply_id {
+            self.queue_incoming(transport_error_frame(id, no_reply))
+                .await?;
         }
 
         Ok(())
@@ -1985,6 +2037,27 @@ fn transport_error_frame(id: &serde_json::Value, message: &str) -> String {
         "error": { "code": -32000, "message": message },
     })
     .to_string()
+}
+
+/// Error for a request answered with `202 Accepted`, which acknowledges
+/// notifications and replies but carries no response.
+const ACCEPTED_WITHOUT_RESPONSE: &str =
+    "server answered the request with 202 Accepted instead of a response";
+
+/// Error for a response body that holds no reply to the request it answers.
+const NO_RESPONSE_IN_BODY: &str = "server response did not contain a reply to this request";
+
+/// Whether `frames` include the final response (a `result` or an `error`) to
+/// the request with `id` (#1465).
+fn frames_answer_request(frames: &[String], id: &serde_json::Value) -> bool {
+    frames.iter().any(|frame| {
+        serde_json::from_str::<serde_json::Value>(frame).is_ok_and(|value| {
+            value
+                .get("id")
+                .is_some_and(|actual| json_request_ids_match(actual, id))
+                && (value.get("result").is_some() || value.get("error").is_some())
+        })
+    })
 }
 
 fn json_request_ids_match(left: &serde_json::Value, right: &serde_json::Value) -> bool {
