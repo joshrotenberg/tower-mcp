@@ -2451,8 +2451,8 @@ mod tests {
     /// `refreshed-access-token`, so a successful retry proves the whole
     /// invalidate-then-refresh path rather than just that a token exists.
     #[cfg(all(feature = "oauth-client", feature = "http"))]
-    async fn spawn_oauth_flow_fixture() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>)
-    {
+    async fn spawn_resource_server_fixture()
+    -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         use axum::body::Bytes;
         use axum::http::{HeaderMap, StatusCode};
         use axum::response::IntoResponse;
@@ -2614,7 +2614,7 @@ mod tests {
     async fn a_real_auth_code_flow_provider_reauthorizes_through_invalidate() {
         use std::sync::atomic::Ordering;
 
-        let (base, seen) = spawn_oauth_flow_fixture().await;
+        let (base, seen) = spawn_resource_server_fixture().await;
         let resource = format!("{base}/mcp");
 
         let flow = OAuthAuthorizationFlow::builder(&resource)
