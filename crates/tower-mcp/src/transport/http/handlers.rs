@@ -1364,6 +1364,13 @@ pub(super) async fn handle_post(
         }
         state.sessions.save_record(&session).await;
     }
+    // The session was created before dispatch. A failed initialize never
+    // admits the client to it and no id is returned below, so drop it now
+    // rather than leave it counting against the session limit until it
+    // idles out.
+    if is_init && !is_successful_init {
+        state.sessions.remove(&session.id).await;
+    }
 
     let negotiated_version = session.protocol_version.read().await.clone();
     let response_version = if request_method == "server/discover"

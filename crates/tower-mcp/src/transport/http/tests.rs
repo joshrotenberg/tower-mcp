@@ -4543,6 +4543,57 @@ async fn stateless_v2026_body_only_initialize_negotiates_legacy_session() {
     assert_eq!(follow_up_response.status(), StatusCode::OK);
 }
 
+/// A failed initialize must not leave its pre-created session behind: with
+/// `max_sessions(1)`, a second failed initialize still reaches the router
+/// and gets `-32022` instead of `503` from a leaked session (#1474).
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn stateless_v2026_failed_initialize_releases_its_session() {
+    let app = HttpTransport::new(create_test_router())
+        .disable_origin_validation()
+        .disable_host_validation()
+        .max_sessions(1)
+        .protocol_versions([PROTOCOL_VERSION_2026_07_28])
+        .unwrap()
+        .into_router();
+    for attempt in 0..2 {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2026-07-28",
+                        "capabilities": {},
+                        "clientInfo": { "name": "t", "version": "0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_ne!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "attempt {attempt}: a failed initialize leaked its session"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["error"]["code"],
+            McpErrorCode::UnsupportedProtocolVersion.code(),
+            "attempt {attempt}"
+        );
+    }
+}
+
 /// Same body-only initialize shape as above, but with `ProtocolSupport`
 /// narrowed to 2026-07-28 only: the router has no legacy version to
 /// negotiate down to, so it returns -32022 rather than a stateless success.
