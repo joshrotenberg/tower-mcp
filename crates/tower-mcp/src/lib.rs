@@ -528,7 +528,7 @@ pub mod async_task;
 pub mod auth;
 pub mod client;
 pub mod context;
-#[cfg(any(feature = "http", feature = "websocket"))]
+#[cfg(feature = "http")]
 pub mod deployment;
 pub mod error;
 #[cfg(any(feature = "http", feature = "websocket"))]
