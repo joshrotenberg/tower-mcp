@@ -371,6 +371,20 @@ fn validate_resource_identifier(server_url: &str, resource: &str) -> Result<(), 
     }
 }
 
+/// Validate an explicit RFC 8707 resource indicator override: an absolute
+/// URL without a fragment, the same shape required of a discovered resource.
+pub(crate) fn validate_resource_override(resource: &str) -> Result<(), OAuthClientError> {
+    let parsed = reqwest::Url::parse(resource).map_err(|error| {
+        OAuthClientError::BuildError(format!("invalid OAuth resource override: {error}"))
+    })?;
+    if parsed.fragment().is_some() {
+        return Err(OAuthClientError::BuildError(
+            "OAuth resource override must not contain a fragment".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn push_unique(values: &mut Vec<String>, value: String) {
     if !values.contains(&value) {
         values.push(value);
@@ -1006,6 +1020,19 @@ impl OAuthAuthorizationCode {
         // than one; otherwise the resource's preference order is retained.
         let discovery =
             discover_oauth_authorization(server_url, config.challenge.take(), &client).await?;
+
+        // An explicit override replaces the discovered resource everywhere
+        // the RFC 8707 resource indicator is sent below: the authorize URL,
+        // code exchange, and refresh requests. Validate it the same way the
+        // discovered resource was just validated inside discovery.
+        let resource = match config.resource.take() {
+            Some(resource) => {
+                validate_resource_override(&resource)?;
+                resource
+            }
+            None => discovery.resource.clone(),
+        };
+
         let metadata = match config.preferred_authorization_server.take() {
             Some(issuer) => discovery
                 .authorization_server(&issuer)
@@ -1084,7 +1111,7 @@ impl OAuthAuthorizationCode {
             if let Some(scopes) = &scope_str {
                 query.append_pair("scope", scopes);
             }
-            query.append_pair("resource", &discovery.resource);
+            query.append_pair("resource", &resource);
         }
 
         Ok(Self {
@@ -1094,7 +1121,7 @@ impl OAuthAuthorizationCode {
                 client_id,
                 client_secret: config.client_secret,
                 token_endpoint_auth_method,
-                resource: discovery.resource,
+                resource,
                 code_verifier,
                 state,
                 redirect_uri,
@@ -1441,6 +1468,15 @@ pub struct OAuthAuthCodeConfig {
     /// multiple authorization servers. The first advertised server is used
     /// when this is omitted.
     pub preferred_authorization_server: Option<String>,
+    /// Override the RFC 8707 resource indicator.
+    ///
+    /// When set, this value replaces the resource discovered from Protected
+    /// Resource Metadata everywhere the resource indicator is sent: the
+    /// authorize URL, code exchange, and refresh requests. Discovery still
+    /// runs to locate the authorization server; only the resource indicator
+    /// used in token requests is overridden. Must be an absolute URL without
+    /// a fragment, the same requirement enforced on the discovered resource.
+    pub resource: Option<String>,
 }
 
 impl Default for OAuthAuthCodeConfig {
@@ -1453,6 +1489,7 @@ impl Default for OAuthAuthCodeConfig {
             http_client: None,
             challenge: None,
             preferred_authorization_server: None,
+            resource: None,
         }
     }
 }
@@ -1706,6 +1743,100 @@ mod tests {
         .to_string()
     }
 
+    /// Like [`spawn_discovery_server`], but also serves a single-issuer
+    /// token endpoint at `/as/token`, so token exchange and refresh requests
+    /// can be captured too.
+    async fn spawn_discovery_and_token_server()
+    -> (String, tokio::task::JoinHandle<Vec<(String, String)>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server_base = base.clone();
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..5 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let header_end = loop {
+                    let mut chunk = [0_u8; 1024];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert!(read > 0);
+                    bytes.extend_from_slice(&chunk[..read]);
+                    if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                        break index + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..header_end]).to_string();
+                let path = headers
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap()
+                    .to_string();
+                let content_length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap_or(0);
+                while bytes.len() < header_end + content_length {
+                    let mut chunk = [0_u8; 1024];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    bytes.extend_from_slice(&chunk[..read]);
+                }
+                let body = String::from_utf8_lossy(&bytes[header_end..header_end + content_length])
+                    .to_string();
+                requests.push((path.clone(), body));
+
+                let (status, extra_headers, response_body) = match path.as_str() {
+                    "/mcp" => (
+                        "401 Unauthorized",
+                        format!(
+                            "WWW-Authenticate: Bearer resource_metadata=\"{server_base}/metadata\"\r\n"
+                        ),
+                        String::new(),
+                    ),
+                    "/metadata" => (
+                        "200 OK",
+                        String::new(),
+                        serde_json::json!({
+                            "resource": format!("{server_base}/mcp"),
+                            "authorization_servers": [format!("{server_base}/as")]
+                        })
+                        .to_string(),
+                    ),
+                    "/.well-known/oauth-authorization-server/as" => (
+                        "200 OK",
+                        String::new(),
+                        authorization_metadata_json(&server_base, "as"),
+                    ),
+                    "/as/token" => (
+                        "200 OK",
+                        String::new(),
+                        serde_json::json!({
+                            "access_token": "test-access-token",
+                            "token_type": "Bearer",
+                            "expires_in": 3600,
+                            "refresh_token": "test-refresh-token"
+                        })
+                        .to_string(),
+                    ),
+                    other => panic!("unexpected request path: {other}"),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n{extra_headers}content-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        (base, task)
+    }
+
     #[test]
     fn test_pkce_code_verifier_length() {
         let verifier = generate_code_verifier();
@@ -1822,6 +1953,74 @@ mod tests {
             parameters.get("code_challenge_method").map(String::as_str),
             Some("S256")
         );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_resource_override_is_used_in_token_requests() {
+        let (base, server) = spawn_discovery_and_token_server().await;
+        let resource = format!("{base}/mcp");
+        let override_resource = "https://override.example.com/aud".to_string();
+        let provider = OAuthAuthorizationCode::start_with_config(
+            &resource,
+            &[],
+            OAuthAuthCodeConfig {
+                client_id: Some("public-client".into()),
+                resource: Some(override_resource.clone()),
+                ..OAuthAuthCodeConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // The authorize URL carries the override, not the discovered
+        // resource (`{base}/mcp`).
+        let authorization_url = reqwest::Url::parse(provider.authorization_url()).unwrap();
+        let parameters: HashMap<_, _> = authorization_url.query_pairs().into_owned().collect();
+        assert_eq!(parameters.get("resource"), Some(&override_resource));
+
+        // Code exchange carries the override.
+        let token = provider.exchange_code("test-code").await.unwrap();
+        assert_eq!(token.access_token, "test-access-token");
+
+        // Refresh carries the override too.
+        let refreshed = provider
+            .refresh_token(token.refresh_token.as_deref().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(refreshed.access_token, "test-access-token");
+
+        let requests = server.await.unwrap();
+        let token_requests: Vec<_> = requests
+            .iter()
+            .filter(|(path, _)| path == "/as/token")
+            .collect();
+        assert_eq!(token_requests.len(), 2);
+        let encoded_override = urlencoding::encode(&override_resource);
+        for (_, body) in token_requests {
+            assert!(
+                body.contains(&format!("resource={encoded_override}")),
+                "token request body missing override resource: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_resource_override_with_fragment_is_rejected() {
+        let (base, server) = spawn_discovery_server().await;
+        let resource = format!("{base}/mcp");
+        let err = OAuthAuthorizationCode::start_with_config(
+            &resource,
+            &[],
+            OAuthAuthCodeConfig {
+                resource: Some("https://override.example.com/aud#frag".to_string()),
+                ..OAuthAuthCodeConfig::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, OAuthClientError::BuildError(_)));
+        assert!(err.to_string().contains("fragment"));
         server.await.unwrap();
     }
 

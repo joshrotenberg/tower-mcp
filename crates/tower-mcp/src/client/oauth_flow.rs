@@ -20,6 +20,7 @@ use super::oauth::{
 use super::oauth_authcode::{
     OAuthAuthorizationServerMetadata, OAuthClientRegistration, OAuthClientRegistrationMethod,
     OAuthClientRegistrationOptions, OAuthClientRegistrationStore, OAuthProtectedResourceMetadata,
+    validate_resource_override,
 };
 
 /// HTTP method used by an OAuth protocol request.
@@ -562,6 +563,7 @@ struct ActiveToken {
 
 struct FlowInner {
     resource_url: String,
+    resource_override: Option<String>,
     registration_options: OAuthClientRegistrationOptions,
     pre_registered_client: Option<(String, Option<String>)>,
     registration_store: Arc<dyn OAuthClientRegistrationStore>,
@@ -594,6 +596,7 @@ impl fmt::Debug for OAuthAuthorizationFlow {
         formatter
             .debug_struct("OAuthAuthorizationFlow")
             .field("resource_url", &self.inner.resource_url)
+            .field("resource_override", &self.inner.resource_override)
             .field("redirect_policy", &self.inner.redirect_policy)
             .field("preferred_issuer", &self.inner.preferred_issuer)
             .finish_non_exhaustive()
@@ -603,6 +606,7 @@ impl fmt::Debug for OAuthAuthorizationFlow {
 /// Builder for [`OAuthAuthorizationFlow`].
 pub struct OAuthAuthorizationFlowBuilder {
     resource_url: String,
+    resource_override: Option<String>,
     registration_options: OAuthClientRegistrationOptions,
     pre_registered_client: Option<(String, Option<String>)>,
     registration_store: Option<Arc<dyn OAuthClientRegistrationStore>>,
@@ -621,6 +625,7 @@ impl fmt::Debug for OAuthAuthorizationFlowBuilder {
         formatter
             .debug_struct("OAuthAuthorizationFlowBuilder")
             .field("resource_url", &self.resource_url)
+            .field("resource_override", &self.resource_override)
             .field("registration_options", &self.registration_options)
             .field("redirect_policy", &self.redirect_policy)
             .field("preferred_issuer", &self.preferred_issuer)
@@ -691,6 +696,20 @@ impl OAuthAuthorizationFlowBuilder {
         self
     }
 
+    /// Override the RFC 8707 resource indicator.
+    ///
+    /// When set, this value replaces the resource discovered from Protected
+    /// Resource Metadata everywhere the resource indicator is sent: the
+    /// authorize URL, code exchange, and refresh requests. It is also what
+    /// the [`OAuthTokenBinding`] is keyed on. Discovery still runs to locate
+    /// the authorization server; only the resource indicator used in token
+    /// requests is overridden. Must be an absolute URL without a fragment,
+    /// the same requirement enforced on the discovered resource.
+    pub fn resource(mut self, resource: impl Into<String>) -> Self {
+        self.resource_override = Some(resource.into());
+        self
+    }
+
     /// Set the pre-expiry refresh buffer.
     pub fn refresh_buffer(mut self, buffer: Duration) -> Self {
         self.refresh_buffer = buffer;
@@ -722,6 +741,9 @@ impl OAuthAuthorizationFlowBuilder {
             )
         })?;
         validate_redirect_policy(&redirect_policy)?;
+        if let Some(resource) = &self.resource_override {
+            validate_resource_override(resource)?;
+        }
         let http = match self.http {
             Some(http) => http,
             None => Arc::new(ReqwestOAuthHttpClient::without_redirects()?),
@@ -729,6 +751,7 @@ impl OAuthAuthorizationFlowBuilder {
         Ok(OAuthAuthorizationFlow {
             inner: Arc::new(FlowInner {
                 resource_url: self.resource_url,
+                resource_override: self.resource_override,
                 registration_options: self.registration_options,
                 pre_registered_client: self.pre_registered_client,
                 registration_store: self.registration_store.unwrap_or_else(|| {
@@ -867,6 +890,7 @@ impl OAuthAuthorizationFlow {
     pub fn builder(resource_url: impl Into<String>) -> OAuthAuthorizationFlowBuilder {
         OAuthAuthorizationFlowBuilder {
             resource_url: resource_url.into(),
+            resource_override: None,
             registration_options: OAuthClientRegistrationOptions::new(),
             pre_registered_client: None,
             registration_store: None,
@@ -988,8 +1012,16 @@ impl OAuthAuthorizationFlow {
             self.inner.assertion_signer.is_some(),
         )?;
         let scopes = select_scopes(&explicit_scopes, &discovery, &metadata);
+        // The explicit override, when configured, replaces the discovered
+        // resource everywhere the RFC 8707 resource indicator is sent, and
+        // is what the token binding below is keyed on.
+        let resource = self
+            .inner
+            .resource_override
+            .clone()
+            .unwrap_or_else(|| discovery.resource.clone());
         let binding = OAuthTokenBinding {
-            resource: discovery.resource.clone(),
+            resource: resource.clone(),
             issuer: metadata.issuer.clone(),
             client_id: registration.client_id().to_string(),
         };
@@ -1030,7 +1062,7 @@ impl OAuthAuthorizationFlow {
             state: state.clone(),
             code_verifier,
             redirect_uri: redirect_uri.clone(),
-            resource: discovery.resource.clone(),
+            resource: resource.clone(),
             issuer: metadata.issuer.clone(),
             token_endpoint: metadata.token_endpoint.clone(),
             registration: registration.clone(),
@@ -1051,7 +1083,7 @@ impl OAuthAuthorizationFlow {
                 .append_pair("state", &state)
                 .append_pair("code_challenge", &code_challenge)
                 .append_pair("code_challenge_method", "S256")
-                .append_pair("resource", &discovery.resource);
+                .append_pair("resource", &resource);
             if !scopes.is_empty() {
                 query.append_pair("scope", &scopes.join(" "));
             }
@@ -1062,7 +1094,7 @@ impl OAuthAuthorizationFlow {
                 request: OAuthAuthorizationRequest {
                     authorization_url: authorization_url.to_string(),
                     redirect_uri,
-                    resource: discovery.resource,
+                    resource,
                     issuer: metadata.issuer,
                     scopes,
                 },
@@ -2438,6 +2470,172 @@ mod tests {
                 "resource".to_string(),
                 "https://mcp.example.com/mcp".to_string()
             )));
+    }
+
+    #[tokio::test]
+    async fn explicit_resource_override_used_for_authorize_exchange_and_refresh() {
+        let http = MockOAuthHttp::new(RegistrationMode::PreRegistered).expiring();
+        let override_resource = "https://override.example.com/aud".to_string();
+        let flow = flow_builder(
+            http.clone(),
+            OAuthClientRegistrationOptions::new(),
+            AutomaticAuthorizationHandler::default(),
+        )
+        .pre_registered_client("pre:client", Some("pre secret".to_string()))
+        .resource(override_resource.clone())
+        .refresh_buffer(Duration::ZERO)
+        .build()
+        .unwrap();
+
+        let OAuthAuthorizationStart::Pending(pending) =
+            flow.begin(std::iter::empty::<&str>()).await.unwrap()
+        else {
+            panic!("expected pending flow")
+        };
+        // The authorization request carries the explicit override, not the
+        // resource discovered from PRM (https://mcp.example.com/mcp).
+        assert_eq!(pending.request().resource, override_resource);
+        let authorization_url = reqwest::Url::parse(&pending.request().authorization_url).unwrap();
+        let parameters: HashMap<_, _> = authorization_url.query_pairs().into_owned().collect();
+        assert_eq!(parameters.get("resource"), Some(&override_resource));
+        let state = parameters.get("state").unwrap().clone();
+
+        let request = pending.request().clone();
+        let mut callback = reqwest::Url::parse(&request.redirect_uri).unwrap();
+        callback
+            .query_pairs_mut()
+            .append_pair("code", "authorization-code")
+            .append_pair("state", &state)
+            .append_pair("iss", &request.issuer);
+        pending
+            .complete_callback_url(callback.as_str())
+            .await
+            .unwrap();
+
+        // Code exchange carried the override.
+        let requests = http.requests().await;
+        let exchange = requests
+            .iter()
+            .find(|request| request.url.ends_with("/token"))
+            .unwrap();
+        let OAuthHttpBody::Form(fields) = &exchange.body else {
+            panic!("expected token form")
+        };
+        assert!(
+            fields
+                .iter()
+                .any(|field| field == &("resource".to_string(), override_resource.clone()))
+        );
+
+        // The immediately-expired token forces a refresh on the next call;
+        // it must carry the override too.
+        assert_eq!(flow.get_token().await.unwrap(), "refreshed-token");
+        let requests = http.requests().await;
+        let refresh = requests
+            .iter()
+            .rfind(|request| request.url.ends_with("/token"))
+            .unwrap();
+        let OAuthHttpBody::Form(fields) = &refresh.body else {
+            panic!("expected refresh form")
+        };
+        assert!(
+            fields
+                .iter()
+                .any(|field| field == &("grant_type".to_string(), "refresh_token".to_string()))
+        );
+        assert!(
+            fields
+                .iter()
+                .any(|field| field == &("resource".to_string(), override_resource.clone()))
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_resource_override_changes_the_token_binding() {
+        let http = MockOAuthHttp::new(RegistrationMode::PreRegistered);
+        let override_resource = "https://override.example.com/aud".to_string();
+        let tokens = MemoryOAuthTokenStore::new();
+
+        // Seed a valid token under the binding the *discovered* resource
+        // would produce.
+        let discovered_binding = OAuthTokenBinding {
+            resource: "https://mcp.example.com/mcp".to_string(),
+            issuer: "https://auth.example.com/issuer".to_string(),
+            client_id: "pre:client".to_string(),
+        };
+        let stale_token = OAuthStoredToken {
+            access_token: "stale-discovered-token".to_string(),
+            refresh_token: None,
+            expires_at: u64::MAX,
+            scopes: vec![],
+        };
+        tokens
+            .save(&discovered_binding, &stale_token)
+            .await
+            .unwrap();
+
+        let flow = flow_builder(
+            http.clone(),
+            OAuthClientRegistrationOptions::new(),
+            AutomaticAuthorizationHandler::default(),
+        )
+        .pre_registered_client("pre:client", Some("pre secret".to_string()))
+        .resource(override_resource.clone())
+        .token_store(tokens.clone())
+        .build()
+        .unwrap();
+
+        // Nothing is stored under the override binding yet, so the token
+        // stored under the discovered resource must not be adopted.
+        let OAuthAuthorizationStart::Pending(pending) =
+            flow.begin(std::iter::empty::<&str>()).await.unwrap()
+        else {
+            panic!("a token stored under the discovered resource must not be reused")
+        };
+
+        let request = pending.request().clone();
+        let state = reqwest::Url::parse(&request.authorization_url)
+            .unwrap()
+            .query_pairs()
+            .find(|(name, _)| name == "state")
+            .unwrap()
+            .1
+            .into_owned();
+        let mut callback = reqwest::Url::parse(&request.redirect_uri).unwrap();
+        callback
+            .query_pairs_mut()
+            .append_pair("code", "authorization-code")
+            .append_pair("state", &state)
+            .append_pair("iss", &request.issuer);
+        pending
+            .complete_callback_url(callback.as_str())
+            .await
+            .unwrap();
+
+        let override_binding = OAuthTokenBinding {
+            resource: override_resource,
+            issuer: "https://auth.example.com/issuer".to_string(),
+            client_id: "pre:client".to_string(),
+        };
+        let stored = tokens.load(&override_binding).await.unwrap().unwrap();
+        assert_eq!(stored.access_token, "access-token-0");
+
+        // The entry under the discovered resource is untouched.
+        let untouched = tokens.load(&discovered_binding).await.unwrap().unwrap();
+        assert_eq!(untouched.access_token, "stale-discovered-token");
+    }
+
+    #[test]
+    fn explicit_resource_override_with_fragment_is_rejected() {
+        let err = OAuthAuthorizationFlow::builder("https://mcp.example.com/mcp")
+            .redirect_policy(OAuthRedirectPolicy::fixed(
+                "http://127.0.0.1:23456/callback",
+            ))
+            .resource("https://override.example.com/aud#frag")
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, OAuthClientError::BuildError(_)));
+        assert!(err.to_string().contains("fragment"));
     }
 
     #[tokio::test]
