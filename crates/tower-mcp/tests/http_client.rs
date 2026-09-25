@@ -3741,6 +3741,13 @@ fn raw_response(status: &str, headers: &str, body: &str) -> String {
     )
 }
 
+/// A response with no declared length: valid only paired with
+/// `Connection: close`, which tells the client to read the body until the
+/// server closes the socket rather than trusting a `Content-Length`.
+fn raw_response_no_length(status: &str, headers: &str, body: &str) -> String {
+    format!("HTTP/1.1 {status}\r\n{headers}Connection: close\r\n\r\n{body}")
+}
+
 /// The JSON-RPC id of a raw HTTP request, as serialized JSON.
 fn raw_request_id(req: &str) -> String {
     req.split_once("\r\n\r\n")
@@ -4025,5 +4032,247 @@ async fn colliding_reply_rejection_case(reject_reply: fn(&str) -> String) {
     assert!(
         result.is_ok(),
         "the client's own request must complete normally despite the rejected reply POST, got: {result:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Bounded response bodies (#1469)
+// ---------------------------------------------------------------------------
+
+/// A JSON-RPC response body for `id`, padded with an ignored `_pad` field so
+/// its total length is exactly `limit` bytes when possible, or as close to
+/// it as a non-negative pad allows. Padding a `tools/list` result keeps the
+/// body valid: `_pad` is not a recognized field and is ignored.
+fn padded_tools_result(id: &str, limit: usize) -> String {
+    let unpadded = format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"tools":[],"_pad":""}}}}"#);
+    let pad_len = limit.saturating_sub(unpadded.len());
+    format!(
+        r#"{{"jsonrpc":"2.0","id":{id},"result":{{"tools":[],"_pad":"{}"}}}}"#,
+        "x".repeat(pad_len)
+    )
+}
+
+/// On an established session, a `tools/list` response whose `Content-Length`
+/// declares it larger than `max_response_body_size` must fail that request
+/// with a transport error naming the limit, checked before any byte of the
+/// body is read. The connection itself is fine, so a following request must
+/// still succeed.
+#[tokio::test]
+async fn session_response_oversized_with_content_length_fails_request() {
+    let limit = 256;
+    let url = spawn_raw_server(move |req| {
+        if raw_is(req, "initialize") {
+            raw_initialize_ok(req)
+        } else if raw_is(req, "notifications/initialized") {
+            raw_response("202 Accepted", "", "")
+        } else if raw_is(req, "tools/list") {
+            let body = padded_tools_result(&raw_request_id(req), limit * 4);
+            raw_response("200 OK", RAW_JSON, &body)
+        } else {
+            let reply = format!(
+                r#"{{"jsonrpc":"2.0","id":{},"result":{{}}}}"#,
+                raw_request_id(req)
+            );
+            raw_response("200 OK", RAW_JSON, &reply)
+        }
+    })
+    .await;
+
+    let config = HttpClientConfig {
+        max_response_body_size: limit,
+        ..raw_client_config()
+    };
+    let client = McpClient::connect(HttpClientTransport::with_config(url, config))
+        .await
+        .unwrap();
+    client.initialize("raw-client", "1.0.0").await.unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(3), client.list_tools())
+        .await
+        .expect("list_tools hung on an oversized response instead of failing");
+    let error = result
+        .expect_err("an oversized response with Content-Length should fail the request")
+        .to_string();
+    assert!(
+        error.contains(&limit.to_string()),
+        "error should mention the {limit}-byte limit, got: {error}"
+    );
+
+    tokio::time::timeout(Duration::from_secs(3), client.ping())
+        .await
+        .expect("ping after the oversized reply hung")
+        .expect("client should stay usable after an oversized reply");
+}
+
+/// As above, but the server declares no length at all (`Connection: close`,
+/// read until the socket closes), so the limit must be enforced by counting
+/// bytes while streaming rather than by inspecting `Content-Length`.
+#[tokio::test]
+async fn session_response_oversized_without_content_length_fails_request() {
+    let limit = 256;
+    let url = spawn_raw_server(move |req| {
+        if raw_is(req, "initialize") {
+            raw_initialize_ok(req)
+        } else if raw_is(req, "notifications/initialized") {
+            raw_response("202 Accepted", "", "")
+        } else if raw_is(req, "tools/list") {
+            let body = padded_tools_result(&raw_request_id(req), limit * 4);
+            raw_response_no_length("200 OK", RAW_JSON, &body)
+        } else {
+            let reply = format!(
+                r#"{{"jsonrpc":"2.0","id":{},"result":{{}}}}"#,
+                raw_request_id(req)
+            );
+            raw_response("200 OK", RAW_JSON, &reply)
+        }
+    })
+    .await;
+
+    let config = HttpClientConfig {
+        max_response_body_size: limit,
+        ..raw_client_config()
+    };
+    let client = McpClient::connect(HttpClientTransport::with_config(url, config))
+        .await
+        .unwrap();
+    client.initialize("raw-client", "1.0.0").await.unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(3), client.list_tools())
+        .await
+        .expect("list_tools hung on a length-less oversized response instead of failing");
+    let error = result
+        .expect_err("an oversized response with no declared length should fail the request")
+        .to_string();
+    assert!(
+        error.contains(&limit.to_string()),
+        "error should mention the {limit}-byte limit, got: {error}"
+    );
+
+    tokio::time::timeout(Duration::from_secs(3), client.ping())
+        .await
+        .expect("ping after the oversized reply hung")
+        .expect("client should stay usable after an oversized reply");
+}
+
+/// A response landing exactly at the limit is not oversized and must still
+/// parse normally.
+#[tokio::test]
+async fn session_response_at_exact_limit_still_parses() {
+    let limit = 256;
+    let url = spawn_raw_server(move |req| {
+        if raw_is(req, "initialize") {
+            raw_initialize_ok(req)
+        } else if raw_is(req, "notifications/initialized") {
+            raw_response("202 Accepted", "", "")
+        } else if raw_is(req, "tools/list") {
+            let body = padded_tools_result(&raw_request_id(req), limit);
+            assert_eq!(
+                body.len(),
+                limit,
+                "test setup: body must land exactly at the limit"
+            );
+            raw_response("200 OK", RAW_JSON, &body)
+        } else {
+            let reply = format!(
+                r#"{{"jsonrpc":"2.0","id":{},"result":{{}}}}"#,
+                raw_request_id(req)
+            );
+            raw_response("200 OK", RAW_JSON, &reply)
+        }
+    })
+    .await;
+
+    let config = HttpClientConfig {
+        max_response_body_size: limit,
+        ..raw_client_config()
+    };
+    let client = McpClient::connect(HttpClientTransport::with_config(url, config))
+        .await
+        .unwrap();
+    client.initialize("raw-client", "1.0.0").await.unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(3), client.list_tools())
+        .await
+        .expect("list_tools hung on an exact-limit response");
+    assert!(
+        result.is_ok(),
+        "a response exactly at the limit should still parse, got: {result:?}"
+    );
+}
+
+/// Error bodies are capped independently of `max_response_body_size` at a
+/// small fixed size and truncated rather than failed: the request must still
+/// fail with the HTTP error itself, not a size-limit error, and the oversized
+/// body must not appear in full in the surfaced message.
+#[tokio::test]
+async fn pre_session_oversized_error_body_is_truncated_not_failed_by_size() {
+    let huge_body = "x".repeat(200 * 1024); // well over the 64 KiB error-body cap
+    let url =
+        spawn_raw_server(move |_| raw_response("500 Internal Server Error", RAW_JSON, &huge_body))
+            .await;
+    let client = McpClient::connect(HttpClientTransport::with_config(url, raw_client_config()))
+        .await
+        .unwrap();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.initialize("raw-client", "1.0.0"),
+    )
+    .await
+    .expect("initialize hung on an oversized error body instead of failing");
+    let error = result
+        .expect_err("initialize should fail with the HTTP error")
+        .to_string();
+    assert!(
+        error.contains("HTTP 500"),
+        "the request should fail with the HTTP error, not a size-limit error, got: {error}"
+    );
+    assert!(
+        error.len() < 200 * 1024,
+        "the oversized error body should be truncated in the surfaced message, got {} bytes",
+        error.len()
+    );
+}
+
+/// Before a session exists, `initialize`'s response goes through the
+/// synchronous path. An oversized response there must fail `initialize`
+/// instead of hanging until the request timeout.
+#[tokio::test]
+async fn pre_session_oversized_initialize_response_fails_without_hanging() {
+    let limit = 256;
+    let url = spawn_raw_server(move |req| {
+        let id = raw_request_id(req);
+        let big = "x".repeat(limit * 4);
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":"2025-11-25","capabilities":{{}},"serverInfo":{{"name":"raw","version":"{big}"}}}}}}"#
+        );
+        raw_response(
+            "200 OK",
+            &format!("{RAW_JSON}mcp-session-id: raw-session\r\nmcp-protocol-version: 2025-11-25\r\n"),
+            &body,
+        )
+    })
+    .await;
+
+    let config = HttpClientConfig {
+        max_response_body_size: limit,
+        ..raw_client_config()
+    };
+    let client = McpClient::connect(HttpClientTransport::with_config(url, config))
+        .await
+        .unwrap();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.initialize("raw-client", "1.0.0"),
+    )
+    .await
+    .expect("initialize hung on an oversized response instead of failing");
+    let error = result
+        .expect_err("an oversized initialize response should fail initialize")
+        .to_string();
+    assert!(
+        error.contains(&limit.to_string()),
+        "error should mention the {limit}-byte limit, got: {error}"
     );
 }

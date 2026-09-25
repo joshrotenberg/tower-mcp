@@ -217,11 +217,28 @@ pub struct HttpClientConfig {
     /// with [`Error::SseEventTooLarge`].
     /// Default: 16 MiB (matching rmcp).
     pub max_sse_event_size: usize,
+    /// Maximum size in bytes buffered for a single non-SSE response body: a
+    /// JSON-RPC response on the request path, or an error body.
+    ///
+    /// A server that answers with a JSON body that never ends (or is simply
+    /// very large) would otherwise be buffered into memory without bound
+    /// until the request timeout fires. This is checked against
+    /// `Content-Length` up front and while streaming, so a response over the
+    /// cap fails that request with a transport error instead; the
+    /// connection itself is left open. Error bodies (used only in messages)
+    /// are truncated rather than failed, independent of this setting.
+    /// Default: 16 MiB (matching `max_sse_event_size`).
+    pub max_response_body_size: usize,
 }
 
 /// Default maximum buffered size for a single SSE event (16 MiB, matching
 /// rmcp). See [`HttpClientConfig::max_sse_event_size`].
 pub const DEFAULT_MAX_SSE_EVENT_SIZE: usize = 16 * 1024 * 1024;
+
+/// Default maximum buffered size for a single non-SSE response body.
+/// Matches [`DEFAULT_MAX_SSE_EVENT_SIZE`]. See
+/// [`HttpClientConfig::max_response_body_size`].
+pub const DEFAULT_MAX_RESPONSE_BODY_SIZE: usize = DEFAULT_MAX_SSE_EVENT_SIZE;
 
 impl Default for HttpClientConfig {
     fn default() -> Self {
@@ -236,6 +253,7 @@ impl Default for HttpClientConfig {
             max_sse_reconnect_attempts: 5,
             session_recovery: true,
             max_sse_event_size: DEFAULT_MAX_SSE_EVENT_SIZE,
+            max_response_body_size: DEFAULT_MAX_RESPONSE_BODY_SIZE,
         }
     }
 }
@@ -1079,6 +1097,75 @@ fn http_status_error(status: reqwest::StatusCode, headers: &reqwest::header::Hea
     format!("server returned HTTP {status}")
 }
 
+/// Why [`read_bounded_body`] failed to produce a body.
+enum BoundedBodyError {
+    /// The body exceeded the configured limit, caught either from a
+    /// declared `Content-Length` or while streaming. The connection itself
+    /// is fine: only this one response was oversized.
+    TooLarge(String),
+    /// The underlying HTTP stream failed while reading the body.
+    Io(reqwest::Error),
+}
+
+/// Read a non-SSE response body, rejecting it once its size exceeds
+/// `limit` instead of buffering an unbounded amount of memory.
+///
+/// Checks `Content-Length` up front so a body that declares itself too
+/// large is rejected before a byte is read, then streams and counts bytes
+/// so a chunked body (or one served with `Connection: close` and no
+/// declared length) is bounded too. Decoded as UTF-8 lossily, the same way
+/// the SSE path in this file decodes bytes (`String::from_utf8_lossy`).
+async fn read_bounded_body(
+    response: reqwest::Response,
+    limit: usize,
+) -> std::result::Result<String, BoundedBodyError> {
+    if let Some(len) = response.content_length()
+        && len > limit as u64
+    {
+        return Err(BoundedBodyError::TooLarge(format!(
+            "response body of {len} bytes exceeds the {limit}-byte limit"
+        )));
+    }
+
+    use futures::StreamExt;
+    let mut stream = response.bytes_stream();
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(BoundedBodyError::Io)?;
+        buf.extend_from_slice(&chunk);
+        if buf.len() > limit {
+            return Err(BoundedBodyError::TooLarge(format!(
+                "response body exceeds the {limit}-byte limit"
+            )));
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Maximum bytes read for an HTTP error body before truncating it.
+///
+/// Error bodies are only used in log lines and error messages, never as
+/// protocol data, so truncating is enough: failing the request over an
+/// oversized error page would be worse than surfacing a partial one.
+const MAX_ERROR_BODY_SIZE: usize = 64 * 1024;
+
+/// Read a non-2xx response body up to [`MAX_ERROR_BODY_SIZE`], truncating
+/// rather than failing the request if the server sends more.
+async fn read_error_body(response: reqwest::Response) -> String {
+    use futures::StreamExt;
+    let mut stream = response.bytes_stream();
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else { break };
+        buf.extend_from_slice(&chunk);
+        if buf.len() > MAX_ERROR_BODY_SIZE {
+            buf.truncate(MAX_ERROR_BODY_SIZE);
+            break;
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 fn operation_label(parsed: Option<&serde_json::Value>) -> String {
     let Some(method) = parsed
         .and_then(|value| value.get("method"))
@@ -1263,6 +1350,7 @@ impl ClientTransport for HttpClientTransport {
             let sse_retry_delay = self.sse_retry_delay.clone();
             let sse_reconnect_signal = self.sse_reconnect_signal.clone();
             let max_sse_event_size = self.config.max_sse_event_size;
+            let max_response_body_size = self.config.max_response_body_size;
             let request_resource = self.url.clone();
             #[cfg(feature = "oauth-client")]
             let token_provider = self.token_provider.clone();
@@ -1312,7 +1400,7 @@ impl ClientTransport for HttpClientTransport {
 
                 if !status.is_success() {
                     let status_error = http_status_error(status, response.headers());
-                    let body = response.text().await.unwrap_or_default();
+                    let body = read_error_body(response).await;
 
                     // Forward a JSON-RPC error body so the message loop can
                     // detect -32005 (SessionNotFound) and trigger session
@@ -1546,8 +1634,8 @@ impl ClientTransport for HttpClientTransport {
                         }
                     }
                 } else {
-                    // Non-SSE response: read body and queue for recv().
-                    match response.text().await {
+                    // Non-SSE response: read body (bounded) and queue for recv().
+                    match read_bounded_body(response, max_response_body_size).await {
                         Ok(body) if !body.is_empty() => {
                             let msgs = extract_json_messages(&body);
                             if msgs.is_empty() {
@@ -1599,7 +1687,20 @@ impl ClientTransport for HttpClientTransport {
                                 tracing::warn!("reply POST returned an empty response body");
                             }
                         }
-                        Err(e) => {
+                        Err(BoundedBodyError::TooLarge(message)) => {
+                            // The connection itself is fine, only this
+                            // reply was oversized: don't mark it
+                            // disconnected. A response has no client
+                            // request to wake; log instead.
+                            tracing::error!(
+                                error = %message,
+                                "Background HTTP response body exceeded the size limit"
+                            );
+                            if let Some(id) = &reply_id {
+                                let _ = tx.send(transport_error_frame(id, &message)).await;
+                            }
+                        }
+                        Err(BoundedBodyError::Io(e)) => {
                             tracing::error!(error = %e, "Failed to read response body");
                             if let Some(id) = &reply_id {
                                 let _ = tx
@@ -1671,7 +1772,7 @@ impl ClientTransport for HttpClientTransport {
         if !status.is_success() {
             #[cfg(feature = "oauth-client")]
             let status_error = http_status_error(status, response.headers());
-            let body = response.text().await.unwrap_or_default();
+            let body = read_error_body(response).await;
             if is_modern_request
                 && let Ok(mut error) = serde_json::from_str::<serde_json::Value>(&body)
                 && is_jsonrpc_error_response(&error)
@@ -1731,11 +1832,24 @@ impl ClientTransport for HttpClientTransport {
             self.protocol_version = Some(pv);
         }
 
-        // Read response body and queue for recv()
-        let body = response
-            .text()
-            .await
-            .map_err(|e| Error::Transport(format!("Failed to read response: {}", e)))?;
+        // Read response body (bounded) and queue for recv()
+        let body = match read_bounded_body(response, self.config.max_response_body_size).await {
+            Ok(body) => body,
+            Err(BoundedBodyError::TooLarge(message)) => {
+                // The connection itself is fine, only this reply was
+                // oversized: queue the error like #1465's fix does instead
+                // of failing the transport, so the caller sees a transport
+                // error rather than hanging.
+                if let Some(id) = &reply_id {
+                    self.queue_incoming(transport_error_frame(id, &message))
+                        .await?;
+                }
+                return Ok(());
+            }
+            Err(BoundedBodyError::Io(e)) => {
+                return Err(Error::Transport(format!("Failed to read response: {}", e)));
+            }
+        };
 
         let msgs = extract_json_messages(&body);
         let answered = reply_id
