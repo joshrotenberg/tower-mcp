@@ -418,13 +418,24 @@ impl Drop for ModernSubscriptionGuard {
 /// Map protocol errors whose final Streamable HTTP binding assigns a
 /// non-success status. Errors emitted after an SSE stream has opened remain
 /// in-band because the HTTP status is already committed.
+///
+/// This mirrors the status codes the transport itself already assigns when
+/// it detects the same errors ahead of dispatch (`handlers.rs`), so a
+/// handler or middleware layer raising one of these codes gets the same HTTP
+/// status as a transport-level rejection: `HeaderMismatch` (-32020),
+/// `UnsupportedProtocolVersion` (-32022), and `InvalidParams` (-32602) all
+/// map to 400; `MethodNotFound` maps to 404.
 pub(super) fn modern_response_status(response: &JsonRpcResponse) -> StatusCode {
     let JsonRpcResponse::Error(error) = response else {
         return StatusCode::OK;
     };
     if error.error.code == ErrorCode::MethodNotFound as i32 {
         StatusCode::NOT_FOUND
-    } else if error.error.code == McpErrorCode::MissingRequiredClientCapability.code() {
+    } else if error.error.code == McpErrorCode::MissingRequiredClientCapability.code()
+        || error.error.code == McpErrorCode::HeaderMismatch.code()
+        || error.error.code == McpErrorCode::UnsupportedProtocolVersion.code()
+        || error.error.code == ErrorCode::InvalidParams as i32
+    {
         StatusCode::BAD_REQUEST
     } else {
         StatusCode::OK

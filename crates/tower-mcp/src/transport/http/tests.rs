@@ -4899,6 +4899,344 @@ async fn stateless_v2026_missing_mcp_method_returns_400() {
     );
 }
 
+/// Test-only layer that answers a `tools/list` request with a fixed
+/// JSON-RPC error, simulating a handler or middleware layer raising a
+/// protocol error from inside the service (#1477) rather than the
+/// transport detecting it ahead of dispatch (as the tests above do). Every
+/// other request, including `initialize`, passes through to the wrapped
+/// router unchanged, so this layer can sit in front of a normal session
+/// handshake.
+#[cfg(feature = "stateless")]
+#[derive(Clone)]
+struct TriggerJsonRpcError {
+    inner: McpRouter,
+    error: JsonRpcError,
+}
+
+#[cfg(feature = "stateless")]
+impl tower_service::Service<RouterRequest> for TriggerJsonRpcError {
+    type Response = RouterResponse;
+    type Error = Infallible;
+    type Future =
+        Pin<Box<dyn Future<Output = std::result::Result<RouterResponse, Infallible>> + Send>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), Infallible>> {
+        tower_service::Service::poll_ready(&mut self.inner, cx)
+    }
+
+    fn call(&mut self, req: RouterRequest) -> Self::Future {
+        if matches!(req.inner, crate::protocol::McpRequest::ListTools(_)) {
+            let response = RouterResponse {
+                id: req.id,
+                inner: Err(self.error.clone()),
+            };
+            return Box::pin(std::future::ready(Ok(response)));
+        }
+        tower_service::Service::call(&mut self.inner, req)
+    }
+}
+
+#[cfg(feature = "stateless")]
+#[derive(Clone)]
+struct TriggerJsonRpcErrorLayer {
+    error: JsonRpcError,
+}
+
+#[cfg(feature = "stateless")]
+impl tower::Layer<McpRouter> for TriggerJsonRpcErrorLayer {
+    type Service = TriggerJsonRpcError;
+
+    fn layer(&self, inner: McpRouter) -> Self::Service {
+        TriggerJsonRpcError {
+            inner,
+            error: self.error.clone(),
+        }
+    }
+}
+
+/// A modern-protocol request whose `tools/list` is answered from inside the
+/// service (a layer, not the transport) with `HeaderMismatch` (-32020) gets
+/// the same HTTP 400 the transport itself already assigns when it detects a
+/// header mismatch ahead of dispatch (#1477).
+#[tokio::test]
+#[cfg(feature = "stateless")]
+async fn stateless_v2026_layer_header_mismatch_is_http_400() {
+    let transport = HttpTransport::new(create_test_router())
+        .disable_origin_validation()
+        .disable_host_validation()
+        .layer(TriggerJsonRpcErrorLayer {
+            error: JsonRpcError::header_mismatch("boom"),
+        });
+    let app = transport.into_router();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header(MCP_METHOD_HEADER, "tools/list")
+        .header(MCP_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION_2026_07_28)
+        .body(Body::from(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {}
+                    }
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["code"], McpErrorCode::HeaderMismatch.code());
+}
+
+/// Same as above, for `UnsupportedProtocolVersion` (-32022).
+#[tokio::test]
+#[cfg(feature = "stateless")]
+async fn stateless_v2026_layer_unsupported_protocol_version_is_http_400() {
+    let transport = HttpTransport::new(create_test_router())
+        .disable_origin_validation()
+        .disable_host_validation()
+        .layer(TriggerJsonRpcErrorLayer {
+            error: JsonRpcError::unsupported_protocol_version("2099-01-01", ["2026-07-28"]),
+        });
+    let app = transport.into_router();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header(MCP_METHOD_HEADER, "tools/list")
+        .header(MCP_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION_2026_07_28)
+        .body(Body::from(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {}
+                    }
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        json["error"]["code"],
+        McpErrorCode::UnsupportedProtocolVersion.code()
+    );
+}
+
+/// Same as above, for `InvalidParams` (-32602).
+#[tokio::test]
+#[cfg(feature = "stateless")]
+async fn stateless_v2026_layer_invalid_params_is_http_400() {
+    let transport = HttpTransport::new(create_test_router())
+        .disable_origin_validation()
+        .disable_host_validation()
+        .layer(TriggerJsonRpcErrorLayer {
+            error: JsonRpcError::invalid_params("boom"),
+        });
+    let app = transport.into_router();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header(MCP_METHOD_HEADER, "tools/list")
+        .header(MCP_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION_2026_07_28)
+        .body(Body::from(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {}
+                    }
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["code"], ErrorCode::InvalidParams.code());
+}
+
+/// The 2025-11-25 session path is untouched by this mapping: the same three
+/// error codes, raised the same way (a layer answering `tools/list` from
+/// inside the service), still come back as HTTP 200 with the JSON-RPC error
+/// in the body, exactly as any other in-band tool or protocol error does on
+/// that revision (#1477).
+#[tokio::test]
+#[cfg(feature = "stateless")]
+async fn session_v2025_layer_protocol_errors_stay_http_200() {
+    for error in [
+        JsonRpcError::header_mismatch("boom"),
+        JsonRpcError::unsupported_protocol_version("2099-01-01", ["2025-11-25"]),
+        JsonRpcError::invalid_params("boom"),
+    ] {
+        let app = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .disable_host_validation()
+            .layer(TriggerJsonRpcErrorLayer {
+                error: error.clone(),
+            })
+            .into_router();
+
+        let init_request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": { "name": "test-client", "version": "1.0.0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(init_request).await.unwrap();
+        let session_id = response
+            .headers()
+            .get(MCP_SESSION_ID_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let initialized_request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header(MCP_SESSION_ID_HEADER, &session_id)
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        app.clone().oneshot(initialized_request).await.unwrap();
+
+        let list_request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header(MCP_SESSION_ID_HEADER, &session_id)
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/list",
+                    "params": {}
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(list_request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "code {} must stay HTTP 200 on the 2025-11-25 session path",
+            error.code
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], error.code);
+    }
+}
+
+/// An ordinary tool error result (`isError: true` in the result, not a
+/// JSON-RPC-level error) is unaffected by this mapping and still returns
+/// HTTP 200 on the 2026-07-28 path (#1477).
+#[tokio::test]
+#[cfg(feature = "stateless")]
+async fn stateless_v2026_tool_error_result_stays_http_200() {
+    use crate::ToolBuilder;
+
+    let tool = ToolBuilder::new("boom")
+        .description("always fails")
+        .no_params_handler(|| async { Err(Error::JsonRpc(JsonRpcError::invalid_params("boom"))) })
+        .build();
+    let router = McpRouter::new()
+        .server_info("test-server", "1.0.0")
+        .tool(tool);
+    let app = HttpTransport::new(router)
+        .disable_origin_validation()
+        .disable_host_validation()
+        .into_router();
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header(MCP_METHOD_HEADER, "tools/call")
+        .header(MCP_NAME_HEADER, "boom")
+        .header(MCP_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION_2026_07_28)
+        .body(Body::from(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "boom",
+                    "arguments": {},
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {}
+                    }
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["result"]["isError"], true);
+}
+
 #[tokio::test]
 async fn sse_responses_false_returns_application_json() {
     // Default behavior: synchronous responses use Content-Type: application/json
