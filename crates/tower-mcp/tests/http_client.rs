@@ -4497,3 +4497,234 @@ async fn established_session_cross_origin_redirect_fails_without_hanging() {
         "the redirect target must never receive the request"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Drop aborts background tasks and terminates the session (#1479)
+// ---------------------------------------------------------------------------
+
+/// A raw server for the drop tests below: answers `initialize` and
+/// `notifications/initialized` normally, holds every SSE `GET` open until the
+/// client side closes it (reported on `get_closed_tx`), and records every
+/// `DELETE` it receives, including the `mcp-session-id` header line, on
+/// `delete_tx`. Returns the URL and both receivers.
+async fn spawn_session_drop_server() -> (
+    String,
+    tokio::sync::mpsc::Receiver<()>,
+    tokio::sync::mpsc::Receiver<String>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (get_closed_tx, get_closed_rx) = tokio::sync::mpsc::channel::<()>(4);
+    let (delete_tx, delete_rx) = tokio::sync::mpsc::channel::<String>(4);
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let get_closed_tx = get_closed_tx.clone();
+            let delete_tx = delete_tx.clone();
+            tokio::spawn(async move {
+                let Some(req) = read_http_request(&mut stream).await else {
+                    return;
+                };
+                if req.starts_with("DELETE") {
+                    let session_header = req
+                        .lines()
+                        .find(|l| l.to_lowercase().starts_with("mcp-session-id"))
+                        .unwrap_or_default()
+                        .to_string();
+                    let _ = delete_tx.send(session_header).await;
+                    let _ = stream
+                        .write_all(raw_response("204 No Content", "", "").as_bytes())
+                        .await;
+                    let _ = stream.flush().await;
+                    return;
+                }
+                if raw_is(&req, "initialize") {
+                    let _ = stream.write_all(raw_initialize_ok(&req).as_bytes()).await;
+                    let _ = stream.flush().await;
+                    return;
+                }
+                if raw_is(&req, "notifications/initialized") {
+                    let _ = stream
+                        .write_all(raw_response("202 Accepted", "", "").as_bytes())
+                        .await;
+                    let _ = stream.flush().await;
+                    return;
+                }
+                if req.starts_with("GET") {
+                    // Hold the SSE stream open (no Content-Length, no body)
+                    // and block on a read; the client's Drop-driven close is
+                    // what unblocks it with EOF.
+                    let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                                   Connection: keep-alive\r\n\r\n";
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.flush().await;
+                    let mut buf = [0u8; 16];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => {
+                                let _ = get_closed_tx.send(()).await;
+                                break;
+                            }
+                            Ok(_) => continue,
+                        }
+                    }
+                    return;
+                }
+                let _ = stream
+                    .write_all(raw_response("202 Accepted", "", "").as_bytes())
+                    .await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+
+    (format!("http://{addr}"), get_closed_rx, delete_rx)
+}
+
+/// #1479: dropping a connected session client with the SSE stream open must
+/// close that GET connection instead of leaving its task detached. Before the
+/// `Drop` impl this connection stayed open until the server's own idle
+/// timeout, since nothing ever aborted the SSE background task.
+#[tokio::test]
+async fn drop_closes_the_open_sse_stream() {
+    let (url, mut get_closed_rx, _delete_rx) = spawn_session_drop_server().await;
+    let config = HttpClientConfig {
+        auto_sse: true,
+        request_timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
+    let client = McpClient::connect(HttpClientTransport::with_config(url, config))
+        .await
+        .unwrap();
+    client.initialize("raw-client", "1.0.0").await.unwrap();
+
+    // Let the background SSE GET actually reach the server before dropping;
+    // otherwise there is nothing yet open to close.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    drop(client);
+
+    tokio::time::timeout(Duration::from_secs(3), get_closed_rx.recv())
+        .await
+        .expect("server never observed the GET connection close (the bug this guards)")
+        .expect("get_closed channel closed unexpectedly");
+}
+
+/// #1479: dropping a connected session client must send a best-effort
+/// session-termination `DELETE` carrying the session id, the same as an
+/// explicit `close()`.
+#[tokio::test]
+async fn drop_sends_a_session_delete() {
+    let (url, _get_closed_rx, mut delete_rx) = spawn_session_drop_server().await;
+    let config = HttpClientConfig {
+        auto_sse: true,
+        request_timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
+    let client = McpClient::connect(HttpClientTransport::with_config(url, config))
+        .await
+        .unwrap();
+    client.initialize("raw-client", "1.0.0").await.unwrap();
+
+    drop(client);
+
+    let session_header = tokio::time::timeout(Duration::from_secs(3), delete_rx.recv())
+        .await
+        .expect("server never received a session-termination DELETE (the bug this guards)")
+        .expect("delete channel closed unexpectedly");
+    assert!(
+        session_header.to_lowercase().contains("raw-session"),
+        "DELETE should carry the session id, got header line: {session_header}"
+    );
+}
+
+/// #1479: dropping after an explicit `close()` (reached here through
+/// `McpClient::shutdown()`, which awaits `close()` before the transport is
+/// dropped) must not send a second session-termination `DELETE`. `close()`
+/// clears the session id once its own `DELETE` is sent, which is what makes
+/// `Drop` a no-op afterward.
+#[tokio::test]
+async fn drop_after_shutdown_does_not_send_a_second_delete() {
+    let (url, _get_closed_rx, mut delete_rx) = spawn_session_drop_server().await;
+    let config = HttpClientConfig {
+        auto_sse: true,
+        request_timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
+    let client = McpClient::connect(HttpClientTransport::with_config(url, config))
+        .await
+        .unwrap();
+    client.initialize("raw-client", "1.0.0").await.unwrap();
+
+    client.shutdown().await.unwrap();
+
+    let first = tokio::time::timeout(Duration::from_secs(3), delete_rx.recv())
+        .await
+        .expect("shutdown's own close() never sent a DELETE")
+        .expect("delete channel closed unexpectedly");
+    assert!(first.to_lowercase().contains("raw-session"));
+
+    // `shutdown()` already consumed the client, and its message loop dropped
+    // the transport right after `close()` returned, so there is nothing left
+    // to drop explicitly here: this bounded wait is what proves the absence
+    // of a second DELETE rather than triggering one.
+    let second = tokio::time::timeout(Duration::from_millis(300), delete_rx.recv()).await;
+    assert!(
+        second.is_err(),
+        "a second DELETE was sent after close() already terminated the session"
+    );
+}
+
+/// #1479: the 2026-07-28 stateless path never establishes a session (no
+/// `mcp-session-id` is ever assigned; see the `!is_modern_request` guard on
+/// every session_id assignment in `send_http_request`), so dropping a
+/// stateless connection must not attempt a session-termination `DELETE`.
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn drop_sends_no_delete_for_a_stateless_connection() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let delete_count = Arc::new(AtomicUsize::new(0));
+    let delete_count_clone = delete_count.clone();
+    let url = spawn_raw_server(move |req| {
+        if req.starts_with("DELETE") {
+            delete_count_clone.fetch_add(1, Ordering::SeqCst);
+            return raw_response("204 No Content", "", "");
+        }
+        if raw_is(req, "server/discover") {
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","id":{},"result":{{"supportedVersions":["2026-07-28"],"capabilities":{{}}}}}}"#,
+                raw_request_id(req)
+            );
+            return raw_response("200 OK", RAW_JSON, &body);
+        }
+        raw_response("202 Accepted", "", "")
+    })
+    .await;
+
+    let client = McpClient::builder()
+        .protocol_support(tower_mcp::ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+        .connect(
+            HttpClientTransport::with_config(url, raw_client_config()),
+            NotificationHandler::new(),
+        )
+        .await
+        .unwrap();
+    client.discover("raw-client", "1.0.0").await.unwrap();
+
+    drop(client);
+
+    // Bound the wait so a regression (a wrongly-spawned DELETE) would show up
+    // as a nonzero count rather than the test racing ahead of it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        delete_count.load(Ordering::SeqCst),
+        0,
+        "a stateless connection must never send a session-termination DELETE"
+    );
+}

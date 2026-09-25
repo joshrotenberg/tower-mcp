@@ -60,6 +60,9 @@ const MCP_NAME_HEADER: &str = "mcp-name";
 const MCP_PARAM_HEADER_PREFIX: &str = "mcp-param-";
 const BASE64_SENTINEL_PREFIX: &str = "=?base64?";
 const BASE64_SENTINEL_SUFFIX: &str = "?=";
+/// Timeout for the best-effort session-termination `DELETE`, used by both
+/// `close()` and the `Drop` impl.
+const SESSION_DELETE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 struct CustomHeaderMapping {
@@ -1997,31 +2000,21 @@ impl ClientTransport for HttpClientTransport {
             task.abort();
         }
 
-        // Send DELETE to terminate the session (best effort)
-        if let Some(ref session_id) = self.session_id {
-            let mut request = self
-                .client
-                .delete(&self.url)
-                .header("mcp-session-id", session_id)
-                .timeout(Duration::from_secs(5));
-
-            for (key, value) in &self.config.headers {
-                request = request.header(key.as_str(), value.as_str());
-            }
-
-            // Dynamic token provider overrides static Authorization header
-            #[cfg(feature = "oauth-client")]
-            if let Some(ref provider) = self.token_provider
-                && let Ok(token) = provider.get_token().await
-                && let Ok(headers) = bearer_headers(&token)
-            {
-                request = request.headers(headers);
-            }
-
-            let _ = request.send().await;
+        // Send DELETE to terminate the session (best effort). Clearing
+        // `session_id` up front, regardless of outcome, is what makes `Drop`
+        // a no-op if it runs afterward.
+        if let Some(session_id) = self.session_id.take() {
+            send_session_delete(SessionDeleteParams {
+                client: self.client.clone(),
+                url: self.url.clone(),
+                session_id,
+                headers: self.config.headers.clone(),
+                #[cfg(feature = "oauth-client")]
+                token_provider: self.token_provider.clone(),
+            })
+            .await;
         }
 
-        self.session_id = None;
         Ok(())
     }
 
@@ -2061,6 +2054,98 @@ impl ClientTransport for HttpClientTransport {
         }
         Ok(())
     }
+}
+
+/// Best-effort teardown when a transport is dropped without an explicit
+/// `close()`.
+///
+/// Aborts every in-flight task the transport owns. `close()` already drains
+/// `request_tasks` and takes `sse_task`, so if `close()` ran first this is a
+/// no-op; the fields are already empty. Also sends the session-termination
+/// `DELETE`, spawned rather than awaited since `Drop::drop` cannot be async,
+/// and only when a Tokio runtime is reachable from the current thread.
+impl Drop for HttpClientTransport {
+    fn drop(&mut self) {
+        for (_, task) in self.request_tasks.drain() {
+            task.abort();
+        }
+        if let Some(task) = self.sse_task.take() {
+            task.abort();
+        }
+
+        // `session_id` is only `Some` for an established legacy (2025-11-25)
+        // session; the 2026-07-28 stateless path never sets it (see
+        // `is_modern_request` above), and `close()` clears it once its own
+        // DELETE has been sent, which keeps this idempotent with `close()`.
+        let Some(session_id) = self.session_id.take() else {
+            return;
+        };
+        // Dropping outside a runtime (e.g. a transport built but never
+        // connected) must not panic; there is nowhere to spawn the request.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+
+        let params = SessionDeleteParams {
+            client: self.client.clone(),
+            url: self.url.clone(),
+            session_id,
+            headers: self.config.headers.clone(),
+            #[cfg(feature = "oauth-client")]
+            token_provider: self.token_provider.clone(),
+        };
+        handle.spawn(send_session_delete(params));
+    }
+}
+
+// =============================================================================
+// Session Termination
+// =============================================================================
+
+/// Owned inputs for the best-effort session-termination `DELETE`, shared by
+/// `close()` (awaited inline) and `Drop` (spawned, since `drop()` cannot
+/// await).
+struct SessionDeleteParams {
+    client: reqwest::Client,
+    url: String,
+    session_id: String,
+    headers: HashMap<String, String>,
+    #[cfg(feature = "oauth-client")]
+    token_provider: Option<Arc<dyn TokenProvider>>,
+}
+
+/// Send the session-termination `DELETE`, best effort: errors and non-2xx
+/// responses are ignored since the server will otherwise reclaim the session
+/// on its own idle timeout.
+async fn send_session_delete(params: SessionDeleteParams) {
+    let SessionDeleteParams {
+        client,
+        url,
+        session_id,
+        headers,
+        #[cfg(feature = "oauth-client")]
+        token_provider,
+    } = params;
+
+    let mut request = client
+        .delete(&url)
+        .header("mcp-session-id", &session_id)
+        .timeout(SESSION_DELETE_TIMEOUT);
+
+    for (key, value) in &headers {
+        request = request.header(key.as_str(), value.as_str());
+    }
+
+    // Dynamic token provider overrides the static Authorization header.
+    #[cfg(feature = "oauth-client")]
+    if let Some(ref provider) = token_provider
+        && let Ok(token) = provider.get_token().await
+        && let Ok(auth_headers) = bearer_headers(&token)
+    {
+        request = request.headers(auth_headers);
+    }
+
+    let _ = request.send().await;
 }
 
 // =============================================================================
@@ -2876,6 +2961,21 @@ mod tests {
             3,
             "discovery probe, rejected first attempt, successful retry"
         );
+    }
+
+    // =========================================================================
+    // Drop / session teardown (#1479)
+    // =========================================================================
+
+    /// Dropping a transport outside any Tokio runtime must not panic, even
+    /// when it has a session id set, which is the one path that would
+    /// otherwise try to spawn the teardown `DELETE`.
+    #[test]
+    fn drop_outside_a_runtime_does_not_panic() {
+        let mut transport = HttpClientTransport::new("http://127.0.0.1:1");
+        transport.session_id = Some("session-outside-runtime".to_string());
+        transport.protocol_version = Some(crate::protocol::LATEST_PROTOCOL_VERSION.to_string());
+        drop(transport);
     }
 
     // =========================================================================
