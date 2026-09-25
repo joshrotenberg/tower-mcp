@@ -22,7 +22,7 @@ HTTP authorization flow.
 
 ```toml
 [dependencies]
-tower-mcp = { version = "0.22", features = ["http", "jwks", "oauth-client"] }
+tower-mcp = { version = "0.23", features = ["http", "jwks", "oauth-client"] }
 ```
 
 The three OAuth roles stay separate:
