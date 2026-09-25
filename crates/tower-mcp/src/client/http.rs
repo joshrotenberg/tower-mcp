@@ -1246,11 +1246,14 @@ impl ClientTransport for HttpClientTransport {
             // carrying it, so a background POST that dies (network error,
             // timeout, HTTP error, empty body, response stream closed early)
             // wakes the caller with an error instead of hanging it forever.
-            let req_id = parsed_message
-                .as_ref()
-                .and_then(|value| value.get("id"))
-                .cloned();
-            let request_id = req_id
+            //
+            // A response (the client's reply to a server-initiated request)
+            // also takes this path, to keep the message loop non-blocking
+            // (#967), but `reply_id` is `None` for it: it is not tracked in
+            // `request_tasks` below, and its failure branches log instead of
+            // injecting an error frame, since the id belongs to the server's
+            // request, not one of ours (#1466).
+            let request_id = reply_id
                 .clone()
                 .and_then(|value| serde_json::from_value(value).ok());
             let is_subscription = method == Some("subscriptions/listen");
@@ -1284,7 +1287,7 @@ impl ClientTransport for HttpClientTransport {
                     Err(e) => {
                         let connection_failed = e.connection_failed;
                         tracing::error!(error = %e.message, "Background HTTP request failed");
-                        if let Some(id) = &req_id {
+                        if let Some(id) = &reply_id {
                             let _ = tx.send(transport_error_frame(id, &e.message)).await;
                         }
                         if connection_failed {
@@ -1317,7 +1320,10 @@ impl ClientTransport for HttpClientTransport {
                     // null, absent, or foreign id such as a gateway's
                     // "server-error", on anything but the session-level
                     // -32005 signal), inject it so the awaiting caller is
-                    // woken by this error instead of hanging.
+                    // woken by this error instead of hanging. A response has
+                    // no `reply_id`, so its error body is forwarded exactly
+                    // as received, with no id rewrite performed on its
+                    // behalf.
                     if !body.is_empty()
                         && let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&body)
                         && is_jsonrpc_error_response(&v)
@@ -1325,19 +1331,22 @@ impl ClientTransport for HttpClientTransport {
                         let is_session_signal =
                             v.pointer("/error/code").and_then(|c| c.as_i64()) == Some(-32005);
                         if !is_session_signal
-                            && let Some(id) = &req_id
+                            && let Some(id) = &reply_id
                             && !v
                                 .get("id")
                                 .is_some_and(|actual| json_request_ids_match(actual, id))
                         {
                             v["id"] = id.clone();
                         }
+                        if reply_id.is_none() {
+                            tracing::warn!(status = %status, "reply POST returned a JSON-RPC error body");
+                        }
                         let _ = tx.send(v.to_string()).await;
                         return;
                     }
 
                     tracing::error!(status = %status, body = %body, "HTTP error from server");
-                    if let Some(id) = &req_id {
+                    if let Some(id) = &reply_id {
                         let _ = tx.send(transport_error_frame(id, &status_error)).await;
                     }
                     connected.store(false, Ordering::Release);
@@ -1393,7 +1402,7 @@ impl ClientTransport for HttpClientTransport {
                                         let value = match value {
                                             Ok(value) => value,
                                             Err(error) if is_subscription => {
-                                                if let Some(id) = &req_id {
+                                                if let Some(id) = &reply_id {
                                                     let _ = tx
                                                         .send(transport_error_frame(
                                                             id,
@@ -1411,7 +1420,7 @@ impl ClientTransport for HttpClientTransport {
                                             }
                                         };
                                         let is_terminal =
-                                            value.get("id").zip(req_id.as_ref()).is_some_and(
+                                            value.get("id").zip(reply_id.as_ref()).is_some_and(
                                                 |(actual, expected)| {
                                                     json_request_ids_match(actual, expected)
                                                 },
@@ -1430,7 +1439,7 @@ impl ClientTransport for HttpClientTransport {
                                                     .pointer(
                                                         "/result/_meta/io.modelcontextprotocol~1subscriptionId",
                                                     )
-                                                    .zip(req_id.as_ref())
+                                                    .zip(reply_id.as_ref())
                                                     .is_some_and(|(actual, expected)| {
                                                         json_request_ids_match(actual, expected)
                                                     })
@@ -1448,7 +1457,7 @@ impl ClientTransport for HttpClientTransport {
                                                     .pointer(
                                                         "/params/_meta/io.modelcontextprotocol~1subscriptionId",
                                                     )
-                                                    .zip(req_id.as_ref())
+                                                    .zip(reply_id.as_ref())
                                                     .is_some_and(|(actual, expected)| {
                                                         json_request_ids_match(actual, expected)
                                                     });
@@ -1486,7 +1495,7 @@ impl ClientTransport for HttpClientTransport {
                                                 )
                                             };
                                             if let Some(message) = violation {
-                                                if let Some(id) = &req_id {
+                                                if let Some(id) = &reply_id {
                                                     let _ = tx
                                                         .send(transport_error_frame(id, message))
                                                         .await;
@@ -1521,14 +1530,17 @@ impl ClientTransport for HttpClientTransport {
                         // The response stream closed without ever delivering a
                         // terminal response. Acknowledgments and ordinary
                         // notifications do not complete a request, so wake the
-                        // caller rather than leave it hanging.
-                        if let Some(id) = &req_id {
-                            let reason = if had_data {
-                                "server closed the response stream before the final reply"
-                            } else {
-                                "server closed the response stream without a reply"
-                            };
+                        // caller rather than leave it hanging. A response has
+                        // no client request to wake; log instead.
+                        let reason = if had_data {
+                            "server closed the response stream before the final reply"
+                        } else {
+                            "server closed the response stream without a reply"
+                        };
+                        if let Some(id) = &reply_id {
                             let _ = tx.send(transport_error_frame(id, reason)).await;
+                        } else {
+                            tracing::warn!(reason, "reply POST stream closed unexpectedly");
                         }
                     }
                 } else {
@@ -1538,14 +1550,20 @@ impl ClientTransport for HttpClientTransport {
                             let msgs = extract_json_messages(&body);
                             if msgs.is_empty() {
                                 // A non-empty body that yields no JSON-RPC
-                                // frames leaves the request uncorrelated.
-                                if let Some(id) = &req_id {
+                                // frames leaves the request uncorrelated. A
+                                // response has no client request to wake;
+                                // log instead.
+                                if let Some(id) = &reply_id {
                                     let _ = tx
                                         .send(transport_error_frame(
                                             id,
                                             "server returned an unparseable response body",
                                         ))
                                         .await;
+                                } else {
+                                    tracing::warn!(
+                                        "reply POST returned an unparseable response body"
+                                    );
                                 }
                             } else {
                                 // A `{}` or non-JSON body still yields one
@@ -1565,19 +1583,23 @@ impl ClientTransport for HttpClientTransport {
                         }
                         Ok(_) => {
                             // 2xx with an empty body: no frame to correlate the
-                            // request, so wake the caller rather than hang.
-                            if let Some(id) = &req_id {
+                            // request, so wake the caller rather than hang. A
+                            // response has no client request to wake; log
+                            // instead.
+                            if let Some(id) = &reply_id {
                                 let _ = tx
                                     .send(transport_error_frame(
                                         id,
                                         "server returned an empty response body",
                                     ))
                                     .await;
+                            } else {
+                                tracing::warn!("reply POST returned an empty response body");
                             }
                         }
                         Err(e) => {
                             tracing::error!(error = %e, "Failed to read response body");
-                            if let Some(id) = &req_id {
+                            if let Some(id) = &reply_id {
                                 let _ = tx
                                     .send(transport_error_frame(
                                         id,
@@ -2860,5 +2882,49 @@ mod tests {
         assert_eq!(parsed["result"]["tools"].as_array().unwrap().len(), 1);
         assert!(transport.tool_header_mappings.contains_key("valid"));
         assert!(!transport.tool_header_mappings.contains_key("invalid"));
+    }
+
+    // =========================================================================
+    // Response vs. request classification (#1466)
+    // =========================================================================
+
+    /// A response (id present, no method) -- the client's reply to a
+    /// server-initiated request -- must never be tracked in `request_tasks`,
+    /// even when its id collides with one of the client's own request ids.
+    /// A request with the same id is tracked as before, and `cancel_request`
+    /// on that id only ever touches the client's own request.
+    #[tokio::test]
+    async fn responses_are_not_tracked_in_request_tasks() {
+        let mut transport = HttpClientTransport::new("http://127.0.0.1:1");
+        transport.session_id = Some("test-session".to_string());
+
+        // The client's reply to a server request sharing id 7 with one of
+        // the client's own (hypothetical) requests below.
+        transport
+            .send(r#"{"jsonrpc":"2.0","id":7,"result":{}}"#)
+            .await
+            .unwrap();
+        assert!(
+            transport.request_tasks.is_empty(),
+            "a response must never be tracked in request_tasks"
+        );
+
+        // The client's own request using the same id is tracked normally.
+        transport
+            .send(r#"{"jsonrpc":"2.0","id":7,"method":"ping","params":{}}"#)
+            .await
+            .unwrap();
+        assert!(
+            transport.request_tasks.contains_key(&RequestId::Number(7)),
+            "a request must still be tracked in request_tasks"
+        );
+
+        // cancel_request on the colliding id only ever aborts the client's
+        // own request POST, never a reply (which was never inserted).
+        transport
+            .cancel_request(&RequestId::Number(7))
+            .await
+            .unwrap();
+        assert!(transport.request_tasks.is_empty());
     }
 }

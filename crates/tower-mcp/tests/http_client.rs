@@ -3902,3 +3902,109 @@ async fn discover_rejected_with_a_foreign_error_id_fails() {
         "the server's error should surface, got: {error}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Replies to server requests are not client requests (#1466)
+// ---------------------------------------------------------------------------
+
+/// Regression: the client's reply to a server-initiated request used to be
+/// tracked exactly like one of the client's own requests, keyed by id. Server
+/// and client request ids are independent sequences that both start at 1, so
+/// a server request pushed while a client request is in flight can collide
+/// with it. Before the fix, a failed reply POST injected an error frame
+/// carrying that shared id, which incorrectly failed the client's own
+/// still-pending request.
+///
+/// Here the raw server pushes a `ping` on the `tools/list` SSE stream using
+/// the same id as the in-flight `tools/list` request, then rejects the
+/// client's reply POST with a `500`. The real `tools/list` result is
+/// withheld on the same connection until the rejected reply POST has been
+/// fully handled, so a spurious error frame reaching the caller first would
+/// prove the bug; the fix leaves the caller waiting for the genuine
+/// completion instead.
+#[tokio::test]
+async fn server_request_colliding_with_client_id_reply_failure_does_not_fail_client_request() {
+    use tokio::io::AsyncWriteExt;
+
+    fn sse_chunk(data: &str) -> String {
+        format!("{:x}\r\n{}\r\n", data.len(), data)
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let reply_handled = Arc::new(tokio::sync::Notify::new());
+
+    {
+        let reply_handled = reply_handled.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let reply_handled = reply_handled.clone();
+                tokio::spawn(async move {
+                    let Some(req) = read_http_request(&mut stream).await else {
+                        return;
+                    };
+                    if raw_is(&req, "initialize") {
+                        let _ = stream.write_all(raw_initialize_ok(&req).as_bytes()).await;
+                        let _ = stream.flush().await;
+                    } else if raw_is(&req, "notifications/initialized") {
+                        let _ = stream
+                            .write_all(raw_response("202 Accepted", "", "").as_bytes())
+                            .await;
+                        let _ = stream.flush().await;
+                    } else if raw_is(&req, "tools/list") {
+                        let id = raw_request_id(&req);
+                        let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                                       Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+                        let _ = stream.write_all(header.as_bytes()).await;
+
+                        // Push a server-initiated `ping` sharing the client's
+                        // own request id.
+                        let ping = format!(
+                            "data: {{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"ping\",\"params\":{{}}}}\n\n"
+                        );
+                        let _ = stream.write_all(sse_chunk(&ping).as_bytes()).await;
+                        let _ = stream.flush().await;
+
+                        // Withhold the real result until the client's reply
+                        // POST below has been received and rejected. If the
+                        // bug regresses, its spurious error frame reaches the
+                        // message loop first.
+                        reply_handled.notified().await;
+
+                        let result = format!(
+                            "data: {{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"tools\":[]}}}}\n\n"
+                        );
+                        let _ = stream.write_all(sse_chunk(&result).as_bytes()).await;
+                        let _ = stream.write_all(b"0\r\n\r\n").await;
+                        let _ = stream.flush().await;
+                    } else {
+                        // The client's reply to the pushed `ping`: an id with
+                        // no method. Reject it, then release the withheld
+                        // `tools/list` completion.
+                        let response = raw_response("500 Internal Server Error", "", "");
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        let _ = stream.flush().await;
+                        reply_handled.notify_one();
+                    }
+                });
+            }
+        });
+    }
+
+    let url = format!("http://{addr}");
+    let client = McpClient::connect(HttpClientTransport::with_config(url, raw_client_config()))
+        .await
+        .unwrap();
+    client.initialize("raw-client", "1.0.0").await.unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(3), client.list_tools())
+        .await
+        .expect("list_tools hung");
+    assert!(
+        result.is_ok(),
+        "the client's own request must complete normally despite the rejected reply POST, got: {result:?}"
+    );
+}
