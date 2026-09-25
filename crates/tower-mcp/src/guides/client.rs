@@ -114,9 +114,12 @@ tower-mcp = { version = "0.22", features = [
 ```
 
 ```rust,no_run
+# #[cfg(feature = "protocol-2026-07-28")]
 use tower_mcp::{BoxError, ProtocolSupport};
+# #[cfg(feature = "protocol-2026-07-28")]
 use tower_mcp::client::{HttpClientTransport, McpClient};
 
+# #[cfg(feature = "protocol-2026-07-28")]
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
     let support = ProtocolSupport::try_new(["2026-07-28"])?;
@@ -134,6 +137,8 @@ async fn main() -> Result<(), BoxError> {
     client.shutdown().await?;
     Ok(())
 }
+# #[cfg(not(feature = "protocol-2026-07-28"))]
+# fn main() {}
 ```
 
 Do not call `initialize` on this path. `discover` selects a mutually supported
