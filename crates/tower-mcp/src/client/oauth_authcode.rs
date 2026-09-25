@@ -1394,8 +1394,25 @@ impl TokenProvider for OAuthAuthorizationCode {
         }
 
         Err(OAuthClientError::TokenRequest(
-            "No valid token available. Call wait_for_callback() to authenticate.".to_string(),
+            "No valid token available; reauthorization is required. Call start() again."
+                .to_string(),
         ))
+    }
+
+    /// Mark the cached access token unusable while keeping its refresh
+    /// token, so the next [`get_token`](TokenProvider::get_token) call
+    /// refreshes instead of re-sending a token the server just rejected.
+    ///
+    /// The in-memory cache is the only thing this touches. `get_token`
+    /// already replaces the whole cache entry once a refresh (or a rejected
+    /// refresh) completes, so there is nothing else to persist here. With no
+    /// refresh token cached, the next `get_token` call reports that
+    /// reauthorization is needed instead of retrying a token that cannot be
+    /// renewed.
+    async fn invalidate(&self) {
+        if let Some(token) = self.inner.cache.write().await.as_mut() {
+            token.expires_at = Instant::now();
+        }
     }
 }
 
@@ -2431,6 +2448,52 @@ mod tests {
         (base, requests)
     }
 
+    /// A local token endpoint that accepts a refresh grant and issues
+    /// `refreshed-access-token`, preserving whatever refresh token the
+    /// request carried. Returns the base URL and a counter of how many
+    /// requests it received.
+    async fn spawn_refresh_success_token_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 1024];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk[..read]);
+                    if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let body = serde_json::json!({
+                    "access_token": "refreshed-access-token",
+                    "token_type": "Bearer",
+                    "expires_in": 3600
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (base, requests)
+    }
+
     /// Build an `OAuthAuthorizationCode` directly with a pre-populated,
     /// already-expired cached token, bypassing the interactive `start()`
     /// flow.
@@ -2482,5 +2545,62 @@ mod tests {
         // The dead refresh token must not be retried on a subsequent call.
         assert!(TokenProvider::get_token(&provider).await.is_err());
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    /// #1467: `invalidate` previously inherited the no-op default, so a 401
+    /// on a token that had not yet expired retried the same rejected token
+    /// forever. It must mark the token unusable so the next `get_token`
+    /// refreshes even though nothing about expiry has changed.
+    #[tokio::test]
+    async fn invalidate_forces_a_refresh_of_a_still_valid_token() {
+        use std::sync::atomic::Ordering;
+
+        let (token_endpoint, requests) = spawn_refresh_success_token_server().await;
+        let provider = test_provider_with_cached_token(
+            format!("{token_endpoint}/token"),
+            CachedAuthCodeToken {
+                access_token: "still-valid-access-token".to_string(),
+                refresh_token: Some("refresh-token".to_string()),
+                expires_at: Instant::now() + Duration::from_secs(3600),
+            },
+        );
+        assert_eq!(
+            TokenProvider::get_token(&provider).await.unwrap(),
+            "still-valid-access-token"
+        );
+
+        provider.invalidate().await;
+
+        assert_eq!(
+            TokenProvider::get_token(&provider).await.unwrap(),
+            "refreshed-access-token",
+            "invalidate() must mark the access token unusable so the next \
+             get_token() refreshes instead of returning the same token"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    /// #1467: with no refresh token to fall back on, `invalidate` must leave
+    /// `get_token` reporting that reauthorization is needed rather than
+    /// silently handing back the same now-unusable token.
+    #[tokio::test]
+    async fn invalidate_without_a_refresh_token_reports_reauthorization_is_needed() {
+        let provider = test_provider_with_cached_token(
+            "http://127.0.0.1:0/token".to_string(),
+            CachedAuthCodeToken {
+                access_token: "still-valid-access-token".to_string(),
+                refresh_token: None,
+                expires_at: Instant::now() + Duration::from_secs(3600),
+            },
+        );
+
+        provider.invalidate().await;
+
+        let error = TokenProvider::get_token(&provider).await.unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("reauthorization"),
+            "expected the error to say reauthorization is needed, got: {message}"
+        );
     }
 }

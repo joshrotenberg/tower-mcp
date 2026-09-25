@@ -2248,6 +2248,11 @@ impl SseParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(feature = "oauth-client", feature = "http"))]
+    use crate::client::{
+        OAuthAuthorizationAction, OAuthAuthorizationFlow, OAuthAuthorizationHandler,
+        OAuthAuthorizationRequest, OAuthRedirectPolicy,
+    };
 
     // =========================================================================
     // 401 re-authentication (#1370)
@@ -2437,6 +2442,232 @@ mod tests {
         let provider = StuckProvider;
         provider.invalidate().await;
         assert_eq!(provider.get_token().await.unwrap(), "stale");
+    }
+
+    // =========================================================================
+    // #1467: a real auth-code provider reauthorizes through invalidate()
+    // =========================================================================
+
+    /// Percent-decode an `application/x-www-form-urlencoded` body. `urlencoding`
+    /// is already a required dependency of `oauth-client`, so this avoids
+    /// pulling in `axum`'s `form` extractor (and `serde_urlencoded`) just for
+    /// one test fixture.
+    #[cfg(all(feature = "oauth-client", feature = "http"))]
+    fn parse_form_body(body: &[u8]) -> HashMap<String, String> {
+        String::from_utf8_lossy(body)
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .filter_map(|pair| {
+                let mut parts = pair.splitn(2, '=');
+                let key = urlencoding::decode(parts.next()?).ok()?.into_owned();
+                let value = urlencoding::decode(parts.next().unwrap_or(""))
+                    .ok()?
+                    .into_owned();
+                Some((key, value))
+            })
+            .collect()
+    }
+
+    /// One axum app standing in for both the protected resource and its
+    /// authorization server, so [`OAuthAuthorizationFlow`] can discover,
+    /// authorize, and refresh against real HTTP rather than a mock
+    /// [`OAuthHttpClient`]. `/mcp` rejects everything except
+    /// `refreshed-access-token`, so a successful retry proves the whole
+    /// invalidate-then-refresh path rather than just that a token exists.
+    #[cfg(all(feature = "oauth-client", feature = "http"))]
+    async fn spawn_resource_server_fixture()
+    -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use axum::body::Bytes;
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::response::IntoResponse;
+        use std::sync::atomic::Ordering;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mcp_base = base.clone();
+        let mcp_seen = seen.clone();
+        let prm_base = base.clone();
+        let as_base = base.clone();
+
+        let app = axum::Router::new()
+            .route(
+                "/mcp",
+                axum::routing::post(move |headers: HeaderMap| {
+                    let seen = mcp_seen.clone();
+                    let base = mcp_base.clone();
+                    async move {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        let accepted = headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .is_some_and(|v| v == "Bearer refreshed-access-token");
+                        if accepted {
+                            return (StatusCode::OK, "{}").into_response();
+                        }
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            [(
+                                "www-authenticate",
+                                format!(
+                                    r#"Bearer error="invalid_token", resource_metadata="{base}/.well-known/oauth-protected-resource""#
+                                ),
+                            )],
+                            "",
+                        )
+                            .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/.well-known/oauth-protected-resource",
+                axum::routing::get(move || {
+                    let base = prm_base.clone();
+                    async move {
+                        axum::Json(serde_json::json!({
+                            "resource": format!("{base}/mcp"),
+                            "authorization_servers": [format!("{base}/as")],
+                            "scopes_supported": ["mcp.scope"]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/.well-known/oauth-authorization-server/as",
+                axum::routing::get(move || {
+                    let base = as_base.clone();
+                    async move {
+                        axum::Json(serde_json::json!({
+                            "issuer": format!("{base}/as"),
+                            "authorization_endpoint": format!("{base}/as/authorize"),
+                            "token_endpoint": format!("{base}/as/token"),
+                            "code_challenge_methods_supported": ["S256"],
+                            "token_endpoint_auth_methods_supported": ["none"]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/as/token",
+                axum::routing::post(move |body: Bytes| async move {
+                    let fields = parse_form_body(&body);
+                    match fields.get("grant_type").map(String::as_str) {
+                        Some("authorization_code") => axum::Json(serde_json::json!({
+                            "access_token": "initial-access-token",
+                            "token_type": "Bearer",
+                            "expires_in": 3600,
+                            "refresh_token": "refresh-token-1",
+                            "scope": "mcp.scope"
+                        }))
+                        .into_response(),
+                        Some("refresh_token") => axum::Json(serde_json::json!({
+                            "access_token": "refreshed-access-token",
+                            "token_type": "Bearer",
+                            "expires_in": 3600,
+                            "scope": "mcp.scope"
+                        }))
+                        .into_response(),
+                        other => (
+                            StatusCode::BAD_REQUEST,
+                            format!("unexpected grant_type: {other:?}"),
+                        )
+                            .into_response(),
+                    }
+                }),
+            );
+
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (base, seen)
+    }
+
+    /// Returns [`OAuthAuthorizationAction::CallbackUrl`] immediately with a
+    /// synthetic authorization code, so the flow completes without an actual
+    /// browser redirect or loopback listener.
+    #[cfg(all(feature = "oauth-client", feature = "http"))]
+    #[derive(Clone, Default)]
+    struct ImmediateCallbackHandler;
+
+    #[cfg(all(feature = "oauth-client", feature = "http"))]
+    #[async_trait::async_trait]
+    impl OAuthAuthorizationHandler for ImmediateCallbackHandler {
+        async fn authorize(
+            &self,
+            request: OAuthAuthorizationRequest,
+        ) -> std::result::Result<OAuthAuthorizationAction, OAuthClientError> {
+            let authorization_url = reqwest::Url::parse(&request.authorization_url).unwrap();
+            let state = authorization_url
+                .query_pairs()
+                .find(|(name, _)| name == "state")
+                .unwrap()
+                .1
+                .into_owned();
+            let mut callback = reqwest::Url::parse(&request.redirect_uri).unwrap();
+            callback
+                .query_pairs_mut()
+                .append_pair("code", "authorization-code")
+                .append_pair("state", &state)
+                .append_pair("iss", &request.issuer);
+            Ok(OAuthAuthorizationAction::CallbackUrl(callback.to_string()))
+        }
+    }
+
+    /// #1467 end-to-end: a real [`OAuthAuthorizationFlow`] behind the HTTP
+    /// transport. The resource server 401s the token minted by the initial
+    /// code exchange; the fix under test is that `invalidate()` now marks it
+    /// unusable so `get_token()` performs an RFC 6749 refresh instead of
+    /// handing back the same rejected token, and the retry succeeds.
+    ///
+    /// This exercises the real provider rather than a mock `TokenProvider`
+    /// (unlike `a_401_challenge_replaces_the_rejected_token_and_retries`, which
+    /// only proves the transport calls `invalidate()` before retrying, not that
+    /// a real provider does anything useful when it does).
+    ///
+    /// `OAuthAuthorizationCode` is not used here instead: its only public entry
+    /// point drives a real loopback callback listener (`start()` /
+    /// `wait_for_callback()`), which has no existing test scaffolding to reuse
+    /// across this module boundary and would not exercise anything beyond what
+    /// this test and the provider-level refresh tests in `oauth_authcode.rs`
+    /// already cover. `OAuthAuthorizationFlow` reaches the same real
+    /// discovery/token-exchange/refresh code through its `CallbackUrl`
+    /// authorization action, which completes without a real redirect.
+    #[cfg(all(feature = "oauth-client", feature = "http"))]
+    #[tokio::test]
+    async fn a_real_auth_code_flow_provider_reauthorizes_through_invalidate() {
+        use std::sync::atomic::Ordering;
+
+        let (base, seen) = spawn_resource_server_fixture().await;
+        let resource = format!("{base}/mcp");
+
+        let flow = OAuthAuthorizationFlow::builder(&resource)
+            .redirect_policy(OAuthRedirectPolicy::fixed(format!("{base}/callback")))
+            .pre_registered_client("test-client", None)
+            .authorization_handler(ImmediateCallbackHandler)
+            .build()
+            .unwrap();
+
+        flow.authorize(["mcp.scope"]).await.unwrap();
+        assert_eq!(
+            flow.get_token().await.unwrap(),
+            "initial-access-token",
+            "sanity: the code exchange installed the token the fixture rejects"
+        );
+
+        let status = send_with(&resource, std::sync::Arc::new(flow.clone())).await;
+
+        assert_eq!(status, reqwest::StatusCode::OK, "the retry must succeed");
+        assert_eq!(
+            flow.get_token().await.unwrap(),
+            "refreshed-access-token",
+            "invalidate() must have caused get_token() to refresh"
+        );
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            3,
+            "discovery probe, rejected first attempt, successful retry"
+        );
     }
 
     // =========================================================================
