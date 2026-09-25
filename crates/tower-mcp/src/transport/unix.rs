@@ -177,6 +177,10 @@ impl UnixSocketTransport {
     }
 
     /// Set allowed origins for CORS validation.
+    ///
+    /// See [`HttpTransport::allowed_origins`] for the normalization rules,
+    /// the implicit localhost allowance, and how an invalid entry is
+    /// handled.
     pub fn allowed_origins(mut self, origins: Vec<String>) -> Self {
         self.inner = self.inner.allowed_origins(origins);
         self

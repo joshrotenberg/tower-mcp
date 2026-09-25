@@ -3636,6 +3636,47 @@ async fn test_origin_validation_allows_configured_origin() {
 }
 
 #[tokio::test]
+async fn test_origin_validation_allows_normalized_origin() {
+    // #1476: an allowlist entry with the default port, a differently-cased
+    // host, and a trailing slash must all still match the browser's exact
+    // `https://my-app.example.com`.
+    let transport = HttpTransport::new(create_test_router()).allowed_origins(vec![
+        "https://my-app.example.com:443".to_string(),
+        "https://Other-App.example.com/".to_string(),
+    ]);
+    let app = transport.into_router();
+
+    for origin in [
+        "https://my-app.example.com",
+        "https://other-app.example.com",
+    ] {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header("Origin", origin)
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": { "name": "test", "version": "1.0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{origin}");
+    }
+}
+
+#[tokio::test]
 async fn test_origin_validation_rejects_unconfigured_origin() {
     let transport = HttpTransport::new(create_test_router())
         .allowed_origins(vec!["https://my-app.example.com".to_string()]);

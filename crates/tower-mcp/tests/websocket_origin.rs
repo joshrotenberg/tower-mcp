@@ -89,6 +89,19 @@ async fn allowlisted_origin_is_upgraded_and_others_are_rejected() {
 }
 
 #[tokio::test]
+async fn normalized_allowlist_entry_matches_the_browser_serialized_origin() {
+    // #1476: an allowlist entry with the default port and a trailing slash
+    // must still match `https://app.example`, which is what a browser
+    // actually sends.
+    let url =
+        serve(transport().allowed_origins(vec!["https://app.example:443/".to_string()])).await;
+    assert_eq!(
+        handshake(&url, Some("https://app.example")).await,
+        StatusCode::SWITCHING_PROTOCOLS
+    );
+}
+
+#[tokio::test]
 async fn disabled_validation_upgrades_any_origin() {
     let url = serve(transport().disable_origin_validation()).await;
     assert_eq!(

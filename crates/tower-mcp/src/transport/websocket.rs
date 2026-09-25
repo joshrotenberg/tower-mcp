@@ -217,8 +217,10 @@ struct AppState {
     sampling_enabled: bool,
     /// Whether the upgrade request's `Origin` is checked (#1464).
     validate_origin: bool,
-    /// Non-localhost origins allowed to open a connection.
-    allowed_origins: Vec<String>,
+    /// Non-localhost origins allowed to open a connection, parsed and
+    /// normalized at build time. See
+    /// [`crate::transport::origin::parse_allowed_origins`].
+    allowed_origins: Vec<crate::transport::origin::AllowedOrigin>,
 }
 
 /// WebSocket transport for MCP servers
@@ -246,7 +248,9 @@ pub struct WebSocketTransport {
     service_factory: ServiceFactory,
     protocol_support: ProtocolSupport,
     validate_origin: bool,
-    allowed_origins: Vec<String>,
+    /// Parsed and normalized at [`Self::allowed_origins`] call time; see
+    /// [`crate::transport::origin::parse_allowed_origins`].
+    allowed_origins: Vec<crate::transport::origin::AllowedOrigin>,
     #[cfg(feature = "oauth")]
     oauth_config: Option<crate::oauth::ProtectedResourceMetadata>,
 }
@@ -297,10 +301,24 @@ impl WebSocketTransport {
     /// Set the non-localhost origins allowed to open a connection.
     ///
     /// Matches [`HttpTransport::allowed_origins`](crate::HttpTransport::allowed_origins):
-    /// entries are compared with the `Origin` header exactly, and `"*"` allows
-    /// any origin.
+    /// entries are parsed once here into `(scheme, host, port)` and compared
+    /// against the same normalized form of the upgrade request's `Origin`
+    /// header, so `"https://example.com:443"`, `"https://Example.com"`, and
+    /// `"https://example.com/"` are all equivalent to
+    /// `"https://example.com"`. `"*"` allows any origin.
+    ///
+    /// This list is additive: a localhost origin (`localhost`, `127.0.0.1`,
+    /// `::1`, any port) is always allowed regardless of this configuration,
+    /// as DNS-rebinding protection against a locally bound server. Setting
+    /// `allowed_origins` narrows which *non-localhost* origins are accepted;
+    /// it does not remove the implicit localhost allowance.
+    ///
+    /// An entry that is not `"*"` or a bare `scheme://host[:port]` origin (a
+    /// path other than `/`, a query, a fragment, userinfo, or a scheme other
+    /// than `http`/`https`/`ws`/`wss`) is logged at `warn` and ignored, since
+    /// it could never match a real `Origin` header.
     pub fn allowed_origins(mut self, origins: Vec<String>) -> Self {
-        self.allowed_origins = origins;
+        self.allowed_origins = crate::transport::origin::parse_allowed_origins(&origins);
         self
     }
 

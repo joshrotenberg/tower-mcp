@@ -84,10 +84,23 @@ metadata path and resource identifier from the mount path correctly.
 `HttpTransport` validates browser `Origin` headers by default:
 
 - a request without `Origin` is accepted;
-- localhost origins are accepted;
-- a non-localhost origin is rejected unless it exactly matches
-  `allowed_origins`;
+- localhost origins (`localhost`, `127.0.0.1`, `::1`, any port) are always
+  accepted, whether or not `allowed_origins` is set -- it is a DNS-rebinding
+  guard against a locally bound server, not something a configured allowlist
+  replaces; `allowed_origins` only adds non-localhost origins on top of it;
+- a non-localhost origin is rejected unless it matches `allowed_origins`;
 - an empty allowlist therefore rejects browser cross-origin access.
+
+`allowed_origins` entries are parsed once, when the transport is built, into
+`(scheme, host, port)` with the scheme's default port filled in, and compared
+against the same normalized form of the incoming `Origin` header. So
+`"https://example.com:443"`, `"https://Example.com"`, and
+`"https://example.com/"` are all equivalent to `"https://example.com"`:
+matching is on the parsed origin, not the exact string. An entry that isn't
+`"*"` or a bare `scheme://host[:port]` origin (a path other than `/`, a
+query, a fragment, userinfo, or a scheme other than `http`/`https`/`ws`/`wss`)
+is logged at `warn` and ignored when `allowed_origins` is called, since it can
+never match a real `Origin` header.
 
 Host validation is also enabled. Localhost variants are accepted. For
 compatibility, non-localhost hosts are accepted when `allowed_hosts` is empty;
