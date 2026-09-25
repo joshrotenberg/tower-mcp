@@ -3367,6 +3367,11 @@ mod tests {
                 .default_ttl(Duration::from_secs(60))
                 .cleanup_interval(Duration::from_secs(60)),
         );
+        // Keep the expiry worker from starting. Its thread runs a signalling
+        // pass when it starts and whenever create_task wakes it, and on a slow
+        // runner that pass could land between the TTL change and the two
+        // manual passes below, leaving them nothing to signal.
+        store.state.worker_started.set(Ok(())).unwrap();
         let (id, cancellation) = store
             .create_task("test-tool", serde_json::json!({}), None, None)
             .await
