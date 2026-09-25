@@ -224,7 +224,12 @@ later request carries the version, client identity, and capabilities in
 `initialize` on the same client.
 
 `discover` retries one recognized `UnsupportedProtocolVersionError` with a
-mutually supported modern version. It does not automatically convert a modern
+mutually supported modern version -- the retry only considers entries in the
+server's `supported` list that also use the discover lifecycle, never a
+legacy `initialize`-lifecycle version, even if the client would otherwise
+accept it. If the server's `supported` list has no discover-lifecycle version
+the client also enables, `discover` fails outright rather than silently
+settling for a legacy one. It does not automatically convert a modern
 client into a legacy client. An application that must connect to unknown-era
 servers should own that policy: probe according to the spec, create a fresh
 client/transport for fallback, and call `initialize` only after classifying the

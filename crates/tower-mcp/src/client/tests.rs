@@ -239,6 +239,69 @@ async fn test_client_initialize() {
     assert_eq!(server_info.server_info.name, "test-server");
 }
 
+fn mock_initialize_response_with_version(protocol_version: &str) -> serde_json::Value {
+    serde_json::json!({
+        "protocolVersion": protocol_version,
+        "serverInfo": {
+            "name": "test-server",
+            "version": "1.0.0"
+        },
+        "capabilities": {
+            "tools": {}
+        }
+    })
+}
+
+/// #1473: `initialize` must validate the version the server selected, not
+/// just accept whatever comes back. A discover-lifecycle version here means
+/// the server answered the legacy handshake with a version that removed it
+/// -- accepting it would leave the client holding a session the server never
+/// intends to service that way.
+#[tokio::test]
+async fn initialize_rejects_a_discover_lifecycle_version() {
+    let transport =
+        MockTransport::with_responses(vec![mock_initialize_response_with_version("2026-07-28")]);
+    let client = McpClient::connect(transport).await.unwrap();
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.initialize("test-client", "1.0.0"),
+    )
+    .await
+    .expect("initialize must not hang");
+
+    let error = outcome
+        .expect_err("a discover-lifecycle version must not complete the initialize handshake");
+    assert!(
+        error.to_string().contains("2026-07-28"),
+        "error should name the rejected version, got: {error}"
+    );
+    assert!(!client.is_initialized());
+}
+
+/// A version the client has never heard of is rejected the same way as a
+/// known-but-wrong-lifecycle one: `initialize` has no basis for trusting it.
+#[tokio::test]
+async fn initialize_rejects_an_unknown_version() {
+    let transport =
+        MockTransport::with_responses(vec![mock_initialize_response_with_version("1999-01-01")]);
+    let client = McpClient::connect(transport).await.unwrap();
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.initialize("test-client", "1.0.0"),
+    )
+    .await
+    .expect("initialize must not hang");
+
+    let error = outcome.expect_err("an unrecognized protocol version must not complete initialize");
+    assert!(
+        error.to_string().contains("1999-01-01"),
+        "error should name the rejected version, got: {error}"
+    );
+    assert!(!client.is_initialized());
+}
+
 #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
 #[tokio::test]
 async fn final_discover_injects_metadata_on_every_request() {
@@ -306,6 +369,92 @@ fn final_discover_result() -> serde_json::Value {
         "ttlMs": 0,
         "cacheScope": "private"
     })
+}
+
+/// #1473: a server that rejects `server/discover` with `-32022` and offers
+/// only legacy `initialize`-lifecycle versions in `supported` has nothing
+/// discover can retry with. Picking a legacy version there would leave the
+/// client believing it's on the sessionless path while it never sends
+/// `initialize` or the `notifications/initialized` handshake the server
+/// actually expects.
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+#[tokio::test]
+async fn discover_retry_fails_when_only_legacy_versions_are_mutual() {
+    let error = JsonRpcError {
+        code: -32022,
+        message: "Unsupported protocol version".to_string(),
+        data: Some(serde_json::json!({ "supported": ["2025-11-25"] })),
+    };
+    let transport = MockTransport::with_replies(vec![MockReply::Error(error)]);
+    let client = McpClient::builder()
+        .protocol_support(ProtocolSupport::default())
+        .connect_simple(transport)
+        .await
+        .unwrap();
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.discover("test-client", "1.0.0"),
+    )
+    .await
+    .expect("discover must not hang waiting on a mismatched retry");
+
+    let error = outcome.expect_err(
+        "a server offering only legacy versions must fail discover, not retry into one",
+    );
+    assert!(
+        error.to_string().contains("fall back to initialize"),
+        "error should point the caller at the initialize fallback, got: {error}"
+    );
+    assert!(!client.is_initialized());
+}
+
+/// The counterpart to the above: when `supported` mixes a legacy version
+/// with a discover-lifecycle one the client also enables, the retry must
+/// still pick the discover-lifecycle version and succeed.
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+#[tokio::test]
+async fn discover_retry_succeeds_with_a_mutual_discover_lifecycle_version() {
+    let error = JsonRpcError {
+        code: -32022,
+        message: "Unsupported protocol version".to_string(),
+        data: Some(serde_json::json!({ "supported": ["2025-11-25", "2026-07-28"] })),
+    };
+    let transport = MockTransport::with_replies(vec![
+        MockReply::Error(error),
+        MockReply::Result(final_discover_result()),
+    ]);
+    let outgoing = transport.outgoing.clone();
+    let client = McpClient::builder()
+        .protocol_support(ProtocolSupport::default())
+        .connect_simple(transport)
+        .await
+        .unwrap();
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.discover("test-client", "1.0.0"),
+    )
+    .await
+    .expect("discover must not hang");
+
+    outcome.expect("a mutual discover-lifecycle version must let the retry succeed");
+    assert_eq!(
+        client.selected_protocol_version().await.as_deref(),
+        Some("2026-07-28")
+    );
+
+    let messages: Vec<serde_json::Value> = outgoing
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|message| serde_json::from_str(message).unwrap())
+        .collect();
+    assert_eq!(
+        messages.len(),
+        2,
+        "expected the original request plus exactly one retry"
+    );
 }
 
 #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]

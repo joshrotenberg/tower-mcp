@@ -898,6 +898,24 @@ impl McpClient {
         };
 
         let result: InitializeResult = self.send_request("initialize", &params).await?;
+
+        // The server picks the protocol version, not necessarily the one
+        // offered. A response outside the initialize-lifecycle set this
+        // client accepts -- a discover-lifecycle version like 2026-07-28, or
+        // one the client narrowed itself away from via `ProtocolSupport` --
+        // must not be treated as a successful handshake: nothing downstream
+        // re-checks it, so an unvalidated version here silently drives every
+        // later request with mismatched semantics.
+        if !crate::protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&result.protocol_version.as_str())
+            || !self.protocol_support.contains(&result.protocol_version)
+        {
+            return Err(Error::Transport(format!(
+                "server selected protocol version `{}`, which is not an initialize-lifecycle version this client supports; client supports: {:?}",
+                result.protocol_version,
+                self.protocol_support.versions()
+            )));
+        }
+
         *self.server_info.write().await = Some(result.clone());
 
         // Store init params for potential session recovery
@@ -976,20 +994,29 @@ impl McpClient {
                 .await
             {
                 Ok(result) => {
+                    // `supported_versions` lists everything the server can
+                    // speak, including legacy `initialize`-lifecycle
+                    // versions it also accepts for backward compatibility.
+                    // Restrict the pick to the discover lifecycle: selecting
+                    // a legacy version here would leave the client believing
+                    // it's on the sessionless 2026-07-28 path while every
+                    // later request still carries per-request `_meta` the
+                    // server never asked for.
                     let selected = self
                         .protocol_support
                         .versions()
                         .iter()
                         .find(|version| {
-                            result
-                                .supported_versions
-                                .iter()
-                                .any(|supported| supported == *version)
+                            version.as_str() == PROTOCOL_VERSION_2026_07_28
+                                && result
+                                    .supported_versions
+                                    .iter()
+                                    .any(|supported| supported == *version)
                         })
                         .cloned()
                         .ok_or_else(|| {
                             Error::Transport(format!(
-                                "server and client have no protocol version in common; server: {:?}, client: {:?}",
+                                "server offers no mutually supported version for server/discover; server: {:?}, client: {:?}; fall back to initialize",
                                 result.supported_versions,
                                 self.protocol_support.versions()
                             ))
@@ -1006,17 +1033,29 @@ impl McpClient {
                         .and_then(|data| data.get("supported"))
                         .and_then(serde_json::Value::as_array)
                         .ok_or_else(|| Error::JsonRpc(error.clone()))?;
+                    // Only retry with a version that both uses the discover
+                    // lifecycle and is enabled on this client. A legacy
+                    // version in `supported` is not a `server/discover`
+                    // candidate at all -- accepting it here would repeat the
+                    // bug in the success branch above, just one round trip
+                    // earlier.
                     candidate = self
                         .protocol_support
                         .versions()
                         .iter()
                         .find(|version| {
-                            supported
-                                .iter()
-                                .any(|item| item.as_str() == Some(version.as_str()))
+                            version.as_str() == PROTOCOL_VERSION_2026_07_28
+                                && supported
+                                    .iter()
+                                    .any(|item| item.as_str() == Some(version.as_str()))
                         })
                         .cloned()
-                        .ok_or_else(|| Error::JsonRpc(error.clone()))?;
+                        .ok_or_else(|| {
+                            Error::Transport(format!(
+                                "server offers no mutually supported version for server/discover; server: {supported:?}, client: {:?}; fall back to initialize",
+                                self.protocol_support.versions()
+                            ))
+                        })?;
                     retried_unsupported = true;
                 }
                 Err(error) => return Err(error),
