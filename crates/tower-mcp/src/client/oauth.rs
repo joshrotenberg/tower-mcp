@@ -1337,7 +1337,12 @@ mod tests {
             .build()
             .unwrap();
 
-        let err = provider.get_token().await.unwrap_err();
+        // Bounded so a regression (the redirect followed to a listener that
+        // never answers) fails here instead of hanging the test run.
+        let err = tokio::time::timeout(Duration::from_secs(5), provider.get_token())
+            .await
+            .expect("get_token hung: the redirect was followed")
+            .unwrap_err();
         server.await.unwrap();
 
         assert!(matches!(err, OAuthClientError::TokenRequest(_)));
