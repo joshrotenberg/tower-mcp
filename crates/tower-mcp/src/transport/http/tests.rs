@@ -1783,6 +1783,205 @@ async fn test_delete_session() {
     assert_eq!(json["error"]["code"], -32005); // SessionNotFound
 }
 
+/// A duplicated `MCP-Protocol-Version` header must not let a downstream
+/// intermediary that reads the last value dispatch on a different version
+/// than the server does (#1468).
+#[tokio::test]
+async fn duplicate_protocol_version_header_rejected_with_http_400() {
+    let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
+    let app = transport.into_router();
+
+    let init_request = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(Body::from(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": { "name": "t", "version": "0" }
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let init_response = app.clone().oneshot(init_request).await.unwrap();
+    let session_id = init_response
+        .headers()
+        .get(MCP_SESSION_ID_HEADER)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header(MCP_SESSION_ID_HEADER, &session_id)
+        .header(MCP_PROTOCOL_VERSION_HEADER, "2025-11-25")
+        .header(MCP_PROTOCOL_VERSION_HEADER, "2025-03-26")
+        .body(Body::from(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["code"].as_i64().unwrap(), -32020);
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("duplicate mcp-protocol-version header")
+    );
+    assert_eq!(json["id"], 2);
+}
+
+/// A duplicated `Mcp-Session-Id` header on a POST request is rejected the
+/// same way as a duplicated protocol-version header (#1468).
+#[tokio::test]
+async fn duplicate_session_id_header_on_post_rejected_with_http_400() {
+    let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
+    let app = transport.into_router();
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header(MCP_SESSION_ID_HEADER, "session-a")
+        .header(MCP_SESSION_ID_HEADER, "session-b")
+        .body(Body::from(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["code"].as_i64().unwrap(), -32020);
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("duplicate mcp-session-id header")
+    );
+}
+
+/// The GET SSE-stream route rejects a duplicated `Mcp-Session-Id` header
+/// the same way the POST route does (#1468).
+#[tokio::test]
+async fn duplicate_session_id_header_on_get_rejected_with_http_400() {
+    let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
+    let app = transport.into_router();
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/")
+        .header("Accept", "text/event-stream")
+        .header(MCP_SESSION_ID_HEADER, "session-a")
+        .header(MCP_SESSION_ID_HEADER, "session-b")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["code"].as_i64().unwrap(), -32020);
+}
+
+/// The DELETE (session-termination) route rejects a duplicated
+/// `Mcp-Session-Id` header the same way the POST and GET routes do (#1468).
+#[tokio::test]
+async fn duplicate_session_id_header_on_delete_rejected_with_http_400() {
+    let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
+    let app = transport.into_router();
+
+    let request = Request::builder()
+        .method("DELETE")
+        .uri("/")
+        .header(MCP_SESSION_ID_HEADER, "session-a")
+        .header(MCP_SESSION_ID_HEADER, "session-b")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["code"].as_i64().unwrap(), -32020);
+}
+
+/// The 2026-07-28 stateless dispatch path (the era `#859` and
+/// `stateless_v2026_rejects_missing_protocol_header_with_http_400` already
+/// cover for a missing/malformed header) also rejects a duplicated
+/// `MCP-Protocol-Version` header (#1468).
+#[tokio::test]
+#[cfg(feature = "stateless")]
+async fn stateless_v2026_duplicate_protocol_version_header_rejected_with_http_400() {
+    let app = HttpTransport::new(create_test_router())
+        .disable_origin_validation()
+        .disable_host_validation()
+        .into_router();
+    let request = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header(MCP_METHOD_HEADER, "tools/list")
+        .header(MCP_PROTOCOL_VERSION_HEADER, "2026-07-28")
+        .header(MCP_PROTOCOL_VERSION_HEADER, "2026-07-28")
+        .body(Body::from(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 101,
+                "method": "tools/list",
+                "params": {
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {}
+                    }
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["id"], 101);
+    assert_eq!(json["error"]["code"].as_i64().unwrap(), -32020);
+}
+
 #[tokio::test]
 async fn test_custom_session_store_receives_create_and_delete() {
     use crate::session_store::{MemorySessionStore, SessionStore as PublicSessionStore};

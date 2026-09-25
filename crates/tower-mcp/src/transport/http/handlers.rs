@@ -202,20 +202,40 @@ fn validate_origin(headers: &HeaderMap, state: &AppState) -> Option<Response> {
     None
 }
 
+/// Read a singleton MCP header, rejecting a duplicate.
+///
+/// `HeaderMap::get` returns only the first value and silently ignores the
+/// rest, which lets a request carrying two different values for the same
+/// header be dispatched on one value here while a proxy, WAF, or auth layer
+/// in front reads the other. Returns `Ok(None)` when the header is absent,
+/// or present but not valid UTF-8 -- matching the prior single-value
+/// behavior of treating an unreadable header as absent. Returns `Err` with
+/// a `HeaderMismatch` JSON-RPC error when the header is present more than
+/// once.
+fn singleton_header(
+    headers: &HeaderMap,
+    name: &str,
+) -> std::result::Result<Option<String>, JsonRpcError> {
+    let mut values = headers.get_all(name).iter();
+    let Some(first) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(JsonRpcError::header_mismatch(format!(
+            "duplicate {name} header"
+        )));
+    }
+    Ok(first.to_str().ok().map(str::to_string))
+}
+
 /// Extract and validate session ID from headers
-fn get_session_id(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get(MCP_SESSION_ID_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
+fn get_session_id(headers: &HeaderMap) -> std::result::Result<Option<String>, JsonRpcError> {
+    singleton_header(headers, MCP_SESSION_ID_HEADER)
 }
 
 /// Extract protocol version from headers
-fn get_protocol_version(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get(MCP_PROTOCOL_VERSION_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
+fn get_protocol_version(headers: &HeaderMap) -> std::result::Result<Option<String>, JsonRpcError> {
+    singleton_header(headers, MCP_PROTOCOL_VERSION_HEADER)
 }
 
 /// Extract Last-Event-ID from headers for SSE stream resumption (SEP-1699)
@@ -268,8 +288,15 @@ fn request_tool_input_schema(
 /// header is also treated as a modern claim so a missing or malformed
 /// envelope receives the specified modern error instead of drifting into the
 /// legacy session path.
-fn claims_modern_protocol(headers: &HeaderMap, parsed: &serde_json::Value) -> bool {
-    get_protocol_version(headers).as_deref() == Some(PROTOCOL_VERSION_2026_07_28)
+///
+/// `protocol_version_header` is the already-validated (single-valued)
+/// `MCP-Protocol-Version` header, resolved once by the caller so a
+/// duplicate header is rejected before this function ever runs.
+fn claims_modern_protocol(
+    protocol_version_header: Option<&str>,
+    parsed: &serde_json::Value,
+) -> bool {
+    protocol_version_header == Some(PROTOCOL_VERSION_2026_07_28)
         || parsed
             .get("params")
             .and_then(serde_json::Value::as_object)
@@ -423,11 +450,37 @@ pub(super) async fn handle_post(
             }
         };
 
+    // Resolve the two singleton headers this handler dispatches on once,
+    // up front. `get_protocol_version` / `get_session_id` reject a
+    // duplicated header; every use below reads the already-validated value
+    // rather than re-reading `headers` (and re-risking the first-value-wins
+    // behavior of `HeaderMap::get` on a duplicate).
+    let protocol_version_header = match get_protocol_version(&headers) {
+        Ok(version) => version,
+        Err(error) => {
+            return json_rpc_error_response_with_status(
+                extract_request_id(&parsed),
+                error,
+                StatusCode::BAD_REQUEST,
+            );
+        }
+    };
+    let session_id_header = match get_session_id(&headers) {
+        Ok(session_id) => session_id,
+        Err(error) => {
+            return json_rpc_error_response_with_status(
+                extract_request_id(&parsed),
+                error,
+                StatusCode::BAD_REQUEST,
+            );
+        }
+    };
+
     // A version header supplies enough exact context to reject a batch before
     // any object-only HTTP classification runs. Legacy batches without a
     // header are validated against their session revision after lookup below.
     if parsed.is_array()
-        && let Some(version) = get_protocol_version(&headers)
+        && let Some(version) = protocol_version_header.clone()
     {
         let revision = match version.parse::<McpProtocolRevision>() {
             Ok(revision) => revision,
@@ -464,7 +517,7 @@ pub(super) async fn handle_post(
         .unwrap_or_default()
         .to_string();
     let tool_input_schema = request_tool_input_schema(&state.service_source, &parsed);
-    let modern_request = claims_modern_protocol(&headers, &parsed);
+    let modern_request = claims_modern_protocol(protocol_version_header.as_deref(), &parsed);
 
     // The modern protocol is selected by its per-request `_meta` envelope,
     // with the final-version HTTP header also acting as a signal for malformed
@@ -480,7 +533,7 @@ pub(super) async fn handle_post(
             }
         };
 
-        let Some(header_version) = get_protocol_version(&headers) else {
+        let Some(header_version) = protocol_version_header.clone() else {
             return json_rpc_error_response_with_status(
                 id,
                 JsonRpcError::header_mismatch("MCP-Protocol-Version header is required"),
@@ -581,7 +634,7 @@ pub(super) async fn handle_post(
             // For non-init requests, only the HTTP-level `MCP-Protocol-Version`
             // header gates stateless mode. Body-level `_meta.protocolVersion` is
             // plumbed to handlers via `stash_per_request_meta` in both paths.
-            get_protocol_version(&headers)
+            protocol_version_header.clone()
         };
 
         if let Some(ref version) = version_in_play
@@ -841,8 +894,8 @@ pub(super) async fn handle_post(
     // initialize requests. They are processed with an ephemeral service and
     // return immediately without storing any session state.
     #[cfg(feature = "stateless")]
-    if !is_init && state.stateless_config.is_some() && get_session_id(&headers).is_none() {
-        let version_from_header = get_protocol_version(&headers);
+    if !is_init && state.stateless_config.is_some() && session_id_header.is_none() {
+        let version_from_header = protocol_version_header.clone();
         let params = parsed.get("params").unwrap_or(&parsed);
         let version_from_meta = crate::stateless::StatelessRequestMeta::from_params(params)
             .and_then(|m| m.protocol_version);
@@ -939,7 +992,7 @@ pub(super) async fn handle_post(
     // This is especially important for optional-session traffic: an unknown
     // header must not be interpreted under a fallback revision.
     if !is_init
-        && let Some(version) = get_protocol_version(&headers)
+        && let Some(version) = protocol_version_header.clone()
         && !state.protocol_support.contains(&version)
     {
         return json_rpc_error_response(
@@ -951,10 +1004,8 @@ pub(super) async fn handle_post(
         );
     }
 
-    let uses_transient_session = !is_init
-        && !modern_request
-        && get_session_id(&headers).is_none()
-        && state.optional_sessions;
+    let uses_transient_session =
+        !is_init && !modern_request && session_id_header.is_none() && state.optional_sessions;
 
     // Get or create session
     let session = if is_init {
@@ -982,7 +1033,7 @@ pub(super) async fn handle_post(
                     .into_response();
             }
         }
-    } else if !modern_request && let Some(session_id) = get_session_id(&headers) {
+    } else if !modern_request && let Some(session_id) = session_id_header.clone() {
         // Client sent a session ID -- look it up
         match state.sessions.get(&session_id).await {
             Some(s) => s,
@@ -1146,7 +1197,7 @@ pub(super) async fn handle_post(
         let method_str = parsed.get("method").and_then(|m| m.as_str()).unwrap_or("");
         if method_str == "subscriptions/listen" {
             let req_id = extract_request_id(&parsed);
-            let effective_version = if let Some(v) = get_protocol_version(&headers) {
+            let effective_version = if let Some(v) = protocol_version_header.clone() {
                 v
             } else {
                 session.protocol_version.read().await.clone()
@@ -1714,9 +1765,12 @@ pub(super) async fn handle_get(
 
     // Get session
     let session_id = match get_session_id(&headers) {
-        Some(id) => id,
-        None => {
+        Ok(Some(id)) => id,
+        Ok(None) => {
             return json_rpc_error_response(None, JsonRpcError::session_required());
+        }
+        Err(error) => {
+            return json_rpc_error_response_with_status(None, error, StatusCode::BAD_REQUEST);
         }
     };
 
@@ -1820,9 +1874,12 @@ pub(super) async fn handle_delete(
     }
 
     let session_id = match get_session_id(&headers) {
-        Some(id) => id,
-        None => {
+        Ok(Some(id)) => id,
+        Ok(None) => {
             return json_rpc_error_response(None, JsonRpcError::session_required());
+        }
+        Err(error) => {
+            return json_rpc_error_response_with_status(None, error, StatusCode::BAD_REQUEST);
         }
     };
 

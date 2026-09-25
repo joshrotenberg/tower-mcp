@@ -219,10 +219,21 @@ impl NameSource {
 /// Pull a header value as a `String`, decoding the SEP-2243 Base64
 /// sentinel if present. Returns `Ok(None)` when the header is absent.
 ///
+/// Uses `get_all` rather than `get` so a duplicated singleton header (e.g.
+/// two `Mcp-Method` values) is rejected instead of silently dispatching on
+/// whichever value `HeaderMap::get` happens to return first -- the same
+/// check `validate_schema_param_headers` already applies to `Mcp-Param-*`.
+///
 /// Per RFC 9110, HTTP parsers trim leading/trailing whitespace from
 /// header values; we rely on hyper/axum having already done so.
 fn header_str(headers: &axum::http::HeaderMap, name: &str) -> Result<Option<String>, JsonRpcError> {
-    let Some(raw) = headers.get(name) else {
+    let values: Vec<_> = headers.get_all(name).iter().collect();
+    if values.len() > 1 {
+        return Err(JsonRpcError::header_mismatch(format!(
+            "duplicate {name} header"
+        )));
+    }
+    let Some(raw) = values.first() else {
         return Ok(None);
     };
     let s = raw
@@ -1117,6 +1128,48 @@ mod tests {
             Sep2243Mode::Strict,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn duplicate_mcp_method_header_rejected() {
+        // Unlike Mcp-Param-*, Mcp-Method and Mcp-Name are true singleton
+        // headers with a fixed name, so a second `.append()` builds a
+        // genuine duplicate that `get_all` sees as two values (#1468).
+        let mut h = HeaderMap::new();
+        h.append(
+            axum::http::HeaderName::from_static("mcp-method"),
+            axum::http::HeaderValue::from_static("tools/list"),
+        );
+        h.append(
+            axum::http::HeaderName::from_static("mcp-method"),
+            axum::http::HeaderValue::from_static("tools/call"),
+        );
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+        let err = validate(&h, &body, Sep2243Mode::Strict).unwrap_err();
+        assert_eq!(err.code, -32020);
+        assert!(err.message.contains("duplicate mcp-method header"));
+    }
+
+    #[test]
+    fn duplicate_mcp_name_header_rejected() {
+        let mut h = HeaderMap::new();
+        h.append(
+            axum::http::HeaderName::from_static("mcp-method"),
+            axum::http::HeaderValue::from_static("tools/call"),
+        );
+        h.append(
+            axum::http::HeaderName::from_static("mcp-name"),
+            axum::http::HeaderValue::from_static("echo"),
+        );
+        h.append(
+            axum::http::HeaderName::from_static("mcp-name"),
+            axum::http::HeaderValue::from_static("other"),
+        );
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                          "params": {"name": "echo"}});
+        let err = validate(&h, &body, Sep2243Mode::Strict).unwrap_err();
+        assert_eq!(err.code, -32020);
+        assert!(err.message.contains("duplicate mcp-name header"));
     }
 
     #[test]
