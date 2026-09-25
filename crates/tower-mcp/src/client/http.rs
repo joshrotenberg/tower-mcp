@@ -229,6 +229,24 @@ pub struct HttpClientConfig {
     /// are truncated rather than failed, independent of this setting.
     /// Default: 16 MiB (matching `max_sse_event_size`).
     pub max_response_body_size: usize,
+    /// Whether to follow a redirect to a different origin (scheme, host, or
+    /// port) than the one the request was sent to.
+    ///
+    /// By default the client follows only same-origin redirects, so a
+    /// same-host `307`/`308` still works, but a server (or an attacker who
+    /// controls a `Location` response) cannot redirect a request to another
+    /// host and have this client forward it there. This matters because
+    /// every header on the request, including custom headers set via
+    /// [`HttpClientConfig::headers`] (`bearer_token`, `api_key_header`,
+    /// `header`) and `mcp-session-id`, is resent to the redirect target;
+    /// reqwest's own stripping only covers `Authorization`, `Cookie`, and
+    /// `Proxy-Authorization`. Set this to `true` only when the server is
+    /// known to redirect across origins and the forwarded headers are safe
+    /// to disclose there. A redirect from `https` to a non-`https` scheme is
+    /// never followed, even with this enabled, since that would send those
+    /// headers in plaintext.
+    /// Default: `false`.
+    pub follow_cross_origin_redirects: bool,
 }
 
 /// Default maximum buffered size for a single SSE event (16 MiB, matching
@@ -254,6 +272,7 @@ impl Default for HttpClientConfig {
             session_recovery: true,
             max_sse_event_size: DEFAULT_MAX_SSE_EVENT_SIZE,
             max_response_body_size: DEFAULT_MAX_RESPONSE_BODY_SIZE,
+            follow_cross_origin_redirects: false,
         }
     }
 }
@@ -292,6 +311,70 @@ impl HttpClientConfig {
         self.headers.insert(name.into(), value.into());
         self
     }
+}
+
+/// Maximum redirect hops the custom redirect policy follows before failing,
+/// matching reqwest's own default (see [`reqwest::redirect::Policy`]).
+/// `Policy::custom` does not get that bound for free; it has to be checked
+/// explicitly.
+const MAX_REDIRECT_HOPS: usize = 10;
+
+/// Whether a redirect from `original` (the request's starting URL) to
+/// `target` (the `Location` it was just pointed at) should be followed.
+///
+/// Same-origin means matching scheme, host, and port, with each scheme's
+/// default port substituted when a URL omits one. A downgrade from `https`
+/// to any other scheme is refused unconditionally, since it would put
+/// whatever headers are on the request on the wire in plaintext; that check
+/// runs even when `allow_cross_origin` opts into following other origins.
+///
+/// Factored out of the `reqwest::redirect::Policy::custom` closure so it can
+/// be unit-tested without standing up TLS.
+fn should_follow_redirect(
+    original: &reqwest::Url,
+    target: &reqwest::Url,
+    allow_cross_origin: bool,
+) -> bool {
+    if original.scheme() == "https" && target.scheme() != "https" {
+        return false;
+    }
+    if allow_cross_origin {
+        return true;
+    }
+    original.scheme() == target.scheme()
+        && original.host_str() == target.host_str()
+        && original.port_or_known_default() == target.port_or_known_default()
+}
+
+/// Build the `reqwest::Client` used for MCP requests, with a redirect policy
+/// that keeps credentials (custom headers, `mcp-session-id`) from leaking to
+/// a redirect target reqwest's own header stripping does not cover. See
+/// [`HttpClientConfig::follow_cross_origin_redirects`].
+fn build_client(allow_cross_origin_redirects: bool) -> reqwest::Client {
+    let policy = reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() > MAX_REDIRECT_HOPS {
+            return attempt.error("too many redirects");
+        }
+        // `previous()` holds every URL requested so far in this chain; the
+        // first entry is the original request, never a redirect target.
+        let Some(original) = attempt.previous().first() else {
+            return attempt.follow();
+        };
+        if should_follow_redirect(original, attempt.url(), allow_cross_origin_redirects) {
+            attempt.follow()
+        } else {
+            let target = attempt.url().to_string();
+            attempt.error(format!(
+                "redirect to a different origin ({target}) was not followed; set \
+                 HttpClientConfig::follow_cross_origin_redirects to allow it (an https-to-http \
+                 downgrade is never followed)"
+            ))
+        }
+    });
+    reqwest::Client::builder()
+        .redirect(policy)
+        .build()
+        .expect("reqwest client with a custom redirect policy should always build")
 }
 
 /// Client transport for MCP servers over Streamable HTTP.
@@ -408,7 +491,7 @@ impl HttpClientTransport {
         let (tx, rx) = mpsc::channel(config.channel_capacity);
         Self {
             url: url.into(),
-            client: reqwest::Client::new(),
+            client: build_client(config.follow_cross_origin_redirects),
             session_id: None,
             protocol_version: None,
             tool_header_mappings: HashMap::new(),
@@ -925,8 +1008,19 @@ struct HttpRequestSendError {
 
 impl HttpRequestSendError {
     fn request(error: reqwest::Error) -> Self {
+        // reqwest::Error's Display doesn't walk its own source chain (e.g. a
+        // redirect failure's Display is just "error following redirect for
+        // url (...)"), so the useful detail -- here, the rejected redirect
+        // target from the custom policy in `build_client` -- lives in
+        // `source()` and has to be appended explicitly.
+        let mut message = format!("HTTP request failed: {error}");
+        let mut source = std::error::Error::source(&error);
+        while let Some(err) = source {
+            message.push_str(&format!(": {err}"));
+            source = err.source();
+        }
         Self {
-            message: format!("HTTP request failed: {error}"),
+            message,
             connection_failed: true,
         }
     }
@@ -3273,5 +3367,90 @@ mod tests {
             .await
             .unwrap();
         assert!(transport.request_tasks.is_empty());
+    }
+
+    // =========================================================================
+    // Redirect policy (#1475)
+    // =========================================================================
+
+    fn url(s: &str) -> reqwest::Url {
+        reqwest::Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn same_origin_redirect_is_followed_by_default() {
+        assert!(should_follow_redirect(
+            &url("https://example.com/mcp"),
+            &url("https://example.com/other"),
+            false,
+        ));
+    }
+
+    #[test]
+    fn different_port_is_not_same_origin_by_default() {
+        assert!(!should_follow_redirect(
+            &url("https://example.com:8443/mcp"),
+            &url("https://example.com:9443/mcp"),
+            false,
+        ));
+    }
+
+    #[test]
+    fn default_port_matches_an_explicit_default_port() {
+        // `https` defaults to 443, so an explicit `:443` is the same origin
+        // as one with the port omitted.
+        assert!(should_follow_redirect(
+            &url("https://example.com/mcp"),
+            &url("https://example.com:443/other"),
+            false,
+        ));
+    }
+
+    #[test]
+    fn cross_host_redirect_is_not_followed_by_default() {
+        assert!(!should_follow_redirect(
+            &url("https://example.com/mcp"),
+            &url("https://attacker.example/mcp"),
+            false,
+        ));
+    }
+
+    #[test]
+    fn cross_host_redirect_is_followed_when_opted_in() {
+        assert!(should_follow_redirect(
+            &url("https://example.com/mcp"),
+            &url("https://attacker.example/mcp"),
+            true,
+        ));
+    }
+
+    #[test]
+    fn https_to_http_downgrade_is_never_followed_even_when_opted_in() {
+        assert!(!should_follow_redirect(
+            &url("https://example.com/mcp"),
+            &url("http://example.com/mcp"),
+            false,
+        ));
+        assert!(!should_follow_redirect(
+            &url("https://example.com/mcp"),
+            &url("http://attacker.example/mcp"),
+            true,
+        ));
+    }
+
+    #[test]
+    fn http_to_https_redirect_is_not_a_downgrade() {
+        // Not a downgrade, but still a scheme change, so it needs the same
+        // opt-in as any other cross-origin redirect.
+        assert!(!should_follow_redirect(
+            &url("http://example.com/mcp"),
+            &url("https://example.com/mcp"),
+            false,
+        ));
+        assert!(should_follow_redirect(
+            &url("http://example.com/mcp"),
+            &url("https://example.com/mcp"),
+            true,
+        ));
     }
 }

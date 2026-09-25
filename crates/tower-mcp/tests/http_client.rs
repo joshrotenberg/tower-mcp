@@ -4276,3 +4276,224 @@ async fn pre_session_oversized_initialize_response_fails_without_hanging() {
         "error should mention the {limit}-byte limit, got: {error}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Redirect policy (#1475): custom headers and mcp-session-id must not leak
+// to a redirect target reqwest's own sensitive-header stripping doesn't
+// cover.
+// ---------------------------------------------------------------------------
+
+/// A same-origin `307` (same host:port, different path) is transparent: the
+/// client follows it and the request still succeeds.
+#[tokio::test]
+async fn same_origin_redirect_is_followed() {
+    let base = Arc::new(std::sync::OnceLock::new());
+    let base_for_server = base.clone();
+    let redirected_from_root = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let redirected_from_root_clone = redirected_from_root.clone();
+    let url = spawn_raw_server(move |req| {
+        if req.starts_with("POST / ") {
+            redirected_from_root_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            let base: &String = base_for_server
+                .get()
+                .expect("base url set before first request");
+            raw_response(
+                "307 Temporary Redirect",
+                &format!("Location: {base}/redirected\r\n"),
+                "",
+            )
+        } else {
+            raw_initialize_ok(req)
+        }
+    })
+    .await;
+    base.set(url.clone()).unwrap();
+
+    let client = McpClient::connect(HttpClientTransport::with_config(url, raw_client_config()))
+        .await
+        .unwrap();
+
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        client.initialize("raw-client", "1.0.0"),
+    )
+    .await
+    .expect("same-origin redirect should not hang")
+    .expect("a same-origin redirect must be followed");
+
+    assert!(
+        redirected_from_root.load(std::sync::atomic::Ordering::SeqCst),
+        "the request should have hit the redirecting path first"
+    );
+}
+
+/// A cross-origin `307` (different port, so a different origin on
+/// `127.0.0.1`) is not followed by default: the target never sees the
+/// request, and the caller fails instead of hanging.
+#[tokio::test]
+async fn cross_origin_redirect_is_not_followed_by_default() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let seen_by_target = Arc::new(AtomicUsize::new(0));
+    let seen_by_target_clone = seen_by_target.clone();
+    let url_target = spawn_raw_server(move |req| {
+        seen_by_target_clone.fetch_add(1, Ordering::SeqCst);
+        raw_initialize_ok(req)
+    })
+    .await;
+
+    let redirect_location = format!("{url_target}/redirected");
+    let url_origin = spawn_raw_server(move |_req| {
+        raw_response(
+            "307 Temporary Redirect",
+            &format!("Location: {redirect_location}\r\n"),
+            "",
+        )
+    })
+    .await;
+
+    let client = McpClient::connect(HttpClientTransport::with_config(
+        url_origin,
+        raw_client_config(),
+    ))
+    .await
+    .unwrap();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.initialize("raw-client", "1.0.0"),
+    )
+    .await
+    .expect("a blocked cross-origin redirect must fail, not hang");
+    let error = result
+        .expect_err("a cross-origin redirect must not be followed by default")
+        .to_string();
+    assert!(
+        error.contains(&format!("{url_target}/redirected")),
+        "the error should name the redirect target, got: {error}"
+    );
+    assert_eq!(
+        seen_by_target.load(Ordering::SeqCst),
+        0,
+        "the redirect target must never receive the request"
+    );
+}
+
+/// With `follow_cross_origin_redirects` set, the same cross-origin `307` is
+/// followed and the request succeeds.
+#[tokio::test]
+async fn cross_origin_redirect_is_followed_when_opted_in() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let seen_by_target = Arc::new(AtomicUsize::new(0));
+    let seen_by_target_clone = seen_by_target.clone();
+    let url_target = spawn_raw_server(move |req| {
+        seen_by_target_clone.fetch_add(1, Ordering::SeqCst);
+        raw_initialize_ok(req)
+    })
+    .await;
+
+    // Only `initialize` is redirected; `notifications/initialized` is
+    // answered directly so the target's request count stays exact.
+    let redirect_location = format!("{url_target}/redirected");
+    let url_origin = spawn_raw_server(move |req| {
+        if raw_is(req, "initialize") {
+            raw_response(
+                "307 Temporary Redirect",
+                &format!("Location: {redirect_location}\r\n"),
+                "",
+            )
+        } else {
+            raw_response("202 Accepted", "", "")
+        }
+    })
+    .await;
+
+    let config = HttpClientConfig {
+        follow_cross_origin_redirects: true,
+        ..raw_client_config()
+    };
+    let client = McpClient::connect(HttpClientTransport::with_config(url_origin, config))
+        .await
+        .unwrap();
+
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        client.initialize("raw-client", "1.0.0"),
+    )
+    .await
+    .expect("an opted-in cross-origin redirect should not hang")
+    .expect("an opted-in cross-origin redirect must be followed");
+
+    assert_eq!(
+        seen_by_target.load(Ordering::SeqCst),
+        1,
+        "the redirect target should have received exactly one request"
+    );
+}
+
+/// The same block applies on the established-session (background task) send
+/// path, not just the pre-session synchronous path: a redirected `tools/list`
+/// fails instead of hanging. Like any other `reqwest::Error` on that path
+/// (network error, timeout, ...), the blocked redirect also marks the
+/// transport disconnected -- that part is unrelated to this fix, just the
+/// existing behavior for a background POST that fails at the `send()` level
+/// rather than with an HTTP-level error.
+#[tokio::test]
+async fn established_session_cross_origin_redirect_fails_without_hanging() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let seen_by_target = Arc::new(AtomicUsize::new(0));
+    let seen_by_target_clone = seen_by_target.clone();
+    let url_target = spawn_raw_server(move |req| {
+        seen_by_target_clone.fetch_add(1, Ordering::SeqCst);
+        raw_initialize_ok(req)
+    })
+    .await;
+
+    let redirect_location = format!("{url_target}/redirected");
+    let url_origin = spawn_raw_server(move |req| {
+        if raw_is(req, "initialize") {
+            raw_initialize_ok(req)
+        } else if raw_is(req, "notifications/initialized") {
+            raw_response("202 Accepted", "", "")
+        } else if raw_is(req, "tools/list") {
+            raw_response(
+                "307 Temporary Redirect",
+                &format!("Location: {redirect_location}\r\n"),
+                "",
+            )
+        } else {
+            let reply = format!(
+                r#"{{"jsonrpc":"2.0","id":{},"result":{{}}}}"#,
+                raw_request_id(req)
+            );
+            raw_response("200 OK", RAW_JSON, &reply)
+        }
+    })
+    .await;
+
+    let client = McpClient::connect(HttpClientTransport::with_config(
+        url_origin,
+        raw_client_config(),
+    ))
+    .await
+    .unwrap();
+    client.initialize("raw-client", "1.0.0").await.unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(3), client.list_tools())
+        .await
+        .expect("a blocked cross-origin redirect must fail, not hang the caller");
+    let error = result
+        .expect_err("a cross-origin redirect must not be followed by default")
+        .to_string();
+    assert!(
+        error.contains(&format!("{url_target}/redirected")),
+        "the error should name the redirect target, got: {error}"
+    );
+    assert_eq!(
+        seen_by_target.load(Ordering::SeqCst),
+        0,
+        "the redirect target must never receive the request"
+    );
+}
