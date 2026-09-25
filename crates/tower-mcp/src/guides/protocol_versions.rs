@@ -129,10 +129,10 @@ fn main() {
 ### Final-only server
 
 ```rust
-# #[cfg(feature = "http")]
+# #[cfg(all(feature = "http", feature = "protocol-2026-07-28"))]
 use tower_mcp::{BoxError, HttpTransport, McpRouter, ProtocolSupport};
 
-# #[cfg(feature = "http")]
+# #[cfg(all(feature = "http", feature = "protocol-2026-07-28"))]
 fn main() -> Result<(), BoxError> {
     let support = ProtocolSupport::try_new(["2026-07-28"])?;
     let transport = HttpTransport::new(McpRouter::new())
@@ -140,17 +140,17 @@ fn main() -> Result<(), BoxError> {
     drop(transport);
     Ok(())
 }
-# #[cfg(not(feature = "http"))]
+# #[cfg(not(all(feature = "http", feature = "protocol-2026-07-28")))]
 # fn main() {}
 ```
 
 ### Explicit dual-era server
 
 ```rust
-# #[cfg(feature = "http")]
+# #[cfg(all(feature = "http", feature = "protocol-2026-07-28"))]
 use tower_mcp::{BoxError, HttpTransport, McpRouter, ProtocolSupport};
 
-# #[cfg(feature = "http")]
+# #[cfg(all(feature = "http", feature = "protocol-2026-07-28"))]
 fn main() -> Result<(), BoxError> {
     let support = ProtocolSupport::try_new([
         "2026-07-28",
@@ -162,7 +162,7 @@ fn main() -> Result<(), BoxError> {
     drop(transport);
     Ok(())
 }
-# #[cfg(not(feature = "http"))]
+# #[cfg(not(all(feature = "http", feature = "protocol-2026-07-28")))]
 # fn main() {}
 ```
 
