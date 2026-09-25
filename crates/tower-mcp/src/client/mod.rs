@@ -3172,6 +3172,16 @@ fn handle_response(
 
     tracing::debug!(id = ?id, "Received response");
 
+    // JSON-RPC 2.0 requires exactly one of `result`/`error`. A frame with
+    // both would otherwise be treated as the server's error response
+    // (`error` is checked first below); reject it as malformed instead.
+    if parsed.get("error").is_some() && parsed.get("result").is_some() {
+        let _ = pending.response_tx.send(Err(Error::Transport(
+            "Response has both result and error".to_string(),
+        )));
+        return;
+    }
+
     if let Some(error) = parsed.get("error") {
         let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-1) as i32;
         let message = error

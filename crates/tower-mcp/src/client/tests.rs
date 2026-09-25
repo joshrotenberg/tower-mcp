@@ -1794,3 +1794,31 @@ async fn test_non_numeric_string_id_does_not_correlate() {
 
     assert_eq!(pending.len(), 1, "numeric request should stay pending");
 }
+
+#[tokio::test]
+async fn test_response_with_both_result_and_error_fails_as_malformed() {
+    // JSON-RPC 2.0 requires exactly one of `result`/`error`. `error` is
+    // checked first below, so without the #1481 guard this would resolve
+    // as the server's error response instead of failing the call outright.
+    let (mut pending, mut rxs) = pending_with(&[RequestId::Number(1)]);
+
+    let response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {"ok": true},
+        "error": {"code": -32603, "message": "x"}
+    });
+    handle_response(&response, &mut pending);
+
+    assert!(pending.is_empty(), "pending request should be resolved");
+    let result = rxs.remove(0).await.unwrap();
+    match result {
+        Err(Error::Transport(msg)) => {
+            assert!(
+                msg.contains("both result and error"),
+                "unexpected message: {msg}"
+            );
+        }
+        other => panic!("expected Error::Transport, got: {other:?}"),
+    }
+}

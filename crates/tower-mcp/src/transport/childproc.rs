@@ -240,9 +240,25 @@ impl ChildProcessConnection {
                 continue;
             }
 
-            let response: JsonRpcResponse = match serde_json::from_value(value) {
+            let response: JsonRpcResponse = match serde_json::from_value(value.clone()) {
                 Ok(response) => response,
                 Err(e) => {
+                    // A malformed response body (e.g. both `result` and
+                    // `error`, rejected by `JsonRpcResponse`'s `Deserialize`)
+                    // is fatal for whichever request it was replying to: the
+                    // child will not resend it, so silently discarding it
+                    // would leave the caller waiting forever. If the frame
+                    // carries the id we are waiting on, fail this call now
+                    // instead of looping for a response that isn't coming.
+                    let response_id = value
+                        .get("id")
+                        .cloned()
+                        .and_then(|v| serde_json::from_value::<RequestId>(v).ok());
+                    if response_id.as_ref() == Some(id) {
+                        return Err(Error::Transport(format!(
+                            "invalid response from child: {e}"
+                        )));
+                    }
                     tracing::warn!(error = %e, "failed to parse response from child, discarding it");
                     continue;
                 }
@@ -465,6 +481,34 @@ mod tests {
             .unwrap();
 
         assert_eq!(response, serde_json::json!({"echoed": true}));
+    }
+
+    #[tokio::test]
+    async fn test_response_with_both_result_and_error_is_rejected() {
+        // A peer that replies with both `result` and `error` violates
+        // JSON-RPC 2.0. It must surface as an error to the caller -- not a
+        // panic, and not a hang waiting for a response that will never come
+        // (#1481).
+        let mut conn = ChildProcessTransport::new("sh")
+            .arg("-c")
+            .arg(
+                r#"read -r _line; printf '{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":-32603,"message":"x"}}\n'"#,
+            )
+            .spawn()
+            .await
+            .unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            conn.send_request("echo", serde_json::json!({"msg": "hello"})),
+        )
+        .await
+        .expect("send_request should not hang");
+
+        assert!(
+            result.is_err(),
+            "expected an error for a response with both result and error, got: {result:?}"
+        );
     }
 
     #[tokio::test]

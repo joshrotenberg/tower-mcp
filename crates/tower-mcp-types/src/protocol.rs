@@ -360,7 +360,7 @@ pub struct JsonRpcErrorResponse {
 }
 
 /// JSON-RPC 2.0 response (either success or error).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 #[non_exhaustive]
 pub enum JsonRpcResponse {
@@ -368,6 +368,40 @@ pub enum JsonRpcResponse {
     Result(JsonRpcResultResponse),
     /// Error response.
     Error(JsonRpcErrorResponse),
+}
+
+impl<'de> Deserialize<'de> for JsonRpcResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // A derived `#[serde(untagged)]` impl tries `Result` first, so a
+        // frame carrying both `result` and `error` would decode as `Result`
+        // and silently drop the error. JSON-RPC 2.0 requires exactly one of
+        // the two, so classify on the object shape before decoding either
+        // variant. Wording matches the equivalent check in `inspection.rs`.
+        let value = Value::deserialize(deserializer)?;
+        let has_result = value.get("result").is_some();
+        let has_error = value.get("error").is_some();
+        if has_result && has_error {
+            return Err(serde::de::Error::custom(
+                "JSON-RPC response has both result and error",
+            ));
+        }
+        if !has_result && !has_error {
+            return Err(serde::de::Error::custom(
+                "JSON-RPC response has neither result nor error",
+            ));
+        }
+        if has_result {
+            return serde_json::from_value(value)
+                .map(JsonRpcResponse::Result)
+                .map_err(serde::de::Error::custom);
+        }
+        serde_json::from_value(value)
+            .map(JsonRpcResponse::Error)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 impl JsonRpcResponse {
@@ -6339,6 +6373,83 @@ mod tests {
             JsonRpcResponse::Error(e) => assert!(e.id.is_none()),
             _ => panic!("expected Error variant"),
         }
+    }
+
+    #[test]
+    fn response_rejects_both_result_and_error() {
+        // A derived `#[serde(untagged)]` impl would try `Result` first and
+        // silently drop `error`. The manual `Deserialize` must reject this
+        // frame outright instead of picking a variant.
+        let wire = r#"{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":-32603,"message":"x"}}"#;
+        let err = serde_json::from_str::<JsonRpcResponse>(wire).unwrap_err();
+        assert!(
+            err.to_string().contains("both result and error"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn response_rejects_neither_result_nor_error() {
+        let wire = r#"{"jsonrpc":"2.0","id":1}"#;
+        let err = serde_json::from_str::<JsonRpcResponse>(wire).unwrap_err();
+        assert!(
+            err.to_string().contains("neither result nor error"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn response_still_decodes_result_only() {
+        let wire = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+        let resp: JsonRpcResponse = serde_json::from_str(wire).unwrap();
+        match resp {
+            JsonRpcResponse::Result(r) => assert_eq!(r.result, serde_json::json!({"ok": true})),
+            JsonRpcResponse::Error(_) => panic!("expected Result variant"),
+        }
+    }
+
+    #[test]
+    fn response_still_decodes_error_only() {
+        let wire = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"x"}}"#;
+        let resp: JsonRpcResponse = serde_json::from_str(wire).unwrap();
+        match resp {
+            JsonRpcResponse::Error(e) => assert_eq!(e.error.code, -32603),
+            JsonRpcResponse::Result(_) => panic!("expected Error variant"),
+        }
+    }
+
+    #[test]
+    fn response_round_trip_unchanged() {
+        let result = JsonRpcResponse::result(RequestId::Number(1), serde_json::json!({"a": 1}));
+        let wire = serde_json::to_string(&result).unwrap();
+        let back: JsonRpcResponse = serde_json::from_str(&wire).unwrap();
+        assert_eq!(
+            serde_json::to_value(&result).unwrap(),
+            serde_json::to_value(&back).unwrap()
+        );
+
+        let error =
+            JsonRpcResponse::error(Some(RequestId::Number(2)), JsonRpcError::parse_error("bad"));
+        let wire = serde_json::to_string(&error).unwrap();
+        let back: JsonRpcResponse = serde_json::from_str(&wire).unwrap();
+        assert_eq!(
+            serde_json::to_value(&error).unwrap(),
+            serde_json::to_value(&back).unwrap()
+        );
+    }
+
+    #[test]
+    fn response_message_does_not_reinterpret_both_fields_frame() {
+        // `JsonRpcResponseMessage` is `Single(JsonRpcResponse) |
+        // Batch(Vec<JsonRpcResponse>)`, also `#[serde(untagged)]`. A
+        // both-fields frame must fail to decode as either arm rather than
+        // being silently reinterpreted (e.g. as an empty/odd batch).
+        let wire = r#"{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":-32603,"message":"x"}}"#;
+        let result = serde_json::from_str::<JsonRpcResponseMessage>(wire);
+        assert!(
+            result.is_err(),
+            "expected a both-fields frame to be rejected, got: {result:?}"
+        );
     }
 
     #[test]
