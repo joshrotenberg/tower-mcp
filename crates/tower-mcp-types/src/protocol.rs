@@ -380,27 +380,31 @@ impl<'de> Deserialize<'de> for JsonRpcResponse {
         // and silently drop the error. JSON-RPC 2.0 requires exactly one of
         // the two, so classify on the object shape before decoding either
         // variant. Wording matches the equivalent check in `inspection.rs`.
+        //
+        // An explicit `null` counts as absent: JSON-RPC 1.0-style peers send
+        // `"result": null` beside a real error (or `"error": null` beside a
+        // result), and those frames are unambiguous.
         let value = Value::deserialize(deserializer)?;
-        let has_result = value.get("result").is_some();
-        let has_error = value.get("error").is_some();
-        if has_result && has_error {
+        let has_error = value.get("error").is_some_and(|error| !error.is_null());
+        let has_result_value = value.get("result").is_some_and(|result| !result.is_null());
+        if has_error && has_result_value {
             return Err(serde::de::Error::custom(
                 "JSON-RPC response has both result and error",
             ));
         }
-        if !has_result && !has_error {
-            return Err(serde::de::Error::custom(
-                "JSON-RPC response has neither result nor error",
-            ));
+        if has_error {
+            return serde_json::from_value(value)
+                .map(JsonRpcResponse::Error)
+                .map_err(serde::de::Error::custom);
         }
-        if has_result {
+        if value.get("result").is_some() {
             return serde_json::from_value(value)
                 .map(JsonRpcResponse::Result)
                 .map_err(serde::de::Error::custom);
         }
-        serde_json::from_value(value)
-            .map(JsonRpcResponse::Error)
-            .map_err(serde::de::Error::custom)
+        Err(serde::de::Error::custom(
+            "JSON-RPC response has neither result nor error",
+        ))
     }
 }
 
@@ -6386,6 +6390,22 @@ mod tests {
             err.to_string().contains("both result and error"),
             "unexpected error message: {err}"
         );
+    }
+
+    #[test]
+    fn response_treats_an_explicit_null_as_absent() {
+        // JSON-RPC 1.0-style peers pair a real value with a null sibling.
+        let wire =
+            r#"{"jsonrpc":"2.0","id":1,"result":null,"error":{"code":-32603,"message":"x"}}"#;
+        assert!(matches!(
+            serde_json::from_str::<JsonRpcResponse>(wire).unwrap(),
+            JsonRpcResponse::Error(_)
+        ));
+        let wire = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true},"error":null}"#;
+        assert!(matches!(
+            serde_json::from_str::<JsonRpcResponse>(wire).unwrap(),
+            JsonRpcResponse::Result(_)
+        ));
     }
 
     #[test]

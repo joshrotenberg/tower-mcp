@@ -3174,15 +3174,17 @@ fn handle_response(
 
     // JSON-RPC 2.0 requires exactly one of `result`/`error`. A frame with
     // both would otherwise be treated as the server's error response
-    // (`error` is checked first below); reject it as malformed instead.
-    if parsed.get("error").is_some() && parsed.get("result").is_some() {
+    // (`error` is checked first below); reject it as malformed instead. An
+    // explicit `null` counts as absent, matching `JsonRpcResponse`.
+    let error = parsed.get("error").filter(|error| !error.is_null());
+    if error.is_some() && parsed.get("result").is_some_and(|result| !result.is_null()) {
         let _ = pending.response_tx.send(Err(Error::Transport(
             "Response has both result and error".to_string(),
         )));
         return;
     }
 
-    if let Some(error) = parsed.get("error") {
+    if let Some(error) = error {
         let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-1) as i32;
         let message = error
             .get("message")
