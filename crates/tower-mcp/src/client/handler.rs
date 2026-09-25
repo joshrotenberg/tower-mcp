@@ -64,6 +64,36 @@ use crate::protocol::{
 use crate::tasks::TaskStatusNotificationParams;
 use tower_mcp_types::JsonRpcError;
 
+tokio::task_local! {
+    /// Cancellation token for whichever server-initiated request the
+    /// current task is dispatching, if any.
+    ///
+    /// Scoped by [`scoped_cancellation`] around each spawned
+    /// `dispatch_server_request` call in the client's message loop, so
+    /// concurrent server-initiated requests each see only their own
+    /// token through [`ClientHandler::current_cancellation_token`].
+    static CURRENT_CANCELLATION: crate::context::CancellationToken;
+}
+
+/// Runs `fut` with `token` available to
+/// [`ClientHandler::current_cancellation_token`].
+///
+/// Internal to the client's message loop (#1483). Each server-initiated
+/// request (`sampling/createMessage`, `elicitation/create`, `roots/list`)
+/// runs on its own task so a `notifications/cancelled` for it can be acted
+/// on without waiting for the handler to return; this scopes that task's
+/// [`CancellationToken`](crate::context::CancellationToken) to the
+/// duration of the handler call so the handler can observe it.
+pub(crate) async fn scoped_cancellation<F>(
+    token: crate::context::CancellationToken,
+    fut: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    CURRENT_CANCELLATION.scope(token, fut).await
+}
+
 /// Notification sent from the server to the client.
 ///
 /// These correspond to the `notifications/` methods defined in the MCP spec
@@ -127,6 +157,15 @@ pub enum ServerNotification {
 /// implementations that either return sensible defaults or reject with
 /// `method_not_found`.
 ///
+/// Each server-initiated request runs on its own task, so a handler that
+/// calls back into the same [`McpClient`](super::McpClient) (for example,
+/// listing tools while answering an elicitation) does not deadlock the
+/// message loop that is waiting to send its reply. If the server sends
+/// `notifications/cancelled` for a request before the handler returns, no
+/// reply is sent for it; call
+/// [`current_cancellation_token()`](Self::current_cancellation_token) from
+/// within the handler to observe that and stop early (#1483).
+///
 /// The unit type `()` implements this trait with all defaults, which is
 /// used by [`McpClient::connect()`](super::McpClient::connect).
 #[async_trait]
@@ -177,6 +216,37 @@ pub trait ClientHandler: Send + Sync + 'static {
     ///
     /// Default: no-op.
     async fn on_notification(&self, _notification: ServerNotification) {}
+
+    /// The [`CancellationToken`](crate::context::CancellationToken) for the
+    /// server-initiated request this handler is currently processing.
+    ///
+    /// The client runs each server-initiated request
+    /// (`sampling/createMessage`, `elicitation/create`, `roots/list`) on its
+    /// own task with its own token, and cancels that token if a matching
+    /// `notifications/cancelled` arrives from the server before the handler
+    /// returns (#1483). Call this from within [`handle_create_message`],
+    /// [`handle_elicit`], or [`handle_list_roots`] and race it against
+    /// whatever the handler is waiting on -- a `tokio::select!` against
+    /// [`cancelled()`](crate::context::CancellationToken::cancelled) is the
+    /// usual shape -- to stop early instead of running to completion after
+    /// the server has stopped waiting. No reply is sent for a cancelled
+    /// request regardless of whether the handler checks this.
+    ///
+    /// This is a new default-implemented method rather than a change to
+    /// the signatures above, so existing implementations of this trait
+    /// keep compiling unchanged; only handlers that want to react to
+    /// cancellation need to call it.
+    ///
+    /// Returns `None` outside of those three calls, for example from
+    /// [`on_notification`](Self::on_notification), or if the handler moved
+    /// the work onto a task of its own rather than awaiting it in place.
+    ///
+    /// [`handle_create_message`]: Self::handle_create_message
+    /// [`handle_elicit`]: Self::handle_elicit
+    /// [`handle_list_roots`]: Self::handle_list_roots
+    fn current_cancellation_token(&self) -> Option<crate::context::CancellationToken> {
+        CURRENT_CANCELLATION.try_with(Clone::clone).ok()
+    }
 }
 
 /// Unit type implements [`ClientHandler`] with all defaults.
@@ -196,7 +266,8 @@ type SimpleCallback = Box<dyn Fn() + Send + Sync>;
 /// Provides typed callback registration for each notification type,
 /// without requiring a full [`ClientHandler`] trait implementation.
 /// Server-initiated requests (sampling, elicitation, roots) are
-/// rejected with `method_not_found`.
+/// rejected with `method_not_found` immediately, so there is nothing
+/// in flight for a `notifications/cancelled` to interrupt.
 ///
 /// # Example
 ///

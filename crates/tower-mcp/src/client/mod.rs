@@ -2722,6 +2722,27 @@ struct PendingRequest {
     acknowledgment_tx: Option<oneshot::Sender<SubscriptionFilter>>,
 }
 
+/// Outcome of a server-initiated request run on its own task (#1483),
+/// relayed back to the message loop so it -- the sole owner of the
+/// transport -- can send the reply.
+struct ServerRequestOutcome {
+    /// The server's original request id.
+    id: RequestId,
+    /// `None` when the request was cancelled: JSON-RPC forbids answering a
+    /// cancelled request, so the loop sends nothing for this id.
+    response: Option<serde_json::Value>,
+}
+
+/// Bundles the message loop's two id-keyed maps into one
+/// [`handle_incoming`] argument. #1483 added
+/// `pending_server_requests` alongside the existing `pending_requests`,
+/// which would otherwise push that function past clippy's
+/// `too_many_arguments` limit.
+struct PendingState<'a> {
+    pending_requests: &'a mut HashMap<RequestId, PendingRequest>,
+    pending_server_requests: &'a mut HashMap<RequestId, crate::context::CancellationToken>,
+}
+
 /// Background message loop that multiplexes incoming/outgoing messages.
 async fn message_loop<T: ClientTransport, H: ClientHandler>(
     mut transport: T,
@@ -2734,6 +2755,14 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
 ) {
     let handler = Arc::new(handler);
     let mut pending_requests: HashMap<RequestId, PendingRequest> = HashMap::new();
+    // Cancellation tokens for server-initiated requests running on their
+    // own tasks, keyed by the server's request id (#1483). Populated by
+    // handle_incoming when the request arrives, cancelled from here when a
+    // matching notifications/cancelled arrives, and removed once the
+    // task's outcome comes back over server_request_tx.
+    let mut pending_server_requests: HashMap<RequestId, crate::context::CancellationToken> =
+        HashMap::new();
+    let (server_request_tx, mut server_request_rx) = mpsc::channel::<ServerRequestOutcome>(32);
 
     loop {
         tokio::select! {
@@ -2881,11 +2910,15 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
                     Ok(Some(line)) => {
                         handle_incoming(
                             &line,
-                            &mut pending_requests,
+                            PendingState {
+                                pending_requests: &mut pending_requests,
+                                pending_server_requests: &mut pending_server_requests,
+                            },
                             &handler,
                             &roots,
                             &mut transport,
                             &response_cache,
+                            &server_request_tx,
                         ).await;
                     }
                     Ok(None) => {
@@ -2898,12 +2931,33 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
                     }
                 }
             }
+
+            // A server-initiated request's task finished or was cancelled
+            // (#1483). The loop is the sole owner of the transport, so the
+            // task hands its outcome back here instead of writing to it
+            // directly; a cancelled request carries no response.
+            Some(outcome) = server_request_rx.recv() => {
+                pending_server_requests.remove(&outcome.id);
+                if let Some(response) = outcome.response
+                    && let Ok(json) = serde_json::to_string(&response)
+                    && let Err(e) = transport.send(&json).await
+                {
+                    tracing::error!(error = %e, "Transport send error");
+                    fail_all_pending(&mut pending_requests, &format!("Transport error: {}", e));
+                    break;
+                }
+            }
         }
     }
 
     // Cleanup
     connected.store(false, Ordering::Release);
     fail_all_pending(&mut pending_requests, "Connection closed");
+    // Stop any server-initiated request tasks still running; their reply
+    // would have nowhere to go now that the loop is exiting.
+    for (_, token) in pending_server_requests.drain() {
+        token.cancel();
+    }
     let _ = transport.close().await;
 }
 
@@ -2953,12 +3007,18 @@ async fn resolve_inputs_with_handler<H: ClientHandler>(
 /// Handle a single incoming message from the server.
 async fn handle_incoming<T: ClientTransport, H: ClientHandler>(
     line: &str,
-    pending_requests: &mut HashMap<RequestId, PendingRequest>,
+    state: PendingState<'_>,
     handler: &Arc<H>,
     roots: &Arc<RwLock<Vec<Root>>>,
     transport: &mut T,
     response_cache: &Arc<ClientResponseCache>,
+    server_request_tx: &mpsc::Sender<ServerRequestOutcome>,
 ) {
+    let PendingState {
+        pending_requests,
+        pending_server_requests,
+    } = state;
+
     let parsed: serde_json::Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(e) => {
@@ -2992,39 +3052,72 @@ async fn handle_incoming<T: ClientTransport, H: ClientHandler>(
     // Case 2: Server-initiated request (has id + method)
     if parsed.get("id").is_some() && parsed.get("method").is_some() {
         let id = parse_request_id(&parsed);
-        let method = parsed["method"].as_str().unwrap_or("");
+        let method = parsed["method"].as_str().unwrap_or("").to_string();
         let params = parsed.get("params").cloned();
 
-        let result = dispatch_server_request(handler, roots, method, params).await;
-
-        // Send response back to the server
-        let response = match result {
-            Ok(value) => {
-                if let Some(id) = id {
-                    serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": value
-                    })
-                } else {
-                    return;
-                }
-            }
-            Err(error) => {
-                serde_json::json!({
+        // Without a parseable id there is nothing to key cancellation
+        // bookkeeping on, and (matching the pre-existing success-path
+        // behavior) no reply is possible either; run it inline rather
+        // than spawn a task nothing could ever be cancelled or answered
+        // for.
+        let Some(id) = id else {
+            if let Err(error) = dispatch_server_request(handler, roots, &method, params).await {
+                let response = serde_json::json!({
                     "jsonrpc": "2.0",
-                    "id": id,
+                    "id": null,
                     "error": {
                         "code": error.code,
                         "message": error.message
                     }
-                })
+                });
+                if let Ok(json) = serde_json::to_string(&response) {
+                    let _ = transport.send(&json).await;
+                }
             }
+            return;
         };
 
-        if let Ok(json) = serde_json::to_string(&response) {
-            let _ = transport.send(&json).await;
-        }
+        // Run on its own task, with its own CancellationToken, instead of
+        // awaiting the handler inline: a notifications/cancelled for this
+        // id needs to reach it before the handler returns, and a
+        // ClientHandler that calls back into this same McpClient would
+        // otherwise deadlock the message loop that is supposed to answer
+        // it (#1483). Cancellation is cooperative, matching
+        // CancellationToken's use everywhere else in this crate: the
+        // token is exposed to the handler via
+        // `ClientHandler::current_cancellation_token` for it to check or
+        // await, and separately, once the handler returns, its result is
+        // discarded and no reply is sent if the token ended up cancelled
+        // -- so a handler that never looks at the token still never
+        // answers a request the server gave up on. The reply itself goes
+        // out through the transport the loop owns, relayed over
+        // `server_request_tx`.
+        let token = crate::context::CancellationToken::new();
+        pending_server_requests.insert(id.clone(), token.clone());
+
+        let task_handler = Arc::clone(handler);
+        let task_roots = Arc::clone(roots);
+        let reply_tx = server_request_tx.clone();
+        let task_id = id.clone();
+        let task_token = token.clone();
+        tokio::spawn(async move {
+            let result = handler::scoped_cancellation(
+                task_token.clone(),
+                dispatch_server_request(&task_handler, &task_roots, &method, params),
+            )
+            .await;
+            let response = if task_token.is_cancelled() {
+                None
+            } else {
+                Some(server_request_response(&task_id, result))
+            };
+            let _ = reply_tx
+                .send(ServerRequestOutcome {
+                    id: task_id,
+                    response,
+                })
+                .await;
+        });
         return;
     }
 
@@ -3034,6 +3127,26 @@ async fn handle_incoming<T: ClientTransport, H: ClientHandler>(
         let params = parsed.get("params").cloned();
         invalidate_response_cache(response_cache, method, params.as_ref()).await;
         let notification = parse_server_notification(method, params);
+
+        // A notifications/cancelled might target a server-initiated
+        // request this client is currently answering (sampling,
+        // elicitation, roots, ping) rather than one of our own
+        // subscriptions -- the wire shape is identical, so
+        // parse_server_notification can't tell them apart. Check the
+        // exact id first and hand off to that task without falling
+        // through to the subscription-matching logic below, which owns a
+        // separate id space. Exact HashMap lookup, not
+        // matching_subscription_id's request_ids_match fallback: JSON-RPC
+        // treats "1" and 1 as different ids (#1483).
+        if let ServerNotification::SubscriptionCancelled {
+            subscription_id, ..
+        } = &notification
+            && let Some(token) = pending_server_requests.get(subscription_id)
+        {
+            token.cancel();
+            return;
+        }
+
         let should_dispatch = match &notification {
             ServerNotification::SubscriptionAcknowledged {
                 subscription_id,
@@ -3258,6 +3371,28 @@ fn handle_response(
         let _ = pending
             .response_tx
             .send(Err(Error::Transport("Invalid response".to_string())));
+    }
+}
+
+/// Build the JSON-RPC reply for a server-initiated request's outcome.
+fn server_request_response(
+    id: &RequestId,
+    result: std::result::Result<serde_json::Value, JsonRpcError>,
+) -> serde_json::Value {
+    match result {
+        Ok(value) => serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": value
+        }),
+        Err(error) => serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": error.code,
+                "message": error.message
+            }
+        }),
     }
 }
 

@@ -1590,6 +1590,317 @@ async fn test_bidirectional_sampling_round_trip() {
     );
 }
 
+// =========================================================================
+// Server-initiated request cancellation (#1483)
+// =========================================================================
+
+#[tokio::test]
+async fn cancelled_server_request_gets_no_reply_and_the_handler_observes_it() {
+    use crate::protocol::{ElicitRequestParams, ElicitResult};
+
+    // Waits on its own CancellationToken instead of completing on its
+    // own, so the test proves the reply is suppressed rather than merely
+    // winning a race against a fast handler.
+    struct WaitingHandler {
+        started: Arc<tokio::sync::Notify>,
+        saw_cancel: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ClientHandler for WaitingHandler {
+        async fn handle_elicit(
+            &self,
+            _params: ElicitRequestParams,
+        ) -> std::result::Result<ElicitResult, JsonRpcError> {
+            self.started.notify_one();
+            let token = self
+                .current_cancellation_token()
+                .expect("token available while handling elicitation/create");
+            token.cancelled().await;
+            self.saw_cancel.store(true, Ordering::SeqCst);
+            Err(JsonRpcError::internal_error("cancelled"))
+        }
+    }
+
+    let started = Arc::new(tokio::sync::Notify::new());
+    let saw_cancel = Arc::new(AtomicBool::new(false));
+    let handler = WaitingHandler {
+        started: started.clone(),
+        saw_cancel: saw_cancel.clone(),
+    };
+
+    let (inject_tx, rx) = mpsc::channel::<String>(32);
+    let outgoing = Arc::new(Mutex::new(Vec::new()));
+    let transport = MockTransport {
+        responses: Arc::new(Mutex::new(vec![MockReply::Result(
+            mock_initialize_response(),
+        )])),
+        response_idx: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        incoming_tx: inject_tx.clone(),
+        incoming_rx: rx,
+        outgoing: outgoing.clone(),
+        connected: Arc::new(AtomicBool::new(true)),
+        fail_notification_sends: Arc::new(AtomicBool::new(false)),
+    };
+
+    let client = McpClient::builder()
+        .with_elicitation()
+        .connect(transport, handler)
+        .await
+        .unwrap();
+    client.initialize("test-client", "1.0.0").await.unwrap();
+
+    inject_tx
+        .send(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 100,
+                "method": "elicitation/create",
+                "params": {
+                    "message": "need input",
+                    "requestedSchema": {"type": "object", "properties": {}, "required": []}
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+        .await
+        .expect("handler should have started");
+
+    inject_tx
+        .send(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": 100}
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !saw_cancel.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("handler should have observed cancellation via current_cancellation_token()");
+
+    // Give the outcome time to reach the loop and (if it were going to)
+    // get written to the transport.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let sent = outgoing.lock().unwrap().clone();
+    assert!(
+        !sent.iter().any(|msg| {
+            serde_json::from_str::<serde_json::Value>(msg)
+                .ok()
+                .and_then(|value| value.get("id").cloned())
+                == Some(serde_json::json!(100))
+        }),
+        "a reply for the cancelled request must not be sent: {sent:?}"
+    );
+}
+
+#[tokio::test]
+async fn client_handler_can_call_back_into_the_client_without_deadlocking() {
+    // Before #1483, the message loop awaited a server-initiated request's
+    // handler inline, so a handler that called back into the same client
+    // (e.g. `ping()`) would deadlock: the reentrant call's own response
+    // could never reach the loop that was blocked waiting on the handler.
+    struct ReentrantHandler {
+        client: Arc<tokio::sync::OnceCell<McpClient>>,
+        completed: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ClientHandler for ReentrantHandler {
+        async fn handle_list_roots(&self) -> std::result::Result<ListRootsResult, JsonRpcError> {
+            let client = self
+                .client
+                .get()
+                .expect("client set before the server request arrives");
+            client
+                .ping()
+                .await
+                .map_err(|error| JsonRpcError::internal_error(error.to_string()))?;
+            self.completed.store(true, Ordering::SeqCst);
+            Ok(ListRootsResult {
+                roots: vec![],
+                meta: None,
+            })
+        }
+    }
+
+    let client_cell = Arc::new(tokio::sync::OnceCell::new());
+    let completed = Arc::new(AtomicBool::new(false));
+    let handler = ReentrantHandler {
+        client: client_cell.clone(),
+        completed: completed.clone(),
+    };
+
+    let (inject_tx, rx) = mpsc::channel::<String>(32);
+    let transport = MockTransport {
+        responses: Arc::new(Mutex::new(vec![
+            MockReply::Result(mock_initialize_response()),
+            MockReply::Result(serde_json::json!({})),
+        ])),
+        response_idx: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        incoming_tx: inject_tx.clone(),
+        incoming_rx: rx,
+        outgoing: Arc::new(Mutex::new(Vec::new())),
+        connected: Arc::new(AtomicBool::new(true)),
+        fail_notification_sends: Arc::new(AtomicBool::new(false)),
+    };
+
+    let client = McpClient::builder()
+        .connect(transport, handler)
+        .await
+        .unwrap();
+    client.initialize("test-client", "1.0.0").await.unwrap();
+    client_cell
+        .set(client)
+        .unwrap_or_else(|_| panic!("client cell is set exactly once"));
+
+    inject_tx
+        .send(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 200,
+                "method": "roots/list"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !completed.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("reentrant call should complete without deadlocking the message loop");
+}
+
+#[tokio::test]
+async fn cancellation_id_matching_is_exact_not_stringified() {
+    // A cancellation whose requestId is the string "1" must not cancel a
+    // server request with numeric id 1: JSON-RPC treats them as distinct
+    // ids, unlike the deliberately lenient fallback response correlation
+    // uses (rmcp-compat note in handle_response).
+    struct WaitingHandler {
+        started: Arc<tokio::sync::Notify>,
+        finished: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ClientHandler for WaitingHandler {
+        async fn handle_list_roots(&self) -> std::result::Result<ListRootsResult, JsonRpcError> {
+            self.started.notify_one();
+            // Give a wrongly-matched cancellation a chance to land before
+            // this returns.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let cancelled = self
+                .current_cancellation_token()
+                .map(|token| token.is_cancelled())
+                .unwrap_or(false);
+            self.finished.store(true, Ordering::SeqCst);
+            if cancelled {
+                Err(JsonRpcError::internal_error(
+                    "wrongly cancelled by a stringified id",
+                ))
+            } else {
+                Ok(ListRootsResult {
+                    roots: vec![],
+                    meta: None,
+                })
+            }
+        }
+    }
+
+    let started = Arc::new(tokio::sync::Notify::new());
+    let finished = Arc::new(AtomicBool::new(false));
+    let handler = WaitingHandler {
+        started: started.clone(),
+        finished: finished.clone(),
+    };
+
+    let (inject_tx, rx) = mpsc::channel::<String>(32);
+    let outgoing = Arc::new(Mutex::new(Vec::new()));
+    let transport = MockTransport {
+        responses: Arc::new(Mutex::new(vec![MockReply::Result(
+            mock_initialize_response(),
+        )])),
+        response_idx: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        incoming_tx: inject_tx.clone(),
+        incoming_rx: rx,
+        outgoing: outgoing.clone(),
+        connected: Arc::new(AtomicBool::new(true)),
+        fail_notification_sends: Arc::new(AtomicBool::new(false)),
+    };
+
+    let client = McpClient::builder()
+        .connect(transport, handler)
+        .await
+        .unwrap();
+    client.initialize("test-client", "1.0.0").await.unwrap();
+
+    // Server request with numeric id 1.
+    inject_tx
+        .send(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "roots/list"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+        .await
+        .expect("handler should have started");
+
+    // A cancellation for the *string* id "1" must not match it.
+    inject_tx
+        .send(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": "1"}
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !finished.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("handler should finish on its own");
+
+    // Give the reply time to reach the transport.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let sent = outgoing.lock().unwrap().clone();
+    assert!(
+        sent.iter().any(|msg| {
+            let value: serde_json::Value = serde_json::from_str(msg).unwrap();
+            value.get("id") == Some(&serde_json::json!(1)) && value.get("result").is_some()
+        }),
+        "the reply for numeric id 1 should still be sent: {sent:?}"
+    );
+}
+
 #[tokio::test]
 async fn test_list_resource_templates() {
     let client = McpClient::connect(MockTransport::with_responses(vec![
