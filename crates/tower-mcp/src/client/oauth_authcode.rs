@@ -287,16 +287,45 @@ async fn fetch_json<T: serde::de::DeserializeOwned>(
     client: &reqwest::Client,
     url: &str,
 ) -> Result<T, OAuthClientError> {
-    client
+    let response = client
         .get(url)
         .send()
         .await
-        .map_err(|error| OAuthClientError::Discovery(error.to_string()))?
+        .map_err(|error| OAuthClientError::Discovery(error.to_string()))?;
+
+    // `error_for_status` only rejects 4xx/5xx, so a redirect-averse client
+    // (`Policy::none()`) surfaces a 3xx here rather than an error. Report it
+    // explicitly instead of letting `.json()` fail on a body that typically
+    // has none, which would read as a confusing parse error.
+    if response.status().is_redirection() {
+        return Err(OAuthClientError::Discovery(redirect_error_detail(
+            "discovery request",
+            &response,
+        )));
+    }
+
+    response
         .error_for_status()
         .map_err(|error| OAuthClientError::Discovery(error.to_string()))?
         .json()
         .await
         .map_err(|error| OAuthClientError::Discovery(error.to_string()))
+}
+
+/// Describe a redirect response for an error message: its status and, when
+/// present, the `Location` it points to.
+pub(crate) fn redirect_error_detail(context: &str, response: &reqwest::Response) -> String {
+    let status = response.status();
+    match response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(location) => format!(
+            "{context} received a redirect ({status}) to `{location}`; redirects are not followed"
+        ),
+        None => format!("{context} received a redirect ({status}) with no Location header"),
+    }
 }
 
 fn protected_resource_metadata_urls(server_url: &str) -> Result<Vec<String>, OAuthClientError> {

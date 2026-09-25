@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use super::oauth_authcode::discover_oauth_authorization;
+use super::oauth_authcode::{discover_oauth_authorization, redirect_error_detail};
 
 /// Trait for dynamic token providers.
 ///
@@ -578,6 +578,21 @@ impl fmt::Debug for OAuthClientCredentials {
     }
 }
 
+/// Build the default client used for discovery and token requests.
+///
+/// With `ClientSecretPost`, the client secret travels in the POST form body,
+/// which reqwest re-sends on a 307/308 redirect regardless of origin. Disable
+/// redirect following so a token endpoint (or something in front of it) can
+/// never receive the secret this way; a 3xx response is instead surfaced as a
+/// clear error. This matches `ReqwestOAuthHttpClient::without_redirects` used
+/// by `OAuthAuthorizationFlow`.
+fn redirect_free_client() -> Result<reqwest::Client, OAuthClientError> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| OAuthClientError::Http(error.to_string()))
+}
+
 impl OAuthClientCredentials {
     /// Create a builder for configuring the client credentials provider.
     pub fn builder() -> OAuthClientCredentialsBuilder {
@@ -599,7 +614,7 @@ impl OAuthClientCredentials {
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
     ) -> Result<Self, OAuthClientError> {
-        let client = reqwest::Client::new();
+        let client = redirect_free_client()?;
         let discovery = discover_oauth_authorization(resource_url, None, &client).await?;
         let metadata = discovery.authorization_servers.first().ok_or_else(|| {
             OAuthClientError::Discovery("no authorization server discovered".into())
@@ -664,6 +679,18 @@ impl OAuthClientCredentials {
             .send()
             .await
             .map_err(|e| OAuthClientError::TokenRequest(e.to_string()))?;
+
+        // The client does not follow redirects (see `redirect_free_client`),
+        // so a 3xx here is the token endpoint's own response, not a body to
+        // parse as a token. Report it explicitly, including the status and
+        // `Location`, rather than falling through to a JSON error that would
+        // not say a redirect happened.
+        if response.status().is_redirection() {
+            return Err(OAuthClientError::TokenRequest(redirect_error_detail(
+                "token request",
+                &response,
+            )));
+        }
 
         if !response.status().is_success() {
             let status = response.status();
@@ -821,7 +848,12 @@ impl OAuthClientCredentialsBuilder {
 
     /// Set a custom `reqwest::Client` for token requests.
     ///
-    /// Use this when you need custom TLS configuration or proxy settings.
+    /// Use this when you need custom TLS configuration or proxy settings. The
+    /// default client does not follow redirects, since `ClientSecretPost`
+    /// puts the client secret in the request body and reqwest re-sends that
+    /// body on a 307/308 regardless of origin. A client supplied here keeps
+    /// whatever redirect policy it was built with; this builder does not
+    /// change it.
     pub fn http_client(mut self, client: reqwest::Client) -> Self {
         self.client = Some(client);
         self
@@ -857,7 +889,10 @@ impl OAuthClientCredentialsBuilder {
             resource,
             scopes: self.scopes,
             refresh_buffer: self.refresh_buffer.unwrap_or(Duration::from_secs(30)),
-            client: self.client.unwrap_or_default(),
+            client: match self.client {
+                Some(client) => client,
+                None => redirect_free_client()?,
+            },
             cache: RwLock::new(None),
         };
 
@@ -1242,6 +1277,77 @@ mod tests {
         assert!(body.contains("client_id=service-client"));
         assert!(body.contains("client_secret=service-secret"));
         assert!(body.contains("scope=tools.call"));
+    }
+
+    #[tokio::test]
+    async fn client_credentials_does_not_follow_cross_origin_redirect() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // A second listener that must never receive a connection: if the
+        // client followed the redirect, the client_secret (which
+        // `ClientSecretPost` puts in the form body) would be re-sent here.
+        let redirect_target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirect_target_addr = redirect_target.local_addr().unwrap();
+        let redirect_target_task = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_millis(200), redirect_target.accept()).await
+        });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+        let location = format!("http://{}/token", redirect_target_addr);
+        let response_location = location.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let header_end = loop {
+                let mut chunk = [0_u8; 1024];
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0);
+                bytes.extend_from_slice(&chunk[..read]);
+                if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            while bytes.len() < header_end + content_length {
+                let mut chunk = [0_u8; 1024];
+                let read = stream.read(&mut chunk).await.unwrap();
+                bytes.extend_from_slice(&chunk[..read]);
+            }
+            let response = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nlocation: {response_location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let provider = OAuthClientCredentials::builder()
+            .client_id("service-client")
+            .client_secret("service-secret")
+            .token_endpoint(endpoint)
+            .token_endpoint_auth_method(OAuthTokenEndpointAuthMethod::ClientSecretPost)
+            .resource("https://mcp.example.com/mcp")
+            .build()
+            .unwrap();
+
+        let err = provider.get_token().await.unwrap_err();
+        server.await.unwrap();
+
+        assert!(matches!(err, OAuthClientError::TokenRequest(_)));
+        let message = err.to_string();
+        assert!(message.contains("307"), "message was: {message}");
+        assert!(message.contains(&location), "message was: {message}");
+
+        // The redirect target's accept() must time out: the client never
+        // followed the Location header, so it never connected.
+        assert!(redirect_target_task.await.unwrap().is_err());
     }
 
     #[tokio::test]
