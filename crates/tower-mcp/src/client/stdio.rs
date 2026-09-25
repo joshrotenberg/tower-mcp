@@ -124,6 +124,33 @@ impl StdioClientTransport {
         })
     }
 
+    /// Cap how many bytes one newline-delimited frame from the server may
+    /// buffer before a delimiter arrives.
+    ///
+    /// A server that writes bytes without ever sending `\n` would otherwise
+    /// grow the frame buffer without bound. This matters most here: a client
+    /// may launch an untrusted server binary, unlike the server side where
+    /// the parent process is usually trusted. Once the cap is crossed,
+    /// [`ClientTransport::recv`] fails with a transport error, the same
+    /// outcome any other stdout read failure already produces. Default:
+    /// 4 MiB.
+    ///
+    /// ```rust,no_run
+    /// use tower_mcp::client::StdioClientTransport;
+    ///
+    /// # async fn example() -> Result<(), tower_mcp::BoxError> {
+    /// let transport = StdioClientTransport::spawn("my-mcp-server", &[])
+    ///     .await?
+    ///     .max_frame_len(1024 * 1024);
+    /// # let _ = transport;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn max_frame_len(mut self, bytes: usize) -> Self {
+        self.stdout.set_max_len(bytes);
+        self
+    }
+
     /// Take the child's piped stderr handle, if the command configured one.
     ///
     /// This returns `None` when stderr is inherited, redirected elsewhere, or
@@ -446,5 +473,54 @@ mod tests {
         }
 
         transport.close().await.unwrap();
+    }
+
+    // =========================================================================
+    // Bounded frame length (#1470)
+    //
+    // The client matters most for this bound: it may launch an untrusted
+    // server binary, whose stdout has no reason to ever send a newline.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn max_frame_len_rejects_a_server_that_never_sends_a_delimiter() {
+        // Pure POSIX shell builtins, no external tools: the server writes
+        // forever and never sends a newline. Without a bound this would hang
+        // rather than fail, which is what the fix (#1470) prevents; the
+        // `timeout` below turns a regression into a fast failure instead of
+        // an unbounded test hang. `close()` reaps the never-ending child
+        // regardless of how the assertion below turns out.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "while true; do printf 'aaaaaaaaaa'; done"]);
+        let mut transport = StdioClientTransport::spawn_command(&mut cmd)
+            .await
+            .unwrap()
+            .max_frame_len(1024);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), transport.recv())
+            .await
+            .expect("an oversized frame must fail rather than hang waiting for a delimiter");
+
+        assert!(
+            result.is_err(),
+            "a frame past the configured limit must surface as an error"
+        );
+
+        transport.close().await.ok();
+    }
+
+    /// A frame comfortably under a small configured limit still arrives.
+    #[tokio::test]
+    async fn max_frame_len_does_not_affect_a_frame_under_the_limit() {
+        let mut transport = StdioClientTransport::spawn("cat", &[])
+            .await
+            .unwrap()
+            .max_frame_len(4096);
+
+        let msg = r#"{"jsonrpc":"2.0","id":1,"method":"test"}"#;
+        transport.send(msg).await.unwrap();
+
+        let received = transport.recv().await.unwrap();
+        assert_eq!(received.as_deref(), Some(msg));
     }
 }

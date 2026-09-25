@@ -242,6 +242,71 @@ async fn stdio_transport_eof_returns_ok() {
     );
 }
 
+/// #1470: a peer that writes bytes without ever sending a delimiter must not
+/// grow the frame buffer without bound. `max_frame_len` bounds it, and once
+/// crossed the loop ends with an error for that peer -- the same outcome a
+/// stdin read failure already produces -- rather than buffering forever.
+#[tokio::test]
+async fn stdio_transport_max_frame_len_ends_the_loop_on_an_oversized_frame() {
+    let mut transport = StdioTransport::new(router()).max_frame_len(64);
+
+    let (mut server_stdin_writer, server_stdin) = tokio::io::duplex(4096);
+    let (server_stdout, _server_stdout_reader) = tokio::io::duplex(4096);
+
+    let handle = tokio::spawn(async move {
+        transport
+            .run_with_streams(server_stdin, server_stdout)
+            .await
+    });
+
+    // Far more than the 64-byte limit, no delimiter.
+    server_stdin_writer
+        .write_all(&b"a".repeat(200))
+        .await
+        .unwrap();
+    server_stdin_writer.flush().await.unwrap();
+
+    let result = timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("an oversized frame must end the loop rather than hang")
+        .expect("transport task join");
+    assert!(
+        result.is_err(),
+        "run_with_streams must fail once a frame crosses max_frame_len, got: {result:?}"
+    );
+}
+
+/// A frame comfortably under a small configured limit is unaffected.
+#[tokio::test]
+async fn stdio_transport_max_frame_len_does_not_affect_a_frame_under_the_limit() {
+    let mut transport = StdioTransport::new(router()).max_frame_len(4096);
+
+    let (server_stdin_writer, server_stdin) = tokio::io::duplex(4096);
+    let (server_stdout, server_stdout_reader) = tokio::io::duplex(4096);
+
+    let handle = tokio::spawn(async move {
+        transport
+            .run_with_streams(server_stdin, server_stdout)
+            .await
+    });
+
+    let mut stdin_writer = server_stdin_writer;
+    stdin_writer
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n")
+        .await
+        .unwrap();
+    stdin_writer.flush().await.unwrap();
+    drop(stdin_writer);
+
+    let frames = read_n_frames(BufReader::new(server_stdout_reader), 1).await;
+    handle
+        .await
+        .expect("transport task join")
+        .expect("run_with_streams ok");
+    assert_eq!(frames.len(), 1, "expected one response: {frames:?}");
+    assert_eq!(frames[0]["id"], 1);
+}
+
 #[cfg(feature = "stateless")]
 fn modern_router() -> McpRouter {
     let inspect = ToolBuilder::new("inspect_meta")

@@ -901,6 +901,8 @@ pub struct StdioTransport {
     outbound_disabled: Option<NotificationSender>,
     /// Bound on requests in flight at once; `None` leaves it unbounded (#1231).
     max_concurrent_requests: Option<usize>,
+    /// Bound on the bytes buffered for one input frame (#1470).
+    max_frame_len: usize,
 }
 
 impl StdioTransport {
@@ -920,6 +922,7 @@ impl StdioTransport {
             control_tx,
             control_rx,
             max_concurrent_requests: None,
+            max_frame_len: crate::framing::DEFAULT_MAX_FRAME_LEN,
         }
     }
 
@@ -969,6 +972,7 @@ impl StdioTransport {
             control_tx,
             control_rx,
             max_concurrent_requests: None,
+            max_frame_len: crate::framing::DEFAULT_MAX_FRAME_LEN,
         }
     }
 
@@ -1015,6 +1019,26 @@ impl StdioTransport {
     /// ```
     pub fn max_concurrent_requests(mut self, limit: usize) -> Self {
         self.max_concurrent_requests = Some(limit);
+        self
+    }
+
+    /// Cap how many bytes one newline-delimited input frame may buffer
+    /// before a delimiter arrives.
+    ///
+    /// A peer that writes bytes without ever sending `\n` would otherwise
+    /// grow the frame buffer without bound. Once the cap is crossed, reading
+    /// fails with a transport error rather than continuing to buffer, which
+    /// ends [`Self::run`] for that peer -- the same outcome a stdin read
+    /// failure already produces. Default: 4 MiB.
+    ///
+    /// ```rust
+    /// use tower_mcp::{McpRouter, StdioTransport};
+    ///
+    /// let router = McpRouter::new().server_info("my-server", "1.0.0");
+    /// let transport = StdioTransport::new(router).max_frame_len(1024 * 1024);
+    /// ```
+    pub fn max_frame_len(mut self, bytes: usize) -> Self {
+        self.max_frame_len = bytes;
         self
     }
 
@@ -1102,6 +1126,8 @@ impl StdioTransport {
             // Carried across the conversion so `.layer()` does not silently
             // discard a concurrency bound set before it.
             max_concurrent_requests: self.max_concurrent_requests,
+            // Same reasoning as `max_concurrent_requests` above.
+            max_frame_len: self.max_frame_len,
             #[cfg(feature = "stateless")]
             subscription_observer,
         }
@@ -1134,7 +1160,7 @@ impl StdioTransport {
         // `read_until` future can discard a partial JSON frame when a
         // notification or control message wins the race; `FrameReader` holds
         // that partial frame until the following poll.
-        let mut frames = FrameReader::new(reader);
+        let mut frames = FrameReader::with_max_len(reader, self.max_frame_len);
         #[cfg(feature = "stateless")]
         let mut subscriptions = StdioSubscriptions {
             server_info: Some(self.router.implementation()),
@@ -1392,6 +1418,8 @@ where
     incoming_notifications: Option<IncomingNotificationHandler>,
     /// Bound on requests in flight at once; `None` leaves it unbounded (#1231).
     max_concurrent_requests: Option<usize>,
+    /// Bound on the bytes buffered for one input frame (#1470).
+    max_frame_len: usize,
     /// Close observer threaded from the router by [`StdioTransport::layer`];
     /// `None` for directly constructed generic transports, which have no
     /// router to read it from.
@@ -1426,6 +1454,7 @@ where
             drain_timeout: None,
             incoming_notifications: None,
             max_concurrent_requests: None,
+            max_frame_len: crate::framing::DEFAULT_MAX_FRAME_LEN,
             #[cfg(feature = "stateless")]
             subscription_observer: None,
         }
@@ -1463,6 +1492,15 @@ where
         self
     }
 
+    /// Cap how many bytes one newline-delimited input frame may buffer
+    /// before a delimiter arrives.
+    ///
+    /// See [`StdioTransport::max_frame_len`]. Default: 4 MiB.
+    pub fn max_frame_len(mut self, bytes: usize) -> Self {
+        self.max_frame_len = bytes;
+        self
+    }
+
     /// Create a new generic stdio transport with notification forwarding.
     ///
     /// Pass a `NotificationReceiver` from [`notification_channel()`] to enable
@@ -1481,6 +1519,7 @@ where
             drain_timeout: None,
             incoming_notifications: None,
             max_concurrent_requests: None,
+            max_frame_len: crate::framing::DEFAULT_MAX_FRAME_LEN,
             #[cfg(feature = "stateless")]
             subscription_observer: None,
         }
@@ -1532,7 +1571,7 @@ where
         R: tokio::io::AsyncRead + Unpin + Send,
         W: tokio::io::AsyncWrite + Unpin + Send,
     {
-        let mut frames = FrameReader::new(reader);
+        let mut frames = FrameReader::with_max_len(reader, self.max_frame_len);
         #[cfg(feature = "stateless")]
         let mut subscriptions =
             StdioSubscriptions::default().with_observer(self.subscription_observer.clone());
@@ -1867,13 +1906,19 @@ where
 pub struct SyncStdioTransport {
     service: JsonRpcService<McpRouter>,
     router: McpRouter,
+    /// Bound on the bytes buffered for one input frame (#1470).
+    max_frame_len: usize,
 }
 
 impl SyncStdioTransport {
     /// Create a new synchronous stdio transport
     pub fn new(router: McpRouter) -> Self {
         let service = JsonRpcService::new(router.clone());
-        Self { service, router }
+        Self {
+            service,
+            router,
+            max_frame_len: crate::framing::DEFAULT_MAX_FRAME_LEN,
+        }
     }
 
     /// Set the exact protocol versions this transport accepts and advertises.
@@ -1895,6 +1940,26 @@ impl SyncStdioTransport {
         Ok(self)
     }
 
+    /// Cap how many bytes one newline-delimited input frame may buffer
+    /// before a delimiter arrives.
+    ///
+    /// A peer that writes bytes without ever sending `\n` would otherwise
+    /// grow the frame buffer without bound. Once the cap is crossed, reading
+    /// fails with a transport error rather than continuing to buffer, which
+    /// ends this transport's run loop for that peer -- the same outcome a
+    /// stdin read failure already produces. Default: 4 MiB.
+    ///
+    /// ```rust
+    /// use tower_mcp::{McpRouter, SyncStdioTransport};
+    ///
+    /// let router = McpRouter::new().server_info("my-server", "1.0.0");
+    /// let transport = SyncStdioTransport::new(router).max_frame_len(1024 * 1024);
+    /// ```
+    pub fn max_frame_len(mut self, bytes: usize) -> Self {
+        self.max_frame_len = bytes;
+        self
+    }
+
     /// Run the transport synchronously using a tokio runtime
     pub fn run_blocking(&mut self) -> Result<()> {
         let stdin = io::stdin();
@@ -1914,7 +1979,7 @@ impl SyncStdioTransport {
 
         tracing::info!("Sync stdio transport started");
 
-        while let Some(frame) = read_frame_blocking(input)? {
+        while let Some(frame) = read_frame_blocking(input, self.max_frame_len)? {
             let line = match frame {
                 InputFrame::Line(line) => line,
                 InputFrame::Undecodable => {
@@ -2047,6 +2112,8 @@ pub struct BidirectionalStdioTransport<S = McpRouter> {
     notification_rx: NotificationReceiver,
     control_tx: mpsc::UnboundedSender<StdioControl>,
     control_rx: mpsc::UnboundedReceiver<StdioControl>,
+    /// Bound on the bytes buffered for one input frame (#1470).
+    max_frame_len: usize,
 }
 
 impl BidirectionalStdioTransport<McpRouter> {
@@ -2075,6 +2142,7 @@ impl BidirectionalStdioTransport<McpRouter> {
             drain_timeout: None,
             control_tx,
             control_rx,
+            max_frame_len: crate::framing::DEFAULT_MAX_FRAME_LEN,
         }
     }
 
@@ -2132,6 +2200,9 @@ impl BidirectionalStdioTransport<McpRouter> {
             notification_rx: self.notification_rx,
             control_tx: self.control_tx,
             control_rx: self.control_rx,
+            // Carried across the conversion so `.layer()` does not silently
+            // discard a frame-length bound set before it.
+            max_frame_len: self.max_frame_len,
         }
     }
 }
@@ -2153,6 +2224,15 @@ where
     /// release handlers as soon as the read loop ends.
     pub fn drain_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.drain_timeout = Some(timeout);
+        self
+    }
+
+    /// Cap how many bytes one newline-delimited input frame may buffer
+    /// before a delimiter arrives.
+    ///
+    /// See [`StdioTransport::max_frame_len`]. Default: 4 MiB.
+    pub fn max_frame_len(mut self, bytes: usize) -> Self {
+        self.max_frame_len = bytes;
         self
     }
 
@@ -2225,7 +2305,7 @@ where
         W: tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let writer = Arc::new(Mutex::new(writer));
-        let mut frames = FrameReader::new(reader);
+        let mut frames = FrameReader::with_max_len(reader, self.max_frame_len);
         let mut in_flight = JoinSet::new();
         #[cfg(feature = "stateless")]
         let mut subscriptions = StdioSubscriptions {

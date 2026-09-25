@@ -52,6 +52,7 @@ pub struct ChildProcessTransport {
     program: String,
     args: Vec<String>,
     envs: Vec<(String, String)>,
+    max_frame_len: usize,
 }
 
 impl ChildProcessTransport {
@@ -61,6 +62,7 @@ impl ChildProcessTransport {
             program: program.into(),
             args: Vec::new(),
             envs: Vec::new(),
+            max_frame_len: crate::framing::DEFAULT_MAX_FRAME_LEN,
         }
     }
 
@@ -86,6 +88,32 @@ impl ChildProcessTransport {
         self
     }
 
+    /// Cap how many bytes one newline-delimited stdout frame from the child
+    /// may buffer before a delimiter arrives.
+    ///
+    /// A child that writes bytes without ever sending `\n` would otherwise
+    /// grow the frame buffer without bound -- the case this connection is
+    /// most exposed to, since a child process is often less trusted than a
+    /// parent. Once the cap is crossed, reading fails with a transport error
+    /// the same way any other stdout read failure does. Default: 4 MiB.
+    ///
+    /// ```rust,no_run
+    /// use tower_mcp::transport::childproc::ChildProcessTransport;
+    ///
+    /// # async fn example() -> Result<(), tower_mcp::BoxError> {
+    /// let transport = ChildProcessTransport::new("my-mcp-server")
+    ///     .max_frame_len(1024 * 1024)
+    ///     .spawn()
+    ///     .await?;
+    /// # let _ = transport;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn max_frame_len(mut self, bytes: usize) -> Self {
+        self.max_frame_len = bytes;
+        self
+    }
+
     /// Spawn the child process
     pub async fn spawn(self) -> Result<ChildProcessConnection> {
         let mut cmd = Command::new(&self.program);
@@ -104,7 +132,7 @@ impl ChildProcessTransport {
 
         tracing::info!(program = %self.program, "Spawned child process");
 
-        ChildProcessConnection::new(child)
+        ChildProcessConnection::new(child, self.max_frame_len)
     }
 }
 
@@ -134,7 +162,7 @@ pub struct ChildProcessConnection {
 }
 
 impl ChildProcessConnection {
-    fn new(mut child: Child) -> Result<Self> {
+    fn new(mut child: Child, max_frame_len: usize) -> Result<Self> {
         let stdin = child
             .stdin
             .take()
@@ -147,7 +175,7 @@ impl ChildProcessConnection {
         Ok(Self {
             child,
             stdin,
-            stdout: FrameReader::new(stdout),
+            stdout: FrameReader::with_max_len(stdout, max_frame_len),
             request_id: AtomicI64::new(1),
             pending: HashMap::new(),
         })
@@ -498,5 +526,59 @@ mod tests {
             .await
             .unwrap();
         conn.shutdown().await.unwrap();
+    }
+
+    // =========================================================================
+    // Bounded frame length (#1470)
+    // =========================================================================
+
+    #[tokio::test]
+    async fn max_frame_len_rejects_a_child_that_never_sends_a_delimiter() {
+        // Pure POSIX shell builtins, no external tools: the child writes
+        // forever and never sends a newline. Without a bound this would
+        // hang rather than fail, which is what the fix (#1470) prevents; the
+        // `timeout` below turns a regression into a fast failure instead of
+        // an unbounded test hang. `kill()` reaps the never-ending child
+        // regardless of how the assertion below turns out.
+        let mut conn = ChildProcessTransport::new("sh")
+            .arg("-c")
+            .arg("while true; do printf 'aaaaaaaaaa'; done")
+            .max_frame_len(1024)
+            .spawn()
+            .await
+            .unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            conn.send_request("tools/list", serde_json::json!({})),
+        )
+        .await
+        .expect("an oversized frame must fail rather than hang waiting for a delimiter");
+
+        let is_err = result.is_err();
+        conn.kill().await.ok();
+        assert!(
+            is_err,
+            "a frame past the configured limit must surface as an error"
+        );
+    }
+
+    /// A frame comfortably under a small configured limit still arrives.
+    #[tokio::test]
+    async fn max_frame_len_does_not_affect_a_frame_under_the_limit() {
+        let mut conn = ChildProcessTransport::new("sh")
+            .arg("-c")
+            .arg(r#"read -r _line; printf '{"jsonrpc":"2.0","id":1,"result":{"echoed":true}}\n'"#)
+            .max_frame_len(4096)
+            .spawn()
+            .await
+            .unwrap();
+
+        let response = conn
+            .send_request("echo", serde_json::json!({"msg": "hello"}))
+            .await
+            .unwrap();
+
+        assert_eq!(response, serde_json::json!({"echoed": true}));
     }
 }

@@ -16,6 +16,15 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::error::{Error, Result};
 
+/// Default maximum size of one newline-delimited frame, in bytes (4 MiB).
+///
+/// Matches `DEFAULT_MAX_BODY_SIZE` in `transport::http`, the equivalent cap
+/// on one JSON-RPC message received over HTTP: both bound a single message
+/// rather than the whole connection, and there is no reason a stdio or
+/// child-process peer should be allowed a larger single frame than an HTTP
+/// client's POST body.
+pub(crate) const DEFAULT_MAX_FRAME_LEN: usize = 4 * 1024 * 1024;
+
 /// One newline-delimited frame read from an input stream.
 ///
 /// Framing happens over bytes, not over decoded text. `0x0A` cannot appear
@@ -63,31 +72,85 @@ pub(crate) fn decode_input_frame(mut raw: Vec<u8>) -> InputFrame {
 pub(crate) struct FrameReader<R> {
     reader: BufReader<R>,
     buf: Vec<u8>,
+    /// Bound on the bytes buffered for one frame; see [`Self::next_frame`].
+    max_frame_len: usize,
 }
 
 impl<R> FrameReader<R>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
+    /// Create a reader bounded by [`DEFAULT_MAX_FRAME_LEN`].
     pub(crate) fn new(reader: R) -> Self {
+        Self::with_max_len(reader, DEFAULT_MAX_FRAME_LEN)
+    }
+
+    /// Create a reader that rejects a frame buffering more than
+    /// `max_frame_len` bytes without a delimiter.
+    pub(crate) fn with_max_len(reader: R, max_frame_len: usize) -> Self {
         Self {
             reader: BufReader::new(reader),
             buf: Vec::new(),
+            max_frame_len,
         }
+    }
+
+    /// Change the frame-length bound after construction.
+    ///
+    /// Lets a caller that already holds a `FrameReader` (built from an
+    /// already-open stream, e.g. a spawned child's stdout) apply a builder
+    /// method for the limit without reconstructing the reader.
+    pub(crate) fn set_max_len(&mut self, max_frame_len: usize) {
+        self.max_frame_len = max_frame_len;
     }
 
     /// Read the next frame, or `None` once the input is exhausted.
     ///
-    /// Cancel-safe in the sense the type documents.
+    /// Reads in whatever chunks the underlying reader fills its buffer with,
+    /// rather than calling `read_until` directly, so a peer that never sends
+    /// a delimiter cannot grow `buf` past `max_frame_len`: each chunk is
+    /// checked against the bound before it is appended, and a frame that
+    /// would cross it fails with [`Error::FrameTooLarge`] instead of
+    /// buffering further. `buf` is cleared on that error, so a caller that
+    /// keeps reading (this type's callers do not; the error ends the
+    /// connection for that peer) starts the next frame clean rather than
+    /// resuming mid-oversized-frame.
+    ///
+    /// Cancel-safe in the sense the type documents: this is the same
+    /// fill-then-consume loop `read_until` runs internally, so bytes read
+    /// before a lost race stay in `buf` exactly as they did before.
     pub(crate) async fn next_frame(&mut self) -> Result<Option<InputFrame>> {
-        let read = self
-            .reader
-            .read_until(b'\n', &mut self.buf)
-            .await
-            .map_err(|e| Error::Transport(format!("Failed to read input frame: {}", e)))?;
-        // Nothing read and nothing held back: end of input. Bytes still held
-        // are a final frame that arrived without its delimiter.
-        if read == 0 && self.buf.is_empty() {
+        loop {
+            let filled = self
+                .reader
+                .fill_buf()
+                .await
+                .map_err(|e| Error::Transport(format!("Failed to read input frame: {}", e)))?;
+            // Nothing read and nothing held back: end of input. Bytes still
+            // held are a final frame that arrived without its delimiter.
+            if filled.is_empty() {
+                break;
+            }
+            let (take, found_newline) = match filled.iter().position(|&b| b == b'\n') {
+                Some(pos) => (pos + 1, true),
+                None => (filled.len(), false),
+            };
+            if self.buf.len() + take > self.max_frame_len {
+                let size = self.buf.len() + take;
+                self.reader.consume(take);
+                self.buf.clear();
+                return Err(Error::FrameTooLarge {
+                    size,
+                    limit: self.max_frame_len,
+                });
+            }
+            self.buf.extend_from_slice(&filled[..take]);
+            self.reader.consume(take);
+            if found_newline {
+                break;
+            }
+        }
+        if self.buf.is_empty() {
             return Ok(None);
         }
         Ok(Some(decode_input_frame(std::mem::take(&mut self.buf))))
@@ -95,12 +158,41 @@ where
 }
 
 /// Blocking counterpart of [`FrameReader::next_frame`], for the sync transport.
-pub(crate) fn read_frame_blocking<R: BufRead>(reader: &mut R) -> Result<Option<InputFrame>> {
+///
+/// Bounded the same way: chunks are checked against `max_frame_len` before
+/// they are appended, so a peer that never sends a delimiter cannot grow the
+/// frame buffer past the limit.
+pub(crate) fn read_frame_blocking<R: BufRead>(
+    reader: &mut R,
+    max_frame_len: usize,
+) -> Result<Option<InputFrame>> {
     let mut raw = Vec::new();
-    let read = reader
-        .read_until(b'\n', &mut raw)
-        .map_err(|e| Error::Transport(format!("Failed to read input frame: {}", e)))?;
-    if read == 0 {
+    loop {
+        let filled = reader
+            .fill_buf()
+            .map_err(|e| Error::Transport(format!("Failed to read input frame: {}", e)))?;
+        if filled.is_empty() {
+            break;
+        }
+        let (take, found_newline) = match filled.iter().position(|&b| b == b'\n') {
+            Some(pos) => (pos + 1, true),
+            None => (filled.len(), false),
+        };
+        if raw.len() + take > max_frame_len {
+            let size = raw.len() + take;
+            reader.consume(take);
+            return Err(Error::FrameTooLarge {
+                size,
+                limit: max_frame_len,
+            });
+        }
+        raw.extend_from_slice(&filled[..take]);
+        reader.consume(take);
+        if found_newline {
+            break;
+        }
+    }
+    if raw.is_empty() {
         return Ok(None);
     }
     Ok(Some(decode_input_frame(raw)))
@@ -340,6 +432,24 @@ mod tests {
         }
     }
 
+    /// Extract the `(size, limit)` pair from a [`Error::FrameTooLarge`]
+    /// result, panicking otherwise.
+    ///
+    /// `InputFrame` deliberately has no `Debug` impl (it can hold a full
+    /// frame's contents), so the bounded-length tests use this instead of
+    /// `Result::unwrap_err`, which requires one.
+    fn expect_frame_too_large(result: Result<Option<InputFrame>>) -> (usize, usize) {
+        match result {
+            Err(Error::FrameTooLarge { size, limit }) => (size, limit),
+            Err(other) => panic!("expected FrameTooLarge, got a different error: {other}"),
+            Ok(Some(InputFrame::Line(_))) => panic!("expected FrameTooLarge, got a line"),
+            Ok(Some(InputFrame::Undecodable)) => {
+                panic!("expected FrameTooLarge, got an undecodable frame")
+            }
+            Ok(None) => panic!("expected FrameTooLarge, got end of input"),
+        }
+    }
+
     /// Assert one frame was rejected by the decoder.
     fn assert_undecodable(frame: Option<InputFrame>) {
         assert!(
@@ -379,9 +489,35 @@ mod tests {
     fn the_blocking_reader_treats_a_bad_frame_the_same_way() {
         let mut input: &[u8] = b"\xff\xfe\n{\"id\":1}\n";
 
-        assert_undecodable(read_frame_blocking(&mut input).unwrap());
-        assert_line(read_frame_blocking(&mut input).unwrap(), "{\"id\":1}");
-        assert!(read_frame_blocking(&mut input).unwrap().is_none());
+        assert_undecodable(read_frame_blocking(&mut input, DEFAULT_MAX_FRAME_LEN).unwrap());
+        assert_line(
+            read_frame_blocking(&mut input, DEFAULT_MAX_FRAME_LEN).unwrap(),
+            "{\"id\":1}",
+        );
+        assert!(
+            read_frame_blocking(&mut input, DEFAULT_MAX_FRAME_LEN)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// The blocking reader is bounded exactly like the async one: a frame at
+    /// the limit parses, one byte over fails with [`Error::FrameTooLarge`].
+    #[test]
+    fn the_blocking_reader_is_bounded_the_same_way() {
+        let limit = 16;
+
+        let mut at_limit: &[u8] = b"123456789012345\n"; // 15 bytes + \n = 16
+        assert_line(
+            read_frame_blocking(&mut at_limit, limit).unwrap(),
+            "123456789012345",
+        );
+
+        let mut over_limit: &[u8] = b"1234567890123456\n"; // 16 bytes + \n = 17
+        assert_eq!(
+            expect_frame_too_large(read_frame_blocking(&mut over_limit, limit)),
+            (17, 16)
+        );
     }
 
     /// The `select!` loops on both ends poll `next_frame` against other
@@ -410,6 +546,109 @@ mod tests {
             .await
             .unwrap();
         assert_line(frames.next_frame().await.unwrap(), frame);
+    }
+
+    // =========================================================================
+    // Bounded frame length tests (#1470)
+    // =========================================================================
+
+    /// A frame that never sends a delimiter and exceeds the configured limit
+    /// fails instead of buffering forever. This is the read-loop counterpart
+    /// of [`crate::client::http`]'s `SseEventTooLarge` handling.
+    #[tokio::test]
+    async fn an_oversized_frame_without_a_delimiter_is_rejected() {
+        let limit = 16;
+        let input: &[u8] = b"this line is much longer than the sixteen byte limit\n";
+        let mut frames = FrameReader::with_max_len(input, limit);
+
+        let (size, reported) = expect_frame_too_large(frames.next_frame().await);
+        assert_eq!(reported, limit);
+        assert!(size > limit, "the error must report the overshoot");
+    }
+
+    /// One byte over the limit is enough to fail; the delimiter that would
+    /// have completed the frame never gets a chance to arrive.
+    #[tokio::test]
+    async fn a_frame_one_byte_over_the_limit_is_rejected() {
+        let limit = 16;
+        let input: &[u8] = b"1234567890123456\n"; // 16 bytes of payload + \n = 17
+        let mut frames = FrameReader::with_max_len(input, limit);
+
+        assert_eq!(expect_frame_too_large(frames.next_frame().await), (17, 16));
+    }
+
+    /// The boundary case: a frame whose bytes (payload plus delimiter) total
+    /// exactly the configured limit must still parse.
+    #[tokio::test]
+    async fn a_frame_exactly_at_the_limit_still_parses() {
+        let limit = 16;
+        let input: &[u8] = b"123456789012345\n"; // 15 bytes of payload + \n = 16
+        let mut frames = FrameReader::with_max_len(input, limit);
+
+        assert_line(frames.next_frame().await.unwrap(), "123456789012345");
+    }
+
+    /// A final frame within the limit that arrives without its delimiter at
+    /// EOF must still parse, exactly as it did before this type bounded its
+    /// buffer: the limit only rejects a frame that grows past it, not one
+    /// that simply never saw a trailing newline.
+    #[tokio::test]
+    async fn a_final_frame_without_a_delimiter_within_the_limit_still_parses_at_eof() {
+        let limit = 16;
+        let input: &[u8] = b"{}";
+        let mut frames = FrameReader::with_max_len(input, limit);
+
+        assert_line(frames.next_frame().await.unwrap(), "{}");
+        assert!(frames.next_frame().await.unwrap().is_none());
+    }
+
+    /// The bound is enforced per chunk as bytes arrive, not only once the
+    /// whole oversized frame has already been buffered. A duplex stream with
+    /// a smaller capacity than the payload forces the writer to pace itself,
+    /// so `next_frame` sees the delimiter-less payload as several chunks; the
+    /// buffer must never hold more than `limit` bytes before the read fails.
+    #[tokio::test]
+    async fn the_limit_is_enforced_incrementally_and_the_buffer_never_exceeds_it() {
+        let limit = 8;
+        let (mut writer, reader) = tokio::io::duplex(4);
+        let mut frames = FrameReader::with_max_len(reader, limit);
+
+        let write = tokio::spawn(async move {
+            // 9 bytes, no delimiter: one more than `limit`.
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut writer, b"123456789").await;
+        });
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), frames.next_frame())
+            .await
+            .expect("an oversized frame must fail rather than hang");
+        let (size, reported) = expect_frame_too_large(result);
+        assert_eq!(reported, limit);
+        // The buffer is checked against the limit before each chunk is
+        // appended, so it can overshoot by at most one chunk (bounded by
+        // the duplex's 4-byte capacity here), never by the whole 9-byte
+        // payload.
+        assert!(
+            size <= limit + 4,
+            "buffer grew past one chunk beyond the limit: {size}"
+        );
+
+        write.abort();
+    }
+
+    /// A per-instance limit configured via [`FrameReader::with_max_len`]
+    /// applies independently of the default: a frame that fits comfortably
+    /// under [`DEFAULT_MAX_FRAME_LEN`] can still be rejected under a smaller
+    /// configured one, and vice versa.
+    #[tokio::test]
+    async fn the_limit_is_configurable_per_instance() {
+        let payload = b"{\"jsonrpc\":\"2.0\"}\n";
+
+        let mut generous = FrameReader::with_max_len(&payload[..], DEFAULT_MAX_FRAME_LEN);
+        assert_line(generous.next_frame().await.unwrap(), r#"{"jsonrpc":"2.0"}"#);
+
+        let mut strict = FrameReader::with_max_len(&payload[..], 4);
+        let (_, reported) = expect_frame_too_large(strict.next_frame().await);
+        assert_eq!(reported, 4);
     }
 
     // =========================================================================

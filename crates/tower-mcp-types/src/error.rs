@@ -536,6 +536,22 @@ pub enum Error {
         limit: usize,
     },
 
+    /// A single newline-delimited frame exceeded the configured maximum size.
+    ///
+    /// Raised by frame-reading transports (stdio, child process) when a peer
+    /// writes more bytes than the configured cap without a `\n` delimiter.
+    /// Reading stops and the buffer is discarded rather than growing without
+    /// bound. `size` is the buffered size at the point the limit was
+    /// detected; `limit` is the configured cap. Analogous to
+    /// [`Error::SseEventTooLarge`] for the HTTP/SSE client.
+    #[error("frame too large: {size} bytes buffered, limit is {limit} bytes")]
+    FrameTooLarge {
+        /// Bytes buffered for the frame when the limit was exceeded.
+        size: usize,
+        /// The configured maximum frame size in bytes.
+        limit: usize,
+    },
+
     /// An internal library or server failure not represented by another variant.
     #[error("Internal error: {0}")]
     Internal(String),
