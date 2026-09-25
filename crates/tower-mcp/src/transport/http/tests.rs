@@ -14,6 +14,7 @@ use super::*;
 // by `http.rs`'s own explicit re-export, reachable through `use super::*`.
 use super::handlers::*;
 use super::session::*;
+use crate::transport::origin::{is_localhost_host, is_localhost_origin};
 use axum::body::Body;
 use axum::http::Request;
 use proptest::prelude::*;

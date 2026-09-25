@@ -30,6 +30,9 @@ pub mod childproc;
 pub(crate) mod extension_bridge;
 
 #[cfg(any(feature = "http", feature = "websocket"))]
+pub(crate) mod origin;
+
+#[cfg(any(feature = "http", feature = "websocket"))]
 pub(crate) mod graceful;
 
 pub mod service;

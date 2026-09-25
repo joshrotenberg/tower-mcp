@@ -215,6 +215,10 @@ struct AppState {
     protocol_support: ProtocolSupport,
     /// Whether sampling is enabled
     sampling_enabled: bool,
+    /// Whether the upgrade request's `Origin` is checked (#1464).
+    validate_origin: bool,
+    /// Non-localhost origins allowed to open a connection.
+    allowed_origins: Vec<String>,
 }
 
 /// WebSocket transport for MCP servers
@@ -241,6 +245,8 @@ pub struct WebSocketTransport {
     sampling_enabled: bool,
     service_factory: ServiceFactory,
     protocol_support: ProtocolSupport,
+    validate_origin: bool,
+    allowed_origins: Vec<String>,
     #[cfg(feature = "oauth")]
     oauth_config: Option<crate::oauth::ProtectedResourceMetadata>,
 }
@@ -269,9 +275,33 @@ impl WebSocketTransport {
             sampling_enabled: false,
             service_factory: identity_factory(),
             protocol_support: ProtocolSupport::default(),
+            validate_origin: true,
+            allowed_origins: Vec::new(),
             #[cfg(feature = "oauth")]
             oauth_config: None,
         }
+    }
+
+    /// Disable `Origin` validation on the upgrade request (not recommended).
+    ///
+    /// Browsers do not apply CORS to WebSocket connections, so without this
+    /// check any web page the user visits can connect to a server bound to
+    /// localhost. By default, requests without an `Origin` header (non-browser
+    /// clients) and localhost origins are accepted, and other origins must be
+    /// listed in [`allowed_origins`](Self::allowed_origins).
+    pub fn disable_origin_validation(mut self) -> Self {
+        self.validate_origin = false;
+        self
+    }
+
+    /// Set the non-localhost origins allowed to open a connection.
+    ///
+    /// Matches [`HttpTransport::allowed_origins`](crate::HttpTransport::allowed_origins):
+    /// entries are compared with the `Origin` header exactly, and `"*"` allows
+    /// any origin.
+    pub fn allowed_origins(mut self, origins: Vec<String>) -> Self {
+        self.allowed_origins = origins;
+        self
     }
 
     /// Enable sampling support for this transport.
@@ -434,6 +464,8 @@ impl WebSocketTransport {
             sessions: SessionStore::new(),
             protocol_support: self.protocol_support,
             sampling_enabled: self.sampling_enabled,
+            validate_origin: self.validate_origin,
+            allowed_origins: self.allowed_origins,
         });
 
         let router = Router::new()
@@ -458,6 +490,8 @@ impl WebSocketTransport {
             sessions: SessionStore::new(),
             protocol_support: self.protocol_support,
             sampling_enabled: self.sampling_enabled,
+            validate_origin: self.validate_origin,
+            allowed_origins: self.allowed_origins,
         });
 
         let ws_router = Router::new()
@@ -621,6 +655,16 @@ async fn handle_websocket(
     use axum::response::IntoResponse;
 
     let (mut parts, _body) = request.into_parts();
+
+    // Browsers do not apply CORS to WebSocket connections: reject a foreign
+    // origin before upgrading (#1464).
+    if let Some(rejection) = crate::transport::origin::validate_origin(
+        &parts.headers,
+        state.validate_origin,
+        &state.allowed_origins,
+    ) {
+        return rejection;
+    }
 
     // Parse MCP subprotocols (mcp.auth.*, mcp.version.*) from Sec-WebSocket-Protocol
     let subprotocols = parse_mcp_subprotocols(&parts.headers, &state.protocol_support);

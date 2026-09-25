@@ -107,6 +107,12 @@ Avoid `"*"` origins for authenticated endpoints. Disabling either validation
 is intended for controlled tests and unusual trusted-network topologies, not
 as a production fix for a proxy misconfiguration.
 
+`WebSocketTransport` applies the same `Origin` rules to the upgrade request,
+with the same `allowed_origins` and `disable_origin_validation` builder
+methods, and answers a rejected handshake with `403`. Browsers do not apply
+CORS to WebSocket connections, so this check is the only thing stopping a web
+page from connecting to a WebSocket server bound to localhost.
+
 Origin validation is a security check, not a CORS response policy. Browser
 clients may also need an axum/tower-http CORS layer on the returned router to
 emit `Access-Control-Allow-*` headers. Allow the MCP methods and headers the
