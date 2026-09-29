@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.23.2] - 2026-09-29
+
+### Features
+
+- Serve and accept 2025-06-18 sessions (closes #1514) ([#1525](https://github.com/joshrotenberg/tower-mcp/pull/1525))
+- **tool:** Opt-in input and output schema validation (closes #1512, #1513) ([#1526](https://github.com/joshrotenberg/tower-mcp/pull/1526))
+
+### Testing
+
+- Reusable contract suites for the store traits (closes #1518) ([#1528](https://github.com/joshrotenberg/tower-mcp/pull/1528))
+
+
+
 ## [0.23.1] - 2026-09-29
 
 
