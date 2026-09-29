@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.23.1] - 2026-09-29
+
+### Documentation
+
+- Correct the WebSocket client note and the roadmap version (closes #1517) ([#1520](https://github.com/joshrotenberg/tower-mcp/pull/1520))
+
+### Features
+
+- **http:** Bind HTTP sessions to the authenticated principal (closes #1515) ([#1519](https://github.com/joshrotenberg/tower-mcp/pull/1519))
+
+
+
 ## [0.23.0] - 2026-09-25
 
 ### Bug Fixes
