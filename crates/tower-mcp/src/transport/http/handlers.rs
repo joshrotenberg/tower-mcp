@@ -898,18 +898,29 @@ pub(super) async fn handle_post(
 
     // Get or create session
     let session = if is_init {
+        // Bind the new session to the caller that initializes it. A resolver
+        // that fails closed cannot bind anything, so no session is created.
+        let Some(principal) = resolve_request_principal(&state, &http_extensions).into_bound()
+        else {
+            return (
+                StatusCode::FORBIDDEN,
+                "Unable to resolve the session principal",
+            )
+                .into_response();
+        };
+
         // Create new session for initialize
         let create_result = match &state.service_source {
             ServiceSource::Router { router, factory } => {
                 // Use with_fresh_session() to ensure each session has its own state
                 state
                     .sessions
-                    .create(router.with_fresh_session(), factory.clone())
+                    .create(router.with_fresh_session(), factory.clone(), principal)
                     .await
             }
             ServiceSource::Service(mutex) => {
                 let service = mutex.lock().unwrap().clone();
-                state.sessions.create_from_service(service).await
+                state.sessions.create_from_service(service, principal).await
             }
         };
         match create_result {
@@ -923,8 +934,10 @@ pub(super) async fn handle_post(
             }
         }
     } else if !modern_request && let Some(session_id) = session_id_header.clone() {
-        // Client sent a session ID -- look it up
-        match state.sessions.get(&session_id).await {
+        // Client sent a session ID -- look it up. A session bound to a
+        // different principal is indistinguishable from one that is absent.
+        let principal = resolve_request_principal(&state, &http_extensions);
+        match state.sessions.get(&session_id, &principal).await {
             Some(s) => s,
             None => {
                 // Return JSON-RPC error with session info so clients know to re-initialize
@@ -1629,6 +1642,7 @@ pub(super) async fn handle_get(
     let (parts, _body) = request.into_parts();
     let headers = parts.headers;
     let uri = parts.uri.clone();
+    let http_extensions = parts.extensions;
 
     // Validate Host (DNS rebinding defense, complement to Origin)
     if let Some(resp) = validate_host(&headers, &uri, &state) {
@@ -1665,7 +1679,8 @@ pub(super) async fn handle_get(
         }
     };
 
-    let session = match state.sessions.get(&session_id).await {
+    let principal = resolve_request_principal(&state, &http_extensions);
+    let session = match state.sessions.get(&session_id, &principal).await {
         Some(s) => s,
         None => {
             return json_rpc_error_response(
@@ -1753,6 +1768,7 @@ pub(super) async fn handle_delete(
     let (parts, _body) = request.into_parts();
     let headers = parts.headers;
     let uri = parts.uri.clone();
+    let http_extensions = parts.extensions;
 
     // Validate Host (DNS rebinding defense, complement to Origin)
     if let Some(resp) = validate_host(&headers, &uri, &state) {
@@ -1774,7 +1790,10 @@ pub(super) async fn handle_delete(
         }
     };
 
-    if state.sessions.remove(&session_id).await {
+    // A session bound to a different principal is left alone and answered
+    // like one that no longer exists.
+    let principal = resolve_request_principal(&state, &http_extensions);
+    if state.sessions.remove_for(&session_id, &principal).await {
         tracing::info!(session_id = %session_id, "Session terminated");
         StatusCode::OK.into_response()
     } else {

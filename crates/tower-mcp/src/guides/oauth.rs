@@ -91,6 +91,37 @@ Do not use `HttpTransport::oauth` alone for a protected endpoint. That
 lower-level method publishes metadata but intentionally does not install token
 or scope enforcement.
 
+### Session binding
+
+A legacy (`2025-11-25`) HTTP session is bound to the principal that
+initialized it. Every later POST, GET, and DELETE that carries the
+`MCP-Session-Id` must resolve to the same principal, so a leaked or guessed
+session ID is not enough for a different token holder to use, stream, or
+terminate the session. A request from another principal is answered exactly
+as an unknown session ID is, and a refused DELETE leaves the session running.
+
+The default principal is the token's `sub` claim, copied verbatim, which is
+also the default Task owner. A token without a `sub` is anonymous, and an
+anonymous session only matches anonymous requests. To use a different key,
+for example one that includes the issuer, install a resolver:
+
+```rust,no_run
+use tower_mcp::{Extensions, HttpTransport, McpRouter};
+use tower_mcp::oauth::token::TokenClaims;
+
+let transport = HttpTransport::new(McpRouter::new())
+    .session_principal_resolver(|extensions: &Extensions| {
+        let claims = extensions.get::<TokenClaims>()?;
+        Some(format!("{}#{}", claims.iss.as_deref()?, claims.sub.as_deref()?))
+    });
+```
+
+A resolver that returns an empty string or panics fails closed. The principal
+is stored in the `SessionRecord`, so the check also applies to sessions
+restored from a shared `SessionStore`. Sessions written by a version without
+binding restore as anonymous and must be re-initialized once authentication is
+enabled. The final `2026-07-28` protocol has no sessions, so it is unaffected.
+
 ### Run the JWKS server example
 
 The repository example uses the same composition and requires a real

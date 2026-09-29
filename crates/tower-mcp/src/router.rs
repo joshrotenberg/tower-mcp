@@ -3691,6 +3691,9 @@ use capabilities::{
     TaskOwnerResolver, custom_task_owner_resolver, default_task_owner_resolver,
     final_client_capabilities,
 };
+// The HTTP transport uses the same default principal for its sessions.
+#[cfg(feature = "http")]
+pub(crate) use capabilities::oauth_task_owner;
 use pagination::paginate;
 use policy::panic_message;
 

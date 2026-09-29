@@ -80,15 +80,19 @@ where
 }
 
 /// The default authenticated Task owner for this request, if any.
+///
+/// Also the default HTTP session principal, so a session and the Tasks created
+/// in it are attributed to the same caller unless an application overrides
+/// one of the two resolvers.
 #[cfg(feature = "oauth")]
-fn oauth_task_owner(extensions: &crate::context::Extensions) -> Option<String> {
+pub(crate) fn oauth_task_owner(extensions: &crate::context::Extensions) -> Option<String> {
     extensions
         .get::<crate::oauth::token::TokenClaims>()
         .and_then(|claims| claims.sub.clone())
 }
 
 #[cfg(not(feature = "oauth"))]
-fn oauth_task_owner(_extensions: &crate::context::Extensions) -> Option<String> {
+pub(crate) fn oauth_task_owner(_extensions: &crate::context::Extensions) -> Option<String> {
     None
 }
 

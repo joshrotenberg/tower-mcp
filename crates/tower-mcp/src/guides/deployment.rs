@@ -160,6 +160,19 @@ The default session TTL is 30 minutes and the default cleanup interval is one
 minute. There is no default maximum; set one to bound per-process session
 memory. The built-in session and event stores are in-memory.
 
+A legacy session is also bound to the principal that initialized it: later
+POST, GET, and DELETE requests naming the session must resolve to the same
+principal, and a different one is answered exactly as an unknown session ID
+is. By default the principal is the OAuth `sub` claim, so with no
+authentication in front of the transport every request is anonymous and
+nothing changes. Use `session_principal_resolver` (or
+`session_principal_from_extension` with `bridge_extension`) when identity
+comes from something other than OAuth claims. The principal is persisted in
+the `SessionRecord`, so it is enforced after a restore on another node; a
+record written before binding existed restores as anonymous, so with
+authentication enabled those clients re-initialize once after an upgrade.
+See the [OAuth guide](crate::guides::oauth) for an example.
+
 Final `subscriptions/listen` streams have a separate, bounded policy because
 they do not consume legacy session slots. By default, a transport admits up to
 256 active final subscriptions. Each stream accepts at most 64 KiB of combined
@@ -231,8 +244,8 @@ stores, keep associated POST streams and their client responses on the node
 that owns the originating request; roots, sampling, and elicitation channels
 are process-local.
 
-`SessionStore` persists identity, capabilities, timestamps, and negotiated
-version. `EventStore` persists resumable legacy notification events. Configure
+`SessionStore` persists identity, capabilities, timestamps, negotiated
+version, and the principal the session is bound to. `EventStore` persists resumable legacy notification events. Configure
 both when failover needs both behaviors:
 
 ```rust,no_run

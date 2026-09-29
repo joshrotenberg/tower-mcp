@@ -2085,6 +2085,7 @@ async fn live_session_get_refreshes_persistent_expiry() {
         .create(
             create_test_router(),
             crate::transport::service::identity_factory(),
+            None,
         )
         .await
         .expect("session should be created");
@@ -2101,7 +2102,12 @@ async fn live_session_get_refreshes_persistent_expiry() {
     let stale_expiry = stale.expires_at;
     store.save(&stale).await.unwrap();
 
-    assert!(registry.get(&session.id).await.is_some());
+    assert!(
+        registry
+            .get(&session.id, &SessionPrincipal::Resolved(None))
+            .await
+            .is_some()
+    );
 
     let refreshed = store
         .load(&session.id)
@@ -2169,11 +2175,14 @@ async fn live_session_get_survives_persistent_refresh_failure() {
         .create(
             create_test_router(),
             crate::transport::service::identity_factory(),
+            None,
         )
         .await
         .expect("session should be created");
 
-    let found = registry.get(&session.id).await;
+    let found = registry
+        .get(&session.id, &SessionPrincipal::Resolved(None))
+        .await;
 
     assert!(found.is_some(), "store failure must not fail a live lookup");
     assert_eq!(
@@ -2260,6 +2269,7 @@ async fn concurrent_remove_cannot_be_undone_by_live_session_refresh() {
         .create(
             create_test_router(),
             crate::transport::service::identity_factory(),
+            None,
         )
         .await
         .expect("session should be created");
@@ -2267,7 +2277,11 @@ async fn concurrent_remove_cannot_be_undone_by_live_session_refresh() {
 
     let get_registry = registry.clone();
     let get_session_id = session_id.clone();
-    let get_task = tokio::spawn(async move { get_registry.get(&get_session_id).await });
+    let get_task = tokio::spawn(async move {
+        get_registry
+            .get(&get_session_id, &SessionPrincipal::Resolved(None))
+            .await
+    });
     store
         .save_started
         .acquire()
@@ -2623,6 +2637,7 @@ async fn test_early_initialized_notification_still_completes_the_handshake() {
         .create(
             create_test_router().with_fresh_session(),
             crate::transport::service::identity_factory(),
+            None,
         )
         .await
         .expect("session creation");

@@ -417,6 +417,9 @@ struct AppState {
     /// Types copied from each HTTP request's extensions into the per-request
     /// MCP extensions (#1242). Empty by default.
     extension_bridges: Vec<crate::transport::extension_bridge::ExtensionBridge>,
+    /// Resolves the principal a session is bound to and later requests are
+    /// checked against (#1515).
+    session_principal_resolver: SessionPrincipalResolver,
     /// Exact protocol versions accepted and advertised by this transport.
     protocol_support: ProtocolSupport,
     /// Session store
@@ -483,6 +486,8 @@ pub struct HttpTransport {
     /// Types copied from each HTTP request's extensions into the per-request
     /// MCP extensions (#1242). Empty by default.
     extension_bridges: Vec<crate::transport::extension_bridge::ExtensionBridge>,
+    /// See [`HttpTransport::session_principal_resolver()`].
+    session_principal_resolver: SessionPrincipalResolver,
     protocol_support: ProtocolSupport,
     validate_origin: bool,
     /// Parsed and normalized at [`Self::allowed_origins`] call time; see
@@ -560,6 +565,7 @@ impl HttpTransport {
             oauth_config: None,
             sse_responses: false,
             extension_bridges: Vec::new(),
+            session_principal_resolver: default_session_principal_resolver(),
             max_body_size: DEFAULT_MAX_BODY_SIZE,
             drain_timeout: None,
         }
@@ -603,6 +609,100 @@ impl HttpTransport {
         self.extension_bridges
             .push(crate::transport::extension_bridge::extension_bridge::<T>());
         self
+    }
+
+    /// Configure how a request is mapped to the principal its session is
+    /// bound to.
+    ///
+    /// A session is bound to the principal resolved when its `initialize`
+    /// request arrives. Every later POST, GET (SSE stream), and DELETE that
+    /// names the session must resolve to the same principal, or the transport
+    /// answers exactly as it does for a session ID it has never seen: the
+    /// same status and body, and a DELETE leaves the session in place. A
+    /// leaked or guessed `MCP-Session-Id` is then not enough for a different
+    /// caller to use it, and a mismatch does not reveal that the ID exists
+    /// (MCP security best practices, "session hijacking").
+    ///
+    /// The resolver receives the extensions the request is served with:
+    /// OAuth [`TokenClaims`](crate::oauth::token::TokenClaims) when the
+    /// `oauth` feature is compiled in, plus every type registered with
+    /// [`bridge_extension`](Self::bridge_extension). It returns a stable
+    /// principal key, or `None` for an anonymous request. An anonymous session
+    /// only matches anonymous requests, and a request that carries a
+    /// principal never matches an anonymous session, so dropping the
+    /// credential does not grant access.
+    ///
+    /// The default resolver uses the OAuth `sub` claim verbatim, the same
+    /// mapping [`McpRouter::task_owner_resolver`] uses for Task owners. A
+    /// token without a `sub` is anonymous. Without the `oauth` feature, or
+    /// with no authentication in front of the transport, every request is
+    /// anonymous and sessions behave as they did before binding existed.
+    /// Installing a resolver replaces that default. Include the issuer in the
+    /// returned key if more than one issuer can reach this transport, and
+    /// never return a bearer token or other credential.
+    ///
+    /// An empty or whitespace-only principal and a panic fail closed: an
+    /// `initialize` is rejected with `403 Forbidden` and no session is
+    /// created, and a request for an existing session is answered as
+    /// session-not-found. Rust's process-global panic hook still runs before a
+    /// panic is caught.
+    ///
+    /// The principal is stored in the
+    /// [`SessionRecord`](crate::session_store::SessionRecord), so the check
+    /// applies to a session restored from a shared
+    /// [`SessionStore`](crate::session_store::SessionStore) on another
+    /// instance. A record written before this field existed has no principal
+    /// and restores as anonymous: with authentication enabled, clients holding
+    /// such a session must re-initialize.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use tower_mcp::{Extensions, HttpTransport, McpRouter};
+    ///
+    /// #[derive(Clone)]
+    /// struct Identity {
+    ///     issuer: String,
+    ///     subject: String,
+    /// }
+    ///
+    /// let router = McpRouter::new().server_info("my-server", "1.0.0");
+    /// let app = HttpTransport::new(router)
+    ///     .bridge_extension::<Identity>()
+    ///     .session_principal_resolver(|extensions: &Extensions| {
+    ///         extensions
+    ///             .get::<Identity>()
+    ///             .map(|id| format!("{}:{}", id.issuer, id.subject))
+    ///     })
+    ///     .into_router_at("/mcp");
+    /// ```
+    #[must_use]
+    pub fn session_principal_resolver<F>(mut self, resolver: F) -> Self
+    where
+        F: Fn(&crate::context::Extensions) -> Option<String> + Send + Sync + 'static,
+    {
+        self.session_principal_resolver = custom_session_principal_resolver(resolver);
+        self
+    }
+
+    /// Resolve the session principal from one request extension type.
+    ///
+    /// The convenient counterpart to
+    /// [`session_principal_resolver`](Self::session_principal_resolver) for a
+    /// type inserted by a Tower layer in front of the transport. The type must
+    /// also be registered with [`bridge_extension`](Self::bridge_extension) to
+    /// be visible to the resolver. A request without `T` is anonymous; the
+    /// mapping only runs when the extension is present. The returned value has
+    /// the same stability and secrecy requirements as the general resolver.
+    #[must_use]
+    pub fn session_principal_from_extension<T>(
+        self,
+        map: impl Fn(&T) -> String + Send + Sync + 'static,
+    ) -> Self
+    where
+        T: Send + Sync + 'static,
+    {
+        self.session_principal_resolver(move |extensions| extensions.get::<T>().map(&map))
     }
 
     /// Create an HTTP transport from a pre-built service.
@@ -668,6 +768,7 @@ impl HttpTransport {
             oauth_config: None,
             sse_responses: false,
             extension_bridges: Vec::new(),
+            session_principal_resolver: default_session_principal_resolver(),
             max_body_size: DEFAULT_MAX_BODY_SIZE,
             drain_timeout: None,
         }
@@ -1419,6 +1520,7 @@ impl HttpTransport {
             modern_subscriptions,
             sse_responses: self.sse_responses,
             extension_bridges: self.extension_bridges.clone(),
+            session_principal_resolver: self.session_principal_resolver.clone(),
             max_body_size: self.max_body_size,
         })
     }
@@ -1640,6 +1742,7 @@ fn spawn_external_notification_fanout(
 }
 
 mod handlers;
+mod principal;
 mod session;
 #[cfg(feature = "stateless")]
 mod stateless_dispatch;
@@ -1651,6 +1754,10 @@ pub use session::{DEFAULT_SESSION_TTL, SessionConfig, SessionHandle, SessionInfo
 // in a build without the feature.
 #[cfg(feature = "stateless")]
 use handlers::{extract_request_id, json_rpc_error_response_with_status};
+use principal::{
+    SessionPrincipal, SessionPrincipalResolver, custom_session_principal_resolver,
+    default_session_principal_resolver, resolve_request_principal,
+};
 use session::{Session, SessionRegistry};
 // Gated in `stateless_dispatch` too, so importing any of these unconditionally
 // breaks the default build that `--all-features` never exercises.

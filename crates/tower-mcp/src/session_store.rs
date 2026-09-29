@@ -65,6 +65,17 @@ pub struct SessionRecord {
     pub last_accessed: SystemTime,
     /// When this session expires. Implementations may remove expired records.
     pub expires_at: SystemTime,
+    /// The principal the session is bound to, as resolved when it was created
+    /// (see `HttpTransport::session_principal_resolver`).
+    ///
+    /// `None` is an anonymous session, which only anonymous requests match.
+    /// Records written before this field existed deserialize to `None`, so a
+    /// session created by an older version restores as anonymous and, with
+    /// authentication enabled, is not usable by an authenticated caller: the
+    /// client must re-initialize. Stores must persist this value unchanged; it
+    /// is authorization data.
+    #[serde(default)]
+    pub principal: Option<String>,
 }
 
 impl SessionRecord {
@@ -81,6 +92,7 @@ impl SessionRecord {
             created_at: now,
             last_accessed: now,
             expires_at: now + ttl,
+            principal: None,
         }
     }
 
@@ -307,6 +319,33 @@ mod tests {
 
     fn sample_record(id: &str) -> SessionRecord {
         SessionRecord::new(id, "2025-11-25", Duration::from_secs(60))
+    }
+
+    #[test]
+    fn record_round_trips_its_principal() {
+        let mut record = sample_record("abc");
+        record.principal = Some("alice".into());
+
+        let json = serde_json::to_string(&record).unwrap();
+        let restored: SessionRecord = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.principal.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn record_written_before_the_principal_field_still_deserializes() {
+        // A record as an older version serialized it: no `principal` key.
+        let mut value = serde_json::to_value(sample_record("legacy")).unwrap();
+        let removed = value.as_object_mut().unwrap().remove("principal");
+        assert!(removed.is_some(), "the current format writes the field");
+
+        let record: SessionRecord = serde_json::from_value(value).unwrap();
+
+        assert_eq!(record.id, "legacy");
+        assert_eq!(
+            record.principal, None,
+            "an old record restores as anonymous"
+        );
     }
 
     #[tokio::test]

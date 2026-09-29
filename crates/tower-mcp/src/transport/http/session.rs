@@ -33,6 +33,12 @@ pub(super) enum SessionServiceSource {
 pub(super) struct Session {
     /// Session ID
     pub(super) id: String,
+    /// The principal that created this session (#1515). `None` is an
+    /// anonymous session, which only anonymous requests match.
+    ///
+    /// Fixed for the life of the session: set when the session is created or
+    /// restored, and persisted in the [`SessionRecord`](crate::session_store::SessionRecord).
+    pub(super) principal: Option<String>,
     /// Source for creating the MCP service
     pub(super) service_source: SessionServiceSource,
     /// Broadcast channel for SSE notifications and outgoing requests
@@ -113,6 +119,7 @@ impl Session {
         let now = Instant::now();
         Self {
             id: uuid::Uuid::new_v4().to_string(),
+            principal: None,
             service_source: SessionServiceSource::Router {
                 router,
                 factory: service_factory,
@@ -145,6 +152,7 @@ impl Session {
         let now = Instant::now();
         Self {
             id: uuid::Uuid::new_v4().to_string(),
+            principal: None,
             service_source: SessionServiceSource::Boxed(std::sync::Mutex::new(service)),
             notifications_tx,
             created_at: now,
@@ -203,6 +211,7 @@ impl Session {
         let now = Instant::now();
         Self {
             id: record.id.clone(),
+            principal: record.principal.clone(),
             service_source: SessionServiceSource::Router {
                 router,
                 factory: service_factory,
@@ -236,6 +245,7 @@ impl Session {
         let now = Instant::now();
         Self {
             id: record.id.clone(),
+            principal: record.principal.clone(),
             service_source: SessionServiceSource::Boxed(std::sync::Mutex::new(service)),
             notifications_tx,
             created_at: now,
@@ -251,6 +261,12 @@ impl Session {
             // instance; treat `notifications/initialized` as already received.
             initialized_notification_received: std::sync::atomic::AtomicBool::new(true),
         }
+    }
+
+    /// Bind this session to the principal that created it.
+    fn with_principal(mut self, principal: Option<String>) -> Self {
+        self.principal = principal;
+        self
     }
 
     /// Create a middleware-wrapped service from this session's service source.
@@ -527,6 +543,9 @@ impl SessionRegistry {
         // session. These remain `None` until a successful initialize.
         record.client_info = session.client_info.read().await.clone();
         record.client_capabilities = session.client_capabilities.read().await.clone();
+        // The principal is what lets a session restored on another instance
+        // keep enforcing the binding.
+        record.principal = session.principal.clone();
         // Convert from monotonic Instant to SystemTime approximation.
         let now = std::time::SystemTime::now();
         let created_ago = session.created_at.elapsed();
@@ -574,6 +593,7 @@ impl SessionRegistry {
         &self,
         router: McpRouter,
         service_factory: ServiceFactory,
+        principal: Option<String>,
     ) -> Option<Arc<Session>> {
         router.session().mark_handshake_started();
 
@@ -592,12 +612,15 @@ impl SessionRegistry {
                 return None;
             }
 
-            let session = Arc::new(Session::new(
-                router,
-                self.sampling_enabled,
-                service_factory,
-                self.events.clone(),
-            ));
+            let session = Arc::new(
+                Session::new(
+                    router,
+                    self.sampling_enabled,
+                    service_factory,
+                    self.events.clone(),
+                )
+                .with_principal(principal),
+            );
             sessions.insert(session.id.clone(), session.clone());
             tracing::debug!(session_id = %session.id, sampling = self.sampling_enabled, "Created new session");
             session
@@ -606,7 +629,11 @@ impl SessionRegistry {
         Some(session)
     }
 
-    pub(super) async fn create_from_service(&self, service: McpBoxService) -> Option<Arc<Session>> {
+    pub(super) async fn create_from_service(
+        &self,
+        service: McpBoxService,
+        principal: Option<String>,
+    ) -> Option<Arc<Session>> {
         let session = {
             let mut sessions = self.sessions.write().await;
 
@@ -621,7 +648,9 @@ impl SessionRegistry {
                 return None;
             }
 
-            let session = Arc::new(Session::from_service(service, self.events.clone()));
+            let session = Arc::new(
+                Session::from_service(service, self.events.clone()).with_principal(principal),
+            );
             sessions.insert(session.id.clone(), session.clone());
             tracing::debug!(session_id = %session.id, "Created new session from service");
             session
@@ -633,7 +662,8 @@ impl SessionRegistry {
     /// Create a new session with its router already marked as initialized.
     ///
     /// Used by the optional-sessions feature to serve requests from clients
-    /// that skip the initialize handshake.
+    /// that skip the initialize handshake. These sessions are per-request and
+    /// their ID is never returned to the client, so they are left unbound.
     pub(super) async fn create_initialized(
         &self,
         router: McpRouter,
@@ -700,11 +730,21 @@ impl SessionRegistry {
         Some(session)
     }
 
-    pub(super) async fn get(&self, id: &str) -> Option<Arc<Session>> {
+    /// Look up the session `id` for a request from `principal`.
+    ///
+    /// A session bound to a different principal is reported as absent, the
+    /// same as an ID that does not exist, and is neither refreshed nor
+    /// restored (#1515). The comparison runs before `touch` so a caller that
+    /// cannot use a session cannot keep it alive either.
+    pub(super) async fn get(&self, id: &str, principal: &SessionPrincipal) -> Option<Arc<Session>> {
         // Fast path: the session is live in this process.
         {
             let sessions = self.sessions.read().await;
             if let Some(session) = sessions.get(id).cloned() {
+                if !principal.matches(&session.principal) {
+                    tracing::debug!(session_id = %id, "Session principal mismatch; treating session as unknown");
+                    return None;
+                }
                 session.touch().await;
                 // Keep the registry read lock through the external save. A
                 // concurrent removal must acquire the write lock, so its
@@ -719,6 +759,15 @@ impl SessionRegistry {
         // store has a record — rebuild it.
         match self.persistent.load(id).await {
             Ok(Some(record)) => {
+                // Check the stored principal before rebuilding anything. A
+                // mismatch also skips auto-reinitialization below, which
+                // would otherwise hand this ID to the wrong caller. (With
+                // `auto_reinit` on, that makes a mismatched ID answer 404
+                // where a never-seen ID gets a fresh session.)
+                if !principal.matches(&record.principal) {
+                    tracing::debug!(session_id = %id, "Session principal mismatch; treating session as unknown");
+                    return None;
+                }
                 tracing::info!(session_id = %id, "Restoring session from persistent store");
                 if let Some(session) = self.restore_from_record(record).await {
                     return Some(session);
@@ -735,8 +784,14 @@ impl SessionRegistry {
         // for single-instance restarts where no external store is
         // configured; loses original client identity.
         if self.auto_reinit {
+            // The recovered session is bound to the caller that recreated it.
+            // A request whose principal cannot be resolved recreates nothing.
+            let bound = match principal {
+                SessionPrincipal::Resolved(bound) => bound.clone(),
+                SessionPrincipal::Invalid => return None,
+            };
             tracing::info!(session_id = %id, "Auto-reinitializing unknown session");
-            return self.auto_reinitialize(id).await;
+            return self.auto_reinitialize(id, bound).await;
         }
 
         None
@@ -823,7 +878,7 @@ impl SessionRegistry {
     ///
     /// Loses the original client's identity and capabilities — the server
     /// sees a session from client `"auto-recovered"`.
-    async fn auto_reinitialize(&self, id: &str) -> Option<Arc<Session>> {
+    async fn auto_reinitialize(&self, id: &str, principal: Option<String>) -> Option<Arc<Session>> {
         let mut record = crate::session_store::SessionRecord::new(
             id.to_string(),
             LATEST_PROTOCOL_VERSION.to_string(),
@@ -839,6 +894,7 @@ impl SessionRegistry {
             meta: None,
         });
         record.client_capabilities = Some(crate::protocol::ClientCapabilities::default());
+        record.principal = principal;
 
         // Persist first so a concurrent request sees the record. Ignore
         // persistence errors; the in-memory session will still work.
@@ -854,6 +910,36 @@ impl SessionRegistry {
             let mut sessions = self.sessions.write().await;
             sessions.remove(id).is_some()
         };
+        self.finish_removal(id, removed).await;
+        removed
+    }
+
+    /// Remove the session `id` on behalf of a request from `principal`.
+    ///
+    /// A session bound to a different principal is left in place and reported
+    /// as not removed, the same as an ID that does not exist. The comparison
+    /// and the removal happen under one write lock.
+    pub(super) async fn remove_for(&self, id: &str, principal: &SessionPrincipal) -> bool {
+        let removed = {
+            let mut sessions = self.sessions.write().await;
+            match sessions.get(id) {
+                Some(session) if principal.matches(&session.principal) => {
+                    sessions.remove(id).is_some()
+                }
+                Some(_) => {
+                    tracing::debug!(session_id = %id, "Session principal mismatch; treating session as unknown");
+                    false
+                }
+                None => false,
+            }
+        };
+        self.finish_removal(id, removed).await;
+        removed
+    }
+
+    /// Drop the persistent record and buffered events of a session that was
+    /// just removed from the live map.
+    async fn finish_removal(&self, id: &str, removed: bool) {
         if removed {
             tracing::debug!(session_id = %id, "Removed session");
             if let Err(e) = self.persistent.delete(id).await {
@@ -863,7 +949,6 @@ impl SessionRegistry {
                 tracing::warn!(session_id = %id, error = %e, "Failed to purge session events");
             }
         }
-        removed
     }
 
     /// Route a pre-serialized external notification to live session SSE
