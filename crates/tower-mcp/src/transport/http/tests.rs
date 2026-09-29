@@ -6014,6 +6014,121 @@ async fn http_batch_policy_uses_exact_session_revision() {
     );
 }
 
+#[tokio::test]
+async fn http_rejects_batch_for_2025_06_18_session() {
+    let app = HttpTransport::new(create_test_router())
+        .disable_origin_validation()
+        .into_router();
+    let session = do_initialize_for_revision(&app, "2025-06-18").await;
+    send_initialized(&app, &session).await;
+    let response = post_legacy_batch(&app, &session).await;
+    assert_eq!(response["error"]["code"], -32600);
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not permit top-level JSON-RPC batches")
+    );
+}
+
+#[tokio::test]
+async fn http_serves_2025_06_18_session() {
+    let app = HttpTransport::new(create_test_router())
+        .disable_origin_validation()
+        .into_router();
+
+    let init_request = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(Body::from(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": { "name": "test-client", "version": "1.0.0" }
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let init_response = app.clone().oneshot(init_request).await.unwrap();
+    assert_eq!(init_response.status(), StatusCode::OK);
+    let session_id = init_response
+        .headers()
+        .get(MCP_SESSION_ID_HEADER)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        init_response
+            .headers()
+            .get(MCP_PROTOCOL_VERSION_HEADER)
+            .and_then(|v| v.to_str().ok()),
+        Some("2025-06-18")
+    );
+    let body = axum::body::to_bytes(init_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let init_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(init_body["result"]["protocolVersion"], "2025-06-18");
+
+    let initialized_request = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header(MCP_SESSION_ID_HEADER, &session_id)
+        .header(MCP_PROTOCOL_VERSION_HEADER, "2025-06-18")
+        .body(Body::from(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let initialized_response = app.clone().oneshot(initialized_request).await.unwrap();
+    assert!(initialized_response.status().is_success());
+
+    let list_request = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header(MCP_SESSION_ID_HEADER, &session_id)
+        .header(MCP_PROTOCOL_VERSION_HEADER, "2025-06-18")
+        .body(Body::from(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = app.oneshot(list_request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(MCP_PROTOCOL_VERSION_HEADER)
+            .and_then(|v| v.to_str().ok()),
+        Some("2025-06-18")
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(list_body.get("error").is_none(), "{list_body}");
+    assert!(list_body["result"]["tools"].is_array());
+}
+
 #[cfg(feature = "stateless")]
 #[tokio::test]
 async fn http_final_batch_is_rejected_before_object_routing() {

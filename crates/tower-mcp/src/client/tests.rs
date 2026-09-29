@@ -279,6 +279,26 @@ async fn initialize_rejects_a_discover_lifecycle_version() {
     assert!(!client.is_initialized());
 }
 
+/// A server that selects 2025-06-18 completes the handshake: it is an
+/// initialize-lifecycle version in the default client policy.
+#[tokio::test]
+async fn initialize_accepts_2025_06_18() {
+    let transport =
+        MockTransport::with_responses(vec![mock_initialize_response_with_version("2025-06-18")]);
+    let client = McpClient::connect(transport).await.unwrap();
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.initialize("test-client", "1.0.0"),
+    )
+    .await
+    .expect("initialize must not hang")
+    .expect("a server-selected 2025-06-18 must complete initialize");
+
+    assert_eq!(result.protocol_version, "2025-06-18");
+    assert!(client.is_initialized());
+}
+
 /// A version the client has never heard of is rejected the same way as a
 /// known-but-wrong-lifecycle one: `initialize` has no basis for trusting it.
 #[tokio::test]

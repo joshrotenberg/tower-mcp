@@ -16,8 +16,12 @@ use crate::protocol::SUPPORTED_PROTOCOL_VERSIONS;
 /// The former `stateless` feature remains a compatibility alias and produces
 /// the same compiled set.
 #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
-pub const COMPILED_PROTOCOL_VERSIONS: &[&str] =
-    &[PROTOCOL_VERSION_2026_07_28, "2025-11-25", "2025-03-26"];
+pub const COMPILED_PROTOCOL_VERSIONS: &[&str] = &[
+    PROTOCOL_VERSION_2026_07_28,
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+];
 
 /// Protocol versions compiled into this build, in preference order.
 #[cfg(not(any(feature = "protocol-2026-07-28", feature = "stateless")))]

@@ -1549,6 +1549,18 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn websocket_rejects_batch_for_2025_06() {
+        let response = websocket_batch_response("2025-06-18").await;
+        assert_eq!(response["error"]["code"], -32600);
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("does not permit top-level JSON-RPC batches")
+        );
+    }
+
     // ========================================================================
     // #1335: the id `handle_incoming_message` answers with if `call_message`
     // fails after `message` already parsed.

@@ -1161,6 +1161,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn negotiated_2025_06_rejects_batch() {
+        let router = create_test_router();
+        let mut service = JsonRpcService::new(router.clone());
+        let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "test", "version": "1.0" }
+        }));
+        let init_response = service.call_single(init_req).await.unwrap();
+        let JsonRpcResponse::Result(init_result) = init_response else {
+            panic!("2025-06-18 initialize should succeed");
+        };
+        assert_eq!(init_result.result["protocolVersion"], "2025-06-18");
+        router.handle_notification(crate::protocol::McpNotification::Initialized);
+
+        let message = JsonRpcMessage::Batch(vec![JsonRpcRequest::new(2, "ping")]);
+        let response = service.call_message(message).await.unwrap();
+        let JsonRpcResponseMessage::Single(JsonRpcResponse::Error(error)) = response else {
+            panic!("2025-06-18 batch should produce one JSON-RPC error");
+        };
+        assert_eq!(error.error.code, -32600);
+        assert!(
+            error
+                .error
+                .message
+                .contains("does not permit top-level JSON-RPC batches")
+        );
+    }
+
+    #[tokio::test]
     async fn test_call_message_empty_batch() {
         let router = create_test_router();
         let mut service = JsonRpcService::new(router);

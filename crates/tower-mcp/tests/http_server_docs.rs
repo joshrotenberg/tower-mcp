@@ -183,7 +183,7 @@ async fn documented_final_curl_bodies_satisfy_current_http_validation() {
                 assert_eq!(response["result"]["resultType"], "complete");
                 assert_eq!(
                     response["result"]["supportedVersions"],
-                    serde_json::json!(["2026-07-28", "2025-11-25", "2025-03-26"])
+                    serde_json::json!(["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"])
                 );
                 assert_eq!(response["result"]["ttlMs"], 0);
                 assert_eq!(response["result"]["cacheScope"], "private");

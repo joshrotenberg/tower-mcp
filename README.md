@@ -152,8 +152,8 @@ tower-mcp in a separate repository.
 
 ## Protocol Compliance
 
-Every build implements the [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25)
-and `2025-03-26` session protocols. The `protocol-2026-07-28` feature compiles the
+Every build implements the [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25),
+`2025-06-18`, and `2025-03-26` session protocols. The `protocol-2026-07-28` feature compiles the
 [2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28) implementation,
 which is enabled at runtime once compiled; narrow the served set with
 `ProtocolSupport::stable()`. HTTP dispatches per request on the `MCP-Protocol-Version`

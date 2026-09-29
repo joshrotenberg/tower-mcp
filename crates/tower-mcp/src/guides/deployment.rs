@@ -139,7 +139,7 @@ One `HttpTransport` can serve both protocol eras on the same URL when
 
 | Client traffic | tower-mcp path | Operational state |
 |---|---|---|
-| `initialize`, then `MCP-Session-Id` | legacy `2025-11-25` / `2025-03-26` | session state, GET/POST SSE, optional event replay |
+| `initialize`, then `MCP-Session-Id` | legacy `2025-11-25` / `2025-06-18` / `2025-03-26` | session state, GET/POST SSE, optional event replay |
 | `MCP-Protocol-Version: 2026-07-28`, required request metadata, no session ID | final `2026-07-28` | independent requests, `server/discover`, explicit `subscriptions/listen` streams |
 
 Legacy sessions are optional by default for compatibility with clients that

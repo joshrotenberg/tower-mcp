@@ -55,6 +55,14 @@ jobs:
             --spec-version 2025-11-25 \
             --expected-failures ./.github/conformance/conformance-baseline.yml
 
+      - name: Run 2025-06-18 conformance suite
+        run: |
+          npx -y "@modelcontextprotocol/conformance@${CONFORMANCE_VERSION}" server \
+            --url http://127.0.0.1:3001/mcp \
+            --suite all \
+            --spec-version 2025-06-18 \
+            --expected-failures ./.github/conformance/conformance-baseline-2025-06-18.yml
+
       - name: Show server logs on failure
         if: failure()
         run: cat /tmp/conformance-server.log
@@ -237,6 +245,15 @@ jobs:
             --spec-version 2025-11-25 \
             --command "cargo run --manifest-path examples/conformance-client/Cargo.toml --" \
             --expected-failures ./.github/conformance/conformance-baseline-client.yml
+
+      - name: Run 2025-06-18 client conformance suite
+        run: |
+          # The empty baseline makes any regression fail immediately.
+          npx -y "@modelcontextprotocol/conformance@${CONFORMANCE_VERSION}" client \
+            --suite all \
+            --spec-version 2025-06-18 \
+            --command "cargo run --manifest-path examples/conformance-client/Cargo.toml --" \
+            --expected-failures ./.github/conformance/conformance-baseline-2025-06-18-client.yml
 
   draft-conformance:
     name: Official 2026-07-28 Suite

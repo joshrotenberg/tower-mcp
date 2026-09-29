@@ -253,10 +253,11 @@ pub const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 /// use tower_mcp_types::protocol::{LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS};
 ///
 /// assert_eq!(LATEST_PROTOCOL_VERSION, "2025-11-25");
+/// assert!(SUPPORTED_PROTOCOL_VERSIONS.contains(&"2025-06-18"));
 /// assert!(SUPPORTED_PROTOCOL_VERSIONS.contains(&"2025-03-26"));
 /// assert!(!SUPPORTED_PROTOCOL_VERSIONS.contains(&"2026-07-28"));
 /// ```
-pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-03-26"];
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26"];
 
 /// The released 2026-07-28 protocol version.
 ///
@@ -6148,7 +6149,7 @@ mod tests {
         assert_eq!(PROTOCOL_VERSION_2026_07_28, "2026-07-28");
         assert!(KNOWN_PROTOCOL_VERSIONS.contains(&PROTOCOL_VERSION_2026_07_28));
         assert!(KNOWN_PROTOCOL_VERSIONS.contains(&"2025-06-18"));
-        assert!(!SUPPORTED_PROTOCOL_VERSIONS.contains(&"2025-06-18"));
+        assert!(SUPPORTED_PROTOCOL_VERSIONS.contains(&"2025-06-18"));
         assert!(
             !SUPPORTED_PROTOCOL_VERSIONS.contains(&PROTOCOL_VERSION_2026_07_28),
             "the released 2026-07-28 implementation remains explicitly \

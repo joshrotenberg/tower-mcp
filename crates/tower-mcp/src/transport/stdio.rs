@@ -3026,6 +3026,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stdio_rejects_batch_for_2025_06() {
+        let router = make_router();
+        let mut service = init_service_for_revision(&router, "2025-06-18").await;
+        let line = serde_json::json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
+        ])
+        .to_string();
+
+        let response = process_line(&mut service, &router, &line)
+            .await
+            .unwrap()
+            .unwrap();
+        let JsonRpcResponseMessage::Single(JsonRpcResponse::Error(error)) = response else {
+            panic!("2025-06-18 stdio batch should return one error");
+        };
+        assert_eq!(error.error.code, -32600);
+    }
+
+    #[tokio::test]
+    async fn stdio_serves_requests_after_2025_06_initialize() {
+        let router = make_router();
+        let mut service = init_service_for_revision(&router, "2025-06-18").await;
+
+        let line = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        let response = process_line(&mut service, &router, line)
+            .await
+            .unwrap()
+            .unwrap();
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["id"], 1);
+        assert!(json.get("result").is_some());
+    }
+
+    #[tokio::test]
     async fn test_process_line_malformed_json() {
         let router = make_router();
         let mut service = init_service(&router).await;

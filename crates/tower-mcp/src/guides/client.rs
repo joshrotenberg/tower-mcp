@@ -41,7 +41,7 @@ operations:
 
 | Protocol path | Builder default? | First MCP call |
 |---|---:|---|
-| `2025-11-25` / `2025-03-26` | yes | `client.initialize(name, version)` |
+| `2025-11-25` / `2025-06-18` / `2025-03-26` | yes | `client.initialize(name, version)` |
 | `2026-07-28` | no | `client.discover(name, version)` |
 
 ### Stable lifecycle over stdio

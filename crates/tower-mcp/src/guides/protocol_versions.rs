@@ -21,6 +21,7 @@ authoritative for protocol behavior:
 |---|---|---|---|
 | `2026-07-28` | released, enabled when compiled | `protocol-2026-07-28` | sessionless, per-request metadata, optional `server/discover` first |
 | `2025-11-25` | stable default | always available | `initialize` session lifecycle |
+| `2025-06-18` | backward compatibility | always available | `initialize` session lifecycle |
 | `2025-03-26` | backward compatibility | always available | `initialize` session lifecycle |
 
 The default Cargo build is intentionally conservative. A release of the MCP
@@ -53,13 +54,13 @@ answers the same question for one string.
 Without the final feature:
 
 ```text
-["2025-11-25", "2025-03-26"]
+["2025-11-25", "2025-06-18", "2025-03-26"]
 ```
 
 With `protocol-2026-07-28`:
 
 ```text
-["2026-07-28", "2025-11-25", "2025-03-26"]
+["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"]
 ```
 
 ### Runtime allowlists
@@ -155,6 +156,7 @@ fn main() -> Result<(), BoxError> {
     let support = ProtocolSupport::try_new([
         "2026-07-28",
         "2025-11-25",
+        "2025-06-18",
         "2025-03-26",
     ])?;
     let transport = HttpTransport::new(McpRouter::new())
@@ -260,7 +262,8 @@ display name or version; use negotiated protocol and capabilities.
 
 Top-level JSON-RPC arrays need a finer distinction than “legacy.” Request
 batches are accepted only for the exact `2025-03-26` revision. Batching was
-removed in `2025-06-18`, so `2025-11-25` and `2026-07-28` reject arrays before
+removed in `2025-06-18`, so `2025-06-18`, `2025-11-25`, and `2026-07-28` reject
+arrays before
 dispatch. `JsonRpcService` records the legacy revision returned by
 `initialize`; HTTP uses the session's negotiated revision, while final
 requests use their per-request metadata. A multi-version `ProtocolSupport`

@@ -20,7 +20,7 @@ The workspace maintains synchronized versions:
 ## MCP Specification Tracking
 
 - tower-mcp tracks the [Model Context Protocol specification](https://spec.modelcontextprotocol.io/)
-- Default spec version: **2025-11-25**, with backward compatibility for **2025-03-26**
+- Default spec version: **2025-11-25**, with backward compatibility for **2025-06-18** and **2025-03-26**
 - Released opt-in spec version: **2026-07-28**, enabled at compile time with
   `protocol-2026-07-28` and selected per client or server with `ProtocolSupport`
 - Spec version changes that require breaking API changes will bump the minor version (pre-1.0) or major version (post-1.0)

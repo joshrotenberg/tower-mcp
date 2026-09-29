@@ -83,7 +83,7 @@
 //! #   "id": 1,
 //! #   "result": {
 //! #     "resultType": "complete",
-//! #     "supportedVersions": ["2026-07-28", "2025-11-25", "2025-03-26"],
+//! #     "supportedVersions": ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"],
 //! #     "capabilities": {
 //! #       "tools": { "listChanged": true },
 //! #       "resources": { "subscribe": false, "listChanged": true },

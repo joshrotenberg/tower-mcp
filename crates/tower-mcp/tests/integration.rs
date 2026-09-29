@@ -483,6 +483,29 @@ async fn test_protocol_version_negotiation_supported() {
 }
 
 #[tokio::test]
+async fn test_protocol_version_negotiation_2025_06_18() {
+    let router = create_test_router();
+    let mut service = JsonRpcService::new(router);
+
+    let init_req = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+        "protocolVersion": "2025-06-18",
+        "capabilities": {},
+        "clientInfo": { "name": "test", "version": "1.0" }
+    }));
+
+    let resp = service.call_single(init_req).await.unwrap();
+
+    match resp {
+        JsonRpcResponse::Result(r) => {
+            let version = r.result.get("protocolVersion").unwrap().as_str().unwrap();
+            assert_eq!(version, "2025-06-18");
+        }
+        JsonRpcResponse::Error(e) => panic!("Unexpected error: {:?}", e),
+        _ => panic!("unexpected response variant"),
+    }
+}
+
+#[tokio::test]
 async fn test_protocol_version_negotiation_unsupported() {
     let router = create_test_router();
     let mut service = JsonRpcService::new(router);

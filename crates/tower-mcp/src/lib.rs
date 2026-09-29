@@ -476,8 +476,8 @@
 //!
 //! ## MCP Specification
 //!
-//! Every build implements the MCP 2025-11-25 and 2025-03-26 session
-//! protocols; the `protocol-2026-07-28` feature adds the released 2026-07-28
+//! Every build implements the MCP 2025-11-25, 2025-06-18, and 2025-03-26
+//! session protocols; the `protocol-2026-07-28` feature adds the released 2026-07-28
 //! specification, enabled by default once compiled:
 //! <https://modelcontextprotocol.io/specification/2026-07-28>
 //!
