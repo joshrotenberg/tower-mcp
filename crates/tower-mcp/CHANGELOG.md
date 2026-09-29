@@ -12,6 +12,15 @@ All notable changes to this project will be documented in this file.
 
 - **http:** Bind HTTP sessions to the authenticated principal (closes #1515) ([#1519](https://github.com/joshrotenberg/tower-mcp/pull/1519))
 
+  `HttpTransport` records the principal that initializes a session (by
+  default the OAuth subject; override with `session_principal_resolver`) and
+  answers a request for that session from any other principal, or from no
+  principal, as if the session did not exist. Deployments without
+  authentication are unaffected. With authentication enabled, sessions
+  persisted by 0.23.0 have no stored principal, so their clients must
+  re-initialize once after the upgrade. A resolver that panics or returns an
+  empty principal makes `initialize` fail with 403.
+
 
 
 ## [0.23.0] - 2026-09-25
