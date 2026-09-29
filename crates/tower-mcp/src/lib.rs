@@ -155,7 +155,7 @@
 //! - `childproc` - Child process transport for subprocess management
 //! - `oauth` - OAuth 2.1 resource server support (JWT validation, metadata endpoint; requires `http`)
 //! - `jwks` - JWKS endpoint fetching for remote key sets (requires `oauth`)
-//! - `testing` - Test utilities (`TestClient`) for ergonomic MCP server testing
+//! - `testing` - Test utilities for MCP servers: `TestClient`, and contract suites for custom `TaskStore`, `SessionStore`, and `EventStore` implementations
 //! - `dynamic-tools` - Runtime registration/deregistration of tools, prompts, and resources via
 //!   [`DynamicToolRegistry`], [`DynamicPromptRegistry`], [`DynamicResourceRegistry`],
 //!   [`DynamicResourceTemplateRegistry`]

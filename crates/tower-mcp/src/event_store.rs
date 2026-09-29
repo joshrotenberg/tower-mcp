@@ -81,15 +81,42 @@ pub type Result<T> = std::result::Result<T, EventStoreError>;
 /// Implementations persist [`EventRecord`]s keyed by session ID. The default
 /// implementation is [`MemoryEventStore`]; external stores (Redis, etc.)
 /// typically live in separate crates.
+///
+/// # Testing an implementation
+///
+/// The `testing` feature ships a contract suite for this trait:
+/// `tower_mcp::testing::store_contracts::event_store_contract` takes a
+/// constructor that returns an empty store and checks the rules documented on
+/// each method. It does not check a buffer capacity, which the trait does not
+/// define.
+///
+/// ```rust,ignore
+/// #[tokio::test]
+/// async fn my_store_honors_the_event_store_contract() {
+///     tower_mcp::testing::store_contracts::event_store_contract(MyStore::new_for_test).await;
+/// }
+/// ```
 #[async_trait]
 pub trait EventStore: Send + Sync + 'static {
     /// Append an event to a session's log.
+    ///
+    /// The transport appends a session's events with increasing IDs, and they
+    /// are replayed in that order.
     async fn append(&self, session_id: &str, event: EventRecord) -> Result<()>;
 
     /// Return events with IDs strictly greater than `after_id`, in order.
+    ///
+    /// Replaying does not consume events: a client that reconnects again sees
+    /// the same events again. Each event comes back with the ID and data it was
+    /// appended with. A session with no events, whether unknown or purged,
+    /// replays as an empty list rather than an error, and one session's events
+    /// never appear in another's replay.
     async fn replay_after(&self, session_id: &str, after_id: u64) -> Result<Vec<EventRecord>>;
 
     /// Remove all events for a session. Idempotent.
+    ///
+    /// Other sessions are untouched, and the purged session can record new
+    /// events afterwards.
     async fn purge_session(&self, session_id: &str) -> Result<()>;
 }
 

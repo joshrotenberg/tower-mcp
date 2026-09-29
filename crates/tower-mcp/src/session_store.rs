@@ -140,13 +140,36 @@ pub type Result<T> = std::result::Result<T, SessionStoreError>;
 /// # Semantics
 ///
 /// - [`create`](Self::create) must ensure the ID in the record is unique,
-///   retrying ID generation if necessary.
-/// - [`save`](Self::save) trusts the caller's ID and performs an upsert.
+///   retrying ID generation if necessary. A colliding `create` never
+///   overwrites the existing session, and the ID the record ends up with is the
+///   one it can be loaded under.
+/// - [`save`](Self::save) trusts the caller's ID and performs an upsert. It
+///   replaces the whole record, so an optional field the caller has cleared
+///   comes back cleared.
+/// - A record comes back from [`load`](Self::load) with the protocol version,
+///   `client_info`, `client_capabilities`, and `principal` it was stored with.
+///   The principal in particular is compared by equality to decide who may use
+///   the session, so `None` and `Some("")` are different values. Timestamps are
+///   kept to whatever precision the backend has.
 /// - [`load`](Self::load) returns `None` for unknown or expired sessions.
 ///   Implementations may choose to return expired records and let the caller
 ///   decide, or filter them out.
 /// - [`delete`](Self::delete) is idempotent -- removing a non-existent ID is
-///   not an error.
+///   not an error. It removes only the named record.
+///
+/// # Testing an implementation
+///
+/// The `testing` feature ships a contract suite for this trait:
+/// `tower_mcp::testing::store_contracts::session_store_contract` takes a
+/// constructor that returns an empty store and checks the rules above. It does
+/// not check expiry, which the rules above leave to the implementation.
+///
+/// ```rust,ignore
+/// #[tokio::test]
+/// async fn my_store_honors_the_session_store_contract() {
+///     tower_mcp::testing::store_contracts::session_store_contract(MyStore::new_for_test).await;
+/// }
+/// ```
 #[async_trait]
 pub trait SessionStore: Send + Sync + 'static {
     /// Create a new session record.

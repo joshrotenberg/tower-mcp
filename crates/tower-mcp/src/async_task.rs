@@ -213,6 +213,41 @@
 //! outlives the request that created it, so there may be no subscriber at the
 //! moment a transition happens, and a client that missed one loses nothing but
 //! time.
+//!
+//! # Testing a store
+//!
+//! Most of what this module requires of a [`TaskStore`] is invisible to the
+//! compiler: terminal states are immutable, the owner survives every
+//! transition, an expired task reads as absent through every method and raises
+//! its token, a spent input request key cannot be reissued. The `testing`
+//! feature ships a suite that checks each of those against your store:
+//!
+//! - `tower_mcp::testing::store_contracts::task_store_contract` covers the
+//!   required methods.
+//! - `task_store_optional_contract` covers `set_status`, `resume_context`,
+//!   `input_responses`, `set_task_meta`, and `discard_task`, for a store that
+//!   overrides them. The router needs `resume_context` for any task that asks
+//!   the client for input, and the last two for task preparation callbacks.
+//!
+//! Each takes a constructor that returns an empty store and runs every check
+//! against a fresh one, so call it from a test with a store backed by a
+//! throwaway database or key prefix:
+//!
+//! ```rust,ignore
+//! use tower_mcp::testing::store_contracts::{task_store_contract, task_store_optional_contract};
+//!
+//! #[tokio::test]
+//! async fn my_store_honors_the_task_store_contract() {
+//!     task_store_contract(MyStore::new_for_test).await;
+//!     task_store_optional_contract(MyStore::new_for_test).await;
+//! }
+//! ```
+//!
+//! A failure names the rule, for example
+//! `TaskStore contract violated: terminal states are immutable: complete_task
+//! applied to a completed task`. Retention limits are not part of the suite:
+//! they are a policy of [`MemoryTaskStore`], and the trait leaves the recovery
+//! from an oversized payload to each implementation.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
@@ -1286,6 +1321,18 @@ pub type TaskSnapshot = (TaskObject, Option<CallToolResult>, Option<JsonRpcError
 ///
 /// # Semantics
 ///
+/// - [`create_task`](Self::create_task) returns an ID distinct from that of
+///   every other task, and the new task is `working` with its token un-raised.
+///   [`get_task`](Self::get_task) reports the `ttl` most recently given to
+///   `create_task` or [`set_ttl`](Self::set_ttl).
+/// - The owner passed to `create_task` is recorded as given and never changes
+///   over the task's life. `None` (anonymous) and `Some("")` are different
+///   owners. [`task_owner`](Self::task_owner) and
+///   [`task_presence`](Self::task_presence) report it for as long as the task
+///   is readable.
+/// - [`get_task_result`](Self::get_task_result) pairs the task object with the
+///   result of a completed task or the error of a failed one, and with neither
+///   for a task in any other state.
 /// - Terminal states ([`TaskStatus::is_terminal`]) are immutable: once a task
 ///   is completed, failed, or cancelled, further transitions must be rejected
 ///   (`Ok(false)` from the transition methods).
@@ -1303,6 +1350,22 @@ pub type TaskSnapshot = (TaskObject, Option<CallToolResult>, Option<JsonRpcError
 ///   which then returns `None`; how an implementation waits (notification,
 ///   polling, pub/sub) is an implementation detail and must not leak into the
 ///   trait.
+///
+/// # Testing an implementation
+///
+/// The `testing` feature ships a contract suite for this trait, so an external
+/// store can check itself against the semantics above instead of relying on
+/// review. `tower_mcp::testing::store_contracts::task_store_contract` covers the
+/// required methods, and `task_store_optional_contract` covers the methods
+/// with defaults for a store that overrides them. Each takes a constructor
+/// that returns an empty store:
+///
+/// ```rust,ignore
+/// #[tokio::test]
+/// async fn my_store_honors_the_task_store_contract() {
+///     tower_mcp::testing::store_contracts::task_store_contract(MyStore::new_for_test).await;
+/// }
+/// ```
 ///
 /// # Implementing this trait
 ///
@@ -1460,7 +1523,8 @@ pub trait TaskStore: Send + Sync + 'static {
         owner: TaskOwner,
     ) -> Result<(String, CancellationToken)>;
 
-    /// Read a task's owner.
+    /// Read a task's owner, exactly as it was given to
+    /// [`create_task`](Self::create_task).
     ///
     /// The outer `Option` distinguishes a known task from an unknown or
     /// expired one; the inner [`TaskOwner`] distinguishes an owned task from
@@ -1472,8 +1536,14 @@ pub trait TaskStore: Send + Sync + 'static {
 
     /// Persist protocol `_meta` for a task.
     ///
-    /// The default preserves source compatibility for external stores. Stores
-    /// that want to support task preparation metadata must override it.
+    /// Returns `Ok(true)` once the metadata is stored, after which every view
+    /// of the task carries it, including after the task reaches a terminal
+    /// state. Returns `Ok(false)` if the task is unknown or expired, or if the
+    /// store does not support metadata.
+    ///
+    /// The default preserves source compatibility for external stores, and
+    /// returns `Ok(false)`. Stores that want to support task preparation
+    /// metadata must override it.
     async fn set_task_meta(&self, task_id: &str, meta: serde_json::Value) -> Result<bool> {
         let _ = (task_id, meta);
         Ok(false)
@@ -1481,8 +1551,13 @@ pub trait TaskStore: Send + Sync + 'static {
 
     /// Remove a task that could not finish initialization.
     ///
-    /// The default preserves source compatibility for external stores. Stores
-    /// used with preparation callbacks should override it.
+    /// Returns `Ok(true)` if the task was removed, after which it reads as
+    /// unknown. Returns `Ok(false)` if there was nothing to remove or the store
+    /// does not support removal; the router then cancels the task instead.
+    ///
+    /// The default preserves source compatibility for external stores, and
+    /// returns `Ok(false)`. Stores used with preparation callbacks should
+    /// override it.
     async fn discard_task(&self, task_id: &str) -> Result<bool> {
         let _ = task_id;
         Ok(false)
@@ -1504,7 +1579,8 @@ pub trait TaskStore: Send + Sync + 'static {
     /// Mark a task as requiring input, recording the requests to be answered.
     ///
     /// `requests` replaces the outstanding set. A key that was outstanding
-    /// and does not appear in the new snapshot becomes superseded.
+    /// and does not appear in the new snapshot becomes superseded. When
+    /// `message` is given it becomes the task's status message.
     ///
     /// Returns `Ok(false)` if the task is unknown, expired, or already
     /// terminal.
@@ -1763,8 +1839,11 @@ pub trait TaskStore: Send + Sync + 'static {
     ///
     /// Terminal states are reached through [`complete_task`](Self::complete_task),
     /// [`fail_task`](Self::fail_task), and [`cancel_task`](Self::cancel_task);
-    /// this is for progress reporting while a task is still running. Returns
-    /// `Ok(false)` if the task is unknown, expired, or already terminal.
+    /// this is for progress reporting while a task is still running. The
+    /// status, and the message when one is given, are what
+    /// [`get_task`](Self::get_task) reports afterwards. Returns `Ok(false)` if
+    /// the task is unknown, expired, or already terminal, and the default,
+    /// which does nothing, returns `Ok(false)` for every task.
     async fn set_status(
         &self,
         task_id: &str,

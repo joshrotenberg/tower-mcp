@@ -37,6 +37,14 @@
 //! # }
 //! ```
 //!
+//! # Store contract suites
+//!
+//! [`store_contracts`] holds reusable suites that check an implementation of
+//! [`TaskStore`](crate::async_task::TaskStore), and, with the `http` or
+//! `websocket` feature, `SessionStore` and `EventStore`, against the behavior
+//! each trait documents. Run them from an ordinary async test when writing an
+//! external store.
+//!
 //! # Full Example
 //!
 //! The following shows a complete test setup with tools, resources, and prompts:
@@ -139,6 +147,8 @@
 //! assert_eq!(pong, json!({}));
 //! # }
 //! ```
+
+pub mod store_contracts;
 
 use std::collections::HashMap;
 

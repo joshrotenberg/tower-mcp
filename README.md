@@ -110,7 +110,7 @@ No features are enabled by default.
 | `jwks` | JWKS endpoint fetching for remote key sets (requires `oauth`) |
 | `http-client` | HTTP client transport |
 | `oauth-client` | OAuth client: authorization code with PKCE, registration, refresh, scope escalation, client credentials, discovery, token providers (requires `http-client`) |
-| `testing` | `TestClient` for in-process server testing |
+| `testing` | `TestClient` for in-process server testing, and contract suites for custom `TaskStore`, `SessionStore`, and `EventStore` implementations |
 | `dynamic-tools` | Runtime registration and deregistration of tools, prompts, and resources |
 | `proxy` | Multi-server aggregation proxy (`McpProxy`) |
 | `macros` | Proc macros (`#[tool_fn]`, `#[prompt_fn]`, `#[resource_fn]`, `#[resource_template_fn]`) |

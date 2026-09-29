@@ -268,6 +268,42 @@ an external backend for a real multi-instance deployment. See
 [`session_store.rs`](https://github.com/joshrotenberg/tower-mcp/blob/main/examples/session_store.rs), and
 [`event_store.rs`](https://github.com/joshrotenberg/tower-mcp/blob/main/examples/event_store.rs).
 
+## Testing a custom store
+
+`SessionStore` and `EventStore` carry rules a store that compiles can still
+break: the session's principal has to come back unchanged, `save` replaces the
+whole record, replay returns events strictly after the given ID and in order.
+The `testing` feature ships a contract suite for each trait, plus one for
+`TaskStore`. Each takes a constructor that returns an empty store, runs every
+check against a fresh one, and panics with the rule it found broken:
+
+```toml
+[dev-dependencies]
+tower-mcp = { version = "0.23", features = ["http", "testing"] }
+```
+
+```rust,ignore
+use tower_mcp::testing::store_contracts::{event_store_contract, session_store_contract};
+
+#[tokio::test]
+async fn redis_session_store_honors_the_contract() {
+    // A fresh key prefix or database per call keeps the checks independent.
+    session_store_contract(|| RedisSessionStore::for_test()).await;
+}
+
+#[tokio::test]
+async fn redis_event_store_honors_the_contract() {
+    event_store_contract(|| RedisEventStore::for_test()).await;
+}
+```
+
+The suites check documented behavior only. They do not check that an expired
+session is hidden from `SessionStore::load` (the trait allows returning it), or
+the buffer capacity of an event store (the trait defines none). Do not run them
+under `tokio::time::pause`; the expiry checks in the task suite poll against
+real time. See `tower_mcp::testing::store_contracts` and the task store's
+[module documentation](crate::async_task) for the rules each suite covers.
+
 ## Reverse proxies and SSE
 
 The proxy must stream response bytes promptly and keep long-lived responses
