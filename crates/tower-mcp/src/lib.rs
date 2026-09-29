@@ -184,19 +184,19 @@
 //!
 //! ## Task-oriented Guides
 //!
-//! - [`guides::client`] —
+//! - [`guides::client`]:
 //!   transport selection, lifecycle, callbacks, requests, caching, retries, and shutdown.
-//! - [`guides::deployment`] —
+//! - [`guides::deployment`]:
 //!   mounting, reverse proxies, origin/host validation, sessions, scaling, timeouts,
 //!   middleware order, health, and graceful shutdown.
-//! - [`guides::protocol_versions`] —
+//! - [`guides::protocol_versions`]:
 //!   compile-time availability, runtime allowlists, lifecycle differences,
 //!   interoperability, and upgrades.
-//! - [`guides::schema_validation`] —
+//! - [`guides::schema_validation`]:
 //!   validating tool arguments and structured output, deriving output schemas,
 //!   the error format, and opting out (requires `schema-validation`).
-//! - [`guides`] — OAuth, MCP Apps, and the complete task-oriented guide index.
-//! - [Examples index](https://github.com/joshrotenberg/tower-mcp/blob/main/examples/README.md) —
+//! - [`guides`]: OAuth, MCP Apps, and the complete task-oriented guide index.
+//! - [Examples index](https://github.com/joshrotenberg/tower-mcp/blob/main/examples/README.md):
 //!   runnable server, client, transport, middleware, OAuth, and extension patterns.
 //!
 //! ## Module Overviews
