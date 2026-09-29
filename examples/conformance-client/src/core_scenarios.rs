@@ -316,9 +316,12 @@ pub async fn sse_retry(server_url: &str) -> Result<()> {
 
 /// `elicitation-defaults` -- Connect with elicitation handler that applies defaults.
 pub async fn elicitation_defaults(server_url: &str) -> Result<()> {
+    let received = std::sync::Arc::new(tokio::sync::Notify::new());
     let (client, _) = connect_initialized(
         server_url,
-        || handlers::ElicitationDefaultsHandler,
+        || handlers::ElicitationDefaultsHandler {
+            received: received.clone(),
+        },
         |b: McpClientBuilder| b.with_elicitation(),
     )
     .await?;
@@ -332,7 +335,7 @@ pub async fn elicitation_defaults(server_url: &str) -> Result<()> {
 
     if let Some(tool) = test_tool {
         tracing::info!(tool = %tool.name, "Calling elicitation defaults test tool");
-        let _ = client.call_tool(&tool.name, serde_json::json!({})).await?;
+        call_until_elicited(&client, &tool.name, &received).await?;
     } else {
         // If the specific tool isn't found, call all tools
         for tool in &tools.tools {
@@ -343,6 +346,48 @@ pub async fn elicitation_defaults(server_url: &str) -> Result<()> {
 
     client.shutdown().await?;
     Ok(())
+}
+
+/// Call `tool` until its `elicitation/create` reaches the handler (#1459).
+///
+/// The harness sends the elicitation with no related request id, so the
+/// TypeScript SDK routes it to the standalone GET SSE stream and discards it
+/// if that stream is not registered yet. The client opens the stream in the
+/// background after `initialize`, so under CI contention the tool call can
+/// win the race and the elicitation is lost, leaving the call waiting for a
+/// response that never comes. Re-issuing the call once the stream is up
+/// recovers. A genuine elicitation regression still fails every attempt.
+async fn call_until_elicited(
+    client: &McpClient,
+    tool: &str,
+    received: &tokio::sync::Notify,
+) -> Result<()> {
+    const ATTEMPTS: u32 = 3;
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+
+    for attempt in 1..=ATTEMPTS {
+        let call = client.call_tool(tool, serde_json::json!({}));
+        tokio::pin!(call);
+        tokio::select! {
+            result = &mut call => {
+                result?;
+                return Ok(());
+            }
+            () = received.notified() => {
+                call.await?;
+                return Ok(());
+            }
+            () = tokio::time::sleep(WINDOW) => {
+                tracing::warn!(
+                    attempt,
+                    attempts = ATTEMPTS,
+                    "no elicitation/create within {WINDOW:?}; re-issuing the tool call"
+                );
+            }
+        }
+    }
+
+    anyhow::bail!("no elicitation/create arrived after {ATTEMPTS} calls to {tool}")
 }
 
 /// `ttl-list` -- Connect and verify tools/list returns a ttlMs hint.

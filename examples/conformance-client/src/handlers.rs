@@ -1,6 +1,8 @@
 //! Client handlers for server-initiated requests (sampling, elicitation, roots).
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Notify;
 use tower_mcp::JsonRpcError;
 use tower_mcp::client::ClientHandler;
 use tower_mcp::client::ServerNotification;
@@ -107,7 +109,12 @@ impl ClientHandler for FullHandler {
 
 /// Elicitation handler that applies default values from the schema.
 /// Used for `elicitation-defaults` scenario (SEP-1034).
-pub struct ElicitationDefaultsHandler;
+///
+/// `received` is notified on every `elicitation/create`, so the scenario can
+/// tell a lost elicitation from a slow one (#1459).
+pub struct ElicitationDefaultsHandler {
+    pub received: Arc<Notify>,
+}
 
 #[async_trait::async_trait]
 impl ClientHandler for ElicitationDefaultsHandler {
@@ -122,6 +129,7 @@ impl ClientHandler for ElicitationDefaultsHandler {
         &self,
         params: ElicitRequestParams,
     ) -> Result<ElicitResult, JsonRpcError> {
+        self.received.notify_one();
         match params {
             ElicitRequestParams::Form(form_params) => {
                 let mut content = HashMap::new();
