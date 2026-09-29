@@ -69,6 +69,29 @@
 //! }
 //! ```
 //!
+//! # Trace context (SEP-414)
+//!
+//! SEP-414 reserves `traceparent` and `tracestate` in a request's `_meta` for
+//! [W3C Trace Context](https://www.w3.org/TR/trace-context/). The JSON-RPC
+//! layer parses them on every request, on the 2025-11-25 lifecycle and on
+//! 2026-07-28, so tool, resource, and prompt handlers can read them with
+//! [`ctx.trace_context()`](RequestContext::trace_context). No feature flag is
+//! needed. A missing or malformed `traceparent` yields `None` and the request
+//! is served normally. [`McpTracingLayer`](crate::middleware::McpTracingLayer)
+//! records the same identifiers on its span; see
+//! [`TraceContext`](crate::trace_context::TraceContext) for the parsing rules.
+//!
+//! ```rust,ignore
+//! use tower_mcp::context::RequestContext;
+//!
+//! async fn my_tool(ctx: RequestContext, input: MyInput) -> Result<CallToolResult> {
+//!     if let Some(trace) = ctx.trace_context() {
+//!         tracing::info!(trace_id = trace.trace_id(), parent_span_id = trace.parent_id());
+//!     }
+//!     Ok(CallToolResult::text("ok"))
+//! }
+//! ```
+//!
 //! # Stateless mode: per-request metadata (`stateless` feature)
 //!
 //! With the 2026-07-28 protocol, clients do not run an initialize handshake.
@@ -619,6 +642,34 @@ impl RequestContext {
     #[cfg(feature = "stateless")]
     pub fn per_request_meta(&self) -> Option<&crate::stateless::StatelessRequestMeta> {
         self.extension::<crate::stateless::StatelessRequestMeta>()
+    }
+
+    /// W3C Trace Context (SEP-414) the client sent in the request's `_meta`.
+    ///
+    /// Available for tools, resources, and prompts on both the 2025-11-25
+    /// lifecycle (`params._meta`) and 2026-07-28 (per-request `_meta`), on any
+    /// transport that runs [`crate::jsonrpc::JsonRpcService`]. Returns `None`
+    /// when the request carried no `traceparent`, when it was malformed, or
+    /// when the request did not come through that service. A malformed value
+    /// never fails the request. See [`TraceContext`](crate::trace_context::TraceContext)
+    /// for the parsing rules.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// async fn my_tool(ctx: RequestContext, input: MyInput) -> Result<CallToolResult> {
+    ///     if let Some(trace) = ctx.trace_context() {
+    ///         tracing::info!(
+    ///             trace_id = trace.trace_id(),
+    ///             parent_span_id = trace.parent_id(),
+    ///             sampled = trace.sampled(),
+    ///         );
+    ///     }
+    ///     Ok(CallToolResult::text("ok"))
+    /// }
+    /// ```
+    pub fn trace_context(&self) -> Option<&crate::trace_context::TraceContext> {
+        self.extension::<crate::trace_context::TraceContext>()
     }
 
     /// SEP-2322 continuation values supplied by the client on this attempt.

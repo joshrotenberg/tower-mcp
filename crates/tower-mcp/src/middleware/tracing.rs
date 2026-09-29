@@ -27,6 +27,21 @@
 //!   - Prompt gets: prompt name
 //! - Request duration
 //! - Response status (success or error code)
+//! - W3C trace context (SEP-414), when the request `_meta` carried a valid
+//!   `traceparent`
+//!
+//! # Trace Context
+//!
+//! The `mcp_request` span always declares the fields `trace_id` and
+//! `parent_span_id`. They hold the 32-digit trace id and the 16-digit span id
+//! from the request's `traceparent`, and stay empty when the request carried
+//! none or a malformed one. The layer reads the context that
+//! [`JsonRpcService`](crate::jsonrpc::JsonRpcService) attaches to the request
+//! extensions, so it needs to sit inside that service, as every transport's
+//! `.layer()` does. It does not set an OpenTelemetry parent; a subscriber can
+//! use the two fields to correlate the span with the caller's trace. Handlers
+//! read the same value with
+//! [`RequestContext::trace_context`](crate::context::RequestContext::trace_context).
 //!
 //! # Log Levels
 //!
@@ -46,6 +61,7 @@ use tracing::{Instrument, Level, Span};
 
 use crate::protocol::McpRequest;
 use crate::router::{RouterRequest, RouterResponse};
+use crate::trace_context::TraceContext;
 
 /// Tower layer that adds structured tracing to MCP requests.
 ///
@@ -141,12 +157,17 @@ where
         let (operation_name, operation_target) = extract_operation_details(&req.inner);
 
         // Create the span based on the configured level
+        // SEP-414 trace context, when the JSON-RPC layer found one in `_meta`.
+        let trace_context = req.extensions.get::<TraceContext>();
+
         let span = create_span(
             self.level,
             &method,
             &request_id,
             operation_name,
             operation_target,
+            trace_context.map(TraceContext::trace_id),
+            trace_context.map(TraceContext::parent_id),
         );
 
         let start = Instant::now();
@@ -236,6 +257,8 @@ fn create_span(
     request_id: &str,
     operation_name: Option<&str>,
     operation_target: Option<String>,
+    trace_id: Option<&str>,
+    parent_span_id: Option<&str>,
 ) -> Span {
     match level {
         Level::TRACE => tracing::trace_span!(
@@ -244,6 +267,8 @@ fn create_span(
             request_id = %request_id,
             operation = operation_name,
             target = operation_target.as_deref(),
+            trace_id = trace_id,
+            parent_span_id = parent_span_id,
         ),
         Level::DEBUG => tracing::debug_span!(
             "mcp_request",
@@ -251,6 +276,8 @@ fn create_span(
             request_id = %request_id,
             operation = operation_name,
             target = operation_target.as_deref(),
+            trace_id = trace_id,
+            parent_span_id = parent_span_id,
         ),
         Level::INFO => tracing::info_span!(
             "mcp_request",
@@ -258,6 +285,8 @@ fn create_span(
             request_id = %request_id,
             operation = operation_name,
             target = operation_target.as_deref(),
+            trace_id = trace_id,
+            parent_span_id = parent_span_id,
         ),
         Level::WARN => tracing::warn_span!(
             "mcp_request",
@@ -265,6 +294,8 @@ fn create_span(
             request_id = %request_id,
             operation = operation_name,
             target = operation_target.as_deref(),
+            trace_id = trace_id,
+            parent_span_id = parent_span_id,
         ),
         Level::ERROR => tracing::error_span!(
             "mcp_request",
@@ -272,6 +303,8 @@ fn create_span(
             request_id = %request_id,
             operation = operation_name,
             target = operation_target.as_deref(),
+            trace_id = trace_id,
+            parent_span_id = parent_span_id,
         ),
     }
 }

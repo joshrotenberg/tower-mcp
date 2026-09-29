@@ -517,6 +517,17 @@ where
     #[cfg(not(feature = "stateless"))]
     let protocol_version: Option<String> = None;
 
+    // SEP-414: `traceparent` / `tracestate` ride in `_meta` on both protocol
+    // revisions, so this runs for every request that reaches the service.
+    if let Some(trace_context) = req
+        .params
+        .as_ref()
+        .and_then(|params| params.get("_meta"))
+        .and_then(crate::trace_context::TraceContext::from_meta)
+    {
+        extensions.insert(trace_context);
+    }
+
     // Parse the MCP request from JSON-RPC
     let mcp_request = match McpRequest::from_jsonrpc(&req) {
         Ok(r) => r,

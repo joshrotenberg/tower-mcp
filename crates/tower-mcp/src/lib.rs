@@ -136,6 +136,7 @@
 //! - [`ReadResourceResult`] - Resource read result
 //! - [`GetPromptResult`] - Prompt expansion result
 //! - [`Content`] - Text, image, audio, or resource content
+//! - [`TraceContext`] - W3C `traceparent` and `tracestate` read from request `_meta` (SEP-414)
 //!
 //! ### Released 2026-07-28 protocol (requires `protocol-2026-07-28`)
 //! - [`stateless::StatelessRequestMeta`] - Per-request `_meta` carrying protocol version,
@@ -567,6 +568,7 @@ pub mod tasks;
 #[cfg(feature = "testing")]
 pub mod testing;
 pub mod tool;
+pub mod trace_context;
 pub mod tracing_layer;
 pub mod transport;
 
@@ -710,6 +712,7 @@ pub use tool::{
     BoxToolService, GuardLayer, McpTool, NoParams, PendingInput, TaskContext, TaskOutcome,
     TaskPreparation, Tool, ToolBuilder, ToolHandler, ToolRequest,
 };
+pub use trace_context::TraceContext;
 pub use transport::{
     BidirectionalStdioTransport, CatchError, GenericStdioTransport, StdioTransport,
     SyncStdioTransport,
