@@ -39,6 +39,9 @@ getrandom = { workspace = true }
 url = { workspace = true, optional = true }
 urlencoding = { workspace = true, optional = true }
 tower-resilience = { workspace = true, optional = true, default-features = false, features = ["circuitbreaker", "ratelimiter", "bulkhead"] }
+# Default features off: no remote (`resolve-http`) or file (`resolve-file`) `$ref`
+# resolution, so validating a tool call never touches the network or filesystem.
+jsonschema = { version = "0.56", optional = true, default-features = false }
 
 [dev-dependencies]
 async-trait.workspace = true
@@ -54,7 +57,7 @@ jsonschema = "0.56"
 [features]
 default = []
 # Enable all optional features
-full = ["http", "websocket", "unix", "childproc", "oauth", "jwks", "testing", "dynamic-tools", "http-client", "oauth-client", "proxy", "macros", "resilience", "mcp-apps", "protocol-2026-07-28"]
+full = ["http", "websocket", "unix", "childproc", "oauth", "jwks", "testing", "dynamic-tools", "http-client", "oauth-client", "proxy", "macros", "resilience", "mcp-apps", "protocol-2026-07-28", "schema-validation"]
 # Transport features
 http = ["dep:axum", "dep:hyper", "dep:http", "dep:http-body-util", "dep:tokio-stream", "dep:uuid"]
 websocket = ["dep:axum", "dep:uuid", "dep:tokio-tungstenite", "dep:futures-util"]
@@ -78,6 +81,9 @@ proxy = []
 resilience = ["dep:tower-resilience"]
 # Proc macros for tool/resource/prompt definitions
 macros = ["dep:tower-mcp-macros"]
+# Validate tool arguments against `inputSchema` and `structuredContent` against
+# `outputSchema` at call time (per-tool opt-out on `ToolBuilder`)
+schema-validation = ["dep:jsonschema"]
 # Typed server support for the stable MCP Apps extension (SEP-1865).
 # Enabling the API does not advertise or activate the extension; applications
 # must still call `McpRouter::with_mcp_apps`.

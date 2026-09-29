@@ -116,6 +116,7 @@ No features are enabled by default.
 | `macros` | Proc macros (`#[tool_fn]`, `#[prompt_fn]`, `#[resource_fn]`, `#[resource_template_fn]`) |
 | `resilience` | Re-export of tower-resilience circuit breaker, rate limiter, and bulkhead layers |
 | `mcp-apps` | Typed server support for the MCP Apps extension; runtime advertisement stays explicit via `McpRouter::with_mcp_apps()` |
+| `schema-validation` | Validate tool arguments against `inputSchema` and `structuredContent` against `outputSchema` at call time; per-tool opt-out on `ToolBuilder` |
 | `protocol-2026-07-28` | Compile the 2026-07-28 protocol implementation |
 | `stateless` | Compatibility alias for `protocol-2026-07-28` |
 

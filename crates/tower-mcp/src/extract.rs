@@ -92,6 +92,7 @@ use serde_json::Value;
 use crate::context::RequestContext;
 use crate::error::{Error, Result};
 use crate::protocol::CallToolResult;
+use crate::tool::SchemaValidation;
 
 // =============================================================================
 // Rejection Types
@@ -1033,6 +1034,7 @@ pub struct ToolBuilderWithExtractor<S, F, T> {
     pub(crate) title: Option<String>,
     pub(crate) description: Option<String>,
     pub(crate) output_schema: Option<Value>,
+    pub(crate) validation: SchemaValidation,
     pub(crate) icons: Option<Vec<crate::protocol::ToolIcon>>,
     pub(crate) annotations: Option<crate::protocol::ToolAnnotations>,
     pub(crate) task_support: crate::protocol::TaskSupportMode,
@@ -1078,6 +1080,7 @@ where
             mrtr_handler: None,
             input_schema: self.input_schema,
         }
+        .with_schema_validation(self.validation)
     }
 
     /// Apply a Tower layer (middleware) to this tool.
@@ -1121,6 +1124,7 @@ where
             title: self.title,
             description: self.description,
             output_schema: self.output_schema,
+            validation: self.validation,
             icons: self.icons,
             annotations: self.annotations,
             task_support: self.task_support,
@@ -1152,6 +1156,7 @@ pub struct ToolBuilderWithExtractorLayer<S, F, T, L> {
     title: Option<String>,
     description: Option<String>,
     output_schema: Option<Value>,
+    validation: SchemaValidation,
     icons: Option<Vec<crate::protocol::ToolIcon>>,
     annotations: Option<crate::protocol::ToolAnnotations>,
     task_support: crate::protocol::TaskSupportMode,
@@ -1208,6 +1213,7 @@ where
             mrtr_handler: None,
             input_schema: self.input_schema,
         }
+        .with_schema_validation(self.validation)
     }
 
     /// Apply an additional Tower layer (middleware).
@@ -1223,6 +1229,7 @@ where
             title: self.title,
             description: self.description,
             output_schema: self.output_schema,
+            validation: self.validation,
             icons: self.icons,
             annotations: self.annotations,
             task_support: self.task_support,
@@ -1259,6 +1266,7 @@ pub struct ToolBuilderWithTypedExtractor<S, F, T, I> {
     pub(crate) title: Option<String>,
     pub(crate) description: Option<String>,
     pub(crate) output_schema: Option<Value>,
+    pub(crate) validation: SchemaValidation,
     pub(crate) input_schema_override: Option<Value>,
     pub(crate) icons: Option<Vec<crate::protocol::ToolIcon>>,
     pub(crate) annotations: Option<crate::protocol::ToolAnnotations>,
@@ -1318,6 +1326,7 @@ where
             mrtr_handler: None,
             input_schema,
         }
+        .with_schema_validation(self.validation)
     }
 }
 

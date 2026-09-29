@@ -13,6 +13,9 @@
 //!   service-to-service clients, persistence, and production policy.
 //! - [`mcp_apps`] — typed MCP Apps resources, negotiation, fallback, CSP,
 //!   permissions, and visibility.
+//! - [`schema_validation`] — checking tool arguments against `inputSchema`
+//!   and `structuredContent` against `outputSchema`, deriving output schemas,
+//!   the error format, and opting out.
 
 // Each guide is gated on the features its examples use. The guides are
 // doc-only, so this is invisible to callers, and it stops a default-features
@@ -27,3 +30,5 @@ pub mod mcp_apps;
 #[cfg(feature = "oauth-client")]
 pub mod oauth;
 pub mod protocol_versions;
+#[cfg(feature = "schema-validation")]
+pub mod schema_validation;

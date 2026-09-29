@@ -994,6 +994,7 @@ pub struct ToolBuilder {
     title: Option<String>,
     description: Option<String>,
     output_schema: Option<Value>,
+    validation: SchemaValidation,
     input_schema_override: Option<Value>,
     icons: Option<Vec<ToolIcon>>,
     annotations: Option<ToolAnnotations>,
@@ -1023,6 +1024,7 @@ impl ToolBuilder {
             title: None,
             description: None,
             output_schema: None,
+            validation: SchemaValidation::default(),
             input_schema_override: None,
             icons: None,
             annotations: None,
@@ -1043,6 +1045,7 @@ impl ToolBuilder {
             title: None,
             description: None,
             output_schema: None,
+            validation: SchemaValidation::default(),
             input_schema_override: None,
             icons: None,
             annotations: None,
@@ -1073,6 +1076,73 @@ impl ToolBuilder {
     /// Set the output schema (JSON Schema for structured output)
     pub fn output_schema(mut self, schema: Value) -> Self {
         self.output_schema = Some(schema);
+        self
+    }
+
+    /// Derive the output schema from a type via [`schemars::JsonSchema`].
+    ///
+    /// The schema is generated the same way input schemas are, so the draft
+    /// and `$defs` handling match. It replaces any schema set earlier with
+    /// [`output_schema`](Self::output_schema), and the MCP specification
+    /// requires it to describe a JSON object.
+    ///
+    /// The tool is not tied to `T`: the handler still builds its own
+    /// [`CallToolResult`], for example with
+    /// [`CallToolResult::from_serialize`]. With the `schema-validation`
+    /// feature, the schema is also checked against the `structuredContent`
+    /// the handler returns.
+    ///
+    /// ```rust
+    /// use schemars::JsonSchema;
+    /// use serde::Serialize;
+    /// use tower_mcp::{CallToolResult, NoParams, ToolBuilder};
+    ///
+    /// #[derive(Serialize, JsonSchema)]
+    /// struct Weather { temperature: f64, conditions: String }
+    ///
+    /// let tool = ToolBuilder::new("weather")
+    ///     .output_schema_for::<Weather>()
+    ///     .handler(|_input: NoParams| async {
+    ///         CallToolResult::from_serialize(&Weather {
+    ///             temperature: 21.5,
+    ///             conditions: "clear".to_string(),
+    ///         })
+    ///     })
+    ///     .build();
+    ///
+    /// let schema = tool.definition().output_schema.unwrap();
+    /// assert_eq!(schema["type"], "object");
+    /// assert!(schema["properties"]["temperature"].is_object());
+    /// ```
+    pub fn output_schema_for<T: JsonSchema>(mut self) -> Self {
+        self.output_schema = Some(
+            serde_json::to_value(schemars::schema_for!(T))
+                .unwrap_or_else(|_| serde_json::json!({ "type": "object" })),
+        );
+        self
+    }
+
+    /// Do not validate this tool's arguments against its input schema.
+    ///
+    /// With the `schema-validation` feature every tool checks `arguments`
+    /// against its advertised `inputSchema` before the handler runs. This
+    /// opts one tool out, for example when its schema is deliberately looser
+    /// or stricter than what the handler accepts. Without the feature this is
+    /// a no-op, so code that calls it builds either way.
+    pub fn skip_input_validation(mut self) -> Self {
+        self.validation.input = false;
+        self
+    }
+
+    /// Do not validate this tool's `structuredContent` against its output
+    /// schema.
+    ///
+    /// With the `schema-validation` feature a result whose `structuredContent`
+    /// does not match the declared `outputSchema` is replaced by an error
+    /// result. This opts one tool out. Without the feature this is a no-op,
+    /// so code that calls it builds either way.
+    pub fn skip_output_validation(mut self) -> Self {
+        self.validation.output = false;
         self
     }
 
@@ -1252,6 +1322,7 @@ impl ToolBuilder {
             title: self.title,
             description: self.description,
             output_schema: self.output_schema,
+            validation: self.validation,
             input_schema_override: self.input_schema_override,
             icons: self.icons,
             annotations: self.annotations,
@@ -1313,6 +1384,7 @@ impl ToolBuilder {
             title: self.title,
             description: self.description,
             output_schema: self.output_schema,
+            validation: self.validation,
             input_schema_override: self.input_schema_override,
             icons: self.icons,
             annotations: self.annotations,
@@ -1458,6 +1530,7 @@ impl ToolBuilder {
             title: self.title,
             description: self.description,
             output_schema: self.output_schema,
+            validation: self.validation,
             input_schema: self.input_schema_override.unwrap_or(derived_schema),
             icons: self.icons,
             annotations: self.annotations,
@@ -1483,6 +1556,7 @@ impl ToolBuilder {
             title: self.title,
             description: self.description,
             output_schema: self.output_schema,
+            validation: self.validation,
             input_schema_override: self.input_schema_override,
             icons: self.icons,
             annotations: self.annotations,
@@ -1604,6 +1678,7 @@ impl ToolBuilder {
             title: self.title,
             description: self.description,
             output_schema: self.output_schema,
+            validation: self.validation,
             icons: self.icons,
             annotations: self.annotations,
             task_support: self.task_support,
@@ -1668,6 +1743,7 @@ impl ToolBuilder {
             title: self.title,
             description: self.description,
             output_schema: self.output_schema,
+            validation: self.validation,
             input_schema_override: self.input_schema_override,
             icons: self.icons,
             annotations: self.annotations,
@@ -1707,6 +1783,7 @@ pub struct ToolBuilderWithHandler<I, F> {
     title: Option<String>,
     description: Option<String>,
     output_schema: Option<Value>,
+    validation: SchemaValidation,
     input_schema_override: Option<Value>,
     icons: Option<Vec<ToolIcon>>,
     annotations: Option<ToolAnnotations>,
@@ -1724,6 +1801,7 @@ pub struct ToolBuilderWithMrtrHandler<I, F> {
     title: Option<String>,
     description: Option<String>,
     output_schema: Option<Value>,
+    validation: SchemaValidation,
     input_schema_override: Option<Value>,
     icons: Option<Vec<ToolIcon>>,
     annotations: Option<ToolAnnotations>,
@@ -1745,6 +1823,7 @@ pub struct ToolBuilderWithLiveHandler {
     title: Option<String>,
     description: Option<String>,
     output_schema: Option<Value>,
+    validation: SchemaValidation,
     input_schema: Value,
     icons: Option<Vec<ToolIcon>>,
     annotations: Option<ToolAnnotations>,
@@ -1774,6 +1853,7 @@ impl ToolBuilderWithLiveHandler {
             live_handler: Some(self.handler),
             input_schema: ensure_object_schema(self.input_schema),
         }
+        .with_schema_validation(self.validation)
     }
 
     /// Add a synchronous fallback for calls that do not negotiate Tasks.
@@ -1833,6 +1913,7 @@ impl ToolBuilderWithLiveHandler {
             title: self.title,
             description: self.description,
             output_schema: self.output_schema,
+            validation: self.validation,
             input_schema: self.input_schema,
             icons: self.icons,
             annotations: self.annotations,
@@ -1894,6 +1975,7 @@ impl ToolBuilderWithLiveHandler {
             title: self.title,
             description: self.description,
             output_schema: self.output_schema,
+            validation: self.validation,
             input_schema: self.input_schema,
             icons: self.icons,
             annotations: self.annotations,
@@ -1985,6 +2067,7 @@ pub struct ToolBuilderWithLiveAndFallback {
     title: Option<String>,
     description: Option<String>,
     output_schema: Option<Value>,
+    validation: SchemaValidation,
     input_schema: Value,
     icons: Option<Vec<ToolIcon>>,
     annotations: Option<ToolAnnotations>,
@@ -2019,6 +2102,7 @@ impl ToolBuilderWithLiveAndFallback {
             live_handler: Some(self.live_handler),
             input_schema: ensure_object_schema(self.input_schema),
         }
+        .with_schema_validation(self.validation)
     }
 }
 
@@ -2034,6 +2118,7 @@ pub struct ToolBuilderWithLiveAndMrtrFallback {
     title: Option<String>,
     description: Option<String>,
     output_schema: Option<Value>,
+    validation: SchemaValidation,
     input_schema: Value,
     icons: Option<Vec<ToolIcon>>,
     annotations: Option<ToolAnnotations>,
@@ -2068,6 +2153,7 @@ impl ToolBuilderWithLiveAndMrtrFallback {
             live_handler: Some(self.live_handler),
             input_schema: ensure_object_schema(self.input_schema),
         }
+        .with_schema_validation(self.validation)
     }
 }
 
@@ -2079,6 +2165,7 @@ pub struct ToolBuilderWithMrtrLayer<I, F, L> {
     title: Option<String>,
     description: Option<String>,
     output_schema: Option<Value>,
+    validation: SchemaValidation,
     input_schema_override: Option<Value>,
     icons: Option<Vec<ToolIcon>>,
     annotations: Option<ToolAnnotations>,
@@ -2097,6 +2184,7 @@ pub struct ToolBuilderWithNoParamsHandler<F> {
     title: Option<String>,
     description: Option<String>,
     output_schema: Option<Value>,
+    validation: SchemaValidation,
     input_schema_override: Option<Value>,
     icons: Option<Vec<ToolIcon>>,
     annotations: Option<ToolAnnotations>,
@@ -2124,6 +2212,7 @@ where
                 handler: self.handler,
             },
         )
+        .with_schema_validation(self.validation)
     }
 
     /// Apply a Tower layer (middleware) to this tool.
@@ -2135,6 +2224,7 @@ where
             title: self.title,
             description: self.description,
             output_schema: self.output_schema,
+            validation: self.validation,
             input_schema_override: self.input_schema_override,
             icons: self.icons,
             annotations: self.annotations,
@@ -2162,6 +2252,7 @@ pub struct ToolBuilderWithNoParamsHandlerLayer<F, L> {
     title: Option<String>,
     description: Option<String>,
     output_schema: Option<Value>,
+    validation: SchemaValidation,
     input_schema_override: Option<Value>,
     icons: Option<Vec<ToolIcon>>,
     annotations: Option<ToolAnnotations>,
@@ -2211,6 +2302,7 @@ where
             mrtr_handler: None,
             input_schema,
         }
+        .with_schema_validation(self.validation)
     }
 
     /// Apply an additional Tower layer (middleware).
@@ -2223,6 +2315,7 @@ where
             title: self.title,
             description: self.description,
             output_schema: self.output_schema,
+            validation: self.validation,
             input_schema_override: self.input_schema_override,
             icons: self.icons,
             annotations: self.annotations,
@@ -2269,7 +2362,7 @@ where
             },
         );
         tool.task_preparer = self.task_preparer;
-        tool
+        tool.with_schema_validation(self.validation)
     }
 
     /// Add a typed preparation step for task-backed invocations.
@@ -2316,6 +2409,7 @@ where
             title: self.title,
             description: self.description,
             output_schema: self.output_schema,
+            validation: self.validation,
             input_schema_override: self.input_schema_override,
             icons: self.icons,
             annotations: self.annotations,
@@ -2364,6 +2458,7 @@ where
                 _phantom: std::marker::PhantomData,
             },
         )
+        .with_schema_validation(self.validation)
     }
 
     /// Apply a Tower layer to every attempt at this MRTR-capable tool.
@@ -2377,6 +2472,7 @@ where
             title: self.title,
             description: self.description,
             output_schema: self.output_schema,
+            validation: self.validation,
             input_schema_override: self.input_schema_override,
             icons: self.icons,
             annotations: self.annotations,
@@ -2442,6 +2538,7 @@ where
             })),
             input_schema,
         }
+        .with_schema_validation(self.validation)
     }
 
     /// Apply an additional Tower layer.
@@ -2454,6 +2551,7 @@ where
             title: self.title,
             description: self.description,
             output_schema: self.output_schema,
+            validation: self.validation,
             input_schema_override: self.input_schema_override,
             icons: self.icons,
             annotations: self.annotations,
@@ -2485,6 +2583,7 @@ pub struct ToolBuilderWithLayer<I, F, L> {
     title: Option<String>,
     description: Option<String>,
     output_schema: Option<Value>,
+    validation: SchemaValidation,
     input_schema_override: Option<Value>,
     icons: Option<Vec<ToolIcon>>,
     annotations: Option<ToolAnnotations>,
@@ -2542,6 +2641,7 @@ where
             mrtr_handler: None,
             input_schema,
         }
+        .with_schema_validation(self.validation)
     }
 
     /// Apply an additional Tower layer (middleware).
@@ -2557,6 +2657,7 @@ where
             title: self.title,
             description: self.description,
             output_schema: self.output_schema,
+            validation: self.validation,
             input_schema_override: self.input_schema_override,
             icons: self.icons,
             annotations: self.annotations,
@@ -2738,6 +2839,7 @@ pub trait McpTool: Send + Sync + 'static {
             None,
             McpToolHandler { tool },
         )
+        .with_schema_validation(SchemaValidation::default())
     }
 }
 
@@ -2773,6 +2875,7 @@ impl<T: McpTool> ToolHandler for McpToolHandler<T> {
 
 mod service;
 mod task;
+mod validation;
 
 // Re-exported at the visibility each item already had, so every path that
 // resolved before still resolves and nothing widens on the way out.
@@ -2780,6 +2883,7 @@ pub use service::{GuardLayer, GuardService, ToolCatchError};
 use task::TypedTaskPreparer;
 pub(crate) use task::{LiveTask, TaskPreparer};
 pub use task::{PendingInput, TaskContext, TaskOutcome, TaskPreparation};
+pub(crate) use validation::SchemaValidation;
 
 // Gated where they are defined, so importing them unconditionally would break
 // every build that is not `--all-features`.
