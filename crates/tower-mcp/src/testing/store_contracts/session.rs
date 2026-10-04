@@ -17,6 +17,10 @@ const KIND: &str = "SessionStore";
 /// Lifetime of records that must stay live for the whole check.
 const LIVE: Duration = Duration::from_secs(3600);
 
+/// Lifetime of records the expiry check lets lapse. Whole seconds, so a
+/// backend that stores its TTL at second precision still accepts it.
+const SHORT: Duration = Duration::from_secs(2);
+
 /// Run the [`SessionStore`] contract against the store `make` builds.
 ///
 /// `make` is called once per check and must return an empty store each time.
@@ -31,13 +35,15 @@ const LIVE: Duration = Duration::from_secs(3600);
 /// - `save` is an upsert that trusts the caller's ID, and an overwrite
 ///   replaces the whole record, including clearing optional fields;
 /// - `load` answers `None` for an unknown ID;
+/// - `load` answers `None` once a record's `expires_at` has passed, whether
+///   or not the store has deleted it yet;
 /// - `delete` removes only the named record and is idempotent.
 ///
-/// Expiry is not checked. The trait lets an implementation either hide an
-/// expired record or return it for the caller to judge, so neither is a
-/// violation. Timestamps are not compared for equality either: the trait does
-/// not fix their storage precision, so a backend that truncates them to
-/// milliseconds is still correct.
+/// The expiry check waits for two-second records to lapse, so the suite takes a
+/// few seconds and must run in real time, not under `tokio::time::pause`.
+/// Timestamps are not compared for equality: the trait does not fix their
+/// storage precision, so a backend that truncates them to milliseconds is
+/// still correct.
 ///
 /// # Panics
 ///
@@ -65,6 +71,7 @@ where
     save_is_an_upsert(&make()).await;
     overwrite_replaces_the_record(&make()).await;
     unknown_sessions(&make()).await;
+    expired_sessions(&make()).await;
     delete_is_scoped_and_idempotent(&make()).await;
 }
 
@@ -339,6 +346,34 @@ async fn unknown_sessions<S: SessionStore>(store: &S) {
         rule,
         "load(\"\") returned a record"
     );
+}
+
+async fn expired_sessions<S: SessionStore>(store: &S) {
+    let rule = "load answers None for an expired record";
+    let created = create(
+        store,
+        SessionRecord::new("lapsing", "2025-11-25", SHORT),
+        rule,
+    )
+    .await;
+    let saved = SessionRecord::new("lapsing-saved", "2025-11-25", SHORT);
+    ok!(rule, store.save(&saved).await);
+    let kept = create(store, record("outlives"), rule).await;
+
+    // Both short-lived records are present before they lapse.
+    load(store, &created.id, rule).await;
+    load(store, &saved.id, rule).await;
+
+    tokio::time::sleep(SHORT + Duration::from_millis(200)).await;
+
+    for id in [&created.id, &saved.id] {
+        check!(
+            ok!(rule, store.load(id).await).is_none(),
+            rule,
+            "load({id:?}) returned a record whose expires_at has passed"
+        );
+    }
+    load(store, &kept.id, rule).await;
 }
 
 async fn delete_is_scoped_and_idempotent<S: SessionStore>(store: &S) {
