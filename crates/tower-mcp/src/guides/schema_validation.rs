@@ -5,8 +5,8 @@ A tool advertises an `inputSchema` and, optionally, an `outputSchema`. serde
 enforces the shape of the arguments a typed handler deserializes, but not the
 constraints a schema can express (`minimum`, `maximum`, `pattern`,
 `minLength`, `format`), and handlers that take `RawArgs` or a hand-written
-`.input_schema(Value)` get no check at all. Nothing compares a result's
-`structuredContent` to the `outputSchema`.
+`.input_schema(Value)` get no schema check without the feature. Without it,
+nothing compares a result's `structuredContent` to the `outputSchema`.
 
 The opt-in `schema-validation` feature adds both checks. It pulls in
 [`jsonschema`](https://crates.io/crates/jsonschema) with its default features
@@ -15,6 +15,28 @@ off, so a schema is never resolved from the network or the filesystem.
 ```toml
 tower-mcp = { version = "0.23", features = ["schema-validation"] }
 ```
+
+## structuredContent shape before 2026-07-28
+
+Independently of the `schema-validation` feature and any output schema,
+tower-mcp checks successful results on MCP 2025-11-25 and earlier requests.
+Their `structuredContent` must be a JSON object. An array, scalar, or explicit
+null is replaced by an error result with no structured content, for example:
+
+```text
+Tool 'snapshots' returned structuredContent of type array; MCP 2025-11-25 and earlier require a JSON object. Wrap a list with CallToolResult::from_list or return an object.
+```
+
+The failure emits a `warn` event on `mcp::tools` with the tool name and message.
+Both shape and schema diagnostics use the build-time tool name, so later
+`with_name_prefix` calls (including `McpRouter::nest`) are not reflected.
+Error results and results without structured content pass through. Requests
+using MCP 2026-07-28 permit any JSON value and are not shape checked. The shape
+check runs before output schema validation, and
+`ToolBuilder::skip_output_validation` disables it even without the feature.
+`McpTool` implementations returning `Vec<_>` and `mcp_app_tool_result` callers
+passing lists receive this error on older requests; use `from_list` or return
+an object.
 
 ## What is checked
 
@@ -121,9 +143,9 @@ assert_eq!(tool.definition().output_schema.unwrap()["type"], "object");
 The handler still builds its own `CallToolResult`. `McpTool::Output` is not
 required to implement `JsonSchema`, so existing implementations keep
 compiling; to derive a schema for one, call `output_schema_for` on a builder,
-or set `.output_schema(...)` yourself. The MCP specification requires an
-output schema to describe a JSON object, and neither method rewrites the
-schema it is given.
+or set `.output_schema(...)` yourself. MCP 2025-11-25 and earlier require
+`"type": "object"` at the root; MCP 2026-07-28 accepts any JSON Schema 2020-12.
+Neither method rewrites or rejects the schema it is given.
 
 ## Opting out
 
@@ -144,8 +166,9 @@ let tool = ToolBuilder::new("passthrough")
     .build();
 ```
 
-Both methods exist whether or not the feature is compiled in, and do nothing
-without it, so a library that calls them builds either way.
+Both methods exist whether or not the feature is compiled in. Without it,
+`skip_input_validation` does nothing; `skip_output_validation` still disables
+the structured-content shape check.
 
 The feature is additive: enabling it anywhere in a dependency graph turns
 validation on for every tool built by tower-mcp in that graph, unless the tool

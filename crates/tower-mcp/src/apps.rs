@@ -691,6 +691,9 @@ impl McpAppResourceBuilder {
 ///
 /// The fallback remains meaningful for hosts that did not negotiate MCP Apps;
 /// the structured content is available to a rendered App.
+/// On MCP 2025-11-25 and earlier, the value must serialize to a JSON object
+/// or the tool call returns an error result; use [`CallToolResult::from_list`]
+/// to wrap a list.
 pub fn mcp_app_tool_result(
     fallback_text: impl Into<String>,
     structured_content: impl Serialize,
