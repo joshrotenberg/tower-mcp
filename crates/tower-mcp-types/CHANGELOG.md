@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.23.3] - 2026-10-09
+
+### Bug Fixes
+
+- **tool:** Reject a non-object structuredContent on 2025 requests (closes #1540) ([#1541](https://github.com/joshrotenberg/tower-mcp/pull/1541))
+
+
+
 ## [0.23.2] - 2026-09-29
 
 ### Features

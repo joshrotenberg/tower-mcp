@@ -2971,7 +2971,7 @@ checksum = "121c2a6cda46980bb0fcd1647ffaf6cd3fc79a013de288782836f6df9c48780e"
 
 [[package]]
 name = "tower-mcp"
-version = "0.23.2"
+version = "0.23.3"
 dependencies = [
  "async-trait",
  "axum",
@@ -3032,7 +3032,7 @@ dependencies = [
 
 [[package]]
 name = "tower-mcp-macros"
-version = "0.23.2"
+version = "0.23.3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3041,7 +3041,7 @@ dependencies = [
 
 [[package]]
 name = "tower-mcp-types"
-version = "0.23.2"
+version = "0.23.3"
 dependencies = [
  "base64 0.23.1",
  "indexmap",
