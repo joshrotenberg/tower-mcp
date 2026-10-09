@@ -85,6 +85,9 @@ impl StdioClientTransport {
     /// Stdin and stdout are automatically set to piped. Stderr keeps the
     /// [`Command`] configuration; its default is inherited.
     ///
+    /// The child is killed if the transport is dropped before
+    /// [`ClientTransport::close`] has stopped it.
+    ///
     /// # Example
     ///
     /// ```rust,no_run
@@ -101,6 +104,19 @@ impl StdioClientTransport {
     /// ```
     pub async fn spawn_command(cmd: &mut Command) -> Result<Self> {
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
+
+        // Tie the child's lifetime to this transport. `close()` is the
+        // graceful path, but nothing guarantees it runs: a caller can drop
+        // the transport on an error path, for example after giving up on a
+        // slow `initialize`, and `Drop for McpClient` aborts the message loop
+        // task before its cleanup can await `close()`. Without this the child
+        // outlives every handle to it, still running with all of its side
+        // effects and with nothing left that can stop it.
+        //
+        // `kill_on_drop` also hands the pid to tokio's orphan reaper, so no
+        // zombie is left behind. A clean `close()` takes the child out of
+        // `self` first, so this never double-kills.
+        cmd.kill_on_drop(true);
 
         let mut child = cmd
             .spawn()
@@ -311,6 +327,70 @@ mod tests {
 
         transport.close().await.unwrap();
         assert!(!transport.is_connected());
+    }
+
+    /// Dropping the transport without `close()` must still kill the child.
+    ///
+    /// The paths that skip `close()` are real: a caller that gives up on a
+    /// slow `initialize` drops the transport, and `Drop for McpClient` aborts
+    /// the message loop task that would have awaited `close()`. A surviving
+    /// child is unreachable but keeps running.
+    ///
+    /// Liveness is measured by side effect rather than by pid: a killed
+    /// process stops appending to its file, whereas `kill -0` on a
+    /// not-yet-reaped zombie still succeeds and would pass a broken
+    /// implementation.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_the_transport_kills_the_child() {
+        use std::time::{Duration, Instant};
+
+        let ticks = std::env::temp_dir().join(format!(
+            "tower-mcp-kill-on-drop-{}-{}.ticks",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&ticks);
+
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            // Ignore SIGTERM so the test cannot pass on a polite signal that a
+            // real unresponsive server would also ignore.
+            &format!(
+                "trap '' TERM; while :; do printf x >> '{}'; sleep 0.1; done",
+                ticks.display()
+            ),
+        ]);
+        let transport = StdioClientTransport::spawn_command(&mut cmd).await.unwrap();
+
+        // Wait until the child is demonstrably alive and writing.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let size = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        while size(&ticks) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "child never started writing; the test cannot tell life from death"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        drop(transport);
+
+        // Let the kill land, then prove the writing stopped for good.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let settled = size(&ticks);
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let later = size(&ticks);
+
+        let _ = std::fs::remove_file(&ticks);
+        assert_eq!(
+            settled, later,
+            "child kept running after its transport was dropped ({settled} -> {later} bytes)"
+        );
     }
 
     #[tokio::test]
