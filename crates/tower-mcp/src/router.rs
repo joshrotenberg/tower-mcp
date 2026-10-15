@@ -1784,6 +1784,7 @@ impl McpRouter {
                 self.session.mark_initializing();
                 let capabilities = self.capabilities_for_protocol(Some(&protocol_version));
                 self.session.insert(params.capabilities.clone());
+                self.session.insert(params.client_info.clone());
                 self.session
                     .insert(crate::NegotiatedExtensions::from_capabilities(
                         &params.capabilities,
