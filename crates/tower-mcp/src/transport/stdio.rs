@@ -63,9 +63,9 @@ use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 
 use crate::context::{
-    ChannelClientRequester, ClientRequesterHandle, NotificationReceiver, NotificationSender,
-    OutgoingRequest, OutgoingRequestReceiver, ServerNotification, notification_channel,
-    outgoing_request_channel,
+    CancellationToken, ChannelClientRequester, ClientRequesterHandle, NotificationReceiver,
+    NotificationSender, OutgoingRequest, OutgoingRequestReceiver, ServerNotification,
+    notification_channel, outgoing_request_channel,
 };
 use tower_service::Service;
 
@@ -228,6 +228,124 @@ fn stdio_control_channel() -> (
     mpsc::unbounded_channel()
 }
 
+/// How long a handler gets to honor its cancellation token once the drain
+/// has given up on it, before its task is aborted (#1557).
+const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The tasks one connection has started, so they can be stopped when the
+/// connection gives up on them (#1557).
+///
+/// Handlers run on detached tasks. When the drain times out nothing else
+/// holds them, so without this they would run on after `run` returned with
+/// their cancellation tokens unfired. The token is a connection-scoped
+/// parent of each request's own, not the router's in-flight registry: that
+/// registry is shared by every clone of a router, so cancelling through it
+/// could reach a request belonging to another connection.
+#[derive(Clone, Default)]
+struct RequestScope {
+    cancel: CancellationToken,
+    tasks: Arc<RequestTasks>,
+}
+
+#[derive(Default)]
+struct RequestTasks {
+    live: std::sync::Mutex<(u64, HashMap<u64, tokio::task::AbortHandle>)>,
+    idle: tokio::sync::Notify,
+}
+
+/// Removes a task from the scope when it ends, however it ends.
+struct TaskEntry {
+    tasks: Arc<RequestTasks>,
+    id: u64,
+}
+
+impl Drop for TaskEntry {
+    fn drop(&mut self) {
+        if let Ok(mut live) = self.tasks.live.lock() {
+            live.1.remove(&self.id);
+        }
+        self.tasks.idle.notify_waiters();
+    }
+}
+
+impl RequestScope {
+    /// The parent of the cancellation token every request on this connection
+    /// is given.
+    fn token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
+    /// Spawn a task that the scope can abort.
+    fn spawn<F>(&self, task: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let Ok(mut live) = self.tasks.live.lock() else {
+            tokio::spawn(task);
+            return;
+        };
+        let id = live.0;
+        live.0 += 1;
+        let entry = TaskEntry {
+            tasks: self.tasks.clone(),
+            id,
+        };
+        // Spawned and registered under the lock, so a task that ends at once
+        // waits for its own entry to exist before removing it.
+        let handle = tokio::spawn(async move {
+            let _entry = entry;
+            task.await;
+        });
+        live.1.insert(id, handle.abort_handle());
+    }
+
+    async fn wait_idle(&self) {
+        loop {
+            let notified = self.tasks.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self
+                .tasks
+                .live
+                .lock()
+                .map_or(true, |live| live.1.is_empty())
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Fire the cancellation token of everything still running, give it
+    /// [`CANCEL_GRACE`] to stop, then abort whatever has not.
+    async fn cancel_and_abort(&self) {
+        self.cancel.cancel();
+        if tokio::time::timeout(CANCEL_GRACE, self.wait_idle())
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        if let Ok(live) = self.tasks.live.lock() {
+            tracing::warn!(
+                tasks = live.1.len(),
+                "in-flight requests ignored cancellation; aborting"
+            );
+            for handle in live.1.values() {
+                handle.abort();
+            }
+        }
+    }
+}
+
+/// Where `GenericStdioTransport::process_input` sends what it produces.
+#[derive(Clone, Copy)]
+struct RequestSinks<'a> {
+    out_tx: &'a OutboundFrames,
+    work_tx: &'a mpsc::UnboundedSender<QueuedRequest>,
+    scope: &'a RequestScope,
+}
+
 /// Write whatever in-flight requests still produce, then return.
 ///
 /// `timeout` bounds the wait. `None` waits for every in-flight request,
@@ -237,11 +355,13 @@ fn stdio_control_channel() -> (
 /// A bound exists for the case where a handler cannot finish until the
 /// application shuts down, and the application is waiting on `run` to
 /// return before shutting down (#1252). Reaching it abandons the remaining
-/// responses, which is why it is opt-in.
+/// responses, which is why it is opt-in. It also cancels the handlers that
+/// were abandoned, and aborts any that do not stop (#1557).
 async fn drain_responses<W>(
     out_rx: &mut mpsc::UnboundedReceiver<String>,
     writer: &mut W,
     timeout: Option<std::time::Duration>,
+    scope: &RequestScope,
 ) -> Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin + Send,
@@ -262,6 +382,7 @@ where
                     timeout_ms = limit.as_millis() as u64,
                     "drain timed out; abandoning in-flight responses"
                 );
+                scope.cancel_and_abort().await;
                 Ok(())
             }
         },
@@ -648,11 +769,18 @@ fn spawn_request_dispatcher(
     mut queue: mpsc::UnboundedReceiver<QueuedRequest>,
     limit: Option<Arc<Semaphore>>,
     out_tx: OutboundFrames,
+    scope: RequestScope,
 ) {
-    tokio::spawn(async move {
+    // Part of the scope too: requests still queued behind a saturated limit
+    // must not start after the connection has given up (#1557).
+    let spawner = scope.clone();
+    spawner.spawn(async move {
         while let Some(work) = queue.recv().await {
             let permit = acquire_request_permit(&limit).await;
-            spawn_request(permit, &out_tx, work);
+            if scope.cancel.is_cancelled() {
+                break;
+            }
+            spawn_request(permit, &out_tx, &scope, work);
         }
     });
 }
@@ -666,12 +794,13 @@ fn spawn_request_dispatcher(
 fn spawn_request<F>(
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
     out_tx: &OutboundFrames,
+    scope: &RequestScope,
     work: F,
 ) where
     F: std::future::Future<Output = Option<String>> + Send + 'static,
 {
     let out_tx = out_tx.clone();
-    tokio::spawn(async move {
+    scope.spawn(async move {
         // Held for the life of the request so the bound counts work in
         // flight rather than requests accepted.
         let _permit = permit;
@@ -985,7 +1114,9 @@ impl StdioTransport {
     ///
     /// Set a bound when a handler might not finish on its own. Reaching it
     /// abandons the remaining responses and returns, which is preferable to
-    /// never returning. Pair it with
+    /// never returning. The handlers still running are cancelled through
+    /// their [`RequestContext`](crate::RequestContext) token, and any that do
+    /// not stop within a short grace period are aborted (#1557). Pair it with
     /// [`StdioTransportHandle::stopping`] so the application can release
     /// those handlers rather than relying on the deadline (#1252).
     pub fn drain_timeout(mut self, timeout: std::time::Duration) -> Self {
@@ -1176,7 +1307,8 @@ impl StdioTransport {
         // The reader hands work to the dispatcher and moves on, so a
         // saturated limit never stops it reading control traffic (#1251).
         let (work_tx, work_rx) = mpsc::unbounded_channel::<QueuedRequest>();
-        spawn_request_dispatcher(work_rx, limit, out_tx.clone());
+        let scope = RequestScope::default();
+        spawn_request_dispatcher(work_rx, limit, out_tx.clone(), scope.clone());
 
         tracing::info!("Stdio transport started, waiting for input");
 
@@ -1238,7 +1370,10 @@ impl StdioTransport {
                     }
 
                     let barrier = is_ordering_barrier(trimmed);
-                    let mut service = self.service.clone();
+                    let mut service = self
+                        .service
+                        .clone()
+                        .with_connection_cancellation(scope.token());
                     let router = self.router.clone();
                     let owned = trimmed.to_string();
                     // The service clone shares the negotiated protocol
@@ -1277,7 +1412,7 @@ impl StdioTransport {
                     } else {
                         // No permit and no queue: a notification must be able
                         // to overtake the requests it affects (#1251).
-                        spawn_request(None, &out_tx, work);
+                        spawn_request(None, &out_tx, &scope, work);
                     }
                 }
 
@@ -1342,7 +1477,7 @@ impl StdioTransport {
         // Without this their responses would be lost on shutdown.
         drop(work_tx);
         drop(out_tx);
-        drain_responses(&mut out_rx, &mut writer, self.drain_timeout).await?;
+        drain_responses(&mut out_rx, &mut writer, self.drain_timeout, &scope).await?;
 
         // The read loop is over: any streams still registered die with
         // the connection and cannot receive a terminal frame.
@@ -1584,7 +1719,8 @@ where
         // Same reasoning as the plain transport: reading must not stall on a
         // saturated limit (#1251).
         let (work_tx, work_rx) = mpsc::unbounded_channel::<QueuedRequest>();
-        spawn_request_dispatcher(work_rx, limit, out_tx.clone());
+        let scope = RequestScope::default();
+        spawn_request_dispatcher(work_rx, limit, out_tx.clone(), scope.clone());
 
         tracing::info!("Generic stdio transport started, waiting for input");
 
@@ -1608,8 +1744,7 @@ where
                         Self::process_input(
                             &mut self.service,
                             &line,
-                            &out_tx,
-                            &work_tx,
+                            &RequestSinks { out_tx: &out_tx, work_tx: &work_tx, scope: &scope },
                             self.incoming_notifications.as_ref(),
                             true,
                             #[cfg(feature = "stateless")]
@@ -1669,8 +1804,7 @@ where
                         Self::process_input(
                             &mut self.service,
                             &line,
-                            &out_tx,
-                            &work_tx,
+                            &RequestSinks { out_tx: &out_tx, work_tx: &work_tx, scope: &scope },
                             self.incoming_notifications.as_ref(),
                             false,
                             #[cfg(feature = "stateless")]
@@ -1706,7 +1840,7 @@ where
         // Without this their responses would be lost on shutdown.
         drop(work_tx);
         drop(out_tx);
-        drain_responses(&mut out_rx, &mut writer, self.drain_timeout).await?;
+        drain_responses(&mut out_rx, &mut writer, self.drain_timeout, &scope).await?;
 
         // The read loop is over: any streams still registered die with
         // the connection and cannot receive a terminal frame.
@@ -1723,12 +1857,16 @@ where
     async fn process_input(
         service: &mut JsonRpcService<S>,
         line: &str,
-        out_tx: &OutboundFrames,
-        work_tx: &mpsc::UnboundedSender<QueuedRequest>,
+        sinks: &RequestSinks<'_>,
         incoming_notifications: Option<&IncomingNotificationHandler>,
         subscriptions_enabled: bool,
         #[cfg(feature = "stateless")] subscriptions: &mut StdioSubscriptions,
     ) -> Result<()> {
+        let RequestSinks {
+            out_tx,
+            work_tx,
+            scope,
+        } = *sinks;
         let trimmed = clean_input_line(line);
         if trimmed.is_empty() {
             return Ok(());
@@ -1813,7 +1951,7 @@ where
 
         // The service clone shares the negotiated protocol revision through
         // an `Arc`, so concurrent requests all see the same handshake state.
-        let mut service = service.clone();
+        let mut service = service.clone().with_connection_cancellation(scope.token());
         let work = async move {
             match service.call_message_answerable(message).await {
                 Ok(Some(response)) => match serde_json::to_string(&response) {
@@ -1846,7 +1984,7 @@ where
         } else if expects_a_response(trimmed) {
             let _ = work_tx.send(Box::pin(work));
         } else {
-            spawn_request(None, out_tx, work);
+            spawn_request(None, out_tx, scope, work);
         }
         Ok(())
     }
@@ -2221,7 +2359,9 @@ where
     /// ends or [`StdioTransportHandle::shutdown`] is called.
     ///
     /// By default, all dispatched requests are allowed to finish writing their
-    /// responses. A deadline aborts any dispatches still running when it expires.
+    /// responses. When a deadline expires, dispatches still running are
+    /// cancelled through their [`RequestContext`](crate::RequestContext) token
+    /// and aborted if they do not stop within a short grace period (#1557).
     /// Pair this with [`StdioTransportHandle::stopping`] to let the application
     /// release handlers as soon as the read loop ends.
     pub fn drain_timeout(mut self, timeout: std::time::Duration) -> Self {
@@ -2309,6 +2449,9 @@ where
         let writer = Arc::new(Mutex::new(writer));
         let mut frames = FrameReader::with_max_len(reader, self.max_frame_len);
         let mut in_flight = JoinSet::new();
+        // Parent of every request's own cancellation token, fired if the
+        // drain gives up on them (#1557).
+        let cancel = CancellationToken::new();
         #[cfg(feature = "stateless")]
         let mut subscriptions = StdioSubscriptions {
             server_info: Some(self.router.implementation()),
@@ -2340,6 +2483,7 @@ where
                         trimmed,
                         writer.clone(),
                         &mut in_flight,
+                        &cancel,
                         #[cfg(feature = "stateless")]
                         &mut subscriptions,
                     ).await?;
@@ -2409,22 +2553,34 @@ where
         while self.request_rx.try_recv().is_ok() {}
         self.pending_requests.lock().await.clear();
 
-        let drain = async {
+        async fn join_all(in_flight: &mut JoinSet<()>) {
             while let Some(result) = in_flight.join_next().await {
                 if let Err(error) = result {
                     tracing::error!(%error, "Request dispatch task failed");
                 }
             }
-        };
+        }
         match self.drain_timeout {
-            None => drain.await,
+            None => join_all(&mut in_flight).await,
             Some(limit) => {
-                if tokio::time::timeout(limit, drain).await.is_err() {
+                if tokio::time::timeout(limit, join_all(&mut in_flight))
+                    .await
+                    .is_err()
+                {
+                    // Give handlers the chance to stop on their own before
+                    // their tasks are aborted (#1557).
                     tracing::warn!(
                         timeout_ms = limit.as_millis() as u64,
-                        "drain timed out; aborting in-flight requests"
+                        "drain timed out; cancelling in-flight requests"
                     );
-                    in_flight.shutdown().await;
+                    cancel.cancel();
+                    if tokio::time::timeout(CANCEL_GRACE, join_all(&mut in_flight))
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!("in-flight requests ignored cancellation; aborting");
+                        in_flight.shutdown().await;
+                    }
                 }
             }
         }
@@ -2442,6 +2598,7 @@ where
         line: &str,
         writer: Arc<Mutex<W>>,
         in_flight: &mut JoinSet<()>,
+        cancel: &CancellationToken,
         #[cfg(feature = "stateless")] subscriptions: &mut StdioSubscriptions,
     ) -> Result<()>
     where
@@ -2524,7 +2681,10 @@ where
         // any handler that calls `ctx.elicit_form()` / `ctx.sample()`: the
         // handler awaits the client's response, but that response can only be
         // read by this same loop (#923).
-        let mut service = self.service.clone();
+        let mut service = self
+            .service
+            .clone()
+            .with_connection_cancellation(cancel.clone());
         in_flight.spawn(async move {
             let response_json = match service.call_message_answerable(message).await {
                 Ok(Some(response)) => serde_json::to_string(&response),
