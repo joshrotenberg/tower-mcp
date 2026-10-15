@@ -1576,6 +1576,33 @@ impl McpRouter {
         capabilities
     }
 
+    /// Store what the client declared at `initialize` in session state.
+    ///
+    /// Shared by `initialize` and by transports that rebuild a session from a
+    /// persisted record, so a restored session sees the same client
+    /// capabilities, client info, and negotiated extensions as the original.
+    /// `protocol_version` selects the server capability surface the client's
+    /// extensions are negotiated against.
+    pub(crate) fn record_client_handshake(
+        &self,
+        protocol_version: &str,
+        capabilities: Option<&crate::protocol::ClientCapabilities>,
+        client_info: Option<&crate::protocol::Implementation>,
+    ) {
+        if let Some(client_info) = client_info {
+            self.session.insert(client_info.clone());
+        }
+        if let Some(capabilities) = capabilities {
+            let server_capabilities = self.capabilities_for_protocol(Some(protocol_version));
+            self.session.insert(capabilities.clone());
+            self.session
+                .insert(crate::NegotiatedExtensions::from_capabilities(
+                    capabilities,
+                    &server_capabilities,
+                ));
+        }
+    }
+
     /// Whether this server opted into the final Tasks extension.
     ///
     /// Distinct from the synthesized advertisement in [`Self::capabilities`],
@@ -1811,13 +1838,11 @@ impl McpRouter {
                 // Transition session state to Initializing
                 self.session.mark_initializing();
                 let capabilities = self.capabilities_for_protocol(Some(&protocol_version));
-                self.session.insert(params.capabilities.clone());
-                self.session.insert(params.client_info.clone());
-                self.session
-                    .insert(crate::NegotiatedExtensions::from_capabilities(
-                        &params.capabilities,
-                        &capabilities,
-                    ));
+                self.record_client_handshake(
+                    &protocol_version,
+                    Some(&params.capabilities),
+                    Some(&params.client_info),
+                );
 
                 Ok(McpResponse::Initialize(InitializeResult {
                     protocol_version,
