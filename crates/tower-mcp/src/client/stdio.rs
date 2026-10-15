@@ -24,6 +24,17 @@
 //! answered. Failing it early would need the request id, which is inside the
 //! bytes that would not decode.
 //!
+//! # Stopping the child
+//!
+//! [`ClientTransport::close`] drops the child's stdin and waits for it to
+//! exit on its own, then kills it. The wait defaults to 5 seconds and is set
+//! with [`StdioClientTransport::close_timeout`]. A kill signals only the
+//! child itself, so a server launched through `npx` or a shell wrapper can
+//! leave descendants running. On Unix, a child spawned as its own process
+//! group leader can be stopped together with its descendants through
+//! [`StdioClientTransport::process_group_shutdown`]. How the child exited is
+//! available from [`StdioClientTransport::exit_status`] after `close`.
+//!
 //! # Example
 //!
 //! ```rust,no_run
@@ -36,7 +47,8 @@
 //! # }
 //! ```
 
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
@@ -46,14 +58,62 @@ use super::transport::ClientTransport;
 use crate::error::{Error, Result};
 use crate::framing::{FrameReader, InputFrame, clean_input_line};
 
+/// How long `close` waits at each stage of stopping the child unless
+/// [`StdioClientTransport::close_timeout`] says otherwise.
+const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often the process group is checked for stragglers while `close`
+/// waits for it to empty.
+#[cfg(unix)]
+const GROUP_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
 /// Client transport that communicates with a subprocess via stdio.
 ///
 /// Spawns a child process and communicates using line-delimited JSON-RPC
 /// messages over stdin (write) and stdout (read). By default stderr is
 /// inherited so server debug output appears in the client's terminal. A
 /// caller using [`Self::spawn_command`] may redirect or pipe it instead.
+///
+/// # Stopping the server
+///
+/// [`ClientTransport::close`] closes the child's stdin, waits up to
+/// [`close_timeout`](Self::close_timeout) (default 5 seconds) for it to exit,
+/// and kills it if it does not. The child's exit status is then available
+/// from [`exit_status`](Self::exit_status). A transport dropped without
+/// `close` kills the child.
+///
+/// Killing signals the child only. Servers started through `npx` or a shell
+/// wrapper often have descendants that keep running after their parent dies.
+/// To stop those as well on Unix, spawn the child as the leader of its own
+/// process group and opt in to [`process_group_shutdown`](Self::process_group_shutdown):
+///
+/// ```rust,no_run
+/// use std::time::Duration;
+/// use tokio::process::Command;
+/// use tower_mcp::client::StdioClientTransport;
+///
+/// # #[cfg(unix)]
+/// # async fn example() -> Result<(), tower_mcp::BoxError> {
+/// let mut cmd = Command::new("npx");
+/// cmd.args(["-y", "@modelcontextprotocol/server-github"])
+///    .process_group(0);
+/// let transport = StdioClientTransport::spawn_command(&mut cmd)
+///     .await?
+///     .close_timeout(Duration::from_secs(2))
+///     .process_group_shutdown(true);
+/// # let _ = transport;
+/// # Ok(())
+/// # }
+/// ```
 pub struct StdioClientTransport {
     child: Option<Child>,
+    /// The child's pid, kept after `close` so callers can still log it.
+    pid: Option<u32>,
+    exit_status: Option<ExitStatus>,
+    close_timeout: Duration,
+    // Only read on Unix; other platforms accept and ignore the setting.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    process_group_shutdown: bool,
     stdin: Option<tokio::process::ChildStdin>,
     // `FrameReader` retains a partially read frame when its future is
     // cancelled by the client's `select!` loop. A bare `read_until` future can
@@ -133,14 +193,26 @@ impl StdioClientTransport {
 
         tracing::info!("Spawned MCP server process");
 
-        Ok(Self {
+        Ok(Self::from_parts(child, stdin, stdout))
+    }
+
+    fn from_parts(
+        child: Child,
+        stdin: tokio::process::ChildStdin,
+        stdout: tokio::process::ChildStdout,
+    ) -> Self {
+        Self {
+            pid: child.id(),
             child: Some(child),
+            exit_status: None,
+            close_timeout: DEFAULT_CLOSE_TIMEOUT,
+            process_group_shutdown: false,
             stdin: Some(stdin),
             stdout: FrameReader::with_max_len(
                 stdout,
                 crate::framing::DEFAULT_MAX_RESPONSE_FRAME_LEN,
             ),
-        })
+        }
     }
 
     /// Cap how many bytes one newline-delimited frame from the server may
@@ -192,14 +264,155 @@ impl StdioClientTransport {
             .take()
             .ok_or_else(|| Error::Transport("Failed to get child stdout".to_string()))?;
 
-        Ok(Self {
-            child: Some(child),
-            stdin: Some(stdin),
-            stdout: FrameReader::with_max_len(
-                stdout,
-                crate::framing::DEFAULT_MAX_RESPONSE_FRAME_LEN,
-            ),
-        })
+        Ok(Self::from_parts(child, stdin, stdout))
+    }
+
+    /// Set how long [`ClientTransport::close`] waits at each stage of
+    /// stopping the child. Default: 5 seconds.
+    ///
+    /// `close` first closes the child's stdin and waits this long for it to
+    /// exit on its own. If it has not, it is killed, or, with
+    /// [`process_group_shutdown`](Self::process_group_shutdown), its process
+    /// group is sent `SIGTERM` and given this long again before `SIGKILL`.
+    ///
+    /// ```rust,no_run
+    /// use std::time::Duration;
+    /// use tower_mcp::client::StdioClientTransport;
+    ///
+    /// # async fn example() -> Result<(), tower_mcp::BoxError> {
+    /// let transport = StdioClientTransport::spawn("my-mcp-server", &[])
+    ///     .await?
+    ///     .close_timeout(Duration::from_millis(500));
+    /// # let _ = transport;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn close_timeout(mut self, timeout: Duration) -> Self {
+        self.close_timeout = timeout;
+        self
+    }
+
+    /// Stop the child's whole process group when closing, not only the child.
+    ///
+    /// Killing a child signals that process alone, so descendants it started
+    /// (an `npx` launcher's real server, a shell wrapper's command) keep
+    /// running. With this enabled, [`ClientTransport::close`] stops the group:
+    ///
+    /// 1. Close the child's stdin and wait up to
+    ///    [`close_timeout`](Self::close_timeout) for the child to exit.
+    /// 2. Send `SIGTERM` to the process group. This also reaches descendants
+    ///    that outlived a child which exited cleanly in step 1; if none are
+    ///    left, there is nothing to wait for.
+    /// 3. Wait up to `close_timeout` for the child to be reaped and the group
+    ///    to empty.
+    /// 4. Send `SIGKILL` to whatever remains in the group.
+    ///
+    /// The group is only signalled if the child is the leader of its own
+    /// group, which is the case when the [`Command`] passed to
+    /// [`spawn_command`](Self::spawn_command) called `process_group(0)`.
+    /// A child that merely shares this process's group is never signalled
+    /// as a group, because that would signal this process too; `close` falls
+    /// back to killing the child alone and logs a warning.
+    ///
+    /// A child in its own process group no longer receives terminal signals
+    /// such as the `SIGINT` from Ctrl-C, which go to the foreground group.
+    ///
+    /// Off by default. On non-Unix platforms this setting has no effect and
+    /// `close` behaves as described on [`close_timeout`](Self::close_timeout).
+    pub fn process_group_shutdown(mut self, enabled: bool) -> Self {
+        self.process_group_shutdown = enabled;
+        self
+    }
+
+    /// The child's process id.
+    ///
+    /// Still returned after [`ClientTransport::close`], when the process no
+    /// longer exists and the number may have been reused. Returns `None` only
+    /// if the operating system never reported a pid.
+    pub fn child_id(&self) -> Option<u32> {
+        self.pid
+    }
+
+    /// How the child exited, as recorded by [`ClientTransport::close`].
+    ///
+    /// `None` before `close`, and if the exit status could not be read. After
+    /// a kill, the status reports the signal rather than a code (on Unix,
+    /// [`std::os::unix::process::ExitStatusExt::signal`]).
+    pub fn exit_status(&self) -> Option<ExitStatus> {
+        self.exit_status
+    }
+}
+
+/// Process-group primitives for `close`. The group id is the leader's pid.
+#[cfg(unix)]
+mod pgroup {
+    use libc::{c_int, pid_t};
+
+    /// The group id for `pid` if it leads a group of its own.
+    ///
+    /// The guard against signalling the caller's own group: a child that did
+    /// not request `process_group(0)` shares it, and `killpg` on it would
+    /// signal this process as well.
+    pub(super) fn own_group_of(pid: u32) -> Option<pid_t> {
+        let pid = pid_t::try_from(pid).ok()?;
+        // SAFETY: `getpgid` takes a plain integer and touches no memory.
+        (unsafe { libc::getpgid(pid) } == pid).then_some(pid)
+    }
+
+    /// Send `signal` to every process in the group. False if it reached
+    /// none, including when the group is already empty.
+    pub(super) fn signal(pgid: pid_t, signal: c_int) -> bool {
+        // SAFETY: `killpg` takes plain integers and touches no memory.
+        unsafe { libc::killpg(pgid, signal) == 0 }
+    }
+}
+
+/// Stop the process group led by `child` once its graceful exit has been
+/// waited on: `SIGTERM`, wait, `SIGKILL`.
+///
+/// `status` is filled in if the leader is reaped along the way. If the leader
+/// was reaped before this ran, `status` is already set.
+#[cfg(unix)]
+async fn stop_process_group(
+    child: &mut Child,
+    pgid: libc::pid_t,
+    grace: Duration,
+    status: &mut Option<ExitStatus>,
+) {
+    use tokio::time::{Instant, sleep, timeout};
+
+    if !pgroup::signal(pgid, libc::SIGTERM) {
+        // Nobody left in the group.
+        return;
+    }
+
+    let deadline = Instant::now() + grace;
+    loop {
+        if status.is_none() {
+            // The leader stays in the group as a zombie until it is reaped,
+            // so the group cannot read as empty before this.
+            if let Ok(Some(exit)) = child.try_wait() {
+                *status = Some(exit);
+            }
+        }
+        if status.is_some() && !pgroup::signal(pgid, 0) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        sleep(GROUP_POLL_INTERVAL).await;
+    }
+
+    tracing::warn!("Process group did not exit after SIGTERM, sending SIGKILL");
+    pgroup::signal(pgid, libc::SIGKILL);
+
+    if status.is_none() {
+        match timeout(grace, child.wait()).await {
+            Ok(Ok(exit)) => *status = Some(exit),
+            Ok(Err(e)) => tracing::error!(error = %e, "Error waiting for child"),
+            Err(_) => tracing::error!("Child did not exit after SIGKILL"),
+        }
     }
 }
 
@@ -267,25 +480,63 @@ impl ClientTransport for StdioClientTransport {
         self.child.is_some() && self.stdin.is_some()
     }
 
+    /// Stop the child: close its stdin, wait for it to exit, then kill it.
+    ///
+    /// See [`close_timeout`](StdioClientTransport::close_timeout) and
+    /// [`process_group_shutdown`](StdioClientTransport::process_group_shutdown)
+    /// for the wait and for stopping descendants. The exit status is recorded
+    /// for [`exit_status`](StdioClientTransport::exit_status).
     async fn close(&mut self) -> Result<()> {
+        // Resolved before stdin is dropped, while the child is certain to
+        // still be in its group.
+        #[cfg(unix)]
+        let group = if self.process_group_shutdown {
+            let group = self.pid.and_then(pgroup::own_group_of);
+            if group.is_none() {
+                tracing::warn!(
+                    "process group shutdown is enabled but the child does not lead its own \
+                     process group (spawn it with `process_group(0)`); stopping the child only"
+                );
+            }
+            group
+        } else {
+            None
+        };
+        // No process groups to signal here; keeps the code below uniform.
+        #[cfg(not(unix))]
+        let group: Option<()> = None;
+
         // Drop stdin to signal EOF to the child process
         self.stdin.take();
 
         if let Some(mut child) = self.child.take() {
-            let result =
-                tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
+            let result = tokio::time::timeout(self.close_timeout, child.wait()).await;
 
             match result {
                 Ok(Ok(status)) => {
                     tracing::info!(status = ?status, "Child process exited");
+                    self.exit_status = Some(status);
                 }
                 Ok(Err(e)) => {
                     tracing::error!(error = %e, "Error waiting for child");
                 }
+                Err(_) if group.is_some() => {
+                    // The group stop below sends the signals.
+                    tracing::warn!("Timeout waiting for child, stopping its process group");
+                }
                 Err(_) => {
                     tracing::warn!("Timeout waiting for child, killing");
                     let _ = child.kill().await;
+                    self.exit_status = child.try_wait().ok().flatten();
                 }
+            }
+
+            // Runs after a clean exit too: descendants can outlive a leader
+            // that left when its stdin closed.
+            #[cfg(unix)]
+            if let Some(pgid) = group {
+                stop_process_group(&mut child, pgid, self.close_timeout, &mut self.exit_status)
+                    .await;
             }
         }
 
@@ -391,6 +642,216 @@ mod tests {
             settled, later,
             "child kept running after its transport was dropped ({settled} -> {later} bytes)"
         );
+    }
+
+    // =========================================================================
+    // Stopping the child (#1549)
+    // =========================================================================
+
+    #[cfg(unix)]
+    fn scratch_file(tag: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "tower-mcp-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    /// Wait for a script to write its background pid to `path`.
+    #[cfg(unix)]
+    async fn read_pid(path: &std::path::Path) -> i32 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path)
+                && let Ok(pid) = text.trim().parse()
+            {
+                return pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child never wrote the background pid"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Whether `pid` is gone, allowing time for it to be signalled and
+    /// reaped. The processes checked here are reparented to init when their
+    /// shell dies, so a killed one stops answering `kill(pid, 0)`; a zombie
+    /// would still answer, which is why this waits instead of checking once.
+    #[cfg(unix)]
+    async fn is_gone(pid: i32) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            // SAFETY: signal 0 only checks that the process exists.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    /// Kill `pid` so a failed assertion does not leave a `sleep` behind.
+    #[cfg(unix)]
+    fn reap_leftover(pid: i32) {
+        // SAFETY: a plain signal to a pid this test started.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+
+    /// A child that starts a background process and ignores stdin EOF is
+    /// stopped together with that process when its group is signalled. Without
+    /// `process_group_shutdown` the background `sleep` outlives `close` (the
+    /// case in #1549), so this fails if the group is not signalled.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_group_shutdown_stops_the_childs_descendants() {
+        use std::time::{Duration, Instant};
+
+        let pidfile = scratch_file("pgroup-pid");
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            &format!("sleep 60 & echo $! > '{}'; sleep 60", pidfile.display()),
+        ])
+        .process_group(0);
+        let mut transport = StdioClientTransport::spawn_command(&mut cmd)
+            .await
+            .unwrap()
+            .close_timeout(Duration::from_millis(300))
+            .process_group_shutdown(true);
+        let background = read_pid(&pidfile).await;
+
+        let started = Instant::now();
+        tokio::time::timeout(Duration::from_secs(10), transport.close())
+            .await
+            .expect("close must not hang")
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        let gone = is_gone(background).await;
+        reap_leftover(background);
+        let _ = std::fs::remove_file(&pidfile);
+        assert!(gone, "the background process outlived close");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "SIGTERM should end the group without waiting out SIGKILL, took {elapsed:?}"
+        );
+        assert!(!transport.exit_status().unwrap().success());
+    }
+
+    /// Descendants can outlive a child that exits cleanly when its stdin
+    /// closes. The group is still signalled, and the clean status is kept.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_group_shutdown_stops_descendants_of_a_child_that_exited() {
+        use std::time::Duration;
+
+        let pidfile = scratch_file("pgroup-clean-pid");
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            &format!(
+                "sleep 60 & echo $! > '{}'; read line; exit 0",
+                pidfile.display()
+            ),
+        ])
+        .process_group(0);
+        let mut transport = StdioClientTransport::spawn_command(&mut cmd)
+            .await
+            .unwrap()
+            .process_group_shutdown(true);
+        let background = read_pid(&pidfile).await;
+
+        tokio::time::timeout(Duration::from_secs(10), transport.close())
+            .await
+            .expect("close must not hang")
+            .unwrap();
+
+        let gone = is_gone(background).await;
+        reap_leftover(background);
+        let _ = std::fs::remove_file(&pidfile);
+        assert!(gone, "the background process outlived a clean exit");
+        assert_eq!(transport.exit_status().unwrap().code(), Some(0));
+    }
+
+    /// Process group shutdown on a child that did not call `process_group(0)`
+    /// must not signal the group it shares with this process. If it did, this
+    /// test process would be signalled and die.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_group_shutdown_ignores_a_child_in_the_callers_group() {
+        use std::time::Duration;
+
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "while :; do sleep 0.1; done"]);
+        let mut transport = StdioClientTransport::spawn_command(&mut cmd)
+            .await
+            .unwrap()
+            .close_timeout(Duration::from_millis(200))
+            .process_group_shutdown(true);
+
+        tokio::time::timeout(Duration::from_secs(10), transport.close())
+            .await
+            .expect("close must not hang")
+            .unwrap();
+        assert!(!transport.exit_status().unwrap().success());
+    }
+
+    /// `close_timeout` bounds the wait on a child that ignores stdin EOF.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn close_timeout_bounds_the_wait_for_the_child() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::time::{Duration, Instant};
+
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "while :; do sleep 0.1; done"]);
+        let mut transport = StdioClientTransport::spawn_command(&mut cmd)
+            .await
+            .unwrap()
+            .close_timeout(Duration::from_millis(200));
+
+        let started = Instant::now();
+        transport.close().await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(200) && elapsed < Duration::from_secs(1),
+            "close should wait the configured 200ms, then kill; took {elapsed:?}"
+        );
+        assert_eq!(
+            transport.exit_status().unwrap().signal(),
+            Some(libc::SIGKILL)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exit_status_is_readable_after_close() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "read line; exit 3"]);
+        let mut transport = StdioClientTransport::spawn_command(&mut cmd).await.unwrap();
+
+        assert!(transport.exit_status().is_none());
+        transport.close().await.unwrap();
+
+        assert_eq!(transport.exit_status().unwrap().code(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn child_id_is_available_before_and_after_close() {
+        let mut transport = StdioClientTransport::spawn("cat", &[]).await.unwrap();
+        let pid = transport.child_id().expect("a spawned child has a pid");
+
+        transport.close().await.unwrap();
+
+        assert_eq!(transport.child_id(), Some(pid));
     }
 
     #[tokio::test]

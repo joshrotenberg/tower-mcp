@@ -127,6 +127,15 @@ impl ChildProcessTransport {
             cmd.env(key, value);
         }
 
+        // Tie the child's lifetime to the connection. `shutdown` and `kill`
+        // are the explicit ways to stop it, but a connection can be dropped
+        // without either, for example on an error path, and the child would
+        // otherwise keep running with nothing left that can stop it.
+        // `kill_on_drop` also hands the pid to tokio's orphan reaper, so no
+        // zombie is left behind (#1543 made the same change for
+        // `StdioClientTransport`).
+        cmd.kill_on_drop(true);
+
         let child = cmd
             .spawn()
             .map_err(|e| Error::Transport(format!("Failed to spawn {}: {}", self.program, e)))?;
@@ -138,6 +147,9 @@ impl ChildProcessTransport {
 }
 
 /// Active connection to a child MCP server process
+///
+/// The child is killed if the connection is dropped without
+/// [`shutdown`](Self::shutdown) or [`kill`](Self::kill) having stopped it.
 ///
 /// # Response correlation and notifications
 ///
@@ -537,6 +549,62 @@ mod tests {
         assert!(
             result.is_err(),
             "expected an error for a response with both result and error, got: {result:?}"
+        );
+    }
+
+    /// Dropping the connection without `shutdown` or `kill` must still stop
+    /// the child. Liveness is measured by side effect, as in the
+    /// `StdioClientTransport` test of the same behavior: `kill -0` on a
+    /// not-yet-reaped zombie would still succeed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_the_connection_kills_the_child() {
+        use std::time::{Duration, Instant};
+
+        let ticks = std::env::temp_dir().join(format!(
+            "tower-mcp-childproc-kill-on-drop-{}-{}.ticks",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&ticks);
+
+        let conn = ChildProcessTransport::new("sh")
+            .args([
+                "-c",
+                // Ignore SIGTERM so only a kill can stop it.
+                &format!(
+                    "trap '' TERM; while :; do printf x >> '{}'; sleep 0.1; done",
+                    ticks.display()
+                ),
+            ])
+            .spawn()
+            .await
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let size = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        while size(&ticks) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "child never started writing; the test cannot tell life from death"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        drop(conn);
+
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let settled = size(&ticks);
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let later = size(&ticks);
+
+        let _ = std::fs::remove_file(&ticks);
+        assert_eq!(
+            settled, later,
+            "child kept running after its connection was dropped ({settled} -> {later} bytes)"
         );
     }
 
