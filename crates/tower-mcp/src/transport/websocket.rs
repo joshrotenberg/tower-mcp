@@ -221,6 +221,10 @@ struct AppState {
     /// normalized at build time. See
     /// [`crate::transport::origin::parse_allowed_origins`].
     allowed_origins: Vec<crate::transport::origin::AllowedOrigin>,
+    /// Whether the upgrade request's `Host` is checked.
+    validate_host: bool,
+    /// Non-localhost hosts accepted when non-empty.
+    allowed_hosts: Vec<String>,
 }
 
 /// WebSocket transport for MCP servers
@@ -251,6 +255,8 @@ pub struct WebSocketTransport {
     /// Parsed and normalized at [`Self::allowed_origins`] call time; see
     /// [`crate::transport::origin::parse_allowed_origins`].
     allowed_origins: Vec<crate::transport::origin::AllowedOrigin>,
+    validate_host: bool,
+    allowed_hosts: Vec<String>,
     #[cfg(feature = "oauth")]
     oauth_config: Option<crate::oauth::ProtectedResourceMetadata>,
 }
@@ -281,6 +287,8 @@ impl WebSocketTransport {
             protocol_support: ProtocolSupport::default(),
             validate_origin: true,
             allowed_origins: Vec::new(),
+            validate_host: true,
+            allowed_hosts: Vec::new(),
             #[cfg(feature = "oauth")]
             oauth_config: None,
         }
@@ -319,6 +327,29 @@ impl WebSocketTransport {
     /// it could never match a real `Origin` header.
     pub fn allowed_origins(mut self, origins: Vec<String>) -> Self {
         self.allowed_origins = crate::transport::origin::parse_allowed_origins(&origins);
+        self
+    }
+
+    /// Disable `Host` header validation on the upgrade request (not
+    /// recommended when binding to a non-loopback interface).
+    ///
+    /// Matches [`HttpTransport::disable_host_validation`](crate::HttpTransport::disable_host_validation).
+    pub fn disable_host_validation(mut self) -> Self {
+        self.validate_host = false;
+        self
+    }
+
+    /// Set allowed hosts for the `Host` header allowlist.
+    ///
+    /// Matches [`HttpTransport::allowed_hosts`](crate::HttpTransport::allowed_hosts):
+    /// each entry is a `host` or `host:port` (e.g. `"api.example.com"`,
+    /// `"api.example.com:8443"`), localhost variants are always accepted, and
+    /// a missing `Host` header falls back to the request's `:authority`. As
+    /// there, an empty list leaves non-localhost hosts accepted, so Host is
+    /// only enforced once an allowlist is configured. A rejected upgrade is
+    /// answered with `400`.
+    pub fn allowed_hosts(mut self, hosts: Vec<String>) -> Self {
+        self.allowed_hosts = hosts;
         self
     }
 
@@ -484,6 +515,8 @@ impl WebSocketTransport {
             sampling_enabled: self.sampling_enabled,
             validate_origin: self.validate_origin,
             allowed_origins: self.allowed_origins,
+            validate_host: self.validate_host,
+            allowed_hosts: self.allowed_hosts,
         });
 
         let router = Router::new()
@@ -510,6 +543,8 @@ impl WebSocketTransport {
             sampling_enabled: self.sampling_enabled,
             validate_origin: self.validate_origin,
             allowed_origins: self.allowed_origins,
+            validate_host: self.validate_host,
+            allowed_hosts: self.allowed_hosts,
         });
 
         let ws_router = Router::new()
@@ -680,6 +715,17 @@ async fn handle_websocket(
         &parts.headers,
         state.validate_origin,
         &state.allowed_origins,
+    ) {
+        return rejection;
+    }
+
+    // DNS-rebinding defense alongside Origin, with the same policy as
+    // `HttpTransport`.
+    if let Some(rejection) = crate::transport::origin::validate_host(
+        &parts.headers,
+        &parts.uri,
+        state.validate_host,
+        &state.allowed_hosts,
     ) {
         return rejection;
     }

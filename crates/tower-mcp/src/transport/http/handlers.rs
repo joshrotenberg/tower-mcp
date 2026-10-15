@@ -17,69 +17,18 @@
 //! Split out of `http.rs` in #1256 (phase 3).
 
 use super::*;
-use crate::transport::origin::is_localhost_host;
 
 type AssociatedCall = Pin<Box<dyn Future<Output = Result<JsonRpcResponse>> + Send + 'static>>;
 
-/// Resolve the effective host for validation.
-///
-/// Prefers the `Host` header, falling back to the HTTP/2 `:authority`
-/// pseudo-header (`request.uri().authority()`) when the header is missing.
-/// This matters behind middleware like `axum::Router::nest`, which can
-/// strip Hyper's synthesized `Host` before our handler sees it.
-pub(super) fn effective_host<'a>(
-    headers: &'a HeaderMap,
-    uri: &'a axum::http::Uri,
-) -> Option<&'a str> {
-    if let Some(value) = headers.get(header::HOST)
-        && let Ok(s) = value.to_str()
-    {
-        return Some(s);
-    }
-    uri.authority().map(|a| a.as_str())
-}
-
 /// Validate the `Host` header (defense-in-depth alongside Origin).
 ///
-/// Returns Some(Response) if validation fails, None if it passes.
+/// See [`crate::transport::origin::validate_host`].
 pub(super) fn validate_host(
     headers: &HeaderMap,
     uri: &axum::http::Uri,
     state: &AppState,
 ) -> Option<Response> {
-    if !state.validate_host {
-        return None;
-    }
-
-    let Some(host) = effective_host(headers, uri) else {
-        if state.allowed_hosts.is_empty() {
-            // No Host header and no allowlist: fall back to permissive
-            // behavior matching pre-validation defaults so we don't break
-            // existing deployments. (Origin already protects browsers.)
-            return None;
-        }
-        tracing::warn!("Rejecting request: missing Host header and no :authority fallback");
-        return Some((StatusCode::BAD_REQUEST, "Missing Host header").into_response());
-    };
-
-    if is_localhost_host(host) {
-        return None;
-    }
-
-    if state.allowed_hosts.is_empty() {
-        // Non-localhost host with no explicit allowlist: keep accepting it.
-        // Operators who want strict Host validation must opt in via
-        // `.allowed_hosts(...)`. This preserves the historical behavior of
-        // not enforcing Host on non-loopback deployments by default.
-        return None;
-    }
-
-    if state.allowed_hosts.iter().any(|h| h == host) {
-        return None;
-    }
-
-    tracing::warn!(host = %host, "Rejecting request: Host not in allowlist");
-    Some((StatusCode::BAD_REQUEST, "Host not allowed").into_response())
+    crate::transport::origin::validate_host(headers, uri, state.validate_host, &state.allowed_hosts)
 }
 
 /// Validate the `Origin` header against this transport's policy.
@@ -143,6 +92,19 @@ fn is_initialize_request(body: &serde_json::Value) -> bool {
         .and_then(|m| m.as_str())
         .map(|m| m == "initialize")
         .unwrap_or(false)
+}
+
+/// Drop the session an `initialize` created when the request is rejected
+/// before it can be admitted to it.
+///
+/// The session is created ahead of dispatch, so every early return between
+/// creation and the failed-initialize cleanup at the end of `handle_post`
+/// would otherwise leave it counting against the session limit until it idles
+/// out (rmcp #1275). A no-op for any other request.
+async fn discard_init_session(state: &AppState, session: &Session, is_init: bool) {
+    if is_init {
+        state.sessions.remove(&session.id).await;
+    }
 }
 
 /// Check if this is a response to one of our outgoing requests
@@ -1006,6 +968,7 @@ pub(super) async fn handle_post(
     let session_revision = match session_protocol_version.parse::<McpProtocolRevision>() {
         Ok(revision) => revision,
         Err(_) => {
+            discard_init_session(&state, &session, is_init).await;
             return json_rpc_error_response(
                 extract_request_id(&parsed),
                 JsonRpcError::unsupported_protocol_version(
@@ -1142,6 +1105,7 @@ pub(super) async fn handle_post(
             error = %err.message,
             "Rejecting request: SEP-2243 header validation failed",
         );
+        discard_init_session(&state, &session, is_init).await;
         let id = extract_request_id(&parsed);
         let mut resp = json_rpc_error_response(id, err);
         // Per SEP-2243 §"Error Code" the HTTP status MUST be 400.
@@ -1256,6 +1220,7 @@ pub(super) async fn handle_post(
             // The serde message is not surfaced: for a struct deserialize it
             // can name the Rust type, the same disclosure #1284 removed from
             // the stdio path.
+            discard_init_session(&state, &session, is_init).await;
             return json_rpc_error_response(
                 id,
                 JsonRpcError::parse_error("not a valid JSON-RPC request"),
@@ -1349,6 +1314,7 @@ pub(super) async fn handle_post(
         match call.await {
             Ok(response) => response,
             Err(error) => {
+                discard_init_session(&state, &session, is_init).await;
                 return json_rpc_error_response(
                     Some(request_id),
                     JsonRpcError::internal_error(error.to_string()),

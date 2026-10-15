@@ -1,4 +1,4 @@
-//! `Origin` validation shared by the HTTP and WebSocket transports.
+//! `Origin` and `Host` validation shared by the HTTP and WebSocket transports.
 //!
 //! Browsers attach `Origin` to cross-site `fetch` requests and to every
 //! WebSocket handshake, and they do not apply CORS to WebSocket connections.
@@ -10,12 +10,32 @@ use std::net::IpAddr;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
+/// Whether `origin` is a well-formed `http(s)://` origin whose host is
+/// localhost.
+///
+/// The origin is parsed (see [`parse_origin`]) before the host is judged, so
+/// a string that merely starts with a localhost authority does not qualify:
+/// `http://localhost:1@evil.com` carries userinfo and its real host is
+/// `evil.com`, and anything with a path, query, or fragment is not an
+/// origin at all.
 pub(crate) fn is_localhost_origin(origin: &str) -> bool {
-    // Parse the origin to extract the host. RFC 3986 makes the URI scheme
-    // case-insensitive, so the prefix match must be too.
-    strip_scheme_ci(origin, "http://")
+    // RFC 3986 makes the URI scheme case-insensitive, so the prefix match
+    // must be too. `ws`/`wss` are accepted by `parse_origin` for allowlist
+    // entries but are not a scheme a browser sends, so they stay excluded.
+    if strip_scheme_ci(origin, "http://")
         .or_else(|| strip_scheme_ci(origin, "https://"))
-        .is_some_and(is_localhost_host)
+        .is_none()
+    {
+        return false;
+    }
+    // `parse_origin` rejects userinfo, a path, a query, and a fragment, but
+    // `http::Uri` is lenient about the authority itself (it reads
+    // `[::1]evil.com` as `[::1]` and accepts an out-of-range port). Judge the
+    // authority text with the strict host check rather than its parsed parts.
+    let authority = origin
+        .split_once("://")
+        .map_or("", |(_, rest)| rest.strip_suffix('/').unwrap_or(rest));
+    parse_origin(origin).is_ok() && is_localhost_host(authority)
 }
 
 /// Case-insensitively strip an ASCII scheme prefix (e.g. `"http://"`) from
@@ -27,6 +47,11 @@ fn strip_scheme_ci<'a>(s: &'a str, scheme: &str) -> Option<&'a str> {
     } else {
         None
     }
+}
+
+/// Whether `port` is a decimal port number (digits only, at most 65535).
+fn is_valid_port(port: &str) -> bool {
+    !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok()
 }
 
 /// Check if a `host:port` (or `[ipv6]:port`) value refers to localhost.
@@ -56,17 +81,20 @@ pub(crate) fn is_localhost_host(host: &str) -> bool {
             return false;
         };
         let after_bracket = &host[close + 1..];
-        let port_ok = after_bracket.is_empty()
-            || after_bracket
-                .strip_prefix(':')
-                .is_some_and(|port| !port.is_empty() && port.parse::<u16>().is_ok());
+        let port_ok =
+            after_bracket.is_empty() || after_bracket.strip_prefix(':').is_some_and(is_valid_port);
         if !port_ok {
             return false;
         }
         &host[1..close]
     } else {
-        // Strip port if present
-        host.split(':').next().unwrap_or(host)
+        // Strip the port if present. A port that is not a valid number is
+        // not "no port", it makes the authority invalid.
+        match host.split_once(':') {
+            Some((_, port)) if !is_valid_port(port) => return false,
+            Some((name, _)) => name,
+            None => host,
+        }
     };
 
     // `localhost`, and its RFC 3986 trailing-dot FQDN form, is
@@ -205,6 +233,7 @@ pub(crate) fn parse_allowed_origins(entries: &[String]) -> Vec<AllowedOrigin> {
 /// When `enabled`:
 /// - Requests without an Origin header are allowed (same-origin, or a
 ///   non-browser client)
+/// - A request with more than one Origin header is rejected
 /// - Localhost origins are always allowed (DNS rebinding protection); a
 ///   configured `allowed_origins` list adds origins on top of this, it does
 ///   not replace it
@@ -217,7 +246,9 @@ pub(crate) fn parse_allowed_origins(entries: &[String]) -> Vec<AllowedOrigin> {
 /// `https://example.com/` in the allowlist all match a browser's
 /// `https://example.com`. An incoming Origin that fails to parse (including
 /// the opaque `null` origin) is rejected unless the allowlist contains
-/// `"*"`.
+/// `"*"`. The localhost allowance applies only to an Origin that parses as a
+/// bare `scheme://host[:port]`, so `http://localhost:1@evil.com` is not
+/// treated as localhost.
 ///
 /// Returns `Some(403 response)` if validation fails, `None` if it passes.
 pub(crate) fn validate_origin(
@@ -229,7 +260,17 @@ pub(crate) fn validate_origin(
         return None;
     }
 
-    if let Some(origin) = headers.get(header::ORIGIN) {
+    // `HeaderMap::get` returns only the first value, which would let a second
+    // `Origin` ride along unchecked behind a harmless first one. A browser
+    // sends exactly one, so more than one is rejected outright.
+    let mut origins = headers.get_all(header::ORIGIN).iter();
+    let first = origins.next();
+    if origins.next().is_some() {
+        tracing::warn!("Rejecting request: multiple Origin headers");
+        return Some((StatusCode::FORBIDDEN, "Origin not allowed").into_response());
+    }
+
+    if let Some(origin) = first {
         let origin_str = origin.to_str().unwrap_or("");
 
         // Always allow localhost origins (DNS rebinding protection allows these)
@@ -281,6 +322,73 @@ pub(crate) fn validate_origin(
     }
 
     None
+}
+
+/// Resolve the effective host for validation.
+///
+/// Prefers the `Host` header, falling back to the HTTP/2 `:authority`
+/// pseudo-header (`request.uri().authority()`) when the header is missing.
+/// This matters behind middleware like `axum::Router::nest`, which can
+/// strip Hyper's synthesized `Host` before our handler sees it.
+pub(crate) fn effective_host<'a>(
+    headers: &'a HeaderMap,
+    uri: &'a axum::http::Uri,
+) -> Option<&'a str> {
+    if let Some(value) = headers.get(header::HOST)
+        && let Ok(s) = value.to_str()
+    {
+        return Some(s);
+    }
+    uri.authority().map(|a| a.as_str())
+}
+
+/// Validate the `Host` header (defense-in-depth alongside Origin).
+///
+/// When `enabled`, localhost hosts are always accepted. Any other host is
+/// accepted when `allowed_hosts` is empty, which preserves the historical
+/// behavior of not enforcing Host on non-loopback deployments unless the
+/// operator opts in, and otherwise must match an entry exactly.
+///
+/// Returns `Some(400 response)` if validation fails, `None` if it passes.
+pub(crate) fn validate_host(
+    headers: &HeaderMap,
+    uri: &axum::http::Uri,
+    enabled: bool,
+    allowed_hosts: &[String],
+) -> Option<Response> {
+    if !enabled {
+        return None;
+    }
+
+    let Some(host) = effective_host(headers, uri) else {
+        if allowed_hosts.is_empty() {
+            // No Host header and no allowlist: fall back to permissive
+            // behavior matching pre-validation defaults so we don't break
+            // existing deployments. (Origin already protects browsers.)
+            return None;
+        }
+        tracing::warn!("Rejecting request: missing Host header and no :authority fallback");
+        return Some((StatusCode::BAD_REQUEST, "Missing Host header").into_response());
+    };
+
+    if is_localhost_host(host) {
+        return None;
+    }
+
+    if allowed_hosts.is_empty() {
+        // Non-localhost host with no explicit allowlist: keep accepting it.
+        // Operators who want strict Host validation must opt in via
+        // `.allowed_hosts(...)`. This preserves the historical behavior of
+        // not enforcing Host on non-loopback deployments by default.
+        return None;
+    }
+
+    if allowed_hosts.iter().any(|h| h == host) {
+        return None;
+    }
+
+    tracing::warn!(host = %host, "Rejecting request: Host not in allowlist");
+    Some((StatusCode::BAD_REQUEST, "Host not allowed").into_response())
 }
 
 #[cfg(test)]
@@ -360,6 +468,97 @@ mod tests {
             "not a valid origin $$",
             &["https://example.com"]
         ));
+    }
+
+    fn header_map_all(origins: &[&str]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for origin in origins {
+            headers.append(header::ORIGIN, origin.parse().unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn duplicate_origin_headers_are_rejected() {
+        let rejected = |origins: &[&str], entries: &[&str]| {
+            let allowed =
+                parse_allowed_origins(&entries.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+            validate_origin(&header_map_all(origins), true, &allowed)
+                .is_some_and(|r| r.status() == StatusCode::FORBIDDEN)
+        };
+        // Order does not matter, and neither does either value being valid.
+        assert!(rejected(&["http://localhost", "https://evil.example"], &[]));
+        assert!(rejected(&["https://evil.example", "http://localhost"], &[]));
+        assert!(rejected(
+            &["https://app.example", "https://app.example"],
+            &["https://app.example"]
+        ));
+        assert!(rejected(&["http://localhost", "http://localhost"], &["*"]));
+        // A single header is unaffected.
+        assert!(!rejected(&["http://localhost"], &[]));
+    }
+
+    #[test]
+    fn userinfo_does_not_pass_as_localhost() {
+        for origin in [
+            "http://localhost:1@evil.com",
+            "http://localhost@evil.com",
+            "https://127.0.0.1:443@evil.com",
+            "http://[::1]:3000@evil.com",
+            "http://user:pass@localhost",
+        ] {
+            assert!(!is_localhost_origin(origin), "{origin}");
+            assert!(!is_allowed(origin, &[]), "{origin}");
+            assert!(!is_allowed(origin, &["https://app.example"]), "{origin}");
+        }
+    }
+
+    #[test]
+    fn malformed_localhost_lookalikes_are_not_localhost() {
+        for origin in [
+            "http://localhost/path",
+            "http://localhost?x=1",
+            "http://localhost#frag",
+            "http://localhost:99999",
+            "http://localhost:abc",
+            "http://localhost evil.com",
+            "http://",
+            "http:///",
+            "http://localhost:3000, http://evil.com",
+        ] {
+            assert!(!is_localhost_origin(origin), "{origin}");
+            assert!(!is_allowed(origin, &["https://app.example"]), "{origin}");
+        }
+    }
+
+    #[test]
+    fn legitimate_localhost_origins_still_pass() {
+        for origin in [
+            "http://localhost:3000",
+            "http://127.0.0.1",
+            "http://127.0.0.1:8080",
+            "https://localhost",
+            "http://[::1]:3000",
+            "HTTP://LocalHost:3000",
+        ] {
+            assert!(is_localhost_origin(origin), "{origin}");
+            assert!(is_allowed(origin, &[]), "{origin}");
+            assert!(is_allowed(origin, &["https://app.example"]), "{origin}");
+        }
+    }
+
+    #[test]
+    fn invalid_ports_are_not_localhost() {
+        for host in [
+            "localhost:abc",
+            "localhost:",
+            "localhost:99999",
+            "localhost:+80",
+            "localhost:1:2",
+        ] {
+            assert!(!is_localhost_host(host), "{host}");
+        }
+        assert!(is_localhost_host("localhost:65535"));
     }
 
     #[test]

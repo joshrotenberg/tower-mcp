@@ -84,10 +84,13 @@ metadata path and resource identifier from the mount path correctly.
 `HttpTransport` validates browser `Origin` headers by default:
 
 - a request without `Origin` is accepted;
+- a request with more than one `Origin` header is rejected;
 - localhost origins (`localhost`, `127.0.0.1`, `::1`, any port) are always
   accepted, whether or not `allowed_origins` is set -- it is a DNS-rebinding
   guard against a locally bound server, not something a configured allowlist
-  replaces; `allowed_origins` only adds non-localhost origins on top of it;
+  replaces; `allowed_origins` only adds non-localhost origins on top of it.
+  The origin is parsed first, so `http://localhost:1@evil.com` (userinfo, real
+  host `evil.com`) is not localhost;
 - a non-localhost origin is rejected unless it matches `allowed_origins`;
 - an empty allowlist therefore rejects browser cross-origin access.
 
@@ -122,7 +125,9 @@ as a production fix for a proxy misconfiguration.
 
 `WebSocketTransport` applies the same `Origin` rules to the upgrade request,
 with the same `allowed_origins` and `disable_origin_validation` builder
-methods, and answers a rejected handshake with `403`. Browsers do not apply
+methods, and answers a rejected handshake with `403`. It also applies the same
+`Host` rules (`allowed_hosts` and `disable_host_validation`, same defaults) and
+answers a rejected `Host` with `400`. Browsers do not apply
 CORS to WebSocket connections, so this check is the only thing stopping a web
 page from connecting to a WebSocket server bound to localhost.
 
