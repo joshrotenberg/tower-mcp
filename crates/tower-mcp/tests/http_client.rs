@@ -18,7 +18,7 @@ use tower_mcp::{
     McpRouter, NoParams, NotificationHandler, PromptBuilder, PromptMessage, PromptRole,
     ReadResourceResult, ResourceBuilder, ResourceContent, ResourceTemplateBuilder, Root,
     SamplingContent, SamplingContentOrArray, SamplingMessage, SubscriptionFilter, ToolBuilder,
-    client::{HttpClientConfig, HttpClientTransport, McpClient},
+    client::{HttpClientConfig, HttpClientTransport, HttpStatusDetails, McpClient},
     extract::{Context, RawArgs},
     transport::http::SessionConfig,
 };
@@ -4727,4 +4727,131 @@ async fn drop_sends_no_delete_for_a_stateless_connection() {
         0,
         "a stateless connection must never send a session-termination DELETE"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A transient HTTP status fails one request, not the transport (#1553)
+// ---------------------------------------------------------------------------
+
+/// A raw server that answers the first `tools/list` with `status`, `headers`
+/// and a plain-text `body`, then answers everything normally.
+async fn spawn_flaky_list_server(
+    status: &'static str,
+    headers: &'static str,
+    body: &'static str,
+) -> String {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let failed_once = Arc::new(AtomicBool::new(false));
+    spawn_raw_server(move |req| {
+        if raw_is(req, "initialize") {
+            raw_initialize_ok(req)
+        } else if raw_is(req, "notifications/initialized") {
+            raw_response("202 Accepted", "", "")
+        } else if raw_is(req, "tools/list") && !failed_once.swap(true, Ordering::SeqCst) {
+            raw_response(status, headers, body)
+        } else {
+            let reply = format!(
+                r#"{{"jsonrpc":"2.0","id":{},"result":{{"tools":[]}}}}"#,
+                raw_request_id(req)
+            );
+            raw_response("200 OK", RAW_JSON, &reply)
+        }
+    })
+    .await
+}
+
+async fn flaky_list_outcome(
+    status: &'static str,
+    headers: &'static str,
+    body: &'static str,
+) -> (tower_mcp::Error, McpClient) {
+    let url = spawn_flaky_list_server(status, headers, body).await;
+    let client = McpClient::connect(HttpClientTransport::with_config(url, raw_client_config()))
+        .await
+        .unwrap();
+    client.initialize("raw-client", "1.0.0").await.unwrap();
+
+    let error = tokio::time::timeout(Duration::from_secs(3), client.list_tools())
+        .await
+        .expect("the failed list_tools hung")
+        .expect_err("the first list_tools must fail");
+    (error, client)
+}
+
+#[tokio::test]
+async fn gateway_503_fails_one_request_and_client_stays_usable() {
+    let (error, client) = flaky_list_outcome(
+        "503 Service Unavailable",
+        "Content-Type: text/plain\r\n",
+        "upstream unavailable",
+    )
+    .await;
+
+    let details = HttpStatusDetails::from_error(&error)
+        .unwrap_or_else(|| panic!("the error should carry the HTTP status, got: {error:?}"));
+    assert_eq!(details.status, 503);
+    assert_eq!(details.retry_after, None);
+    assert_eq!(details.retry_after_delay(), None);
+
+    tokio::time::timeout(Duration::from_secs(3), client.list_tools())
+        .await
+        .expect("list_tools after the 503 hung")
+        .expect("the same client must serve the next request");
+}
+
+#[tokio::test]
+async fn rate_limit_429_exposes_retry_after() {
+    let (error, client) = flaky_list_outcome(
+        "429 Too Many Requests",
+        "Content-Type: text/plain\r\nRetry-After: 7\r\n",
+        "slow down",
+    )
+    .await;
+
+    let details = HttpStatusDetails::from_error(&error)
+        .unwrap_or_else(|| panic!("the error should carry the HTTP status, got: {error:?}"));
+    assert_eq!(details.status, 429);
+    assert_eq!(details.retry_after.as_deref(), Some("7"));
+    assert_eq!(details.retry_after_delay(), Some(Duration::from_secs(7)));
+
+    tokio::time::timeout(Duration::from_secs(3), client.list_tools())
+        .await
+        .expect("list_tools after the 429 hung")
+        .expect("the same client must serve the next request");
+}
+
+#[tokio::test]
+async fn retry_after_http_date_is_passed_through_raw() {
+    let (error, _client) = flaky_list_outcome(
+        "503 Service Unavailable",
+        "Retry-After: Wed, 21 Oct 2026 07:28:00 GMT\r\n",
+        "",
+    )
+    .await;
+
+    let details = HttpStatusDetails::from_error(&error).expect("status details");
+    assert_eq!(
+        details.retry_after.as_deref(),
+        Some("Wed, 21 Oct 2026 07:28:00 GMT")
+    );
+    assert_eq!(details.retry_after_delay(), None);
+}
+
+/// A 404 on an established session still means the endpoint is gone: the
+/// request fails and the transport closes, as before.
+#[tokio::test]
+async fn session_404_still_closes_the_transport() {
+    let (_error, client) = flaky_list_outcome("404 Not Found", "", "").await;
+
+    // The transport closes just after the failed request's error is
+    // delivered, so poll: a follow-up call must eventually fail instead of
+    // reaching the server, which would answer it.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while client.list_tools().await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a 404 must keep closing the transport");
 }
