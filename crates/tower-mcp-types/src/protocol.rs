@@ -143,6 +143,24 @@ pub fn validate_extensions(extensions: &HashMap<String, Value>) -> Result<(), Me
     Ok(())
 }
 
+/// Deserializer for an optional field where an explicit JSON `null` is a
+/// value of its own, not an absent field.
+///
+/// With `#[serde(default)]` an absent field stays `None` while `null` becomes
+/// `Some(Value::Null)`. Serializing keeps the two apart as long as the field
+/// is skipped when `None`.
+pub(crate) mod explicit_null_serde {
+    use serde::{Deserialize, Deserializer};
+    use serde_json::Value;
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Value::deserialize(deserializer).map(Some)
+    }
+}
+
 pub(crate) mod meta_object_serde {
     use serde::de::Error as _;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -2803,7 +2821,17 @@ pub struct CallToolResult {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_error: bool,
     /// Optional structured content for programmatic access.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// MCP 2026-07-28 allows any JSON value, including `null`. An explicit
+    /// `"structuredContent": null` decodes as `Some(Value::Null)` and encodes
+    /// back as `null`, while an absent field stays `None`. On 2025-11-25 and
+    /// earlier the value must be an object, so the tool-call path turns a
+    /// `null` into an error result for those requests.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::protocol::explicit_null_serde::deserialize"
+    )]
     pub structured_content: Option<Value>,
     /// Optional metadata (e.g., for io.modelcontextprotocol/related-task)
     #[serde(
@@ -7655,6 +7683,48 @@ mod tests {
         let structured = result.structured_content.unwrap();
         assert_eq!(structured["count"], 0);
         assert_eq!(structured["results"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn call_tool_result_round_trips_absent_null_and_object_structured_content() {
+        // Absent stays absent and is not written out.
+        let absent: CallToolResult = serde_json::from_value(serde_json::json!({
+            "content": []
+        }))
+        .unwrap();
+        assert!(absent.structured_content.is_none());
+        assert!(
+            !serde_json::to_value(&absent)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("structuredContent")
+        );
+
+        // An explicit null is a value of its own and survives the round trip.
+        let null: CallToolResult = serde_json::from_value(serde_json::json!({
+            "content": [],
+            "structuredContent": null
+        }))
+        .unwrap();
+        assert_eq!(null.structured_content, Some(Value::Null));
+        let encoded = serde_json::to_value(&null).unwrap();
+        assert_eq!(
+            encoded.as_object().unwrap().get("structuredContent"),
+            Some(&Value::Null)
+        );
+
+        // An object is unchanged.
+        let object: CallToolResult = serde_json::from_value(serde_json::json!({
+            "content": [],
+            "structuredContent": {"a": 1}
+        }))
+        .unwrap();
+        assert_eq!(object.structured_content, Some(serde_json::json!({"a": 1})));
+        assert_eq!(
+            serde_json::to_value(&object).unwrap()["structuredContent"],
+            serde_json::json!({"a": 1})
+        );
     }
 
     // =========================================================================

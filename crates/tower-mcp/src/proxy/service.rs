@@ -652,6 +652,7 @@ async fn handle_call_tool(
         task: params.task,
     });
 
+    let final_protocol = crate::router::is_final_protocol_request(&extensions);
     let router_req = RouterRequest {
         id,
         inner: inner_request,
@@ -659,7 +660,17 @@ async fn handle_call_tool(
     };
 
     let resp = service.oneshot(router_req).await.expect("infallible");
-    resp.inner
+    let mut result = resp.inner;
+    // A backend on 2026-07-28 may send an explicit `structuredContent: null`.
+    // 2025-11-25 and earlier require an object when the field is present, so
+    // a peer on those revisions gets the field omitted instead.
+    if !final_protocol
+        && let Ok(McpResponse::CallTool(call)) = &mut result
+        && matches!(call.structured_content, Some(serde_json::Value::Null))
+    {
+        call.structured_content = None;
+    }
+    result
 }
 
 async fn handle_list_resources(infos: Vec<EntryInfo>) -> Result<McpResponse, JsonRpcError> {
