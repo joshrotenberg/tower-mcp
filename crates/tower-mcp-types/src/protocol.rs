@@ -2854,6 +2854,12 @@ impl CallToolResult {
     /// The JSON value is serialized to pretty-printed text for display,
     /// and also stored in `structured_content` for programmatic access.
     ///
+    /// On MCP 2025-11-25 and earlier, `structuredContent` must be a JSON
+    /// object; MCP 2026-07-28 allows any JSON value. The value is stored as
+    /// given. tower-mcp's tool-call path replaces a non-object value with an
+    /// error result on older revisions. Use [`from_list`](Self::from_list)
+    /// to wrap a list in an object.
+    ///
     /// If you have a type that implements [`serde::Serialize`], use
     /// [`from_serialize`](Self::from_serialize) instead to avoid manual `to_value()` calls.
     pub fn json(value: Value) -> Self {
@@ -2875,7 +2881,13 @@ impl CallToolResult {
     /// This is a fallible alternative to [`json`](Self::json) that accepts any
     /// `serde::Serialize` type and handles serialization errors gracefully.
     /// The value is serialized to a `serde_json::Value`, then delegated to `json()`,
-    /// so `structured_content` is populated correctly.
+    /// so `structured_content` stores the serialized value as given.
+    ///
+    /// On MCP 2025-11-25 and earlier, `structuredContent` must be a JSON
+    /// object; MCP 2026-07-28 allows any JSON value. The value is stored as
+    /// given. tower-mcp's tool-call path replaces a non-object value with an
+    /// error result on older revisions. Use [`from_list`](Self::from_list)
+    /// to wrap a list in an object.
     ///
     /// # Errors
     ///
@@ -2912,7 +2924,8 @@ impl CallToolResult {
     /// Create a result from a list of serializable items.
     ///
     /// Wraps the list in a JSON object with the given key and a `count` field,
-    /// since MCP `structuredContent` requires objects, not bare arrays.
+    /// since MCP 2025-11-25 and earlier require `structuredContent` to be an
+    /// object. MCP 2026-07-28 also permits bare arrays.
     ///
     /// # Examples
     ///

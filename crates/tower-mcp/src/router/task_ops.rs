@@ -587,6 +587,13 @@ impl McpRouter {
         };
 
         let mut ctx = RequestContext::new(RequestId::String(task_id.to_string()));
+        // #1540: only 2026-07-28 tasks can park for input. A private marker
+        // preserves that revision's shape rules without fabricating transport
+        // metadata or changing log delivery. Router lifecycle decisions read
+        // the incoming request's extensions, so this replay marker does not
+        // affect those decisions.
+        #[cfg(feature = "stateless")]
+        ctx.extensions_mut().insert(ReplayedFinalRequest);
         // Replay rebuilds a request context, but it is still an invocation of
         // the same task. Restore its stable identity without a process-local
         // live handle so MRTR handlers can correlate every input round.

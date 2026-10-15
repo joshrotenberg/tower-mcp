@@ -1073,7 +1073,11 @@ impl ToolBuilder {
         self
     }
 
-    /// Set the output schema (JSON Schema for structured output)
+    /// Set the output schema (JSON Schema for structured output).
+    ///
+    /// MCP 2025-11-25 and earlier require `"type": "object"` at the root.
+    /// MCP 2026-07-28 accepts any JSON Schema 2020-12. The builder does not
+    /// rewrite or reject the schema.
     pub fn output_schema(mut self, schema: Value) -> Self {
         self.output_schema = Some(schema);
         self
@@ -1083,8 +1087,9 @@ impl ToolBuilder {
     ///
     /// The schema is generated the same way input schemas are, so the draft
     /// and `$defs` handling match. It replaces any schema set earlier with
-    /// [`output_schema`](Self::output_schema), and the MCP specification
-    /// requires it to describe a JSON object.
+    /// [`output_schema`](Self::output_schema). MCP 2025-11-25 and earlier
+    /// require `"type": "object"` at the root; MCP 2026-07-28 accepts any JSON
+    /// Schema 2020-12. The builder does not rewrite or reject the schema.
     ///
     /// The tool is not tied to `T`: the handler still builds its own
     /// [`CallToolResult`], for example with
@@ -1134,13 +1139,14 @@ impl ToolBuilder {
         self
     }
 
-    /// Do not validate this tool's `structuredContent` against its output
-    /// schema.
+    /// Disable this tool's structured-content shape and output schema checks.
     ///
     /// With the `schema-validation` feature a result whose `structuredContent`
     /// does not match the declared `outputSchema` is replaced by an error
-    /// result. This opts one tool out. Without the feature this is a no-op,
-    /// so code that calls it builds either way.
+    /// result. This opts one tool out of that check and the always-on shape
+    /// check that requires a JSON object on MCP 2025-11-25 and earlier. It
+    /// disables the shape check even without the feature. MCP 2026-07-28
+    /// permits any JSON value.
     pub fn skip_output_validation(mut self) -> Self {
         self.validation.output = false;
         self
@@ -2776,6 +2782,11 @@ where
 ///     b: i64,
 /// }
 ///
+/// #[derive(Serialize)]
+/// struct AddOutput {
+///     sum: i64,
+/// }
+///
 /// struct AddTool;
 ///
 /// impl McpTool for AddTool {
@@ -2783,10 +2794,10 @@ where
 ///     const DESCRIPTION: &'static str = "Add two numbers";
 ///
 ///     type Input = AddInput;
-///     type Output = i64;
+///     type Output = AddOutput;
 ///
 ///     async fn call(&self, input: Self::Input) -> Result<Self::Output> {
-///         Ok(input.a + input.b)
+///         Ok(AddOutput { sum: input.a + input.b })
 ///     }
 /// }
 ///
@@ -2802,6 +2813,10 @@ pub trait McpTool: Send + Sync + 'static {
     /// The input type, deserialized from tool call arguments.
     type Input: JsonSchema + DeserializeOwned + Send;
     /// The output type, serialized into the tool call result.
+    ///
+    /// On MCP 2025-11-25 and earlier, the value must serialize to a JSON
+    /// object or the call returns an error result; use
+    /// [`CallToolResult::from_list`] to wrap a list.
     type Output: Serialize + Send;
 
     /// Execute the tool with the given input.

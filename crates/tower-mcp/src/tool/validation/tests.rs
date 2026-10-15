@@ -82,7 +82,7 @@ async fn output_schema_for_replaces_an_earlier_schema() {
     );
 }
 
-/// The switches are always available, and do nothing without the feature.
+/// The switches are available across feature configurations.
 #[tokio::test]
 async fn opt_out_methods_build_with_or_without_the_feature() {
     let tool = ToolBuilder::new("either")
@@ -289,10 +289,10 @@ mod enabled {
         const NAME: &'static str = "bounded";
         const DESCRIPTION: &'static str = "a digit";
         type Input = BoundedInput;
-        type Output = u32;
+        type Output = Value;
 
         async fn call(&self, input: Self::Input) -> Result<Self::Output> {
-            Ok(input.digit)
+            Ok(json!({ "digit": input.digit }))
         }
     }
 
@@ -624,4 +624,347 @@ mod enabled {
         let result = complete(tool.call_outcome(person()).await.unwrap());
         assert!(!result.is_error);
     }
+}
+
+fn shape_tool(result: CallToolResult) -> Tool {
+    ToolBuilder::new("snapshots")
+        .handler(move |()| {
+            let result = result.clone();
+            async move { Ok(result) }
+        })
+        .build()
+}
+
+fn assert_shape_error(result: &CallToolResult, kind: &str) {
+    assert!(result.is_error);
+    assert!(result.structured_content.is_none());
+    assert_serialized_eq(
+        result.first_text().unwrap(),
+        format!(
+            "Tool 'snapshots' returned structuredContent of type {kind}; MCP 2025-11-25 and earlier require a JSON object. Wrap a list with CallToolResult::from_list or return an object."
+        ),
+    );
+}
+
+#[tokio::test]
+async fn an_array_structured_content_is_an_error_result_on_a_2025_request() {
+    assert_shape_error(
+        &shape_tool(CallToolResult::json(json!([1, 2])))
+            .call(Value::Null)
+            .await,
+        "array",
+    );
+}
+
+#[tokio::test]
+async fn a_scalar_structured_content_is_an_error_result_on_a_2025_request() {
+    for (value, kind) in [
+        (json!("value"), "string"),
+        (json!(42), "number"),
+        (json!(true), "boolean"),
+    ] {
+        assert_shape_error(
+            &shape_tool(CallToolResult::json(value))
+                .call(Value::Null)
+                .await,
+            kind,
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_null_structured_content_is_an_error_result_on_a_2025_request() {
+    assert_shape_error(
+        &shape_tool(CallToolResult::json(Value::Null))
+            .call(Value::Null)
+            .await,
+        "null",
+    );
+}
+
+#[tokio::test]
+async fn an_object_structured_content_passes_unchanged() {
+    let expected = CallToolResult::json(json!({"items": [1, 2]}));
+    assert_serialized_eq(
+        shape_tool(expected.clone()).call(Value::Null).await,
+        expected,
+    );
+}
+
+#[tokio::test]
+async fn a_result_without_structured_content_is_not_checked() {
+    let expected = CallToolResult::text("ok");
+    assert_serialized_eq(
+        shape_tool(expected.clone()).call(Value::Null).await,
+        expected,
+    );
+}
+
+#[tokio::test]
+async fn an_error_result_is_not_shape_checked() {
+    let expected = CallToolResult {
+        is_error: true,
+        ..CallToolResult::json(json!([1, 2]))
+    };
+    assert_serialized_eq(
+        shape_tool(expected.clone()).call(Value::Null).await,
+        expected,
+    );
+}
+
+#[tokio::test]
+async fn a_hand_built_result_is_shape_checked() {
+    let result = CallToolResult {
+        structured_content: Some(json!([1, 2])),
+        ..CallToolResult::text("list")
+    };
+    assert_shape_error(&shape_tool(result).call(Value::Null).await, "array");
+}
+
+#[tokio::test]
+async fn an_mcp_tool_whose_output_serializes_to_an_array_is_an_error_result() {
+    struct Snapshots;
+    impl McpTool for Snapshots {
+        const NAME: &'static str = "snapshots";
+        const DESCRIPTION: &'static str = "List snapshots";
+        type Input = NoParams;
+        type Output = Vec<u32>;
+        async fn call(&self, _input: Self::Input) -> Result<Self::Output> {
+            Ok(vec![1, 2])
+        }
+    }
+    assert_shape_error(&Snapshots.into_tool().call(json!({})).await, "array");
+}
+
+#[tokio::test]
+async fn skip_output_validation_also_skips_the_shape_check() {
+    let expected = CallToolResult::json(json!([1, 2]));
+    let tool = ToolBuilder::new("snapshots")
+        .skip_output_validation()
+        .handler(|()| async { Ok(CallToolResult::json(json!([1, 2]))) })
+        .build();
+    assert_serialized_eq(tool.call(Value::Null).await, expected);
+}
+
+#[cfg(not(feature = "schema-validation"))]
+#[tokio::test]
+async fn the_shape_check_runs_without_the_schema_validation_feature() {
+    assert_shape_error(
+        &shape_tool(CallToolResult::json(json!([1, 2])))
+            .call(Value::Null)
+            .await,
+        "array",
+    );
+}
+
+#[tokio::test]
+async fn a_tool_with_an_input_schema_but_no_output_schema_is_still_shape_checked() {
+    let tool = ToolBuilder::new("snapshots")
+        .input_schema(json!({"type": "object"}))
+        .handler(|_args: Value| async { Ok(CallToolResult::json(json!([1, 2]))) })
+        .build();
+    assert_shape_error(&tool.call(json!({})).await, "array");
+}
+
+#[tokio::test]
+async fn a_tool_without_compilable_schemas_is_still_shape_checked() {
+    let tool = ToolBuilder::new("snapshots")
+        .skip_input_validation()
+        .output_schema(json!({"type": "invalid"}))
+        .handler(|()| async { Ok(CallToolResult::json(json!([1, 2]))) })
+        .build();
+    assert_shape_error(&tool.call(Value::Null).await, "array");
+}
+
+#[cfg(feature = "stateless")]
+fn final_context() -> RequestContext {
+    let mut ctx = RequestContext::new(crate::protocol::RequestId::Number(1));
+    ctx.extensions_mut()
+        .insert(crate::stateless::StatelessRequestMeta {
+            protocol_version: Some(crate::protocol::PROTOCOL_VERSION_2026_07_28.to_string()),
+            ..Default::default()
+        });
+    ctx
+}
+
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn a_2026_07_28_request_keeps_an_array_structured_content() {
+    let expected = CallToolResult::json(json!([1, 2]));
+    assert_serialized_eq(
+        shape_tool(expected.clone())
+            .call_with_context(final_context(), Value::Null)
+            .await,
+        expected,
+    );
+}
+
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn a_2026_07_28_request_keeps_a_scalar_structured_content() {
+    for value in [json!("value"), json!(42), json!(true), Value::Null] {
+        let expected = CallToolResult::json(value);
+        assert_serialized_eq(
+            shape_tool(expected.clone())
+                .call_with_context(final_context(), Value::Null)
+                .await,
+            expected,
+        );
+    }
+}
+
+fn live_shape_tool() -> Tool {
+    ToolBuilder::new("snapshots")
+        .live_task_handler(|_task: TaskContext, ()| async {
+            Ok(TaskOutcome::Completed(CallToolResult::json(json!([1, 2]))))
+        })
+        .build()
+}
+
+async fn call_live_shape_tool(ctx: RequestContext) -> CallToolResult {
+    let handler = live_shape_tool().live_handler.unwrap();
+    let TaskOutcome::Completed(result) = handler
+        .call(ctx, TaskContext::new("task".to_string()), Value::Null)
+        .await
+        .unwrap()
+    else {
+        panic!("expected completion")
+    };
+    result
+}
+
+#[tokio::test]
+async fn live_task_handlers_are_shape_checked() {
+    let ctx = RequestContext::new(crate::protocol::RequestId::Number(1));
+    assert_shape_error(&call_live_shape_tool(ctx).await, "array");
+}
+
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn a_2026_07_28_live_task_keeps_an_array_structured_content() {
+    assert_serialized_eq(
+        call_live_shape_tool(final_context()).await,
+        CallToolResult::json(json!([1, 2])),
+    );
+}
+
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn a_replayed_final_request_keeps_arrays_without_transport_metadata_or_dropping_logs() {
+    use crate::context::{ServerNotification, notification_channel};
+    use crate::protocol::{LogLevel, LoggingMessageParams, RequestId};
+
+    let (tx, mut rx) = notification_channel(1);
+    let mut ctx = RequestContext::new(RequestId::Number(1)).with_notification_sender(tx);
+    ctx.extensions_mut()
+        .insert(crate::router::ReplayedFinalRequest);
+
+    assert!(
+        ctx.extension::<crate::stateless::StatelessRequestMeta>()
+            .is_none()
+    );
+    assert!(ctx.per_request_meta().is_none());
+    assert!(crate::router::is_final_protocol_request(ctx.extensions()));
+    ctx.send_log(LoggingMessageParams::new(
+        LogLevel::Debug,
+        json!("replayed"),
+    ));
+    let ServerNotification::LogMessage(params) = rx.try_recv().expect("replay log delivered")
+    else {
+        panic!("expected log notification")
+    };
+    assert_eq!(params.level, LogLevel::Debug);
+    assert_eq!(params.data, json!("replayed"));
+
+    let expected = CallToolResult::json(json!([1, 2]));
+    assert_serialized_eq(
+        shape_tool(expected.clone())
+            .call_with_context(ctx, Value::Null)
+            .await,
+        expected,
+    );
+}
+
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn mrtr_handlers_are_shape_checked() {
+    let tool = ToolBuilder::new("snapshots")
+        .mrtr_handler(|_ctx: RequestContext, ()| async {
+            Ok(RequestOutcome::Complete(CallToolResult::json(json!([
+                1, 2
+            ]))))
+        })
+        .build();
+    let RequestOutcome::Complete(result) = tool.call_outcome(Value::Null).await.unwrap() else {
+        panic!("expected completion")
+    };
+    assert_shape_error(&result, "array");
+    let RequestOutcome::Complete(result) = tool
+        .call_outcome_with_context(final_context(), Value::Null)
+        .await
+        .unwrap()
+    else {
+        panic!("expected completion")
+    };
+    assert_serialized_eq(result, CallToolResult::json(json!([1, 2])));
+}
+
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn an_mrtr_input_required_outcome_passes_through() {
+    let expected = crate::protocol::InputRequiredResult::new().with_request_state("next");
+    let tool = ToolBuilder::new("snapshots")
+        .mrtr_handler(|_ctx: RequestContext, ()| async {
+            Ok(RequestOutcome::InputRequired(
+                crate::protocol::InputRequiredResult::new().with_request_state("next"),
+            ))
+        })
+        .build();
+    assert_serialized_eq(
+        tool.call_outcome(Value::Null).await.unwrap(),
+        RequestOutcome::<CallToolResult>::InputRequired(expected),
+    );
+    assert_serialized_eq(
+        tool.mrtr_handler.unwrap().input_schema(),
+        ensure_object_schema(serde_json::to_value(schemars::schema_for!(())).unwrap()),
+    );
+}
+
+#[cfg(feature = "schema-validation")]
+fn object_output_schema_tool() -> Tool {
+    ToolBuilder::new("snapshots")
+        .output_schema(json!({"type": "object"}))
+        .handler(|()| async { Ok(CallToolResult::json(json!([1, 2]))) })
+        .build()
+}
+
+#[cfg(feature = "schema-validation")]
+#[tokio::test]
+async fn the_shape_check_runs_before_the_output_schema_check() {
+    assert_shape_error(
+        &object_output_schema_tool().call(Value::Null).await,
+        "array",
+    );
+}
+
+#[cfg(all(feature = "schema-validation", feature = "stateless"))]
+#[tokio::test]
+async fn a_2026_07_28_request_still_checks_the_output_schema() {
+    let result = object_output_schema_tool()
+        .call_with_context(final_context(), Value::Null)
+        .await;
+    assert!(result.is_error);
+    assert!(
+        result
+            .first_text()
+            .unwrap()
+            .contains("does not match its output schema")
+    );
+}
+
+fn assert_serialized_eq(actual: impl Serialize, expected: impl Serialize) {
+    assert_eq!(
+        serde_json::to_value(actual).unwrap(),
+        serde_json::to_value(expected).unwrap()
+    );
 }

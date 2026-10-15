@@ -52,20 +52,30 @@ fn prompt_not_found(name: &str) -> Error {
     )))
 }
 
+/// Marks a final-protocol task replay without synthesizing transport metadata.
+#[cfg(feature = "stateless")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReplayedFinalRequest;
+
 /// Whether this request is using the final, stateless 2026-07-28 lifecycle.
 ///
 /// Stable sessionful requests retain the crate's legacy task behavior; final
 /// requests use extension negotiation and server-directed task creation.
+///
+/// A task replay context carries [`ReplayedFinalRequest`] because only
+/// 2026-07-28 tasks can park for input (#1540); extensions a transport
+/// dispatched never contain it, so router lifecycle decisions are unaffected.
 #[cfg(feature = "stateless")]
-fn is_final_protocol_request(extensions: &crate::context::Extensions) -> bool {
-    extensions
-        .get::<crate::stateless::StatelessRequestMeta>()
-        .and_then(|meta| meta.protocol_version.as_deref())
-        == Some(crate::protocol::PROTOCOL_VERSION_2026_07_28)
+pub(crate) fn is_final_protocol_request(extensions: &crate::context::Extensions) -> bool {
+    extensions.get::<ReplayedFinalRequest>().is_some()
+        || extensions
+            .get::<crate::stateless::StatelessRequestMeta>()
+            .and_then(|meta| meta.protocol_version.as_deref())
+            == Some(crate::protocol::PROTOCOL_VERSION_2026_07_28)
 }
 
 #[cfg(not(feature = "stateless"))]
-fn is_final_protocol_request(_extensions: &crate::context::Extensions) -> bool {
+pub(crate) fn is_final_protocol_request(_extensions: &crate::context::Extensions) -> bool {
     false
 }
 

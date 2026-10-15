@@ -37,10 +37,10 @@ impl McpTool for AddTool {
     const DESCRIPTION: &'static str = "Add two numbers";
 
     type Input = AddInput;
-    type Output = i64;
+    type Output = serde_json::Value;
 
     async fn call(&self, input: Self::Input) -> Result<Self::Output> {
-        Ok(input.a + input.b)
+        Ok(serde_json::json!({ "sum": input.a + input.b }))
     }
 
     fn annotations(&self) -> Option<ToolAnnotations> {
@@ -125,7 +125,7 @@ async fn a_trait_defined_tool_carries_its_metadata_and_runs() {
     assert!(!result.is_error);
     assert_eq!(
         result.structured_content,
-        Some(serde_json::json!(5)),
+        Some(serde_json::json!({ "sum": 5 })),
         "the trait's Output should reach the result unchanged"
     );
 }
