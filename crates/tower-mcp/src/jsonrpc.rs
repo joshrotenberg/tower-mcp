@@ -19,6 +19,7 @@ use std::task::{Context, Poll};
 use tower::{Layer, ServiceExt};
 use tower_service::Service;
 
+use crate::context::CancellationToken;
 use crate::error::{Error, JsonRpcError, Result};
 use crate::inspection::{
     McpDirection, McpInspection, McpInspectionError, McpInspectionErrorKind, McpInspector,
@@ -27,7 +28,9 @@ use crate::inspection::{
 use crate::protocol::{
     JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, JsonRpcResponseMessage, McpRequest, ResultType,
 };
-use crate::router::{Extensions, PeerCancelled, RouterRequest, RouterResponse};
+use crate::router::{
+    ConnectionCancellation, Extensions, PeerCancelled, RouterRequest, RouterResponse,
+};
 use crate::{ProtocolSupport, ProtocolSupportError};
 
 /// Tower layer that adds JSON-RPC 2.0 framing to an MCP service.
@@ -110,6 +113,13 @@ impl<S> JsonRpcService<S> {
     /// HTTP/WebSocket layer into the MCP request pipeline.
     pub fn with_extensions(mut self, ext: Extensions) -> Self {
         self.extensions = ext;
+        self
+    }
+
+    /// Give every request this service dispatches a cancellation token that is
+    /// a child of `token`, so cancelling `token` reaches all of them (#1557).
+    pub(crate) fn with_connection_cancellation(mut self, token: CancellationToken) -> Self {
+        self.extensions.insert(ConnectionCancellation(token));
         self
     }
 
