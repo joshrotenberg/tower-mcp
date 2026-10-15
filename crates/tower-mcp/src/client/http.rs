@@ -1593,188 +1593,21 @@ impl ClientTransport for HttpClientTransport {
                     .is_some_and(|ct| ct.contains("text/event-stream"));
 
                 if is_sse {
-                    // Stream SSE response to extract id/retry fields
-                    let mut stream = response.bytes_stream();
-                    let mut parser = SseParser::with_limit(max_sse_event_size);
-                    let mut had_retry = false;
-                    let mut had_data = false;
-                    let mut subscription_acknowledged = false;
-
-                    use futures::StreamExt;
-                    while let Some(result) = stream.next().await {
-                        match result {
-                            Ok(bytes) => {
-                                let text = String::from_utf8_lossy(&bytes);
-                                let events = match parser.feed(&text) {
-                                    Ok(events) => events,
-                                    Err(e) => {
-                                        // A single event exceeded the cap;
-                                        // terminate the stream instead of
-                                        // buffering without bound. The
-                                        // response for this request is lost,
-                                        // so the transport is unusable.
-                                        tracing::error!(error = %e, "POST SSE stream terminated");
-                                        connected.store(false, Ordering::Release);
-                                        return;
-                                    }
-                                };
-                                for event in events {
-                                    if let Some(ref id) = event.id {
-                                        *last_event_id.write().await = Some(id.clone());
-                                    }
-                                    if let Some(retry_ms) = event.retry {
-                                        *sse_retry_delay.write().await =
-                                            Some(Duration::from_millis(retry_ms));
-                                        had_retry = true;
-                                    }
-                                    if !event.data.is_empty() {
-                                        had_data = true;
-                                        let value =
-                                            serde_json::from_str::<serde_json::Value>(&event.data);
-                                        let value = match value {
-                                            Ok(value) => value,
-                                            Err(error) if is_subscription => {
-                                                if let Some(id) = &reply_id {
-                                                    let _ = tx
-                                                        .send(transport_error_frame(
-                                                            id,
-                                                            &format!(
-                                                                "subscription stream returned invalid JSON: {error}"
-                                                            ),
-                                                        ))
-                                                        .await;
-                                                }
-                                                return;
-                                            }
-                                            Err(_) => {
-                                                let _ = tx.send(event.data).await;
-                                                continue;
-                                            }
-                                        };
-                                        let is_terminal =
-                                            value.get("id").zip(reply_id.as_ref()).is_some_and(
-                                                |(actual, expected)| {
-                                                    json_request_ids_match(actual, expected)
-                                                },
-                                            ) && (value.get("result").is_some()
-                                                || value.get("error").is_some());
-
-                                        if is_subscription {
-                                            let violation = if is_terminal {
-                                                if value.get("error").is_some() {
-                                                    None
-                                                } else if !subscription_acknowledged {
-                                                    Some(
-                                                        "subscriptions/listen completed before acknowledgment",
-                                                    )
-                                                } else if !value
-                                                    .pointer(
-                                                        "/result/_meta/io.modelcontextprotocol~1subscriptionId",
-                                                    )
-                                                    .zip(reply_id.as_ref())
-                                                    .is_some_and(|(actual, expected)| {
-                                                        json_request_ids_match(actual, expected)
-                                                    })
-                                                {
-                                                    Some(
-                                                        "subscriptions/listen result carried a missing or mismatched subscription ID",
-                                                    )
-                                                } else {
-                                                    None
-                                                }
-                                            } else if value.get("method").is_some()
-                                                && value.get("id").is_none()
-                                            {
-                                                let correlated = value
-                                                    .pointer(
-                                                        "/params/_meta/io.modelcontextprotocol~1subscriptionId",
-                                                    )
-                                                    .zip(reply_id.as_ref())
-                                                    .is_some_and(|(actual, expected)| {
-                                                        json_request_ids_match(actual, expected)
-                                                    });
-                                                let is_acknowledgment = value
-                                                    .get("method")
-                                                    .and_then(serde_json::Value::as_str)
-                                                    == Some(
-                                                        notifications::SUBSCRIPTIONS_ACKNOWLEDGED,
-                                                    );
-                                                if !correlated {
-                                                    Some(
-                                                        "subscription notification carried a missing or mismatched subscription ID",
-                                                    )
-                                                } else if !subscription_acknowledged
-                                                    && !is_acknowledgment
-                                                {
-                                                    Some(
-                                                        "subscription notification arrived before acknowledgment",
-                                                    )
-                                                } else if subscription_acknowledged
-                                                    && is_acknowledgment
-                                                {
-                                                    Some(
-                                                        "subscription stream sent a duplicate acknowledgment",
-                                                    )
-                                                } else {
-                                                    if is_acknowledgment {
-                                                        subscription_acknowledged = true;
-                                                    }
-                                                    None
-                                                }
-                                            } else {
-                                                Some(
-                                                    "subscription stream returned an unrelated JSON-RPC message",
-                                                )
-                                            };
-                                            if let Some(message) = violation {
-                                                if let Some(id) = &reply_id {
-                                                    let _ = tx
-                                                        .send(transport_error_frame(id, message))
-                                                        .await;
-                                                }
-                                                return;
-                                            }
-                                        }
-                                        let _ = tx.send(event.data).await;
-                                        if is_terminal {
-                                            // The request is complete. Close the response
-                                            // body ourselves even if a non-conforming server
-                                            // leaves the SSE stream open after its final reply.
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "POST SSE stream error");
-                                break;
-                            }
-                        }
-                    }
-
-                    // If the POST SSE stream closed with a retry hint but no data,
-                    // the server expects us to reconnect the GET notification stream.
-                    // Signal the SSE loop to close its current stream and reconnect
-                    // with the updated last_event_id and sse_retry_delay.
-                    if !is_modern_request && had_retry && !had_data {
-                        sse_reconnect_signal.notify_one();
-                    } else {
-                        // The response stream closed without ever delivering a
-                        // terminal response. Acknowledgments and ordinary
-                        // notifications do not complete a request, so wake the
-                        // caller rather than leave it hanging. A response has
-                        // no client request to wake; log instead.
-                        let reason = if had_data {
-                            "server closed the response stream before the final reply"
-                        } else {
-                            "server closed the response stream without a reply"
-                        };
-                        if let Some(id) = &reply_id {
-                            let _ = tx.send(transport_error_frame(id, reason)).await;
-                        } else {
-                            tracing::warn!(reason, "reply POST stream closed unexpectedly");
-                        }
-                    }
+                    pump_post_sse(
+                        response,
+                        PostSseContext {
+                            tx,
+                            reply_id,
+                            is_subscription,
+                            is_modern_request,
+                            connected,
+                            last_event_id,
+                            sse_retry_delay,
+                            sse_reconnect_signal,
+                            max_sse_event_size,
+                        },
+                    )
+                    .await;
                 } else {
                     // Non-SSE response: read body (bounded) and queue for recv().
                     match read_bounded_body(response, max_response_body_size).await {
@@ -1974,6 +1807,41 @@ impl ClientTransport for HttpClientTransport {
             self.protocol_version = Some(pv);
         }
 
+        // A request answered with an SSE stream is read on its own task, as on
+        // the session path, instead of to EOF here. The server may send a
+        // request on that stream (`initialize` answered by a ping, say) and
+        // hold the final reply until it is answered, and the message loop
+        // that answers it is the caller of this method (#1558).
+        let is_sse = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.contains("text/event-stream"));
+        if is_sse && reply_id.is_some() {
+            let request_id = reply_id
+                .clone()
+                .and_then(|value| serde_json::from_value(value).ok());
+            self.request_tasks.retain(|_, task| !task.is_finished());
+            let task = tokio::spawn(pump_post_sse(
+                response,
+                PostSseContext {
+                    tx: self.incoming_tx.clone(),
+                    reply_id,
+                    is_subscription: false,
+                    is_modern_request,
+                    connected: self.connected.clone(),
+                    last_event_id: self.last_event_id.clone(),
+                    sse_retry_delay: self.sse_retry_delay.clone(),
+                    sse_reconnect_signal: self.sse_reconnect_signal.clone(),
+                    max_sse_event_size: self.config.max_sse_event_size,
+                },
+            ));
+            if let Some(request_id) = request_id {
+                self.request_tasks.insert(request_id, task);
+            }
+            return Ok(());
+        }
+
         // Read response body (bounded) and queue for recv()
         let body = match read_bounded_body(response, self.config.max_response_body_size).await {
             Ok(body) => body,
@@ -2140,6 +2008,205 @@ impl Drop for HttpClientTransport {
             token_provider: self.token_provider.clone(),
         };
         handle.spawn(send_session_delete(params));
+    }
+}
+
+// =============================================================================
+// POST Response Streams
+// =============================================================================
+
+/// What [`pump_post_sse`] needs from the transport that spawned it.
+struct PostSseContext {
+    tx: mpsc::Sender<String>,
+    /// The id of the request this stream answers, or `None` for a reply to a
+    /// server request, which is owed nothing.
+    reply_id: Option<serde_json::Value>,
+    is_subscription: bool,
+    is_modern_request: bool,
+    connected: Arc<AtomicBool>,
+    last_event_id: Arc<RwLock<Option<String>>>,
+    sse_retry_delay: Arc<RwLock<Option<Duration>>>,
+    sse_reconnect_signal: Arc<Notify>,
+    max_sse_event_size: usize,
+}
+
+/// Forward the events of a POST's SSE response to the message loop as they
+/// arrive, until the request's final reply or the end of the stream.
+///
+/// Every frame is queued as soon as its event is complete, so the client can
+/// answer a server request sent on this stream (ping, sampling, elicitation)
+/// before the final reply, which the server may be holding until it has.
+/// A stream that ends without that reply wakes the caller with an error.
+async fn pump_post_sse(response: reqwest::Response, ctx: PostSseContext) {
+    let PostSseContext {
+        tx,
+        reply_id,
+        is_subscription,
+        is_modern_request,
+        connected,
+        last_event_id,
+        sse_retry_delay,
+        sse_reconnect_signal,
+        max_sse_event_size,
+    } = ctx;
+
+    // Stream SSE response to extract id/retry fields
+    let mut stream = response.bytes_stream();
+    let mut parser = SseParser::with_limit(max_sse_event_size);
+    let mut had_retry = false;
+    let mut had_data = false;
+    let mut subscription_acknowledged = false;
+
+    use futures::StreamExt;
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                let events = match parser.feed(&text) {
+                    Ok(events) => events,
+                    Err(e) => {
+                        // A single event exceeded the cap;
+                        // terminate the stream instead of
+                        // buffering without bound. The
+                        // response for this request is lost,
+                        // so the transport is unusable.
+                        tracing::error!(error = %e, "POST SSE stream terminated");
+                        connected.store(false, Ordering::Release);
+                        return;
+                    }
+                };
+                for event in events {
+                    if let Some(ref id) = event.id {
+                        *last_event_id.write().await = Some(id.clone());
+                    }
+                    if let Some(retry_ms) = event.retry {
+                        *sse_retry_delay.write().await = Some(Duration::from_millis(retry_ms));
+                        had_retry = true;
+                    }
+                    if !event.data.is_empty() {
+                        had_data = true;
+                        let value = serde_json::from_str::<serde_json::Value>(&event.data);
+                        let value = match value {
+                            Ok(value) => value,
+                            Err(error) if is_subscription => {
+                                if let Some(id) = &reply_id {
+                                    let _ = tx
+                                        .send(transport_error_frame(
+                                            id,
+                                            &format!(
+                                                "subscription stream returned invalid JSON: {error}"
+                                            ),
+                                        ))
+                                        .await;
+                                }
+                                return;
+                            }
+                            Err(_) => {
+                                let _ = tx.send(event.data).await;
+                                continue;
+                            }
+                        };
+                        let is_terminal = value.get("id").zip(reply_id.as_ref()).is_some_and(
+                            |(actual, expected)| json_request_ids_match(actual, expected),
+                        ) && (value.get("result").is_some()
+                            || value.get("error").is_some());
+
+                        if is_subscription {
+                            let violation = if is_terminal {
+                                if value.get("error").is_some() {
+                                    None
+                                } else if !subscription_acknowledged {
+                                    Some("subscriptions/listen completed before acknowledgment")
+                                } else if !value
+                                    .pointer(
+                                        "/result/_meta/io.modelcontextprotocol~1subscriptionId",
+                                    )
+                                    .zip(reply_id.as_ref())
+                                    .is_some_and(|(actual, expected)| {
+                                        json_request_ids_match(actual, expected)
+                                    })
+                                {
+                                    Some(
+                                        "subscriptions/listen result carried a missing or mismatched subscription ID",
+                                    )
+                                } else {
+                                    None
+                                }
+                            } else if value.get("method").is_some() && value.get("id").is_none() {
+                                let correlated = value
+                                    .pointer(
+                                        "/params/_meta/io.modelcontextprotocol~1subscriptionId",
+                                    )
+                                    .zip(reply_id.as_ref())
+                                    .is_some_and(|(actual, expected)| {
+                                        json_request_ids_match(actual, expected)
+                                    });
+                                let is_acknowledgment =
+                                    value.get("method").and_then(serde_json::Value::as_str)
+                                        == Some(notifications::SUBSCRIPTIONS_ACKNOWLEDGED);
+                                if !correlated {
+                                    Some(
+                                        "subscription notification carried a missing or mismatched subscription ID",
+                                    )
+                                } else if !subscription_acknowledged && !is_acknowledgment {
+                                    Some("subscription notification arrived before acknowledgment")
+                                } else if subscription_acknowledged && is_acknowledgment {
+                                    Some("subscription stream sent a duplicate acknowledgment")
+                                } else {
+                                    if is_acknowledgment {
+                                        subscription_acknowledged = true;
+                                    }
+                                    None
+                                }
+                            } else {
+                                Some("subscription stream returned an unrelated JSON-RPC message")
+                            };
+                            if let Some(message) = violation {
+                                if let Some(id) = &reply_id {
+                                    let _ = tx.send(transport_error_frame(id, message)).await;
+                                }
+                                return;
+                            }
+                        }
+                        let _ = tx.send(event.data).await;
+                        if is_terminal {
+                            // The request is complete. Close the response
+                            // body ourselves even if a non-conforming server
+                            // leaves the SSE stream open after its final reply.
+                            return;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "POST SSE stream error");
+                break;
+            }
+        }
+    }
+
+    // If the POST SSE stream closed with a retry hint but no data,
+    // the server expects us to reconnect the GET notification stream.
+    // Signal the SSE loop to close its current stream and reconnect
+    // with the updated last_event_id and sse_retry_delay.
+    if !is_modern_request && had_retry && !had_data {
+        sse_reconnect_signal.notify_one();
+    } else {
+        // The response stream closed without ever delivering a
+        // terminal response. Acknowledgments and ordinary
+        // notifications do not complete a request, so wake the
+        // caller rather than leave it hanging. A response has
+        // no client request to wake; log instead.
+        let reason = if had_data {
+            "server closed the response stream before the final reply"
+        } else {
+            "server closed the response stream without a reply"
+        };
+        if let Some(id) = &reply_id {
+            let _ = tx.send(transport_error_frame(id, reason)).await;
+        } else {
+            tracing::warn!(reason, "reply POST stream closed unexpectedly");
+        }
     }
 }
 

@@ -5168,3 +5168,96 @@ async fn session_404_without_recovery_fails_and_closes_the_transport() {
     .await
     .expect("a 404 without recovery must close the transport");
 }
+
+// =============================================================================
+// Edge cases from #1558
+// =============================================================================
+
+/// A server that answers `initialize` with an SSE stream, pings the client on
+/// that stream, and withholds the `InitializeResult` until the pong arrives.
+/// The client has to answer the ping while the initialize response is still
+/// open, which it cannot do if it reads that response to EOF before
+/// dispatching anything.
+#[tokio::test]
+async fn initialize_response_stream_is_dispatched_as_frames_arrive() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let pong_received = Arc::new(tokio::sync::Notify::new());
+    let pong_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let (pong_received_server, pong_seen_server) = (pong_received.clone(), pong_seen.clone());
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let pong_received = pong_received_server.clone();
+            let pong_seen = pong_seen_server.clone();
+            tokio::spawn(async move {
+                let Some(req) = read_http_request(&mut stream).await else {
+                    return;
+                };
+                if raw_is(&req, "initialize") {
+                    let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                                   mcp-session-id: raw-session\r\n\
+                                   mcp-protocol-version: 2025-11-25\r\n\
+                                   Connection: close\r\n\r\n";
+                    let _ = stream.write_all(headers.as_bytes()).await;
+                    let ping =
+                        "data: {\"jsonrpc\":\"2.0\",\"id\":\"srv-ping\",\"method\":\"ping\"}\n\n";
+                    let _ = stream.write_all(ping.as_bytes()).await;
+                    let _ = stream.flush().await;
+
+                    // Hold the InitializeResult until the pong has arrived.
+                    let _ = tokio::time::timeout(Duration::from_secs(3), pong_received.notified())
+                        .await;
+                    if pong_seen.load(std::sync::atomic::Ordering::SeqCst) {
+                        let result = format!(
+                            "data: {{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{{}},\"serverInfo\":{{\"name\":\"raw\",\"version\":\"0\"}}}}}}\n\n",
+                            raw_request_id(&req)
+                        );
+                        let _ = stream.write_all(result.as_bytes()).await;
+                    }
+                    let _ = stream.flush().await;
+                    return;
+                }
+                if req.contains("\"id\":\"srv-ping\"") && req.contains("\"result\"") {
+                    pong_seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                    pong_received.notify_one();
+                }
+                let _ = stream
+                    .write_all(raw_response("202 Accepted", "", "").as_bytes())
+                    .await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+
+    let client = McpClient::connect(HttpClientTransport::with_config(
+        format!("http://{addr}"),
+        HttpClientConfig {
+            request_timeout: Duration::from_secs(10),
+            ..raw_client_config()
+        },
+    ))
+    .await
+    .unwrap();
+
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.initialize("raw-client", "1.0.0"),
+    )
+    .await
+    .expect("initialize hung waiting on the ping it never answered")
+    .expect("initialize must succeed once the ping is answered");
+    assert_eq!(result.server_info.name, "raw");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "initialize should complete as soon as the pong lands, took {:?}",
+        started.elapsed()
+    );
+    assert!(pong_seen.load(std::sync::atomic::Ordering::SeqCst));
+}
