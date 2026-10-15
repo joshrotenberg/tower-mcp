@@ -1302,6 +1302,8 @@ impl McpRouter {
         // in-flight tracking observe the transport's signal.
         let ctx = if let Some(token) = merged.get::<CancellationToken>() {
             ctx.with_cancellation_token(token.clone())
+        } else if let Some(connection) = merged.get::<ConnectionCancellation>() {
+            ctx.with_cancellation_token(connection.0.child_token())
         } else {
             ctx
         };
@@ -3677,6 +3679,18 @@ impl PeerCancelled {
         self.0.load(AtomicOrdering::Acquire)
     }
 }
+
+/// A connection-wide cancellation signal, offered by a transport that needs to
+/// stop everything one connection has in flight (#1557).
+///
+/// Each request is given a child of this token as its own, so the transport
+/// firing it reaches every handler the connection started while a
+/// `notifications/cancelled` for one request still cancels only that request.
+/// Scoping it to the connection is the point: the router's in-flight registry
+/// is shared by every clone, so cancelling through it could reach a request
+/// that belongs to a different connection.
+#[derive(Debug, Clone)]
+pub(crate) struct ConnectionCancellation(pub(crate) CancellationToken);
 
 /// One tracked dispatch in the router's in-flight registry.
 struct InFlightDispatch {

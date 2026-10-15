@@ -1327,6 +1327,14 @@ impl CancellationToken {
     pub async fn cancelled(&self) {
         self.inner.cancelled().await
     }
+
+    /// A token that is cancelled when this one is, and can also be cancelled
+    /// on its own without affecting this one.
+    pub(crate) fn child_token(&self) -> Self {
+        Self {
+            inner: self.inner.child_token(),
+        }
+    }
 }
 
 /// Builder for creating request contexts
