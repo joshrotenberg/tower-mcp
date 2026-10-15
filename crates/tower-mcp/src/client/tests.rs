@@ -1991,6 +1991,109 @@ async fn cancellation_id_matching_is_exact_not_stringified() {
     );
 }
 
+// =========================================================================
+// Server request with an invalid id (#1558)
+// =========================================================================
+
+#[tokio::test]
+async fn server_request_with_a_non_integer_non_string_id_gets_an_invalid_request_error() {
+    struct CountingHandler {
+        roots_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ClientHandler for CountingHandler {
+        async fn handle_list_roots(&self) -> std::result::Result<ListRootsResult, JsonRpcError> {
+            self.roots_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ListRootsResult {
+                roots: vec![],
+                meta: None,
+            })
+        }
+    }
+
+    let roots_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (inject_tx, rx) = mpsc::channel::<String>(32);
+    let outgoing = Arc::new(Mutex::new(Vec::new()));
+    let transport = MockTransport {
+        responses: Arc::new(Mutex::new(vec![MockReply::Result(
+            mock_initialize_response(),
+        )])),
+        response_idx: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        incoming_tx: inject_tx.clone(),
+        incoming_rx: rx,
+        outgoing: outgoing.clone(),
+        connected: Arc::new(AtomicBool::new(true)),
+        fail_notification_sends: Arc::new(AtomicBool::new(false)),
+    };
+    let client = McpClient::builder()
+        .connect(
+            transport,
+            CountingHandler {
+                roots_calls: roots_calls.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    client.initialize("test-client", "1.0.0").await.unwrap();
+    let before = outgoing.lock().unwrap().len();
+
+    // A float, a boolean, an object, an array, null, and an integer too
+    // large for i64: none is a string or a signed integer.
+    let bad_ids = [
+        "1.5",
+        "true",
+        "{\"a\":1}",
+        "[1]",
+        "null",
+        "18446744073709551615",
+    ];
+    for id in bad_ids {
+        for method in ["ping", "roots/list"] {
+            inject_tx
+                .send(format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}"}}"#
+                ))
+                .await
+                .unwrap();
+        }
+    }
+    // A well-formed integer id still gets its normal reply.
+    inject_tx
+        .send(r#"{"jsonrpc":"2.0","id":7,"method":"ping"}"#.to_string())
+        .await
+        .unwrap();
+
+    let expected = bad_ids.len() * 2 + 1;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while outgoing.lock().unwrap().len() - before < expected {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("every request should be answered");
+
+    let sent: Vec<serde_json::Value> = outgoing.lock().unwrap()[before..]
+        .iter()
+        .map(|msg| serde_json::from_str(msg).unwrap())
+        .collect();
+    let (pongs, errors): (Vec<_>, Vec<_>) =
+        sent.iter().partition(|msg| msg.get("result").is_some());
+    assert_eq!(errors.len(), bad_ids.len() * 2, "sent: {sent:?}");
+    for error in errors {
+        assert_eq!(error["id"], serde_json::Value::Null, "{error}");
+        assert_eq!(error["error"]["code"], -32600, "{error}");
+    }
+    assert_eq!(pongs.len(), 1, "sent: {sent:?}");
+    assert_eq!(pongs[0]["id"], 7);
+    assert_eq!(pongs[0]["result"], serde_json::json!({}));
+    assert_eq!(
+        roots_calls.load(Ordering::SeqCst),
+        0,
+        "the handler must not run for an invalid request"
+    );
+}
+
 #[tokio::test]
 async fn test_list_resource_templates() {
     let client = McpClient::connect(MockTransport::with_responses(vec![
