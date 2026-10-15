@@ -20,9 +20,9 @@
 //! | `event_store_contract` | [`EventStore`](crate::event_store::EventStore) | `testing` and `http` or `websocket` |
 //!
 //! The suites assert documented behavior only. Where a trait leaves something
-//! open, such as whether a session store hides an expired record, the suite
-//! does not check it, so a correct implementation is never rejected for a
-//! choice the trait allows.
+//! open, such as the buffer capacity of an event store, the suite does not
+//! check it, so a correct implementation is never rejected for a choice the
+//! trait allows.
 //!
 //! # Running a suite
 //!

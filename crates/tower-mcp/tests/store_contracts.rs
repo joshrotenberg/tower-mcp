@@ -393,6 +393,15 @@ mod sessions_and_events {
         OverwritesOnCollision,
         /// `save` keeps the old optional fields when the new ones are `None`.
         MergesOnSave,
+        /// Records stay loadable for an hour past their `expires_at`.
+        OutlivesExpiry,
+    }
+
+    /// The record with its lifetime stretched by an hour.
+    fn outliving(record: &SessionRecord) -> SessionRecord {
+        let mut stretched = record.clone();
+        stretched.expires_at += std::time::Duration::from_secs(3600);
+        stretched
     }
 
     struct BrokenSessionStore {
@@ -422,6 +431,12 @@ mod sessions_and_events {
                 }
                 SessionFault::OverwritesOnCollision => self.inner.save(record).await,
                 SessionFault::MergesOnSave => self.inner.create(record).await,
+                SessionFault::OutlivesExpiry => {
+                    let mut stretched = outliving(record);
+                    self.inner.create(&mut stretched).await?;
+                    record.id = stretched.id;
+                    Ok(())
+                }
             }
         }
 
@@ -437,6 +452,7 @@ mod sessions_and_events {
                     }
                     self.inner.save(&merged).await
                 }
+                SessionFault::OutlivesExpiry => self.inner.save(&outliving(record)).await,
                 _ => self.inner.save(record).await,
             }
         }
@@ -473,6 +489,14 @@ mod sessions_and_events {
     )]
     async fn session_suite_catches_a_save_that_merges() {
         session_store_contract(|| BrokenSessionStore::new(SessionFault::MergesOnSave)).await;
+    }
+
+    #[tokio::test]
+    #[should_panic(
+        expected = "SessionStore contract violated: load answers None for an expired record"
+    )]
+    async fn session_suite_catches_an_expired_record_that_still_loads() {
+        session_store_contract(|| BrokenSessionStore::new(SessionFault::OutlivesExpiry)).await;
     }
 
     #[derive(Clone, Copy)]
