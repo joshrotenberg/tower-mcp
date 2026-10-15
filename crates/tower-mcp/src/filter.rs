@@ -79,7 +79,8 @@ impl Filterable for Prompt {
 #[derive(Clone, Default)]
 #[non_exhaustive]
 pub enum DenialBehavior {
-    /// Return "method not found" error -- hides the capability entirely.
+    /// Return a "not found" invalid-params error (-32602) -- hides the
+    /// capability entirely.
     ///
     /// This is the default and recommended for security. Use this in
     /// multi-tenant scenarios where tools should not be discoverable by
@@ -121,7 +122,9 @@ impl DenialBehavior {
     /// Generate the appropriate error for a denied capability.
     pub fn to_error(&self, name: &str) -> Error {
         match self {
-            Self::NotFound => Error::JsonRpc(JsonRpcError::method_not_found(name)),
+            Self::NotFound => {
+                Error::JsonRpc(JsonRpcError::invalid_params(format!("Not found: {name}")))
+            }
             Self::Unauthorized => {
                 Error::JsonRpc(JsonRpcError::forbidden(format!("Unauthorized: {}", name)))
             }

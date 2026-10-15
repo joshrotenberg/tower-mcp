@@ -46,9 +46,19 @@ pub(crate) type CompletionHandler = Arc<
         + Sync,
 >;
 
+// Unknown tools and prompts are invalid params (-32602) in every supported
+// revision (`server/tools` and `server/prompts` error handling). -32601 is
+// reserved for a method the server does not implement; on the 2026-07-28
+// HTTP path it maps to a 404, which clients read as "no such endpoint".
 fn prompt_not_found(name: &str) -> Error {
-    Error::JsonRpc(JsonRpcError::method_not_found(&format!(
+    Error::JsonRpc(JsonRpcError::invalid_params(format!(
         "Prompt not found: {name}"
+    )))
+}
+
+fn tool_not_found(name: &str) -> Error {
+    Error::JsonRpc(JsonRpcError::invalid_params(format!(
+        "Unknown tool: {name}"
     )))
 }
 
@@ -1919,7 +1929,7 @@ impl McpRouter {
                         status = "disabled",
                         "tool call completed"
                     );
-                    return Err(Error::JsonRpc(JsonRpcError::method_not_found(&params.name)));
+                    return Err(tool_not_found(&params.name));
                 }
 
                 // Look up static tools first, then dynamic
@@ -1941,7 +1951,7 @@ impl McpRouter {
                             status = "not_found",
                             "tool call completed"
                         );
-                        return Err(Error::JsonRpc(JsonRpcError::method_not_found(&params.name)));
+                        return Err(tool_not_found(&params.name));
                     }
                 };
 
@@ -1961,7 +1971,8 @@ impl McpRouter {
                         status = "denied",
                         "tool call completed"
                     );
-                    return Err(filter.denial_error(&params.name));
+                    return Err(filter
+                        .denial_error_or_not_found(&params.name, || tool_not_found(&params.name)));
                 }
 
                 // Task creation is client-directed on the legacy protocol and
@@ -1981,9 +1992,7 @@ impl McpRouter {
                         TaskSupportMode::Required if !server_enabled => {
                             // Match tools/list: a final-only task tool is not
                             // part of this server's surface until it opts in.
-                            return Err(Error::JsonRpc(JsonRpcError::method_not_found(
-                                &params.name,
-                            )));
+                            return Err(tool_not_found(&params.name));
                         }
                         TaskSupportMode::Required if !tasks_negotiated => {
                             return Err(Error::JsonRpc(
@@ -2913,7 +2922,9 @@ impl McpRouter {
                 if let Some(filter) = &self.inner.prompt_filter
                     && !filter.is_visible_with_context(&filter_context, &prompt)
                 {
-                    return Err(filter.denial_error(&params.name));
+                    return Err(filter.denial_error_or_not_found(&params.name, || {
+                        prompt_not_found(&params.name)
+                    }));
                 }
 
                 // Before dispatch, so every path shares one check: layered and

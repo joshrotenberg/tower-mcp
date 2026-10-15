@@ -47,7 +47,7 @@
 //!   -H "MCP-Session-Id: <session-id-from-init>" \
 //!   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
 //!
-//! # Try to call hidden admin tool (returns "method not found")
+//! # Try to call hidden admin tool (returns an invalid params "not found" error)
 //! curl -X POST http://localhost:3000/ \
 //!   -H "Content-Type: application/json" \
 //!   -H "MCP-Session-Id: <session-id-from-init>" \
