@@ -1618,10 +1618,12 @@ fn select_scopes(
         && !challenge.scopes.is_empty()
     {
         challenge.scopes.clone()
-    } else if !discovery.protected_resource.scopes_supported.is_empty() {
-        discovery.protected_resource.scopes_supported.clone()
     } else {
-        metadata.scopes_supported.clone()
+        // MCP scope selection strategy: challenge scope, else the resource's
+        // `scopes_supported`, else omit `scope`. The authorization server's own
+        // `scopes_supported` describes everything it issues, not what this
+        // resource needs, so it is not a fallback.
+        discovery.protected_resource.scopes_supported.clone()
     };
     let mut selected = unique_scopes(selected);
     let refresh_supported = metadata.grant_types_supported.is_empty()
@@ -2138,6 +2140,7 @@ mod tests {
         expire_initial_token: bool,
         refresh_failure: Option<RefreshFailure>,
         rotating_refresh: Option<Arc<Mutex<RotatingRefresh>>>,
+        no_resource_scopes: bool,
     }
 
     impl MockOAuthHttp {
@@ -2149,7 +2152,16 @@ mod tests {
                 expire_initial_token: false,
                 refresh_failure: None,
                 rotating_refresh: None,
+                no_resource_scopes: false,
             }
+        }
+
+        /// The 401 challenge carries no `scope` and the protected-resource
+        /// metadata has no `scopes_supported`, while the authorization server
+        /// still advertises scopes of its own.
+        fn without_resource_scopes(mut self) -> Self {
+            self.no_resource_scopes = true;
+            self
         }
 
         fn expiring(mut self) -> Self {
@@ -2209,18 +2221,29 @@ mod tests {
                     status: 401,
                     headers: vec![(
                         "www-authenticate".to_string(),
-                        "Bearer resource_metadata=\"https://mcp.example.com/prm\", scope=\"challenge.scope\""
-                            .to_string(),
+                        if self.no_resource_scopes {
+                            "Bearer resource_metadata=\"https://mcp.example.com/prm\"".to_string()
+                        } else {
+                            "Bearer resource_metadata=\"https://mcp.example.com/prm\", scope=\"challenge.scope\""
+                                .to_string()
+                        },
                     )],
                     body: Vec::new(),
                 }),
                 "/prm" => Ok(Self::response(
                     200,
-                    serde_json::json!({
-                        "resource": "https://mcp.example.com/mcp",
-                        "authorization_servers": ["https://auth.example.com/issuer"],
-                        "scopes_supported": ["prm.scope"]
-                    }),
+                    if self.no_resource_scopes {
+                        serde_json::json!({
+                            "resource": "https://mcp.example.com/mcp",
+                            "authorization_servers": ["https://auth.example.com/issuer"]
+                        })
+                    } else {
+                        serde_json::json!({
+                            "resource": "https://mcp.example.com/mcp",
+                            "authorization_servers": ["https://auth.example.com/issuer"],
+                            "scopes_supported": ["prm.scope"]
+                        })
+                    },
                 )),
                 "/.well-known/oauth-authorization-server/issuer" => {
                     let (cimd, methods) = match self.mode {
@@ -2231,6 +2254,16 @@ mod tests {
                             (false, vec!["client_secret_basic"])
                         }
                         RegistrationMode::PrivateKeyJwt => (false, vec!["private_key_jwt"]),
+                    };
+                    let as_scopes = if self.no_resource_scopes {
+                        vec!["as.scope", "other.scope"]
+                    } else {
+                        vec![
+                            "challenge.scope",
+                            "prm.scope",
+                            "extra.scope",
+                            "offline_access",
+                        ]
                     };
                     Ok(Self::response(
                         200,
@@ -2244,7 +2277,7 @@ mod tests {
                             "code_challenge_methods_supported": ["S256"],
                             "token_endpoint_auth_methods_supported": methods,
                             "grant_types_supported": ["authorization_code", "refresh_token"],
-                            "scopes_supported": ["challenge.scope", "prm.scope", "extra.scope", "offline_access"]
+                            "scopes_supported": as_scopes
                         }),
                     ))
                 }
@@ -2801,6 +2834,48 @@ mod tests {
                 .iter()
                 .any(|request| request.url.ends_with("/token")),
             "no token request should follow a failed registration"
+        );
+    }
+
+    /// #1558 (rmcp PR #1352): with no challenge scope and no PRM
+    /// `scopes_supported`, the MCP scope selection strategy omits `scope`
+    /// rather than requesting everything the AS advertises.
+    #[tokio::test]
+    async fn authorization_url_omits_scope_without_challenge_or_resource_scopes() {
+        let http = MockOAuthHttp::new(RegistrationMode::Dynamic).without_resource_scopes();
+        let flow = flow_builder(
+            http,
+            dynamic_options(),
+            AutomaticAuthorizationHandler::default(),
+        )
+        .build()
+        .unwrap();
+
+        let OAuthAuthorizationStart::Pending(pending) =
+            flow.begin(std::iter::empty::<&str>()).await.unwrap()
+        else {
+            panic!("expected pending flow")
+        };
+
+        let url = reqwest::Url::parse(&pending.request().authorization_url).unwrap();
+        let parameters: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert!(
+            !parameters.contains_key("scope"),
+            "unexpected scope in {url}"
+        );
+        assert!(pending.request().scopes.is_empty());
+
+        // Explicit caller scopes still win.
+        let OAuthAuthorizationStart::Pending(pending) =
+            flow.begin(["explicit.scope"]).await.unwrap()
+        else {
+            panic!("expected pending flow")
+        };
+        let url = reqwest::Url::parse(&pending.request().authorization_url).unwrap();
+        let parameters: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(
+            parameters.get("scope").map(String::as_str),
+            Some("explicit.scope")
         );
     }
 
@@ -3377,6 +3452,15 @@ mod tests {
         };
 
         assert_eq!(select_scopes(&[], &discovery, &metadata), ["prm.scope"]);
+        // With nothing from the challenge or the resource, the AS's own
+        // `scopes_supported` is not used; `scope` is omitted.
+        discovery.protected_resource.scopes_supported.clear();
+        assert!(select_scopes(&[], &discovery, &metadata).is_empty());
+        assert_eq!(
+            select_scopes(&["explicit.scope".to_string()], &discovery, &metadata),
+            ["explicit.scope"]
+        );
+        discovery.protected_resource.scopes_supported = vec!["prm.scope".to_string()];
         discovery.challenge = Some(OAuthBearerChallenge {
             error: None,
             scopes: vec!["challenge.scope".to_string()],
