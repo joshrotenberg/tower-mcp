@@ -441,6 +441,8 @@ pub struct HttpClientTransport {
     /// server closes them. Other completed tasks are pruned on subsequent
     /// sends.
     request_tasks: HashMap<RequestId, JoinHandle<()>>,
+    /// The id of the `initialize` request, which the spec forbids cancelling.
+    initialize_request_id: Option<RequestId>,
     /// The last SSE event ID received, for stream resumption.
     last_event_id: Arc<RwLock<Option<String>>>,
     /// Server-requested retry delay from SSE `retry:` field.
@@ -503,6 +505,7 @@ impl HttpClientTransport {
             incoming_tx: tx,
             sse_task: None,
             request_tasks: HashMap::new(),
+            initialize_request_id: None,
             last_event_id: Arc::new(RwLock::new(None)),
             sse_retry_delay: Arc::new(RwLock::new(None)),
             sse_reconnect_signal: Arc::new(Notify::new()),
@@ -544,6 +547,7 @@ impl HttpClientTransport {
             incoming_tx: tx,
             sse_task: None,
             request_tasks: HashMap::new(),
+            initialize_request_id: None,
             last_event_id: Arc::new(RwLock::new(None)),
             sse_retry_delay: Arc::new(RwLock::new(None)),
             sse_reconnect_signal: Arc::new(Notify::new()),
@@ -1321,6 +1325,11 @@ impl ClientTransport for HttpClientTransport {
             .and_then(|value| value.get("id"))
             .cloned();
         let operation = operation_label(parsed_message.as_ref());
+        if method == Some("initialize") {
+            self.initialize_request_id = reply_id
+                .clone()
+                .and_then(|value| serde_json::from_value(value).ok());
+        }
         let outbound_version = parsed_message
             .as_ref()
             .and_then(|value| {
@@ -1958,12 +1967,35 @@ impl ClientTransport for HttpClientTransport {
     }
 
     async fn cancel_request(&mut self, request_id: &RequestId) -> Result<()> {
+        let mut in_flight = false;
         if let Some(task) = self.request_tasks.remove(request_id) {
             // Dropping reqwest's response byte stream closes this request's
             // HTTP response body, which is the final protocol's cancellation
             // signal. Other concurrent POST streams remain alive.
+            in_flight = !task.is_finished();
             task.abort();
             let _ = task.await;
+        }
+
+        // On a 2025-11-25 session a closed connection is not a cancellation,
+        // so the server keeps working unless it is told. The session id is
+        // only held on that path; the final protocol is sessionless. The
+        // spec forbids cancelling `initialize`.
+        if in_flight
+            && self.session_id.is_some()
+            && self.initialize_request_id.as_ref() != Some(request_id)
+        {
+            let notification = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": { "requestId": request_id },
+            });
+            // The POST is already aborted, so a failed notification leaves
+            // nothing to retry; report success so the request is not kept
+            // pending for a response that can no longer arrive.
+            if let Err(error) = self.send(&notification.to_string()).await {
+                tracing::warn!(%error, "Failed to send notifications/cancelled");
+            }
         }
         Ok(())
     }

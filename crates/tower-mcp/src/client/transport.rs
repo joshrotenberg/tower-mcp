@@ -88,7 +88,10 @@ pub trait ClientTransport: Send + 'static {
     ///
     /// Message-oriented transports such as stdio use the protocol's
     /// `notifications/cancelled` notification. HTTP overrides this method to
-    /// close only the response stream belonging to the request.
+    /// close only the response stream belonging to the request, which is the
+    /// whole cancellation on the 2026-07-28 protocol; on a 2025-11-25 session
+    /// it also sends the notification, since a closed connection does not
+    /// cancel there.
     async fn cancel_request(&mut self, request_id: &RequestId) -> Result<()> {
         self.send(
             &serde_json::json!({

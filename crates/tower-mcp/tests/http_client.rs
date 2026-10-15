@@ -5261,3 +5261,189 @@ async fn initialize_response_stream_is_dispatched_as_frames_arrive() {
     );
     assert!(pong_seen.load(std::sync::atomic::Ordering::SeqCst));
 }
+
+/// A raw server for the cancellation tests: answers `server/discover` and
+/// notifications normally, never answers `tools/call`, and reports the JSON
+/// body of every POST it receives on the returned channel. `initialize` is
+/// answered with a session, or with an SSE stream that issues the session and
+/// then stays silent when `hold_initialize` is set.
+async fn spawn_recording_server(
+    hold_initialize: bool,
+) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (body_tx, body_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let body_tx = body_tx.clone();
+            tokio::spawn(async move {
+                let Some(req) = read_http_request(&mut stream).await else {
+                    return;
+                };
+                if let Some((_, body)) = req.split_once("\r\n\r\n") {
+                    let _ = body_tx.send(body.to_string());
+                }
+                let hold =
+                    (raw_is(&req, "initialize") && hold_initialize) || raw_is(&req, "tools/call");
+                if hold {
+                    if raw_is(&req, "initialize") {
+                        let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                                       mcp-session-id: raw-session\r\n\
+                                       mcp-protocol-version: 2025-11-25\r\n\
+                                       Connection: close\r\n\r\n";
+                        let _ = stream.write_all(headers.as_bytes()).await;
+                        let _ = stream.flush().await;
+                    }
+                    // Never answer; hold the connection until the client
+                    // closes it.
+                    let mut buf = [0u8; 16];
+                    while matches!(stream.read(&mut buf).await, Ok(n) if n > 0) {}
+                    return;
+                }
+                if raw_is(&req, "initialize") {
+                    let _ = stream.write_all(raw_initialize_ok(&req).as_bytes()).await;
+                } else if raw_is(&req, "server/discover") {
+                    let body = format!(
+                        r#"{{"jsonrpc":"2.0","id":{},"result":{{"supportedVersions":["2026-07-28"],"capabilities":{{}}}}}}"#,
+                        raw_request_id(&req)
+                    );
+                    let _ = stream
+                        .write_all(raw_response("200 OK", RAW_JSON, &body).as_bytes())
+                        .await;
+                } else {
+                    let _ = stream
+                        .write_all(raw_response("202 Accepted", "", "").as_bytes())
+                        .await;
+                }
+                let _ = stream.flush().await;
+            });
+        }
+    });
+    (format!("http://{addr}"), body_rx)
+}
+
+/// Read bodies off `rx` until `matches` accepts one, within `limit`.
+async fn next_body_matching(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    limit: Duration,
+    matches: impl Fn(&serde_json::Value) -> bool,
+) -> Option<serde_json::Value> {
+    tokio::time::timeout(limit, async {
+        while let Some(body) = rx.recv().await {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body)
+                && matches(&value)
+            {
+                return Some(value);
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// On a 2025-11-25 session a closed connection is not a cancellation, so
+/// abandoning a request has to say so with `notifications/cancelled`, as it
+/// does on stdio.
+#[tokio::test]
+async fn dropping_a_session_request_sends_notifications_cancelled() {
+    let (url, mut bodies) = spawn_recording_server(false).await;
+    let client = McpClient::connect(HttpClientTransport::with_config(url, raw_client_config()))
+        .await
+        .unwrap();
+    client.initialize("raw-client", "1.0.0").await.unwrap();
+
+    // Abandon the call once the server has received it.
+    let client = Arc::new(client);
+    let call = tokio::spawn({
+        let client = client.clone();
+        async move {
+            let _ = client.call_tool("slow", serde_json::json!({})).await;
+        }
+    });
+    let request = next_body_matching(&mut bodies, Duration::from_secs(3), |v| {
+        v["method"] == "tools/call"
+    })
+    .await
+    .expect("the server never received the tools/call");
+    let request_id = request["id"].clone();
+    call.abort();
+
+    let cancelled = next_body_matching(&mut bodies, Duration::from_secs(3), |v| {
+        v["method"] == "notifications/cancelled"
+    })
+    .await
+    .expect("no notifications/cancelled reached the server for the abandoned request");
+    assert_eq!(cancelled["params"]["requestId"], request_id);
+}
+
+/// The spec forbids cancelling `initialize`, so abandoning one that has
+/// already issued a session sends nothing.
+#[tokio::test]
+async fn dropping_initialize_sends_no_notifications_cancelled() {
+    let (url, mut bodies) = spawn_recording_server(true).await;
+    let client = McpClient::connect(HttpClientTransport::with_config(url, raw_client_config()))
+        .await
+        .unwrap();
+
+    // The server issues the session and then goes quiet, so this times out
+    // and drops the initialize future with its request in flight.
+    let outcome = tokio::time::timeout(
+        Duration::from_millis(300),
+        client.initialize("raw-client", "1.0.0"),
+    )
+    .await;
+    assert!(outcome.is_err(), "initialize should still be waiting");
+
+    let cancelled = next_body_matching(&mut bodies, Duration::from_millis(500), |v| {
+        v["method"] == "notifications/cancelled"
+    })
+    .await;
+    assert!(cancelled.is_none(), "initialize must not be cancelled");
+}
+
+/// On the 2026-07-28 path a disconnect is the cancellation, and there is no
+/// session to address a notification to, so none is sent.
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn dropping_a_final_request_sends_no_notifications_cancelled() {
+    let (url, mut bodies) = spawn_recording_server(false).await;
+    let client = McpClient::builder()
+        .protocol_support(tower_mcp::ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+        .connect(
+            HttpClientTransport::with_config(url, raw_client_config()),
+            NotificationHandler::new(),
+        )
+        .await
+        .unwrap();
+    client.discover("raw-client", "1.0.0").await.unwrap();
+
+    let client = Arc::new(client);
+    let call = tokio::spawn({
+        let client = client.clone();
+        async move {
+            let _ = client.call_tool("slow", serde_json::json!({})).await;
+        }
+    });
+    next_body_matching(&mut bodies, Duration::from_secs(3), |v| {
+        v["method"] == "tools/call"
+    })
+    .await
+    .expect("the server never received the tools/call");
+    call.abort();
+
+    let cancelled = next_body_matching(&mut bodies, Duration::from_millis(500), |v| {
+        v["method"] == "notifications/cancelled"
+    })
+    .await;
+    assert!(
+        cancelled.is_none(),
+        "the final protocol cancels by disconnecting, not by notification"
+    );
+}
