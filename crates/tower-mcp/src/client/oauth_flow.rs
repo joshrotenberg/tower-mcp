@@ -20,7 +20,9 @@ use super::oauth::{
 use super::oauth_authcode::{
     OAuthAuthorizationServerMetadata, OAuthClientRegistration, OAuthClientRegistrationMethod,
     OAuthClientRegistrationOptions, OAuthClientRegistrationStore, OAuthProtectedResourceMetadata,
-    discovery_reason, validate_resource_identifier, validate_resource_override,
+    discovery_reason, preferred_registration_auth_method,
+    require_secret_for_confidential_registration, validate_resource_identifier,
+    validate_resource_override,
 };
 
 /// HTTP method used by an OAuth protocol request.
@@ -1616,10 +1618,12 @@ fn select_scopes(
         && !challenge.scopes.is_empty()
     {
         challenge.scopes.clone()
-    } else if !discovery.protected_resource.scopes_supported.is_empty() {
-        discovery.protected_resource.scopes_supported.clone()
     } else {
-        metadata.scopes_supported.clone()
+        // MCP scope selection strategy: challenge scope, else the resource's
+        // `scopes_supported`, else omit `scope`. The authorization server's own
+        // `scopes_supported` describes everything it issues, not what this
+        // resource needs, so it is not a fallback.
+        discovery.protected_resource.scopes_supported.clone()
     };
     let mut selected = unique_scopes(selected);
     let refresh_supported = metadata.grant_types_supported.is_empty()
@@ -1637,27 +1641,6 @@ fn select_scopes(
         selected.push("offline_access".to_string());
     }
     selected
-}
-
-fn preferred_registration_auth_method(
-    advertised: &[String],
-    has_private_key_signer: bool,
-) -> &'static str {
-    if has_private_key_signer && advertised.iter().any(|method| method == "private_key_jwt") {
-        "private_key_jwt"
-    } else if advertised
-        .iter()
-        .any(|method| method == "client_secret_basic")
-    {
-        "client_secret_basic"
-    } else if advertised
-        .iter()
-        .any(|method| method == "client_secret_post")
-    {
-        "client_secret_post"
-    } else {
-        "none"
-    }
 }
 
 async fn resolve_registration_with_http(
@@ -1730,8 +1713,18 @@ async fn resolve_registration_with_http(
         struct RegistrationResponse {
             client_id: String,
             client_secret: Option<String>,
+            token_endpoint_auth_method: Option<String>,
         }
         let registered: RegistrationResponse = response.json()?;
+        // RFC 7591 section 3.2.1: the response reports the registered
+        // method, which can differ from the requested one.
+        require_secret_for_confidential_registration(
+            registered
+                .token_endpoint_auth_method
+                .as_deref()
+                .unwrap_or(&request.token_endpoint_auth_method),
+            registered.client_secret.as_deref(),
+        )?;
         let registration = OAuthClientRegistration::dynamically_registered(
             metadata.issuer.clone(),
             registered.client_id,
@@ -2116,6 +2109,9 @@ mod tests {
         PreRegistered,
         Cimd,
         Dynamic,
+        /// DCR against an AS that only advertises `client_secret_basic`, whose
+        /// registration endpoint returns no `client_secret`.
+        DynamicConfidentialWithoutSecret,
         PrivateKeyJwt,
     }
 
@@ -2144,6 +2140,7 @@ mod tests {
         expire_initial_token: bool,
         refresh_failure: Option<RefreshFailure>,
         rotating_refresh: Option<Arc<Mutex<RotatingRefresh>>>,
+        no_resource_scopes: bool,
     }
 
     impl MockOAuthHttp {
@@ -2155,7 +2152,16 @@ mod tests {
                 expire_initial_token: false,
                 refresh_failure: None,
                 rotating_refresh: None,
+                no_resource_scopes: false,
             }
+        }
+
+        /// The 401 challenge carries no `scope` and the protected-resource
+        /// metadata has no `scopes_supported`, while the authorization server
+        /// still advertises scopes of its own.
+        fn without_resource_scopes(mut self) -> Self {
+            self.no_resource_scopes = true;
+            self
         }
 
         fn expiring(mut self) -> Self {
@@ -2215,25 +2221,49 @@ mod tests {
                     status: 401,
                     headers: vec![(
                         "www-authenticate".to_string(),
-                        "Bearer resource_metadata=\"https://mcp.example.com/prm\", scope=\"challenge.scope\""
-                            .to_string(),
+                        if self.no_resource_scopes {
+                            "Bearer resource_metadata=\"https://mcp.example.com/prm\"".to_string()
+                        } else {
+                            "Bearer resource_metadata=\"https://mcp.example.com/prm\", scope=\"challenge.scope\""
+                                .to_string()
+                        },
                     )],
                     body: Vec::new(),
                 }),
                 "/prm" => Ok(Self::response(
                     200,
-                    serde_json::json!({
-                        "resource": "https://mcp.example.com/mcp",
-                        "authorization_servers": ["https://auth.example.com/issuer"],
-                        "scopes_supported": ["prm.scope"]
-                    }),
+                    if self.no_resource_scopes {
+                        serde_json::json!({
+                            "resource": "https://mcp.example.com/mcp",
+                            "authorization_servers": ["https://auth.example.com/issuer"]
+                        })
+                    } else {
+                        serde_json::json!({
+                            "resource": "https://mcp.example.com/mcp",
+                            "authorization_servers": ["https://auth.example.com/issuer"],
+                            "scopes_supported": ["prm.scope"]
+                        })
+                    },
                 )),
                 "/.well-known/oauth-authorization-server/issuer" => {
                     let (cimd, methods) = match self.mode {
                         RegistrationMode::PreRegistered => (false, vec!["client_secret_basic"]),
                         RegistrationMode::Cimd => (true, vec!["none"]),
                         RegistrationMode::Dynamic => (false, vec!["none"]),
+                        RegistrationMode::DynamicConfidentialWithoutSecret => {
+                            (false, vec!["client_secret_basic"])
+                        }
                         RegistrationMode::PrivateKeyJwt => (false, vec!["private_key_jwt"]),
+                    };
+                    let as_scopes = if self.no_resource_scopes {
+                        vec!["as.scope", "other.scope"]
+                    } else {
+                        vec![
+                            "challenge.scope",
+                            "prm.scope",
+                            "extra.scope",
+                            "offline_access",
+                        ]
                     };
                     Ok(Self::response(
                         200,
@@ -2247,7 +2277,7 @@ mod tests {
                             "code_challenge_methods_supported": ["S256"],
                             "token_endpoint_auth_methods_supported": methods,
                             "grant_types_supported": ["authorization_code", "refresh_token"],
-                            "scopes_supported": ["challenge.scope", "prm.scope", "extra.scope", "offline_access"]
+                            "scopes_supported": as_scopes
                         }),
                     ))
                 }
@@ -2767,6 +2797,86 @@ mod tests {
             panic!("expected registration JSON")
         };
         assert_eq!(value["redirect_uris"][0], "http://127.0.0.1:23456/callback");
+    }
+
+    /// #1558 (rmcp #1355): a confidential registration that comes back
+    /// without a secret fails at registration, not later at the token
+    /// endpoint after silently falling back to `none`.
+    #[tokio::test]
+    async fn confidential_dynamic_registration_without_secret_is_rejected() {
+        let http = MockOAuthHttp::new(RegistrationMode::DynamicConfidentialWithoutSecret);
+        let flow = flow_builder(
+            http.clone(),
+            dynamic_options(),
+            AutomaticAuthorizationHandler::default(),
+        )
+        .build()
+        .unwrap();
+
+        let error = flow.authorize(["challenge.scope"]).await.unwrap_err();
+
+        assert!(
+            matches!(&error, OAuthClientError::Registration(message)
+                if message.contains("client_secret_basic") && message.contains("client_secret")),
+            "unexpected error: {error}"
+        );
+        let requests = http.requests().await;
+        let registration_request = requests
+            .iter()
+            .find(|request| request.url.ends_with("/register"))
+            .unwrap();
+        let OAuthHttpBody::Json(value) = &registration_request.body else {
+            panic!("expected registration JSON")
+        };
+        assert_eq!(value["token_endpoint_auth_method"], "client_secret_basic");
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.url.ends_with("/token")),
+            "no token request should follow a failed registration"
+        );
+    }
+
+    /// #1558 (rmcp PR #1352): with no challenge scope and no PRM
+    /// `scopes_supported`, the MCP scope selection strategy omits `scope`
+    /// rather than requesting everything the AS advertises.
+    #[tokio::test]
+    async fn authorization_url_omits_scope_without_challenge_or_resource_scopes() {
+        let http = MockOAuthHttp::new(RegistrationMode::Dynamic).without_resource_scopes();
+        let flow = flow_builder(
+            http,
+            dynamic_options(),
+            AutomaticAuthorizationHandler::default(),
+        )
+        .build()
+        .unwrap();
+
+        let OAuthAuthorizationStart::Pending(pending) =
+            flow.begin(std::iter::empty::<&str>()).await.unwrap()
+        else {
+            panic!("expected pending flow")
+        };
+
+        let url = reqwest::Url::parse(&pending.request().authorization_url).unwrap();
+        let parameters: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert!(
+            !parameters.contains_key("scope"),
+            "the authorization URL must not carry a scope"
+        );
+        assert!(pending.request().scopes.is_empty());
+
+        // Explicit caller scopes still win.
+        let OAuthAuthorizationStart::Pending(pending) =
+            flow.begin(["explicit.scope"]).await.unwrap()
+        else {
+            panic!("expected pending flow")
+        };
+        let url = reqwest::Url::parse(&pending.request().authorization_url).unwrap();
+        let parameters: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(
+            parameters.get("scope").map(String::as_str),
+            Some("explicit.scope")
+        );
     }
 
     #[tokio::test]
@@ -3342,6 +3452,15 @@ mod tests {
         };
 
         assert_eq!(select_scopes(&[], &discovery, &metadata), ["prm.scope"]);
+        // With nothing from the challenge or the resource, the AS's own
+        // `scopes_supported` is not used; `scope` is omitted.
+        discovery.protected_resource.scopes_supported.clear();
+        assert!(select_scopes(&[], &discovery, &metadata).is_empty());
+        assert_eq!(
+            select_scopes(&["explicit.scope".to_string()], &discovery, &metadata),
+            ["explicit.scope"]
+        );
+        discovery.protected_resource.scopes_supported = vec!["prm.scope".to_string()];
         discovery.challenge = Some(OAuthBearerChallenge {
             error: None,
             scopes: vec!["challenge.scope".to_string()],

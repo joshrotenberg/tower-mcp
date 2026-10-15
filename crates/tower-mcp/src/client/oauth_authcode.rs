@@ -846,6 +846,80 @@ impl OAuthClientRegistrationOptions {
 struct DynamicClientRegistrationResponse {
     client_id: String,
     client_secret: Option<String>,
+    token_endpoint_auth_method: Option<String>,
+}
+
+/// The registration auth method this client prefers among those the
+/// authorization server advertises. Falls back to `none` when nothing else
+/// matches; callers must check that `none` is actually advertised.
+pub(crate) fn preferred_registration_auth_method(
+    advertised: &[String],
+    has_private_key_signer: bool,
+) -> &'static str {
+    if has_private_key_signer && advertised.iter().any(|method| method == "private_key_jwt") {
+        "private_key_jwt"
+    } else if advertised
+        .iter()
+        .any(|method| method == "client_secret_basic")
+    {
+        "client_secret_basic"
+    } else if advertised
+        .iter()
+        .any(|method| method == "client_secret_post")
+    {
+        "client_secret_post"
+    } else {
+        "none"
+    }
+}
+
+/// Check the caller's requested registration method against the methods the
+/// authorization server advertises (RFC 8414 `token_endpoint_auth_methods_supported`).
+///
+/// An unadvertised method would register a client the server cannot
+/// authenticate. When the requested method is not advertised, fall back to
+/// the same preference order as [`OAuthAuthorizationFlow`](super::OAuthAuthorizationFlow),
+/// and fail if the server advertises nothing this client can use. When the
+/// server advertises no methods, the requested method is kept.
+fn negotiate_registration_auth_method(
+    requested: &str,
+    advertised: &[String],
+) -> Result<String, OAuthClientError> {
+    if advertised.is_empty() || advertised.iter().any(|method| method == requested) {
+        return Ok(requested.to_string());
+    }
+    let preferred = preferred_registration_auth_method(advertised, false);
+    if advertised.iter().any(|method| method == preferred) {
+        tracing::debug!(
+            requested,
+            selected = preferred,
+            "requested token endpoint auth method is not advertised; using the advertised one"
+        );
+        return Ok(preferred.to_string());
+    }
+    Err(OAuthClientError::Registration(format!(
+        "authorization server advertises no token endpoint authentication method this client \
+         can register with (requested `{requested}`, advertised: {})",
+        advertised.join(", ")
+    )))
+}
+
+/// A confidential registration (`client_secret_basic` or `client_secret_post`)
+/// must come back with a non-empty secret. Without one, the token endpoint
+/// rejects every request later, so fail at registration instead of quietly
+/// treating the client as public.
+pub(crate) fn require_secret_for_confidential_registration(
+    method: &str,
+    client_secret: Option<&str>,
+) -> Result<(), OAuthClientError> {
+    if matches!(method, "client_secret_basic" | "client_secret_post")
+        && client_secret.is_none_or(str::is_empty)
+    {
+        return Err(OAuthClientError::Registration(format!(
+            "dynamic client registration used `{method}` but returned no client_secret"
+        )));
+    }
+    Ok(())
 }
 
 /// Select and, when necessary, perform OAuth client registration.
@@ -854,6 +928,14 @@ struct DynamicClientRegistrationResponse {
 /// exactly matches `metadata.issuer`. CIMD URLs must use HTTPS and contain a
 /// non-root path. If no configured mechanism is supported, the returned error
 /// tells the caller to prompt the user for client information.
+///
+/// On the Dynamic Client Registration path, the requested
+/// `token_endpoint_auth_method` is checked against the server's
+/// `token_endpoint_auth_methods_supported`. A method the server does not
+/// advertise is replaced by the first advertised one in the order
+/// `client_secret_basic`, `client_secret_post`, `none`, and registration fails
+/// if none of those is advertised. A confidential registration that returns no
+/// `client_secret` is an error.
 pub async fn resolve_oauth_client_registration(
     client: &reqwest::Client,
     metadata: &OAuthAuthorizationServerMetadata,
@@ -936,9 +1018,15 @@ async fn resolve_oauth_client_registration_inner(
             ));
         }
 
+        let mut request = request.clone();
+        request.token_endpoint_auth_method = negotiate_registration_auth_method(
+            &request.token_endpoint_auth_method,
+            &metadata.token_endpoint_auth_methods_supported,
+        )?;
+
         let response = client
             .post(endpoint)
-            .json(request)
+            .json(&request)
             .send()
             .await
             .map_err(|error| OAuthClientError::Registration(error.to_string()))?;
@@ -959,6 +1047,13 @@ async fn resolve_oauth_client_registration_inner(
             .json()
             .await
             .map_err(|error| OAuthClientError::Registration(error.to_string()))?;
+        require_secret_for_confidential_registration(
+            response
+                .token_endpoint_auth_method
+                .as_deref()
+                .unwrap_or(&request.token_endpoint_auth_method),
+            response.client_secret.as_deref(),
+        )?;
         let registration = OAuthClientRegistration::dynamically_registered(
             metadata.issuer.clone(),
             response.client_id,
@@ -1022,7 +1117,6 @@ struct TokenResponse {
     token_type: String,
     expires_in: Option<u64>,
     refresh_token: Option<String>,
-    #[allow(dead_code)]
     scope: Option<String>,
 }
 
@@ -1032,6 +1126,9 @@ struct CachedAuthCodeToken {
     access_token: String,
     refresh_token: Option<String>,
     expires_at: Instant,
+    /// Scopes the authorization server granted, space-delimited. Refresh
+    /// requests send these rather than the originally requested scopes.
+    scope: Option<String>,
 }
 
 // =============================================================================
@@ -1338,21 +1435,28 @@ impl OAuthAuthorizationCode {
             .await
             .map_err(|e| OAuthClientError::InvalidResponse(e.to_string()))?;
 
-        Ok(to_cached_token(token_response))
+        // RFC 6749 section 5.1: an omitted `scope` means the grant matches
+        // what was requested.
+        Ok(to_cached_token(token_response, self.inner.scopes.clone()))
     }
 
     /// Refresh the access token using the refresh token.
+    ///
+    /// `granted_scope` is what the authorization server granted for the
+    /// token being replaced. It is sent instead of the originally requested
+    /// scopes, which the server may have narrowed.
     async fn refresh_token(
         &self,
         refresh_token: &str,
+        granted_scope: Option<&str>,
     ) -> Result<CachedAuthCodeToken, OAuthClientError> {
         let mut params = vec![
             ("grant_type", "refresh_token".to_string()),
             ("refresh_token", refresh_token.to_string()),
             ("resource", self.inner.resource.clone()),
         ];
-        if let Some(ref scopes) = self.inner.scopes {
-            params.push(("scope", scopes.clone()));
+        if let Some(scope) = granted_scope {
+            params.push(("scope", scope.to_string()));
         }
 
         let response = send_token_request(
@@ -1395,7 +1499,11 @@ impl OAuthAuthorizationCode {
             token_response.refresh_token = Some(refresh_token.to_string());
         }
 
-        Ok(to_cached_token(token_response))
+        // A refresh response without `scope` keeps the previous grant.
+        Ok(to_cached_token(
+            token_response,
+            granted_scope.map(str::to_string),
+        ))
     }
 }
 
@@ -1470,12 +1578,25 @@ fn is_invalid_grant(body: &str) -> bool {
         .is_ok_and(|error| error.error == "invalid_grant")
 }
 
-fn to_cached_token(response: TokenResponse) -> CachedAuthCodeToken {
+/// Build the cached token. `fallback_scope` applies when the response omits
+/// `scope`; a present but empty `scope` records an empty grant.
+fn to_cached_token(response: TokenResponse, fallback_scope: Option<String>) -> CachedAuthCodeToken {
     let expires_in = Duration::from_secs(response.expires_in.unwrap_or(3600));
+    let scope = match response.scope {
+        Some(granted) => {
+            let granted = granted
+                .split_ascii_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            (!granted.is_empty()).then_some(granted)
+        }
+        None => fallback_scope,
+    };
     CachedAuthCodeToken {
         access_token: response.access_token,
         refresh_token: response.refresh_token,
         expires_at: Instant::now() + expires_in,
+        scope,
     }
 }
 
@@ -1514,7 +1635,7 @@ impl TokenProvider for OAuthAuthorizationCode {
             && let Some(ref refresh) = token.refresh_token
         {
             tracing::debug!("Refreshing OAuth access token");
-            match self.refresh_token(refresh).await {
+            match self.refresh_token(refresh, token.scope.as_deref()).await {
                 Ok(new_token) => {
                     let access = new_token.access_token.clone();
                     *cache = Some(new_token);
@@ -2099,7 +2220,10 @@ mod tests {
 
         // Refresh carries the override too.
         let refreshed = provider
-            .refresh_token(token.refresh_token.as_deref().unwrap())
+            .refresh_token(
+                token.refresh_token.as_deref().unwrap(),
+                token.scope.as_deref(),
+            )
             .await
             .unwrap();
         assert_eq!(refreshed.access_token, "test-access-token");
@@ -2706,6 +2830,7 @@ mod tests {
             access_token: "token".into(),
             refresh_token: None,
             expires_at: Instant::now() + Duration::from_secs(300),
+            scope: None,
         };
         assert!(is_token_valid(&valid, Duration::from_secs(30)));
 
@@ -2713,6 +2838,7 @@ mod tests {
             access_token: "token".into(),
             refresh_token: None,
             expires_at: Instant::now() + Duration::from_secs(10),
+            scope: None,
         };
         assert!(!is_token_valid(&expiring, Duration::from_secs(30)));
     }
@@ -2848,6 +2974,7 @@ mod tests {
                 access_token: "expired-access-token".to_string(),
                 refresh_token: Some("dead-refresh-token".to_string()),
                 expires_at: Instant::now() - Duration::from_secs(1),
+                scope: None,
             },
         );
 
@@ -2875,6 +3002,7 @@ mod tests {
                 access_token: "still-valid-access-token".to_string(),
                 refresh_token: Some("refresh-token".to_string()),
                 expires_at: Instant::now() + Duration::from_secs(3600),
+                scope: None,
             },
         );
         assert_eq!(
@@ -2904,6 +3032,7 @@ mod tests {
                 access_token: "still-valid-access-token".to_string(),
                 refresh_token: None,
                 expires_at: Instant::now() + Duration::from_secs(3600),
+                scope: None,
             },
         );
 
@@ -2915,6 +3044,316 @@ mod tests {
             message.contains("reauthorization"),
             "expected the error to say reauthorization is needed, got: {message}"
         );
+    }
+
+    /// A local JSON endpoint (token or registration) that answers each
+    /// request with the next entry of `responses` (the last entry repeats) and records every request
+    /// body. Returns the base URL and the recorded bodies.
+    async fn spawn_recording_json_server(
+        responses: Vec<serde_json::Value>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = bodies.clone();
+        tokio::spawn(async move {
+            let mut index = 0;
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut bytes = Vec::new();
+                let header_end = loop {
+                    let mut chunk = [0_u8; 1024];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert!(read > 0);
+                    bytes.extend_from_slice(&chunk[..read]);
+                    if let Some(at) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                        break at + 4;
+                    }
+                };
+                let content_length: usize = String::from_utf8_lossy(&bytes[..header_end])
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap_or(0);
+                while bytes.len() < header_end + content_length {
+                    let mut chunk = [0_u8; 1024];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    bytes.extend_from_slice(&chunk[..read]);
+                }
+                recorded.lock().unwrap().push(
+                    String::from_utf8_lossy(&bytes[header_end..header_end + content_length])
+                        .to_string(),
+                );
+                let body = responses[index.min(responses.len() - 1)].to_string();
+                index += 1;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (base, bodies)
+    }
+
+    fn form_field(body: &str, name: &str) -> Option<String> {
+        reqwest::Url::parse(&format!("http://x/?{body}"))
+            .unwrap()
+            .query_pairs()
+            .find_map(|(key, value)| (key == name).then(|| value.into_owned()))
+    }
+
+    /// #1558 (rmcp #1330): a refresh must send the scopes the authorization
+    /// server granted, not the ones the client originally asked for.
+    #[tokio::test]
+    async fn refresh_sends_granted_scope_not_requested_scope() {
+        let (base, bodies) = spawn_recording_json_server(vec![serde_json::json!({
+            "access_token": "refreshed-access-token",
+            "token_type": "Bearer",
+            "expires_in": 3600
+        })])
+        .await;
+        let provider = test_provider_with_cached_token(
+            format!("{base}/token"),
+            CachedAuthCodeToken {
+                access_token: "expired-access-token".to_string(),
+                refresh_token: Some("refresh-token".to_string()),
+                expires_at: Instant::now() - Duration::from_secs(1),
+                scope: Some("read".to_string()),
+            },
+        );
+        // The caller originally requested more than the server granted.
+        let provider = OAuthAuthorizationCode {
+            inner: Arc::new(OAuthAuthCodeInner {
+                scopes: Some("read write offline_access".to_string()),
+                ..Arc::into_inner(provider.inner).unwrap()
+            }),
+        };
+
+        TokenProvider::get_token(&provider).await.unwrap();
+        provider.invalidate().await;
+        TokenProvider::get_token(&provider).await.unwrap();
+
+        // A refresh response that omits `scope` keeps the previous grant, so
+        // the second refresh still carries only the granted scope.
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        for body in bodies.iter() {
+            assert_eq!(form_field(body, "scope").as_deref(), Some("read"));
+        }
+    }
+
+    /// A scope returned on refresh replaces the recorded grant.
+    #[tokio::test]
+    async fn refresh_response_scope_updates_the_granted_scope() {
+        let (base, bodies) = spawn_recording_json_server(vec![
+            serde_json::json!({
+                "access_token": "first",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": "read"
+            }),
+            serde_json::json!({
+                "access_token": "second",
+                "token_type": "Bearer",
+                "expires_in": 3600
+            }),
+        ])
+        .await;
+        let provider = test_provider_with_cached_token(
+            format!("{base}/token"),
+            CachedAuthCodeToken {
+                access_token: "expired-access-token".to_string(),
+                refresh_token: Some("refresh-token".to_string()),
+                expires_at: Instant::now() - Duration::from_secs(1),
+                scope: Some("read write".to_string()),
+            },
+        );
+
+        TokenProvider::get_token(&provider).await.unwrap();
+        provider.invalidate().await;
+        TokenProvider::get_token(&provider).await.unwrap();
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(
+            form_field(&bodies[0], "scope").as_deref(),
+            Some("read write")
+        );
+        assert_eq!(form_field(&bodies[1], "scope").as_deref(), Some("read"));
+    }
+
+    /// The code exchange records the granted `scope`, or the requested scope
+    /// when the response omits it (RFC 6749 section 5.1).
+    #[tokio::test]
+    async fn code_exchange_records_granted_scope_or_falls_back_to_requested() {
+        let (base, _bodies) = spawn_recording_json_server(vec![
+            serde_json::json!({
+                "access_token": "a",
+                "token_type": "Bearer",
+                "scope": "read  write"
+            }),
+            serde_json::json!({ "access_token": "b", "token_type": "Bearer" }),
+        ])
+        .await;
+        let provider = test_provider_with_cached_token(
+            format!("{base}/token"),
+            CachedAuthCodeToken {
+                access_token: String::new(),
+                refresh_token: None,
+                expires_at: Instant::now(),
+                scope: None,
+            },
+        );
+        let provider = OAuthAuthorizationCode {
+            inner: Arc::new(OAuthAuthCodeInner {
+                scopes: Some("read write admin".to_string()),
+                ..Arc::into_inner(provider.inner).unwrap()
+            }),
+        };
+
+        let granted = provider.exchange_code("code").await.unwrap();
+        assert_eq!(granted.scope.as_deref(), Some("read write"));
+        let omitted = provider.exchange_code("code").await.unwrap();
+        assert_eq!(omitted.scope.as_deref(), Some("read write admin"));
+    }
+
+    fn dynamic_registration_options(method: &str) -> OAuthClientRegistrationOptions {
+        OAuthClientRegistrationOptions::new().with_dynamic_registration(
+            OAuthDynamicClientRegistration::native("test-client", ["http://127.0.0.1/callback"])
+                .token_endpoint_auth_method(method),
+        )
+    }
+
+    /// Register against a recording endpoint that advertises `advertised`
+    /// methods, and return the registration result with the method that was
+    /// actually sent (`None` when no request reached the endpoint).
+    async fn register_with_advertised_methods(
+        requested: &str,
+        advertised: &[&str],
+        response: serde_json::Value,
+    ) -> (
+        Result<OAuthClientRegistration, OAuthClientError>,
+        Option<String>,
+    ) {
+        let (base, bodies) = spawn_recording_json_server(vec![response]).await;
+        let mut metadata = authorization_server_metadata("https://auth.example.com");
+        metadata.registration_endpoint = Some(format!("{base}/register"));
+        metadata.token_endpoint_auth_methods_supported =
+            advertised.iter().map(|method| method.to_string()).collect();
+
+        let result = resolve_oauth_client_registration(
+            &reqwest::Client::new(),
+            &metadata,
+            &dynamic_registration_options(requested),
+        )
+        .await;
+        let sent = bodies.lock().unwrap().first().map(|body| {
+            serde_json::from_str::<serde_json::Value>(body).unwrap()["token_endpoint_auth_method"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        });
+        (result, sent)
+    }
+
+    /// #1558 (rmcp #1355): the default `none` is not sent to an AS that only
+    /// advertises `client_secret_basic`.
+    #[tokio::test]
+    async fn dcr_replaces_an_unadvertised_method_with_an_advertised_one() {
+        let (result, sent) = register_with_advertised_methods(
+            "none",
+            &["client_secret_basic"],
+            serde_json::json!({ "client_id": "c", "client_secret": "s" }),
+        )
+        .await;
+        assert_eq!(sent.as_deref(), Some("client_secret_basic"));
+        assert_eq!(result.unwrap().client_secret(), Some("s"));
+
+        let (result, sent) = register_with_advertised_methods(
+            "client_secret_basic",
+            &["none"],
+            serde_json::json!({ "client_id": "c" }),
+        )
+        .await;
+        assert_eq!(sent.as_deref(), Some("none"));
+        assert_eq!(result.unwrap().client_secret(), None);
+    }
+
+    #[tokio::test]
+    async fn dcr_keeps_an_advertised_method_and_one_when_nothing_is_advertised() {
+        let (result, sent) = register_with_advertised_methods(
+            "client_secret_post",
+            &["client_secret_basic", "client_secret_post", "none"],
+            serde_json::json!({ "client_id": "c", "client_secret": "s" }),
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(sent.as_deref(), Some("client_secret_post"));
+
+        let (result, sent) =
+            register_with_advertised_methods("none", &[], serde_json::json!({ "client_id": "c" }))
+                .await;
+        result.unwrap();
+        assert_eq!(sent.as_deref(), Some("none"));
+    }
+
+    #[tokio::test]
+    async fn dcr_fails_before_registering_when_no_advertised_method_is_usable() {
+        let (result, sent) = register_with_advertised_methods(
+            "none",
+            &["tls_client_auth"],
+            serde_json::json!({ "client_id": "c" }),
+        )
+        .await;
+        let error = result.unwrap_err();
+        assert!(
+            matches!(&error, OAuthClientError::Registration(message)
+                if message.contains("tls_client_auth")),
+            "unexpected error: {error}"
+        );
+        assert_eq!(sent, None, "no registration request should be sent");
+    }
+
+    /// #1558 (rmcp #1355): a confidential registration with no secret in the
+    /// response is an error rather than a silent fall back to `none`.
+    #[tokio::test]
+    async fn confidential_dcr_without_a_secret_is_rejected() {
+        for (case, returned) in [("absent", None), ("empty", Some(""))] {
+            let mut response = serde_json::json!({ "client_id": "c" });
+            if let Some(value) = returned {
+                response["client_secret"] = value.into();
+            }
+            let (result, sent) =
+                register_with_advertised_methods("client_secret_basic", &[], response).await;
+            assert_eq!(sent.as_deref(), Some("client_secret_basic"));
+            let error = result.unwrap_err();
+            assert!(
+                matches!(&error, OAuthClientError::Registration(message)
+                    if message.contains("client_secret_basic")),
+                "unexpected error when the client_secret is {case}"
+            );
+        }
+    }
+
+    /// RFC 7591 section 3.2.1: the response reports the registered method.
+    /// An AS that downgrades a confidential request to `none` returns no
+    /// secret, and that is not an error.
+    #[tokio::test]
+    async fn dcr_response_method_decides_whether_a_secret_is_required() {
+        let (result, _) = register_with_advertised_methods(
+            "client_secret_basic",
+            &[],
+            serde_json::json!({ "client_id": "c", "token_endpoint_auth_method": "none" }),
+        )
+        .await;
+        assert_eq!(result.unwrap().client_secret(), None);
     }
 
     // =========================================================================

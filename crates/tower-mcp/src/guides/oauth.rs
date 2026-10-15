@@ -347,7 +347,10 @@ With no explicit scopes, the flow uses this order:
 
 1. `scope` from the initial `WWW-Authenticate` challenge;
 2. `scopes_supported` from Protected Resource Metadata; then
-3. authorization-server metadata as an interoperability fallback.
+3. no `scope` parameter at all.
+
+The authorization server's own `scopes_supported` is not consulted, since it
+lists everything the server issues rather than what this resource needs.
 
 A non-empty scope list passed to `authorize` is an application override. Keep
 it least-privileged. If the authorization server advertises both
