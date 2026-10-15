@@ -109,6 +109,10 @@
 //! It returns `None` for 2025-11-25 session-based requests and when the request
 //! carried no modern protocol metadata.
 //!
+//! To read the client's identity on either lifecycle, use
+//! [`ctx.client_info()`](RequestContext::client_info): it returns the per-request
+//! `clientInfo` when present and otherwise the one sent at `initialize`.
+//!
 //! The [`StatelessRequestMeta`](crate::stateless::StatelessRequestMeta) struct
 //! provides:
 //!
@@ -147,8 +151,8 @@ use crate::error::{Error, Result};
 use crate::protocol::{
     CallToolResult, CancelTaskParams, CreateMessageParams, CreateMessageResult, ElicitFormParams,
     ElicitRequestParams, ElicitResult, ElicitUrlParams, GetTaskInfoParams, GetTaskResultParams,
-    ListTasksParams, ListTasksResult, LogLevel, LoggingMessageParams, ProgressParams,
-    ProgressToken, RequestId, TaskObject, TaskStatus,
+    Implementation, ListTasksParams, ListTasksResult, LogLevel, LoggingMessageParams,
+    ProgressParams, ProgressToken, RequestId, TaskObject, TaskStatus,
 };
 use crate::session::SessionState;
 
@@ -642,6 +646,36 @@ impl RequestContext {
     #[cfg(feature = "stateless")]
     pub fn per_request_meta(&self) -> Option<&crate::stateless::StatelessRequestMeta> {
         self.extension::<crate::stateless::StatelessRequestMeta>()
+    }
+
+    /// The identity (`clientInfo`) of the client making this request.
+    ///
+    /// On the 2026-07-28 lifecycle the client identifies itself per request in
+    /// `_meta` under `io.modelcontextprotocol/clientInfo`; that value is used
+    /// when present. Otherwise this returns the `clientInfo` the client sent at
+    /// `initialize` on a 2025 session. Returns `None` when neither is
+    /// available, for example a context created with [`RequestContext::new`] or
+    /// a 2026-07-28 request that omitted the optional field.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// async fn my_tool(ctx: RequestContext, input: MyInput) -> Result<CallToolResult> {
+    ///     if let Some(info) = ctx.client_info() {
+    ///         tracing::info!(client = %info.name, version = %info.version);
+    ///     }
+    ///     Ok(CallToolResult::text("ok"))
+    /// }
+    /// ```
+    pub fn client_info(&self) -> Option<Implementation> {
+        #[cfg(feature = "stateless")]
+        if let Some(info) = self
+            .per_request_meta()
+            .and_then(|meta| meta.client_info.clone())
+        {
+            return Some(info);
+        }
+        self.session()?.get::<Implementation>()
     }
 
     /// W3C Trace Context (SEP-414) the client sent in the request's `_meta`.
