@@ -3030,6 +3030,92 @@ mod stateless_tests {
         server.abort();
     }
 
+    /// A 404 on a 2026-07-28 request carries no session meaning: the server
+    /// answers an unknown method with 404 and -32601, and that must surface
+    /// as method-not-found rather than start a re-initialize (#1556).
+    #[tokio::test]
+    async fn final_unknown_method_404_is_method_not_found_not_session_expiry() {
+        let app = Router::new()
+            .route("/", post(stale_schema_endpoint))
+            .with_state(StaleSchemaState::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = McpClient::builder()
+            .protocol_support(tower_mcp::ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+            .connect_simple(HttpClientTransport::new(url))
+            .await
+            .unwrap();
+        client.discover("test-client", "1.0.0").await.unwrap();
+
+        let error = tokio::time::timeout(Duration::from_secs(5), client.list_resources())
+            .await
+            .expect("list_resources hung")
+            .expect_err("the unknown method must fail");
+        match &error {
+            tower_mcp::Error::JsonRpc(rpc) => assert_eq!(rpc.code, -32601, "{error:?}"),
+            other => panic!("expected method-not-found, got: {other:?}"),
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), client.list_tools())
+            .await
+            .expect("list_tools after the 404 hung")
+            .expect("the transport must stay open after an in-band 404");
+
+        server.abort();
+    }
+
+    /// With no session to expire, a bare 404 on a 2026-07-28 request still
+    /// means the endpoint is gone and closes the transport (#1553, #1556).
+    #[tokio::test]
+    async fn final_bare_404_still_closes_the_transport() {
+        let url = spawn_raw_server(|req| {
+            if raw_is(req, "server/discover") {
+                let body = format!(
+                    r#"{{"jsonrpc":"2.0","id":{},"result":{{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{{}},"ttlMs":0,"cacheScope":"private"}}}}"#,
+                    raw_request_id(req)
+                );
+                raw_response("200 OK", RAW_JSON, &body)
+            } else {
+                raw_response("404 Not Found", "", "")
+            }
+        })
+        .await;
+
+        let client = McpClient::builder()
+            .protocol_support(tower_mcp::ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+            .connect_simple(HttpClientTransport::with_config(url, raw_client_config()))
+            .await
+            .unwrap();
+        client.discover("test-client", "1.0.0").await.unwrap();
+
+        let error = tokio::time::timeout(Duration::from_secs(5), client.list_tools())
+            .await
+            .expect("list_tools hung")
+            .expect_err("the 404 must fail the request");
+        assert!(
+            !matches!(error, tower_mcp::Error::SessionExpired),
+            "a sessionless 404 is not session expiry: {error:?}"
+        );
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            // The closed flag reaches the client after the failed request's
+            // error, so poll until a call reports the closed connection.
+            while !client
+                .list_tools()
+                .await
+                .is_err_and(|error| error.to_string().contains("Connection closed"))
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a sessionless 404 must keep closing the transport");
+    }
+
     /// tools/list works without initialize or session, just protocol version header.
     #[tokio::test]
     async fn test_stateless_tools_list() {
@@ -4838,20 +4924,247 @@ async fn retry_after_http_date_is_passed_through_raw() {
     assert_eq!(details.retry_after_delay(), None);
 }
 
-/// A 404 on an established session still means the endpoint is gone: the
-/// request fails and the transport closes, as before.
-#[tokio::test]
-async fn session_404_still_closes_the_transport() {
-    let (_error, client) = flaky_list_outcome("404 Not Found", "", "").await;
+// ---------------------------------------------------------------------------
+// A 401, 403 or 429 with a JSON-RPC error body keeps its HTTP status (#1555)
+// ---------------------------------------------------------------------------
 
-    // The transport closes just after the failed request's error is
-    // delivered, so poll: a follow-up call must eventually fail instead of
-    // reaching the server, which would answer it.
+fn jsonrpc_error_body(data: Option<&str>) -> String {
+    let data = data.map_or(String::new(), |data| format!(r#","data":{data}"#));
+    format!(
+        r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-32001,"message":"denied by policy"{data}}}}}"#
+    )
+}
+
+/// Leak a test-built body to the `'static` the flaky-server helper takes.
+fn leak(body: String) -> &'static str {
+    Box::leak(body.into_boxed_str())
+}
+
+fn rpc_error(error: &tower_mcp::Error) -> &JsonRpcError {
+    match error {
+        tower_mcp::Error::JsonRpc(rpc) => rpc,
+        other => panic!("expected a JSON-RPC error, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn forbidden_jsonrpc_error_body_exposes_status_and_keeps_server_data() {
+    let body = leak(jsonrpc_error_body(Some(r#"{"reason":"missing scope"}"#)));
+    let (error, client) = flaky_list_outcome("403 Forbidden", RAW_JSON, body).await;
+
+    let details = HttpStatusDetails::from_error(&error)
+        .unwrap_or_else(|| panic!("the error should carry the HTTP status, got: {error:?}"));
+    assert_eq!(details.status, 403);
+    assert_eq!(details.www_authenticate, None);
+
+    // The server's own error is what the caller sees, with its data intact.
+    let rpc = rpc_error(&error);
+    assert_eq!(rpc.code, -32001);
+    assert_eq!(rpc.message, "denied by policy");
+    let data = rpc.data.as_ref().unwrap();
+    assert_eq!(data["reason"], "missing scope");
+    assert_eq!(data["httpStatus"], 403);
+
+    tokio::time::timeout(Duration::from_secs(3), client.list_tools())
+        .await
+        .expect("list_tools after the 403 hung")
+        .expect("the same client must serve the next request");
+}
+
+#[tokio::test]
+async fn unauthorized_jsonrpc_error_body_exposes_the_challenge() {
+    let challenge = r#"Bearer error="invalid_token", resource_metadata="https://example.test/.well-known/oauth-protected-resource""#;
+    let headers = leak(format!(
+        "{RAW_JSON}WWW-Authenticate: {challenge}
+Retry-After: 3
+"
+    ));
+    let (error, _client) =
+        flaky_list_outcome("401 Unauthorized", headers, leak(jsonrpc_error_body(None))).await;
+
+    let details = HttpStatusDetails::from_error(&error).expect("status details");
+    assert_eq!(details.status, 401);
+    assert_eq!(details.www_authenticate.as_deref(), Some(challenge));
+    assert_eq!(details.retry_after.as_deref(), Some("3"));
+    assert_eq!(rpc_error(&error).code, -32001);
+    assert_eq!(rpc_error(&error).message, "denied by policy");
+}
+
+#[tokio::test]
+async fn unauthorized_without_a_jsonrpc_body_exposes_the_challenge() {
+    let (error, _client) = flaky_list_outcome(
+        "401 Unauthorized",
+        "Content-Type: text/plain\r\nWWW-Authenticate: Bearer realm=\"mcp\"\r\n",
+        "unauthorized",
+    )
+    .await;
+
+    let details = HttpStatusDetails::from_error(&error).expect("status details");
+    assert_eq!(details.status, 401);
+    assert_eq!(
+        details.www_authenticate.as_deref(),
+        Some(r#"Bearer realm="mcp""#)
+    );
+}
+
+#[tokio::test]
+async fn server_status_keys_in_error_data_are_not_overwritten() {
+    let body = leak(jsonrpc_error_body(Some(r#"{"httpStatus":"upstream"}"#)));
+    let (error, _client) = flaky_list_outcome("403 Forbidden", RAW_JSON, body).await;
+
+    let data = rpc_error(&error).data.as_ref().unwrap();
+    assert_eq!(data["httpStatus"], "upstream");
+}
+
+#[tokio::test]
+async fn non_object_error_data_moves_under_server_data() {
+    let body = leak(jsonrpc_error_body(Some(r#""policy 7""#)));
+    let (error, _client) = flaky_list_outcome("403 Forbidden", RAW_JSON, body).await;
+
+    let details = HttpStatusDetails::from_error(&error).expect("status details");
+    assert_eq!(details.status, 403);
+    let data = rpc_error(&error).data.as_ref().unwrap();
+    assert_eq!(data["serverData"], "policy 7");
+}
+
+/// Statuses that are not about authorization or rate limits leave the
+/// server's error exactly as sent.
+#[tokio::test]
+async fn in_band_error_on_a_400_gets_no_status_added() {
+    let body = leak(jsonrpc_error_body(None));
+    let (error, _client) = flaky_list_outcome("400 Bad Request", RAW_JSON, body).await;
+
+    assert_eq!(rpc_error(&error).code, -32001);
+    assert_eq!(rpc_error(&error).data, None);
+    assert_eq!(HttpStatusDetails::from_error(&error), None);
+}
+
+// ---------------------------------------------------------------------------
+// A 404 on a session request recovers the session, whatever the body (#1556)
+// ---------------------------------------------------------------------------
+
+/// A raw server that issues a numbered session on each `initialize`, answers
+/// the first `tools/list` with a 404 carrying `body`, and answers `tools/list`
+/// only for the second session afterwards. Returns the URL and the count of
+/// `initialize` requests seen.
+async fn spawn_expiring_session_server(
+    body: &'static str,
+) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let initializes = Arc::new(AtomicUsize::new(0));
+    let expired_once = Arc::new(AtomicBool::new(false));
+    let counter = initializes.clone();
+    let url = spawn_raw_server(move |req| {
+        if raw_is(req, "initialize") {
+            let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+            let reply = format!(
+                r#"{{"jsonrpc":"2.0","id":{},"result":{{"protocolVersion":"2025-11-25","capabilities":{{}},"serverInfo":{{"name":"raw","version":"0"}}}}}}"#,
+                raw_request_id(req)
+            );
+            raw_response(
+                "200 OK",
+                &format!(
+                    "{RAW_JSON}mcp-session-id: session-{n}\r\nmcp-protocol-version: 2025-11-25\r\n"
+                ),
+                &reply,
+            )
+        } else if raw_is(req, "notifications/initialized") {
+            raw_response("202 Accepted", "", "")
+        } else if raw_is(req, "tools/list") && !expired_once.swap(true, Ordering::SeqCst) {
+            raw_response("404 Not Found", if body.is_empty() { "" } else { RAW_JSON }, body)
+        } else if req.to_lowercase().contains("mcp-session-id: session-2") {
+            let reply = format!(
+                r#"{{"jsonrpc":"2.0","id":{},"result":{{"tools":[]}}}}"#,
+                raw_request_id(req)
+            );
+            raw_response("200 OK", RAW_JSON, &reply)
+        } else {
+            raw_response("404 Not Found", "", "")
+        }
+    })
+    .await;
+    (url, initializes)
+}
+
+async fn assert_session_404_recovers(body: &'static str) {
+    let (url, initializes) = spawn_expiring_session_server(body).await;
+    let client = McpClient::connect(HttpClientTransport::with_config(url, raw_client_config()))
+        .await
+        .unwrap();
+    client.initialize("raw-client", "1.0.0").await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), client.list_tools())
+        .await
+        .expect("list_tools hung")
+        .expect("the request must succeed on the re-initialized session");
+    assert_eq!(initializes.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    tokio::time::timeout(Duration::from_secs(3), client.list_tools())
+        .await
+        .expect("the next list_tools hung")
+        .expect("the recovered session must keep serving requests");
+}
+
+#[tokio::test]
+async fn bare_404_on_a_session_request_recovers_the_session() {
+    assert_session_404_recovers("").await;
+}
+
+#[tokio::test]
+async fn session_404_with_a_32001_body_recovers_the_session() {
+    assert_session_404_recovers(
+        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32001,"message":"Session not found"}}"#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn session_404_with_a_32005_body_still_recovers_the_session() {
+    assert_session_404_recovers(
+        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32005,"message":"Session not found"}}"#,
+    )
+    .await;
+}
+
+/// With recovery switched off the 404 is not turned into a session signal:
+/// the request fails with the status, and the transport closes as before.
+#[tokio::test]
+async fn session_404_without_recovery_fails_and_closes_the_transport() {
+    let (url, initializes) = spawn_expiring_session_server("").await;
+    let client = McpClient::connect(HttpClientTransport::with_config(
+        url,
+        HttpClientConfig {
+            session_recovery: false,
+            ..raw_client_config()
+        },
+    ))
+    .await
+    .unwrap();
+    client.initialize("raw-client", "1.0.0").await.unwrap();
+
+    let error = tokio::time::timeout(Duration::from_secs(5), client.list_tools())
+        .await
+        .expect("list_tools hung")
+        .expect_err("the 404 must fail the request");
+    assert_eq!(
+        HttpStatusDetails::from_error(&error).map(|details| details.status),
+        Some(404),
+        "{error:?}"
+    );
+    assert_eq!(initializes.load(std::sync::atomic::Ordering::SeqCst), 1);
+
     tokio::time::timeout(Duration::from_secs(3), async {
-        while client.list_tools().await.is_ok() {
+        // The closed flag reaches the client after the failed request's
+        // error, so poll until a call reports the closed connection.
+        while !client
+            .list_tools()
+            .await
+            .is_err_and(|error| error.to_string().contains("Connection closed"))
+        {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("a 404 must keep closing the transport");
+    .expect("a 404 without recovery must close the transport");
 }

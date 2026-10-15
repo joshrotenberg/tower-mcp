@@ -209,7 +209,8 @@ pub struct HttpClientConfig {
     pub max_sse_reconnect_attempts: u32,
     /// Whether to support automatic session recovery on expiry.
     /// When enabled, HTTP 404 responses (with a session ID attached) and
-    /// JSON-RPC -32005 errors trigger re-initialization.
+    /// JSON-RPC -32005 errors trigger re-initialization. A 404 counts
+    /// whatever its body holds.
     /// Default: `true`.
     pub session_recovery: bool,
     /// Maximum size in bytes buffered for a single SSE event.
@@ -1441,6 +1442,14 @@ impl ClientTransport for HttpClientTransport {
                 .clone()
                 .and_then(|value| serde_json::from_value(value).ok());
             let is_subscription = method == Some("subscriptions/listen");
+            // Whether this request carried `Mcp-Session-Id`: a 404 then means
+            // the session expired (#1556). A 2026-07-28 request is sessionless,
+            // and there a 404 is an ordinary status (an unknown method answers
+            // 404 with -32601).
+            let session_expiry_on_404 = !is_modern_request
+                && self.session_id.is_some()
+                && self.config.session_recovery
+                && reply_id.is_some();
             let reply_id = reply_id.clone();
             let connected = self.connected.clone();
             let last_event_id = self.last_event_id.clone();
@@ -1498,7 +1507,23 @@ impl ClientTransport for HttpClientTransport {
                 if !status.is_success() {
                     let status_error = http_status_error(status, response.headers());
                     let retry_after = retry_after_header(response.headers());
+                    let www_authenticate = www_authenticate_header(response.headers());
                     let body = read_error_body(response).await;
+
+                    // The spec's session-expired signal is the 404 itself, so
+                    // it triggers recovery whatever the body holds: nothing, a
+                    // -32005, or another code such as the -32001 other SDKs
+                    // use. Hand the message loop the -32005 frame it already
+                    // recovers on, and leave the transport open for the
+                    // re-initialize.
+                    if status == reqwest::StatusCode::NOT_FOUND
+                        && session_expiry_on_404
+                        && let Some(id) = &reply_id
+                    {
+                        tracing::info!(body = %body, "HTTP 404 on a session request, signalling session expiry");
+                        let _ = tx.send(session_expired_frame(id)).await;
+                        return;
+                    }
 
                     // Forward a JSON-RPC error body so the message loop can
                     // detect -32005 (SessionNotFound) and trigger session
@@ -1529,6 +1554,12 @@ impl ClientTransport for HttpClientTransport {
                         {
                             v["id"] = id.clone();
                         }
+                        if !is_session_signal && status_annotates_jsonrpc_error(status) {
+                            merge_status_into_error(
+                                &mut v,
+                                status_error_data(status, &retry_after, &www_authenticate),
+                            );
+                        }
                         let _ = tx.send(v.to_string()).await;
                         return;
                     }
@@ -1539,7 +1570,7 @@ impl ClientTransport for HttpClientTransport {
                             .send(transport_error_frame_with_data(
                                 id,
                                 &status_error,
-                                status_error_data(status, &retry_after),
+                                status_error_data(status, &retry_after, &www_authenticate),
                             ))
                             .await;
                     }
@@ -2400,33 +2431,115 @@ fn retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<String> {
         .map(|value| value.trim().to_string())
 }
 
-/// The `data` of the error injected for a non-success HTTP status; read it
+/// The `WWW-Authenticate` challenge, if the response carries one. Several
+/// header lines are joined with `, `, which RFC 9110 defines as equivalent.
+fn www_authenticate_header(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let values: Vec<&str> = headers
+        .get_all(reqwest::header::WWW_AUTHENTICATE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::trim)
+        .collect();
+    (!values.is_empty()).then(|| values.join(", "))
+}
+
+/// The `data` attached to the error for a non-success HTTP status; read it
 /// back with [`HttpStatusDetails::from_error`].
 fn status_error_data(
     status: reqwest::StatusCode,
     retry_after: &Option<String>,
+    www_authenticate: &Option<String>,
 ) -> serde_json::Value {
     let mut data = serde_json::json!({ "httpStatus": status.as_u16() });
     if let Some(raw) = retry_after {
         data["retryAfter"] = serde_json::Value::String(raw.clone());
     }
+    if let Some(challenge) = www_authenticate {
+        data["wwwAuthenticate"] = serde_json::Value::String(challenge.clone());
+    }
     data
 }
 
-/// The HTTP status, and `Retry-After` header if the server sent one, behind a
-/// request the server answered with a non-success status and no JSON-RPC
-/// error body (a 429 from a rate limiter, a 502 or 503 from a gateway).
+/// Whether the status of a response with a JSON-RPC error body is recorded in
+/// that error's `data`.
 ///
-/// The failed request reaches the caller as an [`Error::JsonRpc`] with code
-/// `-32000`, and the transport stays usable for the next request. The details
-/// ride in the error's `data` as `{"httpStatus": 503, "retryAfter": "7"}`;
+/// Limited to the statuses a caller acts on apart from the JSON-RPC code: an
+/// authorization failure (401, 403) and a rate limit (429). Other statuses
+/// that carry a JSON-RPC body (400 with -32602, 404 with -32601) are ordinary
+/// in-band errors whose `data` stays exactly what the server sent.
+fn status_annotates_jsonrpc_error(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 401 | 403 | 429)
+}
+
+/// Record `status_data` (see [`status_error_data`]) in the `data` of the
+/// JSON-RPC error in `frame`, keeping whatever the server put there.
+///
+/// - No `data`: it becomes `status_data`.
+/// - An object: the status keys are added where absent, so a server that sent
+///   its own `httpStatus` wins.
+/// - Any other value (a string, an array): it moves under `serverData` next
+///   to the status keys.
+fn merge_status_into_error(frame: &mut serde_json::Value, status_data: serde_json::Value) {
+    let Some(error) = frame
+        .get_mut("error")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    let data = error.entry("data").or_insert(serde_json::Value::Null);
+    match data {
+        serde_json::Value::Null => *data = status_data,
+        serde_json::Value::Object(existing) => {
+            if let serde_json::Value::Object(additions) = status_data {
+                for (key, value) in additions {
+                    existing.entry(key).or_insert(value);
+                }
+            }
+        }
+        other => {
+            let original = other.take();
+            let mut wrapped = status_data;
+            wrapped["serverData"] = original;
+            *other = wrapped;
+        }
+    }
+}
+
+/// The frame that tells the message loop the session behind request `id` is
+/// gone: the `-32005` (SessionNotFound) error it recovers on.
+fn session_expired_frame(id: &serde_json::Value) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": -32005, "message": "Session not found (HTTP 404)" },
+    })
+    .to_string()
+}
+
+/// The HTTP status of a non-success response, with its `Retry-After` and
+/// `WWW-Authenticate` headers if the server sent them.
+///
+/// The failed request reaches the caller as an [`Error::JsonRpc`], and the
+/// transport stays usable for the next request. The details ride in the
+/// error's `data` as `{"httpStatus": 503, "retryAfter": "7"}`;
 /// [`from_error`](Self::from_error) reads them back, for a retry policy that
-/// needs to tell a transient failure from a dead server.
+/// needs to tell a transient failure from a dead server, or an authorization
+/// failure from an ordinary error.
 ///
-/// A `404` or `410` still closes the transport, since either means the
-/// endpoint is gone. Errors from the initial `initialize` request, which is
-/// sent synchronously, are reported as [`Error::Transport`] text and carry no
-/// details.
+/// Two cases carry them:
+///
+/// - A status with no JSON-RPC error body (a 429 from a rate limiter, a 502
+///   or 503 from a gateway). The error has code `-32000`.
+/// - A 401, 403 or 429 whose body is a JSON-RPC error. That error is the
+///   server's own, code and message included, with the status added to its
+///   `data` (#1555): an existing object `data` keeps its keys and gains the
+///   status keys where absent, and any other `data` moves under `serverData`.
+///
+/// A `404` or `410` with no JSON-RPC body still closes the transport, since
+/// either means the endpoint is gone; a `404` on a session request instead
+/// recovers the session. Errors from the initial `initialize` request, which
+/// is sent synchronously, are reported as [`Error::Transport`] text and carry
+/// no details.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpStatusDetails {
     /// The HTTP status code of the response.
@@ -2434,6 +2547,9 @@ pub struct HttpStatusDetails {
     /// The raw `Retry-After` header value: delta-seconds (`"7"`) or an
     /// HTTP-date, passed through unparsed.
     pub retry_after: Option<String>,
+    /// The raw `WWW-Authenticate` challenge, as sent with a 401 or a 403.
+    /// Several header lines are joined with `, `.
+    pub www_authenticate: Option<String>,
 }
 
 impl HttpStatusDetails {
@@ -2449,9 +2565,14 @@ impl HttpStatusDetails {
             .get("retryAfter")
             .and_then(|value| value.as_str())
             .map(str::to_string);
+        let www_authenticate = data
+            .get("wwwAuthenticate")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
         Some(Self {
             status,
             retry_after,
+            www_authenticate,
         })
     }
 
