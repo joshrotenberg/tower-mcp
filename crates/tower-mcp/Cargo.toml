@@ -43,6 +43,11 @@ tower-resilience = { workspace = true, optional = true, default-features = false
 # resolution, so validating a tool call never touches the network or filesystem.
 jsonschema = { version = "0.58", optional = true, default-features = false }
 
+# Unix only: `killpg`/`getpgid` for `StdioClientTransport::process_group_shutdown`.
+# Already in the lockfile through tokio, so this adds no new crate to the build.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 async-trait.workspace = true
 proptest = "1"

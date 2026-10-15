@@ -73,6 +73,17 @@ but preserves your stderr configuration; call
 after requesting `Stdio::piped()` when your application needs to consume server
 diagnostics itself. `spawn` is the compact convenience API and inherits stderr.
 
+Closing the transport waits 5 seconds for the child to exit after its stdin
+closes, then kills it, and dropping the transport kills the child too. Set the
+wait with
+[`StdioClientTransport::close_timeout`](crate::client::StdioClientTransport::close_timeout)
+and read how the child exited with
+[`exit_status`](crate::client::StdioClientTransport::exit_status). A kill
+reaches only the child, so a server started through `npx` or a shell wrapper can
+leave descendants running; on Unix, spawn it with `process_group(0)` and enable
+[`process_group_shutdown`](crate::client::StdioClientTransport::process_group_shutdown)
+to stop the whole group.
+
 ### Stable lifecycle over HTTP
 
 ```rust,no_run
