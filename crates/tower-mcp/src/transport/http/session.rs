@@ -189,10 +189,14 @@ impl Session {
         // already initialized on the original instance.
         router.session().mark_preinitialized();
         // Handlers read the client's identity through `ctx.client_info()`,
-        // which falls back to session state.
-        if let Some(client_info) = &record.client_info {
-            router.session().insert(client_info.clone());
-        }
+        // which falls back to session state, and read its capabilities and
+        // negotiated extensions from the same place. Re-insert what
+        // `initialize` stored there.
+        router.record_client_handshake(
+            &record.protocol_version,
+            record.client_capabilities.as_ref(),
+            record.client_info.as_ref(),
+        );
 
         let (notifications_tx, _) = broadcast::channel(100);
         let (notif_sender, mut notif_receiver) = notification_channel(256);
