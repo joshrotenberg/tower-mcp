@@ -1962,6 +1962,21 @@ impl ClientTransport for HttpClientTransport {
         while self.incoming_rx.try_recv().is_ok() {}
     }
 
+    async fn end_session(&mut self) {
+        if let Some(session_id) = self.session_id.clone() {
+            send_session_delete(SessionDeleteParams {
+                client: self.client.clone(),
+                url: self.url.clone(),
+                session_id,
+                headers: self.config.headers.clone(),
+                #[cfg(feature = "oauth-client")]
+                token_provider: self.token_provider.clone(),
+            })
+            .await;
+        }
+        self.reset_session().await;
+    }
+
     fn supports_session_recovery(&self) -> bool {
         self.config.session_recovery
     }

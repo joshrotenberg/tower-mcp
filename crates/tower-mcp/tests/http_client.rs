@@ -5447,3 +5447,129 @@ async fn dropping_a_final_request_sends_no_notifications_cancelled() {
         "the final protocol cancels by disconnecting, not by notification"
     );
 }
+
+/// A raw server that answers `initialize` with `reply` (which issues the
+/// session `raw-session`) and reports the `mcp-session-id` header line of
+/// every `DELETE` it receives.
+async fn spawn_initialize_server(
+    reply: fn(&str) -> String,
+) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (delete_tx, delete_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let delete_tx = delete_tx.clone();
+            tokio::spawn(async move {
+                let Some(req) = read_http_request(&mut stream).await else {
+                    return;
+                };
+                let response = if req.starts_with("DELETE") {
+                    let session_header = req
+                        .lines()
+                        .find(|l| l.to_lowercase().starts_with("mcp-session-id"))
+                        .unwrap_or_default()
+                        .to_string();
+                    let _ = delete_tx.send(session_header);
+                    raw_response("204 No Content", "", "")
+                } else if raw_is(&req, "initialize") {
+                    reply(&req)
+                } else {
+                    raw_response("202 Accepted", "", "")
+                };
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+    (format!("http://{addr}"), delete_rx)
+}
+
+fn session_headers() -> String {
+    format!("{RAW_JSON}mcp-session-id: raw-session\r\nmcp-protocol-version: 2025-11-25\r\n")
+}
+
+/// Run a failing `initialize` against `reply`, and require exactly one
+/// `DELETE` for the session it issued, even after the client is dropped.
+async fn assert_failed_initialize_deletes_the_session(reply: fn(&str) -> String) {
+    let (url, mut deletes) = spawn_initialize_server(reply).await;
+    let client = McpClient::connect(HttpClientTransport::with_config(url, raw_client_config()))
+        .await
+        .unwrap();
+
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        client.initialize("raw-client", "1.0.0"),
+    )
+    .await
+    .expect("initialize hung")
+    .expect_err("the handshake must fail");
+
+    let header = tokio::time::timeout(Duration::from_secs(3), deletes.recv())
+        .await
+        .expect("the failed initialize's session was never deleted")
+        .expect("delete channel closed unexpectedly");
+    assert!(
+        header.to_lowercase().contains("raw-session"),
+        "DELETE should carry the session id, got header line: {header}"
+    );
+
+    // The session id was cleared, so dropping the client sends no second one.
+    drop(client);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), deletes.recv())
+            .await
+            .is_err(),
+        "a second DELETE was sent for the same session"
+    );
+}
+
+/// #1558: a session issued alongside a JSON-RPC error result is deleted when
+/// `initialize` fails, not left until shutdown or the server's idle timeout.
+#[tokio::test]
+async fn failed_initialize_deletes_the_session_it_was_issued() {
+    assert_failed_initialize_deletes_the_session(|req| {
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":{},"error":{{"code":-32603,"message":"init failed"}}}}"#,
+            raw_request_id(req)
+        );
+        raw_response("200 OK", &session_headers(), &body)
+    })
+    .await;
+}
+
+/// #1558: a server that picks a protocol version the client does not accept
+/// has `initialize` rejected after the transport already took the session.
+#[tokio::test]
+async fn initialize_rejecting_the_protocol_version_deletes_the_session() {
+    assert_failed_initialize_deletes_the_session(|req| {
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":{},"result":{{"protocolVersion":"1999-01-01","capabilities":{{}},"serverInfo":{{"name":"raw","version":"0"}}}}}}"#,
+            raw_request_id(req)
+        );
+        raw_response("200 OK", &session_headers(), &body)
+    })
+    .await;
+}
+
+/// A successful `initialize` keeps its session until shutdown.
+#[tokio::test]
+async fn successful_initialize_does_not_delete_the_session() {
+    let (url, mut deletes) = spawn_initialize_server(raw_initialize_ok).await;
+    let client = McpClient::connect(HttpClientTransport::with_config(url, raw_client_config()))
+        .await
+        .unwrap();
+    client.initialize("raw-client", "1.0.0").await.unwrap();
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), deletes.recv())
+            .await
+            .is_err(),
+        "a healthy session was deleted"
+    );
+}

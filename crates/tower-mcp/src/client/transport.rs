@@ -84,6 +84,20 @@ pub trait ClientTransport: Send + 'static {
     /// that don't have sessions).
     async fn reset_session(&mut self) {}
 
+    /// Terminate the session an `initialize` left behind, without closing
+    /// the transport.
+    ///
+    /// Called when `initialize` fails after the server may already have
+    /// issued a session, so the server can release it now instead of waiting
+    /// for it to idle out. The transport should end the session on the
+    /// server, best effort, and then forget it as [`reset_session`] does.
+    ///
+    /// The default implementation is a no-op (for transports like stdio
+    /// that don't have sessions).
+    ///
+    /// [`reset_session`]: ClientTransport::reset_session
+    async fn end_session(&mut self) {}
+
     /// Cancel one in-flight request.
     ///
     /// Message-oriented transports such as stdio use the protocol's
