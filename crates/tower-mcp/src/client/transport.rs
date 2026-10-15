@@ -84,11 +84,28 @@ pub trait ClientTransport: Send + 'static {
     /// that don't have sessions).
     async fn reset_session(&mut self) {}
 
+    /// Terminate the session an `initialize` left behind, without closing
+    /// the transport.
+    ///
+    /// Called when `initialize` fails after the server may already have
+    /// issued a session, so the server can release it now instead of waiting
+    /// for it to idle out. The transport should end the session on the
+    /// server, best effort, and then forget it as [`reset_session`] does.
+    ///
+    /// The default implementation is a no-op (for transports like stdio
+    /// that don't have sessions).
+    ///
+    /// [`reset_session`]: ClientTransport::reset_session
+    async fn end_session(&mut self) {}
+
     /// Cancel one in-flight request.
     ///
     /// Message-oriented transports such as stdio use the protocol's
     /// `notifications/cancelled` notification. HTTP overrides this method to
-    /// close only the response stream belonging to the request.
+    /// close only the response stream belonging to the request, which is the
+    /// whole cancellation on the 2026-07-28 protocol; on a 2025-11-25 session
+    /// it also sends the notification, since a closed connection does not
+    /// cancel there.
     async fn cancel_request(&mut self, request_id: &RequestId) -> Result<()> {
         self.send(
             &serde_json::json!({

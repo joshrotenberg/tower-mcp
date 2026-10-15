@@ -238,6 +238,8 @@ enum LoopCommand {
     },
     /// Reset the transport's session state for re-initialization.
     ResetSession { done_tx: oneshot::Sender<()> },
+    /// End the session a failed `initialize` left behind (#1558).
+    EndSession { done_tx: oneshot::Sender<()> },
     /// Fulfil embedded MRTR requests through the configured client handler.
     ResolveInputs {
         requests: InputRequests,
@@ -881,7 +883,26 @@ impl McpClient {
     /// The name and version are recorded, so a transport that supports session
     /// recovery can re-initialize with the same identity without the caller
     /// repeating it.
+    ///
+    /// If the handshake fails after the server issued a session, the session
+    /// is ended (an HTTP transport sends the `DELETE`) instead of being left
+    /// to idle out.
     pub async fn initialize(
+        &self,
+        client_name: &str,
+        client_version: &str,
+    ) -> Result<InitializeResult> {
+        // A failure of a repeat call leaves the established session alone;
+        // only a handshake that never completed has a session to release.
+        let was_initialized = self.initialized.load(Ordering::Acquire);
+        let result = self.initialize_once(client_name, client_version).await;
+        if result.is_err() && !was_initialized {
+            self.end_abandoned_session().await;
+        }
+        result
+    }
+
+    async fn initialize_once(
         &self,
         client_name: &str,
         client_version: &str,
@@ -2448,6 +2469,14 @@ impl McpClient {
 
         // Re-initialize (using send_request_once to avoid recursion)
         tracing::info!("Re-initializing session after expiry");
+        let result = self.reinitialize(client_name, client_version).await;
+        if result.is_err() {
+            self.end_abandoned_session().await;
+        }
+        result
+    }
+
+    async fn reinitialize(&self, client_name: String, client_version: String) -> Result<()> {
         let params = InitializeParams {
             protocol_version: crate::protocol::LATEST_PROTOCOL_VERSION.to_string(),
             capabilities: self.capabilities.clone(),
@@ -2472,6 +2501,23 @@ impl McpClient {
         self.initialized.store(true, Ordering::Release);
 
         Ok(())
+    }
+
+    /// Release the session a failed `initialize` left on the server.
+    ///
+    /// The server may have issued a session id before the handshake failed,
+    /// and nothing else would end it short of the server's idle timeout.
+    /// Best effort: a message loop that is already gone has nothing to end.
+    async fn end_abandoned_session(&self) {
+        let (done_tx, done_rx) = oneshot::channel();
+        if self
+            .command_tx
+            .send(LoopCommand::EndSession { done_tx })
+            .await
+            .is_ok()
+        {
+            let _ = done_rx.await;
+        }
     }
 
     async fn send_notification<P: serde::Serialize>(&self, method: &str, params: &P) -> Result<()> {
@@ -2912,6 +2958,11 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
                         for (_, pending) in pending_requests.drain() {
                             let _ = pending.response_tx.send(Err(Error::SessionExpired));
                         }
+                        let _ = done_tx.send(());
+                    }
+                    Some(LoopCommand::EndSession { done_tx }) => {
+                        tracing::info!("Ending the session left by a failed initialize");
+                        transport.end_session().await;
                         let _ = done_tx.send(());
                     }
                     Some(LoopCommand::Shutdown) | None => {
