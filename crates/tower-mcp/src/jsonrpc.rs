@@ -27,7 +27,7 @@ use crate::inspection::{
 use crate::protocol::{
     JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, JsonRpcResponseMessage, McpRequest, ResultType,
 };
-use crate::router::{Extensions, RouterRequest, RouterResponse};
+use crate::router::{Extensions, PeerCancelled, RouterRequest, RouterResponse};
 use crate::{ProtocolSupport, ProtocolSupportError};
 
 /// Tower layer that adds JSON-RPC 2.0 framing to an MCP service.
@@ -312,6 +312,34 @@ impl<S> JsonRpcService<S> {
         .await
     }
 
+    /// Process a single request, or report that the peer cancelled it.
+    ///
+    /// Returns `Ok(None)` when `notifications/cancelled` reached the request
+    /// while it was in flight. MCP asks a receiver not to answer a request the
+    /// sender has cancelled, so a transport that can leave a request
+    /// unanswered writes nothing for `None` (#1547). [`Self::call_single`]
+    /// keeps answering every request, for callers that cannot.
+    pub(crate) async fn call_single_answerable(
+        &mut self,
+        req: JsonRpcRequest,
+    ) -> Result<Option<JsonRpcResponse>>
+    where
+        S: Service<RouterRequest, Response = RouterResponse, Error = std::convert::Infallible>
+            + Clone
+            + Send
+            + 'static,
+        S::Future: Send,
+    {
+        process_answerable_request(
+            self.inner.clone(),
+            req,
+            self.extensions.clone(),
+            self.protocol_support.clone(),
+            self.negotiated_revision.clone(),
+        )
+        .await
+    }
+
     /// Process a `2025-03-26` batch of JSON-RPC requests concurrently.
     ///
     /// The exact revision must have been negotiated by `initialize`, supplied
@@ -321,6 +349,40 @@ impl<S> JsonRpcService<S> {
         &mut self,
         requests: Vec<JsonRpcRequest>,
     ) -> Result<Vec<JsonRpcResponse>>
+    where
+        S: Service<RouterRequest, Response = RouterResponse, Error = std::convert::Infallible>
+            + Clone
+            + Send
+            + 'static,
+        S::Future: Send,
+    {
+        let responses = self.run_batch(requests, false).await?;
+        Ok(responses.into_iter().flatten().collect())
+    }
+
+    /// [`Self::call_batch`] that leaves out the members the peer cancelled.
+    pub(crate) async fn call_batch_answerable(
+        &mut self,
+        requests: Vec<JsonRpcRequest>,
+    ) -> Result<Vec<JsonRpcResponse>>
+    where
+        S: Service<RouterRequest, Response = RouterResponse, Error = std::convert::Infallible>
+            + Clone
+            + Send
+            + 'static,
+        S::Future: Send,
+    {
+        let responses = self.run_batch(requests, true).await?;
+        Ok(responses.into_iter().flatten().collect())
+    }
+
+    /// Run a batch concurrently. A `None` member is one the peer cancelled,
+    /// which only happens when `answerable` asks for that to be tracked.
+    async fn run_batch(
+        &mut self,
+        requests: Vec<JsonRpcRequest>,
+        answerable: bool,
+    ) -> Result<Vec<Option<JsonRpcResponse>>>
     where
         S: Service<RouterRequest, Response = RouterResponse, Error = std::convert::Infallible>
             + Clone
@@ -349,32 +411,42 @@ impl<S> JsonRpcService<S> {
                 let negotiated_revision = self.negotiated_revision.clone();
                 let req_id = req.id.clone();
                 async move {
-                    match process_single_request(
-                        inner,
-                        req,
-                        extensions,
-                        protocol_support,
-                        negotiated_revision,
-                    )
-                    .await
-                    {
+                    let result = if answerable {
+                        process_answerable_request(
+                            inner,
+                            req,
+                            extensions,
+                            protocol_support,
+                            negotiated_revision,
+                        )
+                        .await
+                    } else {
+                        process_single_request(
+                            inner,
+                            req,
+                            extensions,
+                            protocol_support,
+                            negotiated_revision,
+                        )
+                        .await
+                        .map(Some)
+                    };
+                    match result {
                         Ok(resp) => resp,
                         Err(e) => {
                             // Convert errors to error responses instead of dropping
-                            JsonRpcResponse::error(
+                            Some(JsonRpcResponse::error(
                                 Some(req_id),
                                 JsonRpcError::internal_error(e.to_string()),
-                            )
+                            ))
                         }
                     }
                 }
             })
             .collect();
 
-        let results: Vec<JsonRpcResponse> = futures::future::join_all(futures).await;
-
         // Results will never be empty since we converted all errors to responses
-        Ok(results)
+        Ok(futures::future::join_all(futures).await)
     }
 
     /// Process a JSON-RPC message (single or batch)
@@ -401,6 +473,44 @@ impl<S> JsonRpcService<S> {
             _ => Ok(JsonRpcResponseMessage::Single(JsonRpcResponse::error(
                 None,
                 JsonRpcError::invalid_request("Unsupported message type"),
+            ))),
+        }
+    }
+
+    /// Process a JSON-RPC message, or report that the peer cancelled all of it.
+    ///
+    /// Returns `Ok(None)` when every request in the message was cancelled by
+    /// the peer while in flight, so a transport writes no frame (#1547). A
+    /// batch with some cancelled members answers the rest.
+    pub(crate) async fn call_message_answerable(
+        &mut self,
+        msg: JsonRpcMessage,
+    ) -> Result<Option<JsonRpcResponseMessage>>
+    where
+        S: Service<RouterRequest, Response = RouterResponse, Error = std::convert::Infallible>
+            + Clone
+            + Send
+            + 'static,
+        S::Future: Send,
+    {
+        match msg {
+            JsonRpcMessage::Single(req) => Ok(self
+                .call_single_answerable(req)
+                .await?
+                .map(JsonRpcResponseMessage::Single)),
+            JsonRpcMessage::Batch(requests) => match self.call_batch_answerable(requests).await {
+                Ok(responses) if responses.is_empty() => Ok(None),
+                Ok(responses) => Ok(Some(JsonRpcResponseMessage::Batch(responses))),
+                Err(Error::JsonRpc(error)) => Ok(Some(JsonRpcResponseMessage::Single(
+                    JsonRpcResponse::error(None, error),
+                ))),
+                Err(error) => Err(error),
+            },
+            _ => Ok(Some(JsonRpcResponseMessage::Single(
+                JsonRpcResponse::error(
+                    None,
+                    JsonRpcError::invalid_request("Unsupported message type"),
+                ),
             ))),
         }
     }
@@ -465,6 +575,46 @@ where
         let mut service = self.clone();
         Box::pin(async move { service.call_message(msg).await })
     }
+}
+
+/// Process a single request, reporting `None` if the peer cancelled it.
+///
+/// Registers a [`PeerCancelled`] for the router to set when
+/// `notifications/cancelled` finds this request in flight, then reads it once
+/// the response exists. `initialize` is left untracked: the spec says it MUST
+/// NOT be cancelled, so it is always answered.
+async fn process_answerable_request<S>(
+    inner: S,
+    req: JsonRpcRequest,
+    mut extensions: Extensions,
+    configured_protocol_support: ProtocolSupport,
+    negotiated_revision: Arc<RwLock<Option<McpProtocolRevision>>>,
+) -> std::result::Result<Option<JsonRpcResponse>, Error>
+where
+    S: Service<RouterRequest, Response = RouterResponse, Error = std::convert::Infallible>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send,
+{
+    let peer_cancelled = PeerCancelled::default();
+    if req.method != "initialize" {
+        extensions.insert(peer_cancelled.clone());
+    }
+    let id = req.id.clone();
+    let response = process_single_request(
+        inner,
+        req,
+        extensions,
+        configured_protocol_support,
+        negotiated_revision,
+    )
+    .await;
+    if peer_cancelled.is_marked() {
+        tracing::debug!(request_id = ?id, "Not answering a request the peer cancelled");
+        return Ok(None);
+    }
+    response.map(Some)
 }
 
 /// Helper function to process a single JSON-RPC request
@@ -1261,5 +1411,125 @@ mod tests {
         assert!(matches!(&responses[0], JsonRpcResponse::Result(_)));
         // Second should be an error (method not found)
         assert!(matches!(&responses[1], JsonRpcResponse::Error(_)));
+    }
+
+    /// Stands in for a router that `notifications/cancelled` reached: marks
+    /// the request's [`PeerCancelled`], if it was given one, for the ids in
+    /// `cancel`, and answers with a pong either way.
+    #[derive(Clone)]
+    struct CancelsIds {
+        cancel: Vec<i64>,
+    }
+
+    impl Service<RouterRequest> for CancelsIds {
+        type Response = RouterResponse;
+        type Error = std::convert::Infallible;
+        type Future = std::future::Ready<std::result::Result<RouterResponse, Self::Error>>;
+
+        fn poll_ready(
+            &mut self,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: RouterRequest) -> Self::Future {
+            if let crate::protocol::RequestId::Number(id) = &req.id
+                && self.cancel.contains(id)
+                && let Some(peer_cancelled) = req.extensions.get::<PeerCancelled>()
+            {
+                peer_cancelled.mark();
+            }
+            std::future::ready(Ok(RouterResponse {
+                id: req.id,
+                inner: Ok(crate::protocol::McpResponse::Pong(
+                    crate::protocol::EmptyResult {},
+                )),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn answerable_single_is_dropped_only_when_the_peer_cancelled_it() {
+        let mut cancelled = JsonRpcService::new(CancelsIds { cancel: vec![7] });
+        assert!(
+            cancelled
+                .call_single_answerable(JsonRpcRequest::new(7, "ping"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cancelled
+                .call_single_answerable(JsonRpcRequest::new(8, "ping"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        // The public entry point cannot leave a request unanswered, so it
+        // does not track cancellation at all.
+        assert!(matches!(
+            cancelled
+                .call_single(JsonRpcRequest::new(7, "ping"))
+                .await
+                .unwrap(),
+            JsonRpcResponse::Result(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn initialize_is_answered_even_if_cancellation_arrives() {
+        let mut service = JsonRpcService::new(CancelsIds { cancel: vec![1] });
+        let init = JsonRpcRequest::new(1, "initialize").with_params(serde_json::json!({
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": { "name": "test", "version": "1.0" }
+        }));
+        assert!(
+            service
+                .call_single_answerable(init)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn answerable_batch_omits_cancelled_members() {
+        let mut service = JsonRpcService::new(CancelsIds { cancel: vec![3] })
+            .protocol_versions(["2025-03-26"])
+            .unwrap();
+        let batch = JsonRpcMessage::Batch(vec![
+            JsonRpcRequest::new(2, "ping"),
+            JsonRpcRequest::new(3, "ping"),
+        ]);
+        match service.call_message_answerable(batch).await.unwrap() {
+            Some(JsonRpcResponseMessage::Batch(responses)) => {
+                assert_eq!(responses.len(), 1);
+                assert!(matches!(
+                    &responses[0],
+                    JsonRpcResponse::Result(r) if r.id == crate::protocol::RequestId::Number(2)
+                ));
+            }
+            other => panic!("expected a one-member batch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn answerable_batch_is_dropped_when_every_member_was_cancelled() {
+        let mut service = JsonRpcService::new(CancelsIds { cancel: vec![2, 3] })
+            .protocol_versions(["2025-03-26"])
+            .unwrap();
+        let batch = JsonRpcMessage::Batch(vec![
+            JsonRpcRequest::new(2, "ping"),
+            JsonRpcRequest::new(3, "ping"),
+        ]);
+        assert!(
+            service
+                .call_message_answerable(batch)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

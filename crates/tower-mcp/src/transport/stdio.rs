@@ -688,7 +688,8 @@ fn request_limiter(max_concurrent_requests: Option<usize>) -> Option<Arc<Semapho
 
 /// Process a single line of JSON-RPC input
 ///
-/// Returns `Ok(Some(response))` for requests, `Ok(None)` for notifications.
+/// Returns `Ok(Some(response))` for requests, `Ok(None)` for notifications and
+/// for requests the peer cancelled, which MCP asks us not to answer (#1547).
 async fn process_line(
     service: &mut JsonRpcService<McpRouter>,
     router: &McpRouter,
@@ -749,8 +750,7 @@ async fn process_line(
             "not a valid JSON-RPC request",
         ))));
     };
-    let response = service.call_message(message).await?;
-    Ok(Some(response))
+    service.call_message_answerable(message).await
 }
 
 /// Handle a JSON-RPC notification
@@ -1815,8 +1815,8 @@ where
         // an `Arc`, so concurrent requests all see the same handshake state.
         let mut service = service.clone();
         let work = async move {
-            match service.call_message(message).await {
-                Ok(response) => match serde_json::to_string(&response) {
+            match service.call_message_answerable(message).await {
+                Ok(Some(response)) => match serde_json::to_string(&response) {
                     Ok(json) => {
                         trace_stdio_frame(
                             StdioFrameDirection::Outbound,
@@ -1830,6 +1830,8 @@ where
                         None
                     }
                 },
+                // The peer cancelled it; MCP asks us not to answer (#1547).
+                Ok(None) => None,
                 Err(e) => {
                     tracing::error!(error = %e, "Error processing message");
                     Self::error_frame(None, &e.to_string()).ok()
@@ -2524,8 +2526,10 @@ where
         // read by this same loop (#923).
         let mut service = self.service.clone();
         in_flight.spawn(async move {
-            let response_json = match service.call_message(message).await {
-                Ok(response) => serde_json::to_string(&response),
+            let response_json = match service.call_message_answerable(message).await {
+                Ok(Some(response)) => serde_json::to_string(&response),
+                // The peer cancelled it; MCP asks us not to answer (#1547).
+                Ok(None) => return,
                 Err(e) => {
                     tracing::error!(error = %e, "Error processing message");
                     serde_json::to_string(&parse_error_response(e.to_string()))

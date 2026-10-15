@@ -174,6 +174,41 @@ fn cancellable_tool(name: &'static str, hold_ms: u64) -> tower_mcp::Tool {
         .build()
 }
 
+/// A `hold` tool that counts the calls which saw their cancellation.
+///
+/// A request the client cancels is not answered (#1547), so the response text
+/// can no longer say whether a call was cancelled; the count does.
+fn observing_hold_tool(observed: Arc<AtomicUsize>) -> tower_mcp::Tool {
+    ToolBuilder::new("hold")
+        .description("Runs until cancelled, counting each call that is")
+        .extractor_handler((), move |ctx: Context, RawArgs(_): RawArgs| {
+            let observed = observed.clone();
+            async move {
+                let deadline = std::time::Instant::now() + Duration::from_millis(3_000);
+                while std::time::Instant::now() < deadline {
+                    if ctx.is_cancelled() {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        return Ok(CallToolResult::text("cancelled"));
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Ok(CallToolResult::text("completed"))
+            }
+        })
+        .build()
+}
+
+/// Wait until `observed` reaches `expected`, failing rather than hanging.
+async fn wait_for_observed(observed: &AtomicUsize, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while observed.load(Ordering::SeqCst) < expected {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the cancellation never reached the handler");
+}
+
 fn echo_tool() -> tower_mcp::Tool {
     ToolBuilder::new("echo")
         .description("Echoes its arguments back as text")
@@ -268,9 +303,10 @@ async fn a_cancellation_with_a_mismatched_id_type_is_not_applied() {
     server.shutdown().await;
 }
 
-/// Control, and the valid-construction proof for the two ignored tests below:
-/// under distinct ids, two concurrent calls are answered independently and
-/// cancelling one leaves the other running.
+/// Control, and the valid-construction proof for the two tests below: under
+/// distinct ids, two concurrent calls are handled independently and cancelling
+/// one leaves the other running. The cancelled one is not answered (#1547), so
+/// the first frame is the other call's, and nothing follows for the first.
 #[tokio::test]
 async fn concurrent_calls_under_distinct_ids_are_independently_cancellable() {
     let mut server = Server::with_router(base_router());
@@ -285,15 +321,14 @@ async fn concurrent_calls_under_distinct_ids_are_independently_cancellable() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     server.send(cancel(serde_json::json!(1))).await;
 
-    let frames = server.next_frames(2).await;
-    let by_id = |id: i64| {
-        frames
-            .iter()
-            .find(|f| f["id"] == serde_json::json!(id))
-            .unwrap_or_else(|| panic!("no response for id {id} in {frames:#?}"))
-    };
-    assert_eq!(by_id(1)["result"]["content"][0]["text"], "cancelled");
-    assert_eq!(by_id(2)["result"]["content"][0]["text"], "completed");
+    let frame = server.next_frame().await;
+    assert_eq!(
+        frame["id"],
+        serde_json::json!(2),
+        "the cancelled request must not be answered: {frame}"
+    );
+    assert_eq!(frame["result"]["content"][0]["text"], "completed");
+    server.expect_silence(Duration::from_millis(200)).await;
     server.shutdown().await;
 }
 
@@ -305,7 +340,12 @@ async fn concurrent_calls_under_distinct_ids_are_independently_cancellable() {
 /// first and only the last arrival was reachable (#1270).
 #[tokio::test]
 async fn cancelling_a_duplicated_id_reaches_every_request_using_it() {
-    let mut server = Server::with_router(base_router());
+    let observed = Arc::new(AtomicUsize::new(0));
+    let mut server = Server::with_router(
+        McpRouter::new()
+            .server_info("adversarial", "1.0.0")
+            .tool(observing_hold_tool(observed.clone())),
+    );
     server.initialize().await;
 
     server
@@ -317,16 +357,10 @@ async fn cancelling_a_duplicated_id_reaches_every_request_using_it() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     server.send(cancel(serde_json::json!(7))).await;
 
-    let frames = server.next_frames(2).await;
-    let outcomes: Vec<&str> = frames
-        .iter()
-        .map(|f| f["result"]["content"][0]["text"].as_str().unwrap_or("?"))
-        .collect();
-    assert_eq!(
-        outcomes,
-        vec!["cancelled", "cancelled"],
-        "both requests carrying the cancelled id must stop: {frames:#?}"
-    );
+    // Both requests carrying the cancelled id must stop, and neither is
+    // answered (#1547).
+    wait_for_observed(&observed, 2).await;
+    server.expect_silence(Duration::from_millis(300)).await;
     server.shutdown().await;
 }
 
@@ -338,7 +372,13 @@ async fn cancelling_a_duplicated_id_reaches_every_request_using_it() {
 /// cancellation found nothing to cancel (#1270).
 #[tokio::test]
 async fn completing_one_request_does_not_untrack_its_id_twin() {
-    let mut server = Server::with_router(base_router());
+    let observed = Arc::new(AtomicUsize::new(0));
+    let mut server = Server::with_router(
+        McpRouter::new()
+            .server_info("adversarial", "1.0.0")
+            .tool(observing_hold_tool(observed.clone()))
+            .tool(cancellable_tool("brief", 60)),
+    );
     server.initialize().await;
 
     server
@@ -352,12 +392,11 @@ async fn completing_one_request_does_not_untrack_its_id_twin() {
     let first = server.next_frame().await;
     assert_eq!(first["result"]["content"][0]["text"], "completed");
 
+    // The still-running request under id 7 must observe the cancellation, and
+    // is not answered (#1547).
     server.send(cancel(serde_json::json!(7))).await;
-    let second = server.next_frame().await;
-    assert_eq!(
-        second["result"]["content"][0]["text"], "cancelled",
-        "the still-running request under id 7 must observe the cancellation: {second}"
-    );
+    wait_for_observed(&observed, 1).await;
+    server.expect_silence(Duration::from_millis(300)).await;
     server.shutdown().await;
 }
 
@@ -928,11 +967,14 @@ async fn a_cancelled_request_releases_its_concurrency_slot() {
         .await;
     server.send(cancel(serde_json::json!(1))).await;
 
-    let frames = server.next_frames(2).await;
-    assert!(
-        frames.iter().any(|f| f["id"] == serde_json::json!(2)),
-        "the queued request must run once the slot frees: {frames:#?}"
+    // The cancelled request is not answered (#1547); the queued one is.
+    let frame = server.next_frame().await;
+    assert_eq!(
+        frame["id"],
+        serde_json::json!(2),
+        "the queued request must run once the slot frees: {frame}"
     );
+    server.expect_silence(Duration::from_millis(300)).await;
     server.shutdown().await;
 }
 

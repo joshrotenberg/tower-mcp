@@ -11,6 +11,8 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 use tokio::time::{Duration, timeout};
@@ -86,6 +88,14 @@ fn configurations() -> Vec<(&'static str, Serve)> {
 }
 
 fn router() -> McpRouter {
+    router_observing(Arc::new(AtomicBool::new(false)))
+}
+
+/// The router, with `wait` setting `observed` once it sees its cancellation.
+///
+/// A request the client cancels is not answered (#1547), so the response text
+/// can no longer show that the handler saw the cancellation; the flag does.
+fn router_observing(observed: Arc<AtomicBool>) -> McpRouter {
     let echo = ToolBuilder::new("echo")
         .description("Answers immediately")
         .extractor_handler((), |_ctx: Context, RawArgs(_): RawArgs| async move {
@@ -94,9 +104,13 @@ fn router() -> McpRouter {
         .build();
     let wait = ToolBuilder::new("wait")
         .description("Waits until cancelled")
-        .extractor_handler((), |ctx: Context, RawArgs(_): RawArgs| async move {
-            ctx.cancelled().await;
-            Ok(CallToolResult::text("cancelled"))
+        .extractor_handler((), move |ctx: Context, RawArgs(_): RawArgs| {
+            let observed = observed.clone();
+            async move {
+                ctx.cancelled().await;
+                observed.store(true, Ordering::SeqCst);
+                Ok(CallToolResult::text("cancelled"))
+            }
         })
         .build();
     let notify = ToolBuilder::new("notify")
@@ -196,9 +210,13 @@ where
 /// The writer is returned rather than dropped: closing stdin is end of input
 /// to the server, and these tests need it open while they read.
 fn spawn(serve: Serve) -> (DuplexStream, BufReader<DuplexStream>) {
+    spawn_with(serve, router())
+}
+
+fn spawn_with(serve: Serve, router: McpRouter) -> (DuplexStream, BufReader<DuplexStream>) {
     let (writer, server_stdin) = tokio::io::duplex(8192);
     let (server_stdout, reader) = tokio::io::duplex(8192);
-    tokio::spawn(serve(router(), server_stdin, server_stdout));
+    tokio::spawn(serve(router, server_stdin, server_stdout));
     (writer, BufReader::new(reader))
 }
 
@@ -235,6 +253,46 @@ async fn exchange(
         .expect("frames must arrive")
 }
 
+/// Like [`exchange`], for a cancellation: writes `before`, pauses, writes
+/// `after`, waits for `wait` to see its cancellation, then returns whatever
+/// frames follow until the stream goes quiet.
+///
+/// The cancelled request is not answered, so there is no frame to count on.
+async fn exchange_cancelling(
+    serve: Serve,
+    before: &[String],
+    after: &[String],
+) -> Vec<serde_json::Value> {
+    let observed = Arc::new(AtomicBool::new(false));
+    let (mut writer, reader) = spawn_with(serve, router_observing(observed.clone()));
+
+    for line in before {
+        writer.write_all(line.as_bytes()).await.unwrap();
+        writer.write_all(b"\n").await.unwrap();
+    }
+    writer.flush().await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    for line in after {
+        writer.write_all(line.as_bytes()).await.unwrap();
+        writer.write_all(b"\n").await.unwrap();
+    }
+    writer.flush().await.unwrap();
+
+    timeout(Duration::from_secs(10), async {
+        while !observed.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the cancellation never reached the handler");
+
+    // Only the stream going quiet ends this, so the writer stays open.
+    let frames = read_frames_until_quiet(reader, 16, Duration::from_millis(500)).await;
+    drop(writer);
+    frames
+}
+
 fn id_of(frame: &serde_json::Value) -> Option<i64> {
     frame["id"].as_i64()
 }
@@ -265,49 +323,49 @@ async fn every_configuration_answers_a_request() {
 }
 
 /// #1250 and #1251 were both this assertion, failing in one configuration.
+///
+/// The handler seeing its cancellation is what `exchange_cancelling` waits
+/// for; the cancelled request itself is then not answered (#1547).
 #[tokio::test]
 async fn cancellation_reaches_a_running_handler_everywhere() {
     for (name, serve) in configurations() {
         let cancel =
             r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}"#;
-        let frames = exchange(
+        let frames = exchange_cancelling(
             serve,
             &[INIT.to_string(), INITIALIZED.to_string(), call(2, "wait")],
             &[cancel.to_string()],
-            2,
         )
         .await;
-        let answer = frames
-            .iter()
-            .find(|f| id_of(f) == Some(2))
-            .unwrap_or_else(|| panic!("[{name}] cancellation never landed: {frames:?}"));
-        assert_eq!(
-            answer["result"]["content"][0]["text"], "cancelled",
-            "[{name}] handler did not observe cancellation"
+        assert!(
+            frames.iter().all(|f| id_of(f) != Some(2)),
+            "[{name}] a cancelled request was answered: {frames:?}"
         );
     }
 }
 
 /// Cancellation must overtake queued work, which is what a concurrency cap
-/// previously prevented.
+/// previously prevented. The queued request is answered once the cancelled one
+/// releases its slot; the cancelled one is not (#1547).
 #[tokio::test]
 async fn cancellation_overtakes_a_queued_request_everywhere() {
     for (name, serve) in configurations() {
         let cancel =
             r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}"#;
-        let frames = exchange(
+        let frames = exchange_cancelling(
             serve,
             &[INIT.to_string(), INITIALIZED.to_string(), call(2, "wait")],
             &[call(3, "echo"), cancel.to_string()],
-            3,
         )
         .await;
-        for id in [2, 3] {
-            assert!(
-                frames.iter().any(|f| id_of(f) == Some(id)),
-                "[{name}] no answer for {id}: {frames:?}"
-            );
-        }
+        assert!(
+            frames.iter().any(|f| id_of(f) == Some(3)),
+            "[{name}] no answer for 3: {frames:?}"
+        );
+        assert!(
+            frames.iter().all(|f| id_of(f) != Some(2)),
+            "[{name}] a cancelled request was answered: {frames:?}"
+        );
     }
 }
 
