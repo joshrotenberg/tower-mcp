@@ -3325,10 +3325,10 @@ mod tests {
     /// response is an error rather than a silent fall back to `none`.
     #[tokio::test]
     async fn confidential_dcr_without_a_secret_is_rejected() {
-        for secret in [None, Some("")] {
+        for (case, returned) in [("absent", None), ("empty", Some(""))] {
             let mut response = serde_json::json!({ "client_id": "c" });
-            if let Some(secret) = secret {
-                response["client_secret"] = secret.into();
+            if let Some(value) = returned {
+                response["client_secret"] = value.into();
             }
             let (result, sent) =
                 register_with_advertised_methods("client_secret_basic", &[], response).await;
@@ -3337,7 +3337,7 @@ mod tests {
             assert!(
                 matches!(&error, OAuthClientError::Registration(message)
                     if message.contains("client_secret_basic")),
-                "unexpected error for {secret:?}: {error}"
+                "unexpected error when the client_secret is {case}"
             );
         }
     }

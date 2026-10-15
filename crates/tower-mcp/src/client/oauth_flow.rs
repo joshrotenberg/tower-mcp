@@ -2861,7 +2861,7 @@ mod tests {
         let parameters: HashMap<_, _> = url.query_pairs().into_owned().collect();
         assert!(
             !parameters.contains_key("scope"),
-            "unexpected scope in {url}"
+            "the authorization URL must not carry a scope"
         );
         assert!(pending.request().scopes.is_empty());
 
