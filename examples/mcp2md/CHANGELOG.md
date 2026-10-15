@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.10] - 2026-10-15
+
+### Miscellaneous Tasks
+
+- **mcp2md:** Ship LICENSE files in the published crate ([#1567](https://github.com/joshrotenberg/tower-mcp/pull/1567))
+
+
+
 ## [0.1.9] - 2026-09-29
 
 ### Miscellaneous Tasks

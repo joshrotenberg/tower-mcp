@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.24.0] - 2026-10-15
+
+### Bug Fixes
+
+- **tool:** Reject a non-object structuredContent on 2025 requests (closes #1540) ([#1541](https://github.com/joshrotenberg/tower-mcp/pull/1541))
+- **client:** Accept servers that answer protocol version 2024-11-05 ([#1550](https://github.com/joshrotenberg/tower-mcp/pull/1550))
+- Do not answer a request the client cancelled ([#1552](https://github.com/joshrotenberg/tower-mcp/pull/1552))
+- [**breaking**] **http:** Keep handler -32602 errors in-band on 2026-07-28 and answer unknown tools and prompts with -32602 ([#1560](https://github.com/joshrotenberg/tower-mcp/pull/1560))
+- **client:** Kill the stdio child when its transport is dropped ([#1543](https://github.com/joshrotenberg/tower-mcp/pull/1543))
+- **client:** Keep the HTTP client usable after a 429 or 5xx and expose the status ([#1559](https://github.com/joshrotenberg/tower-mcp/pull/1559))
+- **stdio:** Cancel in-flight handlers when drain_timeout expires ([#1562](https://github.com/joshrotenberg/tower-mcp/pull/1562))
+- **http:** Restore the client's capabilities into router session state on SessionStore restore ([#1564](https://github.com/joshrotenberg/tower-mcp/pull/1564))
+- **client:** Keep the HTTP status on a 401/403 JSON-RPC error and recover sessions on any background 404 ([#1565](https://github.com/joshrotenberg/tower-mcp/pull/1565))
+- **http:** Clean up the session of a rejected initialize, harden Origin parsing, check Host on WebSocket ([#1566](https://github.com/joshrotenberg/tower-mcp/pull/1566))
+- Preserve a null structuredContent, hide a non-object outputSchema from 2025 peers, answer non-integer request ids ([#1568](https://github.com/joshrotenberg/tower-mcp/pull/1568))
+- **oauth-client:** Refresh with granted scopes, honor advertised auth methods, omit scope instead of AS scopes_supported ([#1569](https://github.com/joshrotenberg/tower-mcp/pull/1569))
+- **client:** HTTP initialize ping deadlock, failed-initialize session cleanup, x-mcp-header types, cancellation on 2025 sessions ([#1570](https://github.com/joshrotenberg/tower-mcp/pull/1570))
+
+### Documentation
+
+- **session_store:** Load must not return an expired record (closes #1529) ([#1534](https://github.com/joshrotenberg/tower-mcp/pull/1534))
+
+### Features
+
+- **router:** Expose the initializing client's clientInfo to request handlers ([#1551](https://github.com/joshrotenberg/tower-mcp/pull/1551))
+- **client:** Let StdioClientTransport callers stop the child's process group and read its exit status ([#1563](https://github.com/joshrotenberg/tower-mcp/pull/1563))
+
+
+
 ## [0.23.2] - 2026-09-29
 
 ### Features
