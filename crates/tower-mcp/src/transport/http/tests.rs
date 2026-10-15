@@ -12,9 +12,8 @@ use super::*;
 // happens to re-export for its own use. Nothing from `stateless_dispatch` is
 // glob-imported here: everything this file needs from it is already covered
 // by `http.rs`'s own explicit re-export, reachable through `use super::*`.
-use super::handlers::*;
 use super::session::*;
-use crate::transport::origin::{is_localhost_host, is_localhost_origin};
+use crate::transport::origin::{effective_host, is_localhost_host, is_localhost_origin};
 use axum::body::Body;
 use axum::http::Request;
 use proptest::prelude::*;

@@ -1,4 +1,4 @@
-//! `Origin` validation shared by the HTTP and WebSocket transports.
+//! `Origin` and `Host` validation shared by the HTTP and WebSocket transports.
 //!
 //! Browsers attach `Origin` to cross-site `fetch` requests and to every
 //! WebSocket handshake, and they do not apply CORS to WebSocket connections.
@@ -322,6 +322,73 @@ pub(crate) fn validate_origin(
     }
 
     None
+}
+
+/// Resolve the effective host for validation.
+///
+/// Prefers the `Host` header, falling back to the HTTP/2 `:authority`
+/// pseudo-header (`request.uri().authority()`) when the header is missing.
+/// This matters behind middleware like `axum::Router::nest`, which can
+/// strip Hyper's synthesized `Host` before our handler sees it.
+pub(crate) fn effective_host<'a>(
+    headers: &'a HeaderMap,
+    uri: &'a axum::http::Uri,
+) -> Option<&'a str> {
+    if let Some(value) = headers.get(header::HOST)
+        && let Ok(s) = value.to_str()
+    {
+        return Some(s);
+    }
+    uri.authority().map(|a| a.as_str())
+}
+
+/// Validate the `Host` header (defense-in-depth alongside Origin).
+///
+/// When `enabled`, localhost hosts are always accepted. Any other host is
+/// accepted when `allowed_hosts` is empty, which preserves the historical
+/// behavior of not enforcing Host on non-loopback deployments unless the
+/// operator opts in, and otherwise must match an entry exactly.
+///
+/// Returns `Some(400 response)` if validation fails, `None` if it passes.
+pub(crate) fn validate_host(
+    headers: &HeaderMap,
+    uri: &axum::http::Uri,
+    enabled: bool,
+    allowed_hosts: &[String],
+) -> Option<Response> {
+    if !enabled {
+        return None;
+    }
+
+    let Some(host) = effective_host(headers, uri) else {
+        if allowed_hosts.is_empty() {
+            // No Host header and no allowlist: fall back to permissive
+            // behavior matching pre-validation defaults so we don't break
+            // existing deployments. (Origin already protects browsers.)
+            return None;
+        }
+        tracing::warn!("Rejecting request: missing Host header and no :authority fallback");
+        return Some((StatusCode::BAD_REQUEST, "Missing Host header").into_response());
+    };
+
+    if is_localhost_host(host) {
+        return None;
+    }
+
+    if allowed_hosts.is_empty() {
+        // Non-localhost host with no explicit allowlist: keep accepting it.
+        // Operators who want strict Host validation must opt in via
+        // `.allowed_hosts(...)`. This preserves the historical behavior of
+        // not enforcing Host on non-loopback deployments by default.
+        return None;
+    }
+
+    if allowed_hosts.iter().any(|h| h == host) {
+        return None;
+    }
+
+    tracing::warn!(host = %host, "Rejecting request: Host not in allowlist");
+    Some((StatusCode::BAD_REQUEST, "Host not allowed").into_response())
 }
 
 #[cfg(test)]
