@@ -10,6 +10,9 @@
 //! Regression coverage for #797 (bidi closed instead of writing a parse-error
 //! response) and follow-up to #812.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -2048,18 +2051,35 @@ mod control_under_saturation {
     use super::*;
     use tower_mcp::extract::RawArgs;
 
-    /// A tool that only finishes when its request is cancelled.
-    fn router_with_a_waiting_tool() -> McpRouter {
+    /// A tool that only finishes when its request is cancelled, and says so
+    /// through `observed`. The cancelled request is not answered (#1547), so
+    /// the flag is how a test sees the cancellation arrive.
+    fn router_with_a_waiting_tool(observed: Arc<AtomicBool>) -> McpRouter {
         let wait = ToolBuilder::new("wait")
             .description("Waits until cancelled")
-            .extractor_handler((), |ctx: Context, RawArgs(_): RawArgs| async move {
-                ctx.cancelled().await;
-                Ok(CallToolResult::text("cancelled"))
+            .extractor_handler((), move |ctx: Context, RawArgs(_): RawArgs| {
+                let observed = observed.clone();
+                async move {
+                    ctx.cancelled().await;
+                    observed.store(true, AtomicOrdering::SeqCst);
+                    Ok(CallToolResult::text("cancelled"))
+                }
             })
             .build();
         McpRouter::new()
             .server_info("stdio-control-test", "0.0.0")
             .tool(wait)
+    }
+
+    /// Wait for the handler to see its cancellation, bounded.
+    async fn wait_until_observed(observed: &AtomicBool) {
+        timeout(Duration::from_secs(5), async {
+            while !observed.load(AtomicOrdering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the cancellation never reached the handler");
     }
 
     const INIT: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#;
@@ -2073,7 +2093,8 @@ mod control_under_saturation {
     /// handler? If this fails the problem is the harness, not the limit.
     #[tokio::test]
     async fn cancellation_reaches_a_running_handler_without_a_limit() {
-        let mut transport = StdioTransport::new(router_with_a_waiting_tool());
+        let observed = Arc::new(AtomicBool::new(false));
+        let mut transport = StdioTransport::new(router_with_a_waiting_tool(observed.clone()));
 
         let (mut stdin_writer, server_stdin) = tokio::io::duplex(4096);
         let (server_stdout, server_stdout_reader) = tokio::io::duplex(4096);
@@ -2098,14 +2119,23 @@ mod control_under_saturation {
         }
         stdin_writer.flush().await.unwrap();
 
+        wait_until_observed(&observed).await;
+        let mut reader = BufReader::new(server_stdout_reader);
         let frames = timeout(
             Duration::from_secs(5),
-            read_n_frames(BufReader::new(server_stdout_reader), 3),
+            read_n_frames(BufReader::new(&mut reader), 2),
         )
         .await
-        .expect("unlimited transport must answer all three");
+        .expect("unlimited transport must answer initialize and ping");
         let ids: Vec<i64> = frames.iter().filter_map(|f| f["id"].as_i64()).collect();
-        assert!(ids.contains(&2), "cancelled call answered: {frames:?}");
+        assert_eq!(ids, vec![1, 3], "unexpected frames: {frames:?}");
+        // The cancelled call is not answered (#1547).
+        assert!(
+            timeout(Duration::from_millis(500), read_frame(&mut reader))
+                .await
+                .is_err(),
+            "the cancelled call was answered"
+        );
     }
 
     /// #1251: the permit is acquired inside the read loop, so once every slot
@@ -2117,8 +2147,9 @@ mod control_under_saturation {
     /// the request it cancels, which is exactly what a cap prevents today.
     #[tokio::test]
     async fn a_saturated_limit_must_not_starve_cancellation() {
-        let mut transport =
-            StdioTransport::new(router_with_a_waiting_tool()).max_concurrent_requests(1);
+        let observed = Arc::new(AtomicBool::new(false));
+        let mut transport = StdioTransport::new(router_with_a_waiting_tool(observed.clone()))
+            .max_concurrent_requests(1);
 
         let (mut stdin_writer, server_stdin) = tokio::io::duplex(4096);
         let (server_stdout, server_stdout_reader) = tokio::io::duplex(4096);
@@ -2143,21 +2174,27 @@ mod control_under_saturation {
         }
         stdin_writer.flush().await.unwrap();
 
+        wait_until_observed(&observed).await;
+        let mut reader = BufReader::new(server_stdout_reader);
         let frames = timeout(
             Duration::from_secs(5),
-            read_n_frames(BufReader::new(server_stdout_reader), 3),
+            read_n_frames(BufReader::new(&mut reader), 2),
         )
         .await
         .expect("cancellation must be readable while the limit is saturated");
 
         let ids: Vec<i64> = frames.iter().filter_map(|f| f["id"].as_i64()).collect();
         assert!(
-            ids.contains(&2),
-            "the cancelled call must be answered: {frames:?}"
-        );
-        assert!(
             ids.contains(&3),
             "the queued request must run once the permit frees: {frames:?}"
+        );
+        // The cancelled call is not answered (#1547).
+        assert!(
+            !ids.contains(&2)
+                && timeout(Duration::from_millis(500), read_frame(&mut reader))
+                    .await
+                    .is_err(),
+            "the cancelled call was answered: {frames:?}"
         );
     }
 }
@@ -2171,11 +2208,22 @@ mod inbound_notifications {
     use tower_mcp::extract::RawArgs;
 
     fn router_with_a_waiting_tool() -> McpRouter {
+        router_with_an_observed_waiting_tool(Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Like [`router_with_a_waiting_tool`], and sets `observed` when the call
+    /// sees its cancellation. The cancelled request is not answered (#1547),
+    /// so the flag is how a test sees the cancellation arrive.
+    fn router_with_an_observed_waiting_tool(observed: Arc<AtomicBool>) -> McpRouter {
         let wait = ToolBuilder::new("wait")
             .description("Waits until cancelled")
-            .extractor_handler((), |ctx: Context, RawArgs(_): RawArgs| async move {
-                ctx.cancelled().await;
-                Ok(CallToolResult::text("cancelled"))
+            .extractor_handler((), move |ctx: Context, RawArgs(_): RawArgs| {
+                let observed = observed.clone();
+                async move {
+                    ctx.cancelled().await;
+                    observed.store(true, AtomicOrdering::SeqCst);
+                    Ok(CallToolResult::text("cancelled"))
+                }
             })
             .build();
         McpRouter::new()
@@ -2190,8 +2238,9 @@ mod inbound_notifications {
         r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}"#;
 
     /// Drive a transport through initialize, a slow call, and a cancellation.
-    /// Returns the frames written back.
-    async fn cancel_a_running_call<F, Fut>(run: F) -> Vec<serde_json::Value>
+    /// Waits for the call to see the cancellation, then returns the frames
+    /// written back.
+    async fn cancel_a_running_call<F, Fut>(observed: &AtomicBool, run: F) -> Vec<serde_json::Value>
     where
         F: FnOnce(tokio::io::DuplexStream, tokio::io::DuplexStream) -> Fut,
         Fut: std::future::Future<Output = ()> + Send + 'static,
@@ -2211,12 +2260,22 @@ mod inbound_notifications {
         stdin_writer.write_all(b"\n").await.unwrap();
         stdin_writer.flush().await.unwrap();
 
-        timeout(
-            Duration::from_secs(5),
-            read_n_frames(BufReader::new(server_stdout_reader), 2),
-        )
+        timeout(Duration::from_secs(5), async {
+            while !observed.load(AtomicOrdering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
         .await
-        .expect("the cancelled call must be answered")
+        .expect("the cancellation never reached the handler");
+
+        // Initialize is answered; the cancelled call is not (#1547). Take
+        // whatever else shows up in a short window.
+        let mut reader = BufReader::new(server_stdout_reader);
+        let mut frames = vec![read_frame(&mut reader).await];
+        while let Ok(frame) = timeout(Duration::from_millis(500), read_frame(&mut reader)).await {
+            frames.push(frame);
+        }
+        frames
     }
 
     /// #1250: applying ordinary tower middleware converted the transport to
@@ -2224,18 +2283,19 @@ mod inbound_notifications {
     /// notification. Adding a no-op layer silently broke cancellation.
     #[tokio::test]
     async fn cancellation_survives_a_middleware_layer() {
-        let frames = cancel_a_running_call(|stdin, stdout| async move {
-            let mut transport = StdioTransport::new(router_with_a_waiting_tool())
-                .layer(tower::layer::util::Identity::new());
+        let observed = Arc::new(AtomicBool::new(false));
+        let router = router_with_an_observed_waiting_tool(observed.clone());
+        let frames = cancel_a_running_call(&observed, |stdin, stdout| async move {
+            let mut transport =
+                StdioTransport::new(router).layer(tower::layer::util::Identity::new());
             let _ = transport.run_with_streams(stdin, stdout).await;
         })
         .await;
 
-        let answer = frames
-            .iter()
-            .find(|f| f["id"] == 2)
-            .unwrap_or_else(|| panic!("no answer for the cancelled call: {frames:?}"));
-        assert_eq!(answer["result"]["content"][0]["text"], "cancelled");
+        assert!(
+            frames.iter().all(|f| f["id"] != 2),
+            "the cancelled call must not be answered: {frames:?}"
+        );
     }
 
     /// The same guarantee without any outbound notification channel, which
@@ -2243,18 +2303,18 @@ mod inbound_notifications {
     /// MCP logging just to receive cancellation.
     #[tokio::test]
     async fn cancellation_works_without_server_notifications() {
-        let frames = cancel_a_running_call(|stdin, stdout| async move {
-            let mut transport =
-                StdioTransport::without_server_notifications(router_with_a_waiting_tool());
+        let observed = Arc::new(AtomicBool::new(false));
+        let router = router_with_an_observed_waiting_tool(observed.clone());
+        let frames = cancel_a_running_call(&observed, |stdin, stdout| async move {
+            let mut transport = StdioTransport::without_server_notifications(router);
             let _ = transport.run_with_streams(stdin, stdout).await;
         })
         .await;
 
-        let answer = frames
-            .iter()
-            .find(|f| f["id"] == 2)
-            .unwrap_or_else(|| panic!("no answer for the cancelled call: {frames:?}"));
-        assert_eq!(answer["result"]["content"][0]["text"], "cancelled");
+        assert!(
+            frames.iter().all(|f| f["id"] != 2),
+            "the cancelled call must not be answered: {frames:?}"
+        );
     }
 
     /// Capability advertisement must reflect what the server actually offers,

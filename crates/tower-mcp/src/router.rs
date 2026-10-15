@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 
@@ -1311,7 +1311,12 @@ impl McpRouter {
             .get::<DispatchId>()
             .copied()
             .unwrap_or_else(|| self.next_dispatch());
-        self.register_in_flight(request_id, dispatch, ctx.cancellation_token());
+        self.register_in_flight(
+            request_id,
+            dispatch,
+            ctx.cancellation_token(),
+            per_request.get::<PeerCancelled>().cloned(),
+        );
 
         ctx
     }
@@ -1335,12 +1340,17 @@ impl McpRouter {
         request_id: RequestId,
         dispatch: DispatchId,
         token: CancellationToken,
+        peer_cancelled: Option<PeerCancelled>,
     ) {
         if let Ok(mut in_flight) = self.inner.in_flight.write() {
             in_flight
                 .entry(request_id)
                 .or_default()
-                .push(InFlightDispatch { dispatch, token });
+                .push(InFlightDispatch {
+                    dispatch,
+                    token,
+                    peer_cancelled,
+                });
         }
     }
 
@@ -1375,6 +1385,11 @@ impl McpRouter {
     /// Cancels every dispatch still running under `request_id`. The id is the
     /// only handle a client has, so a client that reused one in flight gets
     /// both stopped rather than an arbitrary one.
+    ///
+    /// A dispatch that carries a [`PeerCancelled`] is also marked, so the
+    /// transport can leave the request unanswered (#1547). Only a dispatch
+    /// found in flight is marked: a cancellation for an unknown or finished id
+    /// changes nothing.
     fn cancel_request(&self, request_id: &RequestId) -> bool {
         let Ok(in_flight) = self.inner.in_flight.read() else {
             return false;
@@ -1384,6 +1399,9 @@ impl McpRouter {
         };
         for entry in entries {
             entry.token.cancel();
+            if let Some(peer_cancelled) = &entry.peer_cancelled {
+                peer_cancelled.mark();
+            }
         }
         !entries.is_empty()
     }
@@ -3626,10 +3644,33 @@ impl RouterResponse {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DispatchId(u64);
 
+/// Records that the peer cancelled a request that was still in flight.
+///
+/// MCP asks a receiver not to answer a request the sender has cancelled.
+/// [`JsonRpcService`](crate::JsonRpcService) puts one in the request
+/// extensions for each request it dispatches on behalf of a transport that
+/// can leave a request unanswered, `McpRouter::cancel_request` sets it when
+/// `notifications/cancelled` finds the request in flight, and the service
+/// reads it once the response is produced. The flag lives only as long as the
+/// request future and its registry entry, so there is nothing to clear.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PeerCancelled(Arc<AtomicBool>);
+
+impl PeerCancelled {
+    pub(crate) fn mark(&self) {
+        self.0.store(true, AtomicOrdering::Release);
+    }
+
+    pub(crate) fn is_marked(&self) -> bool {
+        self.0.load(AtomicOrdering::Acquire)
+    }
+}
+
 /// One tracked dispatch in the router's in-flight registry.
 struct InFlightDispatch {
     dispatch: DispatchId,
     token: CancellationToken,
+    peer_cancelled: Option<PeerCancelled>,
 }
 
 /// Untracks a single dispatch when the request future ends, however it ends.
