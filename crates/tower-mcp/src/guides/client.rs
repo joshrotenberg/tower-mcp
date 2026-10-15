@@ -295,6 +295,15 @@ answered; the HTTP transport stays usable for the next one. Read the status and
 any `Retry-After` header from the error with `HttpStatusDetails::from_error`
 to decide whether and when to retry. Only a 404 or 410 closes the transport.
 
+A 401, 403 or 429 whose body is a JSON-RPC error reaches the caller as the
+server's own error, with the status added to its `data`, so
+`HttpStatusDetails::from_error` tells an authorization failure from an
+ordinary in-band error with the same code. Its `www_authenticate` field holds
+the `WWW-Authenticate` challenge when the server sent one. Server-provided
+`data` is kept: an object gains `httpStatus` (and `retryAfter`,
+`wwwAuthenticate`) where those keys are absent, and any other value moves
+under `serverData`.
+
 Use `is_connected` for a cheap transport-state check, but treat the result as
 a snapshot. The next operation is the authoritative health signal.
 

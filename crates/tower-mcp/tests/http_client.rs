@@ -4855,3 +4855,118 @@ async fn session_404_still_closes_the_transport() {
     .await
     .expect("a 404 must keep closing the transport");
 }
+
+// ---------------------------------------------------------------------------
+// A 401, 403 or 429 with a JSON-RPC error body keeps its HTTP status (#1555)
+// ---------------------------------------------------------------------------
+
+fn jsonrpc_error_body(data: Option<&str>) -> String {
+    let data = data.map_or(String::new(), |data| format!(r#","data":{data}"#));
+    format!(
+        r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-32001,"message":"denied by policy"{data}}}}}"#
+    )
+}
+
+/// Leak a test-built body to the `'static` the flaky-server helper takes.
+fn leak(body: String) -> &'static str {
+    Box::leak(body.into_boxed_str())
+}
+
+fn rpc_error(error: &tower_mcp::Error) -> &JsonRpcError {
+    match error {
+        tower_mcp::Error::JsonRpc(rpc) => rpc,
+        other => panic!("expected a JSON-RPC error, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn forbidden_jsonrpc_error_body_exposes_status_and_keeps_server_data() {
+    let body = leak(jsonrpc_error_body(Some(r#"{"reason":"missing scope"}"#)));
+    let (error, client) = flaky_list_outcome("403 Forbidden", RAW_JSON, body).await;
+
+    let details = HttpStatusDetails::from_error(&error)
+        .unwrap_or_else(|| panic!("the error should carry the HTTP status, got: {error:?}"));
+    assert_eq!(details.status, 403);
+    assert_eq!(details.www_authenticate, None);
+
+    // The server's own error is what the caller sees, with its data intact.
+    let rpc = rpc_error(&error);
+    assert_eq!(rpc.code, -32001);
+    assert_eq!(rpc.message, "denied by policy");
+    let data = rpc.data.as_ref().unwrap();
+    assert_eq!(data["reason"], "missing scope");
+    assert_eq!(data["httpStatus"], 403);
+
+    tokio::time::timeout(Duration::from_secs(3), client.list_tools())
+        .await
+        .expect("list_tools after the 403 hung")
+        .expect("the same client must serve the next request");
+}
+
+#[tokio::test]
+async fn unauthorized_jsonrpc_error_body_exposes_the_challenge() {
+    let challenge = r#"Bearer error="invalid_token", resource_metadata="https://example.test/.well-known/oauth-protected-resource""#;
+    let headers = leak(format!(
+        "{RAW_JSON}WWW-Authenticate: {challenge}
+Retry-After: 3
+"
+    ));
+    let (error, _client) =
+        flaky_list_outcome("401 Unauthorized", headers, leak(jsonrpc_error_body(None))).await;
+
+    let details = HttpStatusDetails::from_error(&error).expect("status details");
+    assert_eq!(details.status, 401);
+    assert_eq!(details.www_authenticate.as_deref(), Some(challenge));
+    assert_eq!(details.retry_after.as_deref(), Some("3"));
+    assert_eq!(rpc_error(&error).code, -32001);
+    assert_eq!(rpc_error(&error).message, "denied by policy");
+}
+
+#[tokio::test]
+async fn unauthorized_without_a_jsonrpc_body_exposes_the_challenge() {
+    let (error, _client) = flaky_list_outcome(
+        "401 Unauthorized",
+        "Content-Type: text/plain\r\nWWW-Authenticate: Bearer realm=\"mcp\"\r\n",
+        "unauthorized",
+    )
+    .await;
+
+    let details = HttpStatusDetails::from_error(&error).expect("status details");
+    assert_eq!(details.status, 401);
+    assert_eq!(
+        details.www_authenticate.as_deref(),
+        Some(r#"Bearer realm="mcp""#)
+    );
+}
+
+#[tokio::test]
+async fn server_status_keys_in_error_data_are_not_overwritten() {
+    let body = leak(jsonrpc_error_body(Some(r#"{"httpStatus":"upstream"}"#)));
+    let (error, _client) = flaky_list_outcome("403 Forbidden", RAW_JSON, body).await;
+
+    let data = rpc_error(&error).data.as_ref().unwrap();
+    assert_eq!(data["httpStatus"], "upstream");
+}
+
+#[tokio::test]
+async fn non_object_error_data_moves_under_server_data() {
+    let body = leak(jsonrpc_error_body(Some(r#""policy 7""#)));
+    let (error, _client) = flaky_list_outcome("403 Forbidden", RAW_JSON, body).await;
+
+    let details = HttpStatusDetails::from_error(&error).expect("status details");
+    assert_eq!(details.status, 403);
+    let data = rpc_error(&error).data.as_ref().unwrap();
+    assert_eq!(data["serverData"], "policy 7");
+}
+
+/// Statuses that are not about authorization or rate limits leave the
+/// server's error exactly as sent.
+#[tokio::test]
+async fn in_band_error_on_a_400_gets_no_status_added() {
+    let body = leak(jsonrpc_error_body(None));
+    let (error, _client) = flaky_list_outcome("400 Bad Request", RAW_JSON, body).await;
+
+    assert_eq!(rpc_error(&error).code, -32001);
+    assert_eq!(rpc_error(&error).data, None);
+    assert_eq!(HttpStatusDetails::from_error(&error), None);
+}
