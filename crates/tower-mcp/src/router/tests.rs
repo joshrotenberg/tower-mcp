@@ -1401,8 +1401,8 @@ async fn test_batch_errors_returned_not_dropped() {
     match &responses[1] {
         JsonRpcResponse::Error(e) => {
             assert_eq!(e.id, Some(RequestId::Number(2)));
-            // Error should indicate method not found
-            assert!(e.error.message.contains("not found") || e.error.code == -32601);
+            // Unknown tool is invalid params
+            assert!(e.error.message.contains("not found") || e.error.code == -32602);
         }
         JsonRpcResponse::Result(_) => panic!("Expected error for second request"),
         _ => panic!("unexpected response variant"),
@@ -1790,7 +1790,7 @@ mod resource_template_filtering_tests {
         let denied = read_template(&mut router, 2, "docs://protected/42")
             .await
             .expect_err("a hidden template must not be readable");
-        assert_eq!(denied.code, -32601);
+        assert_eq!(denied.code, -32602);
         assert_eq!(protected_calls.load(Ordering::SeqCst), 0);
 
         let allowed = read_template(&mut router, 3, "docs://public/42")
@@ -1903,7 +1903,7 @@ mod resource_template_filtering_tests {
             )
             .await
             .expect_err("the denied request must not read the template");
-        assert!(matches!(denied, Error::JsonRpc(error) if error.code == -32601));
+        assert!(matches!(denied, Error::JsonRpc(error) if error.code == -32602));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         let McpResponse::ReadResource(allowed_read) = router
@@ -2119,7 +2119,7 @@ mod resource_template_filtering_tests {
         let denied = read_template(&mut router, 2, "overlap://42")
             .await
             .expect_err("denial of the first route candidate must be final");
-        assert_eq!(denied.code, -32601);
+        assert_eq!(denied.code, -32602);
         assert_eq!(first_calls.load(Ordering::SeqCst), 0);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
     }
@@ -2184,7 +2184,7 @@ mod resource_template_filtering_tests {
             )
             .await
             .expect_err("the denied request must not invoke the dynamic handler");
-        assert!(matches!(denied, Error::JsonRpc(error) if error.code == -32601));
+        assert!(matches!(denied, Error::JsonRpc(error) if error.code == -32602));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         let McpResponse::ReadResource(allowed_read) = router
@@ -2245,7 +2245,7 @@ mod resource_template_filtering_tests {
         let denied = read_template(&mut router, 2, "shadow://42")
             .await
             .expect_err("denying the first match must not fall through to a shadowed template");
-        assert_eq!(denied.code, -32601);
+        assert_eq!(denied.code, -32602);
         assert_eq!(static_calls.load(Ordering::SeqCst), 0);
         assert_eq!(dynamic_calls.load(Ordering::SeqCst), 0);
     }
@@ -5935,10 +5935,10 @@ async fn test_tool_filter_call_denied() {
 
     let resp = router.ready().await.unwrap().call(req).await.unwrap();
 
-    // Should get method not found error (default denial behavior)
+    // Should get a not-found invalid params error (default denial behavior)
     match resp.inner {
         Err(e) => {
-            assert_eq!(e.code, -32601); // Method not found
+            assert_eq!(e.code, -32602); // Invalid params (not found)
         }
         _ => panic!("Expected JsonRpc error"),
     }
@@ -6098,10 +6098,10 @@ async fn test_resource_filter_read_denied() {
 
     let resp = router.ready().await.unwrap().call(req).await.unwrap();
 
-    // Should get method not found error (default denial behavior)
+    // Should get a not-found invalid params error (default denial behavior)
     match resp.inner {
         Err(e) => {
-            assert_eq!(e.code, -32601); // Method not found
+            assert_eq!(e.code, -32602); // Invalid params (not found)
         }
         _ => panic!("Expected JsonRpc error"),
     }
@@ -6257,10 +6257,10 @@ async fn test_prompt_filter_get_denied() {
 
     let resp = router.ready().await.unwrap().call(req).await.unwrap();
 
-    // Should get method not found error (default denial behavior)
+    // Should get a not-found invalid params error (default denial behavior)
     match resp.inner {
         Err(e) => {
-            assert_eq!(e.code, -32601); // Method not found
+            assert_eq!(e.code, -32602); // Invalid params (not found)
         }
         _ => panic!("Expected JsonRpc error"),
     }
@@ -7882,7 +7882,7 @@ mod dynamic_tools_tests {
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
         match resp.inner {
             Err(e) => {
-                assert_eq!(e.code, -32601); // Method not found
+                assert_eq!(e.code, -32602); // Invalid params (not found)
             }
             _ => panic!("Expected JsonRpc error"),
         }
@@ -7971,9 +7971,9 @@ mod dynamic_tools_tests {
         let resp = router.ready().await.unwrap().call(req).await.unwrap();
         match resp.inner {
             Err(e) => {
-                assert_eq!(e.code, -32601);
+                assert_eq!(e.code, -32602);
             }
-            _ => panic!("Expected method not found error"),
+            _ => panic!("Expected invalid params error"),
         }
     }
 
@@ -8181,7 +8181,7 @@ async fn test_disable_tool_blocks_call() {
     };
     let resp = router.ready().await.unwrap().call(req).await.unwrap();
     let err = resp.inner.expect_err("disabled tool should error");
-    assert_eq!(err.code, crate::error::ErrorCode::MethodNotFound as i32);
+    assert_eq!(err.code, crate::error::ErrorCode::InvalidParams as i32);
 }
 
 #[tokio::test]
@@ -8320,7 +8320,7 @@ async fn test_disable_resource_and_prompt() {
     };
     let resp = router.ready().await.unwrap().call(req).await.unwrap();
     let err = resp.inner.expect_err("disabled prompt should error");
-    assert_eq!(err.code, crate::error::ErrorCode::MethodNotFound as i32);
+    assert_eq!(err.code, crate::error::ErrorCode::InvalidParams as i32);
 }
 
 #[test]

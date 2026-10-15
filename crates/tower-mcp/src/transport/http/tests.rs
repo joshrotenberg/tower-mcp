@@ -4834,6 +4834,129 @@ async fn stateless_v2026_unknown_method_is_http_404() {
     assert_eq!(json["error"]["code"], ErrorCode::MethodNotFound.code());
 }
 
+/// POST one 2026-07-28 request with valid `_meta` and the SEP-2243 headers,
+/// returning the HTTP status and JSON body.
+#[cfg(feature = "stateless")]
+async fn post_modern_request(
+    app: axum::Router,
+    method: &str,
+    name: Option<&str>,
+    mut params: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    params["_meta"] = serde_json::json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {}
+    });
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header(MCP_METHOD_HEADER, method)
+        .header(MCP_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION_2026_07_28);
+    if let Some(name) = name {
+        builder = builder.header(MCP_NAME_HEADER, name);
+    }
+    let request = builder
+        .body(Body::from(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": method,
+                "params": params
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+#[cfg(feature = "stateless")]
+fn modern_not_found_app() -> axum::Router {
+    let router = McpRouter::new().server_info("test-server", "1.0.0").prompt(
+        crate::prompt::PromptBuilder::new("greet")
+            .required_arg("name", "Name to greet")
+            .user_message("hi"),
+    );
+    HttpTransport::new(router)
+        .disable_origin_validation()
+        .disable_host_validation()
+        .into_router()
+}
+
+/// #1554: an application "not found" the spec defines as -32602 must not be
+/// an HTTP 400, which a 2026-07-28 client reads as a legacy server and
+/// answers by falling back to `initialize`.
+#[tokio::test]
+#[cfg(feature = "stateless")]
+async fn stateless_v2026_unknown_resource_is_in_band_invalid_params() {
+    let (status, json) = post_modern_request(
+        modern_not_found_app(),
+        "resources/read",
+        Some("file:///nope.txt"),
+        serde_json::json!({ "uri": "file:///nope.txt" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["id"], 7);
+    assert_eq!(json["error"]["code"], ErrorCode::InvalidParams.code());
+}
+
+#[tokio::test]
+#[cfg(feature = "stateless")]
+async fn stateless_v2026_unknown_prompt_is_in_band_invalid_params() {
+    let (status, json) = post_modern_request(
+        modern_not_found_app(),
+        "prompts/get",
+        Some("nope"),
+        serde_json::json!({ "name": "nope" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["error"]["code"], ErrorCode::InvalidParams.code());
+}
+
+#[tokio::test]
+#[cfg(feature = "stateless")]
+async fn stateless_v2026_missing_prompt_argument_is_in_band_invalid_params() {
+    let (status, json) = post_modern_request(
+        modern_not_found_app(),
+        "prompts/get",
+        Some("greet"),
+        serde_json::json!({ "name": "greet", "arguments": {} }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["error"]["code"], ErrorCode::InvalidParams.code());
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing required argument")
+    );
+}
+
+/// An unknown tool is -32602 per `server/tools`, not -32601, which the
+/// 2026-07-28 HTTP path would turn into the unimplemented-method 404.
+#[tokio::test]
+#[cfg(feature = "stateless")]
+async fn stateless_v2026_unknown_tool_is_in_band_invalid_params() {
+    let (status, json) = post_modern_request(
+        modern_not_found_app(),
+        "tools/call",
+        Some("nope"),
+        serde_json::json!({ "name": "nope", "arguments": {} }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["error"]["code"], ErrorCode::InvalidParams.code());
+}
+
 #[tokio::test]
 #[cfg(feature = "stateless")]
 async fn stateless_v2026_ignores_legacy_session_and_resumption_headers() {
@@ -5487,10 +5610,12 @@ async fn stateless_v2026_layer_unsupported_protocol_version_is_http_400() {
     );
 }
 
-/// Same as above, for `InvalidParams` (-32602).
+/// Unlike the two above, a handler-raised `InvalidParams` (-32602) stays
+/// in-band: an unrecognized 400 tells a client to fall back to `initialize`
+/// (#1554).
 #[tokio::test]
 #[cfg(feature = "stateless")]
-async fn stateless_v2026_layer_invalid_params_is_http_400() {
+async fn stateless_v2026_layer_invalid_params_is_http_200() {
     let transport = HttpTransport::new(create_test_router())
         .disable_origin_validation()
         .disable_host_validation()
@@ -5521,7 +5646,7 @@ async fn stateless_v2026_layer_invalid_params_is_http_400() {
         ))
         .unwrap();
     let response = app.oneshot(req).await.unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();

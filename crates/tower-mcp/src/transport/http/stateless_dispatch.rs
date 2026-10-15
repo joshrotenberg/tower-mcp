@@ -419,12 +419,17 @@ impl Drop for ModernSubscriptionGuard {
 /// non-success status. Errors emitted after an SSE stream has opened remain
 /// in-band because the HTTP status is already committed.
 ///
-/// This mirrors the status codes the transport itself already assigns when
-/// it detects the same errors ahead of dispatch (`handlers.rs`), so a
-/// handler or middleware layer raising one of these codes gets the same HTTP
-/// status as a transport-level rejection: `HeaderMismatch` (-32020),
-/// `UnsupportedProtocolVersion` (-32022), and `InvalidParams` (-32602) all
-/// map to 400; `MethodNotFound` maps to 404.
+/// `HeaderMismatch` (-32020), `UnsupportedProtocolVersion` (-32022) and
+/// `MissingRequiredClientCapability` map to 400, as do the transport's own
+/// pre-dispatch rejections (`handlers.rs`), which assign their status
+/// explicitly. `MethodNotFound` maps to 404.
+///
+/// A handler-generated `InvalidParams` (-32602) is deliberately NOT mapped to
+/// 400: ordinary application errors the spec defines as -32602 (unknown
+/// resource, prompt or tool, a missing prompt argument) stay in-band at 200.
+/// The backward-compatibility rules tell a client to fall back to
+/// `initialize` on an unrecognized 400, so a 400 here would make a "not
+/// found" answer look like a legacy server (#1554).
 pub(super) fn modern_response_status(response: &JsonRpcResponse) -> StatusCode {
     let JsonRpcResponse::Error(error) = response else {
         return StatusCode::OK;
@@ -434,7 +439,6 @@ pub(super) fn modern_response_status(response: &JsonRpcResponse) -> StatusCode {
     } else if error.error.code == McpErrorCode::MissingRequiredClientCapability.code()
         || error.error.code == McpErrorCode::HeaderMismatch.code()
         || error.error.code == McpErrorCode::UnsupportedProtocolVersion.code()
-        || error.error.code == ErrorCode::InvalidParams as i32
     {
         StatusCode::BAD_REQUEST
     } else {
