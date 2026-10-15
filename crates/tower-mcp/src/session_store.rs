@@ -63,7 +63,9 @@ pub struct SessionRecord {
     pub created_at: SystemTime,
     /// When this session was last accessed.
     pub last_accessed: SystemTime,
-    /// When this session expires. Implementations may remove expired records.
+    /// When this session expires. Once this time has passed,
+    /// [`SessionStore::load`] must not return the record; implementations may
+    /// also delete it.
     pub expires_at: SystemTime,
     /// The principal the session is bound to, as resolved when it was created
     /// (see `HttpTransport::session_principal_resolver`).
@@ -151,9 +153,12 @@ pub type Result<T> = std::result::Result<T, SessionStoreError>;
 ///   The principal in particular is compared by equality to decide who may use
 ///   the session, so `None` and `Some("")` are different values. Timestamps are
 ///   kept to whatever precision the backend has.
-/// - [`load`](Self::load) returns `None` for unknown or expired sessions.
-///   Implementations may choose to return expired records and let the caller
-///   decide, or filter them out.
+/// - [`load`](Self::load) returns `None` for unknown or expired sessions. An
+///   expired record is one whose [`expires_at`](SessionRecord::expires_at) has
+///   passed. The HTTP transport restores whatever `load` returns without
+///   checking expiry itself, so returning an expired record revives a session
+///   that should be gone. Whether the record is also deleted is up to the
+///   implementation.
 /// - [`delete`](Self::delete) is idempotent -- removing a non-existent ID is
 ///   not an error. It removes only the named record.
 ///
@@ -161,8 +166,7 @@ pub type Result<T> = std::result::Result<T, SessionStoreError>;
 ///
 /// The `testing` feature ships a contract suite for this trait:
 /// `tower_mcp::testing::store_contracts::session_store_contract` takes a
-/// constructor that returns an empty store and checks the rules above. It does
-/// not check expiry, which the rules above leave to the implementation.
+/// constructor that returns an empty store and checks the rules above.
 ///
 /// ```rust,ignore
 /// #[tokio::test]
@@ -181,7 +185,8 @@ pub trait SessionStore: Send + Sync + 'static {
     /// Persist an existing session record. The ID is trusted.
     async fn save(&self, record: &SessionRecord) -> Result<()>;
 
-    /// Load a session record by ID. Returns `None` if unknown or expired.
+    /// Load a session record by ID. Returns `None` if unknown or expired; an
+    /// expired record must never be returned.
     async fn load(&self, id: &str) -> Result<Option<SessionRecord>>;
 
     /// Remove a session record. Idempotent.
