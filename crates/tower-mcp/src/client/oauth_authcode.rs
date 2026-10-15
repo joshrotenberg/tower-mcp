@@ -846,6 +846,80 @@ impl OAuthClientRegistrationOptions {
 struct DynamicClientRegistrationResponse {
     client_id: String,
     client_secret: Option<String>,
+    token_endpoint_auth_method: Option<String>,
+}
+
+/// The registration auth method this client prefers among those the
+/// authorization server advertises. Falls back to `none` when nothing else
+/// matches; callers must check that `none` is actually advertised.
+pub(crate) fn preferred_registration_auth_method(
+    advertised: &[String],
+    has_private_key_signer: bool,
+) -> &'static str {
+    if has_private_key_signer && advertised.iter().any(|method| method == "private_key_jwt") {
+        "private_key_jwt"
+    } else if advertised
+        .iter()
+        .any(|method| method == "client_secret_basic")
+    {
+        "client_secret_basic"
+    } else if advertised
+        .iter()
+        .any(|method| method == "client_secret_post")
+    {
+        "client_secret_post"
+    } else {
+        "none"
+    }
+}
+
+/// Check the caller's requested registration method against the methods the
+/// authorization server advertises (RFC 8414 `token_endpoint_auth_methods_supported`).
+///
+/// An unadvertised method would register a client the server cannot
+/// authenticate. When the requested method is not advertised, fall back to
+/// the same preference order as [`OAuthAuthorizationFlow`](super::OAuthAuthorizationFlow),
+/// and fail if the server advertises nothing this client can use. When the
+/// server advertises no methods, the requested method is kept.
+fn negotiate_registration_auth_method(
+    requested: &str,
+    advertised: &[String],
+) -> Result<String, OAuthClientError> {
+    if advertised.is_empty() || advertised.iter().any(|method| method == requested) {
+        return Ok(requested.to_string());
+    }
+    let preferred = preferred_registration_auth_method(advertised, false);
+    if advertised.iter().any(|method| method == preferred) {
+        tracing::debug!(
+            requested,
+            selected = preferred,
+            "requested token endpoint auth method is not advertised; using the advertised one"
+        );
+        return Ok(preferred.to_string());
+    }
+    Err(OAuthClientError::Registration(format!(
+        "authorization server advertises no token endpoint authentication method this client \
+         can register with (requested `{requested}`, advertised: {})",
+        advertised.join(", ")
+    )))
+}
+
+/// A confidential registration (`client_secret_basic` or `client_secret_post`)
+/// must come back with a non-empty secret. Without one, the token endpoint
+/// rejects every request later, so fail at registration instead of quietly
+/// treating the client as public.
+pub(crate) fn require_secret_for_confidential_registration(
+    method: &str,
+    client_secret: Option<&str>,
+) -> Result<(), OAuthClientError> {
+    if matches!(method, "client_secret_basic" | "client_secret_post")
+        && client_secret.is_none_or(str::is_empty)
+    {
+        return Err(OAuthClientError::Registration(format!(
+            "dynamic client registration used `{method}` but returned no client_secret"
+        )));
+    }
+    Ok(())
 }
 
 /// Select and, when necessary, perform OAuth client registration.
@@ -854,6 +928,14 @@ struct DynamicClientRegistrationResponse {
 /// exactly matches `metadata.issuer`. CIMD URLs must use HTTPS and contain a
 /// non-root path. If no configured mechanism is supported, the returned error
 /// tells the caller to prompt the user for client information.
+///
+/// On the Dynamic Client Registration path, the requested
+/// `token_endpoint_auth_method` is checked against the server's
+/// `token_endpoint_auth_methods_supported`. A method the server does not
+/// advertise is replaced by the first advertised one in the order
+/// `client_secret_basic`, `client_secret_post`, `none`, and registration fails
+/// if none of those is advertised. A confidential registration that returns no
+/// `client_secret` is an error.
 pub async fn resolve_oauth_client_registration(
     client: &reqwest::Client,
     metadata: &OAuthAuthorizationServerMetadata,
@@ -936,9 +1018,15 @@ async fn resolve_oauth_client_registration_inner(
             ));
         }
 
+        let mut request = request.clone();
+        request.token_endpoint_auth_method = negotiate_registration_auth_method(
+            &request.token_endpoint_auth_method,
+            &metadata.token_endpoint_auth_methods_supported,
+        )?;
+
         let response = client
             .post(endpoint)
-            .json(request)
+            .json(&request)
             .send()
             .await
             .map_err(|error| OAuthClientError::Registration(error.to_string()))?;
@@ -959,6 +1047,13 @@ async fn resolve_oauth_client_registration_inner(
             .json()
             .await
             .map_err(|error| OAuthClientError::Registration(error.to_string()))?;
+        require_secret_for_confidential_registration(
+            response
+                .token_endpoint_auth_method
+                .as_deref()
+                .unwrap_or(&request.token_endpoint_auth_method),
+            response.client_secret.as_deref(),
+        )?;
         let registration = OAuthClientRegistration::dynamically_registered(
             metadata.issuer.clone(),
             response.client_id,
@@ -2951,10 +3046,10 @@ mod tests {
         );
     }
 
-    /// A local token endpoint that answers each request with the next entry
-    /// of `responses` (the last entry repeats) and records every request
+    /// A local JSON endpoint (token or registration) that answers each
+    /// request with the next entry of `responses` (the last entry repeats) and records every request
     /// body. Returns the base URL and the recorded bodies.
-    async fn spawn_recording_token_server(
+    async fn spawn_recording_json_server(
         responses: Vec<serde_json::Value>,
     ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3019,7 +3114,7 @@ mod tests {
     /// server granted, not the ones the client originally asked for.
     #[tokio::test]
     async fn refresh_sends_granted_scope_not_requested_scope() {
-        let (base, bodies) = spawn_recording_token_server(vec![serde_json::json!({
+        let (base, bodies) = spawn_recording_json_server(vec![serde_json::json!({
             "access_token": "refreshed-access-token",
             "token_type": "Bearer",
             "expires_in": 3600
@@ -3058,7 +3153,7 @@ mod tests {
     /// A scope returned on refresh replaces the recorded grant.
     #[tokio::test]
     async fn refresh_response_scope_updates_the_granted_scope() {
-        let (base, bodies) = spawn_recording_token_server(vec![
+        let (base, bodies) = spawn_recording_json_server(vec![
             serde_json::json!({
                 "access_token": "first",
                 "token_type": "Bearer",
@@ -3098,7 +3193,7 @@ mod tests {
     /// when the response omits it (RFC 6749 section 5.1).
     #[tokio::test]
     async fn code_exchange_records_granted_scope_or_falls_back_to_requested() {
-        let (base, _bodies) = spawn_recording_token_server(vec![
+        let (base, _bodies) = spawn_recording_json_server(vec![
             serde_json::json!({
                 "access_token": "a",
                 "token_type": "Bearer",
@@ -3127,6 +3222,138 @@ mod tests {
         assert_eq!(granted.scope.as_deref(), Some("read write"));
         let omitted = provider.exchange_code("code").await.unwrap();
         assert_eq!(omitted.scope.as_deref(), Some("read write admin"));
+    }
+
+    fn dynamic_registration_options(method: &str) -> OAuthClientRegistrationOptions {
+        OAuthClientRegistrationOptions::new().with_dynamic_registration(
+            OAuthDynamicClientRegistration::native("test-client", ["http://127.0.0.1/callback"])
+                .token_endpoint_auth_method(method),
+        )
+    }
+
+    /// Register against a recording endpoint that advertises `advertised`
+    /// methods, and return the registration result with the method that was
+    /// actually sent (`None` when no request reached the endpoint).
+    async fn register_with_advertised_methods(
+        requested: &str,
+        advertised: &[&str],
+        response: serde_json::Value,
+    ) -> (
+        Result<OAuthClientRegistration, OAuthClientError>,
+        Option<String>,
+    ) {
+        let (base, bodies) = spawn_recording_json_server(vec![response]).await;
+        let mut metadata = authorization_server_metadata("https://auth.example.com");
+        metadata.registration_endpoint = Some(format!("{base}/register"));
+        metadata.token_endpoint_auth_methods_supported =
+            advertised.iter().map(|method| method.to_string()).collect();
+
+        let result = resolve_oauth_client_registration(
+            &reqwest::Client::new(),
+            &metadata,
+            &dynamic_registration_options(requested),
+        )
+        .await;
+        let sent = bodies.lock().unwrap().first().map(|body| {
+            serde_json::from_str::<serde_json::Value>(body).unwrap()["token_endpoint_auth_method"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        });
+        (result, sent)
+    }
+
+    /// #1558 (rmcp #1355): the default `none` is not sent to an AS that only
+    /// advertises `client_secret_basic`.
+    #[tokio::test]
+    async fn dcr_replaces_an_unadvertised_method_with_an_advertised_one() {
+        let (result, sent) = register_with_advertised_methods(
+            "none",
+            &["client_secret_basic"],
+            serde_json::json!({ "client_id": "c", "client_secret": "s" }),
+        )
+        .await;
+        assert_eq!(sent.as_deref(), Some("client_secret_basic"));
+        assert_eq!(result.unwrap().client_secret(), Some("s"));
+
+        let (result, sent) = register_with_advertised_methods(
+            "client_secret_basic",
+            &["none"],
+            serde_json::json!({ "client_id": "c" }),
+        )
+        .await;
+        assert_eq!(sent.as_deref(), Some("none"));
+        assert_eq!(result.unwrap().client_secret(), None);
+    }
+
+    #[tokio::test]
+    async fn dcr_keeps_an_advertised_method_and_one_when_nothing_is_advertised() {
+        let (result, sent) = register_with_advertised_methods(
+            "client_secret_post",
+            &["client_secret_basic", "client_secret_post", "none"],
+            serde_json::json!({ "client_id": "c", "client_secret": "s" }),
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(sent.as_deref(), Some("client_secret_post"));
+
+        let (result, sent) =
+            register_with_advertised_methods("none", &[], serde_json::json!({ "client_id": "c" }))
+                .await;
+        result.unwrap();
+        assert_eq!(sent.as_deref(), Some("none"));
+    }
+
+    #[tokio::test]
+    async fn dcr_fails_before_registering_when_no_advertised_method_is_usable() {
+        let (result, sent) = register_with_advertised_methods(
+            "none",
+            &["tls_client_auth"],
+            serde_json::json!({ "client_id": "c" }),
+        )
+        .await;
+        let error = result.unwrap_err();
+        assert!(
+            matches!(&error, OAuthClientError::Registration(message)
+                if message.contains("tls_client_auth")),
+            "unexpected error: {error}"
+        );
+        assert_eq!(sent, None, "no registration request should be sent");
+    }
+
+    /// #1558 (rmcp #1355): a confidential registration with no secret in the
+    /// response is an error rather than a silent fall back to `none`.
+    #[tokio::test]
+    async fn confidential_dcr_without_a_secret_is_rejected() {
+        for secret in [None, Some("")] {
+            let mut response = serde_json::json!({ "client_id": "c" });
+            if let Some(secret) = secret {
+                response["client_secret"] = secret.into();
+            }
+            let (result, sent) =
+                register_with_advertised_methods("client_secret_basic", &[], response).await;
+            assert_eq!(sent.as_deref(), Some("client_secret_basic"));
+            let error = result.unwrap_err();
+            assert!(
+                matches!(&error, OAuthClientError::Registration(message)
+                    if message.contains("client_secret_basic")),
+                "unexpected error for {secret:?}: {error}"
+            );
+        }
+    }
+
+    /// RFC 7591 section 3.2.1: the response reports the registered method.
+    /// An AS that downgrades a confidential request to `none` returns no
+    /// secret, and that is not an error.
+    #[tokio::test]
+    async fn dcr_response_method_decides_whether_a_secret_is_required() {
+        let (result, _) = register_with_advertised_methods(
+            "client_secret_basic",
+            &[],
+            serde_json::json!({ "client_id": "c", "token_endpoint_auth_method": "none" }),
+        )
+        .await;
+        assert_eq!(result.unwrap().client_secret(), None);
     }
 
     // =========================================================================

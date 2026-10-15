@@ -20,7 +20,9 @@ use super::oauth::{
 use super::oauth_authcode::{
     OAuthAuthorizationServerMetadata, OAuthClientRegistration, OAuthClientRegistrationMethod,
     OAuthClientRegistrationOptions, OAuthClientRegistrationStore, OAuthProtectedResourceMetadata,
-    discovery_reason, validate_resource_identifier, validate_resource_override,
+    discovery_reason, preferred_registration_auth_method,
+    require_secret_for_confidential_registration, validate_resource_identifier,
+    validate_resource_override,
 };
 
 /// HTTP method used by an OAuth protocol request.
@@ -1639,27 +1641,6 @@ fn select_scopes(
     selected
 }
 
-fn preferred_registration_auth_method(
-    advertised: &[String],
-    has_private_key_signer: bool,
-) -> &'static str {
-    if has_private_key_signer && advertised.iter().any(|method| method == "private_key_jwt") {
-        "private_key_jwt"
-    } else if advertised
-        .iter()
-        .any(|method| method == "client_secret_basic")
-    {
-        "client_secret_basic"
-    } else if advertised
-        .iter()
-        .any(|method| method == "client_secret_post")
-    {
-        "client_secret_post"
-    } else {
-        "none"
-    }
-}
-
 async fn resolve_registration_with_http(
     http: &dyn OAuthHttpClient,
     metadata: &OAuthAuthorizationServerMetadata,
@@ -1730,8 +1711,18 @@ async fn resolve_registration_with_http(
         struct RegistrationResponse {
             client_id: String,
             client_secret: Option<String>,
+            token_endpoint_auth_method: Option<String>,
         }
         let registered: RegistrationResponse = response.json()?;
+        // RFC 7591 section 3.2.1: the response reports the registered
+        // method, which can differ from the requested one.
+        require_secret_for_confidential_registration(
+            registered
+                .token_endpoint_auth_method
+                .as_deref()
+                .unwrap_or(&request.token_endpoint_auth_method),
+            registered.client_secret.as_deref(),
+        )?;
         let registration = OAuthClientRegistration::dynamically_registered(
             metadata.issuer.clone(),
             registered.client_id,
@@ -2116,6 +2107,9 @@ mod tests {
         PreRegistered,
         Cimd,
         Dynamic,
+        /// DCR against an AS that only advertises `client_secret_basic`, whose
+        /// registration endpoint returns no `client_secret`.
+        DynamicConfidentialWithoutSecret,
         PrivateKeyJwt,
     }
 
@@ -2233,6 +2227,9 @@ mod tests {
                         RegistrationMode::PreRegistered => (false, vec!["client_secret_basic"]),
                         RegistrationMode::Cimd => (true, vec!["none"]),
                         RegistrationMode::Dynamic => (false, vec!["none"]),
+                        RegistrationMode::DynamicConfidentialWithoutSecret => {
+                            (false, vec!["client_secret_basic"])
+                        }
                         RegistrationMode::PrivateKeyJwt => (false, vec!["private_key_jwt"]),
                     };
                     Ok(Self::response(
@@ -2767,6 +2764,44 @@ mod tests {
             panic!("expected registration JSON")
         };
         assert_eq!(value["redirect_uris"][0], "http://127.0.0.1:23456/callback");
+    }
+
+    /// #1558 (rmcp #1355): a confidential registration that comes back
+    /// without a secret fails at registration, not later at the token
+    /// endpoint after silently falling back to `none`.
+    #[tokio::test]
+    async fn confidential_dynamic_registration_without_secret_is_rejected() {
+        let http = MockOAuthHttp::new(RegistrationMode::DynamicConfidentialWithoutSecret);
+        let flow = flow_builder(
+            http.clone(),
+            dynamic_options(),
+            AutomaticAuthorizationHandler::default(),
+        )
+        .build()
+        .unwrap();
+
+        let error = flow.authorize(["challenge.scope"]).await.unwrap_err();
+
+        assert!(
+            matches!(&error, OAuthClientError::Registration(message)
+                if message.contains("client_secret_basic") && message.contains("client_secret")),
+            "unexpected error: {error}"
+        );
+        let requests = http.requests().await;
+        let registration_request = requests
+            .iter()
+            .find(|request| request.url.ends_with("/register"))
+            .unwrap();
+        let OAuthHttpBody::Json(value) = &registration_request.body else {
+            panic!("expected registration JSON")
+        };
+        assert_eq!(value["token_endpoint_auth_method"], "client_secret_basic");
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.url.ends_with("/token")),
+            "no token request should follow a failed registration"
+        );
     }
 
     #[tokio::test]
