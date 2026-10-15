@@ -1077,7 +1077,8 @@ impl ToolBuilder {
     ///
     /// MCP 2025-11-25 and earlier require `"type": "object"` at the root.
     /// MCP 2026-07-28 accepts any JSON Schema 2020-12. The builder does not
-    /// rewrite or reject the schema.
+    /// rewrite or reject the schema; `tools/list` omits a schema without
+    /// `"type": "object"` at the root from the entry sent to a 2025 peer.
     pub fn output_schema(mut self, schema: Value) -> Self {
         self.output_schema = Some(schema);
         self
@@ -1089,7 +1090,9 @@ impl ToolBuilder {
     /// and `$defs` handling match. It replaces any schema set earlier with
     /// [`output_schema`](Self::output_schema). MCP 2025-11-25 and earlier
     /// require `"type": "object"` at the root; MCP 2026-07-28 accepts any JSON
-    /// Schema 2020-12. The builder does not rewrite or reject the schema.
+    /// Schema 2020-12. The builder does not rewrite or reject the schema;
+    /// `tools/list` omits a schema without `"type": "object"` at the root from
+    /// the entry sent to a 2025 peer.
     ///
     /// The tool is not tied to `T`: the handler still builds its own
     /// [`CallToolResult`], for example with

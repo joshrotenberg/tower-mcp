@@ -815,6 +815,105 @@ async fn final_protocol_withholds_incomplete_tasks_advertisement() {
     assert!(result.tools[0].execution.is_none());
 }
 
+fn output_schema_tool(name: &str, schema: Option<serde_json::Value>) -> Tool {
+    let builder = ToolBuilder::new(name);
+    let builder = match schema {
+        Some(schema) => builder.output_schema(schema),
+        None => builder,
+    };
+    builder
+        .handler(|_args: serde_json::Value| async { Ok(CallToolResult::text("ok")) })
+        .build()
+}
+
+fn output_schema_router() -> McpRouter {
+    McpRouter::new()
+        .tool(output_schema_tool(
+            "array_out",
+            Some(serde_json::json!({"type": "array", "items": {"type": "number"}})),
+        ))
+        .tool(output_schema_tool(
+            "string_out",
+            Some(serde_json::json!({"type": "string"})),
+        ))
+        .tool(output_schema_tool(
+            "union_out",
+            Some(serde_json::json!({"anyOf": [{"type": "string"}, {"type": "object"}]})),
+        ))
+        .tool(output_schema_tool(
+            "object_out",
+            Some(serde_json::json!({"type": "object", "properties": {"n": {"type": "number"}}})),
+        ))
+        .tool(output_schema_tool("no_schema", None))
+}
+
+fn output_schema_of(tools: &[ToolDefinition], name: &str) -> Option<serde_json::Value> {
+    tools
+        .iter()
+        .find(|tool| tool.name == name)
+        .unwrap_or_else(|| panic!("{name} should be listed"))
+        .output_schema
+        .clone()
+}
+
+#[tokio::test]
+async fn tools_list_omits_a_non_object_output_schema_for_a_2025_peer() {
+    let mut router = output_schema_router();
+    init_router(&mut router).await;
+
+    let McpResponse::ListTools(result) = router
+        .handle(
+            RequestId::Number(2),
+            McpRequest::ListTools(ListToolsParams::default()),
+            Extensions::new(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected tools/list")
+    };
+    assert_eq!(result.tools.len(), 5);
+    assert_eq!(output_schema_of(&result.tools, "array_out"), None);
+    assert_eq!(output_schema_of(&result.tools, "string_out"), None);
+    assert_eq!(output_schema_of(&result.tools, "union_out"), None);
+    assert_eq!(output_schema_of(&result.tools, "no_schema"), None);
+    assert_eq!(
+        output_schema_of(&result.tools, "object_out"),
+        Some(serde_json::json!({"type": "object", "properties": {"n": {"type": "number"}}}))
+    );
+}
+
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn tools_list_keeps_a_non_object_output_schema_for_a_2026_07_28_peer() {
+    let router = output_schema_router();
+
+    let McpResponse::ListTools(result) = router
+        .handle(
+            RequestId::Number(1),
+            McpRequest::ListTools(ListToolsParams::default()),
+            final_extensions(ClientCapabilities::default()),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected tools/list")
+    };
+    assert_eq!(
+        output_schema_of(&result.tools, "array_out"),
+        Some(serde_json::json!({"type": "array", "items": {"type": "number"}}))
+    );
+    assert_eq!(
+        output_schema_of(&result.tools, "string_out"),
+        Some(serde_json::json!({"type": "string"}))
+    );
+    assert_eq!(
+        output_schema_of(&result.tools, "union_out"),
+        Some(serde_json::json!({"anyOf": [{"type": "string"}, {"type": "object"}]}))
+    );
+    assert_eq!(output_schema_of(&result.tools, "no_schema"), None);
+}
+
 #[cfg(feature = "stateless")]
 #[tokio::test]
 async fn final_protocol_enforces_tasks_negotiation() {

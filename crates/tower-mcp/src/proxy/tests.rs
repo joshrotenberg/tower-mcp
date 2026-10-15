@@ -1901,4 +1901,67 @@ mod proxy_tests {
         assert_eq!(proxy.backend_count(), 0);
         assert!(proxy.backend_namespaces().is_empty());
     }
+
+    /// A proxy over one backend whose tool returns an explicit
+    /// `structuredContent: null`. The tool opts out of the backend's own 2025
+    /// shape check so the null reaches the proxy.
+    async fn null_structured_proxy() -> McpProxy {
+        let router = McpRouter::new().tool(
+            ToolBuilder::new("nothing")
+                .skip_output_validation()
+                .handler(|_args: serde_json::Value| async {
+                    Ok(CallToolResult::json(serde_json::Value::Null))
+                })
+                .build(),
+        );
+        McpProxy::builder("test-proxy", "1.0.0")
+            .backend("b", ChannelTransport::new(router))
+            .await
+            .build_strict()
+            .await
+            .expect("proxy should build")
+    }
+
+    fn call_nothing(extensions: Extensions) -> RouterRequest {
+        RouterRequest {
+            id: RequestId::Number(1),
+            inner: McpRequest::CallTool(crate::protocol::CallToolParams {
+                input_responses: None,
+                request_state: None,
+                name: "b_nothing".to_string(),
+                arguments: json!({}),
+                meta: None,
+                task: None,
+            }),
+            extensions,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_proxy_drops_null_structured_content_for_a_2025_request() {
+        let mut proxy = null_structured_proxy().await;
+        let resp = proxy.call(call_nothing(Extensions::new())).await.unwrap();
+        match resp.inner.expect("call tool should succeed") {
+            McpResponse::CallTool(result) => assert!(result.structured_content.is_none()),
+            other => panic!("expected CallTool response, got: {:?}", other),
+        }
+    }
+
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn test_proxy_keeps_null_structured_content_for_a_2026_request() {
+        let mut proxy = null_structured_proxy().await;
+        let mut extensions = Extensions::new();
+        extensions.insert(crate::stateless::StatelessRequestMeta {
+            protocol_version: Some(crate::protocol::PROTOCOL_VERSION_2026_07_28.to_string()),
+            ..Default::default()
+        });
+        let resp = proxy.call(call_nothing(extensions)).await.unwrap();
+        match resp.inner.expect("call tool should succeed") {
+            McpResponse::CallTool(result) => {
+                assert_eq!(result.structured_content, Some(serde_json::Value::Null));
+            }
+            other => panic!("expected CallTool response, got: {:?}", other),
+        }
+    }
 }

@@ -3072,24 +3072,25 @@ async fn handle_incoming<T: ClientTransport, H: ClientHandler>(
         let method = parsed["method"].as_str().unwrap_or("").to_string();
         let params = parsed.get("params").cloned();
 
-        // Without a parseable id there is nothing to key cancellation
-        // bookkeeping on, and (matching the pre-existing success-path
-        // behavior) no reply is possible either; run it inline rather
-        // than spawn a task nothing could ever be cancelled or answered
-        // for.
+        // MCP requires a request id to be a string or an integer, and
+        // forbids null. A message with a `method` and any other id (a
+        // float, a boolean, an object, an array, null) is an invalid
+        // request, not a notification, so it is refused with -32600 and a
+        // null id rather than dispatched or dropped (#1558). The handler
+        // does not run: with no usable id there is nothing to key
+        // cancellation bookkeeping on or correlate a reply to.
         let Some(id) = id else {
-            if let Err(error) = dispatch_server_request(handler, roots, &method, params).await {
-                let response = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": null,
-                    "error": {
-                        "code": error.code,
-                        "message": error.message
-                    }
-                });
-                if let Ok(json) = serde_json::to_string(&response) {
-                    let _ = transport.send(&json).await;
+            let error = JsonRpcError::invalid_request("`id` must be a string or an integer");
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {
+                    "code": error.code,
+                    "message": error.message
                 }
+            });
+            if let Ok(json) = serde_json::to_string(&response) {
+                let _ = transport.send(&json).await;
             }
             return;
         };

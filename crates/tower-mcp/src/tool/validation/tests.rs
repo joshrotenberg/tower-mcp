@@ -962,6 +962,38 @@ async fn a_2026_07_28_request_still_checks_the_output_schema() {
     );
 }
 
+#[cfg(all(feature = "schema-validation", feature = "stateless"))]
+fn null_output_schema_tool(schema: Value) -> Tool {
+    ToolBuilder::new("snapshots")
+        .output_schema(schema)
+        .handler(|()| async { Ok(CallToolResult::json(Value::Null)) })
+        .build()
+}
+
+#[cfg(all(feature = "schema-validation", feature = "stateless"))]
+#[tokio::test]
+async fn a_2026_07_28_null_structured_content_is_checked_against_the_output_schema() {
+    // A schema that takes null accepts it unchanged.
+    let expected = CallToolResult::json(Value::Null);
+    assert_serialized_eq(
+        null_output_schema_tool(json!({"type": "null"}))
+            .call_with_context(final_context(), Value::Null)
+            .await,
+        expected,
+    );
+    // One that does not gets the usual schema violation, not a panic or a pass.
+    let result = null_output_schema_tool(json!({"type": "object"}))
+        .call_with_context(final_context(), Value::Null)
+        .await;
+    assert!(result.is_error);
+    assert!(
+        result
+            .first_text()
+            .unwrap()
+            .contains("does not match its output schema")
+    );
+}
+
 fn assert_serialized_eq(actual: impl Serialize, expected: impl Serialize) {
     assert_eq!(
         serde_json::to_value(actual).unwrap(),

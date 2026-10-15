@@ -1921,6 +1921,14 @@ impl McpRouter {
                     let mut definition = t.definition();
                     if final_protocol {
                         definition.execution = None;
+                    } else if definition.output_schema.as_ref().is_some_and(|schema| {
+                        schema.get("type").and_then(|ty| ty.as_str()) != Some("object")
+                    }) {
+                        // 2025-11-25 and earlier require outputSchema to be an
+                        // object schema, so a peer on those revisions gets the
+                        // tool without one (#1558). 2026-07-28 allows any
+                        // JSON Schema and keeps it.
+                        definition.output_schema = None;
                     }
                     definition
                 };
