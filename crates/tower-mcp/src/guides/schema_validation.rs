@@ -145,7 +145,9 @@ required to implement `JsonSchema`, so existing implementations keep
 compiling; to derive a schema for one, call `output_schema_for` on a builder,
 or set `.output_schema(...)` yourself. MCP 2025-11-25 and earlier require
 `"type": "object"` at the root; MCP 2026-07-28 accepts any JSON Schema 2020-12.
-Neither method rewrites or rejects the schema it is given.
+Neither method rewrites or rejects the schema it is given, but `tools/list`
+leaves a schema without `"type": "object"` at the root out of the entry it
+sends to a 2025 peer; a 2026-07-28 peer receives it unchanged.
 
 ## Opting out
 
