@@ -875,16 +875,17 @@ fn custom_header_mappings(
             )
     }
 
+    // SEP-2243 allows integer, string and boolean; `number` is not permitted.
     fn primitive_header_type(schema: &serde_json::Value) -> bool {
         match schema.get("type") {
             Some(serde_json::Value::String(kind)) => {
-                matches!(kind.as_str(), "string" | "number" | "integer" | "boolean")
+                matches!(kind.as_str(), "string" | "integer" | "boolean")
             }
             Some(serde_json::Value::Array(kinds)) => {
                 let mut primitive = false;
                 for kind in kinds {
                     match kind.as_str() {
-                        Some("string" | "number" | "integer" | "boolean") if !primitive => {
+                        Some("string" | "integer" | "boolean") if !primitive => {
                             primitive = true;
                         }
                         Some("null") => {}
@@ -3590,13 +3591,23 @@ mod tests {
             "properties": {
                 "region": {"type": "string", "x-mcp-header": "Region"},
                 "priority": {"type": "integer", "x-mcp-header": "Priority"},
-                "ratio": {"type": "number", "x-mcp-header": "Ratio"}
+                "enabled": {"type": ["boolean", "null"], "x-mcp-header": "Enabled"}
             }
         }))
         .unwrap();
         assert_eq!(mappings.len(), 3);
 
         for invalid in [
+            // `number` is not an allowed header type (SEP-2243), alone or
+            // combined with null.
+            serde_json::json!({
+                "type": "object",
+                "properties": {"ratio": {"type": "number", "x-mcp-header": "Ratio"}}
+            }),
+            serde_json::json!({
+                "type": "object",
+                "properties": {"ratio": {"type": ["number", "null"], "x-mcp-header": "Ratio"}}
+            }),
             serde_json::json!({
                 "type": "object",
                 "properties": {"value": {"type": "object", "x-mcp-header": "Value"}}
@@ -3644,6 +3655,15 @@ mod tests {
                                     "value": {"type": "array", "x-mcp-header": "Value"}
                                 }
                             }
+                        },
+                        {
+                            "name": "number_typed",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "ratio": {"type": "number", "x-mcp-header": "Ratio"}
+                                }
+                            }
                         }
                     ]
                 }
@@ -3654,6 +3674,7 @@ mod tests {
         assert_eq!(parsed["result"]["tools"].as_array().unwrap().len(), 1);
         assert!(transport.tool_header_mappings.contains_key("valid"));
         assert!(!transport.tool_header_mappings.contains_key("invalid"));
+        assert!(!transport.tool_header_mappings.contains_key("number_typed"));
     }
 
     // =========================================================================
