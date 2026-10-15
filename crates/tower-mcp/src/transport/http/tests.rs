@@ -1298,6 +1298,44 @@ async fn sep_2243_lenient_mode_validates_present_headers() {
     assert_eq!(json["id"], 2);
 }
 
+/// An `initialize` rejected by SEP-2243 header validation must not leave the
+/// session created ahead of dispatch behind (rmcp #1275).
+#[tokio::test]
+async fn rejected_initialize_header_mismatch_leaves_no_session() {
+    let transport = HttpTransport::new(create_test_router())
+        .disable_origin_validation()
+        .max_sessions(1);
+    let (app, handle) = transport.into_router_with_handle();
+
+    for attempt in 0..2 {
+        let init = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header(MCP_METHOD_HEADER, "tools/list")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": { "name": "t", "version": "0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(init).await.unwrap();
+        // A leaked session would turn the second attempt into a 503.
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{attempt}");
+        assert!(response.headers().get(MCP_SESSION_ID_HEADER).is_none());
+        assert_eq!(handle.session_count().await, 0, "attempt {attempt}");
+    }
+}
+
 /// tools/call with matching Mcp-Method + Mcp-Name passes validation.
 /// Driven via initialize requesting the 2026-07-28 protocol version, which
 /// the router negotiates down to a legacy version since `initialize`

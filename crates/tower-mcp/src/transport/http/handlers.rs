@@ -145,6 +145,19 @@ fn is_initialize_request(body: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Drop the session an `initialize` created when the request is rejected
+/// before it can be admitted to it.
+///
+/// The session is created ahead of dispatch, so every early return between
+/// creation and the failed-initialize cleanup at the end of `handle_post`
+/// would otherwise leave it counting against the session limit until it idles
+/// out (rmcp #1275). A no-op for any other request.
+async fn discard_init_session(state: &AppState, session: &Session, is_init: bool) {
+    if is_init {
+        state.sessions.remove(&session.id).await;
+    }
+}
+
 /// Check if this is a response to one of our outgoing requests
 fn is_response(parsed: &serde_json::Value) -> bool {
     crate::framing::is_response_frame(parsed)
@@ -1006,6 +1019,7 @@ pub(super) async fn handle_post(
     let session_revision = match session_protocol_version.parse::<McpProtocolRevision>() {
         Ok(revision) => revision,
         Err(_) => {
+            discard_init_session(&state, &session, is_init).await;
             return json_rpc_error_response(
                 extract_request_id(&parsed),
                 JsonRpcError::unsupported_protocol_version(
@@ -1142,6 +1156,7 @@ pub(super) async fn handle_post(
             error = %err.message,
             "Rejecting request: SEP-2243 header validation failed",
         );
+        discard_init_session(&state, &session, is_init).await;
         let id = extract_request_id(&parsed);
         let mut resp = json_rpc_error_response(id, err);
         // Per SEP-2243 §"Error Code" the HTTP status MUST be 400.
@@ -1256,6 +1271,7 @@ pub(super) async fn handle_post(
             // The serde message is not surfaced: for a struct deserialize it
             // can name the Rust type, the same disclosure #1284 removed from
             // the stdio path.
+            discard_init_session(&state, &session, is_init).await;
             return json_rpc_error_response(
                 id,
                 JsonRpcError::parse_error("not a valid JSON-RPC request"),
@@ -1349,6 +1365,7 @@ pub(super) async fn handle_post(
         match call.await {
             Ok(response) => response,
             Err(error) => {
+                discard_init_session(&state, &session, is_init).await;
                 return json_rpc_error_response(
                     Some(request_id),
                     JsonRpcError::internal_error(error.to_string()),
