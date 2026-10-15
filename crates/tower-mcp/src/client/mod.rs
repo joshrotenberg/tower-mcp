@@ -906,9 +906,7 @@ impl McpClient {
         // must not be treated as a successful handshake: nothing downstream
         // re-checks it, so an unvalidated version here silently drives every
         // later request with mismatched semantics.
-        if !crate::protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&result.protocol_version.as_str())
-            || !self.protocol_support.contains(&result.protocol_version)
-        {
+        if !accepts_initialize_answer(&self.protocol_support, &result.protocol_version) {
             return Err(Error::Transport(format!(
                 "server selected protocol version `{}`, which is not an initialize-lifecycle version this client supports; client supports: {:?}",
                 result.protocol_version,
@@ -2709,6 +2707,25 @@ impl Drop for McpClient {
             task.abort();
         }
     }
+}
+
+/// Version answered by servers that predate 2025-03-26.
+///
+/// Many stdio servers still answer it (#1544). A tower-mcp server never
+/// negotiates it, so it is not in `SUPPORTED_PROTOCOL_VERSIONS` or any
+/// `ProtocolSupport`.
+const LEGACY_INITIALIZE_VERSION: &str = "2024-11-05";
+
+/// Whether `initialize` may complete with the version the server selected.
+///
+/// A `2024-11-05` answer is accepted as part of the oldest compatibility
+/// band, so it follows `2025-03-26`: every built-in policy accepts it, and a
+/// client narrowed away from `2025-03-26` rejects it.
+fn accepts_initialize_answer(support: &ProtocolSupport, version: &str) -> bool {
+    if version == LEGACY_INITIALIZE_VERSION {
+        return support.contains("2025-03-26");
+    }
+    crate::protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&version) && support.contains(version)
 }
 
 // =============================================================================

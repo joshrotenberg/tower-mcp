@@ -299,6 +299,76 @@ async fn initialize_accepts_2025_06_18() {
     assert!(client.is_initialized());
 }
 
+/// Run `initialize` against a server that selects `version`, with the
+/// client's version policy set to `support`.
+async fn initialize_answered_with(
+    version: &str,
+    support: ProtocolSupport,
+) -> (McpClient, Result<InitializeResult>) {
+    let transport =
+        MockTransport::with_responses(vec![mock_initialize_response_with_version(version)]);
+    let client = McpClient::builder()
+        .protocol_support(support)
+        .connect_simple(transport)
+        .await
+        .unwrap();
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.initialize("test-client", "1.0.0"),
+    )
+    .await
+    .expect("initialize must not hang");
+    (client, outcome)
+}
+
+/// #1544: many stdio servers still answer 2024-11-05. Every built-in
+/// version policy accepts it.
+#[tokio::test]
+async fn initialize_accepts_2024_11_05_with_built_in_policies() {
+    for support in [
+        ProtocolSupport::default(),
+        ProtocolSupport::compiled(),
+        ProtocolSupport::stable(),
+    ] {
+        let (client, outcome) = initialize_answered_with("2024-11-05", support.clone()).await;
+        let result = outcome.unwrap_or_else(|error| {
+            panic!("2024-11-05 must complete initialize under {support:?}, got: {error}")
+        });
+        assert_eq!(result.protocol_version, "2024-11-05");
+        assert!(client.is_initialized());
+    }
+}
+
+/// 2024-11-05 follows 2025-03-26: a client narrowed away from the oldest
+/// version this crate implements rejects it too.
+#[tokio::test]
+async fn initialize_rejects_2024_11_05_when_2025_03_26_is_excluded() {
+    let support = ProtocolSupport::try_new(["2025-11-25", "2025-06-18"]).unwrap();
+    let (client, outcome) = initialize_answered_with("2024-11-05", support).await;
+
+    let error = outcome.expect_err("2024-11-05 must be rejected without 2025-03-26");
+    assert!(
+        error.to_string().contains("2024-11-05"),
+        "error should name the rejected version, got: {error}"
+    );
+    assert!(!client.is_initialized());
+}
+
+/// Accepting 2024-11-05 does not open the check to other pre-2025 versions.
+#[tokio::test]
+async fn initialize_rejects_2024_10_07() {
+    let (client, outcome) =
+        initialize_answered_with("2024-10-07", ProtocolSupport::default()).await;
+
+    let error = outcome.expect_err("2024-10-07 must not complete initialize");
+    assert!(
+        error.to_string().contains("2024-10-07"),
+        "error should name the rejected version, got: {error}"
+    );
+    assert!(!client.is_initialized());
+}
+
 /// A version the client has never heard of is rejected the same way as a
 /// known-but-wrong-lifecycle one: `initialize` has no basis for trusting it.
 #[tokio::test]

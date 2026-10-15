@@ -201,6 +201,12 @@ client.initialize("my-client", "1.0.0").await?;
 `notifications/initialized` notification. HTTP stores the negotiated protocol
 version and session ID for later requests.
 
+`initialize` fails if the server selects a version the client's
+`ProtocolSupport` does not enable. One exception: a server that answers
+`2024-11-05`, which many stdio servers still do, is accepted whenever
+`2025-03-26` is enabled, which every built-in policy does. A tower-mcp server
+never negotiates `2024-11-05`.
+
 ### Final client
 
 ```rust,ignore
