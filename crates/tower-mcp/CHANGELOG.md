@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [0.24.0] - 2026-10-15
 
+### Upgrade notes
+
+- **Error codes (breaking).** An unknown, disabled or filtered tool or prompt is now answered `-32602` (Invalid params) on every protocol revision, as every supported spec revision specifies, instead of `-32601` (Method not found). `DenialBehavior::NotFound` produces `-32602` too. On the 2026-07-28 HTTP path, a handler's `-32602` stays in-band at HTTP 200 instead of becoming HTTP 400, which clients read as "fall back to `initialize`". Code or tests that match `-32601` for these cases must change (#1560).
+- **HTTP client errors.** A 429 or 5xx no longer disconnects `HttpClientTransport`; only 404 and 410 without a session close it. Failed requests carry `httpStatus`, `retryAfter` and `wwwAuthenticate` in the error `data`, readable with `HttpStatusDetails::from_error` (#1559, #1565). Any 404 on a 2025-11-25 session request now re-initializes the session (#1565).
+- **Client sessions.** A failed `initialize()` sends a DELETE for the session the server issued (#1570). `ClientTransport` gains `end_session`, with a default no-op.
+- **Origin and Host.** A request with more than one `Origin` header gets 403, and userinfo, query, fragment or invalid-port origins are no longer treated as localhost. `WebSocketTransport` validates `Host` with the same defaults as HTTP (#1566).
+- **`structuredContent`.** An explicit `"structuredContent": null` now decodes as `Some(Value::Null)` instead of `None` (#1568).
+- **OAuth client.** With no explicit, challenge or protected-resource scopes, the authorization URL no longer lists the authorization server's `scopes_supported`. A confidential dynamic registration that returns no `client_secret` is an error at registration (#1569).
+- **stdio.** A request the client cancels is no longer answered (#1552). When `drain_timeout` expires, in-flight handlers are cancelled and then aborted (#1562).
+
 ### Bug Fixes
 
 - **tool:** Reject a non-object structuredContent on 2025 requests (closes #1540) ([#1541](https://github.com/joshrotenberg/tower-mcp/pull/1541))

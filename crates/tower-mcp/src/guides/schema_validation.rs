@@ -13,7 +13,7 @@ The opt-in `schema-validation` feature adds both checks. It pulls in
 off, so a schema is never resolved from the network or the filesystem.
 
 ```toml
-tower-mcp = { version = "0.23", features = ["schema-validation"] }
+tower-mcp = { version = "0.24", features = ["schema-validation"] }
 ```
 
 ## structuredContent shape before 2026-07-28
