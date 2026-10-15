@@ -209,7 +209,8 @@ pub struct HttpClientConfig {
     pub max_sse_reconnect_attempts: u32,
     /// Whether to support automatic session recovery on expiry.
     /// When enabled, HTTP 404 responses (with a session ID attached) and
-    /// JSON-RPC -32005 errors trigger re-initialization.
+    /// JSON-RPC -32005 errors trigger re-initialization. A 404 counts
+    /// whatever its body holds.
     /// Default: `true`.
     pub session_recovery: bool,
     /// Maximum size in bytes buffered for a single SSE event.
@@ -1441,6 +1442,14 @@ impl ClientTransport for HttpClientTransport {
                 .clone()
                 .and_then(|value| serde_json::from_value(value).ok());
             let is_subscription = method == Some("subscriptions/listen");
+            // Whether this request carried `Mcp-Session-Id`: a 404 then means
+            // the session expired (#1556). A 2026-07-28 request is sessionless,
+            // and there a 404 is an ordinary status (an unknown method answers
+            // 404 with -32601).
+            let session_expiry_on_404 = !is_modern_request
+                && self.session_id.is_some()
+                && self.config.session_recovery
+                && reply_id.is_some();
             let reply_id = reply_id.clone();
             let connected = self.connected.clone();
             let last_event_id = self.last_event_id.clone();
@@ -1500,6 +1509,21 @@ impl ClientTransport for HttpClientTransport {
                     let retry_after = retry_after_header(response.headers());
                     let www_authenticate = www_authenticate_header(response.headers());
                     let body = read_error_body(response).await;
+
+                    // The spec's session-expired signal is the 404 itself, so
+                    // it triggers recovery whatever the body holds: nothing, a
+                    // -32005, or another code such as the -32001 other SDKs
+                    // use. Hand the message loop the -32005 frame it already
+                    // recovers on, and leave the transport open for the
+                    // re-initialize.
+                    if status == reqwest::StatusCode::NOT_FOUND
+                        && session_expiry_on_404
+                        && let Some(id) = &reply_id
+                    {
+                        tracing::info!(body = %body, "HTTP 404 on a session request, signalling session expiry");
+                        let _ = tx.send(session_expired_frame(id)).await;
+                        return;
+                    }
 
                     // Forward a JSON-RPC error body so the message loop can
                     // detect -32005 (SessionNotFound) and trigger session
@@ -2481,6 +2505,17 @@ fn merge_status_into_error(frame: &mut serde_json::Value, status_data: serde_jso
     }
 }
 
+/// The frame that tells the message loop the session behind request `id` is
+/// gone: the `-32005` (SessionNotFound) error it recovers on.
+fn session_expired_frame(id: &serde_json::Value) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": -32005, "message": "Session not found (HTTP 404)" },
+    })
+    .to_string()
+}
+
 /// The HTTP status of a non-success response, with its `Retry-After` and
 /// `WWW-Authenticate` headers if the server sent them.
 ///
@@ -2500,10 +2535,11 @@ fn merge_status_into_error(frame: &mut serde_json::Value, status_data: serde_jso
 ///   `data` (#1555): an existing object `data` keeps its keys and gains the
 ///   status keys where absent, and any other `data` moves under `serverData`.
 ///
-/// A `404` or `410` still closes the transport, since either means the
-/// endpoint is gone. Errors from the initial `initialize` request, which is
-/// sent synchronously, are reported as [`Error::Transport`] text and carry no
-/// details.
+/// A `404` or `410` with no JSON-RPC body still closes the transport, since
+/// either means the endpoint is gone; a `404` on a session request instead
+/// recovers the session. Errors from the initial `initialize` request, which
+/// is sent synchronously, are reported as [`Error::Transport`] text and carry
+/// no details.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpStatusDetails {
     /// The HTTP status code of the response.

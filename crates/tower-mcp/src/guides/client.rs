@@ -272,9 +272,12 @@ Disable the cache for diagnostics with `disable_response_cache`.
 
 tower-mcp retries only where the library can establish a safe boundary:
 
-- legacy HTTP session expiry resets the transport, repeats `initialize`, and
-  retries the failed request once; call `disable_session_recovery` on the HTTP
-  transport if the application must own recovery;
+- legacy HTTP session expiry (a 404 on a request that carried
+  `Mcp-Session-Id`, whatever its body, or a JSON-RPC `-32005`) resets the
+  transport, repeats `initialize`, and retries the failed request once; call
+  `disable_session_recovery` on the HTTP transport if the application must own
+  recovery. A 404 on a 2026-07-28 request is not session expiry, since that
+  protocol has no sessions;
 - final version selection retries one recognized unsupported-version response
   with a mutually supported modern version;
 - final tool calls refresh `tools/list` and retry once after a pre-execution
@@ -293,7 +296,8 @@ A non-success HTTP status with no JSON-RPC error body, such as a 429 from a
 rate limiter or a 502 or 503 from a gateway, fails only the request it
 answered; the HTTP transport stays usable for the next one. Read the status and
 any `Retry-After` header from the error with `HttpStatusDetails::from_error`
-to decide whether and when to retry. Only a 404 or 410 closes the transport.
+to decide whether and when to retry. Only a 404 or 410 closes the transport,
+except that a 404 on a session request recovers the session instead.
 
 A 401, 403 or 429 whose body is a JSON-RPC error reaches the caller as the
 server's own error, with the status added to its `data`, so
