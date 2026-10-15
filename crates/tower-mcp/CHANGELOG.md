@@ -2,6 +2,45 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.24.0] - 2026-10-15
+
+### Upgrade notes
+
+- **Error codes (breaking).** An unknown, disabled or filtered tool or prompt is now answered `-32602` (Invalid params) on every protocol revision, as every supported spec revision specifies, instead of `-32601` (Method not found). `DenialBehavior::NotFound` produces `-32602` too. On the 2026-07-28 HTTP path, a handler's `-32602` stays in-band at HTTP 200 instead of becoming HTTP 400, which clients read as "fall back to `initialize`". Code or tests that match `-32601` for these cases must change (#1560).
+- **HTTP client errors.** A 429 or 5xx no longer disconnects `HttpClientTransport`; only 404 and 410 without a session close it. Failed requests carry `httpStatus`, `retryAfter` and `wwwAuthenticate` in the error `data`, readable with `HttpStatusDetails::from_error` (#1559, #1565). Any 404 on a 2025-11-25 session request now re-initializes the session (#1565).
+- **Client sessions.** A failed `initialize()` sends a DELETE for the session the server issued (#1570). `ClientTransport` gains `end_session`, with a default no-op.
+- **Origin and Host.** A request with more than one `Origin` header gets 403, and userinfo, query, fragment or invalid-port origins are no longer treated as localhost. `WebSocketTransport` validates `Host` with the same defaults as HTTP (#1566).
+- **`structuredContent`.** An explicit `"structuredContent": null` now decodes as `Some(Value::Null)` instead of `None` (#1568).
+- **OAuth client.** With no explicit, challenge or protected-resource scopes, the authorization URL no longer lists the authorization server's `scopes_supported`. A confidential dynamic registration that returns no `client_secret` is an error at registration (#1569).
+- **stdio.** A request the client cancels is no longer answered (#1552). When `drain_timeout` expires, in-flight handlers are cancelled and then aborted (#1562).
+
+### Bug Fixes
+
+- **tool:** Reject a non-object structuredContent on 2025 requests (closes #1540) ([#1541](https://github.com/joshrotenberg/tower-mcp/pull/1541))
+- **client:** Accept servers that answer protocol version 2024-11-05 ([#1550](https://github.com/joshrotenberg/tower-mcp/pull/1550))
+- Do not answer a request the client cancelled ([#1552](https://github.com/joshrotenberg/tower-mcp/pull/1552))
+- [**breaking**] **http:** Keep handler -32602 errors in-band on 2026-07-28 and answer unknown tools and prompts with -32602 ([#1560](https://github.com/joshrotenberg/tower-mcp/pull/1560))
+- **client:** Kill the stdio child when its transport is dropped ([#1543](https://github.com/joshrotenberg/tower-mcp/pull/1543))
+- **client:** Keep the HTTP client usable after a 429 or 5xx and expose the status ([#1559](https://github.com/joshrotenberg/tower-mcp/pull/1559))
+- **stdio:** Cancel in-flight handlers when drain_timeout expires ([#1562](https://github.com/joshrotenberg/tower-mcp/pull/1562))
+- **http:** Restore the client's capabilities into router session state on SessionStore restore ([#1564](https://github.com/joshrotenberg/tower-mcp/pull/1564))
+- **client:** Keep the HTTP status on a 401/403 JSON-RPC error and recover sessions on any background 404 ([#1565](https://github.com/joshrotenberg/tower-mcp/pull/1565))
+- **http:** Clean up the session of a rejected initialize, harden Origin parsing, check Host on WebSocket ([#1566](https://github.com/joshrotenberg/tower-mcp/pull/1566))
+- Preserve a null structuredContent, hide a non-object outputSchema from 2025 peers, answer non-integer request ids ([#1568](https://github.com/joshrotenberg/tower-mcp/pull/1568))
+- **oauth-client:** Refresh with granted scopes, honor advertised auth methods, omit scope instead of AS scopes_supported ([#1569](https://github.com/joshrotenberg/tower-mcp/pull/1569))
+- **client:** HTTP initialize ping deadlock, failed-initialize session cleanup, x-mcp-header types, cancellation on 2025 sessions ([#1570](https://github.com/joshrotenberg/tower-mcp/pull/1570))
+
+### Documentation
+
+- **session_store:** Load must not return an expired record (closes #1529) ([#1534](https://github.com/joshrotenberg/tower-mcp/pull/1534))
+
+### Features
+
+- **router:** Expose the initializing client's clientInfo to request handlers ([#1551](https://github.com/joshrotenberg/tower-mcp/pull/1551))
+- **client:** Let StdioClientTransport callers stop the child's process group and read its exit status ([#1563](https://github.com/joshrotenberg/tower-mcp/pull/1563))
+
+
+
 ## [0.23.2] - 2026-09-29
 
 ### Features
