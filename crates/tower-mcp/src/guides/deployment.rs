@@ -297,10 +297,9 @@ async fn redis_event_store_honors_the_contract() {
 }
 ```
 
-The suites check documented behavior only. They do not check that an expired
-session is hidden from `SessionStore::load` (the trait allows returning it), or
-the buffer capacity of an event store (the trait defines none). Do not run them
-under `tokio::time::pause`; the expiry checks in the task suite poll against
+The suites check documented behavior only. They do not check the buffer
+capacity of an event store (the trait defines none). Do not run them under
+`tokio::time::pause`; the expiry checks in the task and session suites wait in
 real time. See `tower_mcp::testing::store_contracts` and the task store's
 [module documentation](crate::async_task) for the rules each suite covers.
 
