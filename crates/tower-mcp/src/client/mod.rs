@@ -69,7 +69,7 @@ mod websocket;
 pub use channel::ChannelTransport;
 pub use handler::{ClientHandler, NotificationHandler, ServerNotification};
 #[cfg(feature = "http-client")]
-pub use http::{HttpClientConfig, HttpClientTransport};
+pub use http::{HttpClientConfig, HttpClientTransport, HttpStatusDetails};
 #[cfg(feature = "oauth-client")]
 pub use oauth::{
     OAuthBearerChallenge, OAuthClientCredentials, OAuthClientCredentialsBuilder, OAuthClientError,

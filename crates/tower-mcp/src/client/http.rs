@@ -1497,6 +1497,7 @@ impl ClientTransport for HttpClientTransport {
 
                 if !status.is_success() {
                     let status_error = http_status_error(status, response.headers());
+                    let retry_after = retry_after_header(response.headers());
                     let body = read_error_body(response).await;
 
                     // Forward a JSON-RPC error body so the message loop can
@@ -1534,9 +1535,21 @@ impl ClientTransport for HttpClientTransport {
 
                     tracing::error!(status = %status, body = %body, "HTTP error from server");
                     if let Some(id) = &reply_id {
-                        let _ = tx.send(transport_error_frame(id, &status_error)).await;
+                        let _ = tx
+                            .send(transport_error_frame_with_data(
+                                id,
+                                &status_error,
+                                status_error_data(status, &retry_after),
+                            ))
+                            .await;
                     }
-                    connected.store(false, Ordering::Release);
+                    // Only a status that says the endpoint is gone ends the
+                    // transport. Anything else (a 429 from a rate limiter, a
+                    // 502 or 503 from a gateway) failed this request alone
+                    // and the next one may well succeed (#1553).
+                    if status_ends_transport(status) {
+                        connected.store(false, Ordering::Release);
+                    }
                     return;
                 }
 
@@ -2354,6 +2367,103 @@ fn transport_error_frame(id: &serde_json::Value, message: &str) -> String {
         "error": { "code": -32000, "message": message },
     })
     .to_string()
+}
+
+/// [`transport_error_frame`] with structured `data` attached to the error.
+fn transport_error_frame_with_data(
+    id: &serde_json::Value,
+    message: &str,
+    data: serde_json::Value,
+) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": -32000, "message": message, "data": data },
+    })
+    .to_string()
+}
+
+/// Whether a non-success status means the endpoint itself is gone, as opposed
+/// to a transient failure of the one request it answered.
+fn status_ends_transport(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE
+    )
+}
+
+/// The raw `Retry-After` header value, if present and readable.
+fn retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().to_string())
+}
+
+/// The `data` of the error injected for a non-success HTTP status; read it
+/// back with [`HttpStatusDetails::from_error`].
+fn status_error_data(
+    status: reqwest::StatusCode,
+    retry_after: &Option<String>,
+) -> serde_json::Value {
+    let mut data = serde_json::json!({ "httpStatus": status.as_u16() });
+    if let Some(raw) = retry_after {
+        data["retryAfter"] = serde_json::Value::String(raw.clone());
+    }
+    data
+}
+
+/// The HTTP status, and `Retry-After` header if the server sent one, behind a
+/// request the server answered with a non-success status and no JSON-RPC
+/// error body (a 429 from a rate limiter, a 502 or 503 from a gateway).
+///
+/// The failed request reaches the caller as an [`Error::JsonRpc`] with code
+/// `-32000`, and the transport stays usable for the next request. The details
+/// ride in the error's `data` as `{"httpStatus": 503, "retryAfter": "7"}`;
+/// [`from_error`](Self::from_error) reads them back, for a retry policy that
+/// needs to tell a transient failure from a dead server.
+///
+/// A `404` or `410` still closes the transport, since either means the
+/// endpoint is gone. Errors from the initial `initialize` request, which is
+/// sent synchronously, are reported as [`Error::Transport`] text and carry no
+/// details.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpStatusDetails {
+    /// The HTTP status code of the response.
+    pub status: u16,
+    /// The raw `Retry-After` header value: delta-seconds (`"7"`) or an
+    /// HTTP-date, passed through unparsed.
+    pub retry_after: Option<String>,
+}
+
+impl HttpStatusDetails {
+    /// Read the details from an error, if it came from a non-success HTTP
+    /// status.
+    pub fn from_error(error: &Error) -> Option<Self> {
+        let Error::JsonRpc(error) = error else {
+            return None;
+        };
+        let data = error.data.as_ref()?;
+        let status = u16::try_from(data.get("httpStatus")?.as_u64()?).ok()?;
+        let retry_after = data
+            .get("retryAfter")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        Some(Self {
+            status,
+            retry_after,
+        })
+    }
+
+    /// The `Retry-After` value as a delay, when it is delta-seconds. `None`
+    /// when absent or an HTTP-date.
+    pub fn retry_after_delay(&self) -> Option<Duration> {
+        self.retry_after
+            .as_deref()?
+            .parse::<u64>()
+            .ok()
+            .map(Duration::from_secs)
+    }
 }
 
 /// Error for a request answered with `202 Accepted`, which acknowledges

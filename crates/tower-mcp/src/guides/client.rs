@@ -289,6 +289,12 @@ be idempotent or carries an application idempotency key. Apply an outer timeout
 around user-facing operations and retain a separate absolute cap even when
 progress notifications arrive.
 
+A non-success HTTP status with no JSON-RPC error body, such as a 429 from a
+rate limiter or a 502 or 503 from a gateway, fails only the request it
+answered; the HTTP transport stays usable for the next one. Read the status and
+any `Retry-After` header from the error with `HttpStatusDetails::from_error`
+to decide whether and when to retry. Only a 404 or 410 closes the transport.
+
 Use `is_connected` for a cheap transport-state check, but treat the result as
 a snapshot. The next operation is the authoritative health signal.
 

@@ -615,7 +615,7 @@ pub use client::{
     NotificationHandler, StdioClientTransport,
 };
 #[cfg(feature = "http-client")]
-pub use client::{HttpClientConfig, HttpClientTransport};
+pub use client::{HttpClientConfig, HttpClientTransport, HttpStatusDetails};
 #[cfg(feature = "oauth-client")]
 pub use client::{
     MemoryOAuthAuthorizationStateStore, MemoryOAuthClientRegistrationStore, MemoryOAuthTokenStore,
