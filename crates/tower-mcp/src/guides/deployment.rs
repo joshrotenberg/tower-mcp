@@ -84,10 +84,13 @@ metadata path and resource identifier from the mount path correctly.
 `HttpTransport` validates browser `Origin` headers by default:
 
 - a request without `Origin` is accepted;
+- a request with more than one `Origin` header is rejected;
 - localhost origins (`localhost`, `127.0.0.1`, `::1`, any port) are always
   accepted, whether or not `allowed_origins` is set -- it is a DNS-rebinding
   guard against a locally bound server, not something a configured allowlist
-  replaces; `allowed_origins` only adds non-localhost origins on top of it;
+  replaces; `allowed_origins` only adds non-localhost origins on top of it.
+  The origin is parsed first, so `http://localhost:1@evil.com` (userinfo, real
+  host `evil.com`) is not localhost;
 - a non-localhost origin is rejected unless it matches `allowed_origins`;
 - an empty allowlist therefore rejects browser cross-origin access.
 
