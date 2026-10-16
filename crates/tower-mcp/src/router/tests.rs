@@ -1617,6 +1617,60 @@ async fn test_read_resource_via_template() {
     }
 }
 
+/// A template whose handler answers with the request id it was given.
+fn request_id_template(pattern: &str) -> crate::resource::ResourceTemplate {
+    use crate::resource::ResourceTemplateBuilder;
+    use std::collections::HashMap;
+
+    ResourceTemplateBuilder::new(pattern)
+        .name(pattern)
+        .handler_with_context(
+            |ctx: RequestContext, uri: String, _vars: HashMap<String, String>| async move {
+                Ok(ReadResourceResult::text(
+                    uri,
+                    format!("{:?}", ctx.request_id()),
+                ))
+            },
+        )
+}
+
+async fn read_text(router: &mut McpRouter, id: i64, uri: &str) -> String {
+    let req = RouterRequest {
+        id: RequestId::Number(id),
+        inner: McpRequest::ReadResource(ReadResourceParams {
+            input_responses: None,
+            request_state: None,
+            uri: uri.to_string(),
+            meta: None,
+        }),
+        extensions: Extensions::new(),
+    };
+    match router.ready().await.unwrap().call(req).await.unwrap().inner {
+        Ok(McpResponse::ReadResource(result)) => result.contents[0].text.clone().unwrap(),
+        other => panic!("Expected ReadResource response, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_template_handler_with_context_receives_the_request_context() {
+    let mut router = McpRouter::new().resource_template(request_id_template("ctx://{id}"));
+    init_router(&mut router).await;
+
+    let text = read_text(&mut router, 42, "ctx://a").await;
+    assert_eq!(text, format!("{:?}", RequestId::Number(42)));
+}
+
+#[cfg(feature = "dynamic-tools")]
+#[tokio::test]
+async fn test_dynamic_template_handler_with_context_receives_the_request_context() {
+    let (mut router, registry) = McpRouter::new().with_dynamic_resource_templates();
+    registry.register(request_id_template("dyn-ctx://{id}"));
+    init_router(&mut router).await;
+
+    let text = read_text(&mut router, 43, "dyn-ctx://a").await;
+    assert_eq!(text, format!("{:?}", RequestId::Number(43)));
+}
+
 #[tokio::test]
 async fn test_static_resource_takes_precedence_over_template() {
     use crate::resource::{ResourceBuilder, ResourceTemplateBuilder};
