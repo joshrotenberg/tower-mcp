@@ -8102,6 +8102,54 @@ mod dynamic_tools_tests {
         assert!(names.contains(&"tool_a"));
         assert!(names.contains(&"tool_b"));
     }
+    #[tokio::test]
+    async fn test_dynamic_tools_replace_all_one_notification() {
+        let (tx, mut rx) = crate::context::notification_channel(16);
+        let (router, registry) = McpRouter::new()
+            .server_info("test", "1.0")
+            .with_dynamic_tools();
+        let mut router = router.with_notification_sender(tx);
+        init_router(&mut router).await;
+
+        let tool = |name: &str| {
+            ToolBuilder::new(name)
+                .description("Reloadable")
+                .handler(|_: AddInput| async { Ok(CallToolResult::text("ok")) })
+                .build()
+        };
+        registry.replace_all([tool("a"), tool("b"), tool("c")]);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ServerNotification::ToolsListChanged
+        ));
+
+        // Three tools become two: one replaced, two removed, one added. Item by
+        // item this was four notifications (#1583).
+        let change = registry.replace_all([tool("b"), tool("d")]);
+        assert_eq!(change.added, ["d"]);
+        assert_eq!(change.removed, ["a", "c"]);
+        assert_eq!(change.replaced, ["b"]);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ServerNotification::ToolsListChanged
+        ));
+        assert!(rx.try_recv().is_err());
+
+        let req = RouterRequest {
+            id: RequestId::Number(2),
+            inner: McpRequest::ListTools(ListToolsParams::default()),
+            extensions: Extensions::new(),
+        };
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+        match resp.inner {
+            Ok(McpResponse::ListTools(result)) => {
+                let mut names: Vec<&str> = result.tools.iter().map(|t| t.name.as_str()).collect();
+                names.sort();
+                assert_eq!(names, ["b", "d"]);
+            }
+            _ => panic!("Expected ListTools response"),
+        }
+    }
 } // mod dynamic_tools_tests
 
 #[tokio::test]

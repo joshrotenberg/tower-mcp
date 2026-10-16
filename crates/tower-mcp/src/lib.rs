@@ -700,7 +700,7 @@ pub use protocol::{RESULT_TYPE_TASK, TASKS_EXTENSION_ID};
 #[cfg(feature = "dynamic-tools")]
 pub use registry::{
     DynamicPromptRegistry, DynamicResourceRegistry, DynamicResourceTemplateRegistry,
-    DynamicToolRegistry,
+    DynamicToolRegistry, RegistryChange,
 };
 pub use resource::{
     BoxResourceService, McpResource, Resource, ResourceBuilder, ResourceRequest, ResourceTemplate,
