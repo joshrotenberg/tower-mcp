@@ -196,6 +196,10 @@
 //! - [`guides::schema_validation`]:
 //!   validating tool arguments and structured output, deriving output schemas,
 //!   the error format, and opting out (requires `schema-validation`).
+//! - [`guides::local_runtime`]:
+//!   handlers backed by `!Send` state such as an embedded interpreter, a
+//!   channel to a `LocalSet` task, cancellation, and reloading a set of tools
+//!   at once (requires `dynamic-tools` and `schema-validation`).
 //! - [`guides`]: OAuth, MCP Apps, and the complete task-oriented guide index.
 //! - [Examples index](https://github.com/joshrotenberg/tower-mcp/blob/main/examples/README.md):
 //!   runnable server, client, transport, middleware, OAuth, and extension patterns.

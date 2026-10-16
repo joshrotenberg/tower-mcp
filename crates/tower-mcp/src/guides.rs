@@ -16,6 +16,9 @@
 //! - [`schema_validation`]: checking tool arguments against `inputSchema`
 //!   and `structuredContent` against `outputSchema`, deriving output schemas,
 //!   the error format, and opting out.
+//! - [`local_runtime`]: serving tools, resources and prompts backed by
+//!   `!Send` state, such as an embedded interpreter, through a channel to a
+//!   task on a `LocalSet`, and reloading them as one set.
 
 // Each guide is gated on the features its examples use. The guides are
 // doc-only, so this is invisible to callers, and it stops a default-features
@@ -25,6 +28,8 @@
 pub mod client;
 #[cfg(feature = "http")]
 pub mod deployment;
+#[cfg(all(feature = "dynamic-tools", feature = "schema-validation"))]
+pub mod local_runtime;
 #[cfg(feature = "mcp-apps")]
 pub mod mcp_apps;
 #[cfg(feature = "oauth-client")]
