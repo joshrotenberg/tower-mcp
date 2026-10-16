@@ -2902,6 +2902,8 @@ use task::TypedTaskPreparer;
 pub(crate) use task::{LiveTask, TaskPreparer};
 pub use task::{PendingInput, TaskContext, TaskOutcome, TaskPreparation};
 pub(crate) use validation::SchemaValidation;
+#[cfg(feature = "schema-validation")]
+pub use validation::{SchemaError, check_schema};
 
 // Gated where they are defined, so importing them unconditionally would break
 // every build that is not `--all-features`.

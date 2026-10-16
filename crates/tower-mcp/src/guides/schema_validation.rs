@@ -188,4 +188,24 @@ take the process down.
 A `$ref` to a remote or file location is not resolved, so such a schema does
 not compile and is left unchecked as described above. Bundle the referenced
 definitions into the schema (`$defs`) instead.
+
+When the schema comes from something you load and can report against, such as
+a plugin, a script, or a config file, check it first with
+`tower_mcp::check_schema`. It compiles the schema with the same options the
+tool validator uses and returns the failure instead of logging it:
+
+```rust
+use serde_json::json;
+use tower_mcp::check_schema;
+
+let schema = json!({ "type": "object", "properties": { "n": { "type": "integr" } } });
+let error = check_schema(&schema).unwrap_err();
+assert_eq!(error.location(), "/properties/n/type");
+// Report it against the file the schema came from, and skip that tool.
+let report = format!("plugins/count.json: inputSchema {error}");
+assert!(report.starts_with("plugins/count.json: inputSchema at /properties/n/type: "));
+```
+
+Building a tool does not call `check_schema`, so a tool built from the same
+schema behaves as described above.
 "####]

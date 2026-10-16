@@ -513,6 +513,72 @@ mod enabled {
         }
     }
 
+    #[tokio::test]
+    async fn check_schema_accepts_a_schema_the_builder_enforces() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "n": { "type": "integer", "minimum": 1 } },
+            "required": ["n"]
+        });
+        assert_eq!(check_schema(&schema), Ok(()));
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let tool = ToolBuilder::new("checked")
+            .input_schema(schema)
+            .extractor_handler((), move |RawArgs(_): RawArgs| {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(CallToolResult::text("ok"))
+                }
+            })
+            .build();
+        let text = rejected(&tool, json!({ "n": 0 }), &calls).await;
+        assert!(text.contains("/n"), "got: {text}");
+    }
+
+    #[test]
+    fn check_schema_rejects_what_the_builder_leaves_unchecked() {
+        let cases = [
+            (json!({ "type": "object", "required": "n" }), "/required"),
+            (json!({ "type": "integr" }), "/type"),
+            (
+                json!({ "type": "object", "properties": { "n": { "minimum": "one" } } }),
+                "/properties/n/minimum",
+            ),
+            (
+                json!({ "type": "object", "properties": { "a": { "$ref": "https://example.com/s.json" } } }),
+                "",
+            ),
+        ];
+        for (schema, location) in cases {
+            let error = check_schema(&schema).expect_err(&schema.to_string());
+            if !location.is_empty() {
+                assert_eq!(error.location(), location, "{schema}: {error}");
+            }
+            assert!(!error.message().is_empty());
+            // The same options: what check_schema rejects, a tool leaves unchecked.
+            assert!(
+                super::super::engine::ToolSchemas::compile("bad", Some(&schema), None).is_none(),
+                "{schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_error_displays_its_location() {
+        let error = check_schema(&json!({ "type": "object", "required": "n" })).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("at /required: {}", error.message())
+        );
+
+        let error = check_schema(&json!(42)).unwrap_err();
+        assert_eq!(error.location(), "");
+        assert!(error.to_string().starts_with("at (root): "), "{error}");
+    }
+
     fn live_person_tool() -> Tool {
         ToolBuilder::new("live")
             .output_schema_for::<Summary>()

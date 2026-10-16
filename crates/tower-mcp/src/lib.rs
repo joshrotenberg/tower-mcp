@@ -719,6 +719,8 @@ pub use tool::{
     BoxToolService, GuardLayer, McpTool, NoParams, PendingInput, TaskContext, TaskOutcome,
     TaskPreparation, Tool, ToolBuilder, ToolHandler, ToolRequest,
 };
+#[cfg(feature = "schema-validation")]
+pub use tool::{SchemaError, check_schema};
 pub use trace_context::TraceContext;
 pub use transport::{
     BidirectionalStdioTransport, CatchError, GenericStdioTransport, StdioTransport,
