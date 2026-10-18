@@ -22,6 +22,12 @@
 //!
 //! # Authentication
 //!
+//! Transport diagnostics omit request/redirect URLs, raw HTTP error bodies,
+//! and arbitrary source chains, which can contain credentials. MCP JSON-RPC
+//! errors are still forwarded as protocol data; [`HttpStatusDetails`] retains
+//! authentication challenges and retry metadata. Treat that data as sensitive
+//! when logging it yourself.
+//!
 //! ```rust,no_run
 //! use tower_mcp::client::{McpClient, HttpClientTransport};
 //!
@@ -367,12 +373,11 @@ fn build_client(allow_cross_origin_redirects: bool) -> reqwest::Client {
         if should_follow_redirect(original, attempt.url(), allow_cross_origin_redirects) {
             attempt.follow()
         } else {
-            let target = attempt.url().to_string();
-            attempt.error(format!(
-                "redirect to a different origin ({target}) was not followed; set \
+            attempt.error(
+                "redirect to a different origin was not followed; set \
                  HttpClientConfig::follow_cross_origin_redirects to allow it (an https-to-http \
-                 downgrade is never followed)"
-            ))
+                 downgrade is never followed)",
+            )
         }
     });
     reqwest::Client::builder()
@@ -387,6 +392,11 @@ fn build_client(allow_cross_origin_redirects: bool) -> reqwest::Client {
 /// protocol. Manages session lifecycle (`mcp-session-id`), opens an SSE
 /// stream for server-initiated messages, and sends client requests via
 /// HTTP POST.
+///
+/// Transport-generated diagnostics omit URLs, raw HTTP error bodies, and
+/// untrusted error details. They retain error categories and HTTP status codes.
+/// MCP JSON-RPC errors and [`HttpStatusDetails`] remain protocol data and may
+/// contain sensitive values; avoid logging them verbatim.
 ///
 /// # How it works
 ///
@@ -1015,29 +1025,42 @@ struct HttpRequestSendError {
     connection_failed: bool,
 }
 
+// Neither Display, Debug, nor a source chain is safe: reqwest carries the URL,
+// and a custom redirect error can quote an entirely different URL.
+fn request_error_message(error: &reqwest::Error) -> String {
+    let category = if error.is_timeout() {
+        "timeout"
+    } else if error.is_redirect() {
+        "redirect rejected (check redirect policy)"
+    } else if error.is_connect() {
+        "connection failed"
+    } else if error.is_builder() {
+        "invalid request configuration"
+    } else if error.is_body() {
+        "response body I/O failed"
+    } else if error.is_decode() {
+        "response decoding failed"
+    } else {
+        "request failed"
+    };
+    match error.status() {
+        Some(status) => format!("HTTP request failed: {category} (HTTP {status})"),
+        None => format!("HTTP request failed: {category}"),
+    }
+}
+
 impl HttpRequestSendError {
     fn request(error: reqwest::Error) -> Self {
-        // reqwest::Error's Display doesn't walk its own source chain (e.g. a
-        // redirect failure's Display is just "error following redirect for
-        // url (...)"), so the useful detail -- here, the rejected redirect
-        // target from the custom policy in `build_client` -- lives in
-        // `source()` and has to be appended explicitly.
-        let mut message = format!("HTTP request failed: {error}");
-        let mut source = std::error::Error::source(&error);
-        while let Some(err) = source {
-            message.push_str(&format!(": {err}"));
-            source = err.source();
-        }
         Self {
-            message,
+            message: request_error_message(&error),
             connection_failed: true,
         }
     }
 
     #[cfg(feature = "oauth-client")]
-    fn oauth(error: OAuthClientError) -> Self {
+    fn oauth(_error: OAuthClientError) -> Self {
         Self {
-            message: error.to_string(),
+            message: "OAuth token acquisition failed".to_string(),
             connection_failed: false,
         }
     }
@@ -1171,27 +1194,22 @@ fn bearer_challenge(headers: &reqwest::header::HeaderMap) -> Option<OAuthBearerC
 
 fn http_status_error(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap) -> String {
     #[cfg(feature = "oauth-client")]
-    if let Some(challenge) = scope_challenge(headers) {
-        let mut message = format!(
-            "server returned HTTP {status}: insufficient_scope requires {}",
-            challenge.required_scopes.join(" ")
-        );
-        if let Some(resource_metadata) = challenge.resource_metadata {
-            message.push_str(&format!(" (resource metadata: {resource_metadata})"));
-        }
-        return message;
+    if scope_challenge(headers).is_some() {
+        return format!("server returned HTTP {status}: insufficient_scope");
     }
 
     // A 401 that reached here survived the re-authentication retry, so the
-    // replacement token was rejected too. Whatever the server said about why
-    // is the only lead the operator has, and reporting a bare status throws
-    // it away (#1370).
+    // replacement token was rejected too. Keep known RFC 6750 error codes,
+    // but never echo descriptions, scope values, or metadata URLs into logs.
+    // The original challenge remains in structured status data.
     #[cfg(feature = "oauth-client")]
     if let Some(challenge) = bearer_challenge(headers) {
-        let detail = challenge
-            .error_description
-            .or(challenge.error)
-            .unwrap_or_else(|| "no detail supplied".to_string());
+        let detail = match challenge.error.as_deref() {
+            Some("invalid_request") => "invalid_request",
+            Some("invalid_token") => "invalid_token",
+            Some("insufficient_scope") => "insufficient_scope",
+            _ => "authentication rejected",
+        };
         return format!("server returned HTTP {status}: {detail}");
     }
 
@@ -1247,9 +1265,9 @@ async fn read_bounded_body(
 
 /// Maximum bytes read for an HTTP error body before truncating it.
 ///
-/// Error bodies are only used in log lines and error messages, never as
-/// protocol data, so truncating is enough: failing the request over an
-/// oversized error page would be worse than surfacing a partial one.
+/// Error bodies are read to recognize MCP JSON-RPC error frames. An oversized
+/// or unrecognized body falls back to status-only diagnostics; raw bodies are
+/// never quoted in transport-generated errors or logs.
 const MAX_ERROR_BODY_SIZE: usize = 64 * 1024;
 
 /// Read a non-2xx response body up to [`MAX_ERROR_BODY_SIZE`], truncating
@@ -1418,7 +1436,7 @@ impl ClientTransport for HttpClientTransport {
             let token = provider
                 .get_token()
                 .await
-                .map_err(|e| Error::Transport(format!("Token provider error: {}", e)))?;
+                .map_err(|_| Error::Transport("Token provider failed".to_string()))?;
             request = request.headers(bearer_headers(&token).map_err(Error::Transport)?);
         }
 
@@ -1530,7 +1548,7 @@ impl ClientTransport for HttpClientTransport {
                         && session_expiry_on_404
                         && let Some(id) = &reply_id
                     {
-                        tracing::info!(body = %body, "HTTP 404 on a session request, signalling session expiry");
+                        tracing::info!("HTTP 404 on a session request, signalling session expiry");
                         let _ = tx.send(session_expired_frame(id)).await;
                         return;
                     }
@@ -1553,7 +1571,7 @@ impl ClientTransport for HttpClientTransport {
                         let is_session_signal =
                             v.pointer("/error/code").and_then(|c| c.as_i64()) == Some(-32005);
                         if reply_id.is_none() && !is_session_signal {
-                            tracing::warn!(status = %status, body = %body, "reply POST returned a JSON-RPC error body");
+                            tracing::warn!(status = %status, "reply POST returned a JSON-RPC error body");
                             return;
                         }
                         if !is_session_signal
@@ -1574,7 +1592,7 @@ impl ClientTransport for HttpClientTransport {
                         return;
                     }
 
-                    tracing::error!(status = %status, body = %body, "HTTP error from server");
+                    tracing::error!(status = %status, "HTTP error from server");
                     if let Some(id) = &reply_id {
                         let _ = tx
                             .send(transport_error_frame_with_data(
@@ -1685,12 +1703,13 @@ impl ClientTransport for HttpClientTransport {
                             }
                         }
                         Err(BoundedBodyError::Io(e)) => {
-                            tracing::error!(error = %e, "Failed to read response body");
+                            let message = request_error_message(&e);
+                            tracing::error!(error = %message, "Failed to read response body");
                             if let Some(id) = &reply_id {
                                 let _ = tx
                                     .send(transport_error_frame(
                                         id,
-                                        &format!("failed to read response body: {e}"),
+                                        &format!("failed to read response body: {message}"),
                                     ))
                                     .await;
                             }
@@ -1754,7 +1773,6 @@ impl ClientTransport for HttpClientTransport {
         }
 
         if !status.is_success() {
-            #[cfg(feature = "oauth-client")]
             let status_error = http_status_error(status, response.headers());
             let body = read_error_body(response).await;
             if is_modern_request
@@ -1782,25 +1800,13 @@ impl ClientTransport for HttpClientTransport {
                 return Err(Error::SessionExpired);
             }
             if status == reqwest::StatusCode::NOT_FOUND && self.session_id.is_none() {
-                return Err(Error::Transport(format!(
-                    "HTTP 404 from {}: MCP endpoint not found (check the endpoint path; \
-                     some servers serve MCP at the root, others at /mcp)",
-                    self.url
-                )));
+                return Err(Error::Transport(
+                    "HTTP 404: MCP endpoint not found (check the endpoint path; \
+                     some servers serve MCP at the root, others at /mcp)"
+                        .to_string(),
+                ));
             }
-            #[cfg(feature = "oauth-client")]
-            if status == reqwest::StatusCode::FORBIDDEN
-                && status_error.contains("insufficient_scope")
-            {
-                return Err(Error::Transport(if body.is_empty() {
-                    status_error
-                } else {
-                    format!("{status_error}: {body}")
-                }));
-            }
-            return Err(Error::Transport(format!(
-                "HTTP {status} from server: {body}"
-            )));
+            return Err(Error::Transport(status_error));
         }
 
         // Update session state
@@ -1866,7 +1872,10 @@ impl ClientTransport for HttpClientTransport {
                 return Ok(());
             }
             Err(BoundedBodyError::Io(e)) => {
-                return Err(Error::Transport(format!("Failed to read response: {}", e)));
+                return Err(Error::Transport(format!(
+                    "Failed to read response: {}",
+                    request_error_message(&e)
+                )));
             }
         };
 
@@ -2226,7 +2235,7 @@ async fn pump_post_sse(response: reqwest::Response, ctx: PostSseContext) {
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "POST SSE stream error");
+                tracing::warn!(error = %request_error_message(&e), "POST SSE stream error");
                 break;
             }
         }
@@ -2378,8 +2387,8 @@ async fn sse_stream_loop(params: SseLoopParams) {
                         break;
                     }
                 },
-                Err(e) => {
-                    tracing::warn!(error = %e, "Token provider failed for SSE connection");
+                Err(_) => {
+                    tracing::warn!("Token provider failed for SSE connection");
                     break;
                 }
             }
@@ -2400,7 +2409,7 @@ async fn sse_stream_loop(params: SseLoopParams) {
                 break;
             }
             Err(e) => {
-                tracing::warn!(error = %e, "SSE connection failed");
+                tracing::warn!(error = %request_error_message(&e), "SSE connection failed");
                 if !config.sse_reconnect || reconnect_attempts >= config.max_sse_reconnect_attempts
                 {
                     break;
@@ -2451,7 +2460,7 @@ async fn sse_stream_loop(params: SseLoopParams) {
                             }
                         }
                         Some(Err(e)) => {
-                            tracing::warn!(error = %e, "SSE stream error");
+                            tracing::warn!(error = %request_error_message(&e), "SSE stream error");
                             break;
                         }
                         None => {

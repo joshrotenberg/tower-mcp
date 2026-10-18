@@ -628,7 +628,7 @@ impl JwksValidator {
             Err(e) => {
                 // On fetch failure, keep stale keys but update fetched_at to avoid
                 // retrying immediately on every request
-                tracing::warn!(error = %e, "JWKS refresh failed, using stale cache");
+                tracing::warn!("JWKS refresh failed, retaining cached keys");
                 if cache.keys.is_empty() {
                     // No stale keys to fall back on
                     Err(e)
@@ -722,7 +722,11 @@ async fn fetch_and_parse_jwks(
     url: &str,
     default_ttl: std::time::Duration,
 ) -> std::result::Result<(HashMap<Option<String>, CachedKey>, std::time::Duration), JwksError> {
-    let response = client.get(url).send().await.map_err(JwksError::Fetch)?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| JwksError::Fetch(error.without_url()))?;
 
     let ttl = parse_cache_control_max_age(
         response
@@ -735,7 +739,7 @@ async fn fetch_and_parse_jwks(
     let jwks: jsonwebtoken::jwk::JwkSet = response
         .json()
         .await
-        .map_err(|e| JwksError::Parse(e.to_string()))?;
+        .map_err(|_| JwksError::Parse("invalid JWKS response".to_string()))?;
 
     let keys = parse_jwk_set(&jwks)?;
     Ok((keys, ttl))
