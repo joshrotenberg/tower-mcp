@@ -79,10 +79,10 @@ fn config() -> HttpClientConfig {
 }
 
 fn assert_private(text: &str) {
-    for secret in SECRETS {
+    for (index, secret) in SECRETS.iter().enumerate() {
         assert!(
             !text.contains(secret),
-            "secret in diagnostics: {secret}\n{text}"
+            "credential sentinel {index} appeared in transport diagnostics"
         );
     }
 }
@@ -117,7 +117,7 @@ async fn failed_initialization(url: &str, expected: &[&str]) {
         expected
             .iter()
             .any(|category| error.to_string().to_lowercase().contains(category)),
-        "{error}"
+        "the transport must report a useful error category"
     );
     client.shutdown().await.unwrap();
 }
