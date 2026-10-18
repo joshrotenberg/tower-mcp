@@ -101,7 +101,7 @@ async fn wait_for_log(logs: &Logs, message: &str) {
     .expect("expected transport diagnostic was not logged");
 }
 
-async fn failed_initialization(url: &str, expected: &str) {
+async fn failed_initialization(url: &str, expected: &[&str]) {
     let client = McpClient::connect(HttpClientTransport::with_config(url, config()))
         .await
         .unwrap();
@@ -114,7 +114,9 @@ async fn failed_initialization(url: &str, expected: &str) {
     .unwrap_err();
     assert_private(&error.to_string());
     assert!(
-        error.to_string().to_lowercase().contains(expected),
+        expected
+            .iter()
+            .any(|category| error.to_string().to_lowercase().contains(category)),
         "{error}"
     );
     client.shutdown().await.unwrap();
@@ -134,23 +136,29 @@ async fn credential_bearing_transport_failures_are_redacted() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let unavailable = format!("http://{}", listener.local_addr().unwrap());
     drop(listener);
-    failed_initialization(&secret_url(&unavailable), "connect").await;
-    failed_initialization("http://[sentinel-query", "configuration").await;
+    // Windows may reach the request deadline before its TCP stack reports
+    // refusal. Both outcomes must remain useful and credential-free.
+    failed_initialization(&secret_url(&unavailable), &["connect", "timeout"]).await;
+    failed_initialization("http://[sentinel-query", &["configuration"]).await;
 
     let stalled = serve(
         axum::Router::new().fallback(|| async { std::future::pending::<&'static str>().await }),
     )
     .await;
-    failed_initialization(&secret_url(&stalled.url), "timeout").await;
+    failed_initialization(&secret_url(&stalled.url), &["timeout"]).await;
 
     // A redirect error's source chain must not reveal its untrusted target.
-    let target = format!("{unavailable}/sentinel-redirect?key=sentinel-query");
+    // Reserve the target port so another fixture cannot reuse it and turn a
+    // cross-origin redirect into a same-origin redirect during this test.
+    let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_origin = format!("http://{}", target_listener.local_addr().unwrap());
+    let target = format!("{target_origin}/sentinel-redirect?key=sentinel-query");
     let redirect = serve(axum::Router::new().fallback(move || {
         let target = target.clone();
         async move { (StatusCode::TEMPORARY_REDIRECT, [("location", target)]) }
     }))
     .await;
-    failed_initialization(&secret_url(&redirect.url), "redirect").await;
+    failed_initialization(&secret_url(&redirect.url), &["redirect"]).await;
 
     // Initial 404/500 failures must not echo URLs or raw HTML/text bodies.
     for status in [StatusCode::NOT_FOUND, StatusCode::INTERNAL_SERVER_ERROR] {
@@ -159,7 +167,7 @@ async fn credential_bearing_transport_failures_are_redacted() {
                 .fallback(move || async move { (status, "sentinel-body: reflected credentials") }),
         )
         .await;
-        failed_initialization(&secret_url(&server.url), status.as_str()).await;
+        failed_initialization(&secret_url(&server.url), &[status.as_str()]).await;
     }
 
     // Authentication descriptions/metadata URLs are untrusted too. They must
@@ -170,7 +178,7 @@ async fn credential_bearing_transport_failures_are_redacted() {
             (StatusCode::FORBIDDEN, [("www-authenticate",
                 "Bearer error=\"insufficient_scope\", scope=\"sentinel-header\", resource_metadata=\"https://example.test/sentinel-query\"")], "sentinel-body")
         })).await;
-        failed_initialization(&secret_url(&server.url), "insufficient_scope").await;
+        failed_initialization(&secret_url(&server.url), &["insufficient_scope"]).await;
     }
 
     // Established requests use the background POST path. A transient HTTP
@@ -218,7 +226,7 @@ async fn credential_bearing_transport_failures_are_redacted() {
 
     // The standalone notification GET uses another background task. A
     // rejected redirect there must also omit its URL from the SSE error log.
-    let target = format!("{unavailable}/sentinel-redirect");
+    let target = format!("{target_origin}/sentinel-redirect");
     let router =
         HttpTransport::new(McpRouter::new())
             .into_router()
