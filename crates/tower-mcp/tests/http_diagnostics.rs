@@ -258,6 +258,53 @@ async fn credential_bearing_transport_failures_are_redacted() {
     wait_for_log(&logs, "SSE connection failed").await;
     client.shutdown().await.unwrap();
 
+    // JWKS fetch errors and refresh warnings must not echo credential URLs
+    // or reflected response data either.
+    #[cfg(feature = "jwks")]
+    {
+        use tower_mcp::oauth::{JwksValidator, TokenValidator};
+        let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let state = failing.clone();
+        let jwks = serve(axum::Router::new().fallback(move || {
+            let state = state.clone();
+            async move {
+                if state.load(std::sync::atomic::Ordering::SeqCst) {
+                    ([("cache-control", "max-age=0")], "sentinel-body")
+                } else {
+                    ([("cache-control", "max-age=0")], r#"{"keys":[]}"#)
+                }
+            }
+        }))
+        .await;
+        let validator = JwksValidator::builder(secret_url(&jwks.url))
+            .build()
+            .await
+            .unwrap();
+        failing.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Respect the validator's public ten-second refresh throttle.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let error = validator
+            .validate_token("eyJhbGciOiJSUzI1NiIsImtpZCI6Im1pc3NpbmcifQ.e30.AA")
+            .await
+            .unwrap_err();
+        assert_private(&error.to_string());
+        wait_for_log(&logs, "JWKS refresh failed").await;
+
+        let redirect_loop = serve(axum::Router::new().fallback(|| async {
+            (
+                StatusCode::TEMPORARY_REDIRECT,
+                [("location", "/sentinel-redirect?key=sentinel-query")],
+            )
+        }))
+        .await;
+        let result = JwksValidator::builder(secret_url(&redirect_loop.url))
+            .build()
+            .await;
+        let error = result.err().expect("redirect loop must fail JWKS fetching");
+        assert_private(&error.to_string());
+        assert_private(&format!("{error:?}"));
+    }
+
     let captured = logs.0.lock().unwrap();
     let captured = String::from_utf8_lossy(&captured);
     assert!(
