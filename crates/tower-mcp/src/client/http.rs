@@ -255,6 +255,13 @@ pub struct HttpClientConfig {
     /// to disclose there. A redirect from `https` to a non-`https` scheme is
     /// never followed, even with this enabled, since that would send those
     /// headers in plaintext.
+    ///
+    /// This only widens where a redirect may lead. Whatever the origin, the
+    /// client follows only `307` and `308`: they resend the request with its
+    /// method and body, whereas `301`, `302`, and `303` would turn the
+    /// JSON-RPC `POST` into a bodyless `GET`. Those statuses are not followed;
+    /// the request fails with the 3xx status, so point the client at the
+    /// final URL.
     /// Default: `false`.
     pub follow_cross_origin_redirects: bool,
 }
@@ -334,6 +341,21 @@ const MAX_REDIRECT_HOPS: usize = 10;
 /// first, and a response with no entry is treated as a first page.
 const MAX_PENDING_TOOLS_LISTS: usize = 64;
 
+/// Whether a redirect with this status is safe to follow for an MCP request.
+///
+/// Only `307` and `308` resend the request with its method and body. For
+/// `301`, `302`, and `303` reqwest rewrites a `POST` into a bodyless `GET`, so
+/// the JSON-RPC message would be dropped and the server would answer a request
+/// it never received. The redirect policy cannot see the method, so this
+/// applies to the SSE `GET` and the session `DELETE` too; the `initialize`
+/// `POST` has to succeed before either is sent.
+fn redirect_preserves_request(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::TEMPORARY_REDIRECT | reqwest::StatusCode::PERMANENT_REDIRECT
+    )
+}
+
 /// Whether a redirect from `original` (the request's starting URL) to
 /// `target` (the `Location` it was just pointed at) should be followed.
 ///
@@ -367,6 +389,12 @@ fn should_follow_redirect(
 /// [`HttpClientConfig::follow_cross_origin_redirects`].
 fn build_client(allow_cross_origin_redirects: bool) -> reqwest::Client {
     let policy = reqwest::redirect::Policy::custom(move |attempt| {
+        // Hand the 3xx response back instead of following it: the caller then
+        // gets a plain non-success status (see `http_status_error`), and the
+        // transport stays connected, unlike a policy error.
+        if !redirect_preserves_request(attempt.status()) {
+            return attempt.stop();
+        }
         if attempt.previous().len() > MAX_REDIRECT_HOPS {
             return attempt.error("too many redirects");
         }
@@ -1253,6 +1281,20 @@ fn http_status_error(status: reqwest::StatusCode, headers: &reqwest::header::Hea
 
     #[cfg(not(feature = "oauth-client"))]
     let _ = headers;
+    // A 301/302/303 reaches here because the redirect policy declines to
+    // follow it. Only that is reported: the `Location` is a URL, which
+    // diagnostics leave out.
+    if matches!(
+        status,
+        reqwest::StatusCode::MOVED_PERMANENTLY
+            | reqwest::StatusCode::FOUND
+            | reqwest::StatusCode::SEE_OTHER
+    ) {
+        return format!(
+            "server returned HTTP {status}: redirect not followed (only 307 and 308 keep \
+             the request body; use the final URL)"
+        );
+    }
     format!("server returned HTTP {status}")
 }
 
@@ -3985,6 +4027,20 @@ mod tests {
 
     fn url(s: &str) -> reqwest::Url {
         reqwest::Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn only_body_preserving_redirect_statuses_are_followed() {
+        use reqwest::StatusCode;
+        assert!(redirect_preserves_request(StatusCode::TEMPORARY_REDIRECT));
+        assert!(redirect_preserves_request(StatusCode::PERMANENT_REDIRECT));
+        for status in [
+            StatusCode::MOVED_PERMANENTLY,
+            StatusCode::FOUND,
+            StatusCode::SEE_OTHER,
+        ] {
+            assert!(!redirect_preserves_request(status), "{status}");
+        }
     }
 
     #[test]

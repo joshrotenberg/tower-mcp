@@ -4470,6 +4470,142 @@ async fn same_origin_redirect_is_followed() {
     );
 }
 
+/// A same-origin `307` or `308` resends the `POST` with its JSON-RPC body
+/// intact (#1590).
+#[tokio::test]
+async fn same_origin_307_and_308_redirects_keep_the_post_body() {
+    for status in ["307 Temporary Redirect", "308 Permanent Redirect"] {
+        let base = Arc::new(std::sync::OnceLock::new());
+        let base_for_server = base.clone();
+        let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+        let bodies_for_server = bodies.clone();
+        let url = spawn_raw_server(move |req| {
+            let body = req.split_once("\r\n\r\n").map_or("", |(_, body)| body);
+            if req.starts_with("POST / ") {
+                let base: &String = base_for_server.get().expect("base url set");
+                raw_response(status, &format!("Location: {base}/redirected\r\n"), "")
+            } else if req.starts_with("POST /redirected ") {
+                if raw_is(req, "initialize") {
+                    bodies_for_server.lock().unwrap().push(body.to_string());
+                    raw_initialize_ok(req)
+                } else {
+                    raw_response("202 Accepted", "", "")
+                }
+            } else {
+                raw_response("405 Method Not Allowed", "", "")
+            }
+        })
+        .await;
+        base.set(url.clone()).unwrap();
+
+        let client = McpClient::connect(HttpClientTransport::with_config(url, raw_client_config()))
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            client.initialize("raw-client", "1.0.0"),
+        )
+        .await
+        .expect("a followed redirect should not hang")
+        .unwrap_or_else(|error| panic!("{status} must be followed: {error}"));
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1, "{status}: one redirected POST");
+        let sent: serde_json::Value = serde_json::from_str(&bodies[0])
+            .unwrap_or_else(|error| panic!("{status}: body was not preserved: {error}"));
+        assert_eq!(sent["method"], "initialize", "{status}");
+    }
+}
+
+/// `301`, `302`, and `303` would make reqwest resend the `POST` as a bodyless
+/// `GET`, so none is followed: the caller gets the status as a plain error,
+/// the redirect target never sees a request, and the transport stays
+/// connected for the next call (#1590).
+#[tokio::test]
+async fn post_301_302_303_redirects_are_not_followed() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    for status in ["301 Moved Permanently", "302 Found", "303 See Other"] {
+        let seen_by_target = Arc::new(AtomicUsize::new(0));
+        let seen_by_target_clone = seen_by_target.clone();
+        let base = Arc::new(std::sync::OnceLock::new());
+        let base_for_server = base.clone();
+        let url = spawn_raw_server(move |req| {
+            if req.starts_with("POST /moved ") {
+                seen_by_target_clone.fetch_add(1, Ordering::SeqCst);
+                raw_response("200 OK", RAW_JSON, "{}")
+            } else if raw_is(req, "initialize") {
+                raw_initialize_ok(req)
+            } else if raw_is(req, "notifications/initialized") {
+                raw_response("202 Accepted", "", "")
+            } else if raw_is(req, "tools/list") {
+                let base: &String = base_for_server.get().expect("base url set");
+                raw_response(status, &format!("Location: {base}/moved\r\n"), "")
+            } else {
+                let reply = format!(
+                    r#"{{"jsonrpc":"2.0","id":{},"result":{{}}}}"#,
+                    raw_request_id(req)
+                );
+                raw_response("200 OK", RAW_JSON, &reply)
+            }
+        })
+        .await;
+        base.set(url.clone()).unwrap();
+
+        let client = McpClient::connect(HttpClientTransport::with_config(url, raw_client_config()))
+            .await
+            .unwrap();
+        client.initialize("raw-client", "1.0.0").await.unwrap();
+
+        let error = tokio::time::timeout(Duration::from_secs(3), client.list_tools())
+            .await
+            .unwrap_or_else(|_| panic!("{status}: the caller hung instead of failing"))
+            .expect_err("a redirect that drops the body must not be followed")
+            .to_string();
+        let code = &status[..3];
+        assert!(
+            error.contains(&format!("HTTP {code}")) && error.contains("redirect not followed"),
+            "{status}: the error should name the status and the redirect, got: {error}"
+        );
+        assert!(!error.contains("/moved"), "{status}: no URL in diagnostics");
+        assert_eq!(
+            seen_by_target.load(Ordering::SeqCst),
+            0,
+            "{status}: the redirect target must never receive the request"
+        );
+
+        // A non-success status fails that request alone.
+        tokio::time::timeout(Duration::from_secs(3), client.ping())
+            .await
+            .unwrap_or_else(|_| panic!("{status}: ping hung"))
+            .unwrap_or_else(|error| panic!("{status}: transport unusable after: {error}"));
+        client.shutdown().await.unwrap();
+    }
+}
+
+/// The same holds before a session exists: a `302` on `initialize` fails it
+/// with the redirect named instead of a timeout.
+#[tokio::test]
+async fn pre_session_302_redirect_fails_initialize_clearly() {
+    let url = spawn_raw_server(|_| raw_response("302 Found", "Location: /elsewhere\r\n", "")).await;
+    let client = McpClient::connect(HttpClientTransport::with_config(url, raw_client_config()))
+        .await
+        .unwrap();
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.initialize("raw-client", "1.0.0"),
+    )
+    .await
+    .expect("initialize hung on a 302")
+    .expect_err("a 302 must not be followed")
+    .to_string();
+    assert!(
+        error.contains("HTTP 302") && error.contains("redirect not followed"),
+        "got: {error}"
+    );
+}
+
 /// A cross-origin `307` (different port, so a different origin on
 /// `127.0.0.1`) is not followed by default: the target never sees the
 /// request, and the caller fails instead of hanging.
