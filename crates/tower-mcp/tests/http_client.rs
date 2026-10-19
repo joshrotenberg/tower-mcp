@@ -1312,10 +1312,11 @@ mod token_provider_tests {
         let client = McpClient::connect(transport).await.unwrap();
 
         client.initialize("test-client", "1.0.0").await.unwrap();
-        let error = client.list_tools().await.unwrap_err().to_string();
+        let error = client.list_tools().await.unwrap_err();
 
-        assert!(error.contains("insufficient_scope"));
-        assert!(error.contains("tools.read"));
+        assert!(error.to_string().contains("insufficient_scope"));
+        let details = HttpStatusDetails::from_error(&error).unwrap();
+        assert!(details.www_authenticate.unwrap().contains("tools.read"));
         assert_eq!(request_count.load(Ordering::SeqCst), 4);
         assert_eq!(requests.lock().unwrap().len(), 3);
     }
@@ -3549,7 +3550,7 @@ async fn pre_session_404_reports_endpoint_not_found() {
         .expect_err("initialize against a wrong path must fail");
     let msg = err.to_string();
     assert!(
-        msg.contains("404") && msg.contains("/nope") && msg.contains("endpoint"),
+        msg.contains("404") && msg.contains("endpoint") && !msg.contains(&url),
         "expected an endpoint-not-found transport error, got: {msg}"
     );
     assert!(
@@ -4287,11 +4288,10 @@ async fn session_response_at_exact_limit_still_parses() {
 }
 
 /// Error bodies are capped independently of `max_response_body_size` at a
-/// small fixed size and truncated rather than failed: the request must still
-/// fail with the HTTP error itself, not a size-limit error, and the oversized
-/// body must not appear in full in the surfaced message.
+/// small fixed size and omitted from diagnostics: the request must still
+/// fail with the HTTP error itself, not a size-limit error.
 #[tokio::test]
-async fn pre_session_oversized_error_body_is_truncated_not_failed_by_size() {
+async fn pre_session_oversized_error_body_is_omitted_not_failed_by_size() {
     let huge_body = "x".repeat(200 * 1024); // well over the 64 KiB error-body cap
     let url =
         spawn_raw_server(move |_| raw_response("500 Internal Server Error", RAW_JSON, &huge_body))
@@ -4315,9 +4315,10 @@ async fn pre_session_oversized_error_body_is_truncated_not_failed_by_size() {
     );
     assert!(
         error.len() < 200 * 1024,
-        "the oversized error body should be truncated in the surfaced message, got {} bytes",
+        "the oversized error body should be omitted from the surfaced message, got {} bytes",
         error.len()
     );
+    assert!(!error.contains("xxxxxxxx"), "raw error bodies are private");
 }
 
 /// Before a session exists, `initialize`'s response goes through the
@@ -4455,8 +4456,8 @@ async fn cross_origin_redirect_is_not_followed_by_default() {
         .expect_err("a cross-origin redirect must not be followed by default")
         .to_string();
     assert!(
-        error.contains(&format!("{url_target}/redirected")),
-        "the error should name the redirect target, got: {error}"
+        error.contains("redirect") && !error.contains(&url_target),
+        "the error should identify a redirect failure without its URL, got: {error}"
     );
     assert_eq!(
         seen_by_target.load(Ordering::SeqCst),
@@ -4574,8 +4575,8 @@ async fn established_session_cross_origin_redirect_fails_without_hanging() {
         .expect_err("a cross-origin redirect must not be followed by default")
         .to_string();
     assert!(
-        error.contains(&format!("{url_target}/redirected")),
-        "the error should name the redirect target, got: {error}"
+        error.contains("redirect") && !error.contains(&url_target),
+        "the error should identify a redirect failure without its URL, got: {error}"
     );
     assert_eq!(
         seen_by_target.load(Ordering::SeqCst),
