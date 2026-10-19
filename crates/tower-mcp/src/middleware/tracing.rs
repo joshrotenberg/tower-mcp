@@ -42,6 +42,8 @@
 //! use the two fields to correlate the span with the caller's trace. Handlers
 //! read the same value with
 //! [`RequestContext::trace_context`](crate::context::RequestContext::trace_context).
+//! The [tracing guide](crate::guides::tracing) shows a layer that does set the
+//! OpenTelemetry parent.
 //!
 //! # Log Levels
 //!

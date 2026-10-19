@@ -19,6 +19,8 @@
 //! - [`local_runtime`]: serving tools, resources and prompts backed by
 //!   `!Send` state, such as an embedded interpreter, through a channel to a
 //!   task on a `LocalSet`, and reloading them as one set.
+//! - [`tracing`]: sending and reading W3C trace context (SEP-414) and linking
+//!   it to OpenTelemetry with `tracing-opentelemetry`.
 
 // Each guide is gated on the features its examples use. The guides are
 // doc-only, so this is invisible to callers, and it stops a default-features
@@ -37,3 +39,4 @@ pub mod oauth;
 pub mod protocol_versions;
 #[cfg(feature = "schema-validation")]
 pub mod schema_validation;
+pub mod tracing;
