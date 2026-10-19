@@ -16,7 +16,7 @@ outside a trusted network.
 
 ```toml
 [dependencies]
-tower-mcp = { version = "0.24", features = ["http"] }
+tower-mcp = { version = "0.25", features = ["http"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 axum = "0.8"
 ```
@@ -290,7 +290,7 @@ check against a fresh one, and panics with the rule it found broken:
 
 ```toml
 [dev-dependencies]
-tower-mcp = { version = "0.24", features = ["http", "testing"] }
+tower-mcp = { version = "0.25", features = ["http", "testing"] }
 ```
 
 ```rust,ignore

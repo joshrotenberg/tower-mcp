@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [0.25.0] - 2026-10-19
 
+### Upgrade notes
+
+- **HTTP session status codes (breaking).** On the 2025 session path, a request for an unknown, expired, terminated or other-principal session now gets HTTP 404, and a request missing a required `Mcp-Session-Id` gets HTTP 400, on POST, GET and DELETE. The JSON-RPC bodies (`-32005`, `-32006`) are unchanged. Spec clients (rmcp, the TypeScript and Python SDKs) now re-initialize on expiry; anything that expected HTTP 200 for these must accept 404/400. DELETE of an unknown id is 404 instead of 200, and a DELETE now removes a session held only in a shared `SessionStore` (#1591, #1597).
+- **`McpClientBuilder` is no longer `UnwindSafe` / `RefUnwindSafe`,** because it can hold the new `trace_context_provider` closure (#1595).
+- **HTTP client redirects.** The default client follows only 307 and 308; a 301, 302 or 303 now fails with a clear error instead of turning the POST into a bodyless GET. Configure the final URL for an endpoint that redirects (#1592).
+- **`output_schema_for::<T>()`** describes `T` as it serializes. An always-written `Option` field is now required (nullable), and serialize-side renames apply. With `schema-validation`, structured content that omits such a field now fails output validation (#1593).
+- **Request ids** written as integral floats (`1.0`) are accepted and answered with the integer (#1593).
+- **Diagnostics.** HTTP and JWKS transport errors and logs no longer include URLs, response bodies, redirect targets or scope values; they report safe categories, status codes and known OAuth error codes. `HttpStatusDetails` still carries structured status data (#1586).
+- **stdio.** On Linux, when stdin and stdout are pipes, the server transports use non-blocking I/O on a private file description instead of tokio's blocking pool, so a server exits after shutdown even if the client keeps stdin open. `StdioPipes::Shared` extends this to macOS pipes and sockets; `StdioPipes::Blocking` restores the old path (#1596).
+- **`ChildProcessConnection::shutdown`** sends SIGTERM before SIGKILL, so it can take up to 10 s instead of 5 s (#1593).
+- **New APIs:**
+  - `replace_all` on the dynamic registries (one `list_changed`, returns a `RegistryChange`), `check_schema`, and `ResourceTemplateBuilder::handler_with_context` (#1584);
+  - `McpClientBuilder::trace_context_provider` and the `guides::tracing` OpenTelemetry guide (#1595);
+  - the `guides::local_runtime` guide for `!Send` runtimes, with `examples/lua-tools` as a worked example (#1584, #1587).
+
 ### Bug Fixes
 
 - Redact sensitive HTTP and JWKS diagnostics ([#1586](https://github.com/joshrotenberg/tower-mcp/pull/1586))
