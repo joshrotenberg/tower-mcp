@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.25.0] - 2026-10-19
+
+### Bug Fixes
+
+- Accept integral-float request ids, build outputSchema for the serialize contract, SIGTERM before SIGKILL in childproc ([#1593](https://github.com/joshrotenberg/tower-mcp/pull/1593))
+
+
+
 ## [0.24.0] - 2026-10-15
 
 ### Bug Fixes

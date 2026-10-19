@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.25.0] - 2026-10-19
+
+### Bug Fixes
+
+- Redact sensitive HTTP and JWKS diagnostics ([#1586](https://github.com/joshrotenberg/tower-mcp/pull/1586))
+- [**breaking**] **http:** Answer an unknown session id with 404 and a missing session id with 400 ([#1591](https://github.com/joshrotenberg/tower-mcp/pull/1591))
+- **client:** Keep x-mcp-header mappings across tools/list pages and follow only 307/308 redirects ([#1592](https://github.com/joshrotenberg/tower-mcp/pull/1592))
+- Accept integral-float request ids, build outputSchema for the serialize contract, SIGTERM before SIGKILL in childproc ([#1593](https://github.com/joshrotenberg/tower-mcp/pull/1593))
+- **http:** DELETE removes a session that lives only in the shared SessionStore ([#1597](https://github.com/joshrotenberg/tower-mcp/pull/1597))
+
+### Features
+
+- Batch registry replace, check_schema, template context handler, !Send guide ([#1584](https://github.com/joshrotenberg/tower-mcp/pull/1584))
+- **client:** Send W3C trace context on each request, and document OpenTelemetry linking ([#1595](https://github.com/joshrotenberg/tower-mcp/pull/1595))
+- **stdio:** Serve piped stdio without tokio's blocking pool, so shutdown no longer waits on stdin ([#1596](https://github.com/joshrotenberg/tower-mcp/pull/1596))
+
+
+
 ## [0.24.0] - 2026-10-15
 
 ### Upgrade notes
