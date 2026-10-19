@@ -664,6 +664,288 @@ async fn request_log_level_does_not_change_stable_wire() {
     );
 }
 
+const TEST_TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+fn test_trace_context() -> crate::TraceContext {
+    crate::TraceContext::parse(TEST_TRACEPARENT, Some("vendor=value")).unwrap()
+}
+
+fn sent_messages(outgoing: &Arc<Mutex<Vec<String>>>) -> Vec<serde_json::Value> {
+    outgoing
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|message| serde_json::from_str(message).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn trace_context_provider_marks_stable_requests_but_not_notifications() {
+    let transport = MockTransport::with_responses(vec![
+        mock_initialize_response(),
+        serde_json::json!({}),
+        serde_json::json!({"content": [{"type": "text", "text": "done"}]}),
+    ]);
+    let outgoing = transport.outgoing.clone();
+    let client = McpClient::builder()
+        .trace_context_provider(|| Some(test_trace_context()))
+        .connect_simple(transport)
+        .await
+        .unwrap();
+
+    client.initialize("test-client", "1.0.0").await.unwrap();
+    // A request with no arguments still gets a `_meta` object to carry it.
+    client.ping().await.unwrap();
+    client
+        .call_tool("work", serde_json::json!({}))
+        .await
+        .unwrap();
+    client
+        .notify("notifications/custom", &serde_json::json!({}))
+        .await
+        .unwrap();
+
+    let messages = sent_messages(&outgoing);
+    let methods: Vec<_> = messages
+        .iter()
+        .map(|message| message["method"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        methods,
+        [
+            "initialize",
+            "notifications/initialized",
+            "ping",
+            "tools/call",
+            "notifications/custom"
+        ]
+    );
+    for index in [0, 2, 3] {
+        let meta = &messages[index]["params"]["_meta"];
+        assert_eq!(meta["traceparent"], TEST_TRACEPARENT, "{}", messages[index]);
+        assert_eq!(meta["tracestate"], "vendor=value", "{}", messages[index]);
+    }
+    for index in [1, 4] {
+        assert!(
+            messages[index]["params"].get("_meta").is_none(),
+            "a notification must not carry trace context: {}",
+            messages[index]
+        );
+    }
+}
+
+#[tokio::test]
+async fn trace_context_without_tracestate_sends_only_traceparent() {
+    let transport = MockTransport::with_responses(vec![serde_json::json!({})]);
+    let outgoing = transport.outgoing.clone();
+    let client = McpClient::builder()
+        .trace_context_provider(|| crate::TraceContext::parse(TEST_TRACEPARENT, None))
+        .connect_simple(transport)
+        .await
+        .unwrap();
+
+    client.ping().await.unwrap();
+
+    let meta = &sent_messages(&outgoing)[0]["params"]["_meta"];
+    assert_eq!(meta["traceparent"], TEST_TRACEPARENT);
+    assert!(meta.get("tracestate").is_none());
+}
+
+#[tokio::test]
+async fn no_provider_or_no_context_sends_no_trace_keys() {
+    for provider in [false, true] {
+        let transport = MockTransport::with_responses(vec![
+            mock_initialize_response(),
+            serde_json::json!({"content": [{"type": "text", "text": "done"}]}),
+        ]);
+        let outgoing = transport.outgoing.clone();
+        let mut builder = McpClient::builder();
+        if provider {
+            // A provider with nothing to report, such as outside any trace.
+            builder = builder.trace_context_provider(|| None);
+        }
+        let client = builder.connect_simple(transport).await.unwrap();
+
+        client.initialize("test-client", "1.0.0").await.unwrap();
+        client
+            .call_tool("work", serde_json::json!({}))
+            .await
+            .unwrap();
+
+        for message in sent_messages(&outgoing) {
+            assert!(
+                message["params"]["_meta"].get("traceparent").is_none()
+                    && message["params"]["_meta"].get("tracestate").is_none(),
+                "provider={provider}: {message}"
+            );
+        }
+        // The typed call keeps its ordinary params shape.
+        assert!(sent_messages(&outgoing)[2]["params"].get("_meta").is_none());
+    }
+}
+
+#[tokio::test]
+async fn invalid_trace_context_is_never_sent() {
+    // `TraceContext` has no unchecked constructor, so a provider that tries
+    // to hand over a malformed value ends up with `None`.
+    let transport = MockTransport::with_responses(vec![serde_json::json!({})]);
+    let outgoing = transport.outgoing.clone();
+    let client = McpClient::builder()
+        .trace_context_provider(|| {
+            crate::TraceContext::parse(
+                "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+                Some("vendor=value"),
+            )
+        })
+        .connect_simple(transport)
+        .await
+        .unwrap();
+
+    client.ping().await.unwrap();
+
+    let message = &sent_messages(&outgoing)[0];
+    assert!(message["params"]["_meta"].get("traceparent").is_none());
+    assert!(message["params"]["_meta"].get("tracestate").is_none());
+}
+
+#[tokio::test]
+async fn trace_context_does_not_overwrite_caller_meta() {
+    let transport = MockTransport::with_responses(vec![
+        serde_json::json!({"content": [{"type": "text", "text": "done"}]}),
+        serde_json::json!({"content": [{"type": "text", "text": "done"}]}),
+    ]);
+    let outgoing = transport.outgoing.clone();
+    let client = McpClient::builder()
+        .trace_context_provider(|| Some(test_trace_context()))
+        .connect_simple(transport)
+        .await
+        .unwrap();
+
+    let caller_traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00";
+    let _: CallToolResult = client
+        .request(
+            "tools/call",
+            &serde_json::json!({
+                "name": "work",
+                "arguments": {},
+                "_meta": {"traceparent": caller_traceparent, "other": 1},
+            }),
+        )
+        .await
+        .unwrap();
+    // Either key is enough: the provider's pair is not mixed with it.
+    let _: CallToolResult = client
+        .request(
+            "tools/call",
+            &serde_json::json!({
+                "name": "work",
+                "arguments": {},
+                "_meta": {"tracestate": "caller=1"},
+            }),
+        )
+        .await
+        .unwrap();
+
+    let messages = sent_messages(&outgoing);
+    let meta = &messages[0]["params"]["_meta"];
+    assert_eq!(meta["traceparent"], caller_traceparent);
+    assert_eq!(meta["other"], 1);
+    assert!(meta.get("tracestate").is_none(), "{meta}");
+    let meta = &messages[1]["params"]["_meta"];
+    assert_eq!(meta["tracestate"], "caller=1");
+    assert!(meta.get("traceparent").is_none(), "{meta}");
+}
+
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+#[tokio::test]
+async fn final_requests_carry_trace_context_beside_protocol_meta() {
+    let transport = MockTransport::with_responses(vec![
+        final_discover_result(),
+        serde_json::json!({
+            "resultType": "complete",
+            "tools": [],
+            "ttlMs": 0,
+            "cacheScope": "private"
+        }),
+        serde_json::json!({
+            "resultType": "complete",
+            "content": [{"type": "text", "text": "done"}]
+        }),
+    ]);
+    let outgoing = transport.outgoing.clone();
+    let client = McpClient::builder()
+        .protocol_support(ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+        .trace_context_provider(|| Some(test_trace_context()))
+        .connect_simple(transport)
+        .await
+        .unwrap();
+
+    client.discover("test-client", "1.0.0").await.unwrap();
+    client.list_tools().await.unwrap();
+    let caller_traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00";
+    let _: CallToolResult = client
+        .request(
+            "tools/call",
+            &serde_json::json!({
+                "name": "work",
+                "arguments": {},
+                "_meta": {"traceparent": caller_traceparent},
+            }),
+        )
+        .await
+        .unwrap();
+
+    let messages = sent_messages(&outgoing);
+    assert_eq!(messages.len(), 3);
+    for message in &messages {
+        let meta = &message["params"]["_meta"];
+        assert_eq!(
+            meta["io.modelcontextprotocol/protocolVersion"], "2026-07-28",
+            "{message}"
+        );
+    }
+    for message in &messages[..2] {
+        let meta = &message["params"]["_meta"];
+        assert_eq!(meta["traceparent"], TEST_TRACEPARENT, "{message}");
+        assert_eq!(meta["tracestate"], "vendor=value", "{message}");
+    }
+    assert_eq!(
+        messages[2]["params"]["_meta"]["traceparent"], caller_traceparent,
+        "a caller-set traceparent must win on the final protocol too"
+    );
+    assert!(messages[2]["params"]["_meta"].get("tracestate").is_none());
+}
+
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+#[tokio::test]
+async fn final_subscription_listen_carries_trace_context() {
+    let transport = SubscriptionTestTransport::new();
+    let outgoing = transport.outgoing.clone();
+    let client = McpClient::builder()
+        .protocol_support(ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+        .trace_context_provider(|| Some(test_trace_context()))
+        .connect_simple(transport)
+        .await
+        .unwrap();
+    client.discover("test-client", "1.0.0").await.unwrap();
+
+    let handle = client
+        .listen_subscriptions(SubscriptionFilter {
+            prompts_list_changed: Some(true),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    drop(handle);
+
+    let messages = sent_messages(&outgoing);
+    let listen = messages
+        .iter()
+        .find(|message| message["method"] == "subscriptions/listen")
+        .expect("subscriptions/listen was sent");
+    assert_eq!(listen["params"]["_meta"]["traceparent"], TEST_TRACEPARENT);
+}
+
 #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
 struct SubscriptionTestTransport {
     incoming_tx: mpsc::Sender<String>,

@@ -453,10 +453,16 @@ pub struct McpClient {
     progress_tokens: Option<Arc<AtomicI64>>,
     /// Default log threshold attached to future 2026-07-28 requests.
     request_log_level: RwLock<Option<LogLevel>>,
+    /// Source of the trace context attached to each request's `_meta`.
+    trace_context_provider: Option<TraceContextProvider>,
     /// Allocator for JSON-RPC request ids, shared with the message loop so
     /// caller-issued and loop-issued ids never collide.
     next_request_id: Arc<AtomicI64>,
 }
+
+/// Source of the W3C trace context attached to outgoing requests.
+type TraceContextProvider =
+    Arc<dyn Fn() -> Option<crate::trace_context::TraceContext> + Send + Sync>;
 
 /// Settings a builder hands to the connect path, grouped so the private
 /// constructor keeps one parameter per concern rather than one per field.
@@ -468,6 +474,7 @@ struct ClientSettings {
     cache_config: ClientCacheConfig,
     request_progress: bool,
     request_log_level: Option<LogLevel>,
+    trace_context_provider: Option<TraceContextProvider>,
 }
 
 /// Builder for configuring and connecting an [`McpClient`].
@@ -517,6 +524,7 @@ pub struct McpClientBuilder {
     cache_config: ClientCacheConfig,
     request_progress: bool,
     request_log_level: Option<LogLevel>,
+    trace_context_provider: Option<TraceContextProvider>,
 }
 
 impl McpClientBuilder {
@@ -535,6 +543,7 @@ impl McpClientBuilder {
             cache_config: ClientCacheConfig::default(),
             request_progress: false,
             request_log_level: None,
+            trace_context_provider: None,
         }
     }
 
@@ -568,6 +577,47 @@ impl McpClientBuilder {
     /// cleared with [`McpClient::set_request_log_level`]. It is off by default.
     pub fn request_log_level(mut self, level: LogLevel) -> Self {
         self.request_log_level = Some(level);
+        self
+    }
+
+    /// Send W3C trace context (SEP-414) on every request.
+    ///
+    /// `provider` is called once for each outgoing request, on the task that
+    /// makes the call, so it can read the caller's current `tracing` span or
+    /// OpenTelemetry context. When it returns a [`TraceContext`], the request's
+    /// `params._meta` gets `traceparent` and, if the context has one,
+    /// `tracestate`. When it returns `None`, no trace keys are added.
+    ///
+    /// A request whose `_meta` already has `traceparent` or `tracestate` is
+    /// left as the caller wrote it, because the two keys describe one trace
+    /// and the provider's value is never mixed in. The hook
+    /// applies to requests on both the `initialize` lifecycle and 2026-07-28,
+    /// including `initialize`, `server/discover` and `subscriptions/listen`;
+    /// notifications do not carry it. It works with no OpenTelemetry
+    /// dependency in this crate: [`TraceContext::parse`] is the only
+    /// constructor, so a value the provider cannot parse is `None` and nothing
+    /// malformed is sent. See [`guides::tracing`](crate::guides::tracing).
+    ///
+    /// ```rust
+    /// use tower_mcp::client::McpClient;
+    /// use tower_mcp::TraceContext;
+    ///
+    /// let builder = McpClient::builder().trace_context_provider(|| {
+    ///     TraceContext::parse(
+    ///         "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    ///         None,
+    ///     )
+    /// });
+    /// # let _ = builder;
+    /// ```
+    ///
+    /// [`TraceContext`]: crate::trace_context::TraceContext
+    /// [`TraceContext::parse`]: crate::trace_context::TraceContext::parse
+    pub fn trace_context_provider<F>(mut self, provider: F) -> Self
+    where
+        F: Fn() -> Option<crate::trace_context::TraceContext> + Send + Sync + 'static,
+    {
+        self.trace_context_provider = Some(Arc::new(provider));
         self
     }
 
@@ -681,6 +731,7 @@ impl McpClientBuilder {
                 cache_config: self.cache_config,
                 request_progress: self.request_progress,
                 request_log_level: self.request_log_level,
+                trace_context_provider: self.trace_context_provider,
             },
         )
         .await
@@ -739,6 +790,7 @@ impl McpClient {
             cache_config,
             request_progress,
             request_log_level,
+            trace_context_provider,
         } = settings;
         let supports_session_recovery = transport.supports_session_recovery();
         let (command_tx, command_rx) = mpsc::channel::<LoopCommand>(64);
@@ -784,6 +836,7 @@ impl McpClient {
             response_cache,
             progress_tokens: request_progress.then(|| Arc::new(AtomicI64::new(1))),
             request_log_level: RwLock::new(request_log_level),
+            trace_context_provider,
             next_request_id,
         })
     }
@@ -1621,6 +1674,7 @@ impl McpClient {
         })?;
         let params = self.with_final_request_meta(params).await?;
         let params = self.with_request_log_level(params).await;
+        let params = self.with_trace_context(params);
         let (id_tx, id_rx) = oneshot::channel();
         let (acknowledgment_tx, acknowledgment_rx) = oneshot::channel();
         let (response_tx, response_rx) = oneshot::channel();
@@ -2402,6 +2456,7 @@ impl McpClient {
         let params_value = self.with_final_request_meta(params_value).await?;
         let params_value = self.with_request_log_level(params_value).await;
         let params_value = self.with_progress_token(params_value);
+        let params_value = self.with_trace_context(params_value);
 
         let id = RequestId::Number(self.next_request_id.fetch_add(1, Ordering::Relaxed));
         let (response_tx, response_rx) = oneshot::channel();
@@ -2619,6 +2674,46 @@ impl McpClient {
         if !meta.contains_key("progressToken") {
             let token = tokens.fetch_add(1, Ordering::Relaxed);
             meta.insert("progressToken".to_string(), serde_json::json!(token));
+        }
+        params
+    }
+
+    /// Attach the provider's W3C trace context (SEP-414) to one request.
+    ///
+    /// Applied beside [`with_progress_token`](Self::with_progress_token), at
+    /// the point every request funnels through, so it covers both lifecycles.
+    /// It runs on the caller's task, which is what lets a provider read the
+    /// caller's current span. A caller that set `traceparent` or `tracestate`
+    /// in `_meta` wins outright, and notifications never pass through here.
+    fn with_trace_context(&self, mut params: serde_json::Value) -> serde_json::Value {
+        let Some(provider) = &self.trace_context_provider else {
+            return params;
+        };
+        let Some(trace_context) = provider() else {
+            return params;
+        };
+        // A null params value (a request with no arguments) becomes an empty
+        // object so it can carry `_meta`; a positional value has nowhere to
+        // put one and is left alone.
+        if params.is_null() {
+            params = serde_json::json!({});
+        }
+        let Some(object) = params.as_object_mut() else {
+            return params;
+        };
+        let meta = object
+            .entry("_meta")
+            .or_insert_with(|| serde_json::json!({}));
+        let Some(meta) = meta.as_object_mut() else {
+            return params;
+        };
+        // The two keys describe one trace, so a caller that set either keeps
+        // control of both rather than getting a mixed pair.
+        if meta.contains_key("traceparent") || meta.contains_key("tracestate") {
+            return params;
+        }
+        for (key, value) in trace_context.entries() {
+            meta.insert(key.to_string(), serde_json::Value::String(value));
         }
         params
     }

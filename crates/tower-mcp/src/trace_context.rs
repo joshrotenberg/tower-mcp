@@ -26,8 +26,20 @@
 //! assert_eq!(ctx.tracestate(), Some("vendor=value"));
 //! ```
 //!
-//! This crate reads the context and exposes it. It does not link the
-//! `tracing` span to an OpenTelemetry parent.
+//! # Sending a context
+//!
+//! A client sends a context by registering a provider on
+//! [`McpClientBuilder::trace_context_provider`](crate::client::McpClientBuilder::trace_context_provider).
+//! [`TraceContext::parse`] is the only constructor, so a provider can only
+//! return a well-formed context: a value it cannot parse becomes `None`, and
+//! the request goes out without trace keys.
+//! [`TraceContext::entries`] yields the `_meta` entries for a context, and the
+//! same pairs work as an OpenTelemetry propagator carrier.
+//!
+//! This crate reads, validates, and sends the context. It does not link the
+//! `tracing` span to an OpenTelemetry parent; the tracing guide
+//! ([`guides::tracing`](crate::guides::tracing)) shows how to do that with
+//! `tracing-opentelemetry`.
 //!
 //! # Parsing rules
 //!
@@ -53,6 +65,10 @@ use serde_json::Value;
 
 /// Length of a version `00` `traceparent`: `2 + 1 + 32 + 1 + 16 + 1 + 2`.
 const TRACEPARENT_LEN: usize = 55;
+/// `_meta` key carrying the `traceparent`.
+const TRACEPARENT_KEY: &str = "traceparent";
+/// `_meta` key carrying the `tracestate`.
+const TRACESTATE_KEY: &str = "tracestate";
 /// Maximum accepted `tracestate` length, in characters.
 const MAX_TRACESTATE_LEN: usize = 512;
 /// Maximum accepted number of `tracestate` list members.
@@ -97,12 +113,12 @@ impl TraceContext {
     /// string reads as absent.
     pub fn from_meta(meta: &Value) -> Option<Self> {
         let meta = meta.as_object()?;
-        let traceparent = meta.get("traceparent")?;
+        let traceparent = meta.get(TRACEPARENT_KEY)?;
         let Some(traceparent) = traceparent.as_str() else {
             tracing::debug!("ignoring trace context: traceparent is not a string");
             return None;
         };
-        let tracestate = meta.get("tracestate").and_then(Value::as_str);
+        let tracestate = meta.get(TRACESTATE_KEY).and_then(Value::as_str);
         let parsed = Self::parse(traceparent, tracestate);
         if parsed.is_none() {
             tracing::debug!(
@@ -143,6 +159,45 @@ impl TraceContext {
     /// and member-count limits.
     pub fn tracestate(&self) -> Option<&str> {
         self.tracestate.as_deref()
+    }
+
+    /// The `traceparent` value for this context, formatted as
+    /// `version-trace-id-parent-id-trace-flags`.
+    ///
+    /// A context parsed from a later `traceparent` version formats with that
+    /// version and its first four fields only; trailing fields are not kept.
+    pub fn traceparent(&self) -> String {
+        format!(
+            "{:02x}-{}-{}-{:02x}",
+            self.version, self.trace_id, self.parent_id, self.trace_flags
+        )
+    }
+
+    /// The `_meta` entries that carry this context: `traceparent`, then
+    /// `tracestate` when there is one.
+    ///
+    /// These are the exact key names the server reads, and the same pairs are
+    /// what an OpenTelemetry `TextMapPropagator` reads from or writes to a
+    /// carrier, so they can be collected into a `HashMap<String, String>` for
+    /// `extract`.
+    ///
+    /// ```rust
+    /// use tower_mcp::TraceContext;
+    ///
+    /// let ctx = TraceContext::parse(
+    ///     "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    ///     Some("vendor=value"),
+    /// )
+    /// .unwrap();
+    /// let entries: Vec<_> = ctx.entries().collect();
+    /// assert_eq!(entries[0].0, "traceparent");
+    /// assert_eq!(entries[1], ("tracestate", "vendor=value".to_string()));
+    /// ```
+    pub fn entries(&self) -> impl Iterator<Item = (&'static str, String)> + '_ {
+        std::iter::once((TRACEPARENT_KEY, self.traceparent())).chain(
+            self.tracestate()
+                .map(|state| (TRACESTATE_KEY, state.to_string())),
+        )
     }
 }
 
@@ -406,6 +461,55 @@ mod tests {
             let ctx = TraceContext::parse(VALID, Some(value)).unwrap();
             assert_eq!(ctx.tracestate(), None, "{value:?}");
         }
+    }
+
+    #[test]
+    fn traceparent_round_trips() {
+        let ctx = TraceContext::parse(VALID, None).unwrap();
+        assert_eq!(ctx.traceparent(), VALID);
+
+        let unsampled = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00";
+        let ctx = TraceContext::parse(unsampled, None).unwrap();
+        assert_eq!(ctx.traceparent(), unsampled);
+
+        // A later version keeps its version and first four fields only.
+        let ctx = TraceContext::parse(
+            "cc-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0a-future",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            ctx.traceparent(),
+            "cc-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0a"
+        );
+        assert!(TraceContext::parse(&ctx.traceparent(), None).is_some());
+    }
+
+    #[test]
+    fn entries_are_the_meta_keys() {
+        let ctx = TraceContext::parse(VALID, Some("vendor=value")).unwrap();
+        let entries: Vec<_> = ctx.entries().collect();
+        assert_eq!(
+            entries,
+            [
+                ("traceparent", VALID.to_string()),
+                ("tracestate", "vendor=value".to_string()),
+            ]
+        );
+
+        let ctx = TraceContext::parse(VALID, None).unwrap();
+        let entries: Vec<_> = ctx.entries().collect();
+        assert_eq!(entries, [("traceparent", VALID.to_string())]);
+    }
+
+    #[test]
+    fn entries_read_back_through_from_meta() {
+        let ctx = TraceContext::parse(VALID, Some("vendor=value")).unwrap();
+        let meta: serde_json::Map<String, Value> = ctx
+            .entries()
+            .map(|(key, value)| (key.to_string(), Value::String(value)))
+            .collect();
+        assert_eq!(TraceContext::from_meta(&Value::Object(meta)), Some(ctx));
     }
 
     #[test]
