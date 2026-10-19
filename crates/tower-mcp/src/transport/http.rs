@@ -125,6 +125,12 @@
 //!   |<-- result -------------------|
 //! ```
 //!
+//! With a shared [`SessionStore`](crate::session_store::SessionStore), a DELETE
+//! for a session that was created on another instance deletes the stored record
+//! (after the same principal check) rather than answering 404. Other instances
+//! that already hold the session in memory are not notified; they keep serving
+//! it until its TTL passes, and their next request rewrites the record.
+//!
 //! ## SSE Stream Resumption (SEP-1699)
 //!
 //! Each SSE event includes a unique, monotonically increasing event ID. If a

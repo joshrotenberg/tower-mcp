@@ -451,6 +451,90 @@ async fn principal_survives_the_session_store_and_is_enforced_after_restore() {
     assert_eq!(record.principal.as_deref(), Some("alice"));
 }
 
+/// #1590: a DELETE reaching an instance that never restored the session
+/// removes the record from the shared store instead of answering 404 and
+/// leaving it until its TTL.
+#[tokio::test]
+async fn delete_on_another_instance_removes_the_stored_record() {
+    let store = Arc::new(MemorySessionStore::new());
+    let shared: Arc<dyn SessionStore> = store.clone();
+
+    let (instance_a, handle_a) = app(bound_transport().session_store(shared.clone()));
+    let session_id = open_session(&instance_a, Some("alice")).await;
+    assert!(store.load(&session_id).await.unwrap().is_some());
+
+    let (instance_b, handle_b) = app(bound_transport().session_store(shared.clone()));
+    let (status, _) = delete(&instance_b, Some("alice"), &session_id).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        store.load(&session_id).await.unwrap().is_none(),
+        "the record is gone from the shared store"
+    );
+    assert_eq!(
+        handle_b.session_count().await,
+        0,
+        "deleting must not restore the session"
+    );
+
+    // Instance B has nothing left to restore from.
+    let (status, json) = list(&instance_b, Some("alice"), &session_id).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(json["error"]["code"], -32005);
+
+    // A repeated DELETE finds nothing.
+    let (status, json) = delete(&instance_b, Some("alice"), &session_id).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(json["error"]["code"], -32005);
+
+    // Known limitation: instance A is not told. It keeps serving the session
+    // from memory until its TTL passes, and that request rewrites the record.
+    assert_eq!(handle_a.session_count().await, 1);
+    let (status, json) = list(&instance_a, Some("alice"), &session_id).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json.get("result").is_some(), "expected a result: {json}");
+    assert!(store.load(&session_id).await.unwrap().is_some());
+}
+
+/// A DELETE from a different principal on an instance that never restored
+/// the session is answered as an unknown session and keeps the record.
+#[tokio::test]
+async fn delete_on_another_instance_by_another_principal_keeps_the_record() {
+    let store = Arc::new(MemorySessionStore::new());
+    let shared: Arc<dyn SessionStore> = store.clone();
+
+    let (instance_a, _) = app(bound_transport().session_store(shared.clone()));
+    let session_id = open_session(&instance_a, Some("alice")).await;
+    let unknown = unknown_responses(&session_id).await;
+
+    let (instance_b, handle_b) = app(bound_transport().session_store(shared.clone()));
+    assert_eq!(
+        delete(&instance_b, Some("bob"), &session_id).await,
+        unknown.delete
+    );
+    assert_eq!(delete(&instance_b, None, &session_id).await, unknown.delete);
+    assert!(
+        store.load(&session_id).await.unwrap().is_some(),
+        "a refused DELETE leaves the record"
+    );
+    assert_eq!(handle_b.session_count().await, 0);
+
+    // The owner can still use the session on instance B.
+    let (status, json) = list(&instance_b, Some("alice"), &session_id).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json.get("result").is_some(), "expected a result: {json}");
+}
+
+/// A DELETE for an ID that is in neither memory nor the shared store is 404.
+#[tokio::test]
+async fn delete_of_an_id_in_no_store_is_not_found() {
+    let shared: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
+    let (instance_b, _) = app(bound_transport().session_store(shared));
+
+    let (status, json) = delete(&instance_b, Some("alice"), "never-existed").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(json["error"]["code"], -32005);
+}
+
 /// Auto-reinitialization has no record to take a principal from, so the
 /// caller that recreates the session becomes its principal.
 #[tokio::test]

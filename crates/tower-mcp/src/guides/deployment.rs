@@ -178,6 +178,12 @@ record written before binding existed restores as anonymous, so with
 authentication enabled those clients re-initialize once after an upgrade.
 See the [OAuth guide](crate::guides::oauth) for an example.
 
+With a shared session store, a DELETE that lands on a node that never held the
+session removes the stored record, so the session cannot be restored on any
+other node afterwards. Nodes that already hold the session in memory are not
+told; they keep serving it until its TTL passes, and their next request writes
+the record back. There is no cross-node invalidation.
+
 Final `subscriptions/listen` streams have a separate, bounded policy because
 they do not consume legacy session slots. By default, a transport admits up to
 256 active final subscriptions. Each stream accepts at most 64 KiB of combined

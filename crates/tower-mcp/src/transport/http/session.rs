@@ -928,6 +928,13 @@ impl SessionRegistry {
     /// A session bound to a different principal is left in place and reported
     /// as not removed, the same as an ID that does not exist. The comparison
     /// and the removal happen under one write lock.
+    ///
+    /// An ID that is not live in this process may still have a record in the
+    /// shared [`SessionStore`](crate::session_store::SessionStore), written by
+    /// another instance. That record is deleted directly, without restoring
+    /// the session, after the same principal check the restore path applies.
+    /// Other instances that hold the session in memory are not told; see
+    /// [`remove_stored`](Self::remove_stored).
     pub(super) async fn remove_for(&self, id: &str, principal: &SessionPrincipal) -> bool {
         let removed = {
             let mut sessions = self.sessions.write().await;
@@ -939,11 +946,53 @@ impl SessionRegistry {
                     tracing::debug!(session_id = %id, "Session principal mismatch; treating session as unknown");
                     false
                 }
-                None => false,
+                None => {
+                    drop(sessions);
+                    return self.remove_stored(id, principal).await;
+                }
             }
         };
         self.finish_removal(id, removed).await;
         removed
+    }
+
+    /// Delete the stored record of a session that is not live in this
+    /// process, if the record exists and belongs to `principal`.
+    ///
+    /// Returns `false`, leaving the record alone, when there is no unexpired
+    /// record, the store cannot be read, or the record is bound to a
+    /// different principal. Deleting an already-deleted record is a no-op, so
+    /// two instances racing on the same DELETE both succeed.
+    ///
+    /// This is not cross-instance invalidation. An instance that already
+    /// restored the session keeps it in memory until its TTL passes, and its
+    /// next request rewrites the record this deleted.
+    async fn remove_stored(&self, id: &str, principal: &SessionPrincipal) -> bool {
+        let record = match self.persistent.load(id).await {
+            Ok(Some(record)) if !record.is_expired() => record,
+            Ok(_) => return false,
+            Err(e) => {
+                tracing::warn!(session_id = %id, error = %e, "Failed to load session record");
+                return false;
+            }
+        };
+        if !principal.matches(&record.principal) {
+            tracing::debug!(session_id = %id, "Session principal mismatch; treating session as unknown");
+            return false;
+        }
+        // A restore on this instance may have raced the load above. Drop the
+        // live copy too so the DELETE does not leave a session with no record.
+        {
+            let mut sessions = self.sessions.write().await;
+            if sessions
+                .get(id)
+                .is_some_and(|s| principal.matches(&s.principal))
+            {
+                sessions.remove(id);
+            }
+        }
+        self.finish_removal(id, true).await;
+        true
     }
 
     /// Drop the persistent record and buffered events of a session that was
