@@ -1,0 +1,23 @@
+# Wire-schema check -- expected failures (#1204).
+#
+# Applies to `cargo run -p wire-schema-check`, which validates every frame the
+# conformance server sent during the official suites against the schema
+# vendored in tools/wire-schema-check/schemas/<version>/ (pinned commit in
+# that directory's README).
+#
+# Each entry is a schema definition expected to fail at that protocol
+# version, with a short reason. The check fails on any failing definition that
+# is not listed here; it prints a note, without failing, when a listed
+# definition no longer fails, so entries can be removed as bugs are fixed.
+#
+# Status at the initial run (conformance@0.2.0-alpha.10, `--suite all`): every
+# frame the server sent validated, so there are no entries.
+#
+# Format: version keys, each mapping a definition name to a reason, e.g.
+#
+#   "2025-11-25":
+#     ListToolsResult: tools/list omits a required field (#NNNN)
+
+"2025-06-18": {}
+"2025-11-25": {}
+"2026-07-28": {}

@@ -12,6 +12,7 @@ members = [
     "tools/interop-probe",
     "tools/rmcp-compat",
     "tools/sdk-interop",
+    "tools/wire-schema-check",
 ]
 
 [workspace.package]

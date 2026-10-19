@@ -1,0 +1,18 @@
+[package]
+name = "wire-schema-check"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Validate captured MCP wire frames against the published JSON schemas"
+
+[[bin]]
+name = "wire-schema-check"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+# Schemas are bundled and every $ref is local, so no network or file resolvers.
+jsonschema = { version = "0.58", default-features = false }
+serde_json.workspace = true
