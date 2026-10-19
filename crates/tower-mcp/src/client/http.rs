@@ -329,6 +329,11 @@ impl HttpClientConfig {
 /// explicitly.
 const MAX_REDIRECT_HOPS: usize = 10;
 
+/// Cap on [`HttpClientTransport::pending_tools_lists`], so requests that never
+/// get a response cannot grow it without bound. The oldest entry is dropped
+/// first, and a response with no entry is treated as a first page.
+const MAX_PENDING_TOOLS_LISTS: usize = 64;
+
 /// Whether a redirect from `original` (the request's starting URL) to
 /// `target` (the `Location` it was just pointed at) should be followed.
 ///
@@ -436,8 +441,14 @@ pub struct HttpClientTransport {
     session_id: Option<String>,
     /// Negotiated protocol version.
     protocol_version: Option<String>,
-    /// Validated custom-header mappings learned from the latest tools/list.
+    /// Validated custom-header mappings learned from `tools/list`. Replaced
+    /// by a first-page response and extended by later pages.
     tool_header_mappings: HashMap<String, Vec<CustomHeaderMapping>>,
+    /// Outbound `tools/list` request ids on the 2026-07-28 path, each with
+    /// whether it carried a `cursor`. The response frame names only the id, so
+    /// this is how [`normalize_incoming_message`](Self::normalize_incoming_message)
+    /// tells a later page from the first. Bounded by [`MAX_PENDING_TOOLS_LISTS`].
+    pending_tools_lists: Vec<(serde_json::Value, bool)>,
     /// Channel receiver for incoming messages (POST responses + SSE events).
     incoming_rx: mpsc::Receiver<String>,
     /// Channel sender used by `send()` to queue POST response bodies
@@ -511,6 +522,7 @@ impl HttpClientTransport {
             session_id: None,
             protocol_version: None,
             tool_header_mappings: HashMap::new(),
+            pending_tools_lists: Vec::new(),
             incoming_rx: rx,
             incoming_tx: tx,
             sse_task: None,
@@ -553,6 +565,7 @@ impl HttpClientTransport {
             session_id: None,
             protocol_version: None,
             tool_header_mappings: HashMap::new(),
+            pending_tools_lists: Vec::new(),
             incoming_rx: rx,
             incoming_tx: tx,
             sse_task: None,
@@ -780,6 +793,26 @@ impl HttpClientTransport {
         let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(&message) else {
             return message;
         };
+        // The server says the tool set changed, so every learned mapping is
+        // suspect. The client re-lists from the first page next.
+        if parsed.get("method").and_then(serde_json::Value::as_str)
+            == Some("notifications/tools/list_changed")
+        {
+            self.tool_header_mappings.clear();
+            return message;
+        }
+        // Take the recorded outbound request, if any, even for a frame that
+        // carries no tools (an error), so the entry does not linger.
+        let later_page = parsed
+            .get("id")
+            .and_then(|id| {
+                let index = self
+                    .pending_tools_lists
+                    .iter()
+                    .position(|(pending, _)| json_request_ids_match(pending, id))?;
+                Some(self.pending_tools_lists.remove(index).1)
+            })
+            .unwrap_or(false);
         let Some(tools) = parsed
             .get_mut("result")
             .and_then(|result| result.get_mut("tools"))
@@ -788,7 +821,12 @@ impl HttpClientTransport {
             return message;
         };
 
-        self.tool_header_mappings.clear();
+        // `list_all_tools` pages, and a later page must add to the mappings
+        // of the earlier ones rather than replace them: a call to a tool from
+        // page one still has to mirror its `Mcp-Param-*` headers.
+        if !later_page {
+            self.tool_header_mappings.clear();
+        }
         tools.retain(|tool| {
             let Some(name) = tool.get("name").and_then(serde_json::Value::as_str) else {
                 return false;
@@ -1362,6 +1400,19 @@ impl ClientTransport for HttpClientTransport {
             // Final requests are sessionless even when a transitional peer
             // incorrectly returns a legacy session header from discovery.
             self.session_id = None;
+        }
+        if is_modern_request
+            && method == Some("tools/list")
+            && let Some(id) = reply_id.as_ref()
+        {
+            let has_cursor = parsed_message
+                .as_ref()
+                .and_then(|value| value.pointer("/params/cursor"))
+                .is_some_and(|cursor| !cursor.is_null());
+            if self.pending_tools_lists.len() >= MAX_PENDING_TOOLS_LISTS {
+                self.pending_tools_lists.remove(0);
+            }
+            self.pending_tools_lists.push((id.clone(), has_cursor));
         }
         let timeout = if is_notification {
             self.config
@@ -3798,6 +3849,90 @@ mod tests {
         assert!(transport.tool_header_mappings.contains_key("valid"));
         assert!(!transport.tool_header_mappings.contains_key("invalid"));
         assert!(!transport.tool_header_mappings.contains_key("number_typed"));
+    }
+
+    fn tools_page(id: i64, tool: &str) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "tools": [{
+                    "name": tool,
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "region": {"type": "string", "x-mcp-header": "Region"}
+                        }
+                    }
+                }]
+            }
+        })
+        .to_string()
+    }
+
+    /// Only a first-page `tools/list` response replaces the mappings; a page
+    /// requested with a cursor adds to them, and `tools/list_changed` drops
+    /// them (#1589).
+    #[test]
+    fn tools_list_pages_merge_header_mappings_until_list_changed() {
+        let mut transport = HttpClientTransport::new("http://localhost:3000");
+        transport.protocol_version = Some(crate::protocol::PROTOCOL_VERSION_2026_07_28.to_string());
+
+        transport
+            .pending_tools_lists
+            .push((serde_json::json!(1), false));
+        transport.normalize_incoming_message(tools_page(1, "first"));
+        transport
+            .pending_tools_lists
+            .push((serde_json::json!(2), true));
+        transport.normalize_incoming_message(tools_page(2, "second"));
+        assert!(transport.pending_tools_lists.is_empty());
+        assert!(transport.tool_header_mappings.contains_key("first"));
+        assert!(transport.tool_header_mappings.contains_key("second"));
+
+        // A new first page replaces what was learned before.
+        transport
+            .pending_tools_lists
+            .push((serde_json::json!(3), false));
+        transport.normalize_incoming_message(tools_page(3, "third"));
+        assert_eq!(transport.tool_header_mappings.len(), 1);
+        assert!(transport.tool_header_mappings.contains_key("third"));
+
+        transport
+            .pending_tools_lists
+            .push((serde_json::json!(4), true));
+        transport.normalize_incoming_message(tools_page(4, "fourth"));
+        assert_eq!(transport.tool_header_mappings.len(), 2);
+
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/tools/list_changed"
+        })
+        .to_string();
+        assert_eq!(
+            transport.normalize_incoming_message(notification.clone()),
+            notification
+        );
+        assert!(transport.tool_header_mappings.is_empty());
+    }
+
+    /// An error response for a pending `tools/list` still consumes its entry.
+    #[test]
+    fn tools_list_error_response_clears_pending_entry() {
+        let mut transport = HttpClientTransport::new("http://localhost:3000");
+        transport.protocol_version = Some(crate::protocol::PROTOCOL_VERSION_2026_07_28.to_string());
+        transport
+            .pending_tools_lists
+            .push((serde_json::json!(7), true));
+        transport.normalize_incoming_message(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "error": {"code": -32603, "message": "boom"}
+            })
+            .to_string(),
+        );
+        assert!(transport.pending_tools_lists.is_empty());
     }
 
     // =========================================================================

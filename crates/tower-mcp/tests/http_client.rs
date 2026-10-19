@@ -3031,6 +3031,62 @@ mod stateless_tests {
         server.abort();
     }
 
+    /// `list_all_tools` pages, and every page's `x-mcp-header` mappings must
+    /// survive: a strict 2026-07-28 server rejects a call to an annotated tool
+    /// that omits its `Mcp-Param-*` header (#1589).
+    #[tokio::test]
+    async fn final_client_keeps_header_mappings_across_tools_list_pages() {
+        let annotated = |name: &'static str, suffix: &'static str| {
+            ToolBuilder::new(name)
+                .input_schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "scope": { "type": "string", "x-mcp-header": suffix }
+                    }
+                }))
+                .extractor_handler((), |RawArgs(args): RawArgs| async move {
+                    Ok(CallToolResult::text(args["scope"].to_string()))
+                })
+                .build()
+        };
+        // One tool per page, so each lands on its own `tools/list` response.
+        let router = McpRouter::new()
+            .server_info("paged-headers", "1.0.0")
+            .page_size(1)
+            .tool(annotated("alpha", "Tenant"))
+            .tool(annotated("beta", "Region"));
+        let app = HttpTransport::new(router)
+            .disable_origin_validation()
+            .stateless(StatelessConfig::new())
+            .into_router();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = McpClient::builder()
+            .protocol_support(tower_mcp::ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+            .connect_simple(HttpClientTransport::new(url))
+            .await
+            .unwrap();
+        client.discover("test-client", "1.0.0").await.unwrap();
+
+        let tools = client.list_all_tools().await.unwrap();
+        assert_eq!(tools.len(), 2, "two pages of one tool each");
+
+        for (name, expected) in [("alpha", "\"acme\""), ("beta", "\"acme\"")] {
+            let result = client
+                .call_tool(name, serde_json::json!({"scope": "acme"}))
+                .await
+                .unwrap_or_else(|error| panic!("{name} rejected: {error}"));
+            assert_eq!(result.first_text(), Some(expected), "{name}");
+        }
+
+        client.shutdown().await.unwrap();
+        server.abort();
+    }
+
     /// A 404 on a 2026-07-28 request carries no session meaning: the server
     /// answers an unknown method with 404 and -32601, and that must surface
     /// as method-not-found rather than start a re-initialize (#1556).
