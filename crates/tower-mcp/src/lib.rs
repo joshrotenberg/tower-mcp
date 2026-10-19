@@ -200,6 +200,9 @@
 //!   handlers backed by `!Send` state such as an embedded interpreter, a
 //!   channel to a `LocalSet` task, cancellation, and reloading a set of tools
 //!   at once (requires `dynamic-tools` and `schema-validation`).
+//! - [`guides::tracing`]:
+//!   sending and reading W3C trace context (SEP-414), and linking it to
+//!   OpenTelemetry with `tracing-opentelemetry`.
 //! - [`guides`]: OAuth, MCP Apps, and the complete task-oriented guide index.
 //! - [Examples index](https://github.com/joshrotenberg/tower-mcp/blob/main/examples/README.md):
 //!   runnable server, client, transport, middleware, OAuth, and extension patterns.
