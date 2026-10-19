@@ -2734,6 +2734,8 @@ fn frames_answer_request(frames: &[String], id: &serde_json::Value) -> bool {
 
 fn json_request_ids_match(left: &serde_json::Value, right: &serde_json::Value) -> bool {
     left == right
+        || (RequestId::from_json(left)
+            .is_some_and(|left| Some(left) == RequestId::from_json(right)))
         || match (left, right) {
             (serde_json::Value::Number(number), serde_json::Value::String(value))
             | (serde_json::Value::String(value), serde_json::Value::Number(number)) => number

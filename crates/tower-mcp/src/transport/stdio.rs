@@ -2727,14 +2727,11 @@ where
     async fn handle_response(&self, parsed: &serde_json::Value) -> Result<()> {
         let id = match parsed.get("id") {
             Some(id) => {
-                if let Some(n) = id.as_i64() {
-                    RequestId::Number(n)
-                } else if let Some(s) = id.as_str() {
-                    RequestId::String(s.to_string())
-                } else {
+                let Some(id) = RequestId::from_json(id) else {
                     tracing::warn!("Response has invalid id type");
                     return Ok(());
-                }
+                };
+                id
             }
             None => {
                 tracing::warn!("Response missing id field");
@@ -3136,6 +3133,20 @@ mod tests {
         assert_eq!(json["jsonrpc"], "2.0");
         assert_eq!(json["id"], 1);
         assert!(json.get("result").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_process_line_integral_float_id_is_answered_with_the_integer() {
+        let router = make_router();
+        let mut service = init_service(&router).await;
+
+        let line = r#"{"jsonrpc":"2.0","id":1.0,"method":"ping"}"#;
+        let result = process_line(&mut service, &router, line).await;
+
+        let response = result.unwrap().unwrap();
+        let json = serde_json::to_value(&response).unwrap();
+        assert!(json.get("result").is_some(), "{json}");
+        assert_eq!(json["id"], 1);
     }
 
     #[tokio::test]
