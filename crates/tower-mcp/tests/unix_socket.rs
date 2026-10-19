@@ -196,7 +196,7 @@ async fn initialize_and_call_a_tool_over_the_socket() {
 
 /// `require_sessions()` must reach the HTTP session gate through this
 /// constructor: a 2025-11-25 request with no session id is refused with
-/// SessionRequired (-32006).
+/// HTTP 400 and SessionRequired (-32006).
 #[tokio::test]
 async fn require_sessions_rejects_a_request_without_a_session_id() {
     let socket = SocketPath::new("sessions");
@@ -205,12 +205,14 @@ async fn require_sessions_rejects_a_request_without_a_session_id() {
         .require_sessions();
     serve_in_background(transport, socket.path()).await;
 
-    let response = post_json(
+    let (status, body) = post(
         socket.path(),
         &[("MCP-Protocol-Version", PROTOCOL_VERSION)],
-        &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string(),
     )
     .await;
+    assert!(status.starts_with("HTTP/1.1 400"), "got {status}: {body}");
+    let response: serde_json::Value = serde_json::from_str(&body).expect("JSON-RPC error body");
     assert_eq!(
         response["error"]["code"], -32006,
         "expected SessionRequired, got: {response}"

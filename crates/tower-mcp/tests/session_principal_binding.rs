@@ -249,6 +249,10 @@ async fn different_principal_is_answered_as_an_unknown_session() {
     let session_id = open_session(&app, Some("alice")).await;
     let unknown = unknown_responses(&session_id).await;
     assert_eq!(unknown.post.1["error"]["code"], -32005);
+    assert_eq!(unknown.post.0, StatusCode::NOT_FOUND);
+    assert_eq!(unknown.get.0, StatusCode::NOT_FOUND);
+    assert_eq!(unknown.delete.0, StatusCode::NOT_FOUND);
+    assert_eq!(unknown.delete.1["error"]["code"], -32005);
 
     assert_eq!(list(&app, Some("bob"), &session_id).await, unknown.post);
     assert_eq!(

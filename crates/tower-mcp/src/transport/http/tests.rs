@@ -1741,8 +1741,9 @@ async fn test_request_without_session_fails() {
 
     let response = app.oneshot(request).await.unwrap();
 
-    // We now return JSON-RPC errors for session issues
-    assert_eq!(response.status(), StatusCode::OK);
+    // A missing session ID where one is required is a 400 carrying the
+    // JSON-RPC error.
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     // Verify it's a JSON-RPC error response
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -1819,8 +1820,8 @@ async fn test_delete_session() {
         .unwrap();
 
     let response = app.oneshot(list_request).await.unwrap();
-    // We now return JSON-RPC errors for session issues
-    assert_eq!(response.status(), StatusCode::OK);
+    // A terminated session is a 404 carrying the JSON-RPC error.
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
     // Verify it's a JSON-RPC error response
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -1829,6 +1830,88 @@ async fn test_delete_session() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(json.get("error").is_some());
     assert_eq!(json["error"]["code"], -32005); // SessionNotFound
+}
+
+/// Send `method` to `/` with an optional session ID, returning the status and
+/// the JSON-RPC error code of the body, if it carries one.
+async fn session_error_status(
+    app: &axum::Router,
+    method: &str,
+    session_id: Option<&str>,
+) -> (StatusCode, Option<i64>) {
+    let mut builder = Request::builder().method(method).uri("/");
+    if let Some(id) = session_id {
+        builder = builder.header(MCP_SESSION_ID_HEADER, id);
+    }
+    let request = if method == "POST" {
+        builder
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string(),
+            ))
+    } else {
+        builder
+            .header("Accept", "text/event-stream")
+            .body(Body::empty())
+    }
+    .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let code = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|json| json["error"]["code"].as_i64());
+    (status, code)
+}
+
+/// An unknown session ID is a 404 with the SessionNotFound body on POST, GET
+/// and DELETE (#1588).
+#[tokio::test]
+async fn unknown_session_id_is_404_on_post_get_and_delete() {
+    let app = HttpTransport::new(create_test_router())
+        .disable_origin_validation()
+        .into_router();
+
+    for method in ["POST", "GET", "DELETE"] {
+        assert_eq!(
+            session_error_status(&app, method, Some("never-seen-before")).await,
+            (StatusCode::NOT_FOUND, Some(-32005)),
+            "{method}"
+        );
+    }
+}
+
+/// A missing session ID where sessions are required is a 400 with the
+/// SessionRequired body on POST, GET and DELETE (#1588).
+#[tokio::test]
+async fn missing_session_id_is_400_on_post_get_and_delete_when_required() {
+    let app = HttpTransport::new(create_test_router())
+        .disable_origin_validation()
+        .require_sessions()
+        .into_router();
+
+    for method in ["POST", "GET", "DELETE"] {
+        assert_eq!(
+            session_error_status(&app, method, None).await,
+            (StatusCode::BAD_REQUEST, Some(-32006)),
+            "{method}"
+        );
+    }
+}
+
+/// Optional sessions (the default) still answer a POST without a session ID
+/// through a transient session rather than an error (#1588).
+#[tokio::test]
+async fn missing_session_id_post_is_unchanged_when_sessions_are_optional() {
+    let app = HttpTransport::new(create_test_router())
+        .disable_origin_validation()
+        .into_router();
+
+    let (status, code) = session_error_status(&app, "POST", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(code, None);
 }
 
 /// A duplicated `MCP-Protocol-Version` header must not let a downstream
@@ -2793,7 +2876,7 @@ async fn test_unknown_session_without_restore_or_auto_reinit_returns_error() {
         .unwrap();
 
     let response = app.oneshot(list_request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -2866,8 +2949,8 @@ async fn test_session_expiration() {
         .unwrap();
 
     let response = app.oneshot(list_request).await.unwrap();
-    // We now return JSON-RPC errors for session issues
-    assert_eq!(response.status(), StatusCode::OK);
+    // A terminated session is a 404 carrying the JSON-RPC error.
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
     // Verify it's a JSON-RPC error response
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -3295,7 +3378,7 @@ async fn test_request_without_session_id_rejected() {
         .unwrap();
 
     let response = app.oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK); // JSON-RPC errors still 200
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -3327,6 +3410,7 @@ async fn test_invalid_session_id_returns_error() {
         .unwrap();
 
     let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -3535,6 +3619,7 @@ async fn test_delete_terminates_session() {
         .unwrap();
 
     let resp = app.oneshot(list_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -5333,7 +5418,7 @@ async fn stateless_v2025_tools_list_without_session_rejected() {
         ))
         .unwrap();
     let response = app.oneshot(req).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();

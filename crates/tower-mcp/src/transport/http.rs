@@ -107,14 +107,16 @@
 //! ## Session Reconnection
 //!
 //! When a session is not found (e.g., after server restart or session expiration),
-//! the server returns a JSON-RPC error with code `-32005` (SessionNotFound).
+//! the server answers with HTTP 404 and a JSON-RPC error body with code `-32005`
+//! (SessionNotFound), as the 2025-11-25 spec requires. The same answer covers a
+//! session bound to a different principal. It applies to POST, GET and DELETE.
 //! Clients should handle this by re-initializing the connection:
 //!
 //! ```text
 //! Client                          Server
 //!   |                               |
 //!   |-- tools/list (old session) -->|
-//!   |<-- error: SessionNotFound ----|
+//!   |<-- 404 SessionNotFound -------|
 //!   |                               |
 //!   |-- initialize --------------->|
 //!   |<-- result + new session id ---|
@@ -156,8 +158,8 @@
 //! |---------|---------------------------|----------------------------------------------------|
 //! | -32020  | HeaderMismatch            | Required HTTP header missing or inconsistent with body (SEP-2243, strict mode) |
 //! | -32022  | UnsupportedProtocolVersion| Server does not support the requested protocol version (SEP-2575) |
-//! | -32005  | SessionNotFound           | Session expired or server restarted                |
-//! | -32006  | SessionRequired           | MCP-Session-Id header missing                      |
+//! | -32005  | SessionNotFound           | Session expired or server restarted (HTTP 404)     |
+//! | -32006  | SessionRequired           | MCP-Session-Id header missing (HTTP 400)           |
 //!
 //! ## Session Handling
 //!
@@ -892,9 +894,9 @@ impl HttpTransport {
     /// Require strict session management.
     ///
     /// When enabled, requests without an `mcp-session-id` header are rejected
-    /// with a `SessionRequired` error (-32006). Clients must complete the
-    /// `initialize` handshake and include the session ID on all subsequent
-    /// requests, as specified by the MCP 2025-11-25 spec.
+    /// with HTTP 400 and a `SessionRequired` error (-32006). Clients must
+    /// complete the `initialize` handshake and include the session ID on all
+    /// subsequent requests, as specified by the MCP 2025-11-25 spec.
     ///
     /// By default, sessions are optional for compatibility with clients
     /// (Codex CLI, Cursor, etc.) that don't carry the session ID forward
