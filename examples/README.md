@@ -154,6 +154,7 @@ These are standalone crates in the workspace:
 | [conformance-client](conformance-client/) | MCP conformance client (235/235 stable; 399/399 final) |
 | [codegen-mcp](codegen-mcp/) | MCP server that helps build MCP servers |
 | [mcp-repl](https://github.com/joshrotenberg/mcp-repl) | Interactive client REPL, now developed in its own repository |
+| [lua-tools](lua-tools/) | Tools defined in Lua files, served through a `!Send` bridge with `replace_all` reloads, schema checks, progress and cancellation |
 | [mcp2md](mcp2md/) | Generate deterministic Markdown documentation and a documentation-coverage assessment from an MCP server |
 
 ## Full Application

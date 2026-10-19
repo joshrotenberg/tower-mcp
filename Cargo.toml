@@ -8,6 +8,7 @@ members = [
     "examples/conformance-server",
     "examples/conformance-client",
     "examples/codegen-mcp",
+    "examples/lua-tools",
     "examples/mcp2md",
     "tools/interop-probe",
     "tools/rmcp-compat",
