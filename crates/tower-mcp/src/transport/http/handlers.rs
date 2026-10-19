@@ -219,13 +219,7 @@ fn is_removed_modern_method(method: &str) -> bool {
 
 /// Extract request ID from a JSON value
 pub(super) fn extract_request_id(parsed: &serde_json::Value) -> Option<RequestId> {
-    parsed.get("id").and_then(|id| {
-        if let Some(n) = id.as_i64() {
-            Some(RequestId::Number(n))
-        } else {
-            id.as_str().map(|s| RequestId::String(s.to_string()))
-        }
-    })
+    parsed.get("id").and_then(RequestId::from_json)
 }
 
 /// Handle POST requests (JSON-RPC messages from client)

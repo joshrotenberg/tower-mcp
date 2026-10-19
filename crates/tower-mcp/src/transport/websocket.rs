@@ -1190,14 +1190,11 @@ async fn handle_response(
 ) -> Result<()> {
     let id = match parsed.get("id") {
         Some(id) => {
-            if let Some(n) = id.as_i64() {
-                RequestId::Number(n)
-            } else if let Some(s) = id.as_str() {
-                RequestId::String(s.to_string())
-            } else {
+            let Some(id) = RequestId::from_json(id) else {
                 tracing::warn!("Response has invalid id type");
                 return Ok(());
-            }
+            };
+            id
         }
         None => {
             tracing::warn!("Response missing id field");

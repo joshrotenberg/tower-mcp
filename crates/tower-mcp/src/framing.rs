@@ -297,11 +297,7 @@ pub(crate) fn is_response_frame(value: &serde_json::Value) -> bool {
 /// because answering one member's id for a whole-batch rejection would be a
 /// worse lie than answering none.
 pub(crate) fn correlating_id(value: &serde_json::Value) -> Option<crate::protocol::RequestId> {
-    match value.get("id")? {
-        serde_json::Value::String(id) => Some(crate::protocol::RequestId::String(id.clone())),
-        serde_json::Value::Number(id) => id.as_i64().map(crate::protocol::RequestId::Number),
-        _ => None,
-    }
+    crate::protocol::RequestId::from_json(value.get("id")?)
 }
 
 /// The id to answer `error` with, for a frame rejected before it was typed.
@@ -382,6 +378,16 @@ mod correlating_id_tests {
                 "{id} is not a JSON-RPC id"
             );
         }
+    }
+
+    /// An integral float is still an integer to JSON Schema, so it correlates
+    /// as that integer (rmcp #1345).
+    #[test]
+    fn an_integral_float_id_is_that_integer() {
+        assert_eq!(
+            correlating_id(&serde_json::json!({"id": 1.0, "method": "tools/list"})),
+            Some(RequestId::Number(1))
+        );
     }
 
     /// Fractional numbers are not JSON-RPC ids either, and must not silently

@@ -2412,6 +2412,24 @@ async fn test_stringified_numeric_response_id_correlates() {
 }
 
 #[tokio::test]
+async fn test_integral_float_response_id_correlates() {
+    // rmcp #1345 analog: a server that writes every number in float form
+    // answers request 42 with 42.0.
+    let (mut pending, mut rxs) = pending_with(&[RequestId::Number(42)]);
+
+    let response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 42.0,
+        "result": {"ok": true}
+    });
+    handle_response(&response, &mut pending);
+
+    assert!(pending.is_empty(), "pending request should be resolved");
+    let result = rxs.remove(0).await.unwrap().unwrap();
+    assert_eq!(result, serde_json::json!({"ok": true}));
+}
+
+#[tokio::test]
 async fn test_exact_string_id_takes_precedence() {
     // A genuine string id "42" must match exactly and win over the
     // numeric interpretation when both are pending.

@@ -667,7 +667,14 @@ pub struct SetLogLevelParams {
 }
 
 /// Request ID - can be string or number per JSON-RPC spec
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// On the wire an id is a string or a number. A number written in float form
+/// that is still a whole number (`1.0`, `1e2`) is read as that integer, up to
+/// 2^53 in magnitude, because JSON Schema counts it as an integer and some
+/// encoders write every number that way. The id is held and echoed back as an
+/// integer (`1`, not `1.0`), the same choice rmcp made (rust-sdk#1346). A
+/// fractional id (`1.5`) or one beyond 2^53 is not a valid id.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(untagged)]
 #[non_exhaustive]
 pub enum RequestId {
@@ -675,6 +682,75 @@ pub enum RequestId {
     String(String),
     /// An integer request identifier.
     Number(i64),
+}
+
+impl RequestId {
+    /// Read a request id out of a raw JSON value.
+    ///
+    /// Returns `None` for anything that is not a valid id: a non-string,
+    /// non-number value, a fractional number, or a number outside the integer
+    /// range this type holds. An integral float up to 2^53 in magnitude
+    /// (`1.0`) is accepted as the integer.
+    pub fn from_json(value: &Value) -> Option<Self> {
+        match value {
+            Value::String(s) => Some(RequestId::String(s.clone())),
+            Value::Number(n) => n
+                .as_i64()
+                .or_else(|| n.as_f64().and_then(integral_float_id))
+                .map(RequestId::Number),
+            _ => None,
+        }
+    }
+}
+
+/// The integer an integral float id stands for, if it is exactly representable.
+fn integral_float_id(f: f64) -> Option<i64> {
+    /// 2^53, the largest magnitude at which every integer is an exact `f64`.
+    const MAX_EXACT: f64 = 9_007_199_254_740_992.0;
+    (f.is_finite() && f.fract() == 0.0 && f.abs() <= MAX_EXACT).then_some(f as i64)
+}
+
+impl<'de> Deserialize<'de> for RequestId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct IdVisitor;
+
+        impl serde::de::Visitor<'_> for IdVisitor {
+            type Value = RequestId;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a string or integer request id")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<RequestId, E> {
+                Ok(RequestId::String(v.to_owned()))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<RequestId, E> {
+                Ok(RequestId::String(v))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<RequestId, E> {
+                Ok(RequestId::Number(v))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<RequestId, E> {
+                i64::try_from(v)
+                    .map(RequestId::Number)
+                    .map_err(|_| E::custom("request id is out of range for a signed integer"))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<RequestId, E> {
+                integral_float_id(v)
+                    .map(RequestId::Number)
+                    .ok_or_else(|| E::custom("request id must be a string or an integer"))
+            }
+        }
+
+        deserializer.deserialize_any(IdVisitor)
+    }
 }
 
 impl From<String> for RequestId {
@@ -6046,6 +6122,77 @@ pub struct SubscriptionsAcknowledgedParams {
 mod tests {
     use super::*;
     use crate::error::JsonRpcError;
+
+    // =========================================================================
+    // Request id wire forms
+    // =========================================================================
+
+    #[test]
+    fn request_id_reads_an_integral_float_as_that_integer() {
+        for (raw, expected) in [
+            ("1.0", 1),
+            ("0.0", 0),
+            ("-0.0", 0),
+            ("-3.0", -3),
+            ("1e2", 100),
+            ("9007199254740992.0", 9_007_199_254_740_992),
+            ("-9007199254740992.0", -9_007_199_254_740_992),
+        ] {
+            let id: RequestId = serde_json::from_str(raw).unwrap();
+            assert_eq!(id, RequestId::Number(expected), "{raw}");
+            let value: Value = serde_json::from_str(raw).unwrap();
+            assert_eq!(
+                RequestId::from_json(&value),
+                Some(RequestId::Number(expected)),
+                "{raw}"
+            );
+            assert_eq!(
+                serde_json::from_value::<RequestId>(value).unwrap(),
+                RequestId::Number(expected),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_id_rejects_fractional_and_oversized_numbers() {
+        for raw in [
+            "1.5",
+            "0.1",
+            "9007199254740994.0",
+            "1e300",
+            "18446744073709551615",
+            "9223372036854775808",
+        ] {
+            assert!(serde_json::from_str::<RequestId>(raw).is_err(), "{raw}");
+            let value: Value = serde_json::from_str(raw).unwrap();
+            assert_eq!(RequestId::from_json(&value), None, "{raw}");
+        }
+        for raw in ["true", "null", "[1]", "{\"a\":1}"] {
+            assert!(serde_json::from_str::<RequestId>(raw).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn request_id_integral_float_is_echoed_as_an_integer() {
+        let request: JsonRpcRequest =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","id":1.0,"method":"ping"}"#).unwrap();
+        assert_eq!(request.id, RequestId::Number(1));
+        let response = JsonRpcResponse::result(request.id, serde_json::json!({}));
+        assert_eq!(serde_json::to_value(&response).unwrap()["id"], 1);
+    }
+
+    #[test]
+    fn request_id_strings_and_integers_are_unchanged() {
+        assert_eq!(
+            serde_json::from_str::<RequestId>("\"1.0\"").unwrap(),
+            RequestId::String("1.0".into())
+        );
+        assert_eq!(
+            serde_json::from_str::<RequestId>("-7").unwrap(),
+            RequestId::Number(-7)
+        );
+    }
 
     // =========================================================================
     // Metadata and extension key validation

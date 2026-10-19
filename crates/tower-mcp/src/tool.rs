@@ -40,6 +40,7 @@ use std::task::{Context, Poll};
 
 use pin_project_lite::pin_project;
 
+use schemars::generate::SchemaSettings;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -1086,8 +1087,11 @@ impl ToolBuilder {
 
     /// Derive the output schema from a type via [`schemars::JsonSchema`].
     ///
-    /// The schema is generated the same way input schemas are, so the draft
-    /// and `$defs` handling match. It replaces any schema set earlier with
+    /// The draft and `$defs` handling match input schemas, but the schema
+    /// describes how `T` is serialized rather than deserialized. An `Option`
+    /// field that is always written is required, a field with
+    /// `#[serde(skip_serializing_if = ...)]` is optional, and serialize-only
+    /// renames are used. It replaces any schema set earlier with
     /// [`output_schema`](Self::output_schema). MCP 2025-11-25 and earlier
     /// require `"type": "object"` at the root; MCP 2026-07-28 accepts any JSON
     /// Schema 2020-12. The builder does not rewrite or reject the schema;
@@ -1124,8 +1128,13 @@ impl ToolBuilder {
     /// ```
     pub fn output_schema_for<T: JsonSchema>(mut self) -> Self {
         self.output_schema = Some(
-            serde_json::to_value(schemars::schema_for!(T))
-                .unwrap_or_else(|_| serde_json::json!({ "type": "object" })),
+            serde_json::to_value(
+                SchemaSettings::draft2020_12()
+                    .for_serialize()
+                    .into_generator()
+                    .into_root_schema_for::<T>(),
+            )
+            .unwrap_or_else(|_| serde_json::json!({ "type": "object" })),
         );
         self
     }

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::super::*;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 // The fields exist to shape the schema; the handlers never read them.
@@ -60,7 +60,7 @@ async fn output_schema_for_matches_the_schemars_schema() {
         .handler(|()| async { Ok(CallToolResult::text("ok")) })
         .build();
 
-    let expected = serde_json::to_value(schemars::schema_for!(Summary)).unwrap();
+    let expected = serialize_schema::<Summary>();
     let schema = tool.definition().output_schema.expect("output schema");
     assert_eq!(schema, expected);
     assert_eq!(schema["type"], "object");
@@ -76,10 +76,73 @@ async fn output_schema_for_replaces_an_earlier_schema() {
         .build();
 
     let schema = tool.definition().output_schema.expect("output schema");
-    assert_eq!(
-        schema,
-        serde_json::to_value(schemars::schema_for!(Summary)).unwrap()
-    );
+    assert_eq!(schema, serialize_schema::<Summary>());
+}
+
+/// The schema schemars generates for `T` under the serialize contract.
+fn serialize_schema<T: JsonSchema>() -> Value {
+    serde_json::to_value(
+        schemars::generate::SchemaSettings::draft2020_12()
+            .for_serialize()
+            .into_generator()
+            .into_root_schema_for::<T>(),
+    )
+    .unwrap()
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct OutputContract {
+    /// Always written, as `null` when absent.
+    always: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sometimes: Option<String>,
+    #[serde(rename(serialize = "wireName", deserialize = "inName"))]
+    renamed: u32,
+}
+
+fn output_schema_of<T: JsonSchema>() -> Value {
+    ToolBuilder::new("contract")
+        .output_schema_for::<T>()
+        .handler(|()| async { Ok(CallToolResult::text("ok")) })
+        .build()
+        .definition()
+        .output_schema
+        .expect("output schema")
+}
+
+fn required_names(schema: &Value) -> Vec<&str> {
+    schema["required"]
+        .as_array()
+        .map(|names| names.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default()
+}
+
+/// The schema describes what the tool writes, so an `Option` that is always
+/// serialized is required (rmcp #1374). The input contract would call it
+/// optional.
+#[test]
+fn output_schema_for_requires_an_always_serialized_option() {
+    let schema = output_schema_of::<OutputContract>();
+    assert_eq!(schema["type"], "object");
+    assert!(required_names(&schema).contains(&"always"), "{schema}");
+
+    let input = serde_json::to_value(schemars::schema_for!(OutputContract)).unwrap();
+    assert!(!required_names(&input).contains(&"always"), "{input}");
+}
+
+#[test]
+fn output_schema_for_leaves_a_skip_serializing_if_field_optional() {
+    let schema = output_schema_of::<OutputContract>();
+    assert!(schema["properties"]["sometimes"].is_object(), "{schema}");
+    assert!(!required_names(&schema).contains(&"sometimes"), "{schema}");
+}
+
+#[test]
+fn output_schema_for_uses_the_serialize_side_rename() {
+    let schema = output_schema_of::<OutputContract>();
+    assert!(schema["properties"]["wireName"].is_object(), "{schema}");
+    assert!(schema["properties"]["inName"].is_null(), "{schema}");
+    assert!(required_names(&schema).contains(&"wireName"), "{schema}");
 }
 
 /// The switches are available across feature configurations.

@@ -541,7 +541,7 @@ fn inspect_optional_error_id(object: &Map<String, Value>) -> Result<(), JsonRpcI
 }
 
 fn valid_request_id(value: &Value) -> bool {
-    matches!(value, Value::String(_)) || value.as_i64().is_some()
+    crate::protocol::RequestId::from_json(value).is_some()
 }
 
 fn decode_value<T>(value: &Value, context: &'static str) -> Result<T, JsonRpcInspectionError>
@@ -716,6 +716,12 @@ mod tests {
                 JsonRpcInspectionErrorKind::InvalidField
             );
         }
+    }
+
+    #[test]
+    fn accepts_an_integral_float_id() {
+        assert!(inspect(json!({"jsonrpc": "2.0", "id": 1.0, "method": "ping"})).is_ok());
+        assert!(inspect(json!({"jsonrpc": "2.0", "id": 2.0, "result": {}})).is_ok());
     }
 
     #[test]

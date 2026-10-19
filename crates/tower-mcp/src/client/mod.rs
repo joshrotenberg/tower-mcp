@@ -3508,13 +3508,7 @@ async fn dispatch_server_request<H: ClientHandler>(
 
 /// Parse a request ID from a JSON-RPC message.
 fn parse_request_id(parsed: &serde_json::Value) -> Option<RequestId> {
-    parsed.get("id").and_then(|id| {
-        if let Some(n) = id.as_i64() {
-            Some(RequestId::Number(n))
-        } else {
-            id.as_str().map(|s| RequestId::String(s.to_string()))
-        }
-    })
+    parsed.get("id").and_then(RequestId::from_json)
 }
 
 /// Parse a server notification into the typed enum.

@@ -47,6 +47,22 @@ use crate::error::{Error, Result};
 use crate::framing::{FrameReader, InputFrame, clean_input_line};
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse, RequestId};
 
+/// How long `shutdown` waits for the child at each stage.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Send `SIGTERM` to the child alone. False if it could not be signalled,
+/// including when it has already been reaped and has no pid.
+#[cfg(unix)]
+fn send_sigterm(child: &Child) -> bool {
+    let Some(pid) = child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()) else {
+        return false;
+    };
+    // SAFETY: `kill` takes plain integers and touches no memory. The child has
+    // not been reaped (it still has a pid), so the number cannot have been
+    // reused.
+    unsafe { libc::kill(pid, libc::SIGTERM) == 0 }
+}
+
 /// Builder for child process transport
 pub struct ChildProcessTransport {
     program: String,
@@ -419,13 +435,23 @@ impl ChildProcessConnection {
     }
 
     /// Gracefully shutdown the child process
-    pub async fn shutdown(mut self) -> Result<()> {
+    ///
+    /// Closes the child's stdin and waits up to 5 seconds for it to exit. On
+    /// Unix, a child still running then is sent `SIGTERM` and given another 5
+    /// seconds before it is killed. Elsewhere it is killed at that point.
+    /// Only the child itself is signalled, not its descendants.
+    pub async fn shutdown(self) -> Result<()> {
+        self.shutdown_with_grace(SHUTDOWN_GRACE).await
+    }
+
+    /// [`shutdown`](Self::shutdown) with the wait at each stage as a parameter,
+    /// so tests do not sit through the real one.
+    async fn shutdown_with_grace(mut self, grace: std::time::Duration) -> Result<()> {
         // Close stdin to signal EOF
         drop(self.stdin);
 
         // Wait for process to exit with timeout
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait()).await;
+        let result = tokio::time::timeout(grace, self.child.wait()).await;
 
         match result {
             Ok(Ok(status)) => {
@@ -437,6 +463,22 @@ impl ChildProcessConnection {
                 Err(Error::Transport(format!("Child process error: {}", e)))
             }
             Err(_) => {
+                #[cfg(unix)]
+                if send_sigterm(&self.child) {
+                    tracing::warn!("Child process did not exit after stdin closed, sent SIGTERM");
+                    match tokio::time::timeout(grace, self.child.wait()).await {
+                        Ok(Ok(status)) => {
+                            tracing::info!(status = ?status, "Child process exited");
+                            return Ok(());
+                        }
+                        Ok(Err(e)) => {
+                            tracing::error!(error = %e, "Error waiting for child process");
+                            return Err(Error::Transport(format!("Child process error: {}", e)));
+                        }
+                        Err(_) => {}
+                    }
+                }
+
                 // Timeout - kill the process
                 tracing::warn!("Child process did not exit gracefully, killing");
                 self.child
@@ -613,6 +655,114 @@ mod tests {
         let conn = ChildProcessTransport::new("cat").spawn().await.unwrap();
         // Shutdown should succeed - cat exits when stdin is closed
         conn.shutdown().await.unwrap();
+    }
+
+    /// A unique scratch path for the shutdown tests' marker files.
+    #[cfg(unix)]
+    fn scratch_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "tower-mcp-childproc-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// Wait for the child to create `ready`, which it does only after its
+    /// signal disposition is in place.
+    #[cfg(unix)]
+    async fn wait_for_file(ready: &std::path::Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child never signalled that it was ready"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A child that ignores stdin EOF but handles `SIGTERM` is sent it before
+    /// it is killed (rmcp #347). Without the step, `shutdown` would kill it
+    /// and the marker would never be written.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_sends_sigterm_to_a_child_that_ignores_stdin_eof() {
+        use std::time::{Duration, Instant};
+
+        let ready = scratch_path("term-ready");
+        let marker = scratch_path("term-marker");
+        let conn = ChildProcessTransport::new("sh")
+            .args([
+                "-c",
+                &format!(
+                    "trap 'echo term > \"{}\"; exit 0' TERM; : > \"{}\"; while :; do sleep 0.1; done",
+                    marker.display(),
+                    ready.display()
+                ),
+            ])
+            .spawn()
+            .await
+            .unwrap();
+        wait_for_file(&ready).await;
+
+        let started = Instant::now();
+        let result = conn.shutdown_with_grace(Duration::from_millis(300)).await;
+        let elapsed = started.elapsed();
+
+        let recorded = std::fs::read_to_string(&marker);
+        let _ = std::fs::remove_file(&ready);
+        let _ = std::fs::remove_file(&marker);
+        result.unwrap();
+        assert_eq!(
+            recorded.expect("SIGTERM was never delivered").trim(),
+            "term"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "shutdown took {elapsed:?}; it should end the child once SIGTERM lands"
+        );
+    }
+
+    /// A child that ignores `SIGTERM` as well is still killed, after both
+    /// waits.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_kills_a_child_that_ignores_sigterm() {
+        use std::time::{Duration, Instant};
+
+        let ready = scratch_path("kill-ready");
+        let conn = ChildProcessTransport::new("sh")
+            .args([
+                "-c",
+                &format!(
+                    "trap '' TERM; : > \"{}\"; while :; do sleep 0.1; done",
+                    ready.display()
+                ),
+            ])
+            .spawn()
+            .await
+            .unwrap();
+        wait_for_file(&ready).await;
+        let pid = conn.child.id().expect("a running child has a pid") as libc::pid_t;
+
+        let grace = Duration::from_millis(300);
+        let started = Instant::now();
+        let result = conn.shutdown_with_grace(grace).await;
+        let elapsed = started.elapsed();
+
+        let _ = std::fs::remove_file(&ready);
+        result.unwrap();
+        assert!(
+            elapsed >= grace * 2,
+            "shutdown returned after {elapsed:?}, before waiting out SIGTERM"
+        );
+        assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
+        // SAFETY: signal 0 only probes for existence. The child was reaped by
+        // `kill`, so a live process here would be the child itself.
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "child survived shutdown");
     }
 
     #[tokio::test]
