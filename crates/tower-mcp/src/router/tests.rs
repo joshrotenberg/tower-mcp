@@ -1617,6 +1617,60 @@ async fn test_read_resource_via_template() {
     }
 }
 
+/// A template whose handler answers with the request id it was given.
+fn request_id_template(pattern: &str) -> crate::resource::ResourceTemplate {
+    use crate::resource::ResourceTemplateBuilder;
+    use std::collections::HashMap;
+
+    ResourceTemplateBuilder::new(pattern)
+        .name(pattern)
+        .handler_with_context(
+            |ctx: RequestContext, uri: String, _vars: HashMap<String, String>| async move {
+                Ok(ReadResourceResult::text(
+                    uri,
+                    format!("{:?}", ctx.request_id()),
+                ))
+            },
+        )
+}
+
+async fn read_text(router: &mut McpRouter, id: i64, uri: &str) -> String {
+    let req = RouterRequest {
+        id: RequestId::Number(id),
+        inner: McpRequest::ReadResource(ReadResourceParams {
+            input_responses: None,
+            request_state: None,
+            uri: uri.to_string(),
+            meta: None,
+        }),
+        extensions: Extensions::new(),
+    };
+    match router.ready().await.unwrap().call(req).await.unwrap().inner {
+        Ok(McpResponse::ReadResource(result)) => result.contents[0].text.clone().unwrap(),
+        other => panic!("Expected ReadResource response, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_template_handler_with_context_receives_the_request_context() {
+    let mut router = McpRouter::new().resource_template(request_id_template("ctx://{id}"));
+    init_router(&mut router).await;
+
+    let text = read_text(&mut router, 42, "ctx://a").await;
+    assert_eq!(text, format!("{:?}", RequestId::Number(42)));
+}
+
+#[cfg(feature = "dynamic-tools")]
+#[tokio::test]
+async fn test_dynamic_template_handler_with_context_receives_the_request_context() {
+    let (mut router, registry) = McpRouter::new().with_dynamic_resource_templates();
+    registry.register(request_id_template("dyn-ctx://{id}"));
+    init_router(&mut router).await;
+
+    let text = read_text(&mut router, 43, "dyn-ctx://a").await;
+    assert_eq!(text, format!("{:?}", RequestId::Number(43)));
+}
+
 #[tokio::test]
 async fn test_static_resource_takes_precedence_over_template() {
     use crate::resource::{ResourceBuilder, ResourceTemplateBuilder};
@@ -8101,6 +8155,54 @@ mod dynamic_tools_tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"tool_a"));
         assert!(names.contains(&"tool_b"));
+    }
+    #[tokio::test]
+    async fn test_dynamic_tools_replace_all_one_notification() {
+        let (tx, mut rx) = crate::context::notification_channel(16);
+        let (router, registry) = McpRouter::new()
+            .server_info("test", "1.0")
+            .with_dynamic_tools();
+        let mut router = router.with_notification_sender(tx);
+        init_router(&mut router).await;
+
+        let tool = |name: &str| {
+            ToolBuilder::new(name)
+                .description("Reloadable")
+                .handler(|_: AddInput| async { Ok(CallToolResult::text("ok")) })
+                .build()
+        };
+        registry.replace_all([tool("a"), tool("b"), tool("c")]);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ServerNotification::ToolsListChanged
+        ));
+
+        // Three tools become two: one replaced, two removed, one added. Item by
+        // item this was four notifications (#1583).
+        let change = registry.replace_all([tool("b"), tool("d")]);
+        assert_eq!(change.added, ["d"]);
+        assert_eq!(change.removed, ["a", "c"]);
+        assert_eq!(change.replaced, ["b"]);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ServerNotification::ToolsListChanged
+        ));
+        assert!(rx.try_recv().is_err());
+
+        let req = RouterRequest {
+            id: RequestId::Number(2),
+            inner: McpRequest::ListTools(ListToolsParams::default()),
+            extensions: Extensions::new(),
+        };
+        let resp = router.ready().await.unwrap().call(req).await.unwrap();
+        match resp.inner {
+            Ok(McpResponse::ListTools(result)) => {
+                let mut names: Vec<&str> = result.tools.iter().map(|t| t.name.as_str()).collect();
+                names.sort();
+                assert_eq!(names, ["b", "d"]);
+            }
+            _ => panic!("Expected ListTools response"),
+        }
     }
 } // mod dynamic_tools_tests
 

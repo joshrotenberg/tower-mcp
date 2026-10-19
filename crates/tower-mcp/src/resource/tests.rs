@@ -675,3 +675,102 @@ fn test_compile_uri_template_returns_result() {
     assert!(compile_uri_template("no-vars").is_ok());
     assert!(compile_uri_template("").is_ok());
 }
+
+// =========================================================================
+// ResourceTemplateBuilder::handler_with_context (#1583)
+// =========================================================================
+
+fn context_template() -> ResourceTemplate {
+    ResourceTemplateBuilder::new("ctx://{id}")
+        .name("context")
+        .handler_with_context(
+            |ctx: RequestContext, uri: String, vars: HashMap<String, String>| async move {
+                Ok(ReadResourceResult::text(
+                    uri,
+                    format!(
+                        "{} {:?} cancelled={}",
+                        vars["id"],
+                        ctx.request_id(),
+                        ctx.is_cancelled()
+                    ),
+                ))
+            },
+        )
+}
+
+#[tokio::test]
+async fn template_handler_with_context_receives_the_callers_context() {
+    let template = context_template();
+    let ctx = RequestContext::new(crate::protocol::RequestId::Number(7));
+    let vars = template.match_uri("ctx://a").unwrap();
+    let outcome = template
+        .read_outcome_with_context(ctx.clone(), "ctx://a", vars)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.as_complete().unwrap().contents[0].text.as_deref(),
+        Some("a Number(7) cancelled=false")
+    );
+
+    ctx.cancel();
+    let vars = template.match_uri("ctx://b").unwrap();
+    let outcome = template
+        .read_outcome_with_context(ctx, "ctx://b", vars)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.as_complete().unwrap().contents[0].text.as_deref(),
+        Some("b Number(7) cancelled=true")
+    );
+}
+
+#[tokio::test]
+async fn template_read_gives_a_context_handler_a_fresh_context() {
+    let template = context_template();
+    let vars = template.match_uri("ctx://a").unwrap();
+    let result = template.read("ctx://a", vars).await.unwrap();
+    assert_eq!(
+        result.contents[0].text.as_deref(),
+        Some("a Number(0) cancelled=false")
+    );
+}
+
+#[tokio::test]
+async fn template_clone_carries_the_context_handler() {
+    let template = context_template().clone();
+    let ctx = RequestContext::new(crate::protocol::RequestId::Number(3));
+    let vars = template.match_uri("ctx://c").unwrap();
+    let outcome = template
+        .read_outcome_with_context(ctx, "ctx://c", vars)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.as_complete().unwrap().contents[0].text.as_deref(),
+        Some("c Number(3) cancelled=false")
+    );
+}
+
+#[test]
+fn try_handler_with_context_reports_a_bad_pattern() {
+    let error = ResourceTemplateBuilder::new("agent://threads{?cursor}/latest")
+        .try_handler_with_context(
+            |_ctx: RequestContext, uri: String, _vars: HashMap<String, String>| async move {
+                Ok(ReadResourceResult::text(uri, ""))
+            },
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("after its query expression"),
+        "{error}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "Invalid URI template")]
+fn handler_with_context_panics_on_a_bad_pattern() {
+    let _ = ResourceTemplateBuilder::new("agent://threads{?cursor}/latest").handler_with_context(
+        |_ctx: RequestContext, uri: String, _vars: HashMap<String, String>| async move {
+            Ok(ReadResourceResult::text(uri, ""))
+        },
+    );
+}

@@ -29,6 +29,7 @@
 //! | [`ResourceBuilder::handler`] | nothing |
 //! | [`ResourceBuilder::handler_with_context`] | a [`RequestContext`] for progress, cancellation, and client requests |
 //! | [`ResourceTemplateBuilder::handler`] | the request URI and the extracted variables |
+//! | [`ResourceTemplateBuilder::handler_with_context`] | a [`RequestContext`], the request URI, and the extracted variables |
 //!
 //! Each returns a [`ReadResourceResult`]. For content already in memory,
 //! [`ResourceBuilder::text`] and [`ResourceBuilder::json`] finish the builder
@@ -1788,12 +1789,15 @@ impl<T: McpResource> ResourceHandler for McpResourceHandler<T> {
 /// Unlike [`ResourceHandler`], a template handler is told which URI matched
 /// and what was extracted from it, because one handler serves many URIs.
 /// Templates are built from closures through
-/// [`ResourceTemplateBuilder::handler`]; no public constructor accepts an
-/// implementation of this trait.
+/// [`ResourceTemplateBuilder::handler`] and
+/// [`ResourceTemplateBuilder::handler_with_context`]; no public constructor
+/// accepts an implementation of this trait.
 pub(crate) trait ResourceTemplateHandler: Send + Sync {
-    /// Read a resource with the given URI variables extracted from the template
+    /// Read a resource with the given URI variables extracted from the
+    /// template. Handlers built with `handler` ignore the context.
     fn read(
         &self,
+        ctx: RequestContext,
         uri: &str,
         variables: HashMap<String, String>,
     ) -> BoxFuture<'_, Result<ReadResourceResult>>;
@@ -2157,6 +2161,12 @@ impl ResourceTemplate {
     /// reports that as an error here; use
     /// [`read_outcome_with_context`](Self::read_outcome_with_context).
     ///
+    /// A handler attached with
+    /// [`ResourceTemplateBuilder::handler_with_context`] receives a fresh
+    /// context here, with request id `0` and no cancellation, the same one
+    /// [`Resource::read`] uses. The router passes the request's own context
+    /// through [`read_outcome_with_context`](Self::read_outcome_with_context).
+    ///
     /// This is a direct application call and does not pass through an
     /// [`McpRouter`](crate::McpRouter), so it does not evaluate the router's
     /// resource-template filter. Callers using a template outside the router
@@ -2167,7 +2177,11 @@ impl ResourceTemplate {
         variables: HashMap<String, String>,
     ) -> BoxFuture<'_, Result<ReadResourceResult>> {
         match &self.handler {
-            Some(handler) => handler.read(uri, variables),
+            Some(handler) => handler.read(
+                RequestContext::new(crate::protocol::RequestId::Number(0)),
+                uri,
+                variables,
+            ),
             None => Box::pin(async {
                 Err(Error::invalid_params(
                     "MRTR resource template requires read_outcome_with_context",
@@ -2177,6 +2191,12 @@ impl ResourceTemplate {
     }
 
     /// Read a matched resource while preserving an SEP-2322 continuation.
+    ///
+    /// This is the call the router makes, with the request's own context. A
+    /// handler attached with
+    /// [`ResourceTemplateBuilder::handler_with_context`] or `mrtr_handler`
+    /// receives `ctx`; one attached with
+    /// [`ResourceTemplateBuilder::handler`] ignores it.
     ///
     /// Calling this method directly does not evaluate an
     /// [`McpRouter`](crate::McpRouter) resource-template filter. The router
@@ -2188,7 +2208,6 @@ impl ResourceTemplate {
         uri: &str,
         variables: HashMap<String, String>,
     ) -> BoxFuture<'_, Result<RequestOutcome<ReadResourceResult>>> {
-        let _ = &ctx;
         #[cfg(feature = "stateless")]
         if let Some(handler) = &self.mrtr_handler {
             return handler.read(ctx, uri, variables);
@@ -2199,7 +2218,7 @@ impl ResourceTemplate {
                 let uri = uri.to_string();
                 Box::pin(async move {
                     handler
-                        .read(&uri, variables)
+                        .read(ctx, &uri, variables)
                         .await
                         .map(RequestOutcome::Complete)
                 })
@@ -2482,6 +2501,83 @@ impl ResourceTemplateBuilder {
         F: Fn(String, HashMap<String, String>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<ReadResourceResult>> + Send + 'static,
     {
+        self.with_template_handler(Arc::new(FnTemplateHandler { handler }))
+    }
+
+    /// Attach a handler that also receives the [`RequestContext`], compile
+    /// the pattern, and return the template.
+    ///
+    /// The template counterpart of [`ResourceBuilder::handler_with_context`].
+    /// Take this form when a read runs long enough to report progress, has to
+    /// notice cancellation, or wants to ask the client something. It is
+    /// available in every build; `mrtr_handler` adds SEP-2322 continuations
+    /// on top of the same arguments.
+    ///
+    /// ```rust
+    /// use std::collections::HashMap;
+    /// use tower_mcp::context::RequestContext;
+    /// use tower_mcp::error::Error;
+    /// use tower_mcp::protocol::{ReadResourceResult, RequestId};
+    /// use tower_mcp::resource::ResourceTemplateBuilder;
+    ///
+    /// let template = ResourceTemplateBuilder::new("logs://{day}")
+    ///     .name("Daily logs")
+    ///     .handler_with_context(
+    ///         |ctx: RequestContext, uri: String, vars: HashMap<String, String>| async move {
+    ///             if ctx.is_cancelled() {
+    ///                 return Err(Error::internal("read cancelled"));
+    ///             }
+    ///             ctx.report_progress(1.0, Some(1.0), Some("read")).await;
+    ///             Ok(ReadResourceResult::text(uri, format!("logs for {}", vars["day"])))
+    ///         },
+    ///     );
+    ///
+    /// # tokio_test::block_on(async {
+    /// let uri = "logs://monday";
+    /// let ctx = RequestContext::new(RequestId::Number(1));
+    /// let vars = template.match_uri(uri).unwrap();
+    /// let outcome = template.read_outcome_with_context(ctx.clone(), uri, vars).await.unwrap();
+    /// let result = outcome.as_complete().unwrap();
+    /// assert_eq!(result.contents[0].text.as_deref(), Some("logs for monday"));
+    ///
+    /// // A cancelled request reaches the handler as cancelled.
+    /// ctx.cancel();
+    /// let vars = template.match_uri(uri).unwrap();
+    /// assert!(template.read_outcome_with_context(ctx, uri, vars).await.is_err());
+    /// # });
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if the URI template is not a valid pattern, as
+    /// [`handler`](Self::handler) does. Use
+    /// [`try_handler_with_context`](Self::try_handler_with_context) for a
+    /// pattern that is not a literal in the source.
+    pub fn handler_with_context<F, Fut>(self, handler: F) -> ResourceTemplate
+    where
+        F: Fn(RequestContext, String, HashMap<String, String>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ReadResourceResult>> + Send + 'static,
+    {
+        self.try_handler_with_context(handler)
+            .unwrap_or_else(|e| panic!("Invalid URI template: {e}"))
+    }
+
+    /// The fallible form of [`handler_with_context`](Self::handler_with_context).
+    pub fn try_handler_with_context<F, Fut>(
+        self,
+        handler: F,
+    ) -> std::result::Result<ResourceTemplate, Error>
+    where
+        F: Fn(RequestContext, String, HashMap<String, String>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ReadResourceResult>> + Send + 'static,
+    {
+        self.with_template_handler(Arc::new(ContextFnTemplateHandler { handler }))
+    }
+
+    fn with_template_handler(
+        self,
+        handler: Arc<dyn ResourceTemplateHandler>,
+    ) -> std::result::Result<ResourceTemplate, Error> {
         let CompiledTemplate {
             pattern,
             variables,
@@ -2502,7 +2598,7 @@ impl ResourceTemplateBuilder {
             pattern,
             query_variables,
             variables,
-            handler: Some(Arc::new(FnTemplateHandler { handler })),
+            handler: Some(handler),
             #[cfg(feature = "stateless")]
             mrtr_handler: None,
         })
@@ -2572,11 +2668,32 @@ where
 {
     fn read(
         &self,
+        _ctx: RequestContext,
         uri: &str,
         variables: HashMap<String, String>,
     ) -> BoxFuture<'_, Result<ReadResourceResult>> {
         let uri = uri.to_string();
         Box::pin((self.handler)(uri, variables))
+    }
+}
+
+/// Handler wrapping a function for templates that takes the request context
+struct ContextFnTemplateHandler<F> {
+    handler: F,
+}
+
+impl<F, Fut> ResourceTemplateHandler for ContextFnTemplateHandler<F>
+where
+    F: Fn(RequestContext, String, HashMap<String, String>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<ReadResourceResult>> + Send + 'static,
+{
+    fn read(
+        &self,
+        ctx: RequestContext,
+        uri: &str,
+        variables: HashMap<String, String>,
+    ) -> BoxFuture<'_, Result<ReadResourceResult>> {
+        Box::pin((self.handler)(ctx, uri.to_string(), variables))
     }
 }
 

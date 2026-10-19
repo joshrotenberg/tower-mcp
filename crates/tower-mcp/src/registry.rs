@@ -4,6 +4,10 @@
 //! adding and removing tools at runtime. When tools change, all connected
 //! sessions are notified via `notifications/tools/list_changed`.
 //!
+//! [`DynamicPromptRegistry`], [`DynamicResourceRegistry`] and
+//! [`DynamicResourceTemplateRegistry`] do the same for prompts, resources and
+//! resource templates.
+//!
 //! # Example
 //!
 //! ```rust
@@ -26,12 +30,88 @@
 //!
 //! registry.register(tool);
 //! ```
+//!
+//! # Replacing a whole set
+//!
+//! `register` and `unregister` each broadcast one `list_changed`, so reloading
+//! a set item by item sends one notification per call, and a client listing in
+//! between sees part of the old set and part of the new. Every registry also
+//! has `replace_all`, which swaps the whole set in one write, broadcasts once,
+//! and returns a [`RegistryChange`] naming what was added, removed and
+//! replaced:
+//!
+//! ```rust
+//! use tower_mcp::{CallToolResult, McpRouter, ToolBuilder};
+//!
+//! fn tool(name: &str) -> tower_mcp::Tool {
+//!     ToolBuilder::new(name)
+//!         .description("Reloadable tool")
+//!         .no_params_handler(|| async { Ok(CallToolResult::text("ok")) })
+//!         .build()
+//! }
+//!
+//! let (_router, registry) = McpRouter::new()
+//!     .server_info("my-server", "1.0.0")
+//!     .with_dynamic_tools();
+//! registry.register(tool("lint"));
+//! registry.register(tool("format"));
+//!
+//! // A reload: `lint` stays (with a new handler), `format` goes, `test` is new.
+//! let change = registry.replace_all([tool("lint"), tool("test")]);
+//! assert_eq!(change.added, ["test"]);
+//! assert_eq!(change.removed, ["format"]);
+//! assert_eq!(change.replaced, ["lint"]);
+//! ```
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 
 use crate::context::{NotificationSender, ServerNotification};
 use crate::tool::Tool;
+
+/// What a `replace_all` call changed, by key.
+///
+/// Keys are tool names, prompt names, resource URIs, and resource template URI
+/// patterns, depending on the registry. Each list is sorted and holds each key
+/// once.
+///
+/// Handlers cannot be compared, so every key present both before and after the
+/// call is reported in [`replaced`](Self::replaced), whether or not its
+/// definition changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RegistryChange {
+    /// Keys in the new set that were not registered before the call.
+    pub added: Vec<String>,
+    /// Keys registered before the call that are not in the new set.
+    pub removed: Vec<String>,
+    /// Keys registered before the call that are also in the new set.
+    pub replaced: Vec<String>,
+}
+
+impl RegistryChange {
+    fn between<'a>(
+        previous: impl IntoIterator<Item = &'a String>,
+        current: impl IntoIterator<Item = &'a String>,
+    ) -> Self {
+        let previous: BTreeSet<&String> = previous.into_iter().collect();
+        let current: BTreeSet<&String> = current.into_iter().collect();
+        Self {
+            added: current
+                .difference(&previous)
+                .map(|key| (*key).clone())
+                .collect(),
+            removed: previous
+                .difference(&current)
+                .map(|key| (*key).clone())
+                .collect(),
+            replaced: current
+                .intersection(&previous)
+                .map(|key| (*key).clone())
+                .collect(),
+        }
+    }
+}
 
 /// Inner state shared between the registry handle and the router.
 pub(crate) struct DynamicToolsInner {
@@ -89,6 +169,7 @@ impl DynamicToolsInner {
 ///
 /// When a tool is registered or unregistered, all connected sessions receive a
 /// `notifications/tools/list_changed` notification.
+/// [`replace_all`](Self::replace_all) swaps the whole set and sends one.
 #[derive(Clone)]
 pub struct DynamicToolRegistry {
     inner: Arc<DynamicToolsInner>,
@@ -123,6 +204,29 @@ impl DynamicToolRegistry {
             self.inner.broadcast_tools_changed();
         }
         removed
+    }
+
+    /// Replace every dynamic tool with `tools`, in one write.
+    ///
+    /// The new set is built before the lock is taken and swapped in under a
+    /// single write, so `tools/list` returns either the old set or the new
+    /// one, never a mix. If two tools share a name, the later one is kept, as
+    /// with [`register`](Self::register).
+    ///
+    /// Broadcasts `ToolsListChanged` once, even when the set did not change.
+    /// A call already running keeps the tool it started with.
+    pub fn replace_all(&self, tools: impl IntoIterator<Item = Tool>) -> RegistryChange {
+        let tools: HashMap<String, Arc<Tool>> = tools
+            .into_iter()
+            .map(|tool| (tool.name.clone(), Arc::new(tool)))
+            .collect();
+        let names: Vec<String> = tools.keys().cloned().collect();
+        let previous = {
+            let mut current = self.inner.tools.write().unwrap();
+            std::mem::replace(&mut *current, tools)
+        };
+        self.inner.broadcast_tools_changed();
+        RegistryChange::between(previous.keys(), &names)
     }
 
     /// List all currently registered dynamic tools.
@@ -196,6 +300,7 @@ impl DynamicPromptsInner {
 ///
 /// When a prompt is registered or unregistered, all connected sessions receive a
 /// `notifications/prompts/list_changed` notification.
+/// [`replace_all`](Self::replace_all) swaps the whole set and sends one.
 ///
 /// # Example
 ///
@@ -247,6 +352,31 @@ impl DynamicPromptRegistry {
             self.inner.broadcast_prompts_changed();
         }
         removed
+    }
+
+    /// Replace every dynamic prompt with `prompts`, in one write.
+    ///
+    /// The new set is built before the lock is taken and swapped in under a
+    /// single write, so `prompts/list` returns either the old set or the new
+    /// one, never a mix. If two prompts share a name, the later one is kept,
+    /// as with [`register`](Self::register).
+    ///
+    /// Broadcasts `PromptsListChanged` once, even when the set did not change.
+    pub fn replace_all(
+        &self,
+        prompts: impl IntoIterator<Item = crate::prompt::Prompt>,
+    ) -> RegistryChange {
+        let prompts: HashMap<String, Arc<crate::prompt::Prompt>> = prompts
+            .into_iter()
+            .map(|prompt| (prompt.name.clone(), Arc::new(prompt)))
+            .collect();
+        let names: Vec<String> = prompts.keys().cloned().collect();
+        let previous = {
+            let mut current = self.inner.prompts.write().unwrap();
+            std::mem::replace(&mut *current, prompts)
+        };
+        self.inner.broadcast_prompts_changed();
+        RegistryChange::between(previous.keys(), &names)
     }
 
     /// List all currently registered dynamic prompts.
@@ -311,6 +441,7 @@ impl DynamicResourcesInner {
 ///
 /// When a resource is registered or unregistered, all connected sessions
 /// receive a `notifications/resources/list_changed` notification.
+/// [`replace_all`](Self::replace_all) swaps the whole set and sends one.
 ///
 /// # Example
 ///
@@ -361,6 +492,32 @@ impl DynamicResourceRegistry {
             self.inner.broadcast_resources_changed();
         }
         removed
+    }
+
+    /// Replace every dynamic resource with `resources`, in one write.
+    ///
+    /// The new set is built before the lock is taken and swapped in under a
+    /// single write, so `resources/list` returns either the old set or the
+    /// new one, never a mix. If two resources share a URI, the later one is
+    /// kept, as with [`register`](Self::register).
+    ///
+    /// Broadcasts `ResourcesListChanged` once, even when the set did not
+    /// change.
+    pub fn replace_all(
+        &self,
+        resources: impl IntoIterator<Item = crate::resource::Resource>,
+    ) -> RegistryChange {
+        let resources: HashMap<String, Arc<crate::resource::Resource>> = resources
+            .into_iter()
+            .map(|resource| (resource.uri.clone(), Arc::new(resource)))
+            .collect();
+        let uris: Vec<String> = resources.keys().cloned().collect();
+        let previous = {
+            let mut current = self.inner.resources.write().unwrap();
+            std::mem::replace(&mut *current, resources)
+        };
+        self.inner.broadcast_resources_changed();
+        RegistryChange::between(previous.keys(), &uris)
     }
 
     /// List all currently registered dynamic resources.
@@ -451,6 +608,7 @@ impl DynamicResourceTemplatesInner {
 ///
 /// When a template is registered or unregistered, all connected sessions
 /// receive a `notifications/resources/list_changed` notification.
+/// [`replace_all`](Self::replace_all) swaps the whole set and sends one.
 ///
 /// # Example
 ///
@@ -505,6 +663,36 @@ impl DynamicResourceTemplateRegistry {
             self.inner.broadcast_resources_changed();
         }
         removed
+    }
+
+    /// Replace every dynamic resource template with `templates`, in one write.
+    ///
+    /// The new set is built before the lock is taken and swapped in under a
+    /// single write, so `resources/templates/list` and `resources/read` see
+    /// either the old set or the new one, never a mix.
+    ///
+    /// Templates are matched in the order `templates` yields them. If two
+    /// share a URI pattern, the later one is kept, at the later position, as
+    /// with [`register`](Self::register).
+    ///
+    /// Broadcasts `ResourcesListChanged` once, even when the set did not
+    /// change.
+    pub fn replace_all(
+        &self,
+        templates: impl IntoIterator<Item = crate::resource::ResourceTemplate>,
+    ) -> RegistryChange {
+        let mut ordered: Vec<Arc<crate::resource::ResourceTemplate>> = Vec::new();
+        for template in templates {
+            ordered.retain(|t| t.uri_template != template.uri_template);
+            ordered.push(Arc::new(template));
+        }
+        let patterns: Vec<String> = ordered.iter().map(|t| t.uri_template.clone()).collect();
+        let previous = {
+            let mut current = self.inner.templates.write().unwrap();
+            std::mem::replace(&mut *current, ordered)
+        };
+        self.inner.broadcast_resources_changed();
+        RegistryChange::between(previous.iter().map(|t| &t.uri_template), &patterns)
     }
 
     /// List all currently registered dynamic resource templates.
@@ -671,6 +859,87 @@ mod tests {
         assert!(matches!(notification, ServerNotification::ToolsListChanged));
     }
 
+    #[tokio::test]
+    async fn test_replace_all_reports_change_and_broadcasts_once() {
+        let (registry, inner) = make_registry();
+        registry.register(make_tool("tool_a"));
+        registry.register(make_tool("tool_b"));
+        registry.register(make_tool("tool_c"));
+
+        let (tx, mut rx) = mpsc::channel(16);
+        inner.add_notification_sender(tx);
+
+        let change = registry.replace_all([make_tool("tool_d"), make_tool("tool_b")]);
+        assert_eq!(change.added, ["tool_d"]);
+        assert_eq!(change.removed, ["tool_a", "tool_c"]);
+        assert_eq!(change.replaced, ["tool_b"]);
+
+        let mut names: Vec<String> = registry.list().iter().map(|t| t.name.clone()).collect();
+        names.sort();
+        assert_eq!(names, ["tool_b", "tool_d"]);
+
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ServerNotification::ToolsListChanged
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "replace_all broadcasts exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_replace_all_broadcasts_when_unchanged() {
+        let (registry, inner) = make_registry();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        inner.add_notification_sender(tx);
+
+        let change = registry.replace_all(Vec::new());
+        assert_eq!(change, RegistryChange::default());
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ServerNotification::ToolsListChanged
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_replace_all_keeps_last_duplicate() {
+        let (registry, inner) = make_registry();
+
+        let first = ToolBuilder::new("dup")
+            .description("first")
+            .no_params_handler(|| async { Ok(CallToolResult::text("first")) })
+            .build();
+        let second = ToolBuilder::new("dup")
+            .description("second")
+            .no_params_handler(|| async { Ok(CallToolResult::text("second")) })
+            .build();
+
+        let change = registry.replace_all([first, second]);
+        assert_eq!(change.added, ["dup"]);
+        assert!(change.removed.is_empty());
+        assert!(change.replaced.is_empty());
+        assert_eq!(registry.list().len(), 1);
+        assert_eq!(
+            inner.get("dup").unwrap().description.as_deref(),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn test_replace_all_keeps_in_flight_tool() {
+        let (registry, inner) = make_registry();
+        registry.register(make_tool("tool_a"));
+
+        // A call holds the Arc it looked up; a reload does not take it away.
+        let held = inner.get("tool_a").unwrap();
+        registry.replace_all(Vec::new());
+        assert!(!registry.contains("tool_a"));
+        assert_eq!(held.name, "tool_a");
+    }
+
     // =========================================================================
     // DynamicPromptRegistry tests
     // =========================================================================
@@ -755,6 +1024,29 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn test_prompt_replace_all() {
+        let (registry, inner) = make_prompt_registry();
+        registry.register(make_prompt("prompt_a"));
+        registry.register(make_prompt("prompt_b"));
+
+        let (tx, mut rx) = mpsc::channel(16);
+        inner.add_notification_sender(tx);
+
+        let change = registry.replace_all([make_prompt("prompt_b"), make_prompt("prompt_c")]);
+        assert_eq!(change.added, ["prompt_c"]);
+        assert_eq!(change.removed, ["prompt_a"]);
+        assert_eq!(change.replaced, ["prompt_b"]);
+        assert!(!registry.contains("prompt_a"));
+        assert!(registry.contains("prompt_c"));
+
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ServerNotification::PromptsListChanged
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
     // =========================================================================
     // DynamicResourceRegistry tests
     // =========================================================================
@@ -818,6 +1110,32 @@ mod tests {
             notification,
             ServerNotification::ResourcesListChanged
         ));
+    }
+
+    #[tokio::test]
+    async fn test_resource_replace_all() {
+        let (registry, inner) = make_resource_registry();
+        registry.register(make_resource("file:///a.txt"));
+        registry.register(make_resource("file:///b.txt"));
+
+        let (tx, mut rx) = mpsc::channel(16);
+        inner.add_notification_sender(tx);
+
+        let change = registry.replace_all([
+            make_resource("file:///c.txt"),
+            make_resource("file:///a.txt"),
+        ]);
+        assert_eq!(change.added, ["file:///c.txt"]);
+        assert_eq!(change.removed, ["file:///b.txt"]);
+        assert_eq!(change.replaced, ["file:///a.txt"]);
+        assert!(!registry.contains("file:///b.txt"));
+        assert!(inner.get("file:///c.txt").is_some());
+
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ServerNotification::ResourcesListChanged
+        ));
+        assert!(rx.try_recv().is_err());
     }
 
     // =========================================================================
@@ -964,5 +1282,73 @@ mod tests {
         assert_eq!(vars.get("table").unwrap(), "users");
 
         assert!(inner.match_uri("db://other/path").is_none());
+    }
+
+    fn make_template(pattern: &str, body: &'static str) -> crate::resource::ResourceTemplate {
+        crate::resource::ResourceTemplateBuilder::new(pattern)
+            .name(pattern)
+            .handler(
+                move |uri: String, _vars: std::collections::HashMap<String, String>| async move {
+                    Ok(crate::protocol::ReadResourceResult::text(uri, body))
+                },
+            )
+    }
+
+    #[tokio::test]
+    async fn test_template_replace_all() {
+        let (registry, inner) = make_template_registry();
+        registry.register(make_template("db://tables/{table}", "table"));
+        registry.register(make_template("db://views/{view}", "view"));
+
+        let (tx, mut rx) = mpsc::channel(16);
+        inner.add_notification_sender(tx);
+
+        let change = registry.replace_all([
+            make_template("db://tables/{table}", "table v2"),
+            make_template("db://indexes/{index}", "index"),
+        ]);
+        assert_eq!(change.added, ["db://indexes/{index}"]);
+        assert_eq!(change.removed, ["db://views/{view}"]);
+        assert_eq!(change.replaced, ["db://tables/{table}"]);
+
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ServerNotification::ResourcesListChanged
+        ));
+        assert!(rx.try_recv().is_err());
+
+        let (template, vars) = inner.match_uri("db://tables/users").unwrap();
+        let result = template.read("db://tables/users", vars).await.unwrap();
+        assert_eq!(result.contents[0].text.as_deref(), Some("table v2"));
+        assert!(inner.match_uri("db://views/v").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_template_replace_all_keeps_given_order() {
+        let (registry, inner) = make_template_registry();
+
+        // Both patterns match `db://users/1`; the first one listed wins.
+        registry.replace_all([
+            make_template("db://users/{id}", "narrow"),
+            make_template("db://{+rest}", "wide"),
+        ]);
+        let (template, _) = inner.match_uri("db://users/1").unwrap();
+        assert_eq!(template.uri_template, "db://users/{id}");
+
+        // A repeated pattern keeps the later one, at the later position.
+        let change = registry.replace_all([
+            make_template("db://users/{id}", "first"),
+            make_template("db://{+rest}", "wide"),
+            make_template("db://users/{id}", "last"),
+        ]);
+        assert_eq!(change.replaced, ["db://users/{id}", "db://{+rest}"]);
+        let patterns: Vec<String> = registry
+            .list()
+            .iter()
+            .map(|t| t.uri_template.clone())
+            .collect();
+        assert_eq!(patterns, ["db://{+rest}", "db://users/{id}"]);
+        let (template, _) = inner.match_uri("db://users/1").unwrap();
+        assert_eq!(template.uri_template, "db://{+rest}");
     }
 }

@@ -31,13 +31,96 @@ impl Default for SchemaValidation {
     }
 }
 
+/// Check that a JSON Schema compiles, with the options tool schemas are
+/// validated with.
+///
+/// A tool whose `inputSchema` or `outputSchema` does not compile is still
+/// built: the failure is logged on `mcp::tools` and that schema is left
+/// unchecked, because a schema taken from a backend or a proxy must not take
+/// the process down. Code that builds tools from definitions it loads at run
+/// time (a plugin, a script, a config file) can call this first and report a
+/// bad schema against its source instead.
+///
+/// The options are the ones every tool schema is compiled with: the draft is
+/// detected from `$schema` (2020-12 when absent), `format` is enforced, and no
+/// reference is resolved from the network or the filesystem, so a remote or
+/// `file:` `$ref` does not compile. Building a tool does not call this and
+/// its behavior does not change.
+///
+/// ```rust
+/// use serde_json::json;
+/// use tower_mcp::tool::check_schema;
+///
+/// let schema = json!({
+///     "type": "object",
+///     "properties": { "path": { "type": "string", "minLength": 1 } },
+///     "required": ["path"]
+/// });
+/// assert!(check_schema(&schema).is_ok());
+///
+/// // `required` must be a list of names.
+/// let error = check_schema(&json!({ "type": "object", "required": "path" })).unwrap_err();
+/// assert_eq!(error.location(), "/required");
+/// assert!(error.to_string().starts_with("at /required: "), "{error}");
+/// ```
+#[cfg(feature = "schema-validation")]
+pub fn check_schema(schema: &Value) -> std::result::Result<(), SchemaError> {
+    engine::options()
+        .build(schema)
+        .map(drop)
+        .map_err(|error| SchemaError {
+            location: error.instance_path().as_str().to_string(),
+            message: error.to_string(),
+        })
+}
+
+/// Why a JSON Schema does not compile, returned by [`check_schema`].
+///
+/// Displays as `at <location>: <message>`, with `(root)` for the schema
+/// itself, the same form a failed argument check uses.
+#[cfg(feature = "schema-validation")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaError {
+    location: String,
+    message: String,
+}
+
+#[cfg(feature = "schema-validation")]
+impl SchemaError {
+    /// A JSON Pointer to the part of the schema at fault; empty for the
+    /// schema itself.
+    pub fn location(&self) -> &str {
+        &self.location
+    }
+
+    /// What is wrong at [`location`](Self::location).
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+#[cfg(feature = "schema-validation")]
+impl std::fmt::Display for SchemaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let location = match self.location.as_str() {
+            "" => "(root)",
+            path => path,
+        };
+        write!(f, "at {location}: {}", self.message)
+    }
+}
+
+#[cfg(feature = "schema-validation")]
+impl std::error::Error for SchemaError {}
+
 impl Tool {
     /// Enforce this tool's schemas around every handler it has.
     ///
     /// Compiles the input schema and, when one is declared, the output schema.
     /// A schema that does not compile is logged and left unchecked; it does
     /// not panic, because a tool built from a backend's schema (a proxy, a
-    /// dynamic registration) must not take the process down.
+    /// dynamic registration) must not take the process down. Callers that
+    /// want the failure instead use [`check_schema`] before building.
     /// Always wraps because the structured-content shape check applies to
     /// every tool regardless of the feature or declared schemas (#1540), so
     /// no tool may bypass the wrapper.
@@ -106,14 +189,18 @@ mod engine {
         output: Option<Validator>,
     }
 
+    /// The options every tool schema is compiled with, shared with
+    /// [`check_schema`](super::check_schema) so the two cannot disagree.
     #[cfg(feature = "schema-validation")]
-    fn compile(tool: &str, which: &'static str, schema: &Value) -> Option<Validator> {
+    pub(super) fn options() -> jsonschema::ValidationOptions<'static> {
         // Formats are annotations by default in draft 2019-09 and later. The
         // schemas here are contracts with a caller, so `format` is enforced.
-        match jsonschema::options()
-            .should_validate_formats(true)
-            .build(schema)
-        {
+        jsonschema::options().should_validate_formats(true)
+    }
+
+    #[cfg(feature = "schema-validation")]
+    fn compile(tool: &str, which: &'static str, schema: &Value) -> Option<Validator> {
+        match options().build(schema) {
             Ok(validator) => Some(validator),
             Err(error) => {
                 tracing::error!(
