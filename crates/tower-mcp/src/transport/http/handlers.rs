@@ -902,11 +902,9 @@ pub(super) async fn handle_post(
         match state.sessions.get(&session_id, &principal).await {
             Some(s) => s,
             None => {
-                // Return JSON-RPC error with session info so clients know to re-initialize
-                return json_rpc_error_response(
-                    None,
-                    JsonRpcError::session_not_found_with_id(&session_id),
-                );
+                // 404 is what tells spec clients to re-initialize; the body
+                // keeps the JSON-RPC error for clients that read it instead.
+                return session_not_found_response(&session_id);
             }
         }
     } else if state.optional_sessions {
@@ -942,7 +940,7 @@ pub(super) async fn handle_post(
         }
     } else {
         // No session ID and sessions are required
-        return json_rpc_error_response(None, JsonRpcError::session_required());
+        return session_required_response();
     };
 
     // Session lookup establishes the exact legacy revision. Validate the raw
@@ -1638,7 +1636,7 @@ pub(super) async fn handle_get(
     let session_id = match get_session_id(&headers) {
         Ok(Some(id)) => id,
         Ok(None) => {
-            return json_rpc_error_response(None, JsonRpcError::session_required());
+            return session_required_response();
         }
         Err(error) => {
             return json_rpc_error_response_with_status(None, error, StatusCode::BAD_REQUEST);
@@ -1649,10 +1647,7 @@ pub(super) async fn handle_get(
     let session = match state.sessions.get(&session_id, &principal).await {
         Some(s) => s,
         None => {
-            return json_rpc_error_response(
-                None,
-                JsonRpcError::session_not_found_with_id(&session_id),
-            );
+            return session_not_found_response(&session_id);
         }
     };
 
@@ -1749,7 +1744,7 @@ pub(super) async fn handle_delete(
     let session_id = match get_session_id(&headers) {
         Ok(Some(id)) => id,
         Ok(None) => {
-            return json_rpc_error_response(None, JsonRpcError::session_required());
+            return session_required_response();
         }
         Err(error) => {
             return json_rpc_error_response_with_status(None, error, StatusCode::BAD_REQUEST);
@@ -1763,10 +1758,8 @@ pub(super) async fn handle_delete(
         tracing::info!(session_id = %session_id, "Session terminated");
         StatusCode::OK.into_response()
     } else {
-        // For DELETE, it's okay if the session doesn't exist - it's already gone
-        // Return OK instead of an error for idempotency
         tracing::debug!(session_id = %session_id, "Session already removed or never existed");
-        StatusCode::OK.into_response()
+        session_not_found_response(&session_id)
     }
 }
 
@@ -1815,6 +1808,28 @@ pub(super) fn json_rpc_error_response(
 ) -> Response {
     let response = JsonRpcResponse::error(id, error);
     axum::Json(response).into_response()
+}
+
+/// HTTP 404 with a `-32005` body for a session ID the server does not know:
+/// unknown, expired, terminated, or bound to a different principal. The
+/// transports spec requires the 404, and it is the only status clients take
+/// as the cue to start a new session.
+fn session_not_found_response(session_id: &str) -> Response {
+    json_rpc_error_response_with_status(
+        None,
+        JsonRpcError::session_not_found_with_id(session_id),
+        StatusCode::NOT_FOUND,
+    )
+}
+
+/// HTTP 400 with a `-32006` body for a request that carries no session ID
+/// where one is required.
+fn session_required_response() -> Response {
+    json_rpc_error_response_with_status(
+        None,
+        JsonRpcError::session_required(),
+        StatusCode::BAD_REQUEST,
+    )
 }
 
 pub(super) fn json_rpc_error_response_with_status(

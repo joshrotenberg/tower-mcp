@@ -2139,6 +2139,7 @@ async fn test_http_client_session_expiry_error() {
         .await
         .unwrap();
 
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
     let body: serde_json::Value = resp.json().await.unwrap();
     let error = body
         .get("error")
@@ -2403,6 +2404,7 @@ async fn test_sessions_required_rejects_without_session_id() {
         .await
         .unwrap();
 
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
     let body: serde_json::Value = resp.json().await.unwrap();
     let error = body
         .get("error")
@@ -3452,6 +3454,65 @@ async fn test_session_recovery_after_expiry() {
     // Verify a new session was created
     let sessions = handle.list_sessions().await;
     assert_eq!(sessions.len(), 1, "Should have exactly one new session");
+}
+
+/// The client re-initializes against the real transport after the server
+/// forgets the session, and the status that drove it is the spec's 404 (#1588).
+#[tokio::test]
+async fn test_session_recovery_follows_a_404_from_the_real_transport() {
+    let statuses = Arc::new(Mutex::new(Vec::new()));
+    let seen = statuses.clone();
+    let transport = HttpTransport::new(test_router()).disable_origin_validation();
+    let (axum_router, handle) = transport.into_router_with_handle();
+    let axum_router = axum_router.layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let seen = seen.clone();
+            async move {
+                let method = request.method().clone();
+                let response = next.run(request).await;
+                seen.lock().unwrap().push((method, response.status()));
+                response
+            }
+        },
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let _server = tokio::spawn(async move {
+        axum::serve(listener, axum_router).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = McpClient::connect(HttpClientTransport::new(&url))
+        .await
+        .unwrap();
+    client
+        .initialize("test-404-recovery", "1.0.0")
+        .await
+        .unwrap();
+
+    let forgotten = handle.list_sessions().await.remove(0).id;
+    assert!(handle.terminate_session(&forgotten).await);
+    statuses.lock().unwrap().clear();
+
+    let tools = client.list_tools().await.unwrap();
+    assert_eq!(
+        tools.tools.len(),
+        2,
+        "the retry must succeed on a new session"
+    );
+
+    let seen = statuses.lock().unwrap().clone();
+    assert_eq!(
+        seen.first().map(|(_, status)| *status),
+        Some(reqwest::StatusCode::NOT_FOUND),
+        "the first request on the forgotten session must be a 404: {seen:?}"
+    );
+    let sessions = handle.list_sessions().await;
+    assert_eq!(sessions.len(), 1);
+    assert_ne!(
+        sessions[0].id, forgotten,
+        "recovery must start a new session"
+    );
 }
 
 /// Verify that session recovery is disabled when configured.
