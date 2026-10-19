@@ -7,7 +7,7 @@
 //! This example shows:
 //! - `CallToolResult::json()` for raw JSON values
 //! - `CallToolResult::from_serialize()` for typed Rust structs
-//! - `.output_schema()` on `ToolBuilder` for declaring the output shape
+//! - `.output_schema_for()` on `ToolBuilder` for declaring the output shape
 //! - Mixed text + structured responses
 //!
 //! Run with: cargo run --example structured_output
@@ -69,10 +69,9 @@ async fn main() -> Result<(), BoxError> {
 
     // Tool 1: Return a typed struct as structured JSON
     // Uses from_serialize() to convert a Rust type to JSON with structured_content
-    let output_schema = serde_json::to_value(schemars::schema_for!(UserProfile))?;
     let get_user = ToolBuilder::new("get_user")
         .description("Look up a user profile by ID. Returns structured JSON.")
-        .output_schema(output_schema)
+        .output_schema_for::<UserProfile>()
         .handler(|input: LookupInput| async move {
             let profile = UserProfile {
                 id: input.user_id,
@@ -90,10 +89,9 @@ async fn main() -> Result<(), BoxError> {
         .build();
 
     // Tool 2: Return search results with output schema
-    let output_schema = serde_json::to_value(schemars::schema_for!(SearchResults))?;
     let search = ToolBuilder::new("search")
         .description("Search for items. Returns structured results with scores.")
-        .output_schema(output_schema)
+        .output_schema_for::<SearchResults>()
         .handler(|input: SearchInput| async move {
             let items: Vec<SearchItem> = (0..input.limit)
                 .map(|i| SearchItem {
