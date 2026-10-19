@@ -29,6 +29,9 @@ jobs:
         run: cargo build --manifest-path examples/conformance-server/Cargo.toml
 
       - name: Start server
+        env:
+          # Capture every JSON-RPC frame for the wire-schema check below.
+          TOWER_MCP_FRAME_LOG: /tmp/conformance-frames.jsonl
         run: |
           cargo run --manifest-path examples/conformance-server/Cargo.toml \
             > /tmp/conformance-server.log 2>&1 &
@@ -62,6 +65,14 @@ jobs:
             --suite all \
             --spec-version 2025-06-18 \
             --expected-failures ./.github/conformance/conformance-baseline-2025-06-18.yml
+
+      - name: Validate captured frames against the published schemas
+        run: |
+          # Every frame the server sent during the two suites above, checked
+          # against the vendored schema for its protocol version (#1204).
+          cargo run -p wire-schema-check -- \
+            --log /tmp/conformance-frames.jsonl \
+            --baseline ./.github/conformance/wire-schema-baseline.yml
 
       - name: Show server logs on failure
         if: failure()
@@ -270,6 +281,9 @@ jobs:
         run: cargo build --manifest-path examples/conformance-server/Cargo.toml
 
       - name: Start server
+        env:
+          # Capture every JSON-RPC frame for the wire-schema check below.
+          TOWER_MCP_FRAME_LOG: /tmp/conformance-frames-draft.jsonl
         run: |
           cargo run --manifest-path examples/conformance-server/Cargo.toml \
             > /tmp/conformance-server-draft.log 2>&1 &
@@ -300,6 +314,14 @@ jobs:
             --spec-version 2026-07-28 \
             --suite all \
             --expected-failures ./.github/conformance/conformance-baseline-draft.yml
+
+      - name: Validate captured frames against the published schema
+        run: |
+          # Every frame the server sent during the suite above, checked
+          # against the vendored 2026-07-28 schema (#1204).
+          cargo run -p wire-schema-check -- \
+            --log /tmp/conformance-frames-draft.jsonl \
+            --baseline ./.github/conformance/wire-schema-baseline.yml
 
       - name: Show server logs on failure
         if: failure()

@@ -25,6 +25,7 @@
 //! - Sampling (LLM requests back to client)
 //! - Elicitation (user input requests)
 
+mod frame_log;
 mod prompts;
 mod resources;
 mod tools;
@@ -109,6 +110,21 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         "http" => {
             let transport = HttpTransport::new(router).with_sampling();
             let app = transport.into_router_at("/mcp");
+            // Wire-level frame capture for `wire-schema-check`; a no-op unless
+            // TOWER_MCP_FRAME_LOG names a file.
+            let app = match frame_log::FrameLog::from_env()? {
+                Some(log) => {
+                    tracing::info!(
+                        "Capturing JSON-RPC frames to the file named by {}",
+                        frame_log::ENV_VAR
+                    );
+                    app.layer(axum::middleware::from_fn_with_state(
+                        log,
+                        frame_log::capture,
+                    ))
+                }
+                None => app,
+            };
             let addr = format!("127.0.0.1:{}", args.port);
             tracing::info!("Starting conformance server on http://{}/mcp", addr);
             let listener = tokio::net::TcpListener::bind(&addr).await?;
