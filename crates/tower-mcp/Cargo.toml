@@ -59,6 +59,12 @@ tracing-subscriber.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream", "form"] }
 jsonschema = "0.58"
 
+# Re-executes itself as a server over pipes, so it brings its own `main`: libtest
+# writes to stdout, which is the protocol stream in the server role.
+[[test]]
+name = "stdio_pipes"
+harness = false
+
 [features]
 default = []
 # Enable all optional features

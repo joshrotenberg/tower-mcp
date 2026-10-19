@@ -137,6 +137,7 @@ production checklist.
 | [testing](testing.rs) | In-process testing with TestClient |
 | [tasks](tasks.rs) | 2026-07-28 Tasks extension lifecycle, notifications, cancellation, and ownership |
 | [weather_server](weather_server.rs) | External API integration (NWS) |
+| [stdio_pipe_bench](stdio_pipe_bench.rs) | Throughput, latency, and shutdown of the stdio server in each `StdioPipes` mode |
 
 ### Macros
 
