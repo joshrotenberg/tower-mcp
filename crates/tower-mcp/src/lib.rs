@@ -730,7 +730,7 @@ pub use tool::{
 pub use tool::{SchemaError, check_schema};
 pub use trace_context::TraceContext;
 pub use transport::{
-    BidirectionalStdioTransport, CatchError, GenericStdioTransport, StdioTransport,
+    BidirectionalStdioTransport, CatchError, GenericStdioTransport, StdioPipes, StdioTransport,
     SyncStdioTransport,
 };
 

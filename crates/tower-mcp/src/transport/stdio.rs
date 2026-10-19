@@ -54,6 +54,8 @@
 //! the rest of that stream; they are not also broadcast in the legacy
 //! untagged form.
 
+mod pipes;
+
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -89,6 +91,8 @@ use crate::transport::subscriptions::{
     subscription_complete_response, subscription_matches, tagged_subscription_notification,
 };
 use crate::{ProtocolSupport, ProtocolSupportError};
+
+pub use pipes::StdioPipes;
 
 // ============================================================================
 // Shared helpers
@@ -1032,6 +1036,8 @@ pub struct StdioTransport {
     max_concurrent_requests: Option<usize>,
     /// Bound on the bytes buffered for one input frame (#1470).
     max_frame_len: usize,
+    /// How `run()` opens stdin and stdout; see [`StdioPipes`].
+    pipes: StdioPipes,
 }
 
 impl StdioTransport {
@@ -1052,6 +1058,7 @@ impl StdioTransport {
             control_rx,
             max_concurrent_requests: None,
             max_frame_len: crate::framing::DEFAULT_MAX_FRAME_LEN,
+            pipes: StdioPipes::Auto,
         }
     }
 
@@ -1102,6 +1109,7 @@ impl StdioTransport {
             control_rx,
             max_concurrent_requests: None,
             max_frame_len: crate::framing::DEFAULT_MAX_FRAME_LEN,
+            pipes: StdioPipes::Auto,
         }
     }
 
@@ -1170,6 +1178,32 @@ impl StdioTransport {
     /// ```
     pub fn max_frame_len(mut self, bytes: usize) -> Self {
         self.max_frame_len = bytes;
+        self
+    }
+
+    /// Choose how [`Self::run`] opens stdin and stdout.
+    ///
+    /// By default, when both are pipes on Linux, they are driven by the I/O
+    /// reactor instead of tokio's blocking thread pool. That saves a thread
+    /// hand-off per message, and it lets [`Self::run`] release stdin when the
+    /// transport stops even though a read is pending, where a blocking read
+    /// would hold the runtime open until the client writes or closes the pipe.
+    /// Other platforms and stream types keep tokio's handles. Framing, limits,
+    /// and shutdown behaviour do not change.
+    ///
+    /// See [`StdioPipes`] for the modes, including [`StdioPipes::Shared`],
+    /// which extends this to macOS, the BSDs, and sockets at the cost of
+    /// setting `O_NONBLOCK` on descriptors other processes may share. This has
+    /// no effect on [`Self::run_with_streams`].
+    ///
+    /// ```rust
+    /// use tower_mcp::{McpRouter, StdioPipes, StdioTransport};
+    ///
+    /// let router = McpRouter::new().server_info("my-server", "1.0.0");
+    /// let transport = StdioTransport::new(router).pipes(StdioPipes::Blocking);
+    /// ```
+    pub fn pipes(mut self, pipes: StdioPipes) -> Self {
+        self.pipes = pipes;
         self
     }
 
@@ -1259,6 +1293,7 @@ impl StdioTransport {
             max_concurrent_requests: self.max_concurrent_requests,
             // Same reasoning as `max_concurrent_requests` above.
             max_frame_len: self.max_frame_len,
+            pipes: self.pipes,
             #[cfg(feature = "stateless")]
             subscription_observer,
         }
@@ -1270,8 +1305,8 @@ impl StdioTransport {
     /// `tokio::io::stdin()` and `tokio::io::stdout()`. Most users want this
     /// method; use [`Self::run_with_streams`] only for in-process testing.
     pub async fn run(&mut self) -> Result<()> {
-        self.run_with_streams(tokio::io::stdin(), tokio::io::stdout())
-            .await
+        let (reader, writer) = pipes::open(self.pipes);
+        self.run_with_streams(reader, writer).await
     }
 
     /// Run the transport, reading from `reader` and writing to `writer`.
@@ -1555,6 +1590,8 @@ where
     max_concurrent_requests: Option<usize>,
     /// Bound on the bytes buffered for one input frame (#1470).
     max_frame_len: usize,
+    /// How `run()` opens stdin and stdout; see [`StdioPipes`].
+    pipes: StdioPipes,
     /// Close observer threaded from the router by [`StdioTransport::layer`];
     /// `None` for directly constructed generic transports, which have no
     /// router to read it from.
@@ -1590,6 +1627,7 @@ where
             incoming_notifications: None,
             max_concurrent_requests: None,
             max_frame_len: crate::framing::DEFAULT_MAX_FRAME_LEN,
+            pipes: StdioPipes::Auto,
             #[cfg(feature = "stateless")]
             subscription_observer: None,
         }
@@ -1636,6 +1674,14 @@ where
         self
     }
 
+    /// Choose how [`Self::run`] opens stdin and stdout.
+    ///
+    /// See [`StdioTransport::pipes`]. Default: [`StdioPipes::Auto`].
+    pub fn pipes(mut self, pipes: StdioPipes) -> Self {
+        self.pipes = pipes;
+        self
+    }
+
     /// Create a new generic stdio transport with notification forwarding.
     ///
     /// Pass a `NotificationReceiver` from [`notification_channel()`] to enable
@@ -1655,6 +1701,7 @@ where
             incoming_notifications: None,
             max_concurrent_requests: None,
             max_frame_len: crate::framing::DEFAULT_MAX_FRAME_LEN,
+            pipes: StdioPipes::Auto,
             #[cfg(feature = "stateless")]
             subscription_observer: None,
         }
@@ -1693,8 +1740,8 @@ where
     /// Thin wrapper around [`Self::run_with_streams`] that wires up
     /// `tokio::io::stdin()` / `tokio::io::stdout()`.
     pub async fn run(&mut self) -> Result<()> {
-        self.run_with_streams(tokio::io::stdin(), tokio::io::stdout())
-            .await
+        let (reader, writer) = pipes::open(self.pipes);
+        self.run_with_streams(reader, writer).await
     }
 
     /// Run the transport, reading from `reader` and writing to `writer`.
@@ -2254,6 +2301,8 @@ pub struct BidirectionalStdioTransport<S = McpRouter> {
     control_rx: mpsc::UnboundedReceiver<StdioControl>,
     /// Bound on the bytes buffered for one input frame (#1470).
     max_frame_len: usize,
+    /// How `run()` opens stdin and stdout; see [`StdioPipes`].
+    pipes: StdioPipes,
 }
 
 impl BidirectionalStdioTransport<McpRouter> {
@@ -2283,6 +2332,7 @@ impl BidirectionalStdioTransport<McpRouter> {
             control_tx,
             control_rx,
             max_frame_len: crate::framing::DEFAULT_MAX_FRAME_LEN,
+            pipes: StdioPipes::Auto,
         }
     }
 
@@ -2343,6 +2393,7 @@ impl BidirectionalStdioTransport<McpRouter> {
             // Carried across the conversion so `.layer()` does not silently
             // discard a frame-length bound set before it.
             max_frame_len: self.max_frame_len,
+            pipes: self.pipes,
         }
     }
 }
@@ -2375,6 +2426,14 @@ where
     /// See [`StdioTransport::max_frame_len`]. Default: 4 MiB.
     pub fn max_frame_len(mut self, bytes: usize) -> Self {
         self.max_frame_len = bytes;
+        self
+    }
+
+    /// Choose how [`Self::run`] opens stdin and stdout.
+    ///
+    /// See [`StdioTransport::pipes`]. Default: [`StdioPipes::Auto`].
+    pub fn pipes(mut self, pipes: StdioPipes) -> Self {
+        self.pipes = pipes;
         self
     }
 
@@ -2425,8 +2484,8 @@ where
     /// Thin wrapper around [`Self::run_with_streams`] that wires up
     /// `tokio::io::stdin()` / `tokio::io::stdout()`.
     pub async fn run(&mut self) -> Result<()> {
-        self.run_with_streams(tokio::io::stdin(), tokio::io::stdout())
-            .await
+        let (reader, writer) = pipes::open(self.pipes);
+        self.run_with_streams(reader, writer).await
     }
 
     /// Run the transport, reading from `reader` and writing to `writer`.

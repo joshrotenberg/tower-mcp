@@ -39,8 +39,8 @@ pub mod service;
 
 pub use service::{CatchError, InjectAnnotations};
 pub use stdio::{
-    BidirectionalStdioTransport, GenericStdioTransport, StdioTransport, StdioTransportHandle,
-    SyncStdioTransport,
+    BidirectionalStdioTransport, GenericStdioTransport, StdioPipes, StdioTransport,
+    StdioTransportHandle, SyncStdioTransport,
 };
 
 #[cfg(feature = "http")]

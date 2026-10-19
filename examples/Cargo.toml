@@ -57,6 +57,10 @@ name = "getting_started"
 path = "getting_started.rs"
 
 [[example]]
+name = "stdio_pipe_bench"
+path = "stdio_pipe_bench.rs"
+
+[[example]]
 name = "mcp_apps"
 path = "mcp_apps.rs"
 required-features = ["mcp-apps"]
