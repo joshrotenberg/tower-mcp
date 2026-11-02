@@ -95,7 +95,7 @@ Results: 40/44 checks passed (0 failed, 4 known-diffs, 0 errors)
 Known diffs are documented divergences that are intentional or explained. They
 appear as `[KNOWN-DIFF]` and do not cause a non-zero exit code.
 
-Current known diffs (verified against rmcp 3.1.0):
+Current known diffs (verified against rmcp 3.7.0):
 
 **`error.message` phrasing for method-not-found:**
 rmcp returns just the method name (e.g. `"nonexistent/method"`); tower-mcp
@@ -118,7 +118,7 @@ A `tools/list` sent before `notifications/initialized` is rejected by tower-mcp
 with `-32600` (InvalidRequest) per #901. rmcp does not enforce this ordering and
 returns the tools list. tower-mcp is the stricter, more spec-compliant side, so
 this is a documented divergence rather than a tower-mcp bug. (With rmcp 1.7.0
-this surfaced as a FAIL; rmcp 2.1.0 and 3.1.0 did not change the
+this surfaced as a FAIL; rmcp 2.1.0, 3.1.0, and 3.7.0 did not change the
 behavior, so it is classified as a KNOWN-DIFF.)
 
 **SSE response wrapping (default mode):**
@@ -151,7 +151,7 @@ validates that the opt-in SSE mode matches rmcp's behavior exactly.
 Change the version constraint in `tools/rmcp-compat/Cargo.toml`:
 
 ```toml
-rmcp = { version = "=3.1.0", features = [...] }
+rmcp = { version = "=3.7.0", features = [...] }
 ```
 
 Then run the harness and update any KNOWN-DIFF entries that have changed.

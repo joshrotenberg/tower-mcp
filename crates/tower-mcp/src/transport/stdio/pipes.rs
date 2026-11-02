@@ -180,7 +180,16 @@ mod fd {
                 None if mode == StdioPipes::Shared => share(fd)?,
                 None => return None,
             };
-            let inner = AsyncFd::with_interest(nonblocking, interest).ok()?;
+            // SAFETY: `nonblocking.fd` is an `OwnedFd` this transport created
+            // (a `/proc/self/fd` reopen or an `F_DUPFD_CLOEXEC` duplicate), not
+            // the inherited fd 0 / fd 1, so nothing else can close or `dup2`
+            // over it. `NonBlockingFd` moves into the `AsyncFd` and closes the
+            // descriptor only when it drops, which is after the registration
+            // is removed. Its `fd` field is private to this module, never
+            // reassigned, and only reached through `get_ref`, so `as_raw_fd`
+            // returns the same open descriptor, naming the same open file
+            // description, for the `AsyncFd`'s whole lifetime.
+            let inner = unsafe { AsyncFd::register_with_interest(nonblocking, interest) }.ok()?;
             Some(Self { inner })
         }
     }
