@@ -34,7 +34,7 @@ the Rust fixture, reserves separate loopback ports, and always terminates child
 servers. Server logs are printed when a leg fails.
 
 The npm fixture overrides the Node adapter's transitive `@hono/node-server`
-dependency to `2.0.12`. The official SDK's declared 1.x range currently
+dependency to `2.1.3`. The official SDK's declared 1.x range currently
 resolves to a version affected by a Windows static-file path-traversal advisory;
 the patched adapter API is covered by this matrix and `npm audit` is clean.
 
