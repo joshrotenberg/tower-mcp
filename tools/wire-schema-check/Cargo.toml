@@ -14,5 +14,5 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 # Schemas are bundled and every $ref is local, so no network or file resolvers.
-jsonschema = { version = "0.58", default-features = false }
+jsonschema = { version = "0.60", default-features = false }
 serde_json.workspace = true

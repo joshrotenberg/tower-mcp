@@ -899,13 +899,12 @@ fn extract_www_auth_param(header: &str, param: &str) -> Option<String> {
 fn build_jwt_assertion(client_id: &str, audience: &str, private_key_pem: &str) -> Result<String> {
     use base64::Engine;
     use p256::ecdsa::{SigningKey, signature::Signer};
-    use p256::pkcs8::DecodePrivateKey;
-    use sec1::DecodeEcPrivateKey;
 
-    // Parse the PEM-encoded private key (try PKCS#8 first, then SEC1)
-    let signing_key = SigningKey::from_pkcs8_pem(private_key_pem)
-        .or_else(|_| SigningKey::from_sec1_pem(private_key_pem))
+    // Parse the PEM-encoded private key. `SecretKey::from_pem` picks PKCS#8
+    // or SEC1 from the PEM label.
+    let secret_key = p256::SecretKey::from_pem(private_key_pem)
         .map_err(|e| anyhow::anyhow!("Failed to parse private key: {}", e))?;
+    let signing_key = SigningKey::from(secret_key);
 
     let b64url = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
