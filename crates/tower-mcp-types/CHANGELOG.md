@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.25.1] - 2026-11-02
+
+- Synchronize the workspace patch version; no crate behavior changes.
+
 ## [0.25.0] - 2026-10-19
 
 ### Bug Fixes

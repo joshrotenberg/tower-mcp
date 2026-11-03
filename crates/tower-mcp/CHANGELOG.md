@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.25.1] - 2026-11-02
+
+### Bug Fixes
+
+- Require Tokio 1.53.3 or newer and use the replacement `AsyncFd` registration API
+  for Unix stdio pipes, preserving compatibility with newer Tokio when warnings
+  are denied (#1610).
+
+### Dependencies
+
+- Update optional JSON Schema validation to `jsonschema` 0.60 (#1610).
+- Refresh repository dependency locks and conformance/interop tooling for security
+  advisories (#1610, #1611). Applications must update their own lockfiles to receive
+  transitive TLS dependency fixes.
+
 ## [0.25.0] - 2026-10-19
 
 ### Upgrade notes
