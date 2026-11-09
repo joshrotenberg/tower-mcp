@@ -1664,6 +1664,99 @@ async fn sep_2243_final_request_requires_schema_annotated_header() {
     assert_eq!(response.status(), StatusCode::OK);
 }
 
+/// A property named `x-mcp-header` and the same key in `dependentRequired`
+/// are not annotations, so the call reaches the tool, and the real `Tenant`
+/// annotation beside them is still enforced.
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn sep_2243_property_named_x_mcp_header_is_not_an_annotation() {
+    use crate::extract::RawArgs;
+    use crate::{CallToolResult, ToolBuilder};
+
+    let tool = |name: &str, schema: serde_json::Value| {
+        ToolBuilder::new(name)
+            .input_schema(schema)
+            .extractor_handler((), |RawArgs(_args): RawArgs| async move {
+                Ok(CallToolResult::text("reached"))
+            })
+            .build()
+    };
+    let app = HttpTransport::new(
+        McpRouter::new()
+            .server_info("header-test", "1.0.0")
+            .tool(tool(
+                "name_only",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"x-mcp-header": {"type": "string"}}
+                }),
+            ))
+            .tool(tool(
+                "with_tenant",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "x-mcp-header": {"type": "string"},
+                        "tenant": {"type": "string", "x-mcp-header": "Tenant"}
+                    },
+                    "dependentRequired": {"x-mcp-header": ["tenant"]}
+                }),
+            )),
+    )
+    .disable_origin_validation()
+    .into_router();
+
+    let call = |name: &'static str, tenant: Option<&'static str>| {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header(MCP_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION_2026_07_28)
+            .header(MCP_METHOD_HEADER, "tools/call")
+            .header(MCP_NAME_HEADER, name);
+        if let Some(value) = tenant {
+            builder = builder.header("Mcp-Param-Tenant", value);
+        }
+        let arguments = if name == "with_tenant" {
+            serde_json::json!({"x-mcp-header": "literal", "tenant": "acme"})
+        } else {
+            serde_json::json!({"x-mcp-header": "literal"})
+        };
+        builder
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 9,
+                    "method": "tools/call",
+                    "params": {
+                        "name": name,
+                        "arguments": arguments,
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion":
+                                PROTOCOL_VERSION_2026_07_28,
+                            "io.modelcontextprotocol/clientCapabilities": {}
+                        }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+
+    let bounded = Duration::from_secs(5);
+    for (name, tenant, expected) in [
+        ("name_only", None, StatusCode::OK),
+        ("with_tenant", Some("acme"), StatusCode::OK),
+        ("with_tenant", None, StatusCode::BAD_REQUEST),
+    ] {
+        let response = tokio::time::timeout(bounded, app.clone().oneshot(call(name, tenant)))
+            .await
+            .expect("tools/call hung")
+            .unwrap();
+        assert_eq!(response.status(), expected, "{name} tenant={tenant:?}");
+    }
+}
+
 /// notifications/initialized still receives ACCEPTED when SEP-2243
 /// headers match (regression for the notification fast path).
 #[tokio::test]

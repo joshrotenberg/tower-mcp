@@ -553,6 +553,8 @@ pub mod extract;
 pub mod filter;
 mod framing;
 pub mod guides;
+#[cfg(any(feature = "http", feature = "http-client"))]
+mod header_annotations;
 pub mod inspection;
 pub mod jsonrpc;
 pub mod middleware;
