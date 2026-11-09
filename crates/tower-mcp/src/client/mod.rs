@@ -73,8 +73,9 @@ pub use http::{HttpClientConfig, HttpClientTransport, HttpStatusDetails};
 #[cfg(feature = "oauth-client")]
 pub use oauth::{
     OAuthBearerChallenge, OAuthClientCredentials, OAuthClientCredentialsBuilder, OAuthClientError,
-    OAuthScopeChallenge, OAuthScopeEscalationConfig, OAuthScopeEscalationHandler,
-    OAuthScopeEscalationRequest, OAuthTokenEndpointAuthMethod, TokenProvider,
+    OAuthRefreshScopePolicy, OAuthScopeChallenge, OAuthScopeEscalationConfig,
+    OAuthScopeEscalationHandler, OAuthScopeEscalationRequest, OAuthTokenEndpointAuthMethod,
+    TokenProvider,
 };
 #[cfg(feature = "oauth-client")]
 pub use oauth_authcode::{

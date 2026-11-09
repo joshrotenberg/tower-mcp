@@ -288,6 +288,76 @@ impl OAuthTokenEndpointAuthMethod {
     }
 }
 
+/// How an authorization-code client sets `scope` on refresh requests.
+///
+/// RFC 6749 section 6 makes the parameter optional and treats omission as a
+/// request for the originally granted scope. Some authorization servers
+/// require it and others reject it, so this is configurable through
+/// [`OAuthAuthCodeConfig::refresh_scope_policy`](super::OAuthAuthCodeConfig::refresh_scope_policy)
+/// and
+/// [`OAuthAuthorizationFlowBuilder::refresh_scope_policy`](super::OAuthAuthorizationFlowBuilder::refresh_scope_policy).
+///
+/// Every policy keeps the recorded grant. A refresh response that returns
+/// `scope` replaces it. A response that omits `scope` keeps the scope the
+/// request sent, or the previous grant when the request sent none.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OAuthRefreshScopePolicy {
+    /// Send the recorded grant, or no `scope` when no grant is recorded.
+    #[default]
+    SendGranted,
+    /// Never send `scope`. Use this for servers that reject the parameter,
+    /// such as those answering `invalid_request: scope parameter not
+    /// supported`.
+    ///
+    /// The server decides what an omitted scope means. Under RFC 6749 that
+    /// is the original grant, which can be broader than the recorded grant
+    /// if an earlier refresh response narrowed it.
+    Omit,
+    /// Send only these scopes. Entries may be space-delimited.
+    ///
+    /// A refresh fails with [`OAuthClientError::TokenRequest`], without
+    /// contacting the server, when this names a scope outside the recorded
+    /// grant or names no scope at all. It never falls back to omitting
+    /// `scope`, which would request the full grant.
+    Narrow(Vec<String>),
+}
+
+impl OAuthRefreshScopePolicy {
+    /// The `scope` value to send on a refresh, given the recorded grant.
+    pub(crate) fn request_scope<'a>(
+        &self,
+        granted: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Option<String>, OAuthClientError> {
+        let granted: Vec<&str> = granted.into_iter().collect();
+        match self {
+            Self::SendGranted => Ok((!granted.is_empty()).then(|| granted.join(" "))),
+            Self::Omit => Ok(None),
+            Self::Narrow(scopes) => {
+                let requested: Vec<&str> = scopes
+                    .iter()
+                    .flat_map(|scope| scope.split_ascii_whitespace())
+                    .collect();
+                if requested.is_empty() {
+                    return Err(OAuthClientError::TokenRequest(
+                        "refresh scope policy narrows to no scopes; use \
+                         OAuthRefreshScopePolicy::Omit to leave `scope` out of refresh requests"
+                            .to_string(),
+                    ));
+                }
+                if let Some(outside) = requested.iter().find(|scope| !granted.contains(scope)) {
+                    return Err(OAuthClientError::TokenRequest(format!(
+                        "refresh scope policy requests `{outside}`, which is outside the \
+                         recorded grant `{}`",
+                        granted.join(" ")
+                    )));
+                }
+                Ok(Some(requested.join(" ")))
+            }
+        }
+    }
+}
+
 /// Context passed to an [`OAuthScopeEscalationHandler`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OAuthScopeEscalationRequest {
@@ -906,6 +976,56 @@ impl OAuthClientCredentialsBuilder {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn refresh_scope_policy_selects_the_scope_parameter() {
+        let granted = || ["read", "write"];
+        assert_eq!(
+            OAuthRefreshScopePolicy::default()
+                .request_scope(granted())
+                .unwrap()
+                .as_deref(),
+            Some("read write")
+        );
+        assert_eq!(
+            OAuthRefreshScopePolicy::SendGranted
+                .request_scope([])
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            OAuthRefreshScopePolicy::Omit
+                .request_scope(granted())
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            OAuthRefreshScopePolicy::Narrow(vec!["write".to_string()])
+                .request_scope(granted())
+                .unwrap()
+                .as_deref(),
+            Some("write")
+        );
+    }
+
+    #[test]
+    fn refresh_scope_policy_rejects_an_invalid_narrowing() {
+        for (scopes, granted) in [
+            (vec!["admin"], vec!["read", "write"]),
+            (vec!["read", "admin"], vec!["read", "write"]),
+            (vec!["read"], vec![]),
+            (vec![], vec!["read", "write"]),
+            (vec!["  "], vec!["read", "write"]),
+        ] {
+            let policy =
+                OAuthRefreshScopePolicy::Narrow(scopes.iter().map(ToString::to_string).collect());
+            let error = policy.request_scope(granted.clone()).unwrap_err();
+            assert!(
+                matches!(error, OAuthClientError::TokenRequest(_)),
+                "{scopes:?} against {granted:?}: {error}"
+            );
+        }
+    }
 
     #[test]
     fn test_builder_missing_client_id() {

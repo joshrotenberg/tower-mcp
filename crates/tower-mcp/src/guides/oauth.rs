@@ -287,6 +287,18 @@ a shared `OAuthAuthorizationStateStore`, and call
 callback route. Use `begin` instead of `authorize` when the UI needs explicit
 `Authorized` versus `Pending` states.
 
+### Refresh scope policy
+
+Refresh requests send the recorded grant in `scope` by default. RFC 6749 makes
+that parameter optional, and some authorization servers reject it. Choose an
+`OAuthRefreshScopePolicy` with `OAuthAuthorizationFlowBuilder::refresh_scope_policy`
+or `OAuthAuthCodeConfig::refresh_scope_policy`:
+
+- `SendGranted` (default) sends the recorded grant.
+- `Omit` leaves `scope` out and keeps the recorded grant.
+- `Narrow` sends a subset of the grant. A scope outside the grant, or an empty
+  list, fails the refresh without contacting the server.
+
 ### Run the interactive client example
 
 The example uses a fixed loopback port. Configure that exact redirect URI in a

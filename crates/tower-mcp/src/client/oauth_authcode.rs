@@ -43,7 +43,8 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex, RwLock, oneshot};
 
 use super::oauth::{
-    OAuthBearerChallenge, OAuthClientError, OAuthTokenEndpointAuthMethod, TokenProvider,
+    OAuthBearerChallenge, OAuthClientError, OAuthRefreshScopePolicy, OAuthTokenEndpointAuthMethod,
+    TokenProvider,
 };
 
 // =============================================================================
@@ -1167,6 +1168,8 @@ struct OAuthAuthCodeInner {
     scopes: Option<String>,
     /// Refresh buffer before expiry.
     refresh_buffer: Duration,
+    /// Controls the `scope` parameter on refresh requests.
+    refresh_scope_policy: OAuthRefreshScopePolicy,
     /// HTTP client.
     client: reqwest::Client,
     /// Cached token.
@@ -1338,6 +1341,7 @@ impl OAuthAuthorizationCode {
                 redirect_uri,
                 scopes: scope_str,
                 refresh_buffer: config.refresh_buffer,
+                refresh_scope_policy: config.refresh_scope_policy,
                 client,
                 cache: RwLock::new(None),
                 callback_rx: Mutex::new(Some(callback_rx)),
@@ -1443,19 +1447,20 @@ impl OAuthAuthorizationCode {
     /// Refresh the access token using the refresh token.
     ///
     /// `granted_scope` is what the authorization server granted for the
-    /// token being replaced. It is sent instead of the originally requested
-    /// scopes, which the server may have narrowed.
+    /// token being replaced. `request_scope` is the `scope` parameter that
+    /// [`OAuthRefreshScopePolicy`] selected from it.
     async fn refresh_token(
         &self,
         refresh_token: &str,
         granted_scope: Option<&str>,
+        request_scope: Option<&str>,
     ) -> Result<CachedAuthCodeToken, OAuthClientError> {
         let mut params = vec![
             ("grant_type", "refresh_token".to_string()),
             ("refresh_token", refresh_token.to_string()),
             ("resource", self.inner.resource.clone()),
         ];
-        if let Some(scope) = granted_scope {
+        if let Some(scope) = request_scope {
             params.push(("scope", scope.to_string()));
         }
 
@@ -1499,10 +1504,12 @@ impl OAuthAuthorizationCode {
             token_response.refresh_token = Some(refresh_token.to_string());
         }
 
-        // A refresh response without `scope` keeps the previous grant.
+        // RFC 6749 section 5.1: an omitted `scope` means the grant matches
+        // what this request asked for. A request without `scope` keeps the
+        // previous grant.
         Ok(to_cached_token(
             token_response,
-            granted_scope.map(str::to_string),
+            request_scope.or(granted_scope).map(str::to_string),
         ))
     }
 }
@@ -1634,8 +1641,18 @@ impl TokenProvider for OAuthAuthorizationCode {
         if let Some(ref token) = *cache
             && let Some(ref refresh) = token.refresh_token
         {
+            let request_scope = self.inner.refresh_scope_policy.request_scope(
+                token
+                    .scope
+                    .as_deref()
+                    .unwrap_or_default()
+                    .split_ascii_whitespace(),
+            )?;
             tracing::debug!("Refreshing OAuth access token");
-            match self.refresh_token(refresh, token.scope.as_deref()).await {
+            match self
+                .refresh_token(refresh, token.scope.as_deref(), request_scope.as_deref())
+                .await
+            {
                 Ok(new_token) => {
                     let access = new_token.access_token.clone();
                     *cache = Some(new_token);
@@ -1712,6 +1729,9 @@ pub struct OAuthAuthCodeConfig {
     /// used in token requests is overridden. Must be an absolute URL without
     /// a fragment, the same requirement enforced on the discovered resource.
     pub resource: Option<String>,
+    /// Controls the `scope` parameter on refresh requests. Default:
+    /// [`OAuthRefreshScopePolicy::SendGranted`].
+    pub refresh_scope_policy: OAuthRefreshScopePolicy,
 }
 
 impl Default for OAuthAuthCodeConfig {
@@ -1725,6 +1745,7 @@ impl Default for OAuthAuthCodeConfig {
             challenge: None,
             preferred_authorization_server: None,
             resource: None,
+            refresh_scope_policy: OAuthRefreshScopePolicy::default(),
         }
     }
 }
@@ -2222,6 +2243,7 @@ mod tests {
         let refreshed = provider
             .refresh_token(
                 token.refresh_token.as_deref().unwrap(),
+                token.scope.as_deref(),
                 token.scope.as_deref(),
             )
             .await
@@ -2953,6 +2975,7 @@ mod tests {
                 redirect_uri: "http://127.0.0.1:0/callback".to_string(),
                 scopes: None,
                 refresh_buffer: Duration::from_secs(30),
+                refresh_scope_policy: OAuthRefreshScopePolicy::default(),
                 client: reqwest::Client::new(),
                 cache: RwLock::new(Some(cache)),
                 callback_rx: Mutex::new(None),
@@ -3052,6 +3075,20 @@ mod tests {
     async fn spawn_recording_json_server(
         responses: Vec<serde_json::Value>,
     ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        spawn_scripted_json_server(move |_body, index| {
+            ("200 OK", responses[index.min(responses.len() - 1)].clone())
+        })
+        .await
+    }
+
+    /// A local JSON endpoint that records every request body and answers
+    /// each with `respond(body, request_index)`.
+    async fn spawn_scripted_json_server<F>(
+        respond: F,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>)
+    where
+        F: Fn(&str, usize) -> (&'static str, serde_json::Value) + Send + 'static,
+    {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3087,14 +3124,15 @@ mod tests {
                     let read = stream.read(&mut chunk).await.unwrap();
                     bytes.extend_from_slice(&chunk[..read]);
                 }
-                recorded.lock().unwrap().push(
+                let request_body =
                     String::from_utf8_lossy(&bytes[header_end..header_end + content_length])
-                        .to_string(),
-                );
-                let body = responses[index.min(responses.len() - 1)].to_string();
+                        .to_string();
+                let (status, body) = respond(&request_body, index);
+                recorded.lock().unwrap().push(request_body);
+                let body = body.to_string();
                 index += 1;
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 let _ = stream.write_all(response.as_bytes()).await;
@@ -3148,6 +3186,235 @@ mod tests {
         for body in bodies.iter() {
             assert_eq!(form_field(body, "scope").as_deref(), Some("read"));
         }
+    }
+
+    /// Bound a test that talks to a local mock server.
+    async fn bounded<F: std::future::Future>(future: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(10), future)
+            .await
+            .expect("test timed out")
+    }
+
+    /// A token endpoint with the behavior reported for Salesforce (#1617): a
+    /// refresh containing `scope` gets `invalid_request`. Every other refresh
+    /// succeeds and rotates the refresh token. `scopes[n]` is the `scope` the
+    /// n-th successful response returns (`None` omits the field).
+    async fn spawn_scope_rejecting_token_server(
+        scopes: Vec<Option<&'static str>>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        spawn_scripted_json_server(move |body, index| {
+            if form_field(body, "scope").is_some() {
+                return (
+                    "400 Bad Request",
+                    serde_json::json!({
+                        "error": "invalid_request",
+                        "error_description": "scope parameter not supported"
+                    }),
+                );
+            }
+            let mut response = serde_json::json!({
+                "access_token": format!("access-{index}"),
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "refresh_token": format!("rotated-{index}"),
+            });
+            if let Some(scope) = scopes[index.min(scopes.len() - 1)] {
+                response["scope"] = scope.into();
+            }
+            ("200 OK", response)
+        })
+        .await
+    }
+
+    fn expired_token_with_scope(scope: Option<&str>) -> CachedAuthCodeToken {
+        CachedAuthCodeToken {
+            access_token: "expired-access-token".to_string(),
+            refresh_token: Some("refresh-token".to_string()),
+            expires_at: Instant::now() - Duration::from_secs(1),
+            scope: scope.map(str::to_string),
+        }
+    }
+
+    fn with_refresh_scope_policy(
+        provider: OAuthAuthorizationCode,
+        refresh_scope_policy: OAuthRefreshScopePolicy,
+    ) -> OAuthAuthorizationCode {
+        OAuthAuthorizationCode {
+            inner: Arc::new(OAuthAuthCodeInner {
+                refresh_scope_policy,
+                ..Arc::into_inner(provider.inner).unwrap()
+            }),
+        }
+    }
+
+    /// #1617: a server that rejects `scope` on refresh works with the omit
+    /// policy, repeatedly, and the recorded grant survives. `resource` and
+    /// refresh-token rotation are unaffected.
+    #[tokio::test]
+    async fn omit_policy_survives_a_token_endpoint_that_rejects_refresh_scope() {
+        bounded(async {
+            let (base, bodies) =
+                spawn_scope_rejecting_token_server(vec![Some("read write"), None, Some("read")])
+                    .await;
+            let provider = with_refresh_scope_policy(
+                test_provider_with_cached_token(
+                    format!("{base}/token"),
+                    expired_token_with_scope(Some("read write")),
+                ),
+                OAuthRefreshScopePolicy::Omit,
+            );
+            let recorded = |provider: &OAuthAuthorizationCode| {
+                let provider = provider.clone();
+                async move { provider.inner.cache.read().await.clone().unwrap().scope }
+            };
+
+            assert_eq!(
+                TokenProvider::get_token(&provider).await.unwrap(),
+                "access-0"
+            );
+            assert_eq!(recorded(&provider).await.as_deref(), Some("read write"));
+
+            // This response omits `scope`, so the previous grant is kept.
+            provider.invalidate().await;
+            assert_eq!(
+                TokenProvider::get_token(&provider).await.unwrap(),
+                "access-1"
+            );
+            assert_eq!(recorded(&provider).await.as_deref(), Some("read write"));
+
+            // A returned `scope` still replaces the grant.
+            provider.invalidate().await;
+            assert_eq!(
+                TokenProvider::get_token(&provider).await.unwrap(),
+                "access-2"
+            );
+            assert_eq!(recorded(&provider).await.as_deref(), Some("read"));
+
+            let bodies = bodies.lock().unwrap();
+            let sent_refresh_tokens: Vec<_> = bodies
+                .iter()
+                .map(|body| form_field(body, "refresh_token").unwrap())
+                .collect();
+            assert_eq!(
+                sent_refresh_tokens,
+                ["refresh-token", "rotated-0", "rotated-1"]
+            );
+            for body in bodies.iter() {
+                assert_eq!(form_field(body, "scope"), None);
+                assert_eq!(
+                    form_field(body, "resource").as_deref(),
+                    Some("https://mcp.example.com")
+                );
+            }
+        })
+        .await;
+    }
+
+    /// #1617: the default policy still sends the grant, so a server that
+    /// rejects `scope` fails exactly as before. This is what keeps the
+    /// default unchanged for servers that require the parameter.
+    #[tokio::test]
+    async fn default_policy_still_sends_scope_to_a_rejecting_endpoint() {
+        bounded(async {
+            let (base, bodies) = spawn_scope_rejecting_token_server(vec![Some("read")]).await;
+            let provider = test_provider_with_cached_token(
+                format!("{base}/token"),
+                expired_token_with_scope(Some("read")),
+            );
+
+            let error = provider
+                .refresh_token("refresh-token", Some("read"), Some("read"))
+                .await
+                .unwrap_err();
+
+            assert!(error.to_string().contains("scope parameter not supported"));
+            assert_eq!(bodies.lock().unwrap().len(), 1);
+        })
+        .await;
+    }
+
+    /// #1617: a narrowed request sends only those scopes, and a response
+    /// without `scope` records what was requested (RFC 6749 section 5.1).
+    #[tokio::test]
+    async fn narrow_policy_sends_a_subset_of_the_grant() {
+        bounded(async {
+            let (base, bodies) = spawn_recording_json_server(vec![serde_json::json!({
+                "access_token": "narrowed",
+                "token_type": "Bearer",
+                "expires_in": 3600
+            })])
+            .await;
+            let provider = with_refresh_scope_policy(
+                test_provider_with_cached_token(
+                    format!("{base}/token"),
+                    expired_token_with_scope(Some("read write")),
+                ),
+                OAuthRefreshScopePolicy::Narrow(vec!["read".to_string()]),
+            );
+
+            TokenProvider::get_token(&provider).await.unwrap();
+            provider.invalidate().await;
+            TokenProvider::get_token(&provider).await.unwrap();
+
+            {
+                let bodies = bodies.lock().unwrap();
+                assert_eq!(bodies.len(), 2);
+                for body in bodies.iter() {
+                    assert_eq!(form_field(body, "scope").as_deref(), Some("read"));
+                }
+            }
+            assert_eq!(
+                provider
+                    .inner
+                    .cache
+                    .read()
+                    .await
+                    .clone()
+                    .unwrap()
+                    .scope
+                    .as_deref(),
+                Some("read")
+            );
+        })
+        .await;
+    }
+
+    /// #1617: an invalid narrowing is reported and nothing is sent, so it
+    /// cannot become a broader request.
+    #[tokio::test]
+    async fn invalid_narrowing_fails_without_a_refresh_request() {
+        bounded(async {
+            let (base, bodies) = spawn_recording_json_server(vec![serde_json::json!({
+                "access_token": "unexpected",
+                "token_type": "Bearer"
+            })])
+            .await;
+            let provider = with_refresh_scope_policy(
+                test_provider_with_cached_token(
+                    format!("{base}/token"),
+                    expired_token_with_scope(Some("read")),
+                ),
+                OAuthRefreshScopePolicy::Narrow(vec!["read admin".to_string()]),
+            );
+
+            let error = TokenProvider::get_token(&provider).await.unwrap_err();
+
+            assert!(error.to_string().contains("`admin`"), "got: {error}");
+            assert!(bodies.lock().unwrap().is_empty());
+            assert_eq!(
+                provider
+                    .inner
+                    .cache
+                    .read()
+                    .await
+                    .clone()
+                    .unwrap()
+                    .scope
+                    .as_deref(),
+                Some("read")
+            );
+        })
+        .await;
     }
 
     /// A scope returned on refresh replaces the recorded grant.

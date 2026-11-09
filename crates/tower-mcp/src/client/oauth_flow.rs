@@ -14,7 +14,7 @@ use base64::Engine;
 use tokio::sync::{Mutex, RwLock, oneshot};
 
 use super::oauth::{
-    OAuthBearerChallenge, OAuthClientError, OAuthScopeEscalationHandler,
+    OAuthBearerChallenge, OAuthClientError, OAuthRefreshScopePolicy, OAuthScopeEscalationHandler,
     OAuthScopeEscalationRequest, OAuthTokenEndpointAuthMethod, TokenProvider,
 };
 use super::oauth_authcode::{
@@ -575,6 +575,7 @@ struct FlowInner {
     redirect_policy: OAuthRedirectPolicy,
     preferred_issuer: Option<String>,
     refresh_buffer: Duration,
+    refresh_scope_policy: OAuthRefreshScopePolicy,
     authorization_handler: Option<Arc<dyn OAuthAuthorizationHandler>>,
     assertion_signer: Option<Arc<dyn OAuthClientAssertionSigner>>,
     current: RwLock<Option<ActiveToken>>,
@@ -618,6 +619,7 @@ pub struct OAuthAuthorizationFlowBuilder {
     redirect_policy: Option<OAuthRedirectPolicy>,
     preferred_issuer: Option<String>,
     refresh_buffer: Duration,
+    refresh_scope_policy: OAuthRefreshScopePolicy,
     authorization_handler: Option<Arc<dyn OAuthAuthorizationHandler>>,
     assertion_signer: Option<Arc<dyn OAuthClientAssertionSigner>>,
 }
@@ -718,6 +720,16 @@ impl OAuthAuthorizationFlowBuilder {
         self
     }
 
+    /// Control the `scope` parameter on refresh requests.
+    ///
+    /// The default, [`OAuthRefreshScopePolicy::SendGranted`], sends the
+    /// recorded grant. Use [`OAuthRefreshScopePolicy::Omit`] for an
+    /// authorization server that rejects `scope` on refresh.
+    pub fn refresh_scope_policy(mut self, policy: OAuthRefreshScopePolicy) -> Self {
+        self.refresh_scope_policy = policy;
+        self
+    }
+
     /// Configure automatic browser/headless authorization handling.
     pub fn authorization_handler(mut self, handler: impl OAuthAuthorizationHandler) -> Self {
         self.authorization_handler = Some(Arc::new(handler));
@@ -769,6 +781,7 @@ impl OAuthAuthorizationFlowBuilder {
                 redirect_policy,
                 preferred_issuer: self.preferred_issuer,
                 refresh_buffer: self.refresh_buffer,
+                refresh_scope_policy: self.refresh_scope_policy,
                 authorization_handler: self.authorization_handler,
                 assertion_signer: self.assertion_signer,
                 current: RwLock::new(None),
@@ -902,6 +915,7 @@ impl OAuthAuthorizationFlow {
             redirect_policy: None,
             preferred_issuer: None,
             refresh_buffer: Duration::from_secs(30),
+            refresh_scope_policy: OAuthRefreshScopePolicy::default(),
             authorization_handler: None,
             assertion_signer: None,
         }
@@ -1233,13 +1247,17 @@ impl TokenProvider for OAuthAuthorizationFlow {
                     .to_string(),
             )
         })?;
+        let request_scope = self
+            .inner
+            .refresh_scope_policy
+            .request_scope(active.token.scopes.iter().map(String::as_str))?;
         let mut fields = vec![
             ("grant_type".to_string(), "refresh_token".to_string()),
             ("refresh_token".to_string(), refresh_token.to_string()),
             ("resource".to_string(), active.binding.resource.clone()),
         ];
-        if !active.token.scopes.is_empty() {
-            fields.push(("scope".to_string(), active.token.scopes.join(" ")));
+        if let Some(scope) = &request_scope {
+            fields.push(("scope".to_string(), scope.clone()));
         }
         let response = send_token_request(
             self.inner.http.as_ref(),
@@ -1295,9 +1313,16 @@ impl TokenProvider for OAuthAuthorizationFlow {
             }
             Err(error) => return Err(error),
         };
+        // RFC 6749 section 5.1: an omitted `scope` means the grant matches
+        // what this request asked for. A request without `scope` keeps the
+        // previous grant.
+        let fallback_scopes = match &request_scope {
+            Some(scope) => unique_scopes([scope]),
+            None => active.token.scopes.clone(),
+        };
         let token = token_from_response(
             response,
-            &active.token.scopes,
+            &fallback_scopes,
             active.token.refresh_token.clone(),
         )?;
         self.inner.token_store.save(&active.binding, &token).await?;
@@ -2394,6 +2419,77 @@ mod tests {
         }
     }
 
+    type TokenFormFields = Vec<(String, String)>;
+
+    /// Wraps [`MockOAuthHttp`] with a token endpoint that rejects any refresh
+    /// containing `scope` (#1617) and rotates the refresh token otherwise.
+    /// `scopes[n]` is the `scope` the n-th successful refresh returns (`None`
+    /// omits the field).
+    #[derive(Clone)]
+    struct ScopeRejectingRefreshHttp {
+        inner: MockOAuthHttp,
+        scopes: Vec<Option<&'static str>>,
+        refreshes: Arc<Mutex<Vec<TokenFormFields>>>,
+    }
+
+    impl ScopeRejectingRefreshHttp {
+        fn new(scopes: Vec<Option<&'static str>>) -> Self {
+            Self {
+                inner: MockOAuthHttp::new(RegistrationMode::Dynamic).expiring(),
+                scopes,
+                refreshes: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl OAuthHttpClient for ScopeRejectingRefreshHttp {
+        async fn execute(
+            &self,
+            request: OAuthHttpRequest,
+        ) -> Result<OAuthHttpResponse, OAuthClientError> {
+            let fields = match &request.body {
+                OAuthHttpBody::Form(fields)
+                    if fields
+                        .iter()
+                        .any(|(name, value)| name == "grant_type" && value == "refresh_token") =>
+                {
+                    fields.clone()
+                }
+                _ => return self.inner.execute(request).await,
+            };
+            let mut refreshes = self.refreshes.lock().await;
+            let index = refreshes.len();
+            refreshes.push(fields.clone());
+            if fields.iter().any(|(name, _)| name == "scope") {
+                return Ok(MockOAuthHttp::response(
+                    400,
+                    serde_json::json!({
+                        "error": "invalid_request",
+                        "error_description": "scope parameter not supported"
+                    }),
+                ));
+            }
+            let mut response = serde_json::json!({
+                "access_token": format!("refreshed-{index}"),
+                "token_type": "Bearer",
+                "expires_in": 0,
+                "refresh_token": format!("rotated-{index}"),
+            });
+            if let Some(scope) = self.scopes[index.min(self.scopes.len() - 1)] {
+                response["scope"] = scope.into();
+            }
+            Ok(MockOAuthHttp::response(200, response))
+        }
+    }
+
+    /// Bound a test so a hung mock fails instead of stalling the suite.
+    async fn bounded<F: std::future::Future>(future: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(10), future)
+            .await
+            .expect("test timed out")
+    }
+
     #[derive(Clone, Default)]
     struct AutomaticAuthorizationHandler {
         calls: Arc<AtomicUsize>,
@@ -2465,6 +2561,156 @@ mod tests {
             ))
             .registration_options(options)
             .authorization_handler(handler)
+    }
+
+    fn scope_policy_flow(
+        http: ScopeRejectingRefreshHttp,
+        policy: OAuthRefreshScopePolicy,
+    ) -> OAuthAuthorizationFlow {
+        OAuthAuthorizationFlow::builder("https://mcp.example.com/mcp")
+            .http_client(http)
+            .redirect_policy(OAuthRedirectPolicy::fixed(
+                "http://127.0.0.1:23456/callback",
+            ))
+            .registration_options(dynamic_options())
+            .authorization_handler(AutomaticAuthorizationHandler::default())
+            .refresh_buffer(Duration::ZERO)
+            .refresh_scope_policy(policy)
+            .build()
+            .unwrap()
+    }
+
+    /// #1617: a server that rejects `scope` on refresh works with the omit
+    /// policy, repeatedly, and the recorded grant survives. `resource` and
+    /// refresh-token rotation are unaffected.
+    #[tokio::test]
+    async fn omit_policy_survives_a_token_endpoint_that_rejects_refresh_scope() {
+        bounded(async {
+            let granted = vec!["challenge.scope", "offline_access"];
+            let http = ScopeRejectingRefreshHttp::new(vec![
+                Some("challenge.scope offline_access"),
+                None,
+                Some("challenge.scope"),
+            ]);
+            let flow = scope_policy_flow(http.clone(), OAuthRefreshScopePolicy::Omit);
+            flow.authorize(["challenge.scope"]).await.unwrap();
+
+            assert_eq!(flow.get_token().await.unwrap(), "refreshed-0");
+            assert_eq!(flow.authorized_scopes().await.unwrap(), granted);
+
+            // This response omits `scope`, so the previous grant is kept.
+            assert_eq!(flow.get_token().await.unwrap(), "refreshed-1");
+            assert_eq!(flow.authorized_scopes().await.unwrap(), granted);
+
+            // A returned `scope` still replaces the grant.
+            assert_eq!(flow.get_token().await.unwrap(), "refreshed-2");
+            assert_eq!(
+                flow.authorized_scopes().await.unwrap(),
+                vec!["challenge.scope"]
+            );
+
+            let refreshes = http.refreshes.lock().await;
+            let value = |fields: &Vec<(String, String)>, field: &str| {
+                fields
+                    .iter()
+                    .find(|(name, _)| name == field)
+                    .map(|(_, value)| value.clone())
+            };
+            let sent_refresh_tokens: Vec<_> = refreshes
+                .iter()
+                .map(|fields| value(fields, "refresh_token").unwrap())
+                .collect();
+            assert_eq!(
+                sent_refresh_tokens,
+                ["refresh-token", "rotated-0", "rotated-1"]
+            );
+            for fields in refreshes.iter() {
+                assert_eq!(value(fields, "scope"), None);
+                assert_eq!(
+                    value(fields, "resource").as_deref(),
+                    Some("https://mcp.example.com/mcp")
+                );
+            }
+        })
+        .await;
+    }
+
+    /// #1617: the default policy keeps sending the recorded grant.
+    #[tokio::test]
+    async fn default_policy_still_sends_scope_to_a_rejecting_endpoint() {
+        bounded(async {
+            let http = ScopeRejectingRefreshHttp::new(vec![None]);
+            let flow = scope_policy_flow(http.clone(), OAuthRefreshScopePolicy::default());
+            flow.authorize(["challenge.scope"]).await.unwrap();
+
+            let error = flow.get_token().await.unwrap_err();
+
+            assert!(error.to_string().contains("scope parameter not supported"));
+            let refreshes = http.refreshes.lock().await;
+            assert!(refreshes[0].contains(&(
+                "scope".to_string(),
+                "challenge.scope offline_access".to_string()
+            )));
+        })
+        .await;
+    }
+
+    /// #1617: a narrowed request sends only those scopes, and a response
+    /// without `scope` records what was requested (RFC 6749 section 5.1).
+    #[tokio::test]
+    async fn narrow_policy_sends_a_subset_of_the_grant() {
+        bounded(async {
+            let http = MockOAuthHttp::new(RegistrationMode::Dynamic).expiring();
+            let flow = flow_builder(
+                http.clone(),
+                dynamic_options(),
+                AutomaticAuthorizationHandler::default(),
+            )
+            .refresh_buffer(Duration::ZERO)
+            .refresh_scope_policy(OAuthRefreshScopePolicy::Narrow(vec![
+                "challenge.scope".to_string(),
+            ]))
+            .build()
+            .unwrap();
+            flow.authorize(["challenge.scope"]).await.unwrap();
+
+            flow.get_token().await.unwrap();
+
+            let requests = http.requests().await;
+            let refresh = requests
+                .iter()
+                .rfind(|request| request.url.ends_with("/token"))
+                .unwrap();
+            let OAuthHttpBody::Form(fields) = &refresh.body else {
+                panic!("expected refresh form")
+            };
+            assert!(fields.contains(&("scope".to_string(), "challenge.scope".to_string())));
+        })
+        .await;
+    }
+
+    /// #1617: an invalid narrowing is reported and nothing is sent, so it
+    /// cannot become a broader request.
+    #[tokio::test]
+    async fn invalid_narrowing_fails_without_a_refresh_request() {
+        bounded(async {
+            let http = ScopeRejectingRefreshHttp::new(vec![None]);
+            let flow = scope_policy_flow(
+                http.clone(),
+                OAuthRefreshScopePolicy::Narrow(vec!["admin".to_string()]),
+            );
+            flow.authorize(["challenge.scope"]).await.unwrap();
+
+            let error = flow.get_token().await.unwrap_err();
+
+            assert!(error.to_string().contains("`admin`"), "got: {error}");
+            assert!(http.refreshes.lock().await.is_empty());
+            assert_eq!(
+                flow.authorized_scopes().await.unwrap(),
+                vec!["challenge.scope", "offline_access"]
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
