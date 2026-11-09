@@ -1706,13 +1706,7 @@ impl ClientTransport for HttpClientTransport {
                 }
 
                 // Check if response is SSE-formatted
-                let is_sse = response
-                    .headers()
-                    .get("content-type")
-                    .and_then(|v| v.to_str().ok())
-                    .is_some_and(|ct| ct.contains("text/event-stream"));
-
-                if is_sse {
+                if response_is_sse(&response) {
                     pump_post_sse(
                         response,
                         PostSseContext {
@@ -1920,12 +1914,7 @@ impl ClientTransport for HttpClientTransport {
         // request on that stream (`initialize` answered by a ping, say) and
         // hold the final reply until it is answered, and the message loop
         // that answers it is the caller of this method (#1558).
-        let is_sse = response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|ct| ct.contains("text/event-stream"));
-        if is_sse && reply_id.is_some() {
+        if response_is_sse(&response) && reply_id.is_some() {
             let request_id = reply_id
                 .clone()
                 .and_then(|value| serde_json::from_value(value).ok());
@@ -2836,6 +2825,25 @@ fn json_request_ids_match(left: &serde_json::Value, right: &serde_json::Value) -
                 .is_some_and(|number| value.parse::<i64>() == Ok(number)),
             _ => false,
         }
+}
+
+/// Whether a `Content-Type` value names the SSE media type. Type and subtype
+/// compare case-insensitively (RFC 9110, section 8.3.1) and parameters are
+/// ignored, so a value that only contains the name does not match (#1621).
+fn is_event_stream_media_type(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
+/// Whether a POST response body has to be read as an SSE stream.
+fn response_is_sse(response: &reqwest::Response) -> bool {
+    response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(is_event_stream_media_type)
 }
 
 fn extract_json_messages(body: &str) -> Vec<String> {
@@ -3800,6 +3808,31 @@ mod tests {
                 "message": "Unsupported protocol version"
             }
         })));
+    }
+
+    #[test]
+    fn event_stream_media_type_matches_only_the_complete_essence() {
+        for content_type in [
+            "text/event-stream",
+            "Text/Event-Stream",
+            "TEXT/EVENT-STREAM; charset=UTF-8",
+            "text/event-stream ; charset=utf-8",
+            " text/event-stream;",
+        ] {
+            assert!(is_event_stream_media_type(content_type), "{content_type}");
+        }
+        for content_type in [
+            "",
+            "text/event-streaming",
+            "text/event-stream+json",
+            "xtext/event-stream",
+            "text/event-stream, application/json",
+            "application/json, text/event-stream",
+            "application/json; note=\"text/event-stream\"",
+            "application/json; profile=text/event-stream",
+        ] {
+            assert!(!is_event_stream_media_type(content_type), "{content_type}");
+        }
     }
 
     #[test]
