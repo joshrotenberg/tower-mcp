@@ -186,6 +186,9 @@ pub trait ClientHandler: Send + Sync + 'static {
     /// Handle an `elicitation/create` request from the server.
     ///
     /// The server is asking the client for user input (form data or URL).
+    /// A URL request arrives as [`ElicitRequestParams::Url`] on the 2025-11-25
+    /// lifecycle and [`ElicitRequestParams::FinalUrl`] on 2026-07-28, which has
+    /// no `elicitationId`.
     ///
     /// Default: returns `method_not_found` error.
     async fn handle_elicit(

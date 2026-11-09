@@ -4871,10 +4871,11 @@ pub struct ElicitFormParams {
     pub meta: Option<RequestMeta>,
 }
 
-/// Parameters for URL-based elicitation request.
+/// Parameters for URL-based elicitation request on the 2025-11-25 lifecycle.
 ///
 /// URL-based elicitation allows servers to direct users to an external URL
 /// (e.g., an OAuth flow or payment page) and receive completion notification.
+/// The 2026-07-28 shape has no `elicitationId`; see [`ElicitFinalUrlParams`].
 ///
 /// # Example
 ///
@@ -4899,14 +4900,13 @@ pub struct ElicitUrlParams {
     pub mode: Option<ElicitMode>,
     /// Unique ID for this elicitation (opaque to client).
     ///
-    /// **2025-11-25 and earlier only.** The final 2026-07-28 schema removes
-    /// this field: MRTR (SEP-2322, not yet implemented -- see #950) replaces
-    /// the completion-notification-plus-ID pattern with a request retry, so
-    /// there is no longer a standalone async completion to correlate. This
-    /// field stays required and unconditionally sent for now, since this
-    /// crate does not yet distinguish 2026-07-28 elicitation requests from
-    /// 2025-11-25 ones -- see [`ElicitationCompleteParams`] for the paired
-    /// notification this ID was meant to correlate with.
+    /// **2025-11-25 only.** The final 2026-07-28 schema removes this field:
+    /// MRTR (SEP-2322) replaces the completion-notification-plus-ID pattern
+    /// with a request retry, so there is no standalone async completion to
+    /// correlate. It stays required here because this type is the 2025-11-25
+    /// shape; use [`ElicitFinalUrlParams`] on the 2026-07-28 lifecycle. See
+    /// [`ElicitationCompleteParams`] for the paired notification this ID
+    /// correlates with.
     pub elicitation_id: String,
     /// Message explaining why the user needs to navigate to the URL
     pub message: String,
@@ -4922,15 +4922,91 @@ pub struct ElicitUrlParams {
     pub meta: Option<RequestMeta>,
 }
 
+/// The `mode` of a 2026-07-28 URL elicitation. The field is required on that
+/// lifecycle and has only this value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ElicitUrlMode {
+    /// URL-based elicitation (out-of-band)
+    #[default]
+    Url,
+}
+
+/// Parameters for URL-based elicitation request on the 2026-07-28 lifecycle.
+///
+/// The final schema requires `mode`, `message` and `url` and has no
+/// `elicitationId`: the client learns the outcome by retrying the original
+/// request (SEP-2322), so there is no completion notification to correlate.
+///
+/// # Example
+///
+/// ```rust
+/// use tower_mcp_types::protocol::ElicitFinalUrlParams;
+///
+/// let params = ElicitFinalUrlParams::new("Please sign in", "https://example.com/auth");
+/// let wire = serde_json::to_value(&params).unwrap();
+/// assert_eq!(wire["mode"], "url");
+/// assert!(wire.get("elicitationId").is_none());
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ElicitFinalUrlParams {
+    /// The elicitation mode. Always `url`.
+    pub mode: ElicitUrlMode,
+    /// Message explaining why the user needs to navigate to the URL
+    pub message: String,
+    /// The URL the user should navigate to
+    pub url: String,
+    /// Request metadata including progress token
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::protocol::meta_object_serde"
+    )]
+    pub meta: Option<RequestMeta>,
+}
+
+impl ElicitFinalUrlParams {
+    /// Create parameters from a message and the URL to open.
+    pub fn new(message: impl Into<String>, url: impl Into<String>) -> Self {
+        Self {
+            mode: ElicitUrlMode::Url,
+            message: message.into(),
+            url: url.into(),
+            meta: None,
+        }
+    }
+}
+
+impl From<ElicitUrlParams> for ElicitFinalUrlParams {
+    /// Drop the legacy `elicitation_id`, which has no 2026-07-28 equivalent.
+    fn from(params: ElicitUrlParams) -> Self {
+        Self {
+            mode: ElicitUrlMode::Url,
+            message: params.message,
+            url: params.url,
+            meta: params.meta,
+        }
+    }
+}
+
 /// Elicitation request parameters (union of form and URL modes)
+///
+/// Deserializing this type directly applies the 2025-11-25 rules, so a URL
+/// request without `elicitationId` is rejected. The 2026-07-28 shape is
+/// accepted only through [`InputRequest`], the one place that shape can occur.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 #[non_exhaustive]
 pub enum ElicitRequestParams {
     /// In-band structured form elicitation.
     Form(ElicitFormParams),
-    /// Out-of-band interaction reached through a URL.
+    /// Out-of-band interaction reached through a URL (2025-11-25 shape).
     Url(ElicitUrlParams),
+    /// Out-of-band interaction reached through a URL (2026-07-28 shape).
+    #[serde(skip_deserializing)]
+    FinalUrl(ElicitFinalUrlParams),
 }
 
 /// Elicitation mode
@@ -5551,10 +5627,10 @@ pub enum ElicitFieldValue {
 /// [`ElicitUrlParams::elicitation_id`]) -- not deprecated, removed outright,
 /// unlike Roots/Sampling/Logging's SEP-2577 12-month deprecation window.
 /// Under [Multi Round-Trip Requests](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2322)
-/// (SEP-2322, not yet implemented by this crate -- see #950), the client
-/// learns the outcome of an out-of-band interaction by retrying the original
-/// request rather than receiving a server-initiated completion signal, so
-/// the correlating ID this type carries no longer fits the protocol.
+/// (SEP-2322), the client learns the outcome of an out-of-band interaction by
+/// retrying the original request rather than receiving a server-initiated
+/// completion signal, so the correlating ID this type carries no longer fits
+/// the protocol.
 /// tower-mcp does not currently send or handle this notification on any
 /// path; this type exists for callers constructing it directly against the
 /// 2025-11-25 wire format.
@@ -5856,8 +5932,46 @@ pub enum InputRequest {
     #[serde(rename = "roots/list")]
     ListRoots(ListRootsParams),
     /// `elicitation/create`
-    #[serde(rename = "elicitation/create")]
+    ///
+    /// `InputRequest` exists only on the 2026-07-28 lifecycle, so a URL request
+    /// is read and written in that shape: `elicitationId` is optional on input
+    /// and never written. An incoming request that still carries the ID is
+    /// kept as [`ElicitRequestParams::Url`]; without it,
+    /// [`ElicitRequestParams::FinalUrl`].
+    #[serde(
+        rename = "elicitation/create",
+        serialize_with = "serialize_final_elicit",
+        deserialize_with = "deserialize_final_elicit"
+    )]
     Elicit(ElicitRequestParams),
+}
+
+fn serialize_final_elicit<S: serde::Serializer>(
+    params: &ElicitRequestParams,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match params {
+        ElicitRequestParams::Url(legacy) => {
+            ElicitFinalUrlParams::from(legacy.clone()).serialize(serializer)
+        }
+        other => other.serialize(serializer),
+    }
+}
+
+fn deserialize_final_elicit<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<ElicitRequestParams, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum FinalElicitRequestParams {
+        Known(ElicitRequestParams),
+        FinalUrl(ElicitFinalUrlParams),
+    }
+
+    Ok(match FinalElicitRequestParams::deserialize(deserializer)? {
+        FinalElicitRequestParams::Known(params) => params,
+        FinalElicitRequestParams::FinalUrl(params) => ElicitRequestParams::FinalUrl(params),
+    })
 }
 
 impl InputRequest {
@@ -8886,5 +9000,104 @@ mod absent_optional_param_tests {
             status["ttl"].is_null(),
             "null ttl means unlimited, not absent: {status}"
         );
+    }
+}
+
+#[cfg(test)]
+mod final_url_elicitation_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn final_url_request() -> Value {
+        json!({
+            "method": "elicitation/create",
+            "params": {
+                "mode": "url",
+                "message": "Sign in",
+                "url": "https://example.com/oauth/start"
+            }
+        })
+    }
+
+    #[test]
+    fn input_request_accepts_a_url_elicitation_without_an_id() {
+        let request: InputRequest = serde_json::from_value(final_url_request()).unwrap();
+        let InputRequest::Elicit(ElicitRequestParams::FinalUrl(params)) = &request else {
+            panic!("expected a final URL elicitation, got {request:?}");
+        };
+        assert_eq!(params.mode, ElicitUrlMode::Url);
+        assert_eq!(params.message, "Sign in");
+        assert_eq!(params.url, "https://example.com/oauth/start");
+        assert_eq!(serde_json::to_value(&request).unwrap(), final_url_request());
+    }
+
+    #[test]
+    fn input_required_envelope_with_an_id_less_url_request_round_trips() {
+        let envelope = json!({
+            "resultType": "input_required",
+            "inputRequests": {"signin": final_url_request()},
+            "requestState": "opaque"
+        });
+        let parsed: InputRequiredResult = serde_json::from_value(envelope.clone()).unwrap();
+        assert_eq!(parsed.result_type, ResultType::InputRequired);
+        assert!(matches!(
+            parsed.input_requests.as_ref().unwrap().get("signin"),
+            Some(InputRequest::Elicit(ElicitRequestParams::FinalUrl(_)))
+        ));
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), envelope);
+    }
+
+    #[test]
+    fn final_url_elicitation_requires_the_url_mode() {
+        for mode in [json!(null), json!("form")] {
+            let mut request = final_url_request();
+            if mode.is_null() {
+                request["params"].as_object_mut().unwrap().remove("mode");
+            } else {
+                request["params"]["mode"] = mode;
+            }
+            let error = serde_json::from_value::<InputRequest>(request).unwrap_err();
+            assert!(error.to_string().contains("did not match"), "{error}");
+        }
+    }
+
+    #[test]
+    fn legacy_params_written_on_the_final_path_omit_the_id() {
+        let request = InputRequest::Elicit(ElicitRequestParams::Url(ElicitUrlParams {
+            mode: None,
+            elicitation_id: "legacy".to_string(),
+            message: "Sign in".to_string(),
+            url: "https://example.com/oauth/start".to_string(),
+            meta: None,
+        }));
+        assert_eq!(serde_json::to_value(&request).unwrap(), final_url_request());
+    }
+
+    #[test]
+    fn id_bearing_request_on_the_final_path_stays_legacy_typed() {
+        let mut request = final_url_request();
+        request["params"]["elicitationId"] = json!("legacy");
+        let parsed: InputRequest = serde_json::from_value(request).unwrap();
+        let InputRequest::Elicit(ElicitRequestParams::Url(params)) = parsed else {
+            panic!("expected the legacy URL variant");
+        };
+        assert_eq!(params.elicitation_id, "legacy");
+    }
+
+    #[test]
+    fn legacy_decoding_still_requires_the_id() {
+        let mut params = final_url_request()["params"].clone();
+        assert!(
+            serde_json::from_value::<ElicitRequestParams>(params.clone()).is_err(),
+            "2025-11-25 URL elicitation must carry elicitationId"
+        );
+
+        params["elicitationId"] = json!("legacy");
+        assert!(matches!(
+            serde_json::from_value::<ElicitRequestParams>(params.clone()).unwrap(),
+            ElicitRequestParams::Url(_)
+        ));
+        let legacy: ElicitUrlParams = serde_json::from_value(params.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&legacy).unwrap(), params);
     }
 }

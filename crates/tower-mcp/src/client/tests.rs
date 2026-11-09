@@ -2775,3 +2775,155 @@ async fn test_response_with_both_result_and_error_fails_as_malformed() {
         other => panic!("expected Error::Transport, got: {other:?}"),
     }
 }
+
+// =========================================================================
+// URL elicitation without elicitationId (#1624)
+// =========================================================================
+
+#[derive(Default)]
+struct RecordingElicitHandler {
+    seen: Arc<Mutex<Vec<crate::protocol::ElicitRequestParams>>>,
+}
+
+#[async_trait]
+impl ClientHandler for RecordingElicitHandler {
+    async fn handle_elicit(
+        &self,
+        params: crate::protocol::ElicitRequestParams,
+    ) -> std::result::Result<crate::protocol::ElicitResult, JsonRpcError> {
+        self.seen.lock().unwrap().push(params);
+        Ok(crate::protocol::ElicitResult {
+            action: crate::protocol::ElicitAction::Accept,
+            content: None,
+            meta: None,
+        })
+    }
+}
+
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+#[tokio::test]
+async fn final_client_fulfils_an_id_less_url_elicitation_frame() {
+    use crate::protocol::ElicitRequestParams;
+
+    let transport = MockTransport::with_responses(vec![
+        final_discover_result(),
+        serde_json::json!({
+            "resultType": "input_required",
+            "inputRequests": {"signin": {
+                "method": "elicitation/create",
+                "params": {
+                    "mode": "url",
+                    "message": "Sign in",
+                    "url": "https://example.com/oauth/start"
+                }
+            }},
+            "requestState": "opaque"
+        }),
+        serde_json::json!({
+            "resultType": "complete",
+            "content": [{"type": "text", "text": "signed in"}]
+        }),
+    ]);
+    let outgoing = transport.outgoing.clone();
+    let handler = RecordingElicitHandler::default();
+    let seen = handler.seen.clone();
+    let client = McpClient::builder()
+        .protocol_support(ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+        .with_elicitation()
+        .connect(transport, handler)
+        .await
+        .unwrap();
+    client.discover("test-client", "1.0.0").await.unwrap();
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.call_tool("signin", serde_json::json!({})),
+    )
+    .await
+    .expect("call timed out")
+    .unwrap();
+    assert_eq!(result.all_text(), "signed in");
+
+    {
+        let seen = seen.lock().unwrap();
+        let [ElicitRequestParams::FinalUrl(params)] = seen.as_slice() else {
+            panic!("expected one final URL elicitation, got {seen:?}");
+        };
+        assert_eq!(params.url, "https://example.com/oauth/start");
+    }
+
+    let retry: serde_json::Value =
+        serde_json::from_str(outgoing.lock().unwrap().last().unwrap()).unwrap();
+    assert_eq!(retry["method"], "tools/call");
+    assert_eq!(retry["params"]["requestState"], "opaque");
+    assert_eq!(
+        retry["params"]["inputResponses"]["signin"]["action"],
+        "accept"
+    );
+}
+
+/// The 2025-11-25 `elicitation/create` request still requires `elicitationId`,
+/// which an ID-less final-shaped request does not satisfy.
+#[tokio::test]
+async fn legacy_elicitation_request_still_requires_the_id() {
+    use crate::protocol::ElicitRequestParams;
+
+    let transport = MockTransport::with_responses(vec![mock_initialize_response()]);
+    let inject = transport.incoming_tx.clone();
+    let outgoing = transport.outgoing.clone();
+    let handler = RecordingElicitHandler::default();
+    let seen = handler.seen.clone();
+    let client = McpClient::builder()
+        .with_elicitation()
+        .connect(transport, handler)
+        .await
+        .unwrap();
+    client.initialize("test-client", "1.0.0").await.unwrap();
+
+    let reply_to = |id: i64| {
+        let outgoing = outgoing.clone();
+        async move {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let reply = outgoing.lock().unwrap().iter().find_map(|message| {
+                        let frame: serde_json::Value = serde_json::from_str(message).unwrap();
+                        (frame["id"] == id && frame.get("method").is_none()).then_some(frame)
+                    });
+                    match reply {
+                        Some(frame) => return frame,
+                        None => tokio::task::yield_now().await,
+                    }
+                }
+            })
+            .await
+            .expect("no reply to the injected request")
+        }
+    };
+
+    let mut params = serde_json::json!({
+        "mode": "url",
+        "message": "Sign in",
+        "url": "https://example.com/oauth/start"
+    });
+    let request = |id: i64, params: &serde_json::Value| {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "elicitation/create",
+            "params": params
+        })
+        .to_string()
+    };
+
+    inject.send(request(100, &params)).await.unwrap();
+    assert_eq!(reply_to(100).await["error"]["code"], -32602);
+    assert!(seen.lock().unwrap().is_empty());
+
+    params["elicitationId"] = serde_json::json!("legacy");
+    inject.send(request(101, &params)).await.unwrap();
+    assert_eq!(reply_to(101).await["result"]["action"], "accept");
+    assert!(matches!(
+        seen.lock().unwrap().as_slice(),
+        [ElicitRequestParams::Url(_)]
+    ));
+}
