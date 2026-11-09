@@ -3904,8 +3904,14 @@ mod tests {
     #[test]
     fn debug_shows_the_expiry_and_redacts_the_secret() {
         let debug = format!("{:?}", stored_with_expiry(Some(NOW)));
-        assert!(debug.contains(&NOW.to_string()), "got: {debug}");
-        assert!(!debug.contains("stored-secret"), "got: {debug}");
+        assert!(
+            debug.contains(&NOW.to_string()),
+            "Debug output is missing the expiry"
+        );
+        assert!(
+            !debug.contains("stored-secret"),
+            "Debug output contains the client secret"
+        );
     }
 
     /// Both the storeless and the store-backed public paths expose the value
