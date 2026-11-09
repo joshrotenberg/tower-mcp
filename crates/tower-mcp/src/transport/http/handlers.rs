@@ -1592,6 +1592,71 @@ async fn handle_subscriptions_listen_sse(session: Arc<Session>) -> Response {
         .into_response()
 }
 
+/// Split an HTTP list or parameter list on `delimiter`, ignoring delimiters
+/// inside quoted strings. A backslash in a quoted string escapes the next byte,
+/// so an escaped quote does not end the string.
+fn split_unquoted(value: &[u8], delimiter: u8) -> impl Iterator<Item = &[u8]> {
+    let mut quoted = false;
+    let mut escaped = false;
+    value.split(move |&byte| {
+        if escaped {
+            escaped = false;
+        } else if quoted && byte == b'\\' {
+            escaped = true;
+        } else if byte == b'"' {
+            quoted = !quoted;
+        } else if !quoted && byte == delimiter {
+            return true;
+        }
+        false
+    })
+}
+
+/// Whether an RFC 9110 qvalue is an explicit zero. A weight outside the
+/// `qvalue` grammar is not, so it is ignored rather than excluding the range.
+fn is_zero_quality(quality: &[u8]) -> bool {
+    let (whole, fraction) = match quality.iter().position(|&byte| byte == b'.') {
+        Some(dot) => (&quality[..dot], &quality[dot + 1..]),
+        None => (quality, &[][..]),
+    };
+    whole == b"0" && fraction.len() <= 3 && fraction.iter().all(|&byte| byte == b'0')
+}
+
+/// Whether one `Accept` list member names SSE with a non-zero weight.
+fn is_event_stream_range(range: &[u8]) -> bool {
+    let mut parts = split_unquoted(range, b';');
+    if !parts.next().is_some_and(|media_type| {
+        media_type
+            .trim_ascii()
+            .eq_ignore_ascii_case(b"text/event-stream")
+    }) {
+        return false;
+    }
+    !parts.any(|parameter| {
+        parameter
+            .iter()
+            .position(|&byte| byte == b'=')
+            .is_some_and(|eq| {
+                parameter[..eq].trim_ascii().eq_ignore_ascii_case(b"q")
+                    && is_zero_quality(parameter[eq + 1..].trim_ascii())
+            })
+    })
+}
+
+/// Whether any `Accept` field explicitly admits `text/event-stream`.
+///
+/// Media types are compared whole and case-insensitively (RFC 9110 section
+/// 8.3.1), across every field value. Wildcards such as `*/*` do not count: the
+/// legacy GET stream has to be asked for by name. Raw bytes are parsed because
+/// quoted strings may hold non-ASCII octets, which `to_str` refuses.
+fn accepts_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::ACCEPT)
+        .iter()
+        .flat_map(|value| split_unquoted(value.as_bytes(), b','))
+        .any(is_event_stream_range)
+}
+
 /// Handle GET requests (SSE stream for server notifications and outgoing requests)
 pub(super) async fn handle_get(
     State(state): State<Arc<AppState>>,
@@ -1613,12 +1678,7 @@ pub(super) async fn handle_get(
     }
 
     // Check Accept header
-    let accept = headers
-        .get(header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    if !accept.contains("text/event-stream") {
+    if !accepts_event_stream(&headers) {
         return (
             StatusCode::NOT_ACCEPTABLE,
             "Accept header must include text/event-stream",
