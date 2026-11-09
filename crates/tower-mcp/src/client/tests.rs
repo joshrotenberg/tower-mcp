@@ -6,6 +6,8 @@
 use super::*;
 use async_trait::async_trait;
 use std::sync::Mutex;
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+use std::time::Duration;
 
 /// Mock transport for testing that auto-responds to requests.
 ///
@@ -1431,6 +1433,240 @@ async fn rotating_private_partition_refetches_resource() {
         Some("principal-b")
     );
     assert_eq!(outgoing.lock().unwrap().len(), 3);
+}
+
+/// Fail a paused-clock test that stops making progress. Paused time
+/// auto-advances once every task is idle, so a hang trips this immediately.
+/// Each test body advances the clock by far less than this bound.
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+async fn bounded<F: std::future::Future>(future: F) -> F::Output {
+    tokio::time::timeout(Duration::from_secs(7 * 24 * 60 * 60), future)
+        .await
+        .expect("test exceeded its time bound")
+}
+
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+async fn final_cache_client(transport: MockTransport, config: ClientCacheConfig) -> McpClient {
+    let client = McpClient::builder()
+        .protocol_support(ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+        .response_cache(config)
+        .connect_simple(transport)
+        .await
+        .unwrap();
+    client.discover("test-client", "1.0.0").await.unwrap();
+    client
+}
+
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+fn refresh_failure() -> MockReply {
+    MockReply::Error(JsonRpcError::internal_error("refresh failed"))
+}
+
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+fn tools_result_without_hints(name: &str) -> serde_json::Value {
+    let mut result = cacheable_tools_result(name);
+    let fields = result.as_object_mut().unwrap();
+    fields.remove("ttlMs");
+    fields.remove("cacheScope");
+    result
+}
+
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+#[tokio::test(start_paused = true)]
+async fn cached_list_reports_remaining_ttl_across_repeated_reads() {
+    bounded(async {
+        let transport = MockTransport::with_responses(vec![
+            final_discover_result(),
+            cacheable_tools_result("cached"),
+        ]);
+        let outgoing = transport.outgoing.clone();
+        let client = final_cache_client(transport, ClientCacheConfig::default()).await;
+
+        assert_eq!(client.list_tools().await.unwrap().ttl_ms, Some(60_000));
+
+        tokio::time::advance(Duration::from_secs(50)).await;
+        assert_eq!(client.list_tools().await.unwrap().ttl_ms, Some(10_000));
+        assert_eq!(client.list_tools().await.unwrap().ttl_ms, Some(10_000));
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(client.list_tools().await.unwrap().ttl_ms, Some(5_000));
+
+        assert_eq!(outgoing.lock().unwrap().len(), 2);
+    })
+    .await;
+}
+
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+#[tokio::test(start_paused = true)]
+async fn stale_list_fallback_reports_zero_ttl() {
+    bounded(async {
+        let transport = MockTransport::with_replies(vec![
+            MockReply::Result(final_discover_result()),
+            MockReply::Result(cacheable_tools_result("cached")),
+            refresh_failure(),
+        ]);
+        let client = final_cache_client(
+            transport,
+            ClientCacheConfig::default().with_serve_stale_on_error(true),
+        )
+        .await;
+        client.list_tools().await.unwrap();
+
+        tokio::time::advance(Duration::from_secs(61)).await;
+        let stale = client.list_tools().await.unwrap();
+        assert_eq!(stale.tools[0].name, "cached");
+        assert_eq!(stale.ttl_ms, Some(0));
+    })
+    .await;
+}
+
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+#[tokio::test(start_paused = true)]
+async fn cached_read_reports_remaining_ttl_and_zero_when_stale() {
+    bounded(async {
+        let transport = MockTransport::with_replies(vec![
+            MockReply::Result(final_discover_result()),
+            MockReply::Result(serde_json::json!({
+                "resultType": "complete",
+                "contents": [{ "uri": "config://app", "text": "value" }],
+                "ttlMs": 30_000,
+                "cacheScope": "private"
+            })),
+            refresh_failure(),
+        ]);
+        let client = final_cache_client(
+            transport,
+            ClientCacheConfig::default().with_serve_stale_on_error(true),
+        )
+        .await;
+        let read = || client.read_resource("config://app");
+
+        assert_eq!(read().await.unwrap().ttl_ms, Some(30_000));
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert_eq!(read().await.unwrap().ttl_ms, Some(10_000));
+        assert_eq!(read().await.unwrap().ttl_ms, Some(10_000));
+
+        tokio::time::advance(Duration::from_secs(11)).await;
+        let stale = read().await.unwrap();
+        assert_eq!(stale.first_text(), Some("value"));
+        assert_eq!(stale.ttl_ms, Some(0));
+    })
+    .await;
+}
+
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+#[tokio::test(start_paused = true)]
+async fn cached_discover_reports_remaining_ttl_and_zero_when_stale() {
+    bounded(async {
+        let mut discover = final_discover_result();
+        discover["ttlMs"] = serde_json::json!(30_000);
+        let transport =
+            MockTransport::with_replies(vec![MockReply::Result(discover), refresh_failure()]);
+        let outgoing = transport.outgoing.clone();
+        let client = McpClient::builder()
+            .protocol_support(ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+            .response_cache(ClientCacheConfig::default().with_serve_stale_on_error(true))
+            .connect_simple(transport)
+            .await
+            .unwrap();
+
+        let first = client.discover("test-client", "1.0.0").await.unwrap();
+        assert_eq!(first.ttl_ms, Some(30_000));
+
+        tokio::time::advance(Duration::from_secs(20)).await;
+        let cached = client.discover("test-client", "1.0.0").await.unwrap();
+        assert_eq!(cached.ttl_ms, Some(10_000));
+        assert_eq!(outgoing.lock().unwrap().len(), 1);
+
+        tokio::time::advance(Duration::from_secs(11)).await;
+        let stale = client.discover("test-client", "1.0.0").await.unwrap();
+        assert_eq!(stale.ttl_ms, Some(0));
+        assert_eq!(outgoing.lock().unwrap().len(), 2);
+    })
+    .await;
+}
+
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+#[tokio::test(start_paused = true)]
+async fn cached_ttl_honors_max_ttl_clamp() {
+    bounded(async {
+        let transport = MockTransport::with_replies(vec![
+            MockReply::Result(final_discover_result()),
+            MockReply::Result(cacheable_tools_result("cached")),
+            refresh_failure(),
+        ]);
+        let client = final_cache_client(
+            transport,
+            ClientCacheConfig::default()
+                .with_max_ttl(Duration::from_secs(10))
+                .with_serve_stale_on_error(true),
+        )
+        .await;
+
+        // The response from the network carries the server's own hint.
+        assert_eq!(client.list_tools().await.unwrap().ttl_ms, Some(60_000));
+        assert_eq!(client.list_tools().await.unwrap().ttl_ms, Some(10_000));
+
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert_eq!(client.list_tools().await.unwrap().ttl_ms, Some(6_000));
+        assert_eq!(client.list_tools().await.unwrap().ttl_ms, Some(6_000));
+
+        tokio::time::advance(Duration::from_secs(7)).await;
+        assert_eq!(client.list_tools().await.unwrap().ttl_ms, Some(0));
+    })
+    .await;
+}
+
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+#[tokio::test(start_paused = true)]
+async fn zero_ttl_hint_is_reported_and_never_cached() {
+    bounded(async {
+        let mut zero = cacheable_tools_result("zero");
+        zero["ttlMs"] = serde_json::json!(0);
+        let transport =
+            MockTransport::with_responses(vec![final_discover_result(), zero.clone(), zero]);
+        let outgoing = transport.outgoing.clone();
+        let client = final_cache_client(transport, ClientCacheConfig::default()).await;
+
+        assert_eq!(client.list_tools().await.unwrap().ttl_ms, Some(0));
+        assert_eq!(client.list_tools().await.unwrap().ttl_ms, Some(0));
+        assert_eq!(outgoing.lock().unwrap().len(), 3);
+        assert_eq!(client.response_cache_len().await, 0);
+    })
+    .await;
+}
+
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+#[tokio::test(start_paused = true)]
+async fn missing_ttl_stays_missing_under_default_ttl() {
+    bounded(async {
+        let transport = MockTransport::with_replies(vec![
+            MockReply::Result(final_discover_result()),
+            MockReply::Result(tools_result_without_hints("local")),
+            refresh_failure(),
+        ]);
+        let outgoing = transport.outgoing.clone();
+        let client = final_cache_client(
+            transport,
+            ClientCacheConfig::default()
+                .with_default_ttl(Duration::from_secs(30))
+                .with_serve_stale_on_error(true),
+        )
+        .await;
+
+        assert_eq!(client.list_tools().await.unwrap().ttl_ms, None);
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(client.list_tools().await.unwrap().ttl_ms, None);
+        assert_eq!(outgoing.lock().unwrap().len(), 2);
+
+        tokio::time::advance(Duration::from_secs(21)).await;
+        let stale = client.list_tools().await.unwrap();
+        assert_eq!(stale.tools[0].name, "local");
+        assert_eq!(stale.ttl_ms, None);
+        assert_eq!(outgoing.lock().unwrap().len(), 3);
+    })
+    .await;
 }
 
 #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
