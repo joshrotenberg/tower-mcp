@@ -343,6 +343,10 @@ Also verify these behaviors in the chosen ingress or CDN:
 - response buffering and compression do not batch SSE events;
 - idle timeouts exceed the intended stream lifetime or keepalives arrive
   frequently enough;
+- response-header timeouts exceed
+  `HttpTransport::initial_response_timeout` (30 seconds by default), after
+  which a silent 2026-07-28 call commits an SSE response and sends keepalives,
+  and an error it returns later travels in-band under the committed 200;
 - request body and header limits permit MCP payloads and `Mcp-Param-*` values;
 - `MCP-Protocol-Version`, `MCP-Session-Id`, `Last-Event-ID`, `Mcp-Method`,
   `Mcp-Name`, `Authorization`, and `WWW-Authenticate` pass unchanged;

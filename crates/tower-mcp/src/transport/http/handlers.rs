@@ -606,22 +606,41 @@ pub(super) async fn handle_post(
             enum FirstOutbound {
                 Response(crate::error::Result<JsonRpcResponse>),
                 Notification(crate::context::ServerNotification),
+                InitialResponseTimeout,
             }
 
-            // Race the handler against its first notification. A closed
-            // channel (no sender attached, or all senders dropped) simply
-            // awaits the handler.
+            // Bounds the whole wait, so it is created once: a notification
+            // routed to a subscription below does not restart it.
+            let initial_response_timeout = state.initial_response_timeout;
+            let initial_response_deadline = async move {
+                match initial_response_timeout {
+                    Some(timeout) => tokio::time::sleep(timeout).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::pin!(initial_response_deadline);
+
+            // Race the handler against its first notification and the
+            // initial-response deadline. A closed channel (no sender
+            // attached, or all senders dropped) leaves the other two.
+            let mut notifications_open = true;
             let first = loop {
                 let outbound = tokio::select! {
                     // A handler may enqueue a notification and complete in
                     // the same poll. Observe the queued notification first so
                     // it is neither dropped nor raced behind the response.
+                    // The deadline goes last so that a result already ready
+                    // when it fires still decides the status.
                     biased;
-                    maybe = notif_rx.recv() => match maybe {
+                    maybe = notif_rx.recv(), if notifications_open => match maybe {
                         Some(n) => FirstOutbound::Notification(n),
-                        None => FirstOutbound::Response((&mut call).await),
+                        None => {
+                            notifications_open = false;
+                            continue;
+                        }
                     },
                     result = &mut call => FirstOutbound::Response(result),
+                    () = &mut initial_response_deadline => FirstOutbound::InitialResponseTimeout,
                 };
                 match outbound {
                     FirstOutbound::Notification(notification)
@@ -650,7 +669,7 @@ pub(super) async fn handle_post(
                             >,
                         > = Box::pin(async move { result });
                         let mut resp = stateless_sse_with_notifications(
-                            notification,
+                            Some(notification),
                             ready_call,
                             notif_rx,
                             StatelessSseContext {
@@ -710,7 +729,11 @@ pub(super) async fn handle_post(
                     // Intentionally NO `mcp-session-id` header for 2026-07-28+ clients.
                     return resp;
                 }
-                FirstOutbound::Notification(first_notif) => {
+                outbound => {
+                    let first_notif = match outbound {
+                        FirstOutbound::Notification(notification) => Some(notification),
+                        _ => None,
+                    };
                     let mut resp = stateless_sse_with_notifications(
                         first_notif,
                         call,
