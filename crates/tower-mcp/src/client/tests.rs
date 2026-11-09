@@ -36,6 +36,9 @@ struct MockTransport {
 enum MockReply {
     Result(serde_json::Value),
     Error(JsonRpcError),
+    /// A result delivered after the delay, for paused-clock tests.
+    #[allow(dead_code)]
+    Delayed(std::time::Duration, serde_json::Value),
 }
 
 #[allow(dead_code)]
@@ -107,18 +110,29 @@ impl ClientTransport for MockTransport {
                 let responses = self.responses.lock().unwrap();
                 if let Some(reply) = responses.get(idx) {
                     let response = match reply {
-                        MockReply::Result(result) => serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": result
-                        }),
+                        MockReply::Result(result) | MockReply::Delayed(_, result) => {
+                            serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": result
+                            })
+                        }
                         MockReply::Error(error) => serde_json::json!({
                             "jsonrpc": "2.0",
                             "id": id,
                             "error": error
                         }),
                     };
-                    let _ = self.incoming_tx.try_send(response.to_string());
+                    if let MockReply::Delayed(delay, _) = reply {
+                        let delay = *delay;
+                        let incoming_tx = self.incoming_tx.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            let _ = incoming_tx.send(response.to_string()).await;
+                        });
+                    } else {
+                        let _ = self.incoming_tx.try_send(response.to_string());
+                    }
                 }
             }
         }
@@ -1665,6 +1679,270 @@ async fn missing_ttl_stays_missing_under_default_ttl() {
         assert_eq!(stale.tools[0].name, "local");
         assert_eq!(stale.ttl_ms, None);
         assert_eq!(outgoing.lock().unwrap().len(), 3);
+    })
+    .await;
+}
+
+/// One `tools/list` page. `next` links to the following page.
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+fn tools_page(
+    name: &str,
+    next: Option<&str>,
+    ttl_ms: Option<u64>,
+    scope: Option<&str>,
+) -> serde_json::Value {
+    let mut page = tools_result_without_hints(name);
+    if let Some(next) = next {
+        page["nextCursor"] = next.into();
+    }
+    if let Some(ttl_ms) = ttl_ms {
+        page["ttlMs"] = ttl_ms.into();
+    }
+    if let Some(scope) = scope {
+        page["cacheScope"] = scope.into();
+    }
+    page
+}
+
+/// Combine `pages`, given as (ttlMs, cacheScope) pairs, through the client.
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+async fn aggregate_hints_of(
+    pages: &[(Option<u64>, Option<&str>)],
+) -> (Option<u64>, Option<CacheScope>) {
+    let mut replies = vec![final_discover_result()];
+    for (index, (ttl_ms, scope)) in pages.iter().enumerate() {
+        let name = format!("tool-{index}");
+        let next = (index + 1 < pages.len()).then(|| format!("cursor-{index}"));
+        replies.push(tools_page(&name, next.as_deref(), *ttl_ms, *scope));
+    }
+    let transport = MockTransport::with_responses(replies);
+    let client = final_cache_client(transport, ClientCacheConfig::default()).await;
+    let listed = client.list_all_tools_with_cache_hints().await.unwrap();
+    assert_eq!(listed.items.len(), pages.len());
+    (listed.ttl_ms, listed.cache_scope)
+}
+
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+#[tokio::test(start_paused = true)]
+async fn aggregate_uses_the_smallest_ttl_of_differing_pages() {
+    bounded(async {
+        let pages = [
+            (Some(60_000), Some("public")),
+            (Some(30_000), Some("public")),
+            (Some(90_000), Some("public")),
+        ];
+        assert_eq!(
+            aggregate_hints_of(&pages).await,
+            (Some(30_000), Some(CacheScope::Public))
+        );
+    })
+    .await;
+}
+
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+#[tokio::test(start_paused = true)]
+async fn aggregate_subtracts_time_spent_paginating() {
+    bounded(async {
+        let transport = MockTransport::with_replies(vec![
+            MockReply::Result(final_discover_result()),
+            MockReply::Result(tools_page("a", Some("1"), Some(60_000), Some("public"))),
+            MockReply::Delayed(
+                Duration::from_secs(20),
+                tools_page("b", Some("2"), Some(120_000), Some("public")),
+            ),
+            MockReply::Delayed(
+                Duration::from_secs(30),
+                tools_page("c", None, Some(300_000), Some("public")),
+            ),
+        ]);
+        let client = final_cache_client(transport, ClientCacheConfig::default()).await;
+
+        let listed = client.list_all_tools_with_cache_hints().await.unwrap();
+
+        assert_eq!(listed.items.len(), 3);
+        // Page one expires at 60s and pagination ended at 50s. The smallest
+        // original TTL alone would report 60s.
+        assert_eq!(listed.ttl_ms, Some(10_000));
+    })
+    .await;
+}
+
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+#[tokio::test(start_paused = true)]
+async fn aggregate_reports_zero_when_the_first_page_expired_during_pagination() {
+    bounded(async {
+        let transport = MockTransport::with_replies(vec![
+            MockReply::Result(final_discover_result()),
+            MockReply::Result(tools_page("a", Some("1"), Some(1_000), Some("public"))),
+            MockReply::Delayed(
+                Duration::from_secs(5),
+                tools_page("b", None, Some(60_000), Some("public")),
+            ),
+        ]);
+        let client = final_cache_client(transport, ClientCacheConfig::default()).await;
+
+        let listed = client.list_all_tools_with_cache_hints().await.unwrap();
+
+        assert_eq!(listed.items.len(), 2);
+        assert_eq!(listed.ttl_ms, Some(0));
+    })
+    .await;
+}
+
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+#[tokio::test(start_paused = true)]
+async fn aggregate_is_public_only_when_every_page_is_public() {
+    bounded(async {
+        let scopes = |first, second| [(Some(60_000), first), (Some(60_000), second)];
+        let cases = [
+            (Some("public"), Some("public"), CacheScope::Public),
+            (Some("public"), Some("private"), CacheScope::Private),
+            (Some("private"), Some("public"), CacheScope::Private),
+            (Some("private"), Some("private"), CacheScope::Private),
+        ];
+        for (first, second, expected) in cases {
+            assert_eq!(
+                aggregate_hints_of(&scopes(first, second)).await.1,
+                Some(expected),
+                "{first:?}, {second:?}"
+            );
+        }
+    })
+    .await;
+}
+
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+#[tokio::test(start_paused = true)]
+async fn aggregate_handles_missing_hints_conservatively() {
+    bounded(async {
+        // Some pages omit a hint: each kind of hint falls back on its own.
+        assert_eq!(
+            aggregate_hints_of(&[(Some(60_000), Some("public")), (None, None)]).await,
+            (Some(0), Some(CacheScope::Private))
+        );
+        assert_eq!(
+            aggregate_hints_of(&[(None, Some("public")), (Some(60_000), Some("public"))]).await,
+            (Some(0), Some(CacheScope::Public))
+        );
+        assert_eq!(
+            aggregate_hints_of(&[(Some(60_000), None), (Some(60_000), Some("public"))]).await,
+            (Some(60_000), Some(CacheScope::Private))
+        );
+        // Every page omits a hint: missing hints stay missing.
+        assert_eq!(
+            aggregate_hints_of(&[(None, None), (None, None)]).await,
+            (None, None)
+        );
+    })
+    .await;
+}
+
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+#[tokio::test(start_paused = true)]
+async fn aggregate_uses_remaining_ttl_of_cached_pages() {
+    bounded(async {
+        let transport = MockTransport::with_responses(vec![
+            final_discover_result(),
+            tools_page("a", Some("1"), Some(8_000), Some("public")),
+            tools_page("b", None, Some(5_000), Some("public")),
+            tools_page("b", None, Some(5_000), Some("public")),
+        ]);
+        let outgoing = transport.outgoing.clone();
+        let client = final_cache_client(transport, ClientCacheConfig::default()).await;
+
+        let first = client.list_all_tools_with_cache_hints().await.unwrap();
+        assert_eq!(first.ttl_ms, Some(5_000));
+        assert_eq!(outgoing.lock().unwrap().len(), 3);
+
+        // Both pages are still cached, so neither is fetched again.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let cached = client.list_all_tools_with_cache_hints().await.unwrap();
+        assert_eq!(cached.items.len(), 2);
+        assert_eq!(cached.ttl_ms, Some(3_000));
+        assert_eq!(cached.cache_scope, Some(CacheScope::Public));
+        assert_eq!(outgoing.lock().unwrap().len(), 3);
+
+        // Page two is refetched with a new 5s lifetime, and the cached page
+        // one, with 2s left, sets the bound.
+        tokio::time::advance(Duration::from_secs(4)).await;
+        let refreshed = client.list_all_tools_with_cache_hints().await.unwrap();
+        assert_eq!(refreshed.ttl_ms, Some(2_000));
+        assert_eq!(outgoing.lock().unwrap().len(), 4);
+    })
+    .await;
+}
+
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+#[tokio::test(start_paused = true)]
+async fn aggregate_caps_server_pages_at_max_ttl() {
+    bounded(async {
+        let transport = MockTransport::with_responses(vec![
+            final_discover_result(),
+            tools_page("a", None, Some(60_000), Some("public")),
+        ]);
+        let client = final_cache_client(
+            transport,
+            ClientCacheConfig::default().with_max_ttl(Duration::from_secs(10)),
+        )
+        .await;
+
+        let listed = client.list_all_tools_with_cache_hints().await.unwrap();
+
+        assert_eq!(listed.ttl_ms, Some(10_000));
+    })
+    .await;
+}
+
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+#[tokio::test(start_paused = true)]
+async fn every_list_kind_has_an_aggregate_helper() {
+    bounded(async {
+        let transport = MockTransport::with_responses(vec![
+            final_discover_result(),
+            serde_json::json!({
+                "resultType": "complete",
+                "resources": [{ "uri": "file://a", "name": "a" }],
+                "nextCursor": "1",
+                "ttlMs": 40_000,
+                "cacheScope": "public"
+            }),
+            serde_json::json!({
+                "resultType": "complete",
+                "resources": [{ "uri": "file://b", "name": "b" }],
+                "ttlMs": 20_000,
+                "cacheScope": "private"
+            }),
+            serde_json::json!({
+                "resultType": "complete",
+                "resourceTemplates": [{ "uriTemplate": "file://{id}", "name": "t" }],
+                "ttlMs": 15_000,
+                "cacheScope": "public"
+            }),
+            serde_json::json!({
+                "resultType": "complete",
+                "prompts": [{ "name": "p" }],
+                "ttlMs": 25_000
+            }),
+        ]);
+        let client = final_cache_client(transport, ClientCacheConfig::default()).await;
+
+        let resources = client.list_all_resources_with_cache_hints().await.unwrap();
+        assert_eq!(resources.items.len(), 2);
+        assert_eq!(resources.ttl_ms, Some(20_000));
+        assert_eq!(resources.cache_scope, Some(CacheScope::Private));
+
+        let templates = client
+            .list_all_resource_templates_with_cache_hints()
+            .await
+            .unwrap();
+        assert_eq!(templates.items[0].name, "t");
+        assert_eq!(templates.ttl_ms, Some(15_000));
+        assert_eq!(templates.cache_scope, Some(CacheScope::Public));
+
+        let prompts = client.list_all_prompts_with_cache_hints().await.unwrap();
+        assert_eq!(prompts.items[0].name, "p");
+        assert_eq!(prompts.ttl_ms, Some(25_000));
+        assert_eq!(prompts.cache_scope, None);
     })
     .await;
 }

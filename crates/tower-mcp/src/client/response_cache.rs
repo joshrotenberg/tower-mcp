@@ -101,6 +101,104 @@ impl Default for ClientCacheConfig {
     }
 }
 
+/// Every page of a paginated list, with cache hints valid for the whole result.
+///
+/// Returned by the `list_all_*_with_cache_hints` methods on
+/// [`McpClient`](super::McpClient). Each page's expiry is fixed when that page
+/// is received, and [`ttl_ms`](Self::ttl_ms) is the time left until the
+/// earliest of them when pagination finishes, so slow pagination shortens it.
+///
+/// A missing hint means the aggregate cannot claim anything for that page:
+///
+/// | Pages | `ttl_ms` | `cache_scope` |
+/// | --- | --- | --- |
+/// | every page has the hint | earliest expiry, as time remaining | `Public` only if every page is public, otherwise `Private` |
+/// | some pages omit the hint | `Some(0)` | `Private` |
+/// | every page omits the hint | `None` | `None` |
+///
+/// Each page's `ttlMs` is capped at
+/// [`ClientCacheConfig::max_ttl`], so a page from the server and the same page
+/// from the cache contribute the same bound.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct AggregateList<T> {
+    /// Items from every page, in page order.
+    pub items: Vec<T>,
+    /// Milliseconds until the first page in the result expires.
+    pub ttl_ms: Option<u64>,
+    /// Scope that is safe for the whole result.
+    pub cache_scope: Option<CacheScope>,
+}
+
+/// Combines per-page cache hints as pages arrive.
+#[derive(Debug)]
+pub(crate) struct AggregateHints {
+    max_ttl: Duration,
+    earliest_expiry: Option<Instant>,
+    missing_ttl: bool,
+    public: bool,
+    private: bool,
+    missing_scope: bool,
+}
+
+impl AggregateHints {
+    pub(crate) fn new(max_ttl: Duration) -> Self {
+        Self {
+            max_ttl,
+            earliest_expiry: None,
+            missing_ttl: false,
+            public: false,
+            private: false,
+            missing_scope: false,
+        }
+    }
+
+    /// Record one page. Call as soon as the page is received.
+    pub(crate) fn observe(&mut self, ttl_ms: Option<u64>, scope: Option<CacheScope>) {
+        let received = Instant::now();
+        // A hint too large for the clock is treated like a missing one.
+        match ttl_ms.and_then(|ttl_ms| {
+            received.checked_add(Duration::from_millis(ttl_ms).min(self.max_ttl))
+        }) {
+            Some(expiry) => {
+                self.earliest_expiry = Some(
+                    self.earliest_expiry
+                        .map_or(expiry, |earliest| earliest.min(expiry)),
+                );
+            }
+            None => self.missing_ttl = true,
+        }
+        match scope {
+            Some(CacheScope::Public) => self.public = true,
+            Some(_) => self.private = true,
+            None => self.missing_scope = true,
+        }
+    }
+
+    /// Build the result once pagination has finished.
+    pub(crate) fn finish<T>(self, items: Vec<T>) -> AggregateList<T> {
+        let ttl_ms = self.earliest_expiry.map(|expiry| {
+            if self.missing_ttl {
+                return 0;
+            }
+            let remaining = expiry.saturating_duration_since(Instant::now());
+            u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX)
+        });
+        let cache_scope = if self.private || (self.public && self.missing_scope) {
+            Some(CacheScope::Private)
+        } else if self.public {
+            Some(CacheScope::Public)
+        } else {
+            None
+        };
+        AggregateList {
+            items,
+            ttl_ms,
+            cache_scope,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Eq)]
 struct CacheKey {
     method: String,
@@ -189,6 +287,10 @@ impl ClientResponseCache {
 
     pub(crate) fn serve_stale_on_error(&self) -> bool {
         self.config.serve_stale_on_error
+    }
+
+    pub(crate) fn aggregate_hints(&self) -> AggregateHints {
+        AggregateHints::new(self.config.max_ttl)
     }
 
     pub(crate) async fn set_partition(&self, partition: String) {
