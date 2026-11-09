@@ -299,6 +299,23 @@ or `OAuthAuthCodeConfig::refresh_scope_policy`:
 - `Narrow` sends a subset of the grant. A scope outside the grant, or an empty
   list, fails the refresh without contacting the server.
 
+### Dynamic Client Registration secret expiry
+
+`OAuthClientRegistration::client_secret_expires_at` exposes the RFC 7591 value
+from either registration path: `Some(0)` means the secret does not expire,
+`Some(timestamp)` is its expiry in Unix seconds, and `None` means unknown,
+including records stored before this field existed. A custom store that keeps
+separate fields must persist this value too.
+
+A stored secret known to be expired is never reused. When the authorization
+server has a `registration_endpoint`, the client registers again and replaces
+the stored entry. Tokens bound to the old `client_id` no longer apply, so
+`OAuthAuthorizationFlow` starts a new authorization. Without an endpoint,
+resolution fails with `OAuthClientError::ClientSecretExpired`. An unknown expiry
+is treated as not expired. `OAuthAuthorizationFlow` also refuses to send an
+expired secret on a later refresh or callback exchange and returns the same
+error; call `authorize` or `begin` again to replace it.
+
 ### Run the interactive client example
 
 The example uses a fixed loopback port. Configure that exact redirect URI in a

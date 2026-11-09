@@ -42,7 +42,7 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use tokio::sync::RwLock;
@@ -222,6 +222,14 @@ impl OAuthScopeChallenge {
             error_description: challenge.error_description,
         })
     }
+}
+
+/// Current time as Unix seconds.
+pub(crate) fn unix_time() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Authentication method used at an OAuth token endpoint.
@@ -523,6 +531,11 @@ pub enum OAuthClientError {
     TokenRefreshRejected(String),
     /// Failed to register an OAuth client.
     Registration(String),
+    /// A Dynamic Client Registration secret has passed its
+    /// `client_secret_expires_at` and could not be replaced automatically.
+    /// The message names the client and what to do next; it never contains
+    /// the secret.
+    ClientSecretExpired(String),
     /// Failed to load, save, or remove persisted OAuth client credentials.
     CredentialStore(String),
     /// Failed to load, save, or remove persisted OAuth tokens.
@@ -549,6 +562,7 @@ impl fmt::Display for OAuthClientError {
                 write!(f, "OAuth refresh token rejected: {}", msg)
             }
             Self::Registration(msg) => write!(f, "OAuth client registration error: {}", msg),
+            Self::ClientSecretExpired(msg) => write!(f, "OAuth client secret expired: {}", msg),
             Self::CredentialStore(msg) => write!(f, "OAuth credential store error: {}", msg),
             Self::TokenStore(msg) => write!(f, "OAuth token store error: {}", msg),
             Self::StateStore(msg) => write!(f, "OAuth state store error: {}", msg),
