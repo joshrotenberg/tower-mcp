@@ -3089,6 +3089,109 @@ mod stateless_tests {
         server.abort();
     }
 
+    #[derive(Clone, Default)]
+    struct HeaderWalkState {
+        mirrored_tenants: Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    async fn header_walk_endpoint(
+        State(state): State<HeaderWalkState>,
+        headers: HeaderMap,
+        Json(body): Json<serde_json::Value>,
+    ) -> Response {
+        let id = body.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        let result = match body
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+        {
+            "server/discover" => serde_json::json!({
+                "resultType": "complete",
+                "supportedVersions": ["2026-07-28"],
+                "capabilities": {"tools": {}},
+                "ttlMs": 0,
+                "cacheScope": "private"
+            }),
+            "tools/list" => serde_json::json!({
+                "resultType": "complete",
+                "tools": [{
+                    "name": "tenant-tool",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "x-mcp-header": {"type": "string"},
+                            "tenant": {"type": "string", "x-mcp-header": "Tenant"}
+                        },
+                        "dependentRequired": {"x-mcp-header": ["tenant"]}
+                    }
+                }],
+                "ttlMs": 60_000,
+                "cacheScope": "private"
+            }),
+            "tools/call" => {
+                state.mirrored_tenants.lock().unwrap().push(
+                    headers
+                        .get("mcp-param-tenant")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string),
+                );
+                serde_json::json!({
+                    "resultType": "complete",
+                    "content": [{"type": "text", "text": "ok"}]
+                })
+            }
+            _ => return StatusCode::NOT_FOUND.into_response(),
+        };
+        Json(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response()
+    }
+
+    /// A property named `x-mcp-header` and a `dependentRequired` entry with
+    /// that key are not annotations, so the tool stays listed and its real
+    /// `Tenant` mapping is mirrored on the next call (#1625).
+    #[tokio::test]
+    async fn final_client_keeps_tool_with_x_mcp_header_property_name() {
+        let state = HeaderWalkState::default();
+        let app = Router::new()
+            .route("/", post(header_walk_endpoint))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = McpClient::builder()
+            .protocol_support(tower_mcp::ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+            .connect_simple(HttpClientTransport::new(url))
+            .await
+            .unwrap();
+        client.discover("test-client", "1.0.0").await.unwrap();
+
+        let tools = tokio::time::timeout(Duration::from_secs(5), client.list_tools())
+            .await
+            .expect("list_tools hung")
+            .unwrap();
+        assert_eq!(tools.tools.len(), 1, "the valid tool must stay listed");
+        assert_eq!(tools.tools[0].name, "tenant-tool");
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client.call_tool(
+                "tenant-tool",
+                serde_json::json!({"x-mcp-header": "literal", "tenant": "acme"}),
+            ),
+        )
+        .await
+        .expect("call_tool hung")
+        .unwrap();
+        assert_eq!(
+            *state.mirrored_tenants.lock().unwrap(),
+            [Some("acme".to_string())]
+        );
+
+        server.abort();
+    }
+
     /// A 404 on a 2026-07-28 request carries no session meaning: the server
     /// answers an unknown method with 404 and -32601, and that must surface
     /// as method-not-found rather than start a re-initialize (#1556).
