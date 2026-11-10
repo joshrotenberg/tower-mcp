@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.26.0] - 2026-11-10
+
+### Bug Fixes
+
+- **http:** Parse legacy SSE Accept values and start keepalives for silent final-protocol calls ([#1627](https://github.com/joshrotenberg/tower-mcp/pull/1627))
+- **client:** Report remaining TTL from cache and add list helpers that keep cache hints ([#1629](https://github.com/joshrotenberg/tower-mcp/pull/1629))
+- **client:** Match SSE media types exactly and walk real schema locations for x-mcp-header ([#1628](https://github.com/joshrotenberg/tower-mcp/pull/1628))
+- **types:** Accept and emit final URL elicitation without the removed elicitationId ([#1630](https://github.com/joshrotenberg/tower-mcp/pull/1630))
+- **client:** Release commands queued while the message loop exits ([#1633](https://github.com/joshrotenberg/tower-mcp/pull/1633))
+
+### Features
+
+- [**breaking**] **oauth-client:** Add a refresh scope policy and keep DCR client secret expiry ([#1626](https://github.com/joshrotenberg/tower-mcp/pull/1626))
+
+
+
 ## [0.25.1] - 2026-11-02
 
 ### Bug Fixes
