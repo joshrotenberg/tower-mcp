@@ -59,6 +59,7 @@ use tokio::task::JoinHandle;
 
 use super::transport::ClientTransport;
 use crate::error::{Error, Result};
+use crate::header_annotations::{CustomHeaderMapping, custom_header_mappings};
 use crate::protocol::{RequestId, notifications};
 
 const MCP_METHOD_HEADER: &str = "mcp-method";
@@ -69,12 +70,6 @@ const BASE64_SENTINEL_SUFFIX: &str = "?=";
 /// Timeout for the best-effort session-termination `DELETE`, used by both
 /// `close()` and the `Drop` impl.
 const SESSION_DELETE_TIMEOUT: Duration = Duration::from_secs(5);
-
-#[derive(Debug, Clone)]
-struct CustomHeaderMapping {
-    suffix: String,
-    property_path: Vec<String>,
-}
 
 #[cfg(feature = "oauth-client")]
 #[derive(Clone)]
@@ -920,123 +915,6 @@ impl HttpClientTransport {
     }
 }
 
-fn custom_header_mappings(
-    schema: &serde_json::Value,
-) -> std::result::Result<Vec<CustomHeaderMapping>, String> {
-    fn annotation_count(value: &serde_json::Value) -> usize {
-        match value {
-            serde_json::Value::Object(object) => {
-                usize::from(object.contains_key("x-mcp-header"))
-                    + object.values().map(annotation_count).sum::<usize>()
-            }
-            serde_json::Value::Array(values) => values.iter().map(annotation_count).sum::<usize>(),
-            _ => 0,
-        }
-    }
-
-    fn is_tchar(byte: u8) -> bool {
-        byte.is_ascii_alphanumeric()
-            || matches!(
-                byte,
-                b'!' | b'#'
-                    | b'$'
-                    | b'%'
-                    | b'&'
-                    | b'\''
-                    | b'*'
-                    | b'+'
-                    | b'-'
-                    | b'.'
-                    | b'^'
-                    | b'_'
-                    | b'`'
-                    | b'|'
-                    | b'~'
-            )
-    }
-
-    // SEP-2243 allows integer, string and boolean; `number` is not permitted.
-    fn primitive_header_type(schema: &serde_json::Value) -> bool {
-        match schema.get("type") {
-            Some(serde_json::Value::String(kind)) => {
-                matches!(kind.as_str(), "string" | "integer" | "boolean")
-            }
-            Some(serde_json::Value::Array(kinds)) => {
-                let mut primitive = false;
-                for kind in kinds {
-                    match kind.as_str() {
-                        Some("string" | "integer" | "boolean") if !primitive => {
-                            primitive = true;
-                        }
-                        Some("null") => {}
-                        _ => return false,
-                    }
-                }
-                primitive
-            }
-            _ => false,
-        }
-    }
-
-    fn walk(
-        schema: &serde_json::Value,
-        path: &mut Vec<String>,
-        seen: &mut std::collections::HashSet<String>,
-        mappings: &mut Vec<CustomHeaderMapping>,
-    ) -> std::result::Result<(), String> {
-        let Some(properties) = schema
-            .get("properties")
-            .and_then(serde_json::Value::as_object)
-        else {
-            return Ok(());
-        };
-        for (property_name, property_schema) in properties {
-            path.push(property_name.clone());
-            if let Some(annotation) = property_schema.get("x-mcp-header") {
-                let suffix = annotation
-                    .as_str()
-                    .ok_or_else(|| format!("annotation at {} is not a string", path.join(".")))?;
-                if suffix.is_empty() || !suffix.bytes().all(is_tchar) {
-                    return Err(format!(
-                        "invalid header suffix {suffix:?} at {}",
-                        path.join(".")
-                    ));
-                }
-                if !primitive_header_type(property_schema) {
-                    return Err(format!(
-                        "annotation at {} is not on a primitive property",
-                        path.join(".")
-                    ));
-                }
-                if !seen.insert(suffix.to_ascii_lowercase()) {
-                    return Err(format!("duplicate header suffix {suffix:?}"));
-                }
-                mappings.push(CustomHeaderMapping {
-                    suffix: suffix.to_string(),
-                    property_path: path.clone(),
-                });
-            }
-            walk(property_schema, path, seen, mappings)?;
-            path.pop();
-        }
-        Ok(())
-    }
-
-    let mut mappings = Vec::new();
-    walk(
-        schema,
-        &mut Vec::new(),
-        &mut std::collections::HashSet::new(),
-        &mut mappings,
-    )?;
-    if annotation_count(schema) != mappings.len() {
-        return Err(
-            "x-mcp-header annotation is not statically reachable through properties".to_string(),
-        );
-    }
-    Ok(mappings)
-}
-
 fn value_at_property_path<'a>(
     root: &'a serde_json::Value,
     path: &[String],
@@ -1706,13 +1584,7 @@ impl ClientTransport for HttpClientTransport {
                 }
 
                 // Check if response is SSE-formatted
-                let is_sse = response
-                    .headers()
-                    .get("content-type")
-                    .and_then(|v| v.to_str().ok())
-                    .is_some_and(|ct| ct.contains("text/event-stream"));
-
-                if is_sse {
+                if response_is_sse(&response) {
                     pump_post_sse(
                         response,
                         PostSseContext {
@@ -1920,12 +1792,7 @@ impl ClientTransport for HttpClientTransport {
         // request on that stream (`initialize` answered by a ping, say) and
         // hold the final reply until it is answered, and the message loop
         // that answers it is the caller of this method (#1558).
-        let is_sse = response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|ct| ct.contains("text/event-stream"));
-        if is_sse && reply_id.is_some() {
+        if response_is_sse(&response) && reply_id.is_some() {
             let request_id = reply_id
                 .clone()
                 .and_then(|value| serde_json::from_value(value).ok());
@@ -2836,6 +2703,25 @@ fn json_request_ids_match(left: &serde_json::Value, right: &serde_json::Value) -
                 .is_some_and(|number| value.parse::<i64>() == Ok(number)),
             _ => false,
         }
+}
+
+/// Whether a `Content-Type` value names the SSE media type. Type and subtype
+/// compare case-insensitively (RFC 9110, section 8.3.1) and parameters are
+/// ignored, so a value that only contains the name does not match (#1621).
+fn is_event_stream_media_type(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
+/// Whether a POST response body has to be read as an SSE stream.
+fn response_is_sse(response: &reqwest::Response) -> bool {
+    response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(is_event_stream_media_type)
 }
 
 fn extract_json_messages(body: &str) -> Vec<String> {
@@ -3803,6 +3689,31 @@ mod tests {
     }
 
     #[test]
+    fn event_stream_media_type_matches_only_the_complete_essence() {
+        for content_type in [
+            "text/event-stream",
+            "Text/Event-Stream",
+            "TEXT/EVENT-STREAM; charset=UTF-8",
+            "text/event-stream ; charset=utf-8",
+            " text/event-stream;",
+        ] {
+            assert!(is_event_stream_media_type(content_type), "{content_type}");
+        }
+        for content_type in [
+            "",
+            "text/event-streaming",
+            "text/event-stream+json",
+            "xtext/event-stream",
+            "text/event-stream, application/json",
+            "application/json, text/event-stream",
+            "application/json; note=\"text/event-stream\"",
+            "application/json; profile=text/event-stream",
+        ] {
+            assert!(!is_event_stream_media_type(content_type), "{content_type}");
+        }
+    }
+
+    #[test]
     fn sep_2243_validates_custom_header_annotations() {
         let mappings = custom_header_mappings(&serde_json::json!({
             "type": "object",
@@ -3893,6 +3804,208 @@ mod tests {
         assert!(transport.tool_header_mappings.contains_key("valid"));
         assert!(!transport.tool_header_mappings.contains_key("invalid"));
         assert!(!transport.tool_header_mappings.contains_key("number_typed"));
+    }
+
+    fn tenant_mapping() -> Vec<(String, Vec<String>)> {
+        vec![("Tenant".to_string(), vec!["tenant".to_string()])]
+    }
+
+    fn mapped(schema: &serde_json::Value) -> Vec<(String, Vec<String>)> {
+        custom_header_mappings(schema)
+            .unwrap_or_else(|error| panic!("{error}: {schema}"))
+            .into_iter()
+            .map(|mapping| (mapping.suffix, mapping.property_path))
+            .collect()
+    }
+
+    #[test]
+    fn sep_2243_property_names_are_not_annotations() {
+        assert!(
+            mapped(&serde_json::json!({
+                "type": "object",
+                "properties": {"x-mcp-header": {"type": "string"}}
+            }))
+            .is_empty()
+        );
+        assert_eq!(
+            mapped(&serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "x-mcp-header": {"type": "string"},
+                    "tenant": {"type": "string", "x-mcp-header": "Tenant"}
+                },
+                "dependentRequired": {"x-mcp-header": ["tenant"]}
+            })),
+            tenant_mapping()
+        );
+        // Every property-name map, at the root and inside a subschema.
+        for keyword in [
+            "patternProperties",
+            "$defs",
+            "definitions",
+            "dependentSchemas",
+            "dependencies",
+        ] {
+            let name_map = serde_json::json!({"x-mcp-header": {"type": "string"}});
+            assert!(
+                mapped(&serde_json::json!({"type": "object", keyword: name_map})).is_empty(),
+                "{keyword}"
+            );
+            assert!(
+                mapped(&serde_json::json!({
+                    "type": "object",
+                    "allOf": [{keyword: name_map}]
+                }))
+                .is_empty(),
+                "allOf/{keyword}"
+            );
+        }
+        // A real annotation on a property that happens to have the name.
+        assert_eq!(
+            mapped(&serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "x-mcp-header": {"type": "string", "x-mcp-header": "Tenant"}
+                }
+            })),
+            vec![("Tenant".to_string(), vec!["x-mcp-header".to_string()])]
+        );
+    }
+
+    #[test]
+    fn sep_2243_literal_data_is_not_an_annotation() {
+        let literal = serde_json::json!({"x-mcp-header": "Tenant", "nested": {"x-mcp-header": 1}});
+        for (keyword, value) in [
+            ("const", literal.clone()),
+            ("enum", serde_json::json!([literal])),
+            ("default", literal.clone()),
+            ("examples", serde_json::json!([literal])),
+            (
+                "dependentRequired",
+                serde_json::json!({"x-mcp-header": ["tenant"]}),
+            ),
+        ] {
+            assert_eq!(
+                mapped(&serde_json::json!({
+                    "type": "object",
+                    keyword: value,
+                    "properties": {
+                        "tenant": {"type": "string", "x-mcp-header": "Tenant", keyword: value},
+                        "other": {"type": "object", keyword: value}
+                    }
+                })),
+                tenant_mapping(),
+                "{keyword}"
+            );
+        }
+    }
+
+    #[test]
+    fn sep_2243_rejects_annotations_off_the_properties_chain() {
+        let annotated = serde_json::json!({"type": "string", "x-mcp-header": "Tenant"});
+        let mut schemas = vec![
+            // The root is not a property.
+            serde_json::json!({"type": "string", "x-mcp-header": "Tenant"}),
+        ];
+        for keyword in [
+            "additionalProperties",
+            "propertyNames",
+            "items",
+            "additionalItems",
+            "contains",
+            "unevaluatedItems",
+            "unevaluatedProperties",
+            "not",
+            "if",
+            "then",
+            "else",
+            "contentSchema",
+        ] {
+            schemas.push(serde_json::json!({"type": "object", keyword: annotated}));
+        }
+        for keyword in ["allOf", "anyOf", "oneOf", "prefixItems", "items"] {
+            schemas.push(serde_json::json!({"type": "object", keyword: [annotated]}));
+        }
+        for keyword in [
+            "patternProperties",
+            "$defs",
+            "definitions",
+            "dependentSchemas",
+            "dependencies",
+        ] {
+            schemas.push(serde_json::json!({"type": "object", keyword: {"tenant": annotated}}));
+        }
+        // Off-chain below a real property, and a combinator nested in $defs.
+        schemas.push(serde_json::json!({
+            "type": "object",
+            "properties": {"a": {"type": "object", "anyOf": [{"properties": {"b": annotated}}]}}
+        }));
+        schemas.push(serde_json::json!({
+            "type": "object",
+            "$defs": {"a": {"oneOf": [{"not": annotated}]}}
+        }));
+        // A sibling real mapping does not hide the off-chain one.
+        schemas.push(serde_json::json!({
+            "type": "object",
+            "properties": {"tenant": annotated},
+            "dependentSchemas": {"tenant": {"properties": {"other": annotated}}}
+        }));
+        for schema in schemas {
+            assert!(
+                custom_header_mappings(&schema).is_err_and(|error| error.contains("reachable")),
+                "{schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn sep_2243_normalization_keeps_tool_with_annotation_lookalikes() {
+        let mut transport = HttpClientTransport::new("http://localhost:3000");
+        transport.protocol_version = Some(crate::protocol::PROTOCOL_VERSION_2026_07_28.to_string());
+        let normalized = transport.normalize_incoming_message(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "tools": [
+                        {
+                            "name": "lookalike",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "x-mcp-header": {"type": "string"},
+                                    "tenant": {"type": "string", "x-mcp-header": "Tenant"}
+                                },
+                                "dependentRequired": {"x-mcp-header": ["tenant"]}
+                            }
+                        },
+                        {
+                            "name": "off_chain",
+                            "inputSchema": {
+                                "type": "object",
+                                "dependentSchemas": {
+                                    "a": {
+                                        "properties": {
+                                            "b": {"type": "string", "x-mcp-header": "B"}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&normalized).unwrap();
+        let tools = parsed["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "lookalike");
+        let mappings = &transport.tool_header_mappings["lookalike"];
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].suffix, "Tenant");
+        assert_eq!(mappings[0].property_path, ["tenant"]);
+        assert!(!transport.tool_header_mappings.contains_key("off_chain"));
     }
 
     fn tools_page(id: i64, tool: &str) -> String {

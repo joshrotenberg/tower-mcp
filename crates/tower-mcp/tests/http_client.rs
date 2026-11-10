@@ -3089,6 +3089,109 @@ mod stateless_tests {
         server.abort();
     }
 
+    #[derive(Clone, Default)]
+    struct HeaderWalkState {
+        mirrored_tenants: Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    async fn header_walk_endpoint(
+        State(state): State<HeaderWalkState>,
+        headers: HeaderMap,
+        Json(body): Json<serde_json::Value>,
+    ) -> Response {
+        let id = body.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        let result = match body
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+        {
+            "server/discover" => serde_json::json!({
+                "resultType": "complete",
+                "supportedVersions": ["2026-07-28"],
+                "capabilities": {"tools": {}},
+                "ttlMs": 0,
+                "cacheScope": "private"
+            }),
+            "tools/list" => serde_json::json!({
+                "resultType": "complete",
+                "tools": [{
+                    "name": "tenant-tool",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "x-mcp-header": {"type": "string"},
+                            "tenant": {"type": "string", "x-mcp-header": "Tenant"}
+                        },
+                        "dependentRequired": {"x-mcp-header": ["tenant"]}
+                    }
+                }],
+                "ttlMs": 60_000,
+                "cacheScope": "private"
+            }),
+            "tools/call" => {
+                state.mirrored_tenants.lock().unwrap().push(
+                    headers
+                        .get("mcp-param-tenant")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string),
+                );
+                serde_json::json!({
+                    "resultType": "complete",
+                    "content": [{"type": "text", "text": "ok"}]
+                })
+            }
+            _ => return StatusCode::NOT_FOUND.into_response(),
+        };
+        Json(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response()
+    }
+
+    /// A property named `x-mcp-header` and a `dependentRequired` entry with
+    /// that key are not annotations, so the tool stays listed and its real
+    /// `Tenant` mapping is mirrored on the next call (#1625).
+    #[tokio::test]
+    async fn final_client_keeps_tool_with_x_mcp_header_property_name() {
+        let state = HeaderWalkState::default();
+        let app = Router::new()
+            .route("/", post(header_walk_endpoint))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = McpClient::builder()
+            .protocol_support(tower_mcp::ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+            .connect_simple(HttpClientTransport::new(url))
+            .await
+            .unwrap();
+        client.discover("test-client", "1.0.0").await.unwrap();
+
+        let tools = tokio::time::timeout(Duration::from_secs(5), client.list_tools())
+            .await
+            .expect("list_tools hung")
+            .unwrap();
+        assert_eq!(tools.tools.len(), 1, "the valid tool must stay listed");
+        assert_eq!(tools.tools[0].name, "tenant-tool");
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client.call_tool(
+                "tenant-tool",
+                serde_json::json!({"x-mcp-header": "literal", "tenant": "acme"}),
+            ),
+        )
+        .await
+        .expect("call_tool hung")
+        .unwrap();
+        assert_eq!(
+            *state.mirrored_tenants.lock().unwrap(),
+            [Some("acme".to_string())]
+        );
+
+        server.abort();
+    }
+
     /// A 404 on a 2026-07-28 request carries no session meaning: the server
     /// answers an unknown method with 404 and -32601, and that must surface
     /// as method-not-found rather than start a re-initialize (#1556).
@@ -5826,4 +5929,235 @@ async fn successful_initialize_does_not_delete_the_session() {
             .is_err(),
         "a healthy session was deleted"
     );
+}
+
+// =============================================================================
+// SSE response media type matching (#1621)
+// =============================================================================
+
+/// A raw server that answers each method in `methods` with `content_type`,
+/// and everything else as ordinary JSON. With `hold_open` the answer is one
+/// SSE event on a stream the server keeps open until `release` is called;
+/// without it the answer is a complete JSON body under `content_type`.
+struct MediaTypeServer {
+    url: String,
+    closed_streams: Arc<std::sync::atomic::AtomicUsize>,
+    release: tokio::sync::watch::Sender<bool>,
+}
+
+impl MediaTypeServer {
+    async fn spawn(content_type: &'static str, methods: &'static [&str], hold_open: bool) -> Self {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let closed_streams = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (release, _) = tokio::sync::watch::channel(false);
+        let server = Self {
+            url,
+            closed_streams: closed_streams.clone(),
+            release: release.clone(),
+        };
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let closed_streams = closed_streams.clone();
+                let mut released = release.subscribe();
+                tokio::spawn(async move {
+                    let Some(req) = read_http_request(&mut stream).await else {
+                        return;
+                    };
+                    let Some(result) = media_type_result(&req) else {
+                        let accepted = raw_response("202 Accepted", "", "");
+                        let _ = stream.write_all(accepted.as_bytes()).await;
+                        return;
+                    };
+                    let session = if raw_is(&req, "initialize") {
+                        "mcp-session-id: raw-session\r\nmcp-protocol-version: 2025-11-25\r\n"
+                    } else {
+                        ""
+                    };
+                    let frame = format!(
+                        r#"{{"jsonrpc":"2.0","id":{},"result":{result}}}"#,
+                        raw_request_id(&req)
+                    );
+                    if !methods.iter().any(|method| raw_is(&req, method)) {
+                        let headers = format!("{RAW_JSON}{session}");
+                        let reply = raw_response("200 OK", &headers, &frame);
+                        let _ = stream.write_all(reply.as_bytes()).await;
+                        return;
+                    }
+                    let headers = format!("Content-Type: {content_type}\r\n{session}");
+                    if !hold_open {
+                        let reply = raw_response("200 OK", &headers, &frame);
+                        let _ = stream.write_all(reply.as_bytes()).await;
+                        return;
+                    }
+                    let reply =
+                        raw_response_no_length("200 OK", &headers, &format!("data: {frame}\n\n"));
+                    let _ = stream.write_all(reply.as_bytes()).await;
+                    let _ = stream.flush().await;
+                    let _ = released.wait_for(|released| *released).await;
+                    closed_streams.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
+        });
+        server
+    }
+
+    /// Asserts no held stream has closed, then lets them close.
+    fn assert_streams_still_open(&self, context: &str) {
+        assert_eq!(
+            self.closed_streams
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "{context}: the response must arrive while the stream is open"
+        );
+        self.release.send_replace(true);
+    }
+}
+
+/// The result object for a raw request, or `None` for a notification.
+fn media_type_result(req: &str) -> Option<String> {
+    if raw_is(req, "initialize") {
+        Some(
+            r#"{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"raw","version":"0"}}"#
+                .to_string(),
+        )
+    } else if raw_is(req, "server/discover") {
+        Some(
+            r#"{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}"#
+                .to_string(),
+        )
+    } else if raw_is(req, "tools/list") {
+        Some(r#"{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}"#.to_string())
+    } else {
+        None
+    }
+}
+
+/// A request timeout far beyond the test bound, so a client reading the held
+/// stream to EOF is caught by the bound rather than rescued by its timeout.
+fn media_type_client_config() -> HttpClientConfig {
+    HttpClientConfig {
+        request_timeout: Duration::from_secs(60),
+        ..raw_client_config()
+    }
+}
+
+/// How long a response already on the wire may take to reach the caller. The
+/// exchange runs over real sockets, so this is a wall-clock bound; passing
+/// runs do not wait for it.
+const MEDIA_TYPE_BOUND: Duration = Duration::from_secs(3);
+
+const SSE_SPELLINGS: [&str; 3] = [
+    "Text/Event-Stream",
+    "TEXT/EVENT-STREAM; charset=UTF-8",
+    "text/EVENT-stream ; charset=utf-8",
+];
+
+#[tokio::test]
+async fn mixed_case_sse_initialize_response_arrives_before_the_stream_closes() {
+    for content_type in SSE_SPELLINGS {
+        let server = MediaTypeServer::spawn(content_type, &["initialize"], true).await;
+        let client = McpClient::connect(HttpClientTransport::with_config(
+            server.url.clone(),
+            media_type_client_config(),
+        ))
+        .await
+        .unwrap();
+
+        let result =
+            tokio::time::timeout(MEDIA_TYPE_BOUND, client.initialize("raw-client", "1.0.0"))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{content_type}: initialize waited for the stream to close")
+                })
+                .unwrap_or_else(|error| panic!("{content_type}: initialize failed: {error:?}"));
+        assert_eq!(result.server_info.name, "raw", "{content_type}");
+        server.assert_streams_still_open(content_type);
+    }
+}
+
+#[tokio::test]
+async fn mixed_case_sse_session_response_arrives_before_the_stream_closes() {
+    for content_type in SSE_SPELLINGS {
+        let server = MediaTypeServer::spawn(content_type, &["tools/list"], true).await;
+        let client = McpClient::connect(HttpClientTransport::with_config(
+            server.url.clone(),
+            media_type_client_config(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::timeout(MEDIA_TYPE_BOUND, client.initialize("raw-client", "1.0.0"))
+            .await
+            .expect("initialize hung")
+            .unwrap();
+
+        let tools = tokio::time::timeout(MEDIA_TYPE_BOUND, client.list_tools())
+            .await
+            .unwrap_or_else(|_| panic!("{content_type}: list_tools waited for the stream to close"))
+            .unwrap_or_else(|error| panic!("{content_type}: list_tools failed: {error:?}"));
+        assert!(tools.tools.is_empty(), "{content_type}");
+        server.assert_streams_still_open(content_type);
+    }
+}
+
+#[tokio::test]
+async fn mixed_case_sse_final_protocol_response_arrives_before_the_stream_closes() {
+    for content_type in SSE_SPELLINGS {
+        let server = MediaTypeServer::spawn(content_type, &["tools/list"], true).await;
+        let client = McpClient::builder()
+            .protocol_support(tower_mcp::ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+            .connect_simple(HttpClientTransport::with_config(
+                server.url.clone(),
+                media_type_client_config(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(MEDIA_TYPE_BOUND, client.discover("raw-client", "1.0.0"))
+            .await
+            .expect("discover hung")
+            .unwrap();
+
+        let tools = tokio::time::timeout(MEDIA_TYPE_BOUND, client.list_tools())
+            .await
+            .unwrap_or_else(|_| panic!("{content_type}: list_tools waited for the stream to close"))
+            .unwrap_or_else(|error| panic!("{content_type}: list_tools failed: {error:?}"));
+        assert!(tools.tools.is_empty(), "{content_type}");
+        server.assert_streams_still_open(content_type);
+    }
+}
+
+/// None of these names the SSE media type, so a complete JSON body under any
+/// of them must be read as JSON rather than parsed for SSE events that are
+/// not there.
+#[tokio::test]
+async fn sse_lookalike_media_types_are_read_as_ordinary_bodies() {
+    for content_type in [
+        "text/event-streaming",
+        "application/json; note=\"text/event-stream\"",
+        "application/json; profile=text/event-stream",
+        "text/event-stream, application/json",
+        "application/json, text/event-stream",
+        "xtext/event-stream",
+    ] {
+        let server =
+            MediaTypeServer::spawn(content_type, &["initialize", "tools/list"], false).await;
+        let client = McpClient::connect(HttpClientTransport::with_config(
+            server.url.clone(),
+            media_type_client_config(),
+        ))
+        .await
+        .unwrap();
+
+        tokio::time::timeout(MEDIA_TYPE_BOUND, client.initialize("raw-client", "1.0.0"))
+            .await
+            .unwrap_or_else(|_| panic!("{content_type}: initialize hung"))
+            .unwrap_or_else(|error| panic!("{content_type}: initialize failed: {error:?}"));
+        let tools = tokio::time::timeout(MEDIA_TYPE_BOUND, client.list_tools())
+            .await
+            .unwrap_or_else(|_| panic!("{content_type}: list_tools hung"))
+            .unwrap_or_else(|error| panic!("{content_type}: list_tools failed: {error:?}"));
+        assert!(tools.tools.is_empty(), "{content_type}");
+    }
 }

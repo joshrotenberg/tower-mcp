@@ -54,6 +54,7 @@ use serde_json::Value;
 use tower_mcp_types::JsonRpcError;
 
 use super::http::{MCP_METHOD_HEADER, MCP_NAME_HEADER, MCP_PARAM_HEADER_PREFIX};
+use crate::header_annotations::custom_header_mappings;
 
 /// Base64 sentinel prefix used for Base64-encoded header values.
 ///
@@ -260,124 +261,6 @@ fn decode_sentinel(value: &str) -> Result<String, String> {
     }
 }
 
-#[derive(Debug)]
-struct CustomHeaderMapping {
-    suffix: String,
-    property_path: Vec<String>,
-}
-
-/// Collect the statically reachable `x-mcp-header` annotations from a tool
-/// input schema. Traversal follows only `properties` chains, exactly matching
-/// SEP-2243's extraction rule.
-fn custom_header_mappings(schema: &Value) -> Result<Vec<CustomHeaderMapping>, JsonRpcError> {
-    fn annotation_count(value: &Value) -> usize {
-        match value {
-            Value::Object(object) => {
-                usize::from(object.contains_key("x-mcp-header"))
-                    + object.values().map(annotation_count).sum::<usize>()
-            }
-            Value::Array(values) => values.iter().map(annotation_count).sum(),
-            _ => 0,
-        }
-    }
-
-    fn is_tchar(byte: u8) -> bool {
-        byte.is_ascii_alphanumeric()
-            || matches!(
-                byte,
-                b'!' | b'#'
-                    | b'$'
-                    | b'%'
-                    | b'&'
-                    | b'\''
-                    | b'*'
-                    | b'+'
-                    | b'-'
-                    | b'.'
-                    | b'^'
-                    | b'_'
-                    | b'`'
-                    | b'|'
-                    | b'~'
-            )
-    }
-
-    fn primitive_header_type(schema: &Value) -> bool {
-        match schema.get("type") {
-            Some(Value::String(kind)) => matches!(kind.as_str(), "string" | "integer" | "boolean"),
-            Some(Value::Array(kinds)) => {
-                let mut primitive = false;
-                for kind in kinds {
-                    match kind.as_str() {
-                        Some("string" | "integer" | "boolean") if !primitive => primitive = true,
-                        Some("null") => {}
-                        _ => return false,
-                    }
-                }
-                primitive
-            }
-            _ => false,
-        }
-    }
-
-    fn walk(
-        schema: &Value,
-        path: &mut Vec<String>,
-        seen: &mut std::collections::HashSet<String>,
-        mappings: &mut Vec<CustomHeaderMapping>,
-    ) -> Result<(), JsonRpcError> {
-        let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
-            return Ok(());
-        };
-
-        for (property_name, property_schema) in properties {
-            path.push(property_name.clone());
-            if let Some(annotation) = property_schema.get("x-mcp-header") {
-                let suffix = annotation.as_str().ok_or_else(|| {
-                    JsonRpcError::header_mismatch(format!(
-                        "x-mcp-header at {} must be a string",
-                        path.join(".")
-                    ))
-                })?;
-                if suffix.is_empty() || !suffix.bytes().all(is_tchar) {
-                    return Err(JsonRpcError::header_mismatch(format!(
-                        "invalid x-mcp-header value {suffix:?} at {}",
-                        path.join(".")
-                    )));
-                }
-                if !primitive_header_type(property_schema) {
-                    return Err(JsonRpcError::header_mismatch(format!(
-                        "x-mcp-header at {} requires a string, integer, or boolean property",
-                        path.join(".")
-                    )));
-                }
-                if !seen.insert(suffix.to_ascii_lowercase()) {
-                    return Err(JsonRpcError::header_mismatch(format!(
-                        "duplicate x-mcp-header value {suffix:?}"
-                    )));
-                }
-                mappings.push(CustomHeaderMapping {
-                    suffix: suffix.to_string(),
-                    property_path: path.clone(),
-                });
-            }
-            walk(property_schema, path, seen, mappings)?;
-            path.pop();
-        }
-        Ok(())
-    }
-
-    let mut seen = std::collections::HashSet::new();
-    let mut mappings = Vec::new();
-    walk(schema, &mut Vec::new(), &mut seen, &mut mappings)?;
-    if annotation_count(schema) != mappings.len() {
-        return Err(JsonRpcError::header_mismatch(
-            "x-mcp-header annotation is not statically reachable through properties",
-        ));
-    }
-    Ok(mappings)
-}
-
 fn value_at_property_path<'a>(root: &'a Value, path: &[String]) -> Option<&'a Value> {
     path.iter().try_fold(root, |value, key| value.get(key))
 }
@@ -389,7 +272,7 @@ fn validate_schema_param_headers(
     mode: Sep2243Mode,
     schema: &Value,
 ) -> Result<(), JsonRpcError> {
-    let mappings = custom_header_mappings(schema)?;
+    let mappings = custom_header_mappings(schema).map_err(JsonRpcError::header_mismatch)?;
     let arguments = parsed
         .get("params")
         .and_then(|params| params.get("arguments"))
@@ -1046,6 +929,120 @@ mod tests {
             .unwrap_err();
             assert_eq!(err.code, -32020);
             assert!(err.message.contains("not statically reachable"));
+        }
+    }
+
+    fn tools_call_with(arguments: Value) -> Value {
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "route", "arguments": arguments}})
+    }
+
+    fn route_headers() -> HeaderMap {
+        hm(&[("mcp-method", "tools/call"), ("mcp-name", "route")])
+    }
+
+    #[test]
+    fn schema_property_named_like_the_annotation_is_not_an_annotation() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"x-mcp-header": {"type": "string"}}
+        });
+        for mode in [Sep2243Mode::Strict, Sep2243Mode::Lenient] {
+            validate_with_tool_schema(
+                &route_headers(),
+                &tools_call_with(json!({"x-mcp-header": "literal"})),
+                mode,
+                Some(&schema),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn schema_dependent_required_fixture_keeps_its_real_mapping() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "x-mcp-header": {"type": "string"},
+                "tenant": {"type": "string", "x-mcp-header": "Tenant"}
+            },
+            "dependentRequired": {"x-mcp-header": ["tenant"]}
+        });
+        let body = tools_call_with(json!({"x-mcp-header": "literal", "tenant": "acme"}));
+        validate_with_tool_schema(
+            &hm(&[
+                ("mcp-method", "tools/call"),
+                ("mcp-name", "route"),
+                ("mcp-param-tenant", "acme"),
+            ]),
+            &body,
+            Sep2243Mode::Strict,
+            Some(&schema),
+        )
+        .unwrap();
+
+        let err =
+            validate_with_tool_schema(&route_headers(), &body, Sep2243Mode::Strict, Some(&schema))
+                .unwrap_err();
+        assert_eq!(err.code, -32020);
+        assert!(err.message.contains("mcp-param-Tenant"), "{}", err.message);
+    }
+
+    #[test]
+    fn schema_literal_data_is_not_an_annotation() {
+        let literal = json!({"x-mcp-header": "Tenant"});
+        for (keyword, value) in [
+            ("const", literal.clone()),
+            ("enum", json!([literal])),
+            ("default", literal.clone()),
+            ("examples", json!([literal])),
+        ] {
+            let schema = json!({
+                "type": "object",
+                keyword: value,
+                "properties": {"other": {"type": "object", keyword: value}}
+            });
+            validate_with_tool_schema(
+                &route_headers(),
+                &tools_call_with(json!({})),
+                Sep2243Mode::Strict,
+                Some(&schema),
+            )
+            .unwrap_or_else(|error| panic!("{keyword}: {error:?}"));
+        }
+    }
+
+    #[test]
+    fn schema_rejects_annotations_under_real_off_chain_locations() {
+        let annotated = json!({"type": "string", "x-mcp-header": "Tenant"});
+        let object_with = json!({"properties": {"tenant": annotated}});
+        for schema in [
+            json!({"type": "object", "dependentSchemas": {"a": object_with}}),
+            json!({"type": "object", "dependentSchemas": {"a": annotated}}),
+            json!({"type": "object", "$defs": {"a": object_with}}),
+            json!({"type": "object", "$defs": {"a": {"oneOf": [annotated]}}}),
+            json!({"type": "object", "allOf": [object_with]}),
+            json!({"type": "object", "anyOf": [object_with]}),
+            json!({"type": "object", "oneOf": [object_with]}),
+            json!({"type": "object", "not": object_with}),
+            json!({"type": "object", "if": object_with}),
+            json!({"type": "object", "patternProperties": {"a": annotated}}),
+            json!({"type": "object", "additionalProperties": annotated}),
+            json!({
+                "type": "object",
+                "properties": {"tenant": annotated},
+                "dependentSchemas": {"tenant": object_with}
+            }),
+        ] {
+            let err = validate_with_tool_schema(
+                &route_headers(),
+                &tools_call_with(json!({})),
+                Sep2243Mode::Strict,
+                Some(&schema),
+            )
+            .expect_err(&schema.to_string());
+            assert_eq!(err.code, -32020, "{schema}");
+            assert!(err.message.contains("not statically reachable"), "{schema}");
         }
     }
 
