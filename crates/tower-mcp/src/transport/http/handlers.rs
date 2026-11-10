@@ -606,22 +606,41 @@ pub(super) async fn handle_post(
             enum FirstOutbound {
                 Response(crate::error::Result<JsonRpcResponse>),
                 Notification(crate::context::ServerNotification),
+                InitialResponseTimeout,
             }
 
-            // Race the handler against its first notification. A closed
-            // channel (no sender attached, or all senders dropped) simply
-            // awaits the handler.
+            // Bounds the whole wait, so it is created once: a notification
+            // routed to a subscription below does not restart it.
+            let initial_response_timeout = state.initial_response_timeout;
+            let initial_response_deadline = async move {
+                match initial_response_timeout {
+                    Some(timeout) => tokio::time::sleep(timeout).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::pin!(initial_response_deadline);
+
+            // Race the handler against its first notification and the
+            // initial-response deadline. A closed channel (no sender
+            // attached, or all senders dropped) leaves the other two.
+            let mut notifications_open = true;
             let first = loop {
                 let outbound = tokio::select! {
                     // A handler may enqueue a notification and complete in
                     // the same poll. Observe the queued notification first so
                     // it is neither dropped nor raced behind the response.
+                    // The deadline goes last so that a result already ready
+                    // when it fires still decides the status.
                     biased;
-                    maybe = notif_rx.recv() => match maybe {
+                    maybe = notif_rx.recv(), if notifications_open => match maybe {
                         Some(n) => FirstOutbound::Notification(n),
-                        None => FirstOutbound::Response((&mut call).await),
+                        None => {
+                            notifications_open = false;
+                            continue;
+                        }
                     },
                     result = &mut call => FirstOutbound::Response(result),
+                    () = &mut initial_response_deadline => FirstOutbound::InitialResponseTimeout,
                 };
                 match outbound {
                     FirstOutbound::Notification(notification)
@@ -650,7 +669,7 @@ pub(super) async fn handle_post(
                             >,
                         > = Box::pin(async move { result });
                         let mut resp = stateless_sse_with_notifications(
-                            notification,
+                            Some(notification),
                             ready_call,
                             notif_rx,
                             StatelessSseContext {
@@ -710,7 +729,11 @@ pub(super) async fn handle_post(
                     // Intentionally NO `mcp-session-id` header for 2026-07-28+ clients.
                     return resp;
                 }
-                FirstOutbound::Notification(first_notif) => {
+                outbound => {
+                    let first_notif = match outbound {
+                        FirstOutbound::Notification(notification) => Some(notification),
+                        _ => None,
+                    };
                     let mut resp = stateless_sse_with_notifications(
                         first_notif,
                         call,
@@ -1592,6 +1615,71 @@ async fn handle_subscriptions_listen_sse(session: Arc<Session>) -> Response {
         .into_response()
 }
 
+/// Split an HTTP list or parameter list on `delimiter`, ignoring delimiters
+/// inside quoted strings. A backslash in a quoted string escapes the next byte,
+/// so an escaped quote does not end the string.
+fn split_unquoted(value: &[u8], delimiter: u8) -> impl Iterator<Item = &[u8]> {
+    let mut quoted = false;
+    let mut escaped = false;
+    value.split(move |&byte| {
+        if escaped {
+            escaped = false;
+        } else if quoted && byte == b'\\' {
+            escaped = true;
+        } else if byte == b'"' {
+            quoted = !quoted;
+        } else if !quoted && byte == delimiter {
+            return true;
+        }
+        false
+    })
+}
+
+/// Whether an RFC 9110 qvalue is an explicit zero. A weight outside the
+/// `qvalue` grammar is not, so it is ignored rather than excluding the range.
+fn is_zero_quality(quality: &[u8]) -> bool {
+    let (whole, fraction) = match quality.iter().position(|&byte| byte == b'.') {
+        Some(dot) => (&quality[..dot], &quality[dot + 1..]),
+        None => (quality, &[][..]),
+    };
+    whole == b"0" && fraction.len() <= 3 && fraction.iter().all(|&byte| byte == b'0')
+}
+
+/// Whether one `Accept` list member names SSE with a non-zero weight.
+fn is_event_stream_range(range: &[u8]) -> bool {
+    let mut parts = split_unquoted(range, b';');
+    if !parts.next().is_some_and(|media_type| {
+        media_type
+            .trim_ascii()
+            .eq_ignore_ascii_case(b"text/event-stream")
+    }) {
+        return false;
+    }
+    !parts.any(|parameter| {
+        parameter
+            .iter()
+            .position(|&byte| byte == b'=')
+            .is_some_and(|eq| {
+                parameter[..eq].trim_ascii().eq_ignore_ascii_case(b"q")
+                    && is_zero_quality(parameter[eq + 1..].trim_ascii())
+            })
+    })
+}
+
+/// Whether any `Accept` field explicitly admits `text/event-stream`.
+///
+/// Media types are compared whole and case-insensitively (RFC 9110 section
+/// 8.3.1), across every field value. Wildcards such as `*/*` do not count: the
+/// legacy GET stream has to be asked for by name. Raw bytes are parsed because
+/// quoted strings may hold non-ASCII octets, which `to_str` refuses.
+fn accepts_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::ACCEPT)
+        .iter()
+        .flat_map(|value| split_unquoted(value.as_bytes(), b','))
+        .any(is_event_stream_range)
+}
+
 /// Handle GET requests (SSE stream for server notifications and outgoing requests)
 pub(super) async fn handle_get(
     State(state): State<Arc<AppState>>,
@@ -1613,12 +1701,7 @@ pub(super) async fn handle_get(
     }
 
     // Check Accept header
-    let accept = headers
-        .get(header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    if !accept.contains("text/event-stream") {
+    if !accepts_event_stream(&headers) {
         return (
             StatusCode::NOT_ACCEPTABLE,
             "Accept header must include text/event-stream",
