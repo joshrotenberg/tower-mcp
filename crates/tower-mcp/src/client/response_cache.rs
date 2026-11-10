@@ -3,9 +3,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 
 use crate::protocol::CacheScope;
 
@@ -17,6 +18,13 @@ pub const DEFAULT_MAX_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Caching is consulted only after the 2026-07-28 lifecycle has been selected.
 /// A result with no `ttlMs` uses [`default_ttl`](Self::default_ttl), which is
 /// zero by default, and is therefore immediately stale.
+///
+/// A result served from the cache reports the lifetime it has left in `ttlMs`,
+/// after applying [`max_ttl`](Self::max_ttl), so caching it again cannot extend
+/// that lifetime. A stale result served after a failed refresh reports zero. A
+/// result whose server omitted `ttlMs` still omits it, even when
+/// [`default_ttl`](Self::default_ttl) allowed it to be cached. A response that
+/// came from the server carries the server's own hint unchanged.
 #[derive(Debug, Clone)]
 pub struct ClientCacheConfig {
     /// Enable the response cache. Default: `true`.
@@ -93,6 +101,104 @@ impl Default for ClientCacheConfig {
     }
 }
 
+/// Every page of a paginated list, with cache hints valid for the whole result.
+///
+/// Returned by the `list_all_*_with_cache_hints` methods on
+/// [`McpClient`](super::McpClient). Each page's expiry is fixed when that page
+/// is received, and [`ttl_ms`](Self::ttl_ms) is the time left until the
+/// earliest of them when pagination finishes, so slow pagination shortens it.
+///
+/// A missing hint means the aggregate cannot claim anything for that page:
+///
+/// | Pages | `ttl_ms` | `cache_scope` |
+/// | --- | --- | --- |
+/// | every page has the hint | earliest expiry, as time remaining | `Public` only if every page is public, otherwise `Private` |
+/// | some pages omit the hint | `Some(0)` | `Private` |
+/// | every page omits the hint | `None` | `None` |
+///
+/// Each page's `ttlMs` is capped at
+/// [`ClientCacheConfig::max_ttl`], so a page from the server and the same page
+/// from the cache contribute the same bound.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct AggregateList<T> {
+    /// Items from every page, in page order.
+    pub items: Vec<T>,
+    /// Milliseconds until the first page in the result expires.
+    pub ttl_ms: Option<u64>,
+    /// Scope that is safe for the whole result.
+    pub cache_scope: Option<CacheScope>,
+}
+
+/// Combines per-page cache hints as pages arrive.
+#[derive(Debug)]
+pub(crate) struct AggregateHints {
+    max_ttl: Duration,
+    earliest_expiry: Option<Instant>,
+    missing_ttl: bool,
+    public: bool,
+    private: bool,
+    missing_scope: bool,
+}
+
+impl AggregateHints {
+    pub(crate) fn new(max_ttl: Duration) -> Self {
+        Self {
+            max_ttl,
+            earliest_expiry: None,
+            missing_ttl: false,
+            public: false,
+            private: false,
+            missing_scope: false,
+        }
+    }
+
+    /// Record one page. Call as soon as the page is received.
+    pub(crate) fn observe(&mut self, ttl_ms: Option<u64>, scope: Option<CacheScope>) {
+        let received = Instant::now();
+        // A hint too large for the clock is treated like a missing one.
+        match ttl_ms.and_then(|ttl_ms| {
+            received.checked_add(Duration::from_millis(ttl_ms).min(self.max_ttl))
+        }) {
+            Some(expiry) => {
+                self.earliest_expiry = Some(
+                    self.earliest_expiry
+                        .map_or(expiry, |earliest| earliest.min(expiry)),
+                );
+            }
+            None => self.missing_ttl = true,
+        }
+        match scope {
+            Some(CacheScope::Public) => self.public = true,
+            Some(_) => self.private = true,
+            None => self.missing_scope = true,
+        }
+    }
+
+    /// Build the result once pagination has finished.
+    pub(crate) fn finish<T>(self, items: Vec<T>) -> AggregateList<T> {
+        let ttl_ms = self.earliest_expiry.map(|expiry| {
+            if self.missing_ttl {
+                return 0;
+            }
+            let remaining = expiry.saturating_duration_since(Instant::now());
+            u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX)
+        });
+        let cache_scope = if self.private || (self.public && self.missing_scope) {
+            Some(CacheScope::Private)
+        } else if self.public {
+            Some(CacheScope::Public)
+        } else {
+            None
+        };
+        AggregateList {
+            items,
+            ttl_ms,
+            cache_scope,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Eq)]
 struct CacheKey {
     method: String,
@@ -127,6 +233,8 @@ struct CacheEntry {
     value: serde_json::Value,
     expires_at: Instant,
     scope: CacheScope,
+    /// The server sent `ttlMs`, so a hit reports the remaining lifetime.
+    has_server_ttl: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +287,10 @@ impl ClientResponseCache {
 
     pub(crate) fn serve_stale_on_error(&self) -> bool {
         self.config.serve_stale_on_error
+    }
+
+    pub(crate) fn aggregate_hints(&self) -> AggregateHints {
+        AggregateHints::new(self.config.max_ttl)
     }
 
     pub(crate) async fn set_partition(&self, partition: String) {
@@ -308,6 +420,7 @@ impl ClientResponseCache {
                 value,
                 expires_at,
                 scope,
+                has_server_ttl: ttl_ms.is_some(),
             },
         );
 
@@ -359,10 +472,19 @@ fn generation_key(method: &str, params: &str) -> LogicalKey {
 }
 
 fn classify_entry(entry: &CacheEntry) -> CacheLookup {
-    if entry.expires_at > Instant::now() {
-        CacheLookup::Fresh(entry.value.clone())
+    let remaining = entry.expires_at.saturating_duration_since(Instant::now());
+    let mut value = entry.value.clone();
+    // Rewrites the clone, so the stored source result is never compounded.
+    if entry.has_server_ttl
+        && let Some(fields) = value.as_object_mut()
+    {
+        let remaining_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
+        fields.insert("ttlMs".to_string(), remaining_ms.into());
+    }
+    if remaining.is_zero() {
+        CacheLookup::Stale(value)
     } else {
-        CacheLookup::Stale(entry.value.clone())
+        CacheLookup::Fresh(value)
     }
 }
 
@@ -392,6 +514,110 @@ mod tests {
 
     fn value(id: u64) -> serde_json::Value {
         serde_json::json!({ "id": id })
+    }
+
+    /// Fail a paused-clock test that stops making progress.
+    async fn bounded<F: std::future::Future>(future: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(7 * 24 * 60 * 60), future)
+            .await
+            .expect("test exceeded its time bound")
+    }
+
+    fn fresh_ttl(lookup: CacheLookup) -> Option<u64> {
+        match lookup {
+            CacheLookup::Fresh(value) => value.get("ttlMs").and_then(serde_json::Value::as_u64),
+            other => panic!("expected a fresh entry, got {other:?}"),
+        }
+    }
+
+    async fn write_tools(
+        cache: &ClientResponseCache,
+        ttl_ms: Option<u64>,
+        scope: Option<CacheScope>,
+    ) {
+        let generation = cache.capture_generation("tools/list", "").await;
+        let mut result = value(1);
+        if let Some(ttl_ms) = ttl_ms {
+            result["ttlMs"] = ttl_ms.into();
+        }
+        cache
+            .write("tools/list", "", generation, result, ttl_ms, scope)
+            .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hit_rewrites_only_the_returned_copy() {
+        bounded(async {
+            let cache = ClientResponseCache::new(
+                ClientCacheConfig::default().with_max_ttl(Duration::from_secs(10)),
+            );
+            write_tools(&cache, Some(60_000), Some(CacheScope::Public)).await;
+
+            for expected in [10_000, 7_000, 4_000] {
+                assert_eq!(
+                    fresh_ttl(cache.lookup("tools/list", "").await),
+                    Some(expected)
+                );
+                tokio::time::advance(Duration::from_secs(3)).await;
+            }
+
+            let state = cache.state.lock().await;
+            let stored = state.entries.values().next().unwrap();
+            assert_eq!(stored.value["ttlMs"], 60_000);
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_entry_saturates_at_zero() {
+        bounded(async {
+            let cache = ClientResponseCache::new(ClientCacheConfig::default());
+            write_tools(&cache, Some(1_000), Some(CacheScope::Public)).await;
+
+            tokio::time::advance(Duration::from_secs(3_600)).await;
+            match cache.lookup("tools/list", "").await {
+                CacheLookup::Stale(value) => assert_eq!(value["ttlMs"], 0),
+                other => panic!("expected a stale entry, got {other:?}"),
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_server_ttl_is_not_invented() {
+        bounded(async {
+            let cache = ClientResponseCache::new(
+                ClientCacheConfig::default().with_default_ttl(Duration::from_secs(30)),
+            );
+            write_tools(&cache, None, Some(CacheScope::Public)).await;
+
+            assert_eq!(fresh_ttl(cache.lookup("tools/list", "").await), None);
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remaining_ttl_holds_across_partition_rotation_and_eviction() {
+        bounded(async {
+            let cache = ClientResponseCache::new(
+                ClientCacheConfig::default().with_partition("principal-a"),
+            );
+            write_tools(&cache, Some(60_000), Some(CacheScope::Public)).await;
+
+            tokio::time::advance(Duration::from_secs(20)).await;
+            cache.set_partition("principal-b".to_string()).await;
+            assert_eq!(
+                fresh_ttl(cache.lookup("tools/list", "").await),
+                Some(40_000)
+            );
+
+            cache.evict_method("tools/list").await;
+            assert!(matches!(
+                cache.lookup("tools/list", "").await,
+                CacheLookup::Miss
+            ));
+        })
+        .await;
     }
 
     #[tokio::test]

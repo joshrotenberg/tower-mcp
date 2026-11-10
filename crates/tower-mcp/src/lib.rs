@@ -636,9 +636,9 @@ pub use client::{
     OAuthClientRegistrationOptions, OAuthClientRegistrationStore, OAuthDynamicClientRegistration,
     OAuthHttpBody, OAuthHttpClient, OAuthHttpMethod, OAuthHttpRequest, OAuthHttpResponse,
     OAuthPendingAuthorization, OAuthPendingAuthorizationState, OAuthRedirectPolicy,
-    OAuthScopeChallenge, OAuthScopeEscalationConfig, OAuthScopeEscalationHandler,
-    OAuthScopeEscalationRequest, OAuthStoredToken, OAuthTokenBinding, OAuthTokenStore,
-    ReqwestOAuthHttpClient, TokenProvider, discover_oauth_authorization_server,
+    OAuthRefreshScopePolicy, OAuthScopeChallenge, OAuthScopeEscalationConfig,
+    OAuthScopeEscalationHandler, OAuthScopeEscalationRequest, OAuthStoredToken, OAuthTokenBinding,
+    OAuthTokenStore, ReqwestOAuthHttpClient, TokenProvider, discover_oauth_authorization_server,
     resolve_oauth_client_registration, resolve_oauth_client_registration_with_store,
 };
 pub use context::{

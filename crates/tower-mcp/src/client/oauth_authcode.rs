@@ -43,7 +43,8 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex, RwLock, oneshot};
 
 use super::oauth::{
-    OAuthBearerChallenge, OAuthClientError, OAuthTokenEndpointAuthMethod, TokenProvider,
+    OAuthBearerChallenge, OAuthClientError, OAuthRefreshScopePolicy, OAuthTokenEndpointAuthMethod,
+    TokenProvider, unix_time,
 };
 
 // =============================================================================
@@ -550,12 +551,18 @@ pub enum OAuthClientRegistrationMethod {
 /// The serialized representation includes `client_secret` so persistent store
 /// implementations can round-trip credentials. Treat it as sensitive data and
 /// only serialize it into an appropriately protected secret store.
+///
+/// Records written before `client_secret_expires_at` existed deserialize with
+/// an unknown expiry. The field is omitted from the output while the expiry
+/// is unknown.
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OAuthClientRegistration {
     client_id: String,
     client_secret: Option<String>,
     method: OAuthClientRegistrationMethod,
     bound_issuer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_secret_expires_at: Option<u64>,
 }
 
 impl fmt::Debug for OAuthClientRegistration {
@@ -568,6 +575,7 @@ impl fmt::Debug for OAuthClientRegistration {
             )
             .field("method", &self.method)
             .field("bound_issuer", &self.bound_issuer)
+            .field("client_secret_expires_at", &self.client_secret_expires_at)
             .finish()
     }
 }
@@ -584,6 +592,7 @@ impl OAuthClientRegistration {
             client_secret,
             method: OAuthClientRegistrationMethod::PreRegistered,
             bound_issuer: Some(issuer.into()),
+            client_secret_expires_at: None,
         }
     }
 
@@ -594,14 +603,31 @@ impl OAuthClientRegistration {
     /// [`resolve_oauth_client_registration_with_store`]. This constructor lets
     /// a persistent [`OAuthClientRegistrationStore`] rebuild a registration
     /// from separately stored fields without relying on a particular
-    /// serialization format.
+    /// serialization format. The secret's expiry is unknown; use
+    /// [`dynamically_registered_with_secret_expiry`](Self::dynamically_registered_with_secret_expiry)
+    /// when it was stored.
     pub fn dynamically_registered(
         issuer: impl Into<String>,
         client_id: impl Into<String>,
         client_secret: Option<String>,
     ) -> Self {
+        Self::dynamically_registered_with_secret_expiry(issuer, client_id, client_secret, None)
+    }
+
+    /// Restore issuer-bound Dynamic Client Registration credentials along
+    /// with their RFC 7591 `client_secret_expires_at` value.
+    ///
+    /// See [`client_secret_expires_at`](Self::client_secret_expires_at) for
+    /// the meaning of `expires_at`. It is ignored without a `client_secret`.
+    pub fn dynamically_registered_with_secret_expiry(
+        issuer: impl Into<String>,
+        client_id: impl Into<String>,
+        client_secret: Option<String>,
+        expires_at: Option<u64>,
+    ) -> Self {
         Self {
             client_id: client_id.into(),
+            client_secret_expires_at: client_secret.as_ref().and(expires_at),
             client_secret,
             method: OAuthClientRegistrationMethod::Dynamic,
             bound_issuer: Some(issuer.into()),
@@ -615,6 +641,7 @@ impl OAuthClientRegistration {
             client_secret: None,
             method: OAuthClientRegistrationMethod::ClientIdMetadataDocument,
             bound_issuer: None,
+            client_secret_expires_at: None,
         }
     }
 
@@ -639,6 +666,28 @@ impl OAuthClientRegistration {
     pub fn bound_issuer(&self) -> Option<&str> {
         self.bound_issuer.as_deref()
     }
+
+    /// RFC 7591 `client_secret_expires_at` for a dynamically issued secret.
+    ///
+    /// - `Some(0)`: the server stated that the secret does not expire.
+    /// - `Some(timestamp)`: the secret expires at these Unix seconds.
+    /// - `None`: the expiry is unknown, because no secret was issued, the
+    ///   server omitted the field or sent an unusable value, or the record
+    ///   predates this field. An unknown expiry is never treated as expired.
+    pub fn client_secret_expires_at(&self) -> Option<u64> {
+        self.client_secret_expires_at
+    }
+
+    /// Whether the client secret is known to have expired at `now` (Unix
+    /// seconds). A secret is expired from its `client_secret_expires_at`
+    /// second onward. This is `false` without a secret, for an explicit
+    /// `0`, and for an unknown expiry.
+    pub fn is_client_secret_expired_at(&self, now: u64) -> bool {
+        self.client_secret.is_some()
+            && self
+                .client_secret_expires_at
+                .is_some_and(|expires_at| expires_at != 0 && now >= expires_at)
+    }
 }
 
 /// Persistent storage for issuer-bound OAuth client registrations.
@@ -650,6 +699,12 @@ impl OAuthClientRegistration {
 /// Only pre-registered and dynamically registered credentials are
 /// issuer-bound. Client ID Metadata Document URLs are portable and are not
 /// passed to this store by [`resolve_oauth_client_registration_with_store`].
+///
+/// A store that keeps separate fields must also keep
+/// [`OAuthClientRegistration::client_secret_expires_at`], and should restore
+/// it with
+/// [`OAuthClientRegistration::dynamically_registered_with_secret_expiry`].
+/// Otherwise an expired secret cannot be detected.
 #[async_trait]
 pub trait OAuthClientRegistrationStore: Send + Sync {
     /// Load client credentials registered with `issuer`.
@@ -847,6 +902,96 @@ struct DynamicClientRegistrationResponse {
     client_id: String,
     client_secret: Option<String>,
     token_endpoint_auth_method: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_client_secret_expires_at")]
+    client_secret_expires_at: Option<u64>,
+}
+
+/// Read `client_secret_expires_at` from a registration response. RFC 7591
+/// requires a non-negative integer. Anything else from a nonconforming server
+/// is treated as an unknown expiry rather than failing a registration that
+/// otherwise succeeded.
+pub(crate) fn deserialize_client_secret_expires_at<'de, D>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+    let expires_at = value.as_u64();
+    if expires_at.is_none() && !value.is_null() {
+        tracing::debug!(%value, "ignoring unusable client_secret_expires_at");
+    }
+    Ok(expires_at)
+}
+
+/// Build the registration for a successful Dynamic Client Registration
+/// response. A secret that has already expired by this client's clock is an
+/// error, since nothing could use it.
+pub(crate) fn new_dynamic_registration(
+    issuer: String,
+    client_id: String,
+    client_secret: Option<String>,
+    expires_at: Option<u64>,
+    now: u64,
+) -> Result<OAuthClientRegistration, OAuthClientError> {
+    let registration = OAuthClientRegistration::dynamically_registered_with_secret_expiry(
+        issuer,
+        client_id,
+        client_secret,
+        expires_at,
+    );
+    if registration.is_client_secret_expired_at(now) {
+        return Err(OAuthClientError::Registration(format!(
+            "authorization server issued client `{}` a secret that expired at Unix time {} \
+             (current time {now})",
+            registration.client_id(),
+            registration.client_secret_expires_at.unwrap_or_default(),
+        )));
+    }
+    Ok(registration)
+}
+
+/// The error for a dynamically registered secret that has expired. `remedy`
+/// tells the caller what to do next.
+pub(crate) fn client_secret_expired_error(
+    registration: &OAuthClientRegistration,
+    issuer: &str,
+    remedy: &str,
+) -> OAuthClientError {
+    OAuthClientError::ClientSecretExpired(format!(
+        "the secret for dynamically registered client `{}` at issuer `{issuer}` expired at Unix \
+         time {}; {remedy}",
+        registration.client_id(),
+        registration.client_secret_expires_at.unwrap_or_default(),
+    ))
+}
+
+/// Decide whether a validated stored Dynamic Client Registration can be
+/// reused. An expired secret returns `false` when the server offers a
+/// registration endpoint, so the caller registers again, and an error
+/// otherwise. A credential known to be expired is never reused.
+pub(crate) fn stored_registration_is_reusable(
+    registration: &OAuthClientRegistration,
+    metadata: &OAuthAuthorizationServerMetadata,
+    now: u64,
+) -> Result<bool, OAuthClientError> {
+    if !registration.is_client_secret_expired_at(now) {
+        return Ok(true);
+    }
+    if metadata.registration_endpoint.is_some() {
+        tracing::debug!(
+            client_id = registration.client_id(),
+            issuer = %metadata.issuer,
+            "stored client secret expired; registering again"
+        );
+        return Ok(false);
+    }
+    Err(client_secret_expired_error(
+        registration,
+        &metadata.issuer,
+        "the authorization server advertises no registration_endpoint, so remove the stored \
+         registration and supply new client credentials",
+    ))
 }
 
 /// The registration auth method this client prefers among those the
@@ -941,7 +1086,7 @@ pub async fn resolve_oauth_client_registration(
     metadata: &OAuthAuthorizationServerMetadata,
     options: &OAuthClientRegistrationOptions,
 ) -> Result<OAuthClientRegistration, OAuthClientError> {
-    resolve_oauth_client_registration_inner(client, metadata, options, None).await
+    resolve_oauth_client_registration_inner(client, metadata, options, None, unix_time()).await
 }
 
 /// Select or create an OAuth client registration with issuer-keyed
@@ -957,13 +1102,21 @@ pub async fn resolve_oauth_client_registration(
 /// reused. The resolver performs a new Dynamic Client Registration with the
 /// new server instead. Stored credentials for the previous issuer are retained
 /// because another resource may still use that authorization server.
+///
+/// A stored secret known to be expired is never returned. When the metadata
+/// has a `registration_endpoint`, the resolver registers a new client and
+/// overwrites the stored entry. The new client has a new `client_id`, so tokens
+/// bound to the old one no longer apply. Without an endpoint it returns
+/// [`OAuthClientError::ClientSecretExpired`]. A stored registration with no
+/// secret, an explicit zero expiry, or an unknown expiry is reused.
 pub async fn resolve_oauth_client_registration_with_store(
     client: &reqwest::Client,
     metadata: &OAuthAuthorizationServerMetadata,
     options: &OAuthClientRegistrationOptions,
     store: &dyn OAuthClientRegistrationStore,
 ) -> Result<OAuthClientRegistration, OAuthClientError> {
-    resolve_oauth_client_registration_inner(client, metadata, options, Some(store)).await
+    resolve_oauth_client_registration_inner(client, metadata, options, Some(store), unix_time())
+        .await
 }
 
 async fn resolve_oauth_client_registration_inner(
@@ -971,6 +1124,7 @@ async fn resolve_oauth_client_registration_inner(
     metadata: &OAuthAuthorizationServerMetadata,
     options: &OAuthClientRegistrationOptions,
     store: Option<&dyn OAuthClientRegistrationStore>,
+    now: u64,
 ) -> Result<OAuthClientRegistration, OAuthClientError> {
     if let Some(registration) = &options.pre_registered {
         if registration.method != OAuthClientRegistrationMethod::PreRegistered {
@@ -997,6 +1151,7 @@ async fn resolve_oauth_client_registration_inner(
             client_secret: None,
             method: OAuthClientRegistrationMethod::ClientIdMetadataDocument,
             bound_issuer: None,
+            client_secret_expires_at: None,
         });
     }
 
@@ -1005,7 +1160,9 @@ async fn resolve_oauth_client_registration_inner(
         && let Some(registration) = store.load(&metadata.issuer).await?
     {
         validate_stored_dynamic_registration(&registration, &metadata.issuer)?;
-        return Ok(registration);
+        if stored_registration_is_reusable(&registration, metadata, now)? {
+            return Ok(registration);
+        }
     }
 
     if let (Some(endpoint), Some(request)) = (
@@ -1054,11 +1211,13 @@ async fn resolve_oauth_client_registration_inner(
                 .unwrap_or(&request.token_endpoint_auth_method),
             response.client_secret.as_deref(),
         )?;
-        let registration = OAuthClientRegistration::dynamically_registered(
+        let registration = new_dynamic_registration(
             metadata.issuer.clone(),
             response.client_id,
             response.client_secret,
-        );
+            response.client_secret_expires_at,
+            now,
+        )?;
         if let Some(store) = store {
             store.save(&metadata.issuer, &registration).await?;
         }
@@ -1167,6 +1326,8 @@ struct OAuthAuthCodeInner {
     scopes: Option<String>,
     /// Refresh buffer before expiry.
     refresh_buffer: Duration,
+    /// Controls the `scope` parameter on refresh requests.
+    refresh_scope_policy: OAuthRefreshScopePolicy,
     /// HTTP client.
     client: reqwest::Client,
     /// Cached token.
@@ -1338,6 +1499,7 @@ impl OAuthAuthorizationCode {
                 redirect_uri,
                 scopes: scope_str,
                 refresh_buffer: config.refresh_buffer,
+                refresh_scope_policy: config.refresh_scope_policy,
                 client,
                 cache: RwLock::new(None),
                 callback_rx: Mutex::new(Some(callback_rx)),
@@ -1443,19 +1605,20 @@ impl OAuthAuthorizationCode {
     /// Refresh the access token using the refresh token.
     ///
     /// `granted_scope` is what the authorization server granted for the
-    /// token being replaced. It is sent instead of the originally requested
-    /// scopes, which the server may have narrowed.
+    /// token being replaced. `request_scope` is the `scope` parameter that
+    /// [`OAuthRefreshScopePolicy`] selected from it.
     async fn refresh_token(
         &self,
         refresh_token: &str,
         granted_scope: Option<&str>,
+        request_scope: Option<&str>,
     ) -> Result<CachedAuthCodeToken, OAuthClientError> {
         let mut params = vec![
             ("grant_type", "refresh_token".to_string()),
             ("refresh_token", refresh_token.to_string()),
             ("resource", self.inner.resource.clone()),
         ];
-        if let Some(scope) = granted_scope {
+        if let Some(scope) = request_scope {
             params.push(("scope", scope.to_string()));
         }
 
@@ -1499,10 +1662,12 @@ impl OAuthAuthorizationCode {
             token_response.refresh_token = Some(refresh_token.to_string());
         }
 
-        // A refresh response without `scope` keeps the previous grant.
+        // RFC 6749 section 5.1: an omitted `scope` means the grant matches
+        // what this request asked for. A request without `scope` keeps the
+        // previous grant.
         Ok(to_cached_token(
             token_response,
-            granted_scope.map(str::to_string),
+            request_scope.or(granted_scope).map(str::to_string),
         ))
     }
 }
@@ -1634,8 +1799,18 @@ impl TokenProvider for OAuthAuthorizationCode {
         if let Some(ref token) = *cache
             && let Some(ref refresh) = token.refresh_token
         {
+            let request_scope = self.inner.refresh_scope_policy.request_scope(
+                token
+                    .scope
+                    .as_deref()
+                    .unwrap_or_default()
+                    .split_ascii_whitespace(),
+            )?;
             tracing::debug!("Refreshing OAuth access token");
-            match self.refresh_token(refresh, token.scope.as_deref()).await {
+            match self
+                .refresh_token(refresh, token.scope.as_deref(), request_scope.as_deref())
+                .await
+            {
                 Ok(new_token) => {
                     let access = new_token.access_token.clone();
                     *cache = Some(new_token);
@@ -1712,6 +1887,9 @@ pub struct OAuthAuthCodeConfig {
     /// used in token requests is overridden. Must be an absolute URL without
     /// a fragment, the same requirement enforced on the discovered resource.
     pub resource: Option<String>,
+    /// Controls the `scope` parameter on refresh requests. Default:
+    /// [`OAuthRefreshScopePolicy::SendGranted`].
+    pub refresh_scope_policy: OAuthRefreshScopePolicy,
 }
 
 impl Default for OAuthAuthCodeConfig {
@@ -1725,6 +1903,7 @@ impl Default for OAuthAuthCodeConfig {
             challenge: None,
             preferred_authorization_server: None,
             resource: None,
+            refresh_scope_policy: OAuthRefreshScopePolicy::default(),
         }
     }
 }
@@ -2223,6 +2402,7 @@ mod tests {
             .refresh_token(
                 token.refresh_token.as_deref().unwrap(),
                 token.scope.as_deref(),
+                token.scope.as_deref(),
             )
             .await
             .unwrap();
@@ -2643,6 +2823,7 @@ mod tests {
             client_secret: Some("stored-secret".to_string()),
             method: OAuthClientRegistrationMethod::Dynamic,
             bound_issuer: Some(issuer.to_string()),
+            client_secret_expires_at: None,
         };
         let store = MemoryOAuthClientRegistrationStore::new();
         store.save(issuer, &registration).await.unwrap();
@@ -2673,6 +2854,7 @@ mod tests {
             client_secret: Some("old-secret".to_string()),
             method: OAuthClientRegistrationMethod::Dynamic,
             bound_issuer: Some(old_issuer.to_string()),
+            client_secret_expires_at: None,
         };
         let store = MemoryOAuthClientRegistrationStore::new();
         store.save(old_issuer, &old_registration).await.unwrap();
@@ -2720,6 +2902,7 @@ mod tests {
             client_secret: None,
             method: OAuthClientRegistrationMethod::Dynamic,
             bound_issuer: Some("https://old-auth.example.com".to_string()),
+            client_secret_expires_at: None,
         };
         let store = MemoryOAuthClientRegistrationStore::new();
         store.save(issuer, &registration).await.unwrap();
@@ -2953,6 +3136,7 @@ mod tests {
                 redirect_uri: "http://127.0.0.1:0/callback".to_string(),
                 scopes: None,
                 refresh_buffer: Duration::from_secs(30),
+                refresh_scope_policy: OAuthRefreshScopePolicy::default(),
                 client: reqwest::Client::new(),
                 cache: RwLock::new(Some(cache)),
                 callback_rx: Mutex::new(None),
@@ -3052,6 +3236,20 @@ mod tests {
     async fn spawn_recording_json_server(
         responses: Vec<serde_json::Value>,
     ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        spawn_scripted_json_server(move |_body, index| {
+            ("200 OK", responses[index.min(responses.len() - 1)].clone())
+        })
+        .await
+    }
+
+    /// A local JSON endpoint that records every request body and answers
+    /// each with `respond(body, request_index)`.
+    async fn spawn_scripted_json_server<F>(
+        respond: F,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>)
+    where
+        F: Fn(&str, usize) -> (&'static str, serde_json::Value) + Send + 'static,
+    {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3087,14 +3285,15 @@ mod tests {
                     let read = stream.read(&mut chunk).await.unwrap();
                     bytes.extend_from_slice(&chunk[..read]);
                 }
-                recorded.lock().unwrap().push(
+                let request_body =
                     String::from_utf8_lossy(&bytes[header_end..header_end + content_length])
-                        .to_string(),
-                );
-                let body = responses[index.min(responses.len() - 1)].to_string();
+                        .to_string();
+                let (status, body) = respond(&request_body, index);
+                recorded.lock().unwrap().push(request_body);
+                let body = body.to_string();
                 index += 1;
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 let _ = stream.write_all(response.as_bytes()).await;
@@ -3148,6 +3347,235 @@ mod tests {
         for body in bodies.iter() {
             assert_eq!(form_field(body, "scope").as_deref(), Some("read"));
         }
+    }
+
+    /// Bound a test that talks to a local mock server.
+    async fn bounded<F: std::future::Future>(future: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(10), future)
+            .await
+            .expect("test timed out")
+    }
+
+    /// A token endpoint with the behavior reported for Salesforce (#1617): a
+    /// refresh containing `scope` gets `invalid_request`. Every other refresh
+    /// succeeds and rotates the refresh token. `scopes[n]` is the `scope` the
+    /// n-th successful response returns (`None` omits the field).
+    async fn spawn_scope_rejecting_token_server(
+        scopes: Vec<Option<&'static str>>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        spawn_scripted_json_server(move |body, index| {
+            if form_field(body, "scope").is_some() {
+                return (
+                    "400 Bad Request",
+                    serde_json::json!({
+                        "error": "invalid_request",
+                        "error_description": "scope parameter not supported"
+                    }),
+                );
+            }
+            let mut response = serde_json::json!({
+                "access_token": format!("access-{index}"),
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "refresh_token": format!("rotated-{index}"),
+            });
+            if let Some(scope) = scopes[index.min(scopes.len() - 1)] {
+                response["scope"] = scope.into();
+            }
+            ("200 OK", response)
+        })
+        .await
+    }
+
+    fn expired_token_with_scope(scope: Option<&str>) -> CachedAuthCodeToken {
+        CachedAuthCodeToken {
+            access_token: "expired-access-token".to_string(),
+            refresh_token: Some("refresh-token".to_string()),
+            expires_at: Instant::now() - Duration::from_secs(1),
+            scope: scope.map(str::to_string),
+        }
+    }
+
+    fn with_refresh_scope_policy(
+        provider: OAuthAuthorizationCode,
+        refresh_scope_policy: OAuthRefreshScopePolicy,
+    ) -> OAuthAuthorizationCode {
+        OAuthAuthorizationCode {
+            inner: Arc::new(OAuthAuthCodeInner {
+                refresh_scope_policy,
+                ..Arc::into_inner(provider.inner).unwrap()
+            }),
+        }
+    }
+
+    /// #1617: a server that rejects `scope` on refresh works with the omit
+    /// policy, repeatedly, and the recorded grant survives. `resource` and
+    /// refresh-token rotation are unaffected.
+    #[tokio::test]
+    async fn omit_policy_survives_a_token_endpoint_that_rejects_refresh_scope() {
+        bounded(async {
+            let (base, bodies) =
+                spawn_scope_rejecting_token_server(vec![Some("read write"), None, Some("read")])
+                    .await;
+            let provider = with_refresh_scope_policy(
+                test_provider_with_cached_token(
+                    format!("{base}/token"),
+                    expired_token_with_scope(Some("read write")),
+                ),
+                OAuthRefreshScopePolicy::Omit,
+            );
+            let recorded = |provider: &OAuthAuthorizationCode| {
+                let provider = provider.clone();
+                async move { provider.inner.cache.read().await.clone().unwrap().scope }
+            };
+
+            assert_eq!(
+                TokenProvider::get_token(&provider).await.unwrap(),
+                "access-0"
+            );
+            assert_eq!(recorded(&provider).await.as_deref(), Some("read write"));
+
+            // This response omits `scope`, so the previous grant is kept.
+            provider.invalidate().await;
+            assert_eq!(
+                TokenProvider::get_token(&provider).await.unwrap(),
+                "access-1"
+            );
+            assert_eq!(recorded(&provider).await.as_deref(), Some("read write"));
+
+            // A returned `scope` still replaces the grant.
+            provider.invalidate().await;
+            assert_eq!(
+                TokenProvider::get_token(&provider).await.unwrap(),
+                "access-2"
+            );
+            assert_eq!(recorded(&provider).await.as_deref(), Some("read"));
+
+            let bodies = bodies.lock().unwrap();
+            let sent_refresh_tokens: Vec<_> = bodies
+                .iter()
+                .map(|body| form_field(body, "refresh_token").unwrap())
+                .collect();
+            assert_eq!(
+                sent_refresh_tokens,
+                ["refresh-token", "rotated-0", "rotated-1"]
+            );
+            for body in bodies.iter() {
+                assert_eq!(form_field(body, "scope"), None);
+                assert_eq!(
+                    form_field(body, "resource").as_deref(),
+                    Some("https://mcp.example.com")
+                );
+            }
+        })
+        .await;
+    }
+
+    /// #1617: the default policy still sends the grant, so a server that
+    /// rejects `scope` fails exactly as before. This is what keeps the
+    /// default unchanged for servers that require the parameter.
+    #[tokio::test]
+    async fn default_policy_still_sends_scope_to_a_rejecting_endpoint() {
+        bounded(async {
+            let (base, bodies) = spawn_scope_rejecting_token_server(vec![Some("read")]).await;
+            let provider = test_provider_with_cached_token(
+                format!("{base}/token"),
+                expired_token_with_scope(Some("read")),
+            );
+
+            let error = provider
+                .refresh_token("refresh-token", Some("read"), Some("read"))
+                .await
+                .unwrap_err();
+
+            assert!(error.to_string().contains("scope parameter not supported"));
+            assert_eq!(bodies.lock().unwrap().len(), 1);
+        })
+        .await;
+    }
+
+    /// #1617: a narrowed request sends only those scopes, and a response
+    /// without `scope` records what was requested (RFC 6749 section 5.1).
+    #[tokio::test]
+    async fn narrow_policy_sends_a_subset_of_the_grant() {
+        bounded(async {
+            let (base, bodies) = spawn_recording_json_server(vec![serde_json::json!({
+                "access_token": "narrowed",
+                "token_type": "Bearer",
+                "expires_in": 3600
+            })])
+            .await;
+            let provider = with_refresh_scope_policy(
+                test_provider_with_cached_token(
+                    format!("{base}/token"),
+                    expired_token_with_scope(Some("read write")),
+                ),
+                OAuthRefreshScopePolicy::Narrow(vec!["read".to_string()]),
+            );
+
+            TokenProvider::get_token(&provider).await.unwrap();
+            provider.invalidate().await;
+            TokenProvider::get_token(&provider).await.unwrap();
+
+            {
+                let bodies = bodies.lock().unwrap();
+                assert_eq!(bodies.len(), 2);
+                for body in bodies.iter() {
+                    assert_eq!(form_field(body, "scope").as_deref(), Some("read"));
+                }
+            }
+            assert_eq!(
+                provider
+                    .inner
+                    .cache
+                    .read()
+                    .await
+                    .clone()
+                    .unwrap()
+                    .scope
+                    .as_deref(),
+                Some("read")
+            );
+        })
+        .await;
+    }
+
+    /// #1617: an invalid narrowing is reported and nothing is sent, so it
+    /// cannot become a broader request.
+    #[tokio::test]
+    async fn invalid_narrowing_fails_without_a_refresh_request() {
+        bounded(async {
+            let (base, bodies) = spawn_recording_json_server(vec![serde_json::json!({
+                "access_token": "unexpected",
+                "token_type": "Bearer"
+            })])
+            .await;
+            let provider = with_refresh_scope_policy(
+                test_provider_with_cached_token(
+                    format!("{base}/token"),
+                    expired_token_with_scope(Some("read")),
+                ),
+                OAuthRefreshScopePolicy::Narrow(vec!["read admin".to_string()]),
+            );
+
+            let error = TokenProvider::get_token(&provider).await.unwrap_err();
+
+            assert!(error.to_string().contains("`admin`"), "got: {error}");
+            assert!(bodies.lock().unwrap().is_empty());
+            assert_eq!(
+                provider
+                    .inner
+                    .cache
+                    .read()
+                    .await
+                    .clone()
+                    .unwrap()
+                    .scope
+                    .as_deref(),
+                Some("read")
+            );
+        })
+        .await;
     }
 
     /// A scope returned on refresh replaces the recorded grant.
@@ -3354,6 +3782,390 @@ mod tests {
         )
         .await;
         assert_eq!(result.unwrap().client_secret(), None);
+    }
+
+    // =========================================================================
+    // client_secret_expires_at (#1618)
+    // =========================================================================
+
+    const NOW: u64 = 1_800_000_000;
+    const ISSUER: &str = "https://auth.example.com";
+
+    fn stored_with_expiry(expires_at: Option<u64>) -> OAuthClientRegistration {
+        OAuthClientRegistration::dynamically_registered_with_secret_expiry(
+            ISSUER,
+            "stored-client",
+            Some("stored-secret".to_string()),
+            expires_at,
+        )
+    }
+
+    /// Resolve through the store at a fixed clock against a registration
+    /// endpoint that issues `new-client`, returning the result and how many
+    /// registration requests were made.
+    async fn resolve_stored_at(
+        store: &MemoryOAuthClientRegistrationStore,
+        now: u64,
+    ) -> (Result<OAuthClientRegistration, OAuthClientError>, usize) {
+        let (base, bodies) = spawn_recording_json_server(vec![serde_json::json!({
+            "client_id": "new-client",
+            "client_secret": "new-secret",
+            "client_secret_expires_at": NOW + 3600,
+        })])
+        .await;
+        let mut metadata = authorization_server_metadata(ISSUER);
+        metadata.registration_endpoint = Some(format!("{base}/register"));
+        let result = resolve_oauth_client_registration_inner(
+            &reqwest::Client::new(),
+            &metadata,
+            &dynamic_registration_options("client_secret_basic"),
+            Some(store),
+            now,
+        )
+        .await;
+        let requests = bodies.lock().unwrap().len();
+        (result, requests)
+    }
+
+    #[test]
+    fn secret_expiry_distinguishes_finite_zero_and_unknown() {
+        for (expires_at, now, expired) in [
+            (Some(NOW + 1), NOW, false),
+            (Some(NOW), NOW, true),
+            (Some(NOW - 1), NOW, true),
+            (Some(0), NOW, false),
+            (Some(0), u64::MAX, false),
+            (None, u64::MAX, false),
+        ] {
+            assert_eq!(
+                stored_with_expiry(expires_at).is_client_secret_expired_at(now),
+                expired,
+                "{expires_at:?} at {now}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_public_client_has_no_secret_expiry() {
+        let registration = OAuthClientRegistration::dynamically_registered_with_secret_expiry(
+            ISSUER,
+            "public-client",
+            None,
+            Some(1),
+        );
+        assert_eq!(registration.client_secret_expires_at(), None);
+        assert!(!registration.is_client_secret_expired_at(NOW));
+
+        // A hand-written record cannot make a public client expire either.
+        let restored: OAuthClientRegistration = serde_json::from_value(serde_json::json!({
+            "client_id": "public-client",
+            "client_secret": null,
+            "method": "dynamic",
+            "bound_issuer": ISSUER,
+            "client_secret_expires_at": 1,
+        }))
+        .unwrap();
+        assert!(!restored.is_client_secret_expired_at(NOW));
+    }
+
+    #[test]
+    fn secret_expiry_round_trips_through_serialization() {
+        for (expires_at, serialized) in [
+            (Some(NOW), serde_json::json!(NOW)),
+            (Some(0), serde_json::json!(0)),
+            (None, serde_json::Value::Null),
+        ] {
+            let registration = stored_with_expiry(expires_at);
+            let json = serde_json::to_value(&registration).unwrap();
+            assert_eq!(json["client_secret_expires_at"], serialized);
+            assert_eq!(
+                json.as_object()
+                    .unwrap()
+                    .contains_key("client_secret_expires_at"),
+                expires_at.is_some()
+            );
+            let restored: OAuthClientRegistration = serde_json::from_value(json).unwrap();
+            assert_eq!(restored, registration);
+            assert_eq!(restored.client_secret_expires_at(), expires_at);
+        }
+    }
+
+    #[test]
+    fn records_written_before_the_field_existed_have_an_unknown_expiry() {
+        let restored: OAuthClientRegistration = serde_json::from_str(
+            r#"{"client_id":"old","client_secret":"s","method":"dynamic",
+                "bound_issuer":"https://auth.example.com"}"#,
+        )
+        .unwrap();
+        assert_eq!(restored.client_secret_expires_at(), None);
+        assert!(!restored.is_client_secret_expired_at(u64::MAX));
+    }
+
+    #[test]
+    fn debug_shows_the_expiry_and_redacts_the_secret() {
+        let debug = format!("{:?}", stored_with_expiry(Some(NOW)));
+        assert!(
+            debug.contains(&NOW.to_string()),
+            "Debug output is missing the expiry"
+        );
+        assert!(
+            !debug.contains("stored-secret"),
+            "Debug output contains the client secret"
+        );
+    }
+
+    /// Both the storeless and the store-backed public paths expose the value
+    /// the server sent, for finite, zero, absent, and unusable expiries.
+    #[tokio::test]
+    async fn dcr_response_expiry_is_exposed_by_both_public_paths() {
+        bounded(async {
+            for (sent, expected) in [
+                (Some(serde_json::json!(NOW + 60)), Some(NOW + 60)),
+                (Some(serde_json::json!(0)), Some(0)),
+                (None, None),
+                (Some(serde_json::Value::Null), None),
+                (Some(serde_json::json!("soon")), None),
+                (Some(serde_json::json!(-1)), None),
+                (Some(serde_json::json!(1.5)), None),
+            ] {
+                let mut response = serde_json::json!({ "client_id": "c", "client_secret": "s" });
+                if let Some(sent) = sent.clone() {
+                    response["client_secret_expires_at"] = sent;
+                }
+                let (result, _) =
+                    register_with_advertised_methods("client_secret_basic", &[], response.clone())
+                        .await;
+                assert_eq!(
+                    result.unwrap().client_secret_expires_at(),
+                    expected,
+                    "storeless path, {sent:?}"
+                );
+
+                let (base, _) = spawn_recording_json_server(vec![response]).await;
+                let mut metadata = authorization_server_metadata(ISSUER);
+                metadata.registration_endpoint = Some(format!("{base}/register"));
+                let store = MemoryOAuthClientRegistrationStore::new();
+                let resolved = resolve_oauth_client_registration_with_store(
+                    &reqwest::Client::new(),
+                    &metadata,
+                    &dynamic_registration_options("client_secret_basic"),
+                    &store,
+                )
+                .await
+                .unwrap();
+                assert_eq!(resolved.client_secret_expires_at(), expected, "{sent:?}");
+                let saved = store.load(ISSUER).await.unwrap().unwrap();
+                assert_eq!(saved.client_secret_expires_at(), expected, "{sent:?}");
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn dcr_response_for_a_public_client_records_no_expiry() {
+        bounded(async {
+            let (result, _) = register_with_advertised_methods(
+                "none",
+                &[],
+                serde_json::json!({ "client_id": "c", "client_secret_expires_at": 1 }),
+            )
+            .await;
+            let registration = result.unwrap();
+            assert_eq!(registration.client_secret(), None);
+            assert_eq!(registration.client_secret_expires_at(), None);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_secret_issued_already_expired_is_rejected_and_not_saved() {
+        bounded(async {
+            let (base, _) = spawn_recording_json_server(vec![serde_json::json!({
+                "client_id": "c",
+                "client_secret": "s",
+                "client_secret_expires_at": 1,
+            })])
+            .await;
+            let mut metadata = authorization_server_metadata(ISSUER);
+            metadata.registration_endpoint = Some(format!("{base}/register"));
+            let store = MemoryOAuthClientRegistrationStore::new();
+
+            let error = resolve_oauth_client_registration_with_store(
+                &reqwest::Client::new(),
+                &metadata,
+                &dynamic_registration_options("client_secret_basic"),
+                &store,
+            )
+            .await
+            .unwrap_err();
+
+            assert!(
+                matches!(error, OAuthClientError::Registration(_)),
+                "{error}"
+            );
+            assert!(store.is_empty().await);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_stored_secret_is_reused_until_it_is_known_to_be_expired() {
+        bounded(async {
+            for (expires_at, now) in [
+                (Some(NOW + 1), NOW),
+                (Some(0), NOW),
+                (Some(0), u64::MAX),
+                (None, u64::MAX),
+            ] {
+                let store = MemoryOAuthClientRegistrationStore::new();
+                let stored = stored_with_expiry(expires_at);
+                store.save(ISSUER, &stored).await.unwrap();
+
+                let (result, requests) = resolve_stored_at(&store, now).await;
+
+                assert_eq!(result.unwrap(), stored, "{expires_at:?} at {now}");
+                assert_eq!(requests, 0, "{expires_at:?} at {now}");
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_expired_stored_secret_is_replaced_by_registering_again() {
+        bounded(async {
+            let store = MemoryOAuthClientRegistrationStore::new();
+            store
+                .save(ISSUER, &stored_with_expiry(Some(NOW)))
+                .await
+                .unwrap();
+
+            let (result, requests) = resolve_stored_at(&store, NOW).await;
+
+            let resolved = result.unwrap();
+            assert_eq!(requests, 1);
+            assert_eq!(resolved.client_id(), "new-client");
+            assert_eq!(resolved.client_secret_expires_at(), Some(NOW + 3600));
+            assert_eq!(resolved.bound_issuer(), Some(ISSUER));
+            assert_eq!(store.load(ISSUER).await.unwrap(), Some(resolved.clone()));
+
+            // Restoration: the replacement is reused while it is live.
+            let (again, requests) = resolve_stored_at(&store, NOW + 1).await;
+            assert_eq!(again.unwrap(), resolved);
+            assert_eq!(requests, 0);
+        })
+        .await;
+    }
+
+    /// The public entry point reads the real clock. A timestamp of 1 is in
+    /// the past on any clock, so this stays deterministic.
+    #[tokio::test]
+    async fn store_backed_public_path_does_not_reuse_an_expired_secret() {
+        bounded(async {
+            let store = MemoryOAuthClientRegistrationStore::new();
+            store
+                .save(ISSUER, &stored_with_expiry(Some(1)))
+                .await
+                .unwrap();
+            let (base, bodies) = spawn_recording_json_server(vec![serde_json::json!({
+                "client_id": "new-client",
+                "client_secret": "new-secret",
+                "client_secret_expires_at": 0,
+            })])
+            .await;
+            let mut metadata = authorization_server_metadata(ISSUER);
+            metadata.registration_endpoint = Some(format!("{base}/register"));
+
+            let resolved = resolve_oauth_client_registration_with_store(
+                &reqwest::Client::new(),
+                &metadata,
+                &dynamic_registration_options("client_secret_basic"),
+                &store,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(resolved.client_id(), "new-client");
+            assert_eq!(bodies.lock().unwrap().len(), 1);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_expired_secret_without_a_registration_endpoint_is_a_specific_error() {
+        bounded(async {
+            let store = MemoryOAuthClientRegistrationStore::new();
+            let stored = stored_with_expiry(Some(1));
+            store.save(ISSUER, &stored).await.unwrap();
+
+            let error = resolve_oauth_client_registration_with_store(
+                &reqwest::Client::new(),
+                &authorization_server_metadata(ISSUER),
+                &dynamic_registration_options("client_secret_basic"),
+                &store,
+            )
+            .await
+            .unwrap_err();
+
+            assert!(
+                matches!(error, OAuthClientError::ClientSecretExpired(_)),
+                "got: {error}"
+            );
+            let message = error.to_string();
+            assert!(message.contains("stored-client"), "got: {message}");
+            assert!(message.contains(ISSUER), "got: {message}");
+            assert!(message.contains("registration_endpoint"), "got: {message}");
+            assert!(!message.contains("stored-secret"), "got: {message}");
+            assert_eq!(store.load(ISSUER).await.unwrap(), Some(stored));
+        })
+        .await;
+    }
+
+    /// The issuer binding is checked before expiry, so a mis-keyed record is
+    /// reported as corruption instead of triggering a new registration.
+    #[tokio::test]
+    async fn issuer_binding_is_checked_before_expiry() {
+        bounded(async {
+            let store = MemoryOAuthClientRegistrationStore::new();
+            let wrong_issuer = OAuthClientRegistration::dynamically_registered_with_secret_expiry(
+                "https://other-auth.example.com",
+                "stored-client",
+                Some("stored-secret".to_string()),
+                Some(1),
+            );
+            store.save(ISSUER, &wrong_issuer).await.unwrap();
+
+            let (result, requests) = resolve_stored_at(&store, NOW).await;
+
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, OAuthClientError::CredentialStore(_)),
+                "{error}"
+            );
+            assert_eq!(requests, 0);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_stored_public_client_is_reused_regardless_of_expiry_fields() {
+        bounded(async {
+            let store = MemoryOAuthClientRegistrationStore::new();
+            let public: OAuthClientRegistration = serde_json::from_value(serde_json::json!({
+                "client_id": "public-client",
+                "client_secret": null,
+                "method": "dynamic",
+                "bound_issuer": ISSUER,
+                "client_secret_expires_at": 1,
+            }))
+            .unwrap();
+            store.save(ISSUER, &public).await.unwrap();
+
+            let (result, requests) = resolve_stored_at(&store, NOW).await;
+
+            assert_eq!(result.unwrap().client_id(), "public-client");
+            assert_eq!(requests, 0);
+        })
+        .await;
     }
 
     // =========================================================================

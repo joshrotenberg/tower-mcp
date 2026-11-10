@@ -6856,3 +6856,103 @@ async fn legacy_initialize_with_malformed_envelope_gets_a_matching_id() {
         "error message must not name the Rust type (#1284 precedent): {message}"
     );
 }
+
+/// Status of a legacy SSE GET on a valid initialized session, given one
+/// `Accept` field per slice element.
+async fn legacy_sse_get_status(app: &Router, session_id: &str, accept: &[&str]) -> StatusCode {
+    let mut builder = Request::builder()
+        .method("GET")
+        .uri("/")
+        .header(MCP_SESSION_ID_HEADER, session_id);
+    for value in accept {
+        builder = builder.header(
+            header::ACCEPT,
+            HeaderValue::from_bytes(value.as_bytes()).unwrap(),
+        );
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    response.status()
+}
+
+/// Legacy SSE GET admission parses `Accept` as a media-range list (#1619).
+#[tokio::test]
+async fn legacy_sse_get_parses_accept_media_ranges() {
+    const ADMITTED: &[&[&str]] = &[
+        &["text/event-stream"],
+        &["TEXT/EVENT-STREAM"],
+        &["Text/Event-Stream"],
+        &["application/json, text/event-stream"],
+        &["application/json", "text/event-stream"],
+        &["application/json", "TEXT/event-STREAM;q=0.5"],
+        &["\ttext/event-stream  ,application/json"],
+        &["text/event-stream;q=1"],
+        &["text/event-stream ; Q=0.5"],
+        &["text/event-stream;q=0.001"],
+        // A positive entry admits even when another is zero-weighted.
+        &["text/event-stream;q=0, text/event-stream;q=0.5"],
+        // Only an explicit zero excludes; a malformed weight is ignored.
+        &["text/event-stream;q=abc"],
+        // Valid parameters, including delimiters inside quoted strings.
+        &["text/event-stream;charset=utf-8"],
+        &[r#"text/event-stream;note="a,b;c""#],
+        &[r#"text/event-stream;note="a;q=0""#],
+        &[r#"text/event-stream;note="q=0, x""#],
+        &[r#"text/event-stream;note="esc\",aped;q=0""#],
+        &[r#"application/json;note="a,b", text/event-stream"#],
+        &["text/event-stream;note=\"café\""],
+    ];
+    const REJECTED: &[&[&str]] = &[
+        &[],
+        &[""],
+        &["application/json"],
+        &["application/json", "text/html"],
+        // Lookalikes that contain the type as a substring.
+        &["text/event-streamx"],
+        &["xtext/event-stream"],
+        &["text/event-stream-v2"],
+        &["text/event-stream+json"],
+        &["application/text/event-stream"],
+        // Explicit zero quality.
+        &["text/event-stream;q=0"],
+        &["text/event-stream; q=0.0"],
+        &["text/event-stream ;Q=0.000"],
+        &["text/event-stream;q=0."],
+        &[r#"text/event-stream;q=0;note="x""#],
+        &["text/event-stream;q=0", "application/json"],
+        // A media type only named inside another entry's quoted parameter.
+        &[r#"application/json;note="text/event-stream""#],
+        &[r#"application/json;note="a, text/event-stream""#],
+        &[r#"application/json;note="esc\", text/event-stream""#],
+        // The existing policy requires SSE to be named explicitly.
+        &["*/*"],
+        &["text/*"],
+    ];
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let app = HttpTransport::new(create_test_router())
+            .disable_origin_validation()
+            .into_router();
+        let session_id = init_session(&app).await;
+
+        let mut mismatches = Vec::new();
+        for accept in ADMITTED {
+            let status = legacy_sse_get_status(&app, &session_id, accept).await;
+            if status != StatusCode::OK {
+                mismatches.push(format!("expected 200, got {status} for {accept:?}"));
+            }
+        }
+        for accept in REJECTED {
+            let status = legacy_sse_get_status(&app, &session_id, accept).await;
+            if status != StatusCode::NOT_ACCEPTABLE {
+                mismatches.push(format!("expected 406, got {status} for {accept:?}"));
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    })
+    .await
+    .expect("legacy SSE GET matrix timed out");
+}

@@ -34,6 +34,12 @@
 //! clients are always handled correctly even on transports that never call
 //! `HttpTransport::stateless()`.
 //!
+//! A call on this path answers with plain JSON and its usual HTTP status when
+//! it finishes silently within [`HttpTransport::initial_response_timeout()`]
+//! (30 seconds by default). Past that it commits an SSE response and sends
+//! keepalives; an error returned after the commit travels in-band under the
+//! committed 200.
+//!
 //! ### Legacy SEP-1442 opt-in path
 //!
 //! Calling [`HttpTransport::stateless()`] with a [`crate::stateless::StatelessConfig`]
@@ -453,6 +459,9 @@ struct AppState {
     /// responses (see [`HttpTransport::stamp_server_info()`]).
     #[cfg(feature = "stateless")]
     stamp_server_info: bool,
+    /// See [`HttpTransport::initial_response_timeout()`].
+    #[cfg(feature = "stateless")]
+    initial_response_timeout: Option<Duration>,
     /// Active final-protocol `subscriptions/listen` streams.
     #[cfg(feature = "stateless")]
     modern_subscriptions: Arc<ModernSubscriptionRegistry>,
@@ -525,6 +534,9 @@ pub struct HttpTransport {
     /// See [`HttpTransport::stamp_server_info()`] for details.
     #[cfg(feature = "stateless")]
     stamp_server_info: bool,
+    /// See [`HttpTransport::initial_response_timeout()`].
+    #[cfg(feature = "stateless")]
+    initial_response_timeout: Option<Duration>,
     #[cfg(feature = "oauth")]
     oauth_config: Option<OAuthConfig>,
     /// When true, synchronous JSON-RPC responses are wrapped in SSE format.
@@ -569,6 +581,8 @@ impl HttpTransport {
             subscription_limits: SubscriptionLimits::default(),
             #[cfg(feature = "stateless")]
             stamp_server_info: true,
+            #[cfg(feature = "stateless")]
+            initial_response_timeout: Some(DEFAULT_INITIAL_RESPONSE_TIMEOUT),
             #[cfg(feature = "oauth")]
             oauth_config: None,
             sse_responses: false,
@@ -772,6 +786,8 @@ impl HttpTransport {
             subscription_limits: SubscriptionLimits::default(),
             #[cfg(feature = "stateless")]
             stamp_server_info: true,
+            #[cfg(feature = "stateless")]
+            initial_response_timeout: Some(DEFAULT_INITIAL_RESPONSE_TIMEOUT),
             #[cfg(feature = "oauth")]
             oauth_config: None,
             sse_responses: false,
@@ -988,6 +1004,48 @@ impl HttpTransport {
     /// ```
     pub fn sse_responses(mut self, enabled: bool) -> Self {
         self.sse_responses = enabled;
+        self
+    }
+
+    /// How long a silent 2026-07-28 sessionless call may leave the client
+    /// without a response head before the transport commits an SSE response.
+    ///
+    /// Until the handler emits a notification or finishes, a sessionless call
+    /// has sent no bytes, so a long-running one can be dropped by a proxy's
+    /// response-header or idle timeout even though it is healthy. When this
+    /// interval elapses first, the transport commits `200 text/event-stream`,
+    /// writes an SSE comment, sends keepalive comments every 30 seconds while
+    /// the handler runs, and delivers the terminal result as the last event.
+    ///
+    /// A handler that finishes within the interval is unaffected: its result
+    /// or error keeps the usual JSON body and HTTP status. A handler that
+    /// emits a request-scoped notification first upgrades to SSE as it always
+    /// has. A result that is ready at the moment the interval elapses still
+    /// takes the JSON path.
+    ///
+    /// **After the response is committed the HTTP status can no longer
+    /// change.** An error the handler returns later, including one that would
+    /// otherwise map to HTTP 400 or 404, travels in-band as a JSON-RPC error
+    /// event under the committed 200.
+    ///
+    /// Client disconnect still cancels the request after the commit. Pass
+    /// `None` to disable the deadline, so a silent call sends nothing until
+    /// it finishes. Legacy session requests and `subscriptions/listen` are
+    /// not affected.
+    ///
+    /// Default: `Some(Duration::from_secs(30))`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use std::time::Duration;
+    ///
+    /// let transport = HttpTransport::new(router)
+    ///     .initial_response_timeout(Some(Duration::from_secs(10)));
+    /// ```
+    #[cfg(feature = "stateless")]
+    pub fn initial_response_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.initial_response_timeout = timeout;
         self
     }
 
@@ -1525,6 +1583,8 @@ impl HttpTransport {
             #[cfg(feature = "stateless")]
             stamp_server_info: self.stamp_server_info,
             #[cfg(feature = "stateless")]
+            initial_response_timeout: self.initial_response_timeout,
+            #[cfg(feature = "stateless")]
             modern_subscriptions,
             sse_responses: self.sse_responses,
             extension_bridges: self.extension_bridges.clone(),
@@ -1771,9 +1831,10 @@ use session::{Session, SessionRegistry};
 // breaks the default build that `--all-features` never exercises.
 #[cfg(feature = "stateless")]
 use stateless_dispatch::{
-    CancelOnDisconnect, ModernSubscriptionRegistry, StatelessSseContext,
-    handle_modern_subscriptions_listen_sse, is_stateless_protocol_version, modern_response_status,
-    stamp_server_info, stash_per_request_meta, stateless_sse_with_notifications,
+    CancelOnDisconnect, DEFAULT_INITIAL_RESPONSE_TIMEOUT, ModernSubscriptionRegistry,
+    StatelessSseContext, handle_modern_subscriptions_listen_sse, is_stateless_protocol_version,
+    modern_response_status, stamp_server_info, stash_per_request_meta,
+    stateless_sse_with_notifications,
 };
 
 #[cfg(test)]
