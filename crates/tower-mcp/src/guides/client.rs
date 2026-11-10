@@ -221,6 +221,20 @@ let prompts = client.list_all_prompts().await?;
 Use the single-page methods (`list_tools`, `list_tools_with_cursor`, and their
 resource/prompt equivalents) when you want to control page fetches.
 
+The `list_all_*` helpers return only the items, which is enough for one-off use.
+When you keep the combined list, call the matching
+`list_all_*_with_cache_hints` helper instead:
+
+```rust,ignore
+let listed = client.list_all_tools_with_cache_hints().await?;
+// `listed.items`, plus `listed.ttl_ms` and `listed.cache_scope` for the whole list.
+```
+
+`ttl_ms` is the time left until the earliest page expires, measured when
+pagination finishes. `cache_scope` is `Public` only when every page is public.
+If only some pages omit a hint, `ttl_ms` is zero and `cache_scope` is `Private`.
+If every page omits a hint, it stays `None`.
+
 `call_tool` preserves every content item and the protocol-level `is_error`
 flag. `call_tool_text` concatenates text items and converts a tool error result
 into a Rust error:
@@ -270,6 +284,9 @@ Important defaults and boundaries:
 - server TTLs are capped at 24 hours by default;
 - at most 512 distinct resource reads are retained by default;
 - stale data is not served after a refresh error unless explicitly enabled;
+- a cached result reports its remaining lifetime in `ttlMs` after the `max_ttl`
+  cap, a stale result served after a refresh error reports zero, and a result
+  without a server `ttlMs` still has none;
 - private cache entries are isolated by the configured partition;
 - list/resource change notifications invalidate matching entries;
 - MRTR interim results and task polling are not cached.
