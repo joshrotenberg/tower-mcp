@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [0.26.0] - 2026-11-10
 
+### Upgrade notes
+
+- **`OAuthAuthCodeConfig` has a new public field, `refresh_scope_policy` (breaking).** A struct literal that lists every field no longer compiles; add `..Default::default()` or set the field. The default, `OAuthRefreshScopePolicy::SendGranted`, keeps the previous refresh behavior. `Omit` and `Narrow(scopes)` are also available, on the config or through `OAuthAuthorizationFlowBuilder::refresh_scope_policy` (#1626).
+- **Expired DCR client secrets are not reused.** `OAuthClientRegistration` keeps the server's `client_secret_expires_at`. A stored registration whose secret has expired is re-registered, or the flow fails with the new `OAuthClientError::ClientSecretExpired`. Registrations serialized before this release load with the expiry unknown and are used as before (#1626).
+- **Initial response timeout on the 2026-07-28 HTTP path, on by default.** When a stateless call produces nothing for 30 s, the transport commits `200 text/event-stream`, sends keepalive comments every 30 s, and delivers the result as the last event. After that commit the HTTP status cannot change, so a later error that would have been HTTP 400 or 404 arrives as an in-band JSON-RPC error under the 200. Calls that finish within the interval are unaffected. Use `HttpTransport::initial_response_timeout(None)` for the previous behavior, or pass another duration. Legacy session requests and `subscriptions/listen` are not affected (#1627).
+- **`Accept` parsing for the legacy GET stream.** `text/event-stream` is now matched whole and case-insensitively across every `Accept` field, with parameters and quoted strings handled, and an entry with `q=0` is refused. Wildcards such as `*/*` still do not open the stream (#1627).
+- **Client SSE detection.** The client treats a response as SSE only when its media type is exactly `text/event-stream`, not a type that merely starts with it (#1628).
+- **`x-mcp-header` annotations** are read from the schema locations the spec defines, on both client and server, and a tool input property that is itself named `x-mcp-header` no longer causes HTTP 400 (#1628).
+- **Cache hints.** A response served from the client cache reports the remaining `ttlMs` (0 once stale) instead of the original value. New `list_all_tools_with_cache_hints`, `list_all_resources_with_cache_hints`, `list_all_resource_templates_with_cache_hints` and `list_all_prompts_with_cache_hints` return an `AggregateList<T>` that keeps the hints across pages (#1629).
+- **Final URL elicitation.** `tower-mcp-types` accepts and emits 2026-07-28 URL-mode elicitation without the removed `elicitationId`, through the new `ElicitRequestParams::FinalUrl` variant (#1630).
+- **Client shutdown.** A command queued while the client message loop exits now gets an error reply instead of waiting forever. This fixes an occasional hang in `initialize` after a connection error, when no caller-side timeout is set (#1633).
+
 ### Bug Fixes
 
 - **http:** Parse legacy SSE Accept values and start keepalives for silent final-protocol calls ([#1627](https://github.com/joshrotenberg/tower-mcp/pull/1627))
