@@ -3232,6 +3232,12 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
         token.cancel();
     }
     let _ = transport.close().await;
+    // A caller can take a queue slot before the loop stops and write its
+    // command after. Dropping the receiver would strand that command, and its
+    // reply channel, in the queue for as long as the client holds a sender.
+    // Draining waits for outstanding slots, so every reply channel resolves.
+    command_rx.close();
+    while command_rx.recv().await.is_some() {}
 }
 
 async fn resolve_inputs_with_handler<H: ClientHandler>(
