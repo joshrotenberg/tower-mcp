@@ -856,7 +856,9 @@ pub(super) fn validate_input_required_result(
                         },
                     )
                 }
-                InputRequest::Elicit(ElicitRequestParams::Url(_)) => (
+                InputRequest::Elicit(
+                    ElicitRequestParams::Url(_) | ElicitRequestParams::FinalUrl(_),
+                ) => (
                     actual
                         .elicitation
                         .as_ref()

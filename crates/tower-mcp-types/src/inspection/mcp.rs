@@ -1307,6 +1307,15 @@ mod tests {
             )
             .is_ok()
         );
+        let mut id_less = url.clone();
+        id_less["params"]
+            .as_object_mut()
+            .unwrap()
+            .remove("elicitationId");
+        assert!(
+            inspect("2025-11-25", id_less, Some(McpDirection::ServerToClient)).is_err(),
+            "2025-11-25 URL elicitation must carry elicitationId"
+        );
         let error = inspect("2025-06-18", url, Some(McpDirection::ServerToClient)).unwrap_err();
         assert_eq!(error.kind(), McpInspectionErrorKind::InvalidParams);
     }
