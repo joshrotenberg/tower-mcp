@@ -3441,3 +3441,61 @@ async fn legacy_elicitation_request_still_requires_the_id() {
         [ElicitRequestParams::Url(_)]
     ));
 }
+
+// =========================================================================
+// Commands queued while the message loop exits
+// =========================================================================
+
+/// A transport whose every send fails, which ends the message loop.
+struct FailingSendTransport;
+
+#[async_trait]
+impl ClientTransport for FailingSendTransport {
+    async fn send(&mut self, _message: &str) -> Result<()> {
+        Err(Error::Transport("send failed".to_string()))
+    }
+
+    async fn recv(&mut self) -> Result<Option<String>> {
+        std::future::pending().await
+    }
+
+    fn is_connected(&self) -> bool {
+        true
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// A command whose queue slot was taken before the loop exited, and which is
+/// written after, still has its reply channel released. Without that,
+/// `end_abandoned_session` after a failed `initialize` could wait forever.
+#[tokio::test]
+async fn a_command_queued_while_the_loop_exits_is_released() {
+    let client = McpClient::builder()
+        .connect_simple(FailingSendTransport)
+        .await
+        .unwrap();
+    let permit = client.command_tx.clone().reserve_owned().await.unwrap();
+
+    let failed: Result<serde_json::Value> =
+        client.send_request("ping", &serde_json::json!({})).await;
+    assert!(failed.is_err());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.command_tx.closed(),
+    )
+    .await
+    .expect("the message loop stops accepting commands");
+
+    let (done_tx, done_rx) = oneshot::channel();
+    permit.send(LoopCommand::EndSession { done_tx });
+    let released = tokio::time::timeout(std::time::Duration::from_secs(5), done_rx)
+        .await
+        .expect("a command queued while the loop exited is released");
+    assert!(
+        released.is_err(),
+        "the exited loop does not run the command"
+    );
+}
