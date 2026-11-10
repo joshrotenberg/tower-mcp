@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.26.0] - 2026-11-10
+
+### Bug Fixes
+
+- **types:** Accept and emit final URL elicitation without the removed elicitationId ([#1630](https://github.com/joshrotenberg/tower-mcp/pull/1630))
+
+
+
 ## [0.25.1] - 2026-11-02
 
 - Synchronize the workspace patch version; no crate behavior changes.
