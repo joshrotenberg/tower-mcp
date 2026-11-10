@@ -73,8 +73,9 @@ pub use http::{HttpClientConfig, HttpClientTransport, HttpStatusDetails};
 #[cfg(feature = "oauth-client")]
 pub use oauth::{
     OAuthBearerChallenge, OAuthClientCredentials, OAuthClientCredentialsBuilder, OAuthClientError,
-    OAuthScopeChallenge, OAuthScopeEscalationConfig, OAuthScopeEscalationHandler,
-    OAuthScopeEscalationRequest, OAuthTokenEndpointAuthMethod, TokenProvider,
+    OAuthRefreshScopePolicy, OAuthScopeChallenge, OAuthScopeEscalationConfig,
+    OAuthScopeEscalationHandler, OAuthScopeEscalationRequest, OAuthTokenEndpointAuthMethod,
+    TokenProvider,
 };
 #[cfg(feature = "oauth-client")]
 pub use oauth_authcode::{
@@ -96,7 +97,7 @@ pub use oauth_flow::{
     OAuthPendingAuthorizationState, OAuthRedirectPolicy, OAuthStoredToken, OAuthTokenBinding,
     OAuthTokenStore, ReqwestOAuthHttpClient,
 };
-pub use response_cache::{ClientCacheConfig, DEFAULT_MAX_CACHE_TTL};
+pub use response_cache::{AggregateList, ClientCacheConfig, DEFAULT_MAX_CACHE_TTL};
 pub use stdio::StdioClientTransport;
 pub use transport::ClientTransport;
 #[cfg(feature = "websocket")]
@@ -1857,6 +1858,49 @@ impl McpClient {
         Ok(all)
     }
 
+    /// List all tools with cache hints valid for the combined result.
+    ///
+    /// Use this when the caller keeps the combined list and needs to know how
+    /// long it may reuse it, or whether it may share it across authorization
+    /// contexts. Use [`list_all_tools`](Self::list_all_tools) when only the
+    /// items matter. [`AggregateList`] documents how page hints combine.
+    ///
+    /// ```rust
+    /// use tower_mcp::client::{ChannelTransport, McpClient};
+    /// use tower_mcp::{CallToolResult, McpRouter, ToolBuilder};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), tower_mcp::BoxError> {
+    /// let ping = ToolBuilder::new("ping")
+    ///     .description("Reply with pong")
+    ///     .no_params_handler(|| async { Ok(CallToolResult::text("pong")) })
+    ///     .build();
+    /// let server = McpRouter::new().server_info("demo", "1.0.0").tool(ping);
+    /// let client = McpClient::connect(ChannelTransport::new(server)).await?;
+    /// client.initialize("my-client", "1.0.0").await?;
+    ///
+    /// let listed = client.list_all_tools_with_cache_hints().await?;
+    /// assert_eq!(listed.items.len(), 1);
+    /// # client.shutdown().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn list_all_tools_with_cache_hints(&self) -> Result<AggregateList<ToolDefinition>> {
+        let mut all = Vec::new();
+        let mut cursor = None;
+        let mut hints = self.response_cache.aggregate_hints();
+        loop {
+            let result = self.list_tools_with_cursor(cursor).await?;
+            hints.observe(result.ttl_ms, result.cache_scope);
+            all.extend(result.tools);
+            match result.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        Ok(hints.finish(all))
+    }
+
     /// List all resources, following pagination cursors until exhausted.
     pub async fn list_all_resources(&self) -> Result<Vec<ResourceDefinition>> {
         let mut all = Vec::new();
@@ -1870,6 +1914,28 @@ impl McpClient {
             }
         }
         Ok(all)
+    }
+
+    /// List all resources with cache hints valid for the combined result.
+    ///
+    /// Use [`list_all_resources`](Self::list_all_resources) when only the items matter.
+    /// [`AggregateList`] documents how page hints combine.
+    pub async fn list_all_resources_with_cache_hints(
+        &self,
+    ) -> Result<AggregateList<ResourceDefinition>> {
+        let mut all = Vec::new();
+        let mut cursor = None;
+        let mut hints = self.response_cache.aggregate_hints();
+        loop {
+            let result = self.list_resources_with_cursor(cursor).await?;
+            hints.observe(result.ttl_ms, result.cache_scope);
+            all.extend(result.resources);
+            match result.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        Ok(hints.finish(all))
     }
 
     /// List all resource templates, following pagination cursors until exhausted.
@@ -1887,6 +1953,28 @@ impl McpClient {
         Ok(all)
     }
 
+    /// List all resource templates with cache hints valid for the combined result.
+    ///
+    /// Use [`list_all_resource_templates`](Self::list_all_resource_templates) when only the items matter.
+    /// [`AggregateList`] documents how page hints combine.
+    pub async fn list_all_resource_templates_with_cache_hints(
+        &self,
+    ) -> Result<AggregateList<ResourceTemplateDefinition>> {
+        let mut all = Vec::new();
+        let mut cursor = None;
+        let mut hints = self.response_cache.aggregate_hints();
+        loop {
+            let result = self.list_resource_templates_with_cursor(cursor).await?;
+            hints.observe(result.ttl_ms, result.cache_scope);
+            all.extend(result.resource_templates);
+            match result.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        Ok(hints.finish(all))
+    }
+
     /// List all prompts, following pagination cursors until exhausted.
     pub async fn list_all_prompts(&self) -> Result<Vec<PromptDefinition>> {
         let mut all = Vec::new();
@@ -1900,6 +1988,28 @@ impl McpClient {
             }
         }
         Ok(all)
+    }
+
+    /// List all prompts with cache hints valid for the combined result.
+    ///
+    /// Use [`list_all_prompts`](Self::list_all_prompts) when only the items matter.
+    /// [`AggregateList`] documents how page hints combine.
+    pub async fn list_all_prompts_with_cache_hints(
+        &self,
+    ) -> Result<AggregateList<PromptDefinition>> {
+        let mut all = Vec::new();
+        let mut cursor = None;
+        let mut hints = self.response_cache.aggregate_hints();
+        loop {
+            let result = self.list_prompts_with_cursor(cursor).await?;
+            hints.observe(result.ttl_ms, result.cache_scope);
+            all.extend(result.prompts);
+            match result.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        Ok(hints.finish(all))
     }
 
     /// Call a tool and return the concatenated text content.

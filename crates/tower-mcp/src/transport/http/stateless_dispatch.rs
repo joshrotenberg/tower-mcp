@@ -510,15 +510,10 @@ impl Drop for CancelOnDisconnect {
     }
 }
 
-/// Stream a sessionless POST response as SSE: the notifications the handler
-/// emitted, in order, followed by the terminal JSON-RPC response.
-///
-/// Invoked when a handler produced a notification before its terminal
-/// response on the 2026-07-28 sessionless path. A plain JSON body would drop
-/// those notifications (there is no session stream to carry them), so the
-/// response falls back to `text/event-stream`: the buffered first
-/// notification, any further notifications as they arrive, and finally the
-/// terminal response, after which the stream ends.
+/// Default for [`HttpTransport::initial_response_timeout()`].
+pub(super) const DEFAULT_INITIAL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Per-request state for [`stateless_sse_with_notifications`].
 pub(super) struct StatelessSseContext {
     pub(super) version: String,
     pub(super) method: String,
@@ -527,8 +522,23 @@ pub(super) struct StatelessSseContext {
     pub(super) subscriptions: Arc<ModernSubscriptionRegistry>,
 }
 
+/// Stream a sessionless POST response as SSE: the notifications the handler
+/// emitted, in order, followed by the terminal JSON-RPC response.
+///
+/// Invoked on the 2026-07-28 sessionless path when a handler produced a
+/// notification before its terminal response, or stayed silent past
+/// [`HttpTransport::initial_response_timeout()`]. A plain JSON body would drop
+/// those notifications (there is no session stream to carry them) and cannot
+/// be started before the result exists, so the response falls back to
+/// `text/event-stream`: the first notification if there was one, otherwise an
+/// SSE comment so bytes pass through intermediaries right away, then any
+/// further notifications as they arrive, and finally the terminal response,
+/// after which the stream ends.
+///
+/// The status is committed as 200, so an error the handler returns later
+/// travels in-band as the terminal event under that status.
 pub(super) fn stateless_sse_with_notifications(
-    first: crate::context::ServerNotification,
+    first: Option<crate::context::ServerNotification>,
     call: std::pin::Pin<
         Box<dyn std::future::Future<Output = crate::error::Result<JsonRpcResponse>> + Send>,
     >,
@@ -543,6 +553,9 @@ pub(super) fn stateless_sse_with_notifications(
         >,
         rx: crate::context::NotificationReceiver,
         rx_open: bool,
+        /// Whether an opening comment is still owed: set when the deadline
+        /// committed the response and there is no first notification.
+        opening_comment: bool,
         queue: std::collections::VecDeque<String>,
         terminal: Option<String>,
         version: String,
@@ -557,8 +570,10 @@ pub(super) fn stateless_sse_with_notifications(
         subscriptions: Arc<ModernSubscriptionRegistry>,
     }
 
+    let opening_comment = first.is_none();
     let mut queue = std::collections::VecDeque::new();
-    if !request.subscriptions.publish(&first)
+    if let Some(first) = first
+        && !request.subscriptions.publish(&first)
         && let Some(json) = crate::transport::stdio::serialize_notification(&first)
     {
         queue.push_back(json);
@@ -567,6 +582,7 @@ pub(super) fn stateless_sse_with_notifications(
         call: Some(call),
         rx,
         rx_open: true,
+        opening_comment,
         queue,
         terminal: None,
         version: request.version,
@@ -577,6 +593,9 @@ pub(super) fn stateless_sse_with_notifications(
     };
 
     let stream = futures::stream::unfold(ctx, |mut ctx| async move {
+        if std::mem::take(&mut ctx.opening_comment) {
+            return Some((Ok::<_, Infallible>(Event::default().comment("ping")), ctx));
+        }
         loop {
             // Buffered notifications flush first to preserve emission order.
             if let Some(json) = ctx.queue.pop_front() {

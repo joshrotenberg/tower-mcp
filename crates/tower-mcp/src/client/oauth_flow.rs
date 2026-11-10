@@ -7,22 +7,23 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine;
 use tokio::sync::{Mutex, RwLock, oneshot};
 
 use super::oauth::{
-    OAuthBearerChallenge, OAuthClientError, OAuthScopeEscalationHandler,
-    OAuthScopeEscalationRequest, OAuthTokenEndpointAuthMethod, TokenProvider,
+    OAuthBearerChallenge, OAuthClientError, OAuthRefreshScopePolicy, OAuthScopeEscalationHandler,
+    OAuthScopeEscalationRequest, OAuthTokenEndpointAuthMethod, TokenProvider, unix_time,
 };
 use super::oauth_authcode::{
     OAuthAuthorizationServerMetadata, OAuthClientRegistration, OAuthClientRegistrationMethod,
     OAuthClientRegistrationOptions, OAuthClientRegistrationStore, OAuthProtectedResourceMetadata,
-    discovery_reason, preferred_registration_auth_method,
-    require_secret_for_confidential_registration, validate_resource_identifier,
-    validate_resource_override,
+    client_secret_expired_error, deserialize_client_secret_expires_at, discovery_reason,
+    new_dynamic_registration, preferred_registration_auth_method,
+    require_secret_for_confidential_registration, stored_registration_is_reusable,
+    validate_resource_identifier, validate_resource_override,
 };
 
 /// HTTP method used by an OAuth protocol request.
@@ -575,6 +576,7 @@ struct FlowInner {
     redirect_policy: OAuthRedirectPolicy,
     preferred_issuer: Option<String>,
     refresh_buffer: Duration,
+    refresh_scope_policy: OAuthRefreshScopePolicy,
     authorization_handler: Option<Arc<dyn OAuthAuthorizationHandler>>,
     assertion_signer: Option<Arc<dyn OAuthClientAssertionSigner>>,
     current: RwLock<Option<ActiveToken>>,
@@ -618,6 +620,7 @@ pub struct OAuthAuthorizationFlowBuilder {
     redirect_policy: Option<OAuthRedirectPolicy>,
     preferred_issuer: Option<String>,
     refresh_buffer: Duration,
+    refresh_scope_policy: OAuthRefreshScopePolicy,
     authorization_handler: Option<Arc<dyn OAuthAuthorizationHandler>>,
     assertion_signer: Option<Arc<dyn OAuthClientAssertionSigner>>,
 }
@@ -660,6 +663,12 @@ impl OAuthAuthorizationFlowBuilder {
     }
 
     /// Configure issuer-bound client-credential persistence.
+    ///
+    /// A stored dynamically registered secret known to be expired is never
+    /// reused. See [`resolve_oauth_client_registration_with_store`] for how
+    /// it is replaced.
+    ///
+    /// [`resolve_oauth_client_registration_with_store`]: super::resolve_oauth_client_registration_with_store
     pub fn registration_store(
         mut self,
         store: impl OAuthClientRegistrationStore + 'static,
@@ -718,6 +727,16 @@ impl OAuthAuthorizationFlowBuilder {
         self
     }
 
+    /// Control the `scope` parameter on refresh requests.
+    ///
+    /// The default, [`OAuthRefreshScopePolicy::SendGranted`], sends the
+    /// recorded grant. Use [`OAuthRefreshScopePolicy::Omit`] for an
+    /// authorization server that rejects `scope` on refresh.
+    pub fn refresh_scope_policy(mut self, policy: OAuthRefreshScopePolicy) -> Self {
+        self.refresh_scope_policy = policy;
+        self
+    }
+
     /// Configure automatic browser/headless authorization handling.
     pub fn authorization_handler(mut self, handler: impl OAuthAuthorizationHandler) -> Self {
         self.authorization_handler = Some(Arc::new(handler));
@@ -769,6 +788,7 @@ impl OAuthAuthorizationFlowBuilder {
                 redirect_policy,
                 preferred_issuer: self.preferred_issuer,
                 refresh_buffer: self.refresh_buffer,
+                refresh_scope_policy: self.refresh_scope_policy,
                 authorization_handler: self.authorization_handler,
                 assertion_signer: self.assertion_signer,
                 current: RwLock::new(None),
@@ -902,6 +922,7 @@ impl OAuthAuthorizationFlow {
             redirect_policy: None,
             preferred_issuer: None,
             refresh_buffer: Duration::from_secs(30),
+            refresh_scope_policy: OAuthRefreshScopePolicy::default(),
             authorization_handler: None,
             assertion_signer: None,
         }
@@ -1005,6 +1026,7 @@ impl OAuthAuthorizationFlow {
             &metadata,
             &registration_options,
             self.inner.registration_store.as_ref(),
+            unix_time(),
         )
         .await?;
 
@@ -1233,13 +1255,17 @@ impl TokenProvider for OAuthAuthorizationFlow {
                     .to_string(),
             )
         })?;
+        let request_scope = self
+            .inner
+            .refresh_scope_policy
+            .request_scope(active.token.scopes.iter().map(String::as_str))?;
         let mut fields = vec![
             ("grant_type".to_string(), "refresh_token".to_string()),
             ("refresh_token".to_string(), refresh_token.to_string()),
             ("resource".to_string(), active.binding.resource.clone()),
         ];
-        if !active.token.scopes.is_empty() {
-            fields.push(("scope".to_string(), active.token.scopes.join(" ")));
+        if let Some(scope) = &request_scope {
+            fields.push(("scope".to_string(), scope.clone()));
         }
         let response = send_token_request(
             self.inner.http.as_ref(),
@@ -1295,9 +1321,16 @@ impl TokenProvider for OAuthAuthorizationFlow {
             }
             Err(error) => return Err(error),
         };
+        // RFC 6749 section 5.1: an omitted `scope` means the grant matches
+        // what this request asked for. A request without `scope` keeps the
+        // previous grant.
+        let fallback_scopes = match &request_scope {
+            Some(scope) => unique_scopes([scope]),
+            None => active.token.scopes.clone(),
+        };
         let token = token_from_response(
             response,
-            &active.token.scopes,
+            &fallback_scopes,
             active.token.refresh_token.clone(),
         )?;
         self.inner.token_store.save(&active.binding, &token).await?;
@@ -1648,6 +1681,7 @@ async fn resolve_registration_with_http(
     metadata: &OAuthAuthorizationServerMetadata,
     options: &OAuthClientRegistrationOptions,
     store: &dyn OAuthClientRegistrationStore,
+    now: u64,
 ) -> Result<OAuthClientRegistration, OAuthClientError> {
     if let Some(registration) = &options.pre_registered {
         if registration.method() != OAuthClientRegistrationMethod::PreRegistered {
@@ -1685,7 +1719,9 @@ async fn resolve_registration_with_http(
                 metadata.issuer
             )));
         }
-        return Ok(registration);
+        if stored_registration_is_reusable(&registration, metadata, now)? {
+            return Ok(registration);
+        }
     }
 
     if let (Some(endpoint), Some(request)) = (
@@ -1714,6 +1750,8 @@ async fn resolve_registration_with_http(
             client_id: String,
             client_secret: Option<String>,
             token_endpoint_auth_method: Option<String>,
+            #[serde(default, deserialize_with = "deserialize_client_secret_expires_at")]
+            client_secret_expires_at: Option<u64>,
         }
         let registered: RegistrationResponse = response.json()?;
         // RFC 7591 section 3.2.1: the response reports the registered
@@ -1725,11 +1763,13 @@ async fn resolve_registration_with_http(
                 .unwrap_or(&request.token_endpoint_auth_method),
             registered.client_secret.as_deref(),
         )?;
-        let registration = OAuthClientRegistration::dynamically_registered(
+        let registration = new_dynamic_registration(
             metadata.issuer.clone(),
             registered.client_id,
             registered.client_secret,
-        );
+            registered.client_secret_expires_at,
+            now,
+        )?;
         store.save(&metadata.issuer, &registration).await?;
         return Ok(registration);
     }
@@ -1778,6 +1818,20 @@ async fn send_token_request(
     let is_refresh = fields
         .iter()
         .any(|(name, value)| name == "grant_type" && value == "refresh_token");
+    // A registration held in memory or in persisted pending state can outlive
+    // its client secret, so this is checked where the secret would be sent.
+    if matches!(
+        method,
+        OAuthTokenEndpointAuthMethod::ClientSecretBasic
+            | OAuthTokenEndpointAuthMethod::ClientSecretPost
+    ) && registration.is_client_secret_expired_at(unix_time())
+    {
+        return Err(client_secret_expired_error(
+            registration,
+            issuer,
+            "call authorize() or begin() again to obtain a new client registration",
+        ));
+    }
     let mut request = OAuthHttpRequest::post_form(token_endpoint, Vec::new());
     match method {
         OAuthTokenEndpointAuthMethod::None => {
@@ -1915,13 +1969,6 @@ fn scopes_are_covered(requested: &[String], granted: &[String]) -> bool {
     requested
         .iter()
         .all(|scope| granted.iter().any(|granted| granted == scope))
-}
-
-fn unix_time() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 fn unique_scopes<I, S>(scopes: I) -> Vec<String>
@@ -2112,6 +2159,8 @@ mod tests {
         /// DCR against an AS that only advertises `client_secret_basic`, whose
         /// registration endpoint returns no `client_secret`.
         DynamicConfidentialWithoutSecret,
+        /// DCR against an AS that only advertises `client_secret_basic`.
+        DynamicConfidential,
         PrivateKeyJwt,
     }
 
@@ -2141,6 +2190,8 @@ mod tests {
         refresh_failure: Option<RefreshFailure>,
         rotating_refresh: Option<Arc<Mutex<RotatingRefresh>>>,
         no_resource_scopes: bool,
+        registration_response: Option<serde_json::Value>,
+        no_registration_endpoint: bool,
     }
 
     impl MockOAuthHttp {
@@ -2153,6 +2204,8 @@ mod tests {
                 refresh_failure: None,
                 rotating_refresh: None,
                 no_resource_scopes: false,
+                registration_response: None,
+                no_registration_endpoint: false,
             }
         }
 
@@ -2162,6 +2215,34 @@ mod tests {
         fn without_resource_scopes(mut self) -> Self {
             self.no_resource_scopes = true;
             self
+        }
+
+        /// The registration endpoint returns this body.
+        fn registration_response(mut self, response: serde_json::Value) -> Self {
+            self.registration_response = Some(response);
+            self
+        }
+
+        /// The authorization server advertises no `registration_endpoint`.
+        fn without_registration_endpoint(mut self) -> Self {
+            self.no_registration_endpoint = true;
+            self
+        }
+
+        async fn registration_requests(&self) -> usize {
+            self.requests()
+                .await
+                .iter()
+                .filter(|request| request.url.ends_with("/register"))
+                .count()
+        }
+
+        async fn token_requests(&self) -> usize {
+            self.requests()
+                .await
+                .iter()
+                .filter(|request| request.url.ends_with("/token"))
+                .count()
         }
 
         fn expiring(mut self) -> Self {
@@ -2250,7 +2331,8 @@ mod tests {
                         RegistrationMode::PreRegistered => (false, vec!["client_secret_basic"]),
                         RegistrationMode::Cimd => (true, vec!["none"]),
                         RegistrationMode::Dynamic => (false, vec!["none"]),
-                        RegistrationMode::DynamicConfidentialWithoutSecret => {
+                        RegistrationMode::DynamicConfidentialWithoutSecret
+                        | RegistrationMode::DynamicConfidential => {
                             (false, vec!["client_secret_basic"])
                         }
                         RegistrationMode::PrivateKeyJwt => (false, vec!["private_key_jwt"]),
@@ -2265,25 +2347,31 @@ mod tests {
                             "offline_access",
                         ]
                     };
-                    Ok(Self::response(
-                        200,
-                        serde_json::json!({
-                            "issuer": "https://auth.example.com/issuer",
-                            "authorization_endpoint": "https://auth.example.com/authorize",
-                            "token_endpoint": "https://auth.example.com/token",
-                            "registration_endpoint": "https://auth.example.com/register",
-                            "client_id_metadata_document_supported": cimd,
-                            "authorization_response_iss_parameter_supported": true,
-                            "code_challenge_methods_supported": ["S256"],
-                            "token_endpoint_auth_methods_supported": methods,
-                            "grant_types_supported": ["authorization_code", "refresh_token"],
-                            "scopes_supported": as_scopes
-                        }),
-                    ))
+                    let mut metadata = serde_json::json!({
+                        "issuer": "https://auth.example.com/issuer",
+                        "authorization_endpoint": "https://auth.example.com/authorize",
+                        "token_endpoint": "https://auth.example.com/token",
+                        "registration_endpoint": "https://auth.example.com/register",
+                        "client_id_metadata_document_supported": cimd,
+                        "authorization_response_iss_parameter_supported": true,
+                        "code_challenge_methods_supported": ["S256"],
+                        "token_endpoint_auth_methods_supported": methods,
+                        "grant_types_supported": ["authorization_code", "refresh_token"],
+                        "scopes_supported": as_scopes
+                    });
+                    if self.no_registration_endpoint {
+                        metadata
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("registration_endpoint");
+                    }
+                    Ok(Self::response(200, metadata))
                 }
                 "/register" => Ok(Self::response(
                     201,
-                    serde_json::json!({ "client_id": "dynamic-client" }),
+                    self.registration_response
+                        .clone()
+                        .unwrap_or_else(|| serde_json::json!({ "client_id": "dynamic-client" })),
                 )),
                 "/token" => {
                     let request_number = self.token_requests.fetch_add(1, Ordering::SeqCst);
@@ -2394,6 +2482,77 @@ mod tests {
         }
     }
 
+    type TokenFormFields = Vec<(String, String)>;
+
+    /// Wraps [`MockOAuthHttp`] with a token endpoint that rejects any refresh
+    /// containing `scope` (#1617) and rotates the refresh token otherwise.
+    /// `scopes[n]` is the `scope` the n-th successful refresh returns (`None`
+    /// omits the field).
+    #[derive(Clone)]
+    struct ScopeRejectingRefreshHttp {
+        inner: MockOAuthHttp,
+        scopes: Vec<Option<&'static str>>,
+        refreshes: Arc<Mutex<Vec<TokenFormFields>>>,
+    }
+
+    impl ScopeRejectingRefreshHttp {
+        fn new(scopes: Vec<Option<&'static str>>) -> Self {
+            Self {
+                inner: MockOAuthHttp::new(RegistrationMode::Dynamic).expiring(),
+                scopes,
+                refreshes: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl OAuthHttpClient for ScopeRejectingRefreshHttp {
+        async fn execute(
+            &self,
+            request: OAuthHttpRequest,
+        ) -> Result<OAuthHttpResponse, OAuthClientError> {
+            let fields = match &request.body {
+                OAuthHttpBody::Form(fields)
+                    if fields
+                        .iter()
+                        .any(|(name, value)| name == "grant_type" && value == "refresh_token") =>
+                {
+                    fields.clone()
+                }
+                _ => return self.inner.execute(request).await,
+            };
+            let mut refreshes = self.refreshes.lock().await;
+            let index = refreshes.len();
+            refreshes.push(fields.clone());
+            if fields.iter().any(|(name, _)| name == "scope") {
+                return Ok(MockOAuthHttp::response(
+                    400,
+                    serde_json::json!({
+                        "error": "invalid_request",
+                        "error_description": "scope parameter not supported"
+                    }),
+                ));
+            }
+            let mut response = serde_json::json!({
+                "access_token": format!("refreshed-{index}"),
+                "token_type": "Bearer",
+                "expires_in": 0,
+                "refresh_token": format!("rotated-{index}"),
+            });
+            if let Some(scope) = self.scopes[index.min(self.scopes.len() - 1)] {
+                response["scope"] = scope.into();
+            }
+            Ok(MockOAuthHttp::response(200, response))
+        }
+    }
+
+    /// Bound a test so a hung mock fails instead of stalling the suite.
+    async fn bounded<F: std::future::Future>(future: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(10), future)
+            .await
+            .expect("test timed out")
+    }
+
     #[derive(Clone, Default)]
     struct AutomaticAuthorizationHandler {
         calls: Arc<AtomicUsize>,
@@ -2465,6 +2624,509 @@ mod tests {
             ))
             .registration_options(options)
             .authorization_handler(handler)
+    }
+
+    fn scope_policy_flow(
+        http: ScopeRejectingRefreshHttp,
+        policy: OAuthRefreshScopePolicy,
+    ) -> OAuthAuthorizationFlow {
+        OAuthAuthorizationFlow::builder("https://mcp.example.com/mcp")
+            .http_client(http)
+            .redirect_policy(OAuthRedirectPolicy::fixed(
+                "http://127.0.0.1:23456/callback",
+            ))
+            .registration_options(dynamic_options())
+            .authorization_handler(AutomaticAuthorizationHandler::default())
+            .refresh_buffer(Duration::ZERO)
+            .refresh_scope_policy(policy)
+            .build()
+            .unwrap()
+    }
+
+    /// #1617: a server that rejects `scope` on refresh works with the omit
+    /// policy, repeatedly, and the recorded grant survives. `resource` and
+    /// refresh-token rotation are unaffected.
+    #[tokio::test]
+    async fn omit_policy_survives_a_token_endpoint_that_rejects_refresh_scope() {
+        bounded(async {
+            let granted = vec!["challenge.scope", "offline_access"];
+            let http = ScopeRejectingRefreshHttp::new(vec![
+                Some("challenge.scope offline_access"),
+                None,
+                Some("challenge.scope"),
+            ]);
+            let flow = scope_policy_flow(http.clone(), OAuthRefreshScopePolicy::Omit);
+            flow.authorize(["challenge.scope"]).await.unwrap();
+
+            assert_eq!(flow.get_token().await.unwrap(), "refreshed-0");
+            assert_eq!(flow.authorized_scopes().await.unwrap(), granted);
+
+            // This response omits `scope`, so the previous grant is kept.
+            assert_eq!(flow.get_token().await.unwrap(), "refreshed-1");
+            assert_eq!(flow.authorized_scopes().await.unwrap(), granted);
+
+            // A returned `scope` still replaces the grant.
+            assert_eq!(flow.get_token().await.unwrap(), "refreshed-2");
+            assert_eq!(
+                flow.authorized_scopes().await.unwrap(),
+                vec!["challenge.scope"]
+            );
+
+            let refreshes = http.refreshes.lock().await;
+            let value = |fields: &Vec<(String, String)>, field: &str| {
+                fields
+                    .iter()
+                    .find(|(name, _)| name == field)
+                    .map(|(_, value)| value.clone())
+            };
+            let sent_refresh_tokens: Vec<_> = refreshes
+                .iter()
+                .map(|fields| value(fields, "refresh_token").unwrap())
+                .collect();
+            assert_eq!(
+                sent_refresh_tokens,
+                ["refresh-token", "rotated-0", "rotated-1"]
+            );
+            for fields in refreshes.iter() {
+                assert_eq!(value(fields, "scope"), None);
+                assert_eq!(
+                    value(fields, "resource").as_deref(),
+                    Some("https://mcp.example.com/mcp")
+                );
+            }
+        })
+        .await;
+    }
+
+    /// #1617: the default policy keeps sending the recorded grant.
+    #[tokio::test]
+    async fn default_policy_still_sends_scope_to_a_rejecting_endpoint() {
+        bounded(async {
+            let http = ScopeRejectingRefreshHttp::new(vec![None]);
+            let flow = scope_policy_flow(http.clone(), OAuthRefreshScopePolicy::default());
+            flow.authorize(["challenge.scope"]).await.unwrap();
+
+            let error = flow.get_token().await.unwrap_err();
+
+            assert!(error.to_string().contains("scope parameter not supported"));
+            let refreshes = http.refreshes.lock().await;
+            assert!(refreshes[0].contains(&(
+                "scope".to_string(),
+                "challenge.scope offline_access".to_string()
+            )));
+        })
+        .await;
+    }
+
+    /// #1617: a narrowed request sends only those scopes, and a response
+    /// without `scope` records what was requested (RFC 6749 section 5.1).
+    #[tokio::test]
+    async fn narrow_policy_sends_a_subset_of_the_grant() {
+        bounded(async {
+            let http = MockOAuthHttp::new(RegistrationMode::Dynamic).expiring();
+            let flow = flow_builder(
+                http.clone(),
+                dynamic_options(),
+                AutomaticAuthorizationHandler::default(),
+            )
+            .refresh_buffer(Duration::ZERO)
+            .refresh_scope_policy(OAuthRefreshScopePolicy::Narrow(vec![
+                "challenge.scope".to_string(),
+            ]))
+            .build()
+            .unwrap();
+            flow.authorize(["challenge.scope"]).await.unwrap();
+
+            flow.get_token().await.unwrap();
+
+            let requests = http.requests().await;
+            let refresh = requests
+                .iter()
+                .rfind(|request| request.url.ends_with("/token"))
+                .unwrap();
+            let OAuthHttpBody::Form(fields) = &refresh.body else {
+                panic!("expected refresh form")
+            };
+            assert!(fields.contains(&("scope".to_string(), "challenge.scope".to_string())));
+        })
+        .await;
+    }
+
+    /// #1617: an invalid narrowing is reported and nothing is sent, so it
+    /// cannot become a broader request.
+    #[tokio::test]
+    async fn invalid_narrowing_fails_without_a_refresh_request() {
+        bounded(async {
+            let http = ScopeRejectingRefreshHttp::new(vec![None]);
+            let flow = scope_policy_flow(
+                http.clone(),
+                OAuthRefreshScopePolicy::Narrow(vec!["admin".to_string()]),
+            );
+            flow.authorize(["challenge.scope"]).await.unwrap();
+
+            let error = flow.get_token().await.unwrap_err();
+
+            assert!(error.to_string().contains("`admin`"), "got: {error}");
+            assert!(http.refreshes.lock().await.is_empty());
+            assert_eq!(
+                flow.authorized_scopes().await.unwrap(),
+                vec!["challenge.scope", "offline_access"]
+            );
+        })
+        .await;
+    }
+
+    const ISSUER: &str = "https://auth.example.com/issuer";
+    const NOW: u64 = 1_800_000_000;
+
+    type RegistrationStore = super::super::oauth_authcode::MemoryOAuthClientRegistrationStore;
+
+    fn dynamic_only_options() -> OAuthClientRegistrationOptions {
+        OAuthClientRegistrationOptions::new().with_dynamic_registration(
+            super::super::oauth_authcode::OAuthDynamicClientRegistration::native(
+                "test-client",
+                ["http://127.0.0.1:23456/callback"],
+            ),
+        )
+    }
+
+    fn stored_with_expiry(expires_at: Option<u64>) -> OAuthClientRegistration {
+        OAuthClientRegistration::dynamically_registered_with_secret_expiry(
+            ISSUER,
+            "stored-client",
+            Some("stored-secret".to_string()),
+            expires_at,
+        )
+    }
+
+    fn confidential_http() -> MockOAuthHttp {
+        MockOAuthHttp::new(RegistrationMode::DynamicConfidential).registration_response(
+            serde_json::json!({
+                "client_id": "new-client",
+                "client_secret": "new-secret",
+                "client_secret_expires_at": u64::MAX,
+            }),
+        )
+    }
+
+    fn expiry_flow(http: MockOAuthHttp, store: RegistrationStore) -> OAuthAuthorizationFlow {
+        flow_builder(
+            http,
+            dynamic_only_options(),
+            AutomaticAuthorizationHandler::default(),
+        )
+        .registration_store(store)
+        .build()
+        .unwrap()
+    }
+
+    async fn active_registration(flow: &OAuthAuthorizationFlow) -> OAuthClientRegistration {
+        flow.inner
+            .current
+            .read()
+            .await
+            .clone()
+            .unwrap()
+            .registration
+    }
+
+    #[tokio::test]
+    async fn flow_dcr_preserves_secret_expiry_through_the_store() {
+        bounded(async {
+            for (sent, expected) in [
+                (Some(serde_json::json!(u64::MAX)), Some(u64::MAX)),
+                (Some(serde_json::json!(0)), Some(0)),
+                (None, None),
+                (Some(serde_json::json!("soon")), None),
+            ] {
+                let mut response =
+                    serde_json::json!({ "client_id": "new-client", "client_secret": "s" });
+                if let Some(sent) = sent.clone() {
+                    response["client_secret_expires_at"] = sent;
+                }
+                let http = MockOAuthHttp::new(RegistrationMode::DynamicConfidential)
+                    .registration_response(response);
+                let store = RegistrationStore::new();
+                let flow = expiry_flow(http, store.clone());
+
+                flow.authorize(["challenge.scope"]).await.unwrap();
+
+                assert_eq!(
+                    active_registration(&flow).await.client_secret_expires_at(),
+                    expected,
+                    "{sent:?}"
+                );
+                let saved = store.load(ISSUER).await.unwrap().unwrap();
+                assert_eq!(saved.client_secret_expires_at(), expected, "{sent:?}");
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn flow_reuses_a_stored_secret_that_is_not_known_to_be_expired() {
+        bounded(async {
+            for expires_at in [Some(u64::MAX), Some(0), None] {
+                let http = confidential_http();
+                let store = RegistrationStore::new();
+                let stored = stored_with_expiry(expires_at);
+                store.save(ISSUER, &stored).await.unwrap();
+                let flow = expiry_flow(http.clone(), store);
+
+                flow.authorize(["challenge.scope"]).await.unwrap();
+
+                assert_eq!(active_registration(&flow).await, stored, "{expires_at:?}");
+                assert_eq!(http.registration_requests().await, 0, "{expires_at:?}");
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn flow_registers_again_when_the_stored_secret_has_expired() {
+        bounded(async {
+            let http = confidential_http();
+            let store = RegistrationStore::new();
+            store
+                .save(ISSUER, &stored_with_expiry(Some(1)))
+                .await
+                .unwrap();
+            let flow = expiry_flow(http.clone(), store.clone());
+
+            flow.authorize(["challenge.scope"]).await.unwrap();
+
+            let active = active_registration(&flow).await;
+            assert_eq!(active.client_id(), "new-client");
+            assert_eq!(active.bound_issuer(), Some(ISSUER));
+            assert_eq!(http.registration_requests().await, 1);
+            assert_eq!(store.load(ISSUER).await.unwrap(), Some(active.clone()));
+            let token_request = http
+                .requests()
+                .await
+                .into_iter()
+                .find(|request| request.url.ends_with("/token"))
+                .unwrap();
+            let expired = format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode("stored-client:stored-secret")
+            );
+            assert!(
+                !token_request
+                    .headers
+                    .iter()
+                    .any(|(_, value)| value == &expired),
+                "the expired credential must not reach the token endpoint"
+            );
+
+            // Restoration: a rebuilt flow reuses the replacement.
+            let rebuilt = expiry_flow(http.clone(), store);
+            rebuilt.authorize(["challenge.scope"]).await.unwrap();
+            assert_eq!(active_registration(&rebuilt).await, active);
+            assert_eq!(http.registration_requests().await, 1);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn flow_reports_an_expired_secret_without_a_registration_endpoint() {
+        bounded(async {
+            let http = confidential_http().without_registration_endpoint();
+            let store = RegistrationStore::new();
+            store
+                .save(ISSUER, &stored_with_expiry(Some(1)))
+                .await
+                .unwrap();
+            let flow = expiry_flow(http.clone(), store);
+
+            let error = flow.authorize(["challenge.scope"]).await.unwrap_err();
+
+            assert!(
+                matches!(error, OAuthClientError::ClientSecretExpired(_)),
+                "got: {error}"
+            );
+            assert!(!error.to_string().contains("stored-secret"));
+            assert_eq!(http.token_requests().await, 0);
+        })
+        .await;
+    }
+
+    /// Boundary behavior with an injected clock, including the issuer check.
+    #[tokio::test]
+    async fn flow_registration_resolution_honors_the_injected_clock() {
+        bounded(async {
+            let http = confidential_http();
+            let mut metadata = OAuthAuthorizationServerMetadata {
+                issuer: ISSUER.to_string(),
+                authorization_endpoint: "https://auth.example.com/authorize".to_string(),
+                token_endpoint: "https://auth.example.com/token".to_string(),
+                registration_endpoint: Some("https://auth.example.com/register".to_string()),
+                client_id_metadata_document_supported: false,
+                authorization_response_iss_parameter_supported: false,
+                code_challenge_methods_supported: vec!["S256".to_string()],
+                token_endpoint_auth_methods_supported: Vec::new(),
+                grant_types_supported: Vec::new(),
+                scopes_supported: Vec::new(),
+            };
+            let options = dynamic_only_options();
+            let store = RegistrationStore::new();
+            let stored = stored_with_expiry(Some(NOW));
+            store.save(ISSUER, &stored).await.unwrap();
+
+            let before =
+                resolve_registration_with_http(&http, &metadata, &options, &store, NOW - 1)
+                    .await
+                    .unwrap();
+            assert_eq!(before, stored);
+            assert_eq!(http.registration_requests().await, 0);
+
+            let at = resolve_registration_with_http(&http, &metadata, &options, &store, NOW)
+                .await
+                .unwrap();
+            assert_eq!(at.client_id(), "new-client");
+            assert_eq!(http.registration_requests().await, 1);
+
+            // A record bound to another issuer is rejected, expired or not.
+            let wrong_issuer = OAuthClientRegistration::dynamically_registered_with_secret_expiry(
+                "https://other.example.com",
+                "stored-client",
+                Some("stored-secret".to_string()),
+                Some(1),
+            );
+            store.save(ISSUER, &wrong_issuer).await.unwrap();
+            metadata.registration_endpoint = None;
+            let error = resolve_registration_with_http(&http, &metadata, &options, &store, NOW)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, OAuthClientError::CredentialStore(_)),
+                "{error}"
+            );
+        })
+        .await;
+    }
+
+    /// A long-lived flow can outlive its client secret. Refreshing must not
+    /// send it once it is known to be expired.
+    #[tokio::test]
+    async fn refresh_does_not_send_an_expired_client_secret() {
+        bounded(async {
+            let http = confidential_http().expiring();
+            let flow = flow_builder(
+                http.clone(),
+                dynamic_only_options(),
+                AutomaticAuthorizationHandler::default(),
+            )
+            .refresh_buffer(Duration::ZERO)
+            .build()
+            .unwrap();
+            flow.authorize(["challenge.scope"]).await.unwrap();
+            let token_requests = http.token_requests().await;
+            flow.inner
+                .current
+                .write()
+                .await
+                .as_mut()
+                .unwrap()
+                .registration = stored_with_expiry(Some(1));
+
+            let error = flow.get_token().await.unwrap_err();
+
+            assert!(
+                matches!(&error, OAuthClientError::ClientSecretExpired(message)
+                    if message.contains("authorize()")),
+                "got: {error}"
+            );
+            assert_eq!(http.token_requests().await, token_requests);
+            assert!(flow.inner.current.read().await.is_some());
+        })
+        .await;
+    }
+
+    /// Persisted pending state round-trips the expiry, and completing the
+    /// callback does not send a secret that expired in the meantime.
+    #[tokio::test]
+    async fn callback_exchange_does_not_send_an_expired_client_secret() {
+        bounded(async {
+            let http = confidential_http();
+            let states = MemoryOAuthAuthorizationStateStore::new();
+            let pending = OAuthPendingAuthorizationState {
+                state: "pending-state".to_string(),
+                code_verifier: "verifier".to_string(),
+                redirect_uri: "http://127.0.0.1:23456/callback".to_string(),
+                resource: "https://mcp.example.com/mcp".to_string(),
+                issuer: ISSUER.to_string(),
+                token_endpoint: "https://auth.example.com/token".to_string(),
+                registration: stored_with_expiry(Some(1)),
+                token_endpoint_auth_method: OAuthTokenEndpointAuthMethod::ClientSecretBasic,
+                scopes: vec!["challenge.scope".to_string()],
+                iss_required: false,
+            };
+            let restored: OAuthPendingAuthorizationState =
+                serde_json::from_value(serde_json::to_value(&pending).unwrap()).unwrap();
+            assert_eq!(restored.registration.client_secret_expires_at(), Some(1));
+            states.save(&restored).await.unwrap();
+            let flow = flow_builder(
+                http.clone(),
+                dynamic_only_options(),
+                AutomaticAuthorizationHandler::default(),
+            )
+            .state_store(states)
+            .build()
+            .unwrap();
+
+            let error = flow
+                .complete_callback_url("http://127.0.0.1:23456/callback?code=c&state=pending-state")
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(error, OAuthClientError::ClientSecretExpired(_)),
+                "got: {error}"
+            );
+            assert_eq!(http.token_requests().await, 0);
+        })
+        .await;
+    }
+
+    /// `none` and `private_key_jwt` never send the secret, so its expiry does
+    /// not block a token request.
+    #[tokio::test]
+    async fn an_expired_secret_does_not_block_auth_methods_that_do_not_send_it() {
+        bounded(async {
+            let registration = stored_with_expiry(Some(1));
+            for method in [
+                OAuthTokenEndpointAuthMethod::None,
+                OAuthTokenEndpointAuthMethod::PrivateKeyJwt,
+            ] {
+                let http = confidential_http();
+                let signer = SameClientSigner;
+                send_token_request(
+                    &http,
+                    "https://auth.example.com/token",
+                    ISSUER,
+                    &registration,
+                    method,
+                    vec![("grant_type".to_string(), "authorization_code".to_string())],
+                    Some(&signer),
+                )
+                .await
+                .unwrap();
+                assert_eq!(http.token_requests().await, 1, "{method:?}");
+            }
+        })
+        .await;
+    }
+
+    struct SameClientSigner;
+
+    #[async_trait]
+    impl OAuthClientAssertionSigner for SameClientSigner {
+        async fn sign_client_assertion(
+            &self,
+            _request: OAuthClientAssertionRequest,
+        ) -> Result<String, OAuthClientError> {
+            Ok("assertion".to_string())
+        }
     }
 
     #[tokio::test]
