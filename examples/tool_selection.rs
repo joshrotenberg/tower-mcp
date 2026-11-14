@@ -204,11 +204,7 @@ async fn main() -> Result<(), BoxError> {
 
         // Layer 3: Preset filter
         // In "essentials" mode, only show curated tools
-        if use_preset && !essentials.contains(tool.name.as_str()) {
-            return false;
-        }
-
-        true
+        !use_preset || essentials.contains(tool.name.as_str())
     }));
 
     eprintln!("Server ready. Connect with an MCP client via stdio.");
