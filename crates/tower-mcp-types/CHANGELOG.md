@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.26.1] - 2026-11-15
+
+### Features
+
+- Implement the Skills extension (SEP-2640) ([#1642](https://github.com/joshrotenberg/tower-mcp/pull/1642))
+
+
+
 ## [0.26.0] - 2026-11-10
 
 ### Bug Fixes

@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.26.1] - 2026-11-15
+
+### Bug Fixes
+
+- **proxy:** Stage backend replacement before atomic publication ([#1643](https://github.com/joshrotenberg/tower-mcp/pull/1643))
+
+### Features
+
+- Implement the Skills extension (SEP-2640) ([#1642](https://github.com/joshrotenberg/tower-mcp/pull/1642))
+
+### Testing
+
+- **childproc:** Widen SIGTERM test grace to stop a macOS CI flake ([#1641](https://github.com/joshrotenberg/tower-mcp/pull/1641))
+
+
+
 ## [0.26.0] - 2026-11-10
 
 ### Upgrade notes
