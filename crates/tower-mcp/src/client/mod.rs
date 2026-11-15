@@ -2012,6 +2012,135 @@ impl McpClient {
         Ok(hints.finish(all))
     }
 
+    /// List skills served through the Skills extension (SEP-2640).
+    ///
+    /// Call this only against a server that declared
+    /// `io.modelcontextprotocol/skills`; any other server answers
+    /// `MethodNotFound`. An empty or partial listing does not mean the server
+    /// has no other skills: [`get_skill`](Self::get_skill) answers for any
+    /// skill it serves.
+    pub async fn list_skills(&self) -> Result<crate::protocol::skills::ListSkillsResult> {
+        self.list_skills_with_cursor(None).await
+    }
+
+    /// List skills with an optional pagination cursor.
+    pub async fn list_skills_with_cursor(
+        &self,
+        cursor: Option<String>,
+    ) -> Result<crate::protocol::skills::ListSkillsResult> {
+        self.ensure_initialized()?;
+        self.send_request(
+            crate::protocol::skills::METHOD_SKILLS_LIST,
+            &crate::protocol::skills::ListSkillsParams { cursor, meta: None },
+        )
+        .await
+    }
+
+    /// List all skills, following pagination cursors until exhausted.
+    pub async fn list_all_skills(&self) -> Result<Vec<crate::protocol::skills::Skill>> {
+        Ok(self.list_all_skills_with_cache_hints().await?.items)
+    }
+
+    /// List all skills with cache hints valid for the combined result.
+    ///
+    /// Use [`list_all_skills`](Self::list_all_skills) when only the entries
+    /// matter. [`AggregateList`] documents how page hints combine.
+    pub async fn list_all_skills_with_cache_hints(
+        &self,
+    ) -> Result<AggregateList<crate::protocol::skills::Skill>> {
+        let mut all = Vec::new();
+        let mut cursor = None;
+        let mut hints = self.response_cache.aggregate_hints();
+        loop {
+            let result = self.list_skills_with_cursor(cursor).await?;
+            hints.observe(result.ttl_ms, result.cache_scope);
+            all.extend(result.skills);
+            match result.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        Ok(hints.finish(all))
+    }
+
+    /// Fetch the entry for one skill by the URI of its `SKILL.md`.
+    ///
+    /// The server answers `-32602` (invalid params) when it serves no skill
+    /// at that URI. Call this again to refresh an entry's digests, for
+    /// example after a file fails verification.
+    pub async fn get_skill(&self, uri: &str) -> Result<crate::protocol::skills::GetSkillResult> {
+        self.ensure_initialized()?;
+        self.send_request(
+            crate::protocol::skills::METHOD_SKILLS_GET,
+            &crate::protocol::skills::GetSkillParams {
+                uri: uri.to_string(),
+                meta: None,
+            },
+        )
+        .await
+    }
+
+    /// List the direct children of a directory resource
+    /// (`resources/directory/read`, SEP-2640).
+    ///
+    /// Only call this against a server whose skills extension settings
+    /// declare `directoryRead: true`. Subdirectories carry
+    /// `mimeType: "inode/directory"`; the listing is not recursive.
+    pub async fn read_resource_directory(
+        &self,
+        uri: &str,
+        cursor: Option<String>,
+    ) -> Result<crate::protocol::skills::ReadResourceDirectoryResult> {
+        self.ensure_initialized()?;
+        self.send_request(
+            crate::protocol::skills::METHOD_RESOURCES_DIRECTORY_READ,
+            &crate::protocol::skills::ReadResourceDirectoryParams {
+                uri: uri.to_string(),
+                cursor,
+                meta: None,
+            },
+        )
+        .await
+    }
+
+    /// Read one file of a skill and verify it against the skill's entry.
+    ///
+    /// This is the read-time verification SEP-2640 requires of hosts: the
+    /// file must be listed in the entry's `resources`, its byte length must
+    /// equal the listed `size`, and its SHA-256 digest must equal the listed
+    /// `digest`. For the skill's `SKILL.md`, the parsed frontmatter must also
+    /// equal the entry's `frontmatter`. A failure returns
+    /// [`Error::Internal`](crate::Error) with the reason, and the content is
+    /// not returned. On a mismatch, refresh the entry with
+    /// [`get_skill`](Self::get_skill) before retrying.
+    ///
+    /// A dynamic skill (`resources: "dynamic"`) cannot be verified, so its
+    /// files are rejected; read them with [`read_resource`](Self::read_resource)
+    /// if the application accepts unverifiable content.
+    #[cfg(feature = "skills")]
+    pub async fn read_verified_skill_file(
+        &self,
+        skill: &crate::protocol::skills::Skill,
+        uri: &str,
+    ) -> Result<Vec<u8>> {
+        crate::skills::verify::check_listed(skill, uri)
+            .map_err(|e| Error::internal(e.to_string()))?;
+        let result = self.read_resource(uri).await?;
+        let content = result
+            .contents
+            .iter()
+            .find(|c| c.uri == uri)
+            .or_else(|| result.contents.first())
+            .ok_or_else(|| {
+                Error::internal(format!("resources/read of {uri} returned no content"))
+            })?;
+        let bytes = crate::skills::verify::content_bytes(content)
+            .map_err(|e| Error::internal(e.to_string()))?;
+        crate::skills::verify::verify_file(skill, uri, &bytes)
+            .map_err(|e| Error::internal(e.to_string()))?;
+        Ok(bytes)
+    }
+
     /// Call a tool and return the concatenated text content.
     ///
     /// Returns the text from all [`Text`](crate::protocol::Content::Text) items joined together.

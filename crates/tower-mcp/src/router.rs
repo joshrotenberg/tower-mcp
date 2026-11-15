@@ -238,6 +238,9 @@ struct McpRouterInner {
     extensions: Arc<crate::context::Extensions>,
     /// Locally supported MCP protocol extensions and their server settings.
     protocol_extensions: HashMap<String, serde_json::Value>,
+    /// Skills extension catalog (SEP-2640), when one is registered.
+    #[cfg(feature = "skills")]
+    skills: Option<Arc<crate::skills::SkillSet>>,
     /// Minimum log level for filtering outgoing log notifications (set by client via logging/setLevel)
     min_log_level: Arc<RwLock<LogLevel>>,
     /// Page size for list method pagination (None = return all results)
@@ -693,6 +696,8 @@ impl McpRouter {
                 task_store: Arc::new(MemoryTaskStore::new()),
                 extensions: Arc::new(crate::context::Extensions::new()),
                 protocol_extensions: HashMap::new(),
+                #[cfg(feature = "skills")]
+                skills: None,
                 completion_handler: None,
                 tool_filter: None,
                 resource_filter: None,
@@ -1422,6 +1427,11 @@ impl McpRouter {
     fn capabilities(&self) -> ServerCapabilities {
         let has_resources =
             !self.inner.resources.is_empty() || !self.inner.resource_templates.is_empty();
+        // SEP-2640: a server declaring the Skills extension MUST also declare
+        // the resources capability, even when every skill is dynamic and its
+        // files are served from somewhere the router cannot see.
+        #[cfg(feature = "skills")]
+        let has_resources = has_resources || self.inner.skills.is_some();
         let has_notifications = self.inner.notification_tx.is_some();
 
         // Each of these defaults to `has_notifications`, which is what this
@@ -3391,6 +3401,20 @@ impl McpRouter {
                 ))
             }
 
+            #[cfg(feature = "skills")]
+            McpRequest::ListSkills(params) => self.handle_list_skills(params, &extensions),
+            #[cfg(feature = "skills")]
+            McpRequest::GetSkill(params) => self.handle_get_skill(params, &extensions),
+            #[cfg(feature = "skills")]
+            McpRequest::ReadResourceDirectory(params) => {
+                self.handle_read_resource_directory(params, &extensions)
+            }
+            #[cfg(not(feature = "skills"))]
+            request @ (McpRequest::ListSkills(_)
+            | McpRequest::GetSkill(_)
+            | McpRequest::ReadResourceDirectory(_)) => Err(Error::JsonRpc(
+                JsonRpcError::method_not_found(request.method_name()),
+            )),
             McpRequest::Unknown { method, .. } => {
                 Err(Error::JsonRpc(JsonRpcError::method_not_found(&method)))
             }
@@ -3795,6 +3819,8 @@ mod merge;
 mod notify;
 mod pagination;
 mod policy;
+#[cfg(feature = "skills")]
+mod skills;
 mod task_ops;
 
 use capabilities::{

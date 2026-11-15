@@ -912,6 +912,9 @@ fn is_cacheable_result_method(method: &str) -> bool {
             | "resources/list"
             | "resources/read"
             | "resources/templates/list"
+            | "skills/list"
+            | "skills/get"
+            | "resources/directory/read"
     )
 }
 

@@ -33,6 +33,7 @@ regex = "1"
 base64.workspace = true
 thiserror = { workspace = true }
 sha2 = { workspace = true, optional = true }
+yaml_serde = { workspace = true, optional = true }
 # Required: task identifiers can act as bearer tokens and are generated from
 # system entropy (SEP-2663).
 getrandom = { workspace = true }
@@ -68,7 +69,7 @@ harness = false
 [features]
 default = []
 # Enable all optional features
-full = ["http", "websocket", "unix", "childproc", "oauth", "jwks", "testing", "dynamic-tools", "http-client", "oauth-client", "proxy", "macros", "resilience", "mcp-apps", "protocol-2026-07-28", "schema-validation"]
+full = ["http", "websocket", "unix", "childproc", "oauth", "jwks", "testing", "dynamic-tools", "http-client", "oauth-client", "proxy", "macros", "resilience", "mcp-apps", "protocol-2026-07-28", "schema-validation", "skills"]
 # Transport features
 http = ["dep:axum", "dep:hyper", "dep:http", "dep:http-body-util", "dep:tokio-stream", "dep:uuid"]
 websocket = ["dep:axum", "dep:uuid", "dep:tokio-tungstenite", "dep:futures-util"]
@@ -102,6 +103,9 @@ mcp-apps = ["dep:url"]
 # Compile the released MCP 2026-07-28 implementation. Runtime clients and
 # servers may narrow the compiled set with ProtocolSupport.
 protocol-2026-07-28 = ["stateless"]
+# Skills extension (SEP-2640): serve Agent Skills as `skill://` resources with
+# `skills/list`, `skills/get`, and optional `resources/directory/read`.
+skills = ["dep:sha2", "dep:yaml_serde"]
 # Compatibility alias for the former feature name. New consumers should enable
 # `protocol-2026-07-28`; existing `stateless` users retain the same behavior.
 stateless = ["dep:sha2"]

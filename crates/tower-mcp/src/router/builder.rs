@@ -709,6 +709,19 @@ impl McpRouter {
                 .insert(identifier.clone(), settings.clone());
         }
 
+        // Merge skills catalogs (last wins per skill URI). The skill files
+        // already arrived with the resources above.
+        #[cfg(feature = "skills")]
+        if let Some(other_skills) = &other_inner.skills {
+            let merged = match inner.skills.take() {
+                Some(existing) => Arc::unwrap_or_clone(existing).merge((**other_skills).clone()),
+                None => (**other_skills).clone(),
+            };
+            let (identifier, settings) = merged.extension().into_parts();
+            inner.protocol_extensions.insert(identifier, settings);
+            inner.skills = Some(Arc::new(merged));
+        }
+
         self
     }
 

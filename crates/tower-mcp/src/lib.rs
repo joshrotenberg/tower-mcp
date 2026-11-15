@@ -577,6 +577,8 @@ pub mod router;
 pub mod session;
 #[cfg(any(feature = "http", feature = "websocket"))]
 pub mod session_store;
+#[cfg(feature = "skills")]
+pub mod skills;
 #[cfg(feature = "stateless")]
 pub mod stateless;
 mod task_execution;
