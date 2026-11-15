@@ -708,8 +708,12 @@ mod tests {
             .unwrap();
         wait_for_file(&ready).await;
 
+        // `sh` runs the TERM trap only after its foreground `sleep 0.1`
+        // returns, then forks `echo`. On a loaded runner that took longer
+        // than a 300 ms grace, so the child was killed before the trap wrote
+        // the marker. Two seconds leaves room and stays under the 5 s bound.
         let started = Instant::now();
-        let result = conn.shutdown_with_grace(Duration::from_millis(300)).await;
+        let result = conn.shutdown_with_grace(Duration::from_secs(2)).await;
         let elapsed = started.elapsed();
 
         let recorded = std::fs::read_to_string(&marker);
