@@ -11,7 +11,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  CONFORMANCE_VERSION: "0.2.0-alpha.10"
+  CONFORMANCE_VERSION: "0.2.0-alpha.12"
 
 jobs:
   server-conformance:
@@ -315,9 +315,28 @@ jobs:
             --suite all \
             --expected-failures ./.github/conformance/conformance-baseline-draft.yml
 
+      - name: Run Skills extension (SEP-2640) server scenarios
+        run: |
+          # Extension scenarios are not on the spec timeline, so --suite all
+          # leaves them out and --force runs them. A skipped check means the
+          # fixture stopped declaring the extension, which would otherwise
+          # pass silently, so treat it as a failure.
+          set -o pipefail
+          for scenario in sep-2640-skills-enumeration sep-2640-skills-manifest sep-2640-skills-directory; do
+            npx -y "@modelcontextprotocol/conformance@${CONFORMANCE_VERSION}" server \
+              --url http://127.0.0.1:3001/mcp \
+              --scenario "$scenario" \
+              --force \
+              | tee "/tmp/$scenario.log"
+            if sed 's/\x1b\[[0-9;]*m//g' "/tmp/$scenario.log" | grep -q '\] SKIPPED'; then
+              echo "::error::$scenario skipped checks; is the skills extension still declared?"
+              exit 1
+            fi
+          done
+
       - name: Validate captured frames against the published schema
         run: |
-          # Every frame the server sent during the suite above, checked
+          # Every frame the server sent during the suites above, checked
           # against the vendored 2026-07-28 schema (#1204).
           cargo run -p wire-schema-check -- \
             --log /tmp/conformance-frames-draft.jsonl \
@@ -358,6 +377,26 @@ jobs:
             --command "cargo run --manifest-path examples/conformance-client/Cargo.toml --" \
             --expected-failures ./.github/conformance/conformance-baseline-draft-client.yml \
             | tee /tmp/conformance-draft-client.log
+
+      - name: Run Skills extension (SEP-2640) client scenarios
+        run: |
+          # As on the server side, --suite all leaves extension scenarios out.
+          # The verify-* scenarios pass when the client refuses tampered
+          # content, so a non-zero client exit there is expected; the
+          # harness grades the requests it saw.
+          set -o pipefail
+          for scenario in sep-2640-client-no-prefetch sep-2640-client-verify-digest sep-2640-client-verify-size sep-2640-client-verify-frontmatter; do
+            npx -y "@modelcontextprotocol/conformance@${CONFORMANCE_VERSION}" client \
+              --scenario "$scenario" \
+              --force \
+              --spec-version 2026-07-28 \
+              --command "cargo run --manifest-path examples/conformance-client/Cargo.toml --" \
+              | tee "/tmp/$scenario.log"
+            if sed 's/\x1b\[[0-9;]*m//g' "/tmp/$scenario.log" | grep -q '\] SKIPPED'; then
+              echo "::error::$scenario skipped checks"
+              exit 1
+            fi
+          done
 
       - name: Publish suite summary
         if: always()

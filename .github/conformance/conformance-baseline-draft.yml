@@ -7,8 +7,9 @@
 # Remove entries as the phases land; CI fails when a baselined scenario
 # starts passing (stale entry) or a non-baselined scenario fails.
 #
-# Status at 0.2.0-alpha.10 after the final HTTP lifecycle, schema-aware
-# custom headers, and SEP-2322 MRTR work: all 114 server checks pass.
+# Status at 0.2.0-alpha.12: all 152 server checks pass. The SEP-2640 skills
+# server scenarios are run separately with --force, since --suite all leaves
+# extension scenarios out.
 #
 # Format (0.2.x suite): plain scenario-name strings under `server:` /
 # `client:` keys; reasons live in these comments.

@@ -4,7 +4,7 @@
 # `client --spec-version 2025-11-25 --suite all`.
 # CI fails if any scenario regresses.
 #
-# Status at 0.2.0-alpha.10 after the authorization work: all 18 scenarios are
-# green (235 checks, zero failures or warnings).
+# Status at 0.2.0-alpha.12: all scenarios are green (253 checks, zero
+# failures or warnings).
 
 client: []

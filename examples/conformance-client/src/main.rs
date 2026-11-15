@@ -9,6 +9,7 @@
 mod auth_scenarios;
 mod core_scenarios;
 mod handlers;
+mod skills_scenarios;
 
 use std::env;
 use std::process;
@@ -58,6 +59,19 @@ async fn main() {
 
         // Stable task implementation advertisement (#951 tracks final support)
         "tasks-extension" => core_scenarios::tasks_extension(&server_url).await,
+
+        // SEP-1613 / SEP-2106: echo a tool's inputSchema back unchanged
+        "json-schema-2020-12-preservation" => {
+            core_scenarios::json_schema_preservation(&server_url).await
+        }
+
+        // SEP-2640 Skills extension
+        "sep-2640-client-no-prefetch" => skills_scenarios::no_prefetch(&server_url).await,
+        "sep-2640-client-verify-digest"
+        | "sep-2640-client-verify-size"
+        | "sep-2640-client-verify-frontmatter" => {
+            skills_scenarios::load_and_verify(&server_url).await
+        }
 
         // Auth scenarios - metadata discovery
         "auth/metadata-default"
