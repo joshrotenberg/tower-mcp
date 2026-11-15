@@ -163,6 +163,33 @@ impl fmt::Display for AddBackendError {
 
 impl std::error::Error for AddBackendError {}
 
+/// A backend that is connected and initialized but not yet published.
+struct StagedBackend {
+    backend: Backend,
+    invalidation_rx: mpsc::Receiver<ListChanged>,
+}
+
+/// What a commit does with an existing backend of the same namespace.
+#[derive(Clone, Copy)]
+enum CommitMode {
+    /// The namespace must be free.
+    Add,
+    /// An existing backend of the namespace is replaced in place.
+    Replace,
+}
+
+/// The routing entry for `backend` with `layer` applied to its service.
+fn layered_entry<L>(backend: &Backend, layer: L) -> BackendEntry
+where
+    L: tower::Layer<BackendService> + Send + 'static,
+    L::Service: Service<RouterRequest, Response = RouterResponse> + Clone + Send + 'static,
+    <L::Service as Service<RouterRequest>>::Error: fmt::Display + Send,
+    <L::Service as Service<RouterRequest>>::Future: Send,
+{
+    let caught = CatchError::new(layer.layer(backend.service()));
+    BackendEntry::from_backend_with_service(backend, BoxCloneService::new(caught))
+}
+
 impl McpProxy {
     /// Create a builder for configuring the proxy.
     pub fn builder(name: impl Into<String>, version: impl Into<String>) -> super::McpProxyBuilder {
@@ -195,8 +222,16 @@ impl McpProxy {
     /// Add a backend dynamically from a [`ClientTransport`].
     ///
     /// The transport is connected, the MCP initialize handshake runs, and
-    /// capabilities are discovered. The new backend is immediately available
-    /// to all clones of this proxy.
+    /// capabilities are discovered before the backend is published. The new
+    /// backend is then visible to all clones of this proxy at once.
+    ///
+    /// Membership changes ([`add_backend`](Self::add_backend),
+    /// [`remove_backend`](Self::remove_backend),
+    /// [`replace_backend`](Self::replace_backend) and their `_with_layer`
+    /// forms) are serialized at a single commit point and take effect in the
+    /// order they commit. The namespace is checked before connecting and again
+    /// at commit, since another call may have claimed it in the meantime.
+    /// Dropping the returned future before it completes publishes nothing.
     ///
     /// # Errors
     ///
@@ -218,47 +253,10 @@ impl McpProxy {
         transport: impl ClientTransport,
     ) -> Result<(), AddBackendError> {
         let namespace = namespace.into();
-        let separator = self.shared.separator.clone();
-
-        // Validate namespace uniqueness and prefix ambiguity
-        {
-            let entries = self.entries.lock().expect("entries lock poisoned");
-            self.validate_namespace(&namespace, &separator, &entries)?;
-        }
-
-        // Connect and initialize (no lock held during async operations)
-        let (invalidation_tx, invalidation_rx) = mpsc::channel(16);
-        let backend = Backend::connect(namespace.clone(), transport, separator, invalidation_tx)
-            .await
-            .map_err(AddBackendError::Connect)?;
-
-        backend
-            .initialize(&self.shared.name, &self.shared.version)
-            .await
-            .map_err(AddBackendError::Initialize)?;
-
-        let entry = BackendEntry::from_backend(&backend);
-
-        // Add to shared state
-        {
-            let mut entries = self.entries.lock().expect("entries lock poisoned");
-            entries.push(entry);
-        }
-
-        // Spawn invalidation watcher
-        let backend_idx = {
-            let mut backends = self.shared.backends.write().await;
-            let idx = backends.len();
-            backends.push(backend);
-            idx
-        };
-
-        self.spawn_invalidation_watcher(backend_idx, invalidation_rx);
-
-        // Notify downstream clients that capabilities changed
-        self.notify_all_changed().await;
-
-        Ok(())
+        self.check_namespace(&namespace, None)?;
+        let staged = self.stage(namespace, transport).await?;
+        let entry = BackendEntry::from_backend(&staged.backend);
+        self.commit(staged, entry, CommitMode::Add).await
     }
 
     /// Add a backend dynamically with a custom middleware-wrapped service.
@@ -291,69 +289,29 @@ impl McpProxy {
         <L::Service as Service<RouterRequest>>::Future: Send,
     {
         let namespace = namespace.into();
-        let separator = self.shared.separator.clone();
-
-        {
-            let entries = self.entries.lock().expect("entries lock poisoned");
-            self.validate_namespace(&namespace, &separator, &entries)?;
-        }
-
-        let (invalidation_tx, invalidation_rx) = mpsc::channel(16);
-        let backend = Backend::connect(namespace.clone(), transport, separator, invalidation_tx)
-            .await
-            .map_err(AddBackendError::Connect)?;
-
-        backend
-            .initialize(&self.shared.name, &self.shared.version)
-            .await
-            .map_err(AddBackendError::Initialize)?;
-
-        // Apply middleware layer
-        let base = backend.service();
-        let layered = layer.layer(base);
-        let caught = CatchError::new(layered);
-        let service = BoxCloneService::new(caught);
-        let entry = BackendEntry::from_backend_with_service(&backend, service);
-
-        {
-            let mut entries = self.entries.lock().expect("entries lock poisoned");
-            entries.push(entry);
-        }
-
-        let backend_idx = {
-            let mut backends = self.shared.backends.write().await;
-            let idx = backends.len();
-            backends.push(backend);
-            idx
-        };
-
-        self.spawn_invalidation_watcher(backend_idx, invalidation_rx);
-
-        if let Some(tx) = &self.shared.notification_tx {
-            let _ = tx
-                .send(crate::context::ServerNotification::ToolsListChanged)
-                .await;
-            let _ = tx
-                .send(crate::context::ServerNotification::ResourcesListChanged)
-                .await;
-            let _ = tx
-                .send(crate::context::ServerNotification::PromptsListChanged)
-                .await;
-        }
-
-        Ok(())
+        self.check_namespace(&namespace, None)?;
+        let staged = self.stage(namespace, transport).await?;
+        let entry = layered_entry(&staged.backend, layer);
+        self.commit(staged, entry, CommitMode::Add).await
     }
 
     /// Validate that a namespace can be added without conflicts.
+    ///
+    /// `replacing` names a namespace whose existing backend is about to be
+    /// replaced, so it does not count as a conflict with itself.
     fn validate_namespace(
         &self,
         namespace: &str,
         separator: &str,
         entries: &[BackendEntry],
+        replacing: Option<&str>,
     ) -> Result<(), AddBackendError> {
         let new_prefix = format!("{}{}", namespace, separator);
 
         for entry in entries {
+            if replacing == Some(entry.namespace.as_str()) {
+                continue;
+            }
             if entry.namespace == namespace {
                 return Err(AddBackendError::DuplicateNamespace(namespace.to_string()));
             }
@@ -369,19 +327,123 @@ impl McpProxy {
         Ok(())
     }
 
+    /// Early namespace check, so a doomed add fails before connecting.
+    fn check_namespace(
+        &self,
+        namespace: &str,
+        replacing: Option<&str>,
+    ) -> Result<(), AddBackendError> {
+        let entries = self.entries.lock().expect("entries lock poisoned");
+        self.validate_namespace(namespace, &self.shared.separator, &entries, replacing)
+    }
+
+    /// Connect, initialize, and discover a backend without publishing it.
+    ///
+    /// Nothing shared is touched here, so a failure or a dropped future
+    /// leaves the proxy exactly as it was.
+    async fn stage(
+        &self,
+        namespace: String,
+        transport: impl ClientTransport,
+    ) -> Result<StagedBackend, AddBackendError> {
+        let (invalidation_tx, invalidation_rx) = mpsc::channel(16);
+        let backend = Backend::connect(
+            namespace,
+            transport,
+            self.shared.separator.clone(),
+            invalidation_tx,
+        )
+        .await
+        .map_err(AddBackendError::Connect)?;
+
+        backend
+            .initialize(&self.shared.name, &self.shared.version)
+            .await
+            .map_err(AddBackendError::Initialize)?;
+
+        Ok(StagedBackend {
+            backend,
+            invalidation_rx,
+        })
+    }
+
+    /// Publish a staged backend.
+    ///
+    /// This is the single commit point for membership changes. The
+    /// `backends` write lock is taken first and is the only `.await` before
+    /// both lists change, and both change with no `.await` between them, so
+    /// commits are serialized, a dropped future either changed nothing or
+    /// changed both lists, and routing never sees one list ahead of the other.
+    async fn commit(
+        &self,
+        staged: StagedBackend,
+        entry: BackendEntry,
+        mode: CommitMode,
+    ) -> Result<(), AddBackendError> {
+        let StagedBackend {
+            backend,
+            invalidation_rx,
+        } = staged;
+        let backend_id = backend.id;
+        let namespace = backend.namespace.clone();
+        let separator = self.shared.separator.clone();
+
+        // The replaced backend, if any, is dropped only after both locks are
+        // released.
+        let _replaced = {
+            let mut backends = self.shared.backends.write().await;
+            let mut entries = self.entries.lock().expect("entries lock poisoned");
+            match mode {
+                CommitMode::Add => {
+                    self.validate_namespace(&namespace, &separator, &entries, None)?;
+                    entries.push(entry);
+                    backends.push(backend);
+                    None
+                }
+                CommitMode::Replace => {
+                    self.validate_namespace(&namespace, &separator, &entries, Some(&namespace))?;
+                    match entries.iter().position(|e| e.namespace == namespace) {
+                        Some(i) => entries[i] = entry,
+                        None => entries.push(entry),
+                    }
+                    match backends.iter().position(|b| b.namespace == namespace) {
+                        Some(i) => Some(std::mem::replace(&mut backends[i], backend)),
+                        None => {
+                            backends.push(backend);
+                            None
+                        }
+                    }
+                }
+            }
+        };
+
+        self.spawn_invalidation_watcher(backend_id, invalidation_rx);
+        self.notify_all_changed().await;
+        Ok(())
+    }
+
     /// Spawn a background task that watches for list-changed notifications
     /// from a backend and refreshes the cache.
+    ///
+    /// The watcher follows the backend by [`Backend::id`], not by position or
+    /// namespace: once that backend is removed or replaced it exits rather
+    /// than refreshing whichever backend took its place. The `backends` lock
+    /// is released before any refresh call, so a slow backend cannot hold up
+    /// a membership change.
     pub(super) fn spawn_invalidation_watcher(
         &self,
-        backend_idx: usize,
+        backend_id: u64,
         mut rx: mpsc::Receiver<ListChanged>,
     ) {
         let shared = Arc::clone(&self.shared);
         tokio::spawn(async move {
             while let Some(changed) = rx.recv().await {
-                let backends = shared.backends.read().await;
-                let Some(backend) = backends.get(backend_idx) else {
-                    break;
+                let backend = {
+                    let backends = shared.backends.read().await;
+                    match backends.iter().find(|b| b.id == backend_id) {
+                        Some(backend) => backend.clone(),
+                        None => break,
+                    }
                 };
                 tracing::debug!(
                     namespace = %backend.namespace,
@@ -435,25 +497,31 @@ impl McpProxy {
     /// }
     /// ```
     pub async fn remove_backend(&self, namespace: &str) -> bool {
-        // Remove from entries (synchronous)
-        let found = {
+        // Same commit point as `commit`: the write lock first, then both
+        // lists with no `.await` in between. Dropping the removed Backend
+        // drops its invalidation sender, which ends its watcher.
+        let removed = {
+            let mut backends = self.shared.backends.write().await;
             let mut entries = self.entries.lock().expect("entries lock poisoned");
             let before = entries.len();
             entries.retain(|e| e.namespace != namespace);
-            entries.len() < before
+            let found = entries.len() < before;
+            let mut removed = Vec::new();
+            backends.retain(|b| {
+                if b.namespace == namespace {
+                    removed.push(b.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            found.then_some(removed)
         };
 
-        if !found {
+        if removed.is_none() {
             return false;
         }
-
-        // Remove from backends (async)
-        // Dropping the Backend drops its invalidation_tx sender, which
-        // causes the spawned invalidation watcher to exit naturally.
-        {
-            let mut backends = self.shared.backends.write().await;
-            backends.retain(|b| b.namespace != namespace);
-        }
+        drop(removed);
 
         // Notify downstream clients that capabilities changed
         self.notify_all_changed().await;
@@ -462,11 +530,26 @@ impl McpProxy {
         true
     }
 
-    /// Replace a backend by removing the old one and adding a new one with
-    /// the same namespace.
+    /// Replace a backend with a new connection under the same namespace.
     ///
-    /// This is a convenience for `remove_backend()` + `add_backend()`. If
-    /// the add fails, the old backend is already gone (no rollback).
+    /// The replacement is connected, initialized, and has its capabilities
+    /// discovered while the existing backend keeps serving requests. Only
+    /// then are routing and backend state switched over together, keeping
+    /// the backend's position. If connecting or initializing fails, or the
+    /// returned future is dropped before it completes, the existing backend
+    /// is left in place and keeps serving.
+    ///
+    /// Replacing a namespace that has no backend adds one. Concurrent
+    /// membership changes take effect in commit order (see
+    /// [`add_backend`](Self::add_backend)), so of two concurrent replaces of
+    /// one namespace the later commit wins, and a replace that commits after
+    /// a remove of the same namespace re-adds it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the namespace creates an ambiguous prefix with a
+    /// different backend, or if the replacement fails to connect or
+    /// initialize. In every error case the existing backend is unchanged.
     ///
     /// # Example
     ///
@@ -479,8 +562,35 @@ impl McpProxy {
         transport: impl ClientTransport,
     ) -> Result<(), AddBackendError> {
         let namespace = namespace.into();
-        self.remove_backend(&namespace).await;
-        self.add_backend(namespace, transport).await
+        self.check_namespace(&namespace, Some(&namespace))?;
+        let staged = self.stage(namespace, transport).await?;
+        let entry = BackendEntry::from_backend(&staged.backend);
+        self.commit(staged, entry, CommitMode::Replace).await
+    }
+
+    /// Replace a backend with a new middleware-wrapped connection.
+    ///
+    /// Like [`replace_backend()`](Self::replace_backend), with the same
+    /// staging and commit guarantees, but applies a Tower layer to the
+    /// replacement's dispatch service, as
+    /// [`add_backend_with_layer()`](Self::add_backend_with_layer) does.
+    pub async fn replace_backend_with_layer<L>(
+        &self,
+        namespace: impl Into<String>,
+        transport: impl ClientTransport,
+        layer: L,
+    ) -> Result<(), AddBackendError>
+    where
+        L: tower::Layer<BackendService> + Send + 'static,
+        L::Service: Service<RouterRequest, Response = RouterResponse> + Clone + Send + 'static,
+        <L::Service as Service<RouterRequest>>::Error: fmt::Display + Send,
+        <L::Service as Service<RouterRequest>>::Future: Send,
+    {
+        let namespace = namespace.into();
+        self.check_namespace(&namespace, Some(&namespace))?;
+        let staged = self.stage(namespace, transport).await?;
+        let entry = layered_entry(&staged.backend, layer);
+        self.commit(staged, entry, CommitMode::Replace).await
     }
 
     /// Return the namespaces of all currently registered backends.
