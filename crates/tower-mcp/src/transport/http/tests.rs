@@ -1923,6 +1923,9 @@ async fn test_delete_session() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(json.get("error").is_some());
     assert_eq!(json["error"]["code"], -32005); // SessionNotFound
+    // The request carried an id, so the error must echo it rather than null,
+    // which the published schemas reject for error responses.
+    assert_eq!(json["id"], 2, "{json}");
 }
 
 /// Send `method` to `/` with an optional session ID, returning the status and
