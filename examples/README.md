@@ -130,6 +130,7 @@ production checklist.
 |---------|---------------|
 | [proxy](proxy.rs) | Multi-server aggregation with namespace isolation |
 | [resource_templates](resource_templates.rs) | URI template matching (RFC 6570) |
+| [skills_server](skills_server.rs) | Serve a directory of Agent Skills with the Skills extension (SEP-2640) |
 | [structured_output](structured_output.rs) | Typed JSON output with schemas |
 | [error_handling](error_handling.rs) | Tool error patterns and propagation |
 | [event_store](event_store.rs) | Custom `EventStore` for persistent SSE event buffering and cross-instance resumption |

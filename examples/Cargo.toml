@@ -40,6 +40,7 @@ proxy = ["tower-mcp/proxy"]
 macros = ["tower-mcp/macros"]
 resilience = ["tower-mcp/resilience"]
 mcp-apps = ["tower-mcp/mcp-apps"]
+skills = ["tower-mcp/skills"]
 protocol-2026-07-28 = ["tower-mcp/protocol-2026-07-28"]
 stateless = ["tower-mcp/stateless"]
 
@@ -64,6 +65,11 @@ path = "stdio_pipe_bench.rs"
 name = "mcp_apps"
 path = "mcp_apps.rs"
 required-features = ["mcp-apps"]
+
+[[example]]
+name = "skills_server"
+path = "skills_server.rs"
+required-features = ["skills"]
 
 [[example]]
 name = "tasks"
