@@ -15,8 +15,7 @@
 
 use std::path::PathBuf;
 
-use tower_mcp::skills::SkillSet;
-use tower_mcp::{BoxError, McpRouter, StdioTransport};
+use tower_mcp::{BoxError, McpRouter, SkillSet, StdioTransport};
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {

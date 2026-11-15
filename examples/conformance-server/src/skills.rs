@@ -6,7 +6,7 @@
 //! the directory-read checks), a skill under an organizational prefix, and a
 //! skill reachable only through `skills/get`.
 
-use tower_mcp::skills::{SkillBuilder, SkillError, SkillSet};
+use tower_mcp::{SkillBuilder, SkillError, SkillSet};
 
 const PDF_SKILL_MD: &str = "---
 name: pdf-processing

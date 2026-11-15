@@ -126,7 +126,7 @@
 //! - [`PromptBuilder`] - Builder for defining prompts
 //! - [`StdioTransport`] - Stdio transport for CLI servers
 //! - [`McpAppResourceBuilder`] - Typed `ui://` resources for MCP Apps (requires `mcp-apps`)
-//! - `skills::SkillSet` - Agent Skills served through the Skills extension (requires `skills`)
+//! - [`SkillSet`] - Agent Skills served through the Skills extension (requires `skills`)
 //!
 //! ### Client
 //! - [`McpClient`] - Client for connecting to MCP servers
@@ -655,6 +655,8 @@ pub use context::{
     OutgoingRequestSender, RequestContext, RequestContextBuilder, ServerNotification,
     notification_channel, outgoing_request_channel,
 };
+#[cfg(feature = "skills")]
+pub use skills::{SkillBuilder, SkillError, SkillSet};
 // `JsonRpcError` is the type of `JsonRpcErrorResponse::error`, and every
 // other JSON-RPC message type is re-exported here, so leaving it out meant a
 // caller could build the response from the crate root but not name its one

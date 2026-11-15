@@ -39,7 +39,7 @@ jobs:
           for feature in \
             http websocket unix childproc oauth jwks testing dynamic-tools \
             http-client oauth-client proxy macros resilience mcp-apps \
-            protocol-2026-07-28 stateless
+            protocol-2026-07-28 stateless skills
           do
             cargo check -p tower-mcp --all-targets --features "$feature"
           done
