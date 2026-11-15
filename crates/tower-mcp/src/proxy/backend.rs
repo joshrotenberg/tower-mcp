@@ -39,8 +39,24 @@ pub(crate) enum ListChanged {
     Prompts,
 }
 
+/// Source of [`Backend::id`] values; never reused within a process.
+static NEXT_BACKEND_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_backend_id() -> u64 {
+    NEXT_BACKEND_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A connected backend MCP server with namespace and cached capabilities.
+///
+/// Every field is a cheap handle, so a clone shares the connection and the
+/// cache with the original.
+#[derive(Clone)]
 pub(crate) struct Backend {
+    /// Process-unique identity of this connection. A replacement under the
+    /// same namespace gets a new id, so anything that tracks a backend over
+    /// time (the invalidation watcher) keys on this rather than on the
+    /// namespace or a position in a list.
+    pub id: u64,
     /// Namespace prefix for this backend's capabilities.
     pub namespace: String,
     /// Separator between namespace and name (default: `_`).
@@ -81,6 +97,7 @@ impl Backend {
         let cache = Arc::new(RwLock::new(CachedCapabilities::default()));
 
         Ok(Self {
+            id: next_backend_id(),
             namespace: namespace.into(),
             separator,
             client: Arc::new(client),
@@ -95,6 +112,7 @@ impl Backend {
             .server_info_blocking()
             .and_then(|info| info.instructions.clone());
         Self {
+            id: next_backend_id(),
             namespace: namespace.into(),
             separator,
             client: Arc::new(client),

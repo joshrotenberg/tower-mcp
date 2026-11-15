@@ -475,7 +475,7 @@ impl McpProxyBuilder {
             };
 
             if let Some(rx) = pb.invalidation_rx {
-                invalidation_rxs.push((backends.len(), rx));
+                invalidation_rxs.push((pb.backend.id, rx));
             }
 
             entries.push(entry);
@@ -518,8 +518,8 @@ impl McpProxyBuilder {
         );
 
         // Spawn invalidation watchers for backends with notification handlers.
-        for (backend_idx, rx) in invalidation_rxs {
-            proxy.spawn_invalidation_watcher(backend_idx, rx);
+        for (backend_id, rx) in invalidation_rxs {
+            proxy.spawn_invalidation_watcher(backend_id, rx);
         }
 
         Ok(ProxyBuildResult { proxy, skipped })

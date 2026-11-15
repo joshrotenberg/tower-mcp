@@ -1964,4 +1964,295 @@ mod proxy_tests {
             other => panic!("expected CallTool response, got: {:?}", other),
         }
     }
+
+    // ========================================================================
+    // Atomic backend replacement (#1616)
+    // ========================================================================
+
+    /// A transport whose server never answers, so initialization stalls
+    /// until the caller gives up.
+    struct StallTransport;
+
+    #[async_trait::async_trait]
+    impl crate::client::ClientTransport for StallTransport {
+        async fn send(&mut self, _message: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+
+        async fn recv(&mut self) -> crate::error::Result<Option<String>> {
+            std::future::pending().await
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        async fn close(&mut self) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn call_math_add(proxy: &mut McpProxy) -> Result<String, String> {
+        let resp = call_proxy(
+            proxy,
+            McpRequest::CallTool(crate::protocol::CallToolParams {
+                input_responses: None,
+                request_state: None,
+                name: "math_add".to_string(),
+                arguments: json!({"a": 2, "b": 3}),
+                meta: None,
+                task: None,
+            }),
+        )
+        .await
+        .map_err(|e| e.message)?;
+        match resp {
+            McpResponse::CallTool(r) => Ok(r.all_text()),
+            other => Err(format!("expected CallTool, got {other:?}")),
+        }
+    }
+
+    async fn listed_tool_names(proxy: &mut McpProxy) -> Vec<String> {
+        match call_proxy(proxy, McpRequest::ListTools(Default::default()))
+            .await
+            .expect("list tools should succeed")
+        {
+            McpResponse::ListTools(result) => {
+                let mut names: Vec<String> = result.tools.into_iter().map(|t| t.name).collect();
+                names.sort();
+                names
+            }
+            other => panic!("expected ListTools, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_replace_backend_failure_keeps_previous_backend() {
+        let mut proxy = build_test_proxy().await;
+
+        let err = proxy
+            .replace_backend("math", BrokenTransport)
+            .await
+            .expect_err("a broken replacement must fail");
+        assert!(
+            matches!(
+                err,
+                crate::proxy::AddBackendError::Connect(_)
+                    | crate::proxy::AddBackendError::Initialize(_)
+            ),
+            "{err}"
+        );
+
+        assert_eq!(proxy.backend_namespaces(), vec!["math", "text"]);
+        assert_eq!(call_math_add(&mut proxy).await.unwrap(), "5");
+        assert!(
+            listed_tool_names(&mut proxy)
+                .await
+                .contains(&"math_add".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_replace_backend_retry_after_failure_succeeds() {
+        let mut proxy = build_test_proxy().await;
+        assert!(
+            proxy
+                .replace_backend("math", BrokenTransport)
+                .await
+                .is_err()
+        );
+
+        proxy
+            .replace_backend("math", ChannelTransport::new(math_router()))
+            .await
+            .expect("retry should succeed");
+        assert_eq!(proxy.backend_count(), 2);
+        assert_eq!(call_math_add(&mut proxy).await.unwrap(), "5");
+    }
+
+    #[tokio::test]
+    async fn test_replace_backend_cancelled_during_staging_keeps_previous_backend() {
+        let mut proxy = build_test_proxy().await;
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(200),
+            proxy.replace_backend("math", StallTransport),
+        )
+        .await;
+        assert!(outcome.is_err(), "staging should still be stalled");
+
+        assert_eq!(proxy.backend_namespaces(), vec!["math", "text"]);
+        assert_eq!(call_math_add(&mut proxy).await.unwrap(), "5");
+    }
+
+    #[tokio::test]
+    async fn test_replace_backend_serves_old_until_commit_then_new() {
+        let mut proxy = build_test_proxy().await;
+
+        // A replacement still staging must not disturb the live backend.
+        let staging = {
+            let proxy = proxy.clone();
+            tokio::spawn(async move { proxy.replace_backend("math", StallTransport).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(call_math_add(&mut proxy).await.unwrap(), "5");
+        staging.abort();
+
+        // Replace "math" with a server exposing different tools; the switch is
+        // visible at once and the backend keeps its position.
+        proxy
+            .replace_backend("math", ChannelTransport::new(text_router()))
+            .await
+            .expect("replace should succeed");
+        assert_eq!(proxy.backend_namespaces(), vec!["math", "text"]);
+        let names = listed_tool_names(&mut proxy).await;
+        assert!(names.contains(&"math_echo".to_string()), "{names:?}");
+        assert!(!names.contains(&"math_add".to_string()), "{names:?}");
+        assert!(call_math_add(&mut proxy).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_replace_backend_with_layer_applies_layer() {
+        let mut proxy = build_test_proxy().await;
+        proxy
+            .replace_backend_with_layer(
+                "math",
+                ChannelTransport::new(slow_router()),
+                TimeoutLayer::new(Duration::from_millis(50)),
+            )
+            .await
+            .expect("replace should succeed");
+
+        let resp = call_proxy(
+            &mut proxy,
+            McpRequest::CallTool(crate::protocol::CallToolParams {
+                input_responses: None,
+                request_state: None,
+                name: "math_slow".to_string(),
+                arguments: json!({"delay_ms": 500}),
+                meta: None,
+                task: None,
+            }),
+        )
+        .await;
+        let timed_out = match resp {
+            Err(_) => true,
+            Ok(McpResponse::CallTool(r)) => r.is_error,
+            Ok(_) => false,
+        };
+        assert!(timed_out, "the replacement's timeout layer should apply");
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_replaces_leave_one_backend() {
+        let proxy = build_test_proxy().await;
+        let (a, b) = tokio::join!(
+            proxy.replace_backend("math", ChannelTransport::new(math_router())),
+            proxy.replace_backend("math", ChannelTransport::new(math_router())),
+        );
+        a.expect("first replace");
+        b.expect("second replace");
+        assert_eq!(proxy.backend_namespaces(), vec!["math", "text"]);
+        assert_eq!(proxy.shared.backends.read().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_replace_backend_rejects_conflict_with_other_backend() {
+        let proxy = McpProxy::builder("p", "1.0.0")
+            .separator(".")
+            .backend("db", ChannelTransport::new(math_router()))
+            .await
+            .build_strict()
+            .await
+            .expect("proxy should build");
+        // "db.read" would shadow "db"'s prefix; replacing it is still a conflict.
+        let err = proxy
+            .replace_backend("db.read", ChannelTransport::new(text_router()))
+            .await
+            .expect_err("ambiguous prefix");
+        assert!(
+            matches!(err, crate::proxy::AddBackendError::AmbiguousPrefix { .. }),
+            "{err}"
+        );
+        assert_eq!(proxy.backend_namespaces(), vec!["db"]);
+    }
+
+    /// A backend whose host can push notifications into its client stream.
+    fn notifying_backend(
+        router: McpRouter,
+    ) -> (ChannelTransport, crate::context::NotificationSender) {
+        let (tx, rx) = notification_channel(16);
+        let router = router.with_notification_sender(tx.clone());
+        (ChannelTransport::with_notifications(router, rx), tx)
+    }
+
+    fn drain(rx: &mut crate::context::NotificationReceiver) {
+        while rx.try_recv().is_ok() {}
+    }
+
+    #[tokio::test]
+    async fn test_watcher_follows_backend_identity_after_removal() {
+        let (proxy_tx, mut proxy_rx) = notification_channel(64);
+        let (c_transport, c_tx) = notifying_backend(math_router());
+        let proxy = McpProxy::builder("watch", "1.0.0")
+            .notification_sender(proxy_tx)
+            .backend("a", ChannelTransport::new(math_router()))
+            .await
+            .backend("b", ChannelTransport::new(text_router()))
+            .await
+            .backend("c", c_transport)
+            .await
+            .build_strict()
+            .await
+            .expect("proxy should build");
+
+        // Removing the first backend shifts every later position. A watcher
+        // keyed on position would now find nothing at c's old index.
+        assert!(proxy.remove_backend("a").await);
+        drain(&mut proxy_rx);
+
+        c_tx.send(crate::context::ServerNotification::ToolsListChanged)
+            .await
+            .unwrap();
+        let forwarded = tokio::time::timeout(Duration::from_secs(5), proxy_rx.recv())
+            .await
+            .expect("c's watcher should refresh and forward the change");
+        assert!(matches!(
+            forwarded,
+            Some(crate::context::ServerNotification::ToolsListChanged)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_watcher_runs_for_replacement_backend() {
+        let (proxy_tx, mut proxy_rx) = notification_channel(64);
+        let proxy = McpProxy::builder("watch", "1.0.0")
+            .notification_sender(proxy_tx)
+            .backend("a", ChannelTransport::new(math_router()))
+            .await
+            .backend("b", ChannelTransport::new(text_router()))
+            .await
+            .build_strict()
+            .await
+            .expect("proxy should build");
+
+        let (replacement, replacement_tx) = notifying_backend(math_router());
+        proxy
+            .replace_backend("a", replacement)
+            .await
+            .expect("replace should succeed");
+        drain(&mut proxy_rx);
+
+        replacement_tx
+            .send(crate::context::ServerNotification::PromptsListChanged)
+            .await
+            .unwrap();
+        let forwarded = tokio::time::timeout(Duration::from_secs(5), proxy_rx.recv())
+            .await
+            .expect("the replacement's watcher should forward the change");
+        assert!(matches!(
+            forwarded,
+            Some(crate::context::ServerNotification::PromptsListChanged)
+        ));
+    }
 }
