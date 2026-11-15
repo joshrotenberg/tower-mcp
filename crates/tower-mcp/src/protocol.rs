@@ -4,3 +4,6 @@
 //! <https://modelcontextprotocol.io/specification/2025-11-25>
 
 pub use tower_mcp_types::protocol::*;
+
+/// Skills extension wire types (SEP-2640).
+pub use tower_mcp_types::skills;

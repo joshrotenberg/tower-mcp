@@ -920,8 +920,9 @@ pub(super) async fn handle_post(
             Some(s) => s,
             None => {
                 // 404 is what tells spec clients to re-initialize; the body
-                // keeps the JSON-RPC error for clients that read it instead.
-                return session_not_found_response(&session_id);
+                // keeps the JSON-RPC error for clients that read it instead,
+                // answered with the request's own id so it correlates.
+                return session_not_found_response(extract_request_id(&parsed), &session_id);
             }
         }
     } else if state.optional_sessions {
@@ -1724,7 +1725,7 @@ pub(super) async fn handle_get(
     let session = match state.sessions.get(&session_id, &principal).await {
         Some(s) => s,
         None => {
-            return session_not_found_response(&session_id);
+            return session_not_found_response(None, &session_id);
         }
     };
 
@@ -1836,7 +1837,7 @@ pub(super) async fn handle_delete(
         StatusCode::OK.into_response()
     } else {
         tracing::debug!(session_id = %session_id, "Session already removed or never existed");
-        session_not_found_response(&session_id)
+        session_not_found_response(None, &session_id)
     }
 }
 
@@ -1891,9 +1892,15 @@ pub(super) fn json_rpc_error_response(
 /// unknown, expired, terminated, or bound to a different principal. The
 /// transports spec requires the 404, and it is the only status clients take
 /// as the cue to start a new session.
-fn session_not_found_response(session_id: &str) -> Response {
+///
+/// `id` is the request's id when the body carried one (a POST), so the error
+/// correlates with the request; a GET or DELETE has no request to answer.
+fn session_not_found_response(
+    id: Option<crate::protocol::RequestId>,
+    session_id: &str,
+) -> Response {
     json_rpc_error_response_with_status(
-        None,
+        id,
         JsonRpcError::session_not_found_with_id(session_id),
         StatusCode::NOT_FOUND,
     )

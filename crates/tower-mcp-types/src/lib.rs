@@ -119,6 +119,7 @@
 pub mod error;
 pub mod inspection;
 pub mod protocol;
+pub mod skills;
 pub mod tasks;
 
 #[cfg(feature = "testing")]

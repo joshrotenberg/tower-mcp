@@ -502,6 +502,26 @@ pub fn build_tool_arguments(schema: &serde_json::Value) -> serde_json::Value {
     serde_json::Value::Object(args)
 }
 
+/// `json-schema-2020-12-preservation` -- list tools, then pass the focal
+/// tool's `inputSchema` back verbatim to `json_schema_echo`, so the harness
+/// can check that no JSON Schema 2020-12 keyword was dropped on the way in.
+pub async fn json_schema_preservation(server_url: &str) -> Result<()> {
+    const FOCAL: &str = "json_schema_2020_12_tool";
+    const ECHO: &str = "json_schema_echo";
+    let client = connect_activated(server_url, || handlers::BasicHandler, |b| b).await?;
+    let tools = client.list_all_tools().await?;
+    let focal = tools
+        .iter()
+        .find(|t| t.name == FOCAL)
+        .ok_or_else(|| anyhow::anyhow!("server did not list {FOCAL}"))?;
+    let schema = serde_json::to_value(&focal.input_schema)?;
+    client
+        .call_tool(ECHO, serde_json::json!({ "schema": schema }))
+        .await?;
+    client.shutdown().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod handshake_retry_tests {
     use super::*;

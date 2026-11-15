@@ -116,6 +116,7 @@ No features are enabled by default.
 | `macros` | Proc macros (`#[tool_fn]`, `#[prompt_fn]`, `#[resource_fn]`, `#[resource_template_fn]`) |
 | `resilience` | Re-export of tower-resilience circuit breaker, rate limiter, and bulkhead layers |
 | `mcp-apps` | Typed server support for the MCP Apps extension; runtime advertisement stays explicit via `McpRouter::with_mcp_apps()` |
+| `skills` | Skills extension (SEP-2640): serve Agent Skills as `skill://` resources with `skills/list`, `skills/get`, and `resources/directory/read` via `McpRouter::skills`, and verify skill files on the client with `McpClient::read_verified_skill_file` |
 | `schema-validation` | Validate tool arguments against `inputSchema` and `structuredContent` against `outputSchema` at call time; per-tool opt-out on `ToolBuilder` |
 | `protocol-2026-07-28` | Compile the 2026-07-28 protocol implementation |
 | `stateless` | Compatibility alias for `protocol-2026-07-28` |
@@ -169,7 +170,8 @@ session management, SSE event IDs with stream resumption, and extension declarat
 negotiation. Request batching is accepted on `2025-03-26` only, where the spec defines
 it. The 2026-07-28 build adds sessionless dispatch, `server/discover`,
 `subscriptions/listen`, per-request `_meta`, response-cache hints, Multi Round-Trip
-Requests, and the Tasks extension (opt in with `McpRouter::with_tasks`).
+Requests, and the Tasks extension (opt in with `McpRouter::with_tasks`). The `skills`
+feature adds the Skills extension (SEP-2640) on both the server and the client.
 
 Four of those are Deprecated by the specification as of 2026-07-28 and remain
 supported here: sampling, logging, and roots (SEP-2577), and Dynamic Client
@@ -184,7 +186,8 @@ The [official MCP conformance suite](https://github.com/modelcontextprotocol/con
 runs on every PR in
 [`conformance.yml`](https://github.com/joshrotenberg/tower-mcp/actions/workflows/conformance.yml),
 covering server and client for both revisions. All four suites pass with zero failures
-and empty expected-failure baselines, pinned to `conformance@0.2.0-alpha.10`. The suite
+and empty expected-failure baselines, pinned to `conformance@0.2.0-alpha.12`, and the
+Skills extension (SEP-2640) server and client scenarios run alongside them. The suite
 is maintained upstream and grows with the spec, so scenario and check counts move; the
 workflow is the current result.
 

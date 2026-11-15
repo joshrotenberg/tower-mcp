@@ -126,6 +126,7 @@
 //! - [`PromptBuilder`] - Builder for defining prompts
 //! - [`StdioTransport`] - Stdio transport for CLI servers
 //! - [`McpAppResourceBuilder`] - Typed `ui://` resources for MCP Apps (requires `mcp-apps`)
+//! - [`SkillSet`] - Agent Skills served through the Skills extension (requires `skills`)
 //!
 //! ### Client
 //! - [`McpClient`] - Client for connecting to MCP servers
@@ -168,6 +169,11 @@
 //! - `macros` - Optional proc macros (`#[tool_fn]`, `#[prompt_fn]`, `#[resource_fn]`, `#[resource_template_fn]`)
 //! - `mcp-apps` - Typed server support for the stable MCP Apps extension. Runtime
 //!   advertisement remains explicit through [`McpRouter::with_mcp_apps`].
+//! - `skills` - The Skills extension (SEP-2640): `skills::SkillSet` loads Agent
+//!   Skills from disk or memory and `McpRouter::skills` serves them as `skill://`
+//!   resources with `skills/list`, `skills/get`, and `resources/directory/read`. The
+//!   client side verifies skill files against their digests with
+//!   `McpClient::read_verified_skill_file`.
 //! - `schema-validation` - Validate tool arguments against `inputSchema` and
 //!   `structuredContent` against `outputSchema` at call time, on by default for every
 //!   tool once compiled (opt out per tool with `ToolBuilder::skip_input_validation` and
@@ -577,6 +583,8 @@ pub mod router;
 pub mod session;
 #[cfg(any(feature = "http", feature = "websocket"))]
 pub mod session_store;
+#[cfg(feature = "skills")]
+pub mod skills;
 #[cfg(feature = "stateless")]
 pub mod stateless;
 mod task_execution;
@@ -647,6 +655,8 @@ pub use context::{
     OutgoingRequestSender, RequestContext, RequestContextBuilder, ServerNotification,
     notification_channel, outgoing_request_channel,
 };
+#[cfg(feature = "skills")]
+pub use skills::{SkillBuilder, SkillError, SkillSet};
 // `JsonRpcError` is the type of `JsonRpcErrorResponse::error`, and every
 // other JSON-RPC message type is re-exported here, so leaving it out meant a
 // caller could build the response from the crate root but not name its one

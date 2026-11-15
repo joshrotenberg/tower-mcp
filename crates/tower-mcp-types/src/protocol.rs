@@ -832,6 +832,12 @@ pub enum McpRequest {
     /// returns an SSE stream. The variant is defined here for client-side
     /// type-safe construction and for any future transport implementations.
     SubscriptionsListen(SubscriptionsListenParams),
+    /// SEP-2640 Skills extension: `skills/list`.
+    ListSkills(crate::skills::ListSkillsParams),
+    /// SEP-2640 Skills extension: `skills/get`.
+    GetSkill(crate::skills::GetSkillParams),
+    /// SEP-2640 Skills extension: `resources/directory/read`.
+    ReadResourceDirectory(crate::skills::ReadResourceDirectoryParams),
     /// Unknown method
     Unknown {
         /// Unrecognized JSON-RPC method name.
@@ -863,6 +869,9 @@ impl McpRequest {
             McpRequest::Complete(_) => "completion/complete",
             McpRequest::Discover(_) => "server/discover",
             McpRequest::SubscriptionsListen(_) => "subscriptions/listen",
+            McpRequest::ListSkills(_) => crate::skills::METHOD_SKILLS_LIST,
+            McpRequest::GetSkill(_) => crate::skills::METHOD_SKILLS_GET,
+            McpRequest::ReadResourceDirectory(_) => crate::skills::METHOD_RESOURCES_DIRECTORY_READ,
             McpRequest::Unknown { method, .. } => method,
         }
     }
@@ -1105,6 +1114,16 @@ pub enum McpResponse {
     /// for potential future transport implementations that want a typed
     /// result.
     SubscriptionsListen(SubscriptionsListenResult),
+    /// SEP-2640 `skills/list` response.
+    ListSkills(crate::skills::ListSkillsResult),
+    /// SEP-2640 `skills/get` response.
+    GetSkill(crate::skills::GetSkillResult),
+    /// SEP-2640 `resources/directory/read` response.
+    ///
+    /// Its shape overlaps [`McpResponse::ListResources`], so untagged
+    /// deserialization of a raw response never selects this variant; decode
+    /// the result as [`crate::skills::ReadResourceDirectoryResult`] directly.
+    ReadResourceDirectory(crate::skills::ReadResourceDirectoryResult),
     /// Generic empty response for methods without a result body.
     Empty(EmptyResult),
     /// Raw JSON value for experimental/extension methods.
@@ -2562,7 +2581,9 @@ pub enum CacheScope {
 /// not parse as `CacheScope` becomes `None`, same as if the field had been
 /// absent. Serialization is untouched: `CacheScope`'s own `Deserialize` stays
 /// strict for values this crate produces and re-parses itself.
-fn deserialize_lenient_cache_scope<'de, D>(deserializer: D) -> Result<Option<CacheScope>, D::Error>
+pub(crate) fn deserialize_lenient_cache_scope<'de, D>(
+    deserializer: D,
+) -> Result<Option<CacheScope>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -2576,7 +2597,7 @@ where
 /// A negative or non-integer value is malformed advisory metadata, not a
 /// reason to fail the whole result; it becomes `None`, same as an absent
 /// field.
-fn deserialize_lenient_ttl_ms<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+pub(crate) fn deserialize_lenient_ttl_ms<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -5750,6 +5771,21 @@ impl McpRequest {
                 let p: SubscriptionsListenParams =
                     serde_json::from_value(params).unwrap_or_default();
                 Ok(McpRequest::SubscriptionsListen(p))
+            }
+            // SEP-2640 Skills extension. Parsed unconditionally; a router with
+            // no skills registered answers these as MethodNotFound.
+            crate::skills::METHOD_SKILLS_LIST => {
+                let p: crate::skills::ListSkillsParams =
+                    serde_json::from_value(params).unwrap_or_default();
+                Ok(McpRequest::ListSkills(p))
+            }
+            crate::skills::METHOD_SKILLS_GET => {
+                let p: crate::skills::GetSkillParams = serde_json::from_value(params)?;
+                Ok(McpRequest::GetSkill(p))
+            }
+            crate::skills::METHOD_RESOURCES_DIRECTORY_READ => {
+                let p: crate::skills::ReadResourceDirectoryParams = serde_json::from_value(params)?;
+                Ok(McpRequest::ReadResourceDirectory(p))
             }
             method => Ok(McpRequest::Unknown {
                 method: method.to_string(),

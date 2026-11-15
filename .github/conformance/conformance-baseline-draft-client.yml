@@ -7,8 +7,9 @@
 # as the gaps close; CI fails when a baselined scenario starts passing (stale
 # entry) or a non-baselined scenario fails.
 #
-# Status at 0.2.0-alpha.10 after the final client lifecycle and authorization
-# work: all 32 scenarios are green (399 checks, zero failures or warnings).
+# Status at 0.2.0-alpha.12: all scenarios are green (416 checks, zero
+# failures or warnings). The SEP-2640 skills client scenarios are run
+# separately with --force, since --suite all leaves extension scenarios out.
 #
 # Format (0.2.x suite): plain scenario-name strings under the `client:` key;
 # reasons live in these comments.

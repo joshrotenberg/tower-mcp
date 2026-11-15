@@ -24,10 +24,12 @@
 //! - Logging notifications
 //! - Sampling (LLM requests back to client)
 //! - Elicitation (user input requests)
+//! - Skills extension (SEP-2640): skills/list, skills/get, resources/directory/read
 
 mod frame_log;
 mod prompts;
 mod resources;
+mod skills;
 mod tools;
 
 use clap::Parser;
@@ -101,6 +103,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     for prompt in prompts::build_prompts() {
         router = router.prompt(prompt);
     }
+    router = router.skills(skills::build_skills()?);
 
     match args.transport.as_str() {
         "stdio" => {
