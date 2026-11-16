@@ -3499,3 +3499,327 @@ async fn a_command_queued_while_the_loop_exits_is_released() {
         "the exited loop does not run the command"
     );
 }
+
+// #1644: every `list_all_*` walk is bounded by `max_list_pages`.
+
+/// A `tools/list` page with one tool per name and an optional next cursor.
+fn named_tools_page(names: &[&str], next: Option<&str>) -> serde_json::Value {
+    let tools: Vec<serde_json::Value> = names
+        .iter()
+        .map(|name| {
+            serde_json::json!({
+                "name": name,
+                "inputSchema": { "type": "object", "properties": {} }
+            })
+        })
+        .collect();
+    let mut page = serde_json::json!({ "tools": tools });
+    if let Some(next) = next {
+        page["nextCursor"] = next.into();
+    }
+    page
+}
+
+/// Connect an initialized client with the given page budget.
+async fn paged_client(transport: MockTransport, max_pages: usize) -> McpClient {
+    let client = McpClient::builder()
+        .max_list_pages(max_pages)
+        .connect_simple(transport)
+        .await
+        .unwrap();
+    client.initialize("test-client", "1.0.0").await.unwrap();
+    client
+}
+
+/// The `params.cursor` of every outgoing request for `method`, in order.
+fn sent_cursors(outgoing: &Arc<Mutex<Vec<String>>>, method: &str) -> Vec<Option<String>> {
+    outgoing
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|message| serde_json::from_str::<serde_json::Value>(message).ok())
+        .filter(|message| message["method"] == method)
+        .map(|message| message["params"]["cursor"].as_str().map(str::to_string))
+        .collect()
+}
+
+fn assert_page_limit(err: Error, method: &str, limit: usize) {
+    match err {
+        Error::ListPageLimitExceeded {
+            method: got_method,
+            limit: got_limit,
+        } => {
+            assert_eq!(got_method, method);
+            assert_eq!(got_limit, limit);
+        }
+        other => panic!("expected ListPageLimitExceeded, got {other}"),
+    }
+}
+
+#[test]
+fn list_page_budget_defaults_and_normalizes_zero() {
+    assert_eq!(
+        McpClientBuilder::new().max_list_pages,
+        DEFAULT_MAX_LIST_PAGES
+    );
+    assert_eq!(DEFAULT_MAX_LIST_PAGES, 1000);
+    assert_eq!(McpClientBuilder::new().max_list_pages(0).max_list_pages, 1);
+    assert_eq!(McpClientBuilder::new().max_list_pages(7).max_list_pages, 7);
+}
+
+#[tokio::test]
+async fn list_all_stops_a_repeated_cursor_at_the_page_budget() {
+    let mut replies = vec![mock_initialize_response()];
+    replies.extend((0..10).map(|_| named_tools_page(&["loop"], Some("same"))));
+    let transport = MockTransport::with_responses(replies);
+    let outgoing = transport.outgoing.clone();
+    let client = paged_client(transport, 3).await;
+
+    let err = client.list_all_tools().await.unwrap_err();
+    assert_page_limit(err, "tools/list", 3);
+    assert_eq!(
+        sent_cursors(&outgoing, "tools/list"),
+        vec![None, Some("same".to_string()), Some("same".to_string())],
+        "a repeated cursor is followed, and only the budget ends the walk"
+    );
+}
+
+#[tokio::test]
+async fn list_all_follows_an_empty_string_cursor() {
+    let transport = MockTransport::with_responses(vec![
+        mock_initialize_response(),
+        named_tools_page(&["first"], Some("")),
+        named_tools_page(&["second"], None),
+    ]);
+    let outgoing = transport.outgoing.clone();
+    let client = paged_client(transport, 5).await;
+
+    let tools = client.list_all_tools().await.unwrap();
+    let names: Vec<_> = tools.iter().map(|tool| tool.name.as_str()).collect();
+    assert_eq!(names, ["first", "second"]);
+    assert_eq!(
+        sent_cursors(&outgoing, "tools/list"),
+        vec![None, Some(String::new())],
+        "an empty cursor is a valid opaque cursor, not the end of the list"
+    );
+}
+
+#[tokio::test]
+async fn list_all_stops_an_empty_string_cursor_loop_at_the_page_budget() {
+    let mut replies = vec![mock_initialize_response()];
+    replies.extend((0..10).map(|_| named_tools_page(&["loop"], Some(""))));
+    let transport = MockTransport::with_responses(replies);
+    let outgoing = transport.outgoing.clone();
+    let client = paged_client(transport, 4).await;
+
+    let err = client.list_all_tools().await.unwrap_err();
+    assert_page_limit(err, "tools/list", 4);
+    assert_eq!(sent_cursors(&outgoing, "tools/list").len(), 4);
+}
+
+#[tokio::test]
+async fn list_all_stops_ever_changing_cursors_at_the_page_budget() {
+    let mut replies = vec![mock_initialize_response()];
+    for page in 0..10 {
+        let next = format!("cursor-{page}");
+        replies.push(named_tools_page(&["tool"], Some(&next)));
+    }
+    let transport = MockTransport::with_responses(replies);
+    let outgoing = transport.outgoing.clone();
+    let client = paged_client(transport, 4).await;
+
+    let err = client.list_all_tools().await.unwrap_err();
+    assert_page_limit(err, "tools/list", 4);
+    assert_eq!(
+        sent_cursors(&outgoing, "tools/list"),
+        vec![
+            None,
+            Some("cursor-0".to_string()),
+            Some("cursor-1".to_string()),
+            Some("cursor-2".to_string()),
+        ],
+        "distinct cursors are all followed until the budget is spent"
+    );
+}
+
+#[tokio::test]
+async fn list_all_counts_zero_item_pages_against_the_budget() {
+    // Within budget: empty pages are followed and contribute nothing.
+    let transport = MockTransport::with_responses(vec![
+        mock_initialize_response(),
+        named_tools_page(&[], Some("a")),
+        named_tools_page(&[], Some("b")),
+        named_tools_page(&["only"], None),
+    ]);
+    let client = paged_client(transport, 3).await;
+    let tools = client.list_all_tools().await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name, "only");
+
+    // Over budget: a server sending only empty pages is still stopped.
+    let mut replies = vec![mock_initialize_response()];
+    replies.extend((0..10).map(|page| named_tools_page(&[], Some(&format!("e{page}")))));
+    let transport = MockTransport::with_responses(replies);
+    let outgoing = transport.outgoing.clone();
+    let client = paged_client(transport, 3).await;
+    let err = client.list_all_tools().await.unwrap_err();
+    assert_page_limit(err, "tools/list", 3);
+    assert_eq!(sent_cursors(&outgoing, "tools/list").len(), 3);
+}
+
+#[tokio::test]
+async fn list_all_succeeds_when_the_last_page_is_exactly_the_budget() {
+    let pages = || {
+        vec![
+            mock_initialize_response(),
+            named_tools_page(&["a"], Some("1")),
+            named_tools_page(&["b"], Some("2")),
+            named_tools_page(&["c"], None),
+        ]
+    };
+
+    let transport = MockTransport::with_responses(pages());
+    let outgoing = transport.outgoing.clone();
+    let client = paged_client(transport, 3).await;
+    let tools = client.list_all_tools().await.unwrap();
+    let names: Vec<_> = tools.iter().map(|tool| tool.name.as_str()).collect();
+    assert_eq!(names, ["a", "b", "c"]);
+    assert_eq!(sent_cursors(&outgoing, "tools/list").len(), 3);
+
+    let client = paged_client(MockTransport::with_responses(pages()), 3).await;
+    let listed = client.list_all_tools_with_cache_hints().await.unwrap();
+    assert_eq!(listed.items.len(), 3);
+    assert_eq!(listed.ttl_ms, None);
+    assert_eq!(listed.cache_scope, None);
+}
+
+#[tokio::test]
+async fn list_all_fails_one_page_over_the_budget_without_a_partial_result() {
+    let transport = MockTransport::with_responses(vec![
+        mock_initialize_response(),
+        named_tools_page(&["a"], Some("1")),
+        named_tools_page(&["b"], Some("2")),
+        named_tools_page(&["c"], Some("3")),
+        named_tools_page(&["d"], None),
+    ]);
+    let outgoing = transport.outgoing.clone();
+    let client = paged_client(transport, 3).await;
+
+    let err = client.list_all_tools().await.unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("tools/list"), "{message}");
+    assert!(message.contains("3 pages"), "{message}");
+    assert!(message.contains("max_list_pages"), "{message}");
+    assert_page_limit(err, "tools/list", 3);
+    assert_eq!(
+        sent_cursors(&outgoing, "tools/list").len(),
+        3,
+        "the fourth page is never requested"
+    );
+}
+
+/// Every list family, in both its item-only and cache-hint form, shares the
+/// budget and names its own method in the error.
+#[tokio::test]
+async fn every_list_all_helper_enforces_the_page_budget() {
+    // One page shape that deserializes as any list result.
+    let endless = serde_json::json!({
+        "tools": [],
+        "resources": [],
+        "resourceTemplates": [],
+        "prompts": [],
+        "skills": [],
+        "nextCursor": "more"
+    });
+    let mut replies = vec![mock_initialize_response()];
+    // Ten helpers, two pages each before the budget of two is spent.
+    replies.extend((0..20).map(|_| endless.clone()));
+    let client = paged_client(MockTransport::with_responses(replies), 2).await;
+
+    assert_page_limit(client.list_all_tools().await.unwrap_err(), "tools/list", 2);
+    assert_page_limit(
+        client.list_all_tools_with_cache_hints().await.unwrap_err(),
+        "tools/list",
+        2,
+    );
+    assert_page_limit(
+        client.list_all_resources().await.unwrap_err(),
+        "resources/list",
+        2,
+    );
+    assert_page_limit(
+        client
+            .list_all_resources_with_cache_hints()
+            .await
+            .unwrap_err(),
+        "resources/list",
+        2,
+    );
+    assert_page_limit(
+        client.list_all_resource_templates().await.unwrap_err(),
+        "resources/templates/list",
+        2,
+    );
+    assert_page_limit(
+        client
+            .list_all_resource_templates_with_cache_hints()
+            .await
+            .unwrap_err(),
+        "resources/templates/list",
+        2,
+    );
+    assert_page_limit(
+        client.list_all_prompts().await.unwrap_err(),
+        "prompts/list",
+        2,
+    );
+    assert_page_limit(
+        client
+            .list_all_prompts_with_cache_hints()
+            .await
+            .unwrap_err(),
+        "prompts/list",
+        2,
+    );
+    assert_page_limit(
+        client.list_all_skills().await.unwrap_err(),
+        "skills/list",
+        2,
+    );
+    assert_page_limit(
+        client.list_all_skills_with_cache_hints().await.unwrap_err(),
+        "skills/list",
+        2,
+    );
+}
+
+/// On 2026-07-28 a repeated cursor can be answered from the response cache
+/// without a request; those pages still count against the budget.
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+#[tokio::test(start_paused = true)]
+async fn cached_pages_count_against_the_page_budget() {
+    bounded(async {
+        let transport = MockTransport::with_responses(vec![
+            final_discover_result(),
+            tools_page("first", Some("same"), Some(60_000), Some("public")),
+            tools_page("looping", Some("same"), Some(60_000), Some("public")),
+        ]);
+        let outgoing = transport.outgoing.clone();
+        let client = McpClient::builder()
+            .protocol_support(ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+            .max_list_pages(5)
+            .connect_simple(transport)
+            .await
+            .unwrap();
+        client.discover("test-client", "1.0.0").await.unwrap();
+
+        let err = client.list_all_tools_with_cache_hints().await.unwrap_err();
+        assert_page_limit(err, "tools/list", 5);
+        assert_eq!(
+            sent_cursors(&outgoing, "tools/list"),
+            vec![None, Some("same".to_string())],
+            "pages after the second come from the cache"
+        );
+    })
+    .await;
+}

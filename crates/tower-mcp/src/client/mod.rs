@@ -447,6 +447,8 @@ pub struct McpClient {
     recovery_lock: Mutex<()>,
     /// Maximum number of input-required rounds auto-driven per operation.
     max_mrtr_rounds: usize,
+    /// Maximum number of pages one `list_all_*` call fetches.
+    max_list_pages: usize,
     /// SEP-2549 final-protocol response cache.
     response_cache: Arc<ClientResponseCache>,
     /// Allocator for per-request progress tokens; `None` when the client did
@@ -461,6 +463,27 @@ pub struct McpClient {
     next_request_id: Arc<AtomicI64>,
 }
 
+/// Default page budget for one automatic list walk.
+///
+/// A `list_all_*` call that fetches this many pages and is handed another
+/// `nextCursor` fails with [`Error::ListPageLimitExceeded`]. Change it with
+/// [`McpClientBuilder::max_list_pages`].
+///
+/// One thousand pages is far beyond any catalog a server is expected to
+/// serve: even at ten items per page it covers ten thousand tools, and
+/// servers built on this crate return every item in one page unless
+/// configured otherwise. It still stops a server that hands out cursors
+/// forever after a bounded number of round trips rather than never.
+pub const DEFAULT_MAX_LIST_PAGES: usize = 1000;
+
+/// One page of a list walk, reduced to the parts pagination needs.
+struct ListPage<T> {
+    items: Vec<T>,
+    next_cursor: Option<String>,
+    ttl_ms: Option<u64>,
+    cache_scope: Option<CacheScope>,
+}
+
 /// Source of the W3C trace context attached to outgoing requests.
 type TraceContextProvider =
     Arc<dyn Fn() -> Option<crate::trace_context::TraceContext> + Send + Sync>;
@@ -472,6 +495,7 @@ struct ClientSettings {
     roots: Vec<Root>,
     protocol_support: ProtocolSupport,
     max_mrtr_rounds: usize,
+    max_list_pages: usize,
     cache_config: ClientCacheConfig,
     request_progress: bool,
     request_log_level: Option<LogLevel>,
@@ -522,6 +546,7 @@ pub struct McpClientBuilder {
     roots: Vec<Root>,
     protocol_support: ProtocolSupport,
     max_mrtr_rounds: usize,
+    max_list_pages: usize,
     cache_config: ClientCacheConfig,
     request_progress: bool,
     request_log_level: Option<LogLevel>,
@@ -541,6 +566,7 @@ impl McpClientBuilder {
             // before `discover`.
             protocol_support: ProtocolSupport::default(),
             max_mrtr_rounds: 8,
+            max_list_pages: DEFAULT_MAX_LIST_PAGES,
             cache_config: ClientCacheConfig::default(),
             request_progress: false,
             request_log_level: None,
@@ -675,6 +701,44 @@ impl McpClientBuilder {
         self
     }
 
+    /// Bound the number of pages one automatic list walk may fetch.
+    ///
+    /// Applies to every `list_all_*` helper and its `_with_cache_hints`
+    /// variant, for tools, resources, resource templates, prompts and skills.
+    /// Each call counts its own pages. A walk that has fetched `pages` pages
+    /// and is handed another `nextCursor` fails with
+    /// [`Error::ListPageLimitExceeded`] instead of returning the partial
+    /// result as if it were the whole catalog. A walk that ends in exactly
+    /// `pages` pages succeeds.
+    ///
+    /// Zero is normalized to one. The default is
+    /// [`DEFAULT_MAX_LIST_PAGES`].
+    ///
+    /// MCP cursors are opaque, so the client cannot tell a server that is
+    /// looping (repeating a cursor, or minting a fresh one forever) from one
+    /// with a very long catalog. A request timeout bounds each page but not a
+    /// sequence of prompt, successful pages, so this budget is what stops the
+    /// walk.
+    ///
+    /// This is a page count, not a memory limit. A server picks its own page
+    /// size, so the items a walk collects are bounded only by the page budget
+    /// times however many items each page carries. Per-response size limits
+    /// belong to the transport (for example the HTTP client's maximum SSE
+    /// event size, or the stdio maximum frame size) and are configured
+    /// separately. A caller that cannot hold a full catalog in memory should
+    /// page with the `list_*_with_cursor` methods instead.
+    ///
+    /// ```rust
+    /// use tower_mcp::client::McpClient;
+    ///
+    /// let builder = McpClient::builder().max_list_pages(50);
+    /// # let _ = builder;
+    /// ```
+    pub fn max_list_pages(mut self, pages: usize) -> Self {
+        self.max_list_pages = pages.max(1);
+        self
+    }
+
     /// Configure the SEP-2549 final-protocol response cache.
     pub fn response_cache(mut self, config: ClientCacheConfig) -> Self {
         self.cache_config = config;
@@ -729,6 +793,7 @@ impl McpClientBuilder {
                 roots: self.roots,
                 protocol_support: self.protocol_support,
                 max_mrtr_rounds: self.max_mrtr_rounds,
+                max_list_pages: self.max_list_pages,
                 cache_config: self.cache_config,
                 request_progress: self.request_progress,
                 request_log_level: self.request_log_level,
@@ -788,6 +853,7 @@ impl McpClient {
             roots,
             protocol_support,
             max_mrtr_rounds,
+            max_list_pages,
             cache_config,
             request_progress,
             request_log_level,
@@ -834,6 +900,7 @@ impl McpClient {
             init_params: RwLock::new(None),
             recovery_lock: Mutex::new(()),
             max_mrtr_rounds,
+            max_list_pages,
             response_cache,
             progress_tokens: request_progress.then(|| Arc::new(AtomicI64::new(1))),
             request_log_level: RwLock::new(request_log_level),
@@ -1807,6 +1874,9 @@ impl McpClient {
 
     /// List all tools, following pagination cursors until exhausted.
     ///
+    /// Fails with [`Error::ListPageLimitExceeded`] if the server still names a
+    /// next page after [`McpClientBuilder::max_list_pages`] pages.
+    ///
     /// The pages are separate requests, so a catalogue that changes while the
     /// walk is in progress can yield a list that never existed at any single
     /// moment. That is inherent to cursor pagination rather than something
@@ -1845,17 +1915,7 @@ impl McpClient {
     /// # }
     /// ```
     pub async fn list_all_tools(&self) -> Result<Vec<ToolDefinition>> {
-        let mut all = Vec::new();
-        let mut cursor = None;
-        loop {
-            let result = self.list_tools_with_cursor(cursor).await?;
-            all.extend(result.tools);
-            match result.next_cursor {
-                Some(c) => cursor = Some(c),
-                None => break,
-            }
-        }
-        Ok(all)
+        Ok(self.list_all_tools_with_cache_hints().await?.items)
     }
 
     /// List all tools with cache hints valid for the combined result.
@@ -1864,6 +1924,7 @@ impl McpClient {
     /// long it may reuse it, or whether it may share it across authorization
     /// contexts. Use [`list_all_tools`](Self::list_all_tools) when only the
     /// items matter. [`AggregateList`] documents how page hints combine.
+    /// The page budget from [`McpClientBuilder::max_list_pages`] applies.
     ///
     /// ```rust
     /// use tower_mcp::client::{ChannelTransport, McpClient};
@@ -1886,130 +1947,103 @@ impl McpClient {
     /// # }
     /// ```
     pub async fn list_all_tools_with_cache_hints(&self) -> Result<AggregateList<ToolDefinition>> {
-        let mut all = Vec::new();
-        let mut cursor = None;
-        let mut hints = self.response_cache.aggregate_hints();
-        loop {
-            let result = self.list_tools_with_cursor(cursor).await?;
-            hints.observe(result.ttl_ms, result.cache_scope);
-            all.extend(result.tools);
-            match result.next_cursor {
-                Some(c) => cursor = Some(c),
-                None => break,
-            }
-        }
-        Ok(hints.finish(all))
+        self.collect_list_pages("tools/list", |cursor| async move {
+            let page = self.list_tools_with_cursor(cursor).await?;
+            Ok(ListPage {
+                items: page.tools,
+                next_cursor: page.next_cursor,
+                ttl_ms: page.ttl_ms,
+                cache_scope: page.cache_scope,
+            })
+        })
+        .await
     }
 
     /// List all resources, following pagination cursors until exhausted.
+    ///
+    /// Fails with [`Error::ListPageLimitExceeded`] if the server still names a
+    /// next page after [`McpClientBuilder::max_list_pages`] pages.
     pub async fn list_all_resources(&self) -> Result<Vec<ResourceDefinition>> {
-        let mut all = Vec::new();
-        let mut cursor = None;
-        loop {
-            let result = self.list_resources_with_cursor(cursor).await?;
-            all.extend(result.resources);
-            match result.next_cursor {
-                Some(c) => cursor = Some(c),
-                None => break,
-            }
-        }
-        Ok(all)
+        Ok(self.list_all_resources_with_cache_hints().await?.items)
     }
 
     /// List all resources with cache hints valid for the combined result.
     ///
     /// Use [`list_all_resources`](Self::list_all_resources) when only the items matter.
     /// [`AggregateList`] documents how page hints combine.
+    /// The page budget from [`McpClientBuilder::max_list_pages`] applies.
     pub async fn list_all_resources_with_cache_hints(
         &self,
     ) -> Result<AggregateList<ResourceDefinition>> {
-        let mut all = Vec::new();
-        let mut cursor = None;
-        let mut hints = self.response_cache.aggregate_hints();
-        loop {
-            let result = self.list_resources_with_cursor(cursor).await?;
-            hints.observe(result.ttl_ms, result.cache_scope);
-            all.extend(result.resources);
-            match result.next_cursor {
-                Some(c) => cursor = Some(c),
-                None => break,
-            }
-        }
-        Ok(hints.finish(all))
+        self.collect_list_pages("resources/list", |cursor| async move {
+            let page = self.list_resources_with_cursor(cursor).await?;
+            Ok(ListPage {
+                items: page.resources,
+                next_cursor: page.next_cursor,
+                ttl_ms: page.ttl_ms,
+                cache_scope: page.cache_scope,
+            })
+        })
+        .await
     }
 
     /// List all resource templates, following pagination cursors until exhausted.
+    ///
+    /// Fails with [`Error::ListPageLimitExceeded`] if the server still names a
+    /// next page after [`McpClientBuilder::max_list_pages`] pages.
     pub async fn list_all_resource_templates(&self) -> Result<Vec<ResourceTemplateDefinition>> {
-        let mut all = Vec::new();
-        let mut cursor = None;
-        loop {
-            let result = self.list_resource_templates_with_cursor(cursor).await?;
-            all.extend(result.resource_templates);
-            match result.next_cursor {
-                Some(c) => cursor = Some(c),
-                None => break,
-            }
-        }
-        Ok(all)
+        Ok(self
+            .list_all_resource_templates_with_cache_hints()
+            .await?
+            .items)
     }
 
     /// List all resource templates with cache hints valid for the combined result.
     ///
     /// Use [`list_all_resource_templates`](Self::list_all_resource_templates) when only the items matter.
     /// [`AggregateList`] documents how page hints combine.
+    /// The page budget from [`McpClientBuilder::max_list_pages`] applies.
     pub async fn list_all_resource_templates_with_cache_hints(
         &self,
     ) -> Result<AggregateList<ResourceTemplateDefinition>> {
-        let mut all = Vec::new();
-        let mut cursor = None;
-        let mut hints = self.response_cache.aggregate_hints();
-        loop {
-            let result = self.list_resource_templates_with_cursor(cursor).await?;
-            hints.observe(result.ttl_ms, result.cache_scope);
-            all.extend(result.resource_templates);
-            match result.next_cursor {
-                Some(c) => cursor = Some(c),
-                None => break,
-            }
-        }
-        Ok(hints.finish(all))
+        self.collect_list_pages("resources/templates/list", |cursor| async move {
+            let page = self.list_resource_templates_with_cursor(cursor).await?;
+            Ok(ListPage {
+                items: page.resource_templates,
+                next_cursor: page.next_cursor,
+                ttl_ms: page.ttl_ms,
+                cache_scope: page.cache_scope,
+            })
+        })
+        .await
     }
 
     /// List all prompts, following pagination cursors until exhausted.
+    ///
+    /// Fails with [`Error::ListPageLimitExceeded`] if the server still names a
+    /// next page after [`McpClientBuilder::max_list_pages`] pages.
     pub async fn list_all_prompts(&self) -> Result<Vec<PromptDefinition>> {
-        let mut all = Vec::new();
-        let mut cursor = None;
-        loop {
-            let result = self.list_prompts_with_cursor(cursor).await?;
-            all.extend(result.prompts);
-            match result.next_cursor {
-                Some(c) => cursor = Some(c),
-                None => break,
-            }
-        }
-        Ok(all)
+        Ok(self.list_all_prompts_with_cache_hints().await?.items)
     }
 
     /// List all prompts with cache hints valid for the combined result.
     ///
     /// Use [`list_all_prompts`](Self::list_all_prompts) when only the items matter.
     /// [`AggregateList`] documents how page hints combine.
+    /// The page budget from [`McpClientBuilder::max_list_pages`] applies.
     pub async fn list_all_prompts_with_cache_hints(
         &self,
     ) -> Result<AggregateList<PromptDefinition>> {
-        let mut all = Vec::new();
-        let mut cursor = None;
-        let mut hints = self.response_cache.aggregate_hints();
-        loop {
-            let result = self.list_prompts_with_cursor(cursor).await?;
-            hints.observe(result.ttl_ms, result.cache_scope);
-            all.extend(result.prompts);
-            match result.next_cursor {
-                Some(c) => cursor = Some(c),
-                None => break,
-            }
-        }
-        Ok(hints.finish(all))
+        self.collect_list_pages("prompts/list", |cursor| async move {
+            let page = self.list_prompts_with_cursor(cursor).await?;
+            Ok(ListPage {
+                items: page.prompts,
+                next_cursor: page.next_cursor,
+                ttl_ms: page.ttl_ms,
+                cache_scope: page.cache_scope,
+            })
+        })
+        .await
     }
 
     /// List skills served through the Skills extension (SEP-2640).
@@ -2037,6 +2071,9 @@ impl McpClient {
     }
 
     /// List all skills, following pagination cursors until exhausted.
+    ///
+    /// Fails with [`Error::ListPageLimitExceeded`] if the server still names a
+    /// next page after [`McpClientBuilder::max_list_pages`] pages.
     pub async fn list_all_skills(&self) -> Result<Vec<crate::protocol::skills::Skill>> {
         Ok(self.list_all_skills_with_cache_hints().await?.items)
     }
@@ -2045,22 +2082,23 @@ impl McpClient {
     ///
     /// Use [`list_all_skills`](Self::list_all_skills) when only the entries
     /// matter. [`AggregateList`] documents how page hints combine.
+    /// The page budget from [`McpClientBuilder::max_list_pages`] applies.
     pub async fn list_all_skills_with_cache_hints(
         &self,
     ) -> Result<AggregateList<crate::protocol::skills::Skill>> {
-        let mut all = Vec::new();
-        let mut cursor = None;
-        let mut hints = self.response_cache.aggregate_hints();
-        loop {
-            let result = self.list_skills_with_cursor(cursor).await?;
-            hints.observe(result.ttl_ms, result.cache_scope);
-            all.extend(result.skills);
-            match result.next_cursor {
-                Some(c) => cursor = Some(c),
-                None => break,
-            }
-        }
-        Ok(hints.finish(all))
+        self.collect_list_pages(
+            crate::protocol::skills::METHOD_SKILLS_LIST,
+            |cursor| async move {
+                let page = self.list_skills_with_cursor(cursor).await?;
+                Ok(ListPage {
+                    items: page.skills,
+                    next_cursor: page.next_cursor,
+                    ttl_ms: page.ttl_ms,
+                    cache_scope: page.cache_scope,
+                })
+            },
+        )
+        .await
     }
 
     /// Fetch the entry for one skill by the URI of its `SKILL.md`.
@@ -2554,6 +2592,45 @@ impl McpClient {
                 self.send_request("tools/call", params).await
             }
             result => result,
+        }
+    }
+
+    /// Follow `nextCursor` from the first page until a page has none.
+    ///
+    /// Shared by every `list_all_*` helper. Fails with
+    /// [`Error::ListPageLimitExceeded`] when `max_list_pages` pages have been
+    /// fetched and the last still names a next page, discarding the partial
+    /// result. Cursors are opaque, so an empty or repeated cursor is followed
+    /// like any other and only the page count ends a walk the server never
+    /// finishes.
+    async fn collect_list_pages<T, F, Fut>(
+        &self,
+        method: &str,
+        mut fetch: F,
+    ) -> Result<AggregateList<T>>
+    where
+        F: FnMut(Option<String>) -> Fut,
+        Fut: std::future::Future<Output = Result<ListPage<T>>>,
+    {
+        let mut all = Vec::new();
+        let mut cursor = None;
+        let mut hints = self.response_cache.aggregate_hints();
+        let mut pages = 0usize;
+        loop {
+            let page = fetch(cursor.take()).await?;
+            pages += 1;
+            hints.observe(page.ttl_ms, page.cache_scope);
+            all.extend(page.items);
+            match page.next_cursor {
+                None => return Ok(hints.finish(all)),
+                Some(_) if pages >= self.max_list_pages => {
+                    return Err(Error::ListPageLimitExceeded {
+                        method: method.to_string(),
+                        limit: self.max_list_pages,
+                    });
+                }
+                Some(next) => cursor = Some(next),
+            }
         }
     }
 

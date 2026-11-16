@@ -552,6 +552,26 @@ pub enum Error {
         limit: usize,
     },
 
+    /// An automatic list walk reached its page budget with a cursor remaining.
+    ///
+    /// Raised by the client's `list_all_*` helpers when the server returned
+    /// `limit` pages and the last one still carried a `nextCursor`. The items
+    /// gathered so far are discarded rather than returned as if they were the
+    /// whole catalog. Raise the budget on the client builder
+    /// (`McpClientBuilder::max_list_pages`) for a server that really serves
+    /// that many pages, or page with the `list_*_with_cursor` methods to
+    /// process pages incrementally.
+    #[error(
+        "{method} returned a next cursor after {limit} pages, the configured page limit; \
+         raise the client's max_list_pages or page manually with a cursor"
+    )]
+    ListPageLimitExceeded {
+        /// The list method being paginated, such as `tools/list`.
+        method: String,
+        /// The configured maximum number of pages.
+        limit: usize,
+    },
+
     /// An internal library or server failure not represented by another variant.
     #[error("Internal error: {0}")]
     Internal(String),
