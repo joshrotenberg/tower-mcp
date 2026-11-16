@@ -1192,8 +1192,9 @@ enum BoundedBodyError {
 /// Checks `Content-Length` up front so a body that declares itself too
 /// large is rejected before a byte is read, then streams and counts bytes
 /// so a chunked body (or one served with `Connection: close` and no
-/// declared length) is bounded too. Decoded as UTF-8 lossily, the same way
-/// the SSE path in this file decodes bytes (`String::from_utf8_lossy`).
+/// declared length) is bounded too. Decoded as UTF-8 lossily once the whole
+/// body is in, the same way the SSE parser decodes each complete line
+/// (`String::from_utf8_lossy`), so a chunk boundary never splits a code point.
 async fn read_bounded_body(
     response: reqwest::Response,
     limit: usize,
@@ -2137,8 +2138,7 @@ async fn pump_post_sse(response: reqwest::Response, ctx: PostSseContext) {
     while let Some(result) = stream.next().await {
         match result {
             Ok(bytes) => {
-                let text = String::from_utf8_lossy(&bytes);
-                let events = match parser.feed(&text) {
+                let events = match parser.feed(&bytes) {
                     Ok(events) => events,
                     Err(e) => {
                         // A single event exceeded the cap;
@@ -2454,8 +2454,7 @@ async fn sse_stream_loop(params: SseLoopParams) {
                 chunk = stream.next() => {
                     match chunk {
                         Some(Ok(bytes)) => {
-                            let text = String::from_utf8_lossy(&bytes);
-                            let events = match parser.feed(&text) {
+                            let events = match parser.feed(&bytes) {
                                 Ok(events) => events,
                                 Err(e) => {
                                     // A single event exceeded the cap;
@@ -2802,7 +2801,7 @@ fn extract_json_messages(body: &str) -> Vec<String> {
         // The body is already fully in memory here, so no event-size cap
         // applies: an unlimited parser never returns an error.
         let mut parser = SseParser::new();
-        let events = parser.feed(body).unwrap_or_default();
+        let events = parser.feed(body.as_bytes()).unwrap_or_default();
         events.into_iter().map(|e| e.data).collect()
     } else {
         vec![trimmed.to_string()]
@@ -2820,17 +2819,30 @@ struct SseEvent {
     retry: Option<u64>,
 }
 
+/// The UTF-8 byte order mark, stripped once from the start of a stream.
+const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+
 /// Incremental SSE parser.
 ///
-/// Handles partial chunks from the byte stream, buffering incomplete
-/// lines across `feed()` calls. When constructed with
-/// [`with_limit`](Self::with_limit), a single event whose buffered size
-/// exceeds the limit terminates parsing with
+/// Takes the body as raw bytes, in whatever chunks the network delivers,
+/// and buffers an incomplete line across `feed()` calls. Lines are split
+/// at the byte level on CR, LF, or CRLF (all ASCII, so a terminator can
+/// never fall inside a multibyte UTF-8 sequence) and each line is decoded
+/// only once it is complete. A code point split across two chunks is
+/// therefore decoded intact; decoding each chunk on its own would turn
+/// both halves into U+FFFD (#1653).
+///
+/// Bytes inside a complete line that are not valid UTF-8 are decoded
+/// lossily, each invalid sequence becoming U+FFFD, as they were before
+/// this parser took bytes.
+///
+/// When constructed with [`with_limit`](Self::with_limit), a single event
+/// whose buffered size in bytes exceeds the limit terminates parsing with
 /// [`Error::SseEventTooLarge`] instead of growing without bound
 /// (rmcp #970 analog).
 struct SseParser {
-    /// Partial line buffer (when a chunk ends mid-line).
-    buffer: String,
+    /// Bytes of the current, unterminated line (when a chunk ends mid-line).
+    buffer: Vec<u8>,
     /// Current event being parsed.
     current_id: Option<String>,
     current_data: Vec<String>,
@@ -2839,12 +2851,18 @@ struct SseParser {
     data_len: usize,
     /// Maximum buffered size for a single event.
     max_event_size: usize,
-    /// Whether any chunk has been fed yet.
+    /// Whether the start of the stream is still undecided: no byte has
+    /// arrived yet, or only a prefix of a BOM has.
     ///
     /// A BOM is only a BOM at the very start of the stream; the same bytes
     /// later in it are a zero-width no-break space inside someone's data
-    /// (#1303).
+    /// (#1303). Its three bytes can arrive in separate chunks.
     at_stream_start: bool,
+    /// The last line ended with a CR that was the final byte of its chunk.
+    ///
+    /// An LF opening the next chunk is the second half of that CRLF, not
+    /// an empty line of its own (which would end the event early).
+    pending_cr: bool,
 }
 
 impl SseParser {
@@ -2857,67 +2875,68 @@ impl SseParser {
     /// `max_event_size` bytes.
     fn with_limit(max_event_size: usize) -> Self {
         Self {
-            buffer: String::new(),
+            buffer: Vec::new(),
             current_id: None,
             current_data: Vec::new(),
             current_retry: None,
             data_len: 0,
             max_event_size,
             at_stream_start: true,
+            pending_cr: false,
         }
     }
 
-    /// Feed a chunk of text and return any complete events.
+    /// Feed a chunk of raw body bytes and return any complete events.
     ///
     /// Returns [`Error::SseEventTooLarge`] when the bytes buffered for a
     /// single in-progress event exceed the configured limit. The parser
     /// should not be fed further after an error.
-    fn feed(&mut self, text: &str) -> Result<Vec<SseEvent>> {
+    fn feed(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>> {
+        let mut chunk = chunk;
+        if self.pending_cr && !chunk.is_empty() {
+            self.pending_cr = false;
+            if chunk[0] == b'\n' {
+                chunk = &chunk[1..];
+            }
+        }
+        self.buffer.extend_from_slice(chunk);
+
         // A leading BOM would make the first field name unrecognisable, so an
         // event whose first line is `data:` would be dropped whole (#1303).
-        let text = if std::mem::take(&mut self.at_stream_start) {
-            text.strip_prefix('\u{feff}').unwrap_or(text)
-        } else {
-            text
-        };
-        self.buffer.push_str(text);
+        if self.at_stream_start {
+            if self.buffer.len() < UTF8_BOM.len() && UTF8_BOM.starts_with(&self.buffer) {
+                // Nothing yet, or the first bytes of what may be a BOM: wait
+                // for the bytes that decide it.
+                return Ok(Vec::new());
+            }
+            self.at_stream_start = false;
+            if self.buffer.starts_with(UTF8_BOM) {
+                self.buffer.drain(..UTF8_BOM.len());
+            }
+        }
+
         let mut events = Vec::new();
 
         // Process complete lines
-        while let Some(newline_pos) = self.buffer.find('\n') {
-            let line = self.buffer[..newline_pos]
-                .trim_end_matches('\r')
-                .to_string();
-            self.buffer = self.buffer[newline_pos + 1..].to_string();
-
-            if line.is_empty() {
-                // Empty line = end of event
-                if !self.current_data.is_empty() || self.current_retry.is_some() {
-                    events.push(SseEvent {
-                        id: self.current_id.take(),
-                        data: self.current_data.join("\n"),
-                        retry: self.current_retry.take(),
-                    });
-                    self.current_data.clear();
-                    self.data_len = 0;
+        let mut start = 0;
+        while let Some(offset) = self.buffer[start..]
+            .iter()
+            .position(|&b| b == b'\n' || b == b'\r')
+        {
+            let end = start + offset;
+            let mut next = end + 1;
+            if self.buffer[end] == b'\r' {
+                match self.buffer.get(next) {
+                    Some(b'\n') => next += 1,
+                    Some(_) => {}
+                    None => self.pending_cr = true,
                 }
-                self.current_id = None;
-                self.current_retry = None;
-            } else if let Some(value) = line.strip_prefix("id:") {
-                let trimmed = value.trim();
-                if !trimmed.is_empty() {
-                    self.current_id = Some(trimmed.to_string());
-                }
-            } else if let Some(value) = line.strip_prefix("data:") {
-                let data = value.trim().to_string();
-                self.data_len += data.len();
-                self.current_data.push(data);
-            } else if let Some(value) = line.strip_prefix("retry:") {
-                self.current_retry = value.trim().parse().ok();
             }
-            // Lines starting with ':' are comments (keep-alive) -- ignored
-            // Lines starting with 'event:' are event types -- ignored (we only care about data)
+            let line = String::from_utf8_lossy(&self.buffer[start..end]).into_owned();
+            start = next;
+            self.process_line(&line, &mut events);
         }
+        self.buffer.drain(..start);
 
         // Everything still buffered belongs to a single unfinished event
         // (or an unfinished line of one). Cap it so a server that never
@@ -2931,6 +2950,38 @@ impl SseParser {
         }
 
         Ok(events)
+    }
+
+    /// Apply one complete, decoded line to the event in progress, pushing
+    /// the event onto `events` when the line ends it.
+    fn process_line(&mut self, line: &str, events: &mut Vec<SseEvent>) {
+        if line.is_empty() {
+            // Empty line = end of event
+            if !self.current_data.is_empty() || self.current_retry.is_some() {
+                events.push(SseEvent {
+                    id: self.current_id.take(),
+                    data: self.current_data.join("\n"),
+                    retry: self.current_retry.take(),
+                });
+                self.current_data.clear();
+                self.data_len = 0;
+            }
+            self.current_id = None;
+            self.current_retry = None;
+        } else if let Some(value) = line.strip_prefix("id:") {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                self.current_id = Some(trimmed.to_string());
+            }
+        } else if let Some(value) = line.strip_prefix("data:") {
+            let data = value.trim().to_string();
+            self.data_len += data.len();
+            self.current_data.push(data);
+        } else if let Some(value) = line.strip_prefix("retry:") {
+            self.current_retry = value.trim().parse().ok();
+        }
+        // Lines starting with ':' are comments (keep-alive) -- ignored
+        // Lines starting with 'event:' are event types -- ignored (we only care about data)
     }
 }
 
@@ -3382,7 +3433,7 @@ mod tests {
     fn test_parse_complete_event() {
         let mut parser = SseParser::new();
         let events = parser
-            .feed("id: 1\nevent: message\ndata: {\"hello\":\"world\"}\n\n")
+            .feed(b"id: 1\nevent: message\ndata: {\"hello\":\"world\"}\n\n")
             .unwrap();
 
         assert_eq!(events.len(), 1);
@@ -3396,7 +3447,7 @@ mod tests {
     fn test_parse_strips_a_bom_at_the_start_of_the_stream() {
         let mut parser = SseParser::new();
         let events = parser
-            .feed("\u{feff}data: {\"hello\":\"world\"}\n\n")
+            .feed("\u{feff}data: {\"hello\":\"world\"}\n\n".as_bytes())
             .unwrap();
 
         assert_eq!(events.len(), 1, "the opening event must survive a BOM");
@@ -3409,9 +3460,9 @@ mod tests {
     #[test]
     fn test_parse_keeps_a_bom_inside_the_stream() {
         let mut parser = SseParser::new();
-        assert!(parser.feed("data: first\n\n").unwrap().len() == 1);
+        assert!(parser.feed(b"data: first\n\n").unwrap().len() == 1);
 
-        let events = parser.feed("data: \u{feff}second\n\n").unwrap();
+        let events = parser.feed("data: \u{feff}second\n\n".as_bytes()).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "\u{feff}second");
     }
@@ -3438,7 +3489,7 @@ mod tests {
     fn test_parse_multiple_events() {
         let mut parser = SseParser::new();
         let events = parser
-            .feed("id: 1\ndata: first\n\nid: 2\ndata: second\n\nid: 3\ndata: third\n\n")
+            .feed(b"id: 1\ndata: first\n\nid: 2\ndata: second\n\nid: 3\ndata: third\n\n")
             .unwrap();
 
         assert_eq!(events.len(), 3);
@@ -3455,11 +3506,11 @@ mod tests {
         let mut parser = SseParser::new();
 
         // First chunk: partial event
-        let events = parser.feed("id: 1\nda").unwrap();
+        let events = parser.feed(b"id: 1\nda").unwrap();
         assert!(events.is_empty());
 
         // Second chunk: completes the event
-        let events = parser.feed("ta: hello\n\n").unwrap();
+        let events = parser.feed(b"ta: hello\n\n").unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, Some("1".to_string()));
         assert_eq!(events[0].data, "hello");
@@ -3469,7 +3520,7 @@ mod tests {
     fn test_parse_multiline_data() {
         let mut parser = SseParser::new();
         let events = parser
-            .feed("id: 1\ndata: line1\ndata: line2\ndata: line3\n\n")
+            .feed(b"id: 1\ndata: line1\ndata: line2\ndata: line3\n\n")
             .unwrap();
 
         assert_eq!(events.len(), 1);
@@ -3479,7 +3530,9 @@ mod tests {
     #[test]
     fn test_parse_comment_lines() {
         let mut parser = SseParser::new();
-        let events = parser.feed(": keep-alive\nid: 1\ndata: hello\n\n").unwrap();
+        let events = parser
+            .feed(b": keep-alive\nid: 1\ndata: hello\n\n")
+            .unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "hello");
@@ -3488,7 +3541,7 @@ mod tests {
     #[test]
     fn test_parse_event_without_id() {
         let mut parser = SseParser::new();
-        let events = parser.feed("data: no-id-event\n\n").unwrap();
+        let events = parser.feed(b"data: no-id-event\n\n").unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, None);
@@ -3498,7 +3551,7 @@ mod tests {
     #[test]
     fn test_empty_data_no_event() {
         let mut parser = SseParser::new();
-        let events = parser.feed("id: 1\n\n").unwrap();
+        let events = parser.feed(b"id: 1\n\n").unwrap();
 
         // No data lines = no event produced
         assert!(events.is_empty());
@@ -3507,7 +3560,7 @@ mod tests {
     #[test]
     fn test_parse_crlf_line_endings() {
         let mut parser = SseParser::new();
-        let events = parser.feed("id: 1\r\ndata: crlf\r\n\r\n").unwrap();
+        let events = parser.feed(b"id: 1\r\ndata: crlf\r\n\r\n").unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "crlf");
@@ -3518,7 +3571,7 @@ mod tests {
         let mut parser = SseParser::new();
         let json = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"token":"t1","progress":50}}"#;
         let input = format!("id: 42\nevent: message\ndata: {}\n\n", json);
-        let events = parser.feed(&input).unwrap();
+        let events = parser.feed(input.as_bytes()).unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, Some("42".to_string()));
@@ -3534,7 +3587,7 @@ mod tests {
 
         // An unterminated data line larger than the limit trips the cap.
         let big = "data: ".to_string() + &"x".repeat(128);
-        let err = parser.feed(&big).unwrap_err();
+        let err = parser.feed(big.as_bytes()).unwrap_err();
         match err {
             Error::SseEventTooLarge { size, limit } => {
                 assert!(size > 64, "size {} should exceed limit", size);
@@ -3551,7 +3604,7 @@ mod tests {
         // Many complete data lines belonging to one unterminated event.
         let mut result = Ok(Vec::new());
         for _ in 0..10 {
-            result = parser.feed("data: 0123456789\n");
+            result = parser.feed(b"data: 0123456789\n");
             if result.is_err() {
                 break;
             }
@@ -3562,8 +3615,138 @@ mod tests {
     #[test]
     fn test_events_within_limit_pass() {
         let mut parser = SseParser::with_limit(64);
-        let events = parser.feed("data: hello\n\ndata: world\n\n").unwrap();
+        let events = parser.feed(b"data: hello\n\ndata: world\n\n").unwrap();
         assert_eq!(events.len(), 2);
+    }
+
+    /// Feed `input` as two chunks split at `split` and return every event.
+    fn feed_split(parser: &mut SseParser, input: &[u8], split: usize) -> Vec<SseEvent> {
+        let (a, b) = input.split_at(split);
+        let mut events = parser.feed(a).unwrap();
+        events.extend(parser.feed(b).unwrap());
+        events
+    }
+
+    /// #1653: a 2-, 3-, or 4-byte code point split across two chunks, at
+    /// every byte offset of the stream, decodes exactly. Decoding each
+    /// chunk on its own turned both halves into U+FFFD.
+    #[test]
+    fn test_code_point_split_at_every_offset_decodes_intact() {
+        for (ch, width) in [('\u{e9}', 2), ('\u{6f22}', 3), ('\u{1f600}', 4)] {
+            assert_eq!(ch.len_utf8(), width, "test setup");
+            let data = format!(r#"{{"text":"a{ch}b"}}"#);
+            let input = format!("id: 1\ndata: {data}\n\n");
+            for split in 0..=input.len() {
+                let mut parser = SseParser::new();
+                let events = feed_split(&mut parser, input.as_bytes(), split);
+                assert_eq!(events.len(), 1, "{ch:?} split at {split}");
+                assert_eq!(events[0].data, data, "{ch:?} split at {split}");
+                assert_eq!(events[0].id.as_deref(), Some("1"));
+            }
+        }
+    }
+
+    /// The same, one byte per chunk, so every code point is split at every
+    /// one of its internal offsets in a single stream.
+    #[test]
+    fn test_one_byte_chunks_decode_intact() {
+        let data = "\u{e9} \u{6f22}\u{5b57} \u{1f600}";
+        let input = format!("data: {data}\r\n\r\ndata: {data}\n\n");
+        let mut parser = SseParser::new();
+        let mut events = Vec::new();
+        for byte in input.as_bytes() {
+            events.extend(parser.feed(std::slice::from_ref(byte)).unwrap());
+        }
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| event.data == data));
+    }
+
+    /// #1303 still holds when the BOM's three bytes arrive in separate
+    /// chunks, and an empty first chunk does not use up the stream start.
+    #[test]
+    fn test_bom_split_across_chunks_is_stripped() {
+        let input = "\u{feff}data: {\"hello\":\"world\"}\n\n";
+        for split in 0..=input.len() {
+            let mut parser = SseParser::new();
+            let events = feed_split(&mut parser, input.as_bytes(), split);
+            assert_eq!(events.len(), 1, "split at {split}");
+            assert_eq!(events[0].data, "{\"hello\":\"world\"}", "split at {split}");
+        }
+
+        let mut parser = SseParser::new();
+        assert!(parser.feed(b"").unwrap().is_empty());
+        assert!(parser.feed(b"\xEF").unwrap().is_empty());
+        assert!(parser.feed(b"\xBB").unwrap().is_empty());
+        let events = parser.feed(b"\xBFdata: x\n\n").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, "x");
+    }
+
+    /// A CR ending one chunk and the LF opening the next are one CRLF, not
+    /// two line endings: the empty line between them would end the event
+    /// early and split its data in two.
+    #[test]
+    fn test_crlf_split_across_chunks_is_one_line_ending() {
+        let input = "id: 1\r\ndata: a\r\ndata: b\r\n\r\nid: 2\r\ndata: c\r\n\r\n";
+        for split in 0..=input.len() {
+            let mut parser = SseParser::new();
+            let events = feed_split(&mut parser, input.as_bytes(), split);
+            assert_eq!(events.len(), 2, "split at {split}");
+            assert_eq!(events[0].data, "a\nb", "split at {split}");
+            assert_eq!(events[0].id.as_deref(), Some("1"));
+            assert_eq!(events[1].data, "c", "split at {split}");
+            assert_eq!(events[1].id.as_deref(), Some("2"));
+        }
+    }
+
+    /// A lone CR is a line ending too (the SSE grammar allows CR, LF, and
+    /// CRLF), including when it is the last byte of a chunk.
+    #[test]
+    fn test_lone_cr_line_endings() {
+        let input = "data: a\rdata: b\r\rdata: c\r\r";
+        for split in 0..=input.len() {
+            let mut parser = SseParser::new();
+            let events = feed_split(&mut parser, input.as_bytes(), split);
+            let data: Vec<_> = events.iter().map(|e| e.data.as_str()).collect();
+            assert_eq!(data, ["a\nb", "c"], "split at {split}");
+        }
+    }
+
+    /// The event-size limit counts bytes, not characters: fifteen 4-byte
+    /// emoji are 15 characters but 60 bytes.
+    #[test]
+    fn test_event_size_limit_counts_bytes() {
+        let emoji = "\u{1f600}";
+        let within = format!("data: {}", emoji.repeat(14)); // 62 bytes
+        assert!(SseParser::with_limit(64).feed(within.as_bytes()).is_ok());
+
+        let over = format!("data: {}", emoji.repeat(15)); // 66 bytes
+        match SseParser::with_limit(64).feed(over.as_bytes()) {
+            Err(Error::SseEventTooLarge { size, limit }) => {
+                assert_eq!(size, over.len());
+                assert_eq!(limit, 64);
+            }
+            other => panic!("expected SseEventTooLarge, got {other:?}"),
+        }
+
+        // Split mid-emoji, the partial line still counts in bytes.
+        let mut parser = SseParser::with_limit(64);
+        assert!(parser.feed(&over.as_bytes()[..63]).is_ok());
+        assert!(matches!(
+            parser.feed(&over.as_bytes()[63..]),
+            Err(Error::SseEventTooLarge { size: 66, .. })
+        ));
+    }
+
+    /// Bytes that are not UTF-8 inside a complete line are decoded lossily,
+    /// as before the parser took bytes: each invalid sequence becomes one
+    /// U+FFFD and the rest of the event survives.
+    #[test]
+    fn test_invalid_utf8_in_a_complete_line_is_decoded_lossily() {
+        let mut parser = SseParser::new();
+        let events = parser.feed(b"data: a\xFFb\n\n").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, "a\u{fffd}b");
     }
 
     // =========================================================================
@@ -4883,6 +5066,233 @@ mod tests {
             let frame = next_frame(&mut transport).await;
             assert_eq!(frame["error"]["code"], -32005);
             assert_eq!(frame["error"]["message"], "server sentinel");
+        }
+    }
+
+    // =========================================================================
+    // #1653: SSE text survives a code point split across network chunks
+    // =========================================================================
+
+    mod sse_chunk_boundaries {
+        use super::*;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        const WAIT: Duration = Duration::from_secs(5);
+
+        /// A 2-byte, two 3-byte (CJK), and a 4-byte (emoji) character.
+        const TEXT: &str = "caf\u{e9} \u{6f22}\u{5b57} \u{1f600}";
+
+        /// Read one HTTP/1.1 request and return its request line and body.
+        async fn read_request(stream: &mut TcpStream) -> Option<(String, String)> {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+                    let len = head
+                        .to_ascii_lowercase()
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    while buf.len() < end + 4 + len {
+                        let n = stream.read(&mut chunk).await.ok()?;
+                        if n == 0 {
+                            return None;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let request_line = head.lines().next().unwrap_or_default().to_string();
+                    let body = String::from_utf8_lossy(&buf[end + 4..end + 4 + len]).into_owned();
+                    return Some((request_line, body));
+                }
+                let n = stream.read(&mut chunk).await.ok()?;
+                if n == 0 {
+                    return None;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+        }
+
+        /// A raw server that hands each request's line, body, and socket to
+        /// `respond`, so a test controls every byte and every pause.
+        async fn serve<F, Fut>(respond: F) -> String
+        where
+            F: Fn(String, String, TcpStream) -> Fut + Send + Sync + 'static,
+            Fut: std::future::Future<Output = ()> + Send + 'static,
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let respond = Arc::new(respond);
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let respond = respond.clone();
+                    tokio::spawn(async move {
+                        if let Some((line, body)) = read_request(&mut stream).await {
+                            respond(line, body, stream).await;
+                        }
+                    });
+                }
+            });
+            url
+        }
+
+        /// Split `bytes` into chunks so that every multibyte character is cut
+        /// `offset` bytes in (capped to stay inside the character).
+        fn split_inside_each_char(
+            text: &str,
+            prefix: &str,
+            suffix: &str,
+            offset: usize,
+        ) -> Vec<Vec<u8>> {
+            let mut cuts = Vec::new();
+            for (index, ch) in text.char_indices() {
+                if ch.len_utf8() > 1 {
+                    cuts.push(prefix.len() + index + offset.min(ch.len_utf8() - 1));
+                }
+            }
+            let whole = format!("{prefix}{text}{suffix}").into_bytes();
+            let mut chunks = Vec::new();
+            let mut start = 0;
+            for cut in cuts {
+                chunks.push(whole[start..cut].to_vec());
+                start = cut;
+            }
+            chunks.push(whole[start..].to_vec());
+            chunks
+        }
+
+        /// Write an SSE response head and `chunks` as separate HTTP chunks
+        /// with a pause between each, so the client reads them separately.
+        /// With `finish`, the chunked body is then terminated.
+        async fn write_sse(stream: &mut TcpStream, extra: &str, chunks: &[Vec<u8>], finish: bool) {
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n{extra}Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(head.as_bytes()).await;
+            let _ = stream.flush().await;
+            for chunk in chunks {
+                let _ = stream
+                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .await;
+                let _ = stream.write_all(chunk).await;
+                let _ = stream.write_all(b"\r\n").await;
+                let _ = stream.flush().await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            if finish {
+                let _ = stream.write_all(b"0\r\n\r\n").await;
+                let _ = stream.flush().await;
+            }
+        }
+
+        async fn next_frame(transport: &mut HttpClientTransport) -> serde_json::Value {
+            let frame = tokio::time::timeout(WAIT, transport.recv())
+                .await
+                .expect("no frame arrived")
+                .expect("recv failed")
+                .expect("transport closed");
+            serde_json::from_str(&frame).unwrap()
+        }
+
+        /// POST path: the `initialize` reply arrives as an SSE stream whose
+        /// chunks cut through every multibyte character.
+        #[tokio::test]
+        async fn post_sse_reply_decodes_split_code_points() {
+            for offset in 1..=3 {
+                let prefix = r#"data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"raw","version":"0"},"instructions":""#;
+                let chunks = split_inside_each_char(TEXT, prefix, "\"}}\n\n", offset);
+                assert!(chunks.len() > 4, "test setup: the stream is split");
+                let url = serve(move |_, _, mut s| {
+                    let chunks = chunks.clone();
+                    async move { write_sse(&mut s, "", &chunks, true).await }
+                })
+                .await;
+
+                let mut transport = HttpClientTransport::with_config(
+                    &url,
+                    HttpClientConfig {
+                        auto_sse: false,
+                        request_timeout: WAIT,
+                        ..Default::default()
+                    },
+                );
+                transport
+                    .send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+                    .await
+                    .unwrap();
+                let frame = next_frame(&mut transport).await;
+
+                assert_eq!(frame["id"], 1, "offset {offset}: got {frame}");
+                assert_eq!(
+                    frame["result"]["instructions"], TEXT,
+                    "offset {offset}: got {frame}"
+                );
+                assert!(!frame.to_string().contains('\u{fffd}'));
+            }
+        }
+
+        /// GET path: after `initialize` opens a session, the background
+        /// stream delivers a notification whose chunks cut through every
+        /// multibyte character.
+        #[tokio::test]
+        async fn get_stream_decodes_split_code_points() {
+            for offset in 1..=3 {
+                let prefix = r#"data: {"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":""#;
+                let chunks = split_inside_each_char(TEXT, prefix, "\"}}\n\n", offset);
+                let url = serve(move |line, _, mut s| {
+                    let chunks = chunks.clone();
+                    async move {
+                        if line.starts_with("GET ") {
+                            // Hold the stream open so the client does not
+                            // reconnect and replay the event.
+                            write_sse(&mut s, "", &chunks, false).await;
+                            tokio::time::sleep(WAIT).await;
+                        } else {
+                            let reply = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"raw","version":"0"}}}"#;
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nmcp-session-id: s-1\r\nmcp-protocol-version: 2025-11-25\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                reply.len()
+                            );
+                            let _ = s.write_all(head.as_bytes()).await;
+                            let _ = s.write_all(reply.as_bytes()).await;
+                            let _ = s.flush().await;
+                        }
+                    }
+                })
+                .await;
+
+                let mut transport = HttpClientTransport::with_config(
+                    &url,
+                    HttpClientConfig {
+                        auto_sse: true,
+                        sse_reconnect: false,
+                        request_timeout: WAIT,
+                        ..Default::default()
+                    },
+                );
+                transport
+                    .send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+                    .await
+                    .unwrap();
+
+                let mut notification = None;
+                for _ in 0..2 {
+                    let frame = next_frame(&mut transport).await;
+                    if frame["method"] == "notifications/message" {
+                        notification = Some(frame);
+                        break;
+                    }
+                }
+                let frame = notification.expect("the GET stream delivered no notification");
+
+                assert_eq!(
+                    frame["params"]["data"], TEXT,
+                    "offset {offset}: got {frame}"
+                );
+                assert!(!frame.to_string().contains('\u{fffd}'));
+            }
         }
     }
 }
