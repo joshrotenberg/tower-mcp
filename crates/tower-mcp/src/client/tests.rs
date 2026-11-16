@@ -3443,6 +3443,201 @@ async fn legacy_elicitation_request_still_requires_the_id() {
 }
 
 // =========================================================================
+// SEP-1330 enum shapes reach the handler intact (#1652)
+// =========================================================================
+
+/// One form elicitation carrying every SEP-1330 enum shape from the
+/// 2026-07-28 schema, with every optional keyword set.
+fn sep1330_form_params() -> serde_json::Value {
+    serde_json::json!({
+        "mode": "form",
+        "message": "Choose",
+        "requestedSchema": {
+            "type": "object",
+            "properties": {
+                "untitledSingle": {
+                    "type": "string",
+                    "title": "Color",
+                    "description": "Pick one",
+                    "enum": ["red", "green"],
+                    "default": "red"
+                },
+                "titledSingle": {
+                    "type": "string",
+                    "title": "Color",
+                    "description": "Pick one",
+                    "oneOf": [
+                        {"const": "#FF0000", "title": "Red"},
+                        {"const": "#00FF00", "title": "Green"}
+                    ],
+                    "default": "#00FF00"
+                },
+                "legacyEnum": {
+                    "type": "string",
+                    "enum": ["red", "green"],
+                    "enumNames": ["Red", "Green"],
+                    "default": "green"
+                },
+                "untitledMulti": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 2,
+                    "items": {"type": "string", "enum": ["red", "green", "blue"]},
+                    "default": ["red"]
+                },
+                "titledMulti": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 2,
+                    "items": {"anyOf": [
+                        {"const": "#FF0000", "title": "Red"},
+                        {"const": "#00FF00", "title": "Green"}
+                    ]},
+                    "default": ["#FF0000"]
+                }
+            },
+            "required": ["titledSingle"]
+        }
+    })
+}
+
+/// Assert the handler saw exactly one form elicitation, decoded into the
+/// modelled variant for each shape, and that it re-encodes to what was sent.
+fn assert_sep1330_form_intact(seen: &[crate::protocol::ElicitRequestParams]) {
+    use crate::protocol::{ElicitRequestParams, PrimitiveSchemaDefinition};
+
+    let [ElicitRequestParams::Form(params)] = seen else {
+        panic!("expected one form elicitation, got {seen:?}");
+    };
+    let properties = &params.requested_schema.properties;
+    assert!(matches!(
+        properties.get("untitledSingle"),
+        Some(PrimitiveSchemaDefinition::SingleSelectEnum(_))
+    ));
+    match properties.get("titledSingle") {
+        Some(PrimitiveSchemaDefinition::TitledSingleSelectEnum(schema)) => {
+            let consts: Vec<&str> = schema.one_of.iter().map(|o| o.value.as_str()).collect();
+            assert_eq!(consts, ["#FF0000", "#00FF00"]);
+        }
+        other => panic!("titledSingle decoded as {other:?}"),
+    }
+    match properties.get("legacyEnum") {
+        Some(PrimitiveSchemaDefinition::LegacyTitledEnum(schema)) => {
+            assert_eq!(schema.enum_names, ["Red", "Green"]);
+        }
+        other => panic!("legacyEnum decoded as {other:?}"),
+    }
+    match properties.get("untitledMulti") {
+        Some(PrimitiveSchemaDefinition::MultiSelectEnum(schema)) => {
+            assert_eq!((schema.min_items, schema.max_items), (Some(1), Some(2)));
+        }
+        other => panic!("untitledMulti decoded as {other:?}"),
+    }
+    match properties.get("titledMulti") {
+        Some(PrimitiveSchemaDefinition::TitledMultiSelectEnum(schema)) => {
+            assert_eq!(schema.items.any_of.len(), 2);
+            assert_eq!((schema.min_items, schema.max_items), (Some(1), Some(2)));
+        }
+        other => panic!("titledMulti decoded as {other:?}"),
+    }
+    assert_eq!(
+        serde_json::to_value(params).unwrap(),
+        sep1330_form_params(),
+        "the handler must receive the schema without loss"
+    );
+}
+
+/// Before #1652, the titled multi-select failed to decode and the client
+/// answered the whole `elicitation/create` with -32602 without calling the
+/// handler; the titled single-select arrived as free text.
+#[tokio::test]
+async fn elicitation_create_delivers_every_sep1330_enum_shape_to_the_handler() {
+    let transport = MockTransport::with_responses(vec![mock_initialize_response()]);
+    let inject = transport.incoming_tx.clone();
+    let outgoing = transport.outgoing.clone();
+    let handler = RecordingElicitHandler::default();
+    let seen = handler.seen.clone();
+    let client = McpClient::builder()
+        .with_elicitation()
+        .connect(transport, handler)
+        .await
+        .unwrap();
+    client.initialize("test-client", "1.0.0").await.unwrap();
+
+    inject
+        .send(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 200,
+                "method": "elicitation/create",
+                "params": sep1330_form_params()
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let reply = outgoing.lock().unwrap().iter().find_map(|message| {
+                let frame: serde_json::Value = serde_json::from_str(message).unwrap();
+                (frame["id"] == 200 && frame.get("method").is_none()).then_some(frame)
+            });
+            match reply {
+                Some(frame) => return frame,
+                None => tokio::task::yield_now().await,
+            }
+        }
+    })
+    .await
+    .expect("no reply to the injected elicitation/create");
+
+    assert_eq!(reply["result"]["action"], "accept", "{reply}");
+    assert_sep1330_form_intact(&seen.lock().unwrap());
+}
+
+/// The same shapes inside a 2026-07-28 `input_required` result, which the
+/// client fulfils through the same handler.
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+#[tokio::test]
+async fn input_required_delivers_every_sep1330_enum_shape_to_the_handler() {
+    let transport = MockTransport::with_responses(vec![
+        final_discover_result(),
+        serde_json::json!({
+            "resultType": "input_required",
+            "inputRequests": {"choose": {
+                "method": "elicitation/create",
+                "params": sep1330_form_params()
+            }},
+            "requestState": "opaque"
+        }),
+        serde_json::json!({
+            "resultType": "complete",
+            "content": [{"type": "text", "text": "chosen"}]
+        }),
+    ]);
+    let handler = RecordingElicitHandler::default();
+    let seen = handler.seen.clone();
+    let client = McpClient::builder()
+        .protocol_support(ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+        .with_elicitation()
+        .connect(transport, handler)
+        .await
+        .unwrap();
+    client.discover("test-client", "1.0.0").await.unwrap();
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.call_tool("choose", serde_json::json!({})),
+    )
+    .await
+    .expect("call timed out")
+    .unwrap();
+    assert_eq!(result.all_text(), "chosen");
+    assert_sep1330_form_intact(&seen.lock().unwrap());
+}
+
+// =========================================================================
 // Commands queued while the message loop exits
 // =========================================================================
 

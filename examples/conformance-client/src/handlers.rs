@@ -180,6 +180,18 @@ fn extract_default(def: &PrimitiveSchemaDefinition) -> Option<ElicitFieldValue> 
             .default
             .as_ref()
             .map(|d| ElicitFieldValue::StringArray(d.clone())),
+        PrimitiveSchemaDefinition::TitledSingleSelectEnum(e) => e
+            .default
+            .as_ref()
+            .map(|d| ElicitFieldValue::String(d.clone())),
+        PrimitiveSchemaDefinition::LegacyTitledEnum(e) => e
+            .default
+            .as_ref()
+            .map(|d| ElicitFieldValue::String(d.clone())),
+        PrimitiveSchemaDefinition::TitledMultiSelectEnum(e) => e
+            .default
+            .as_ref()
+            .map(|d| ElicitFieldValue::StringArray(d.clone())),
         _ => None,
     }
 }

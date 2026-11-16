@@ -812,6 +812,61 @@ fn build_per_request_meta() -> Tool {
         .build()
 }
 
+/// One field of each SEP-1330 enum shape, built with the typed builders.
+///
+/// The wire JSON is identical to the `raw_field` schema this replaced; the
+/// test below pins it.
+fn sep1330_enum_schema() -> ElicitFormSchema {
+    ElicitFormSchema::new()
+        // 1. Untitled single-select
+        .enum_field(
+            "untitledSingle",
+            None,
+            vec!["option1".into(), "option2".into(), "option3".into()],
+            false,
+        )
+        // 2. Titled single-select
+        .titled_enum_field(
+            "titledSingle",
+            None,
+            &[
+                ("value1", "First Option"),
+                ("value2", "Second Option"),
+                ("value3", "Third Option"),
+            ],
+            false,
+        )
+        // 3. Legacy titled (deprecated)
+        .legacy_titled_enum_field(
+            "legacyEnum",
+            None,
+            &[
+                ("opt1", "Option One"),
+                ("opt2", "Option Two"),
+                ("opt3", "Option Three"),
+            ],
+            false,
+        )
+        // 4. Untitled multi-select
+        .multi_select_enum_field(
+            "untitledMulti",
+            None,
+            &["option1", "option2", "option3"],
+            false,
+        )
+        // 5. Titled multi-select
+        .titled_multi_select_enum_field(
+            "titledMulti",
+            None,
+            &[
+                ("value1", "First Choice"),
+                ("value2", "Second Choice"),
+                ("value3", "Third Choice"),
+            ],
+            false,
+        )
+}
+
 fn build_elicitation_sep1330_enums() -> Tool {
     ToolBuilder::new("test_elicitation_sep1330_enums")
         .description("Requests elicitation with enum schemas -- all 5 SEP-1330 variants")
@@ -819,67 +874,7 @@ fn build_elicitation_sep1330_enums() -> Tool {
             if !ctx.can_elicit() {
                 return Ok(CallToolResult::error("Elicitation not available"));
             }
-            // Build schema with all 5 enum variants
-            let schema = ElicitFormSchema::new()
-                // 1. Untitled single-select
-                .raw_field(
-                    "untitledSingle",
-                    serde_json::json!({
-                        "type": "string",
-                        "enum": ["option1", "option2", "option3"]
-                    }),
-                    false,
-                )
-                // 2. Titled single-select
-                .raw_field(
-                    "titledSingle",
-                    serde_json::json!({
-                        "type": "string",
-                        "oneOf": [
-                            { "const": "value1", "title": "First Option" },
-                            { "const": "value2", "title": "Second Option" },
-                            { "const": "value3", "title": "Third Option" }
-                        ]
-                    }),
-                    false,
-                )
-                // 3. Legacy titled (deprecated)
-                .raw_field(
-                    "legacyEnum",
-                    serde_json::json!({
-                        "type": "string",
-                        "enum": ["opt1", "opt2", "opt3"],
-                        "enumNames": ["Option One", "Option Two", "Option Three"]
-                    }),
-                    false,
-                )
-                // 4. Untitled multi-select
-                .raw_field(
-                    "untitledMulti",
-                    serde_json::json!({
-                        "type": "array",
-                        "items": {
-                            "type": "string",
-                            "enum": ["option1", "option2", "option3"]
-                        }
-                    }),
-                    false,
-                )
-                // 5. Titled multi-select
-                .raw_field(
-                    "titledMulti",
-                    serde_json::json!({
-                        "type": "array",
-                        "items": {
-                            "anyOf": [
-                                { "const": "value1", "title": "First Choice" },
-                                { "const": "value2", "title": "Second Choice" },
-                                { "const": "value3", "title": "Third Choice" }
-                            ]
-                        }
-                    }),
-                    false,
-                );
+            let schema = sep1330_enum_schema();
             let params = ElicitFormParams {
                 mode: Some(ElicitMode::Form),
                 message: "Please select from enum options".to_string(),
@@ -916,4 +911,72 @@ fn build_create_task() -> Tool {
             Ok(CallToolResult::text("task support available"))
         })
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The builder-made SEP-1330 schema sends exactly the JSON the fixture
+    /// used to hand-write with `raw_field` (#1652).
+    #[test]
+    fn sep1330_enum_schema_matches_the_original_raw_fields() {
+        let expected = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "untitledSingle": {
+                    "type": "string",
+                    "enum": ["option1", "option2", "option3"]
+                },
+                "titledSingle": {
+                    "type": "string",
+                    "oneOf": [
+                        { "const": "value1", "title": "First Option" },
+                        { "const": "value2", "title": "Second Option" },
+                        { "const": "value3", "title": "Third Option" }
+                    ]
+                },
+                "legacyEnum": {
+                    "type": "string",
+                    "enum": ["opt1", "opt2", "opt3"],
+                    "enumNames": ["Option One", "Option Two", "Option Three"]
+                },
+                "untitledMulti": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": ["option1", "option2", "option3"]
+                    }
+                },
+                "titledMulti": {
+                    "type": "array",
+                    "items": {
+                        "anyOf": [
+                            { "const": "value1", "title": "First Choice" },
+                            { "const": "value2", "title": "Second Choice" },
+                            { "const": "value3", "title": "Third Choice" }
+                        ]
+                    }
+                }
+            }
+        });
+        let actual = serde_json::to_value(sep1330_enum_schema()).unwrap();
+        assert_eq!(actual, expected);
+        let order: Vec<&str> = actual["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "untitledSingle",
+                "titledSingle",
+                "legacyEnum",
+                "untitledMulti",
+                "titledMulti"
+            ]
+        );
+    }
 }

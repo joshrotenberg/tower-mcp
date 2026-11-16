@@ -715,6 +715,10 @@ pub use protocol::{
     ToolAnnotations, ToolChoice, ToolDefinition, ToolExecution, ToolIcon, ToolsCapability,
     UnsubscribeResourceParams, UpdateTaskParams,
 };
+pub use protocol::{
+    LegacyTitledEnumSchema, TitledEnumOption, TitledMultiSelectEnumItems,
+    TitledMultiSelectEnumSchema, TitledSingleSelectEnumSchema,
+};
 pub use protocol::{RESULT_TYPE_TASK, TASKS_EXTENSION_ID};
 #[cfg(feature = "dynamic-tools")]
 pub use registry::{
