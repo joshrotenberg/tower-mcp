@@ -18,6 +18,7 @@ use super::oauth::{
     OAuthScopeEscalationRequest, OAuthTokenEndpointAuthMethod, TokenProvider, token_is_fresh,
     unix_time,
 };
+use super::oauth_address::{AddressGuard, OAuthAddressPolicy, address_blocked_in};
 use super::oauth_authcode::{
     OAuthAuthorizationServerMetadata, OAuthClientRegistration, OAuthClientRegistrationMethod,
     OAuthClientRegistrationOptions, OAuthClientRegistrationStore, OAuthProtectedResourceMetadata,
@@ -146,6 +147,15 @@ impl OAuthHttpResponse {
 /// Implementations control proxying, TLS, telemetry, retries, and test
 /// behavior without requiring the authorization state machine to depend on a
 /// particular HTTP stack.
+///
+/// [`OAuthAuthorizationFlow`] checks every request URL against its
+/// [`OAuthAddressPolicy`] before calling [`execute`](Self::execute), but for a
+/// custom implementation only IP-literal hosts and `localhost` names are
+/// checked there, because the flow cannot know how the implementation
+/// resolves names. An implementation that resolves names itself should apply
+/// the policy to the resolved addresses, for example by building its reqwest
+/// client with [`OAuthAddressPolicy::resolver`], and should not follow
+/// redirects (or should check each redirect target).
 #[async_trait]
 pub trait OAuthHttpClient: Send + Sync + 'static {
     /// Execute one OAuth protocol request.
@@ -176,9 +186,30 @@ impl ReqwestOAuthHttpClient {
     }
 
     /// Create a client that does not automatically follow redirects.
+    ///
+    /// This client applies no [`OAuthAddressPolicy`] to resolved addresses;
+    /// [`with_address_policy`](Self::with_address_policy) does.
     pub fn without_redirects() -> Result<Self, OAuthClientError> {
         reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map(Self::new)
+            .map_err(|error| OAuthClientError::Http(error.to_string()))
+    }
+
+    /// Create a client that does not follow redirects and applies `policy`
+    /// to every address DNS returns, for talking to the MCP server at
+    /// `server_url`.
+    ///
+    /// This is the client [`OAuthAuthorizationFlow`] builds by default. Use
+    /// it to wrap the default client in a custom [`OAuthHttpClient`] without
+    /// losing connect-time enforcement.
+    pub fn with_address_policy(
+        policy: &OAuthAddressPolicy,
+        server_url: &str,
+    ) -> Result<Self, OAuthClientError> {
+        AddressGuard::new(policy, server_url, false)
+            .client_builder(false)
             .build()
             .map(Self::new)
             .map_err(|error| OAuthClientError::Http(error.to_string()))
@@ -204,10 +235,9 @@ impl OAuthHttpClient for ReqwestOAuthHttpClient {
             OAuthHttpBody::Form(fields) => builder.form(&fields),
             OAuthHttpBody::Json(value) => builder.json(&value),
         };
-        let response = builder
-            .send()
-            .await
-            .map_err(|error| OAuthClientError::Http(error.to_string()))?;
+        let response = builder.send().await.map_err(|error| {
+            address_blocked_in(&error).unwrap_or_else(|| OAuthClientError::Http(error.to_string()))
+        })?;
         let status = response.status().as_u16();
         let headers = response
             .headers()
@@ -229,6 +259,24 @@ impl OAuthHttpClient for ReqwestOAuthHttpClient {
             headers,
             body,
         })
+    }
+}
+
+/// Applies an [`OAuthAddressPolicy`] to every request before delegating to
+/// the configured [`OAuthHttpClient`].
+struct AddressCheckedHttpClient {
+    inner: Arc<dyn OAuthHttpClient>,
+    guard: AddressGuard,
+}
+
+#[async_trait]
+impl OAuthHttpClient for AddressCheckedHttpClient {
+    async fn execute(
+        &self,
+        request: OAuthHttpRequest,
+    ) -> Result<OAuthHttpResponse, OAuthClientError> {
+        self.guard.check(&request.url).await?;
+        self.inner.execute(request).await
     }
 }
 
@@ -638,6 +686,7 @@ pub struct OAuthAuthorizationFlowBuilder {
     refresh_scope_policy: OAuthRefreshScopePolicy,
     authorization_handler: Option<Arc<dyn OAuthAuthorizationHandler>>,
     assertion_signer: Option<Arc<dyn OAuthClientAssertionSigner>>,
+    address_policy: OAuthAddressPolicy,
 }
 
 impl fmt::Debug for OAuthAuthorizationFlowBuilder {
@@ -650,6 +699,7 @@ impl fmt::Debug for OAuthAuthorizationFlowBuilder {
             .field("redirect_policy", &self.redirect_policy)
             .field("preferred_issuer", &self.preferred_issuer)
             .field("refresh_buffer", &self.refresh_buffer)
+            .field("address_policy", &self.address_policy)
             .finish_non_exhaustive()
     }
 }
@@ -705,8 +755,28 @@ impl OAuthAuthorizationFlowBuilder {
     }
 
     /// Configure the OAuth protocol HTTP implementation.
+    ///
+    /// The [`address_policy`](Self::address_policy) is still checked before
+    /// every request, but only for IP-literal hosts and `localhost` names;
+    /// see [`OAuthHttpClient`] for applying it to resolved addresses.
     pub fn http_client(mut self, client: impl OAuthHttpClient) -> Self {
         self.http = Some(Arc::new(client));
+        self
+    }
+
+    /// Configure the address policy for server-supplied URLs.
+    ///
+    /// Default: [`OAuthAddressPolicy::default()`], which blocks loopback,
+    /// link-local, private-network, and other non-public destinations outside
+    /// the resource URL's own origin. It applies to every OAuth request the
+    /// flow makes: the challenge's `resource_metadata`, issuer metadata URLs,
+    /// and the token and registration endpoints from authorization server
+    /// metadata. The default HTTP client also applies it to every resolved
+    /// address at connect time. Use [`OAuthAddressPolicy::allow_host`] or
+    /// [`OAuthAddressPolicy::allow_cidr`] for an authorization server on a
+    /// private network, or [`OAuthAddressPolicy::disabled`] to opt out.
+    pub fn address_policy(mut self, policy: OAuthAddressPolicy) -> Self {
+        self.address_policy = policy;
         self
     }
 
@@ -788,9 +858,21 @@ impl OAuthAuthorizationFlowBuilder {
         if let Some(resource) = &self.resource_override {
             validate_resource_override(resource)?;
         }
-        let http = match self.http {
+        let http: Arc<dyn OAuthHttpClient> = match self.http {
             Some(http) => http,
-            None => Arc::new(ReqwestOAuthHttpClient::without_redirects()?),
+            None => Arc::new(ReqwestOAuthHttpClient::with_address_policy(
+                &self.address_policy,
+                &self.resource_url,
+            )?),
+        };
+        // Host names are left to the HTTP client: the default client's
+        // resolver checks every address it connects to, and a custom client
+        // resolves names in ways the flow cannot see.
+        let guard = AddressGuard::new(&self.address_policy, &self.resource_url, false);
+        let http: Arc<dyn OAuthHttpClient> = if guard.is_enabled() {
+            Arc::new(AddressCheckedHttpClient { inner: http, guard })
+        } else {
+            http
         };
         Ok(OAuthAuthorizationFlow {
             inner: Arc::new(FlowInner {
@@ -948,6 +1030,7 @@ impl OAuthAuthorizationFlow {
             refresh_scope_policy: OAuthRefreshScopePolicy::default(),
             authorization_handler: None,
             assertion_signer: None,
+            address_policy: OAuthAddressPolicy::default(),
         }
     }
 

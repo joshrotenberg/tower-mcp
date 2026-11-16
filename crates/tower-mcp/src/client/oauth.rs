@@ -47,7 +47,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use super::oauth_authcode::{discover_oauth_authorization, redirect_error_detail};
+use super::oauth_address::{AddressGuard, OAuthAddressPolicy, address_blocked_in};
+use super::oauth_authcode::{discover_oauth_authorization_with_policy, redirect_error_detail};
 
 /// Trait for dynamic token providers.
 ///
@@ -621,6 +622,11 @@ pub enum OAuthClientError {
     InvalidResponse(String),
     /// Builder validation failed (missing required fields).
     BuildError(String),
+    /// A URL supplied by the server side resolved to an address the
+    /// [`OAuthAddressPolicy`](super::OAuthAddressPolicy) blocks, such as
+    /// loopback, link-local, or a private network. The message names the
+    /// host and how to allow it; it never contains a response body.
+    AddressBlocked(String),
 }
 
 impl fmt::Display for OAuthClientError {
@@ -641,6 +647,7 @@ impl fmt::Display for OAuthClientError {
             Self::ScopeEscalation(msg) => write!(f, "OAuth scope escalation error: {}", msg),
             Self::InvalidResponse(msg) => write!(f, "OAuth invalid response: {}", msg),
             Self::BuildError(msg) => write!(f, "OAuth builder error: {}", msg),
+            Self::AddressBlocked(msg) => write!(f, "OAuth address policy: {}", msg),
         }
     }
 }
@@ -765,20 +772,52 @@ impl OAuthClientCredentials {
     /// Metadata discovery, validates authorization-server metadata, and binds
     /// token requests to the discovered resource using RFC 8707.
     ///
+    /// Server-supplied URLs, including the discovered token endpoint, are
+    /// subject to the default [`OAuthAddressPolicy`]; use
+    /// [`discover_with_address_policy`](Self::discover_with_address_policy)
+    /// to configure it.
+    ///
     /// # Errors
     ///
     /// Returns [`OAuthClientError::Discovery`] if the metadata endpoint
-    /// is unreachable or does not contain a `token_endpoint`.
+    /// is unreachable or does not contain a `token_endpoint`, and
+    /// [`OAuthClientError::AddressBlocked`] if a server-supplied URL is
+    /// blocked by the address policy.
     pub async fn discover(
         resource_url: &str,
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
     ) -> Result<Self, OAuthClientError> {
-        let client = redirect_free_client()?;
-        let discovery = discover_oauth_authorization(resource_url, None, &client).await?;
+        Self::discover_with_address_policy(
+            resource_url,
+            client_id,
+            client_secret,
+            &OAuthAddressPolicy::default(),
+        )
+        .await
+    }
+
+    /// [`discover`](Self::discover) with an explicit [`OAuthAddressPolicy`].
+    ///
+    /// The policy also stays on the provider's HTTP client, so token
+    /// requests resolve the token endpoint through it.
+    pub async fn discover_with_address_policy(
+        resource_url: &str,
+        client_id: impl Into<String>,
+        client_secret: impl Into<String>,
+        policy: &OAuthAddressPolicy,
+    ) -> Result<Self, OAuthClientError> {
+        let guard = AddressGuard::new(policy, resource_url, true);
+        let client = guard
+            .client_builder(false)
+            .build()
+            .map_err(|error| OAuthClientError::Http(error.to_string()))?;
+        let discovery =
+            discover_oauth_authorization_with_policy(resource_url, None, &client, policy).await?;
         let metadata = discovery.authorization_servers.first().ok_or_else(|| {
             OAuthClientError::Discovery("no authorization server discovered".into())
         })?;
+        guard.check(&metadata.token_endpoint).await?;
         let auth_method = OAuthTokenEndpointAuthMethod::select(
             &metadata.token_endpoint_auth_methods_supported,
             true,
@@ -832,11 +871,9 @@ impl OAuthClientCredentials {
             }
         }
 
-        let response = request
-            .form(&params)
-            .send()
-            .await
-            .map_err(|e| OAuthClientError::TokenRequest(e.to_string()))?;
+        let response = request.form(&params).send().await.map_err(|e| {
+            address_blocked_in(&e).unwrap_or_else(|| OAuthClientError::TokenRequest(e.to_string()))
+        })?;
 
         // The client does not follow redirects (see `redirect_free_client`),
         // so a 3xx here is the token endpoint's own response, not a body to
