@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.27.0] - 2026-11-16
+
+### Bug Fixes
+
+- **client:** Bound list_all pagination with a page budget ([#1648](https://github.com/joshrotenberg/tower-mcp/pull/1648))
+- [**breaking**] **types:** Preserve additional top-level capabilities ([#1650](https://github.com/joshrotenberg/tower-mcp/pull/1650))
+- [**breaking**] **types:** Model every SEP-1330 elicitation enum shape ([#1659](https://github.com/joshrotenberg/tower-mcp/pull/1659))
+
+
+
 ## [0.26.1] - 2026-11-15
 
 ### Features
