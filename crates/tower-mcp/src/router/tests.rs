@@ -635,6 +635,130 @@ async fn final_tasks_work_across_independent_routers_with_a_shared_store() {
 }
 
 #[test]
+fn router_advertises_additional_capabilities_on_both_protocols() {
+    let router = McpRouter::new()
+        .with_additional_capability("events", serde_json::json!({ "kinds": ["created"] }))
+        .unwrap()
+        .with_additional_capability("custom", serde_json::json!({}))
+        .unwrap();
+
+    let stable = router.capabilities();
+    let final_capabilities =
+        router.capabilities_for_protocol(Some(crate::protocol::PROTOCOL_VERSION_2026_07_28));
+    for capabilities in [stable, final_capabilities] {
+        let json = serde_json::to_value(&capabilities).unwrap();
+        assert_eq!(json["events"], serde_json::json!({ "kinds": ["created"] }));
+        assert_eq!(json["custom"], serde_json::json!({}));
+        assert!(json.get("experimental").is_none());
+        assert!(json.get("extensions").is_none());
+    }
+}
+
+#[test]
+fn router_additional_capability_rejects_built_in_names() {
+    for name in ServerCapabilities::KNOWN_CAPABILITIES {
+        let error = McpRouter::new()
+            .with_additional_capability(*name, serde_json::json!({}))
+            .err()
+            .unwrap();
+        assert_eq!(
+            error,
+            AdditionalCapabilityError::ReservedName((*name).to_string())
+        );
+    }
+    assert!(matches!(
+        McpRouter::new().with_additional_capability("", serde_json::json!({})),
+        Err(AdditionalCapabilityError::EmptyName)
+    ));
+}
+
+#[test]
+fn merged_and_nested_routers_carry_additional_capabilities() {
+    let base = McpRouter::new()
+        .with_additional_capability("events", serde_json::json!({ "v": 1 }))
+        .unwrap();
+    let other = McpRouter::new()
+        .with_additional_capability("events", serde_json::json!({ "v": 2 }))
+        .unwrap()
+        .with_additional_capability("custom", serde_json::json!({}))
+        .unwrap();
+
+    let merged = base.clone().merge(other.clone());
+    let caps = merged.capabilities();
+    assert_eq!(caps.additional["events"], serde_json::json!({ "v": 2 }));
+    assert_eq!(caps.additional["custom"], serde_json::json!({}));
+
+    let nested = base.nest("sub", other);
+    let caps = nested.capabilities();
+    assert_eq!(caps.additional["events"], serde_json::json!({ "v": 2 }));
+    assert_eq!(caps.additional["custom"], serde_json::json!({}));
+}
+
+#[tokio::test]
+async fn initialize_result_advertises_additional_capabilities() {
+    let router = McpRouter::new()
+        .with_additional_capability("events", serde_json::json!({}))
+        .unwrap();
+    let response = router
+        .handle(
+            RequestId::Number(1),
+            McpRequest::Initialize(InitializeParams {
+                protocol_version: crate::protocol::LATEST_PROTOCOL_VERSION.to_string(),
+                capabilities: ClientCapabilities::default(),
+                client_info: Implementation {
+                    name: "additional-capabilities".to_string(),
+                    version: "1.0.0".to_string(),
+                    title: None,
+                    description: None,
+                    icons: None,
+                    website_url: None,
+                    meta: None,
+                },
+                meta: None,
+            }),
+            Extensions::new(),
+        )
+        .await
+        .unwrap();
+    let McpResponse::Initialize(result) = response else {
+        panic!("Expected Initialize response");
+    };
+    let json = serde_json::to_value(&result).unwrap();
+    assert_eq!(json["capabilities"]["events"], serde_json::json!({}));
+    let decoded: InitializeResult = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        decoded.capabilities.additional.get("events"),
+        Some(&serde_json::json!({}))
+    );
+}
+
+#[cfg(feature = "stateless")]
+#[tokio::test]
+async fn discover_result_advertises_additional_capabilities() {
+    let router = McpRouter::new()
+        .with_additional_capability("events", serde_json::json!({}))
+        .unwrap();
+    let McpResponse::Discover(result) = router
+        .handle(
+            RequestId::Number(1),
+            McpRequest::Discover(DiscoverParams::default()),
+            Extensions::new(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("Expected Discover response");
+    };
+    let json = serde_json::to_value(&result).unwrap();
+    assert_eq!(json["capabilities"]["events"], serde_json::json!({}));
+    let decoded: DiscoverResult = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        decoded.capabilities.additional.get("events"),
+        Some(&serde_json::json!({}))
+    );
+}
+
+#[test]
 fn router_advertises_only_locally_declared_protocol_extensions() {
     let router = McpRouter::new().with_protocol_extension(
         crate::ExtensionDeclaration::new(
@@ -1129,6 +1253,7 @@ async fn init_router(router: &mut McpRouter) {
                 tasks: None,
                 experimental: None,
                 extensions: None,
+                ..Default::default()
             },
             client_info: Implementation {
                 name: "test".to_string(),
@@ -1814,6 +1939,7 @@ async fn test_capabilities_include_resources_with_only_templates() {
                 tasks: None,
                 experimental: None,
                 extensions: None,
+                ..Default::default()
             },
             client_info: Implementation {
                 name: "test".to_string(),
@@ -2500,6 +2626,7 @@ async fn test_logging_capability_with_channel() {
                 tasks: None,
                 experimental: None,
                 extensions: None,
+                ..Default::default()
             },
             client_info: Implementation {
                 name: "test".to_string(),
@@ -2537,6 +2664,7 @@ async fn test_no_logging_capability_without_channel() {
                 tasks: None,
                 experimental: None,
                 extensions: None,
+                ..Default::default()
             },
             client_info: Implementation {
                 name: "test".to_string(),
@@ -5127,6 +5255,7 @@ async fn test_subscription_capability_advertised() {
                 tasks: None,
                 experimental: None,
                 extensions: None,
+                ..Default::default()
             },
             client_info: Implementation {
                 name: "test".to_string(),
@@ -7376,6 +7505,7 @@ async fn send_initialize(router: &mut McpRouter) -> InitializeResult {
                 tasks: None,
                 experimental: None,
                 extensions: None,
+                ..Default::default()
             },
             client_info: Implementation {
                 name: "test".to_string(),

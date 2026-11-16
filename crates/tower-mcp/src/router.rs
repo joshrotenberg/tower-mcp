@@ -238,6 +238,8 @@ struct McpRouterInner {
     extensions: Arc<crate::context::Extensions>,
     /// Locally supported MCP protocol extensions and their server settings.
     protocol_extensions: HashMap<String, serde_json::Value>,
+    /// Additional top-level server capabilities advertised verbatim.
+    additional_capabilities: serde_json::Map<String, serde_json::Value>,
     /// Skills extension catalog (SEP-2640), when one is registered.
     #[cfg(feature = "skills")]
     skills: Option<Arc<crate::skills::SkillSet>>,
@@ -696,6 +698,7 @@ impl McpRouter {
                 task_store: Arc::new(MemoryTaskStore::new()),
                 extensions: Arc::new(crate::context::Extensions::new()),
                 protocol_extensions: HashMap::new(),
+                additional_capabilities: serde_json::Map::new(),
                 #[cfg(feature = "skills")]
                 skills: None,
                 completion_handler: None,
@@ -1214,6 +1217,46 @@ impl McpRouter {
         self
     }
 
+    /// Advertise an additional top-level server capability.
+    ///
+    /// The server capability set is open: besides the capabilities this
+    /// router derives from what is registered, a server may define its own,
+    /// such as `events`. The value is advertised verbatim at the top level of
+    /// `capabilities` in both the `initialize` and `server/discover` results.
+    /// Calling this again with the same name replaces the earlier value.
+    ///
+    /// Built-in capability names (see
+    /// [`ServerCapabilities::KNOWN_CAPABILITIES`]) are rejected, so this
+    /// cannot override what the router derives, and `extensions` stays behind
+    /// [`with_protocol_extension`](Self::with_protocol_extension) and its
+    /// validation.
+    ///
+    /// ```rust
+    /// use tower_mcp::McpRouter;
+    ///
+    /// let router = McpRouter::new()
+    ///     .with_additional_capability("events", serde_json::json!({}))
+    ///     .unwrap();
+    /// assert!(
+    ///     McpRouter::new()
+    ///         .with_additional_capability("tools", serde_json::json!({}))
+    ///         .is_err()
+    /// );
+    /// # let _ = router;
+    /// ```
+    pub fn with_additional_capability(
+        mut self,
+        name: impl Into<String>,
+        value: serde_json::Value,
+    ) -> std::result::Result<Self, AdditionalCapabilityError> {
+        let name = name.into();
+        ServerCapabilities::validate_additional_name(&name)?;
+        Arc::make_mut(&mut self.inner)
+            .additional_capabilities
+            .insert(name, value);
+        Ok(self)
+    }
+
     /// Get the router's extensions.
     pub fn extensions(&self) -> &crate::context::Extensions {
         &self.inner.extensions
@@ -1555,6 +1598,7 @@ impl McpRouter {
                 }
                 (!map.is_empty()).then_some(map)
             },
+            additional: self.inner.additional_capabilities.clone(),
         }
     }
 

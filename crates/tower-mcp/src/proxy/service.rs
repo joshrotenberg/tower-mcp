@@ -721,6 +721,7 @@ async fn handle_initialize(
             completions: None,
             experimental: None,
             extensions: None,
+            ..Default::default()
         },
         instructions,
         meta: None,

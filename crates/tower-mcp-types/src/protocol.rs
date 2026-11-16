@@ -249,6 +249,104 @@ mod extension_map_serde {
     }
 }
 
+/// A name given for an additional capability was rejected.
+///
+/// [`ServerCapabilities`] and [`ClientCapabilities`] are open sets: besides
+/// the capabilities modelled as named fields, a peer may advertise its own
+/// top-level capabilities, which these types keep in their `additional` map.
+/// A name that matches a named field cannot be stored there, because it would
+/// shadow (or, for `extensions`, bypass the validation of) the typed field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AdditionalCapabilityError {
+    /// The capability name was empty.
+    EmptyName,
+    /// The capability name belongs to a capability modelled as a named field.
+    ReservedName(String),
+}
+
+impl std::fmt::Display for AdditionalCapabilityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyName => write!(f, "additional capability name must not be empty"),
+            Self::ReservedName(name) => write!(
+                f,
+                "{name:?} is a built-in capability and cannot be set as an additional capability"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AdditionalCapabilityError {}
+
+fn validate_additional_capability_name(
+    name: &str,
+    known: &[&str],
+) -> Result<(), AdditionalCapabilityError> {
+    if name.is_empty() {
+        return Err(AdditionalCapabilityError::EmptyName);
+    }
+    if known.contains(&name) {
+        return Err(AdditionalCapabilityError::ReservedName(name.to_string()));
+    }
+    Ok(())
+}
+
+/// Serializers for the flattened `additional` capability maps.
+///
+/// Deserialization needs no help: serde only routes keys that match no named
+/// field into a flattened map. Serialization does, because the map is a public
+/// field and a caller can insert a built-in name directly. Emitting it would
+/// produce a duplicate JSON key, so built-in names are skipped here and the
+/// typed field always wins.
+mod additional_capabilities_serde {
+    use serde::Serializer;
+    use serde_json::{Map, Value};
+
+    pub fn serialize_server<S>(
+        additional: &Map<String, Value>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serialize_filtered(
+            additional,
+            super::ServerCapabilities::KNOWN_CAPABILITIES,
+            serializer,
+        )
+    }
+
+    pub fn serialize_client<S>(
+        additional: &Map<String, Value>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serialize_filtered(
+            additional,
+            super::ClientCapabilities::KNOWN_CAPABILITIES,
+            serializer,
+        )
+    }
+
+    fn serialize_filtered<S>(
+        additional: &Map<String, Value>,
+        known: &[&str],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_map(
+            additional
+                .iter()
+                .filter(|(name, _)| !name.is_empty() && !known.contains(&name.as_str())),
+        )
+    }
+}
+
 /// The JSON-RPC version. MUST be "2.0".
 pub const JSONRPC_VERSION: &str = "2.0";
 
@@ -1190,6 +1288,66 @@ pub struct ClientCapabilities {
         with = "extension_map_serde"
     )]
     pub extensions: Option<HashMap<String, serde_json::Value>>,
+    /// Additional top-level capabilities this type does not model.
+    ///
+    /// The 2026-07-28 schema leaves the client capability set open, so any
+    /// top-level key that matches no named field is kept here and written
+    /// back at the top level, not moved under `experimental` or
+    /// `extensions`. Use [`insert_additional`](Self::insert_additional) to
+    /// add one with name validation. Entries whose name matches a named field
+    /// (see [`KNOWN_CAPABILITIES`](Self::KNOWN_CAPABILITIES)) are never
+    /// serialized.
+    #[serde(
+        flatten,
+        serialize_with = "additional_capabilities_serde::serialize_client"
+    )]
+    pub additional: serde_json::Map<String, serde_json::Value>,
+}
+
+impl ClientCapabilities {
+    /// Top-level capability names modelled as named fields of this type.
+    ///
+    /// These names cannot be used for [`additional`](Self::additional)
+    /// capabilities.
+    pub const KNOWN_CAPABILITIES: &'static [&'static str] = &[
+        "roots",
+        "sampling",
+        "elicitation",
+        "tasks",
+        "experimental",
+        "extensions",
+    ];
+
+    /// Check that `name` can be used for an additional capability.
+    ///
+    /// Rejects an empty name and any name in
+    /// [`KNOWN_CAPABILITIES`](Self::KNOWN_CAPABILITIES).
+    pub fn validate_additional_name(name: &str) -> Result<(), AdditionalCapabilityError> {
+        validate_additional_capability_name(name, Self::KNOWN_CAPABILITIES)
+    }
+
+    /// Advertise an additional top-level capability, returning any previous
+    /// value stored under the same name.
+    ///
+    /// ```rust
+    /// use tower_mcp_types::protocol::ClientCapabilities;
+    ///
+    /// let mut caps = ClientCapabilities::default();
+    /// caps.insert_additional("events", serde_json::json!({})).unwrap();
+    /// assert!(caps.insert_additional("sampling", serde_json::json!({})).is_err());
+    ///
+    /// let json = serde_json::to_value(&caps).unwrap();
+    /// assert_eq!(json, serde_json::json!({ "events": {} }));
+    /// ```
+    pub fn insert_additional(
+        &mut self,
+        name: impl Into<String>,
+        value: serde_json::Value,
+    ) -> Result<Option<serde_json::Value>, AdditionalCapabilityError> {
+        let name = name.into();
+        Self::validate_additional_name(&name)?;
+        Ok(self.additional.insert(name, value))
+    }
 }
 
 /// Client capability for elicitation (requesting user input)
@@ -2457,6 +2615,73 @@ pub struct ServerCapabilities {
         with = "extension_map_serde"
     )]
     pub extensions: Option<HashMap<String, serde_json::Value>>,
+    /// Additional top-level capabilities this type does not model.
+    ///
+    /// The 2026-07-28 schema leaves the server capability set open, so any
+    /// top-level key that matches no named field (for example `events`) is
+    /// kept here and written back at the top level, not moved under
+    /// `experimental` or `extensions`. This lets an intermediary relay an
+    /// upstream server's capabilities without losing the ones it does not
+    /// understand. Use [`insert_additional`](Self::insert_additional) to add
+    /// one with name validation. Entries whose name matches a named field
+    /// (see [`KNOWN_CAPABILITIES`](Self::KNOWN_CAPABILITIES)) are never
+    /// serialized.
+    #[serde(
+        flatten,
+        serialize_with = "additional_capabilities_serde::serialize_server"
+    )]
+    pub additional: serde_json::Map<String, serde_json::Value>,
+}
+
+impl ServerCapabilities {
+    /// Top-level capability names modelled as named fields of this type.
+    ///
+    /// These names cannot be used for [`additional`](Self::additional)
+    /// capabilities.
+    pub const KNOWN_CAPABILITIES: &'static [&'static str] = &[
+        "tools",
+        "resources",
+        "prompts",
+        "logging",
+        "tasks",
+        "completions",
+        "experimental",
+        "extensions",
+    ];
+
+    /// Check that `name` can be used for an additional capability.
+    ///
+    /// Rejects an empty name and any name in
+    /// [`KNOWN_CAPABILITIES`](Self::KNOWN_CAPABILITIES).
+    pub fn validate_additional_name(name: &str) -> Result<(), AdditionalCapabilityError> {
+        validate_additional_capability_name(name, Self::KNOWN_CAPABILITIES)
+    }
+
+    /// Advertise an additional top-level capability, returning any previous
+    /// value stored under the same name.
+    ///
+    /// ```rust
+    /// use tower_mcp_types::protocol::{AdditionalCapabilityError, ServerCapabilities};
+    ///
+    /// let mut caps = ServerCapabilities::default();
+    /// caps.insert_additional("events", serde_json::json!({})).unwrap();
+    /// assert_eq!(
+    ///     caps.insert_additional("tools", serde_json::json!({})),
+    ///     Err(AdditionalCapabilityError::ReservedName("tools".into())),
+    /// );
+    ///
+    /// let json = serde_json::to_value(&caps).unwrap();
+    /// assert_eq!(json, serde_json::json!({ "events": {} }));
+    /// ```
+    pub fn insert_additional(
+        &mut self,
+        name: impl Into<String>,
+        value: serde_json::Value,
+    ) -> Result<Option<serde_json::Value>, AdditionalCapabilityError> {
+        let name = name.into();
+        Self::validate_additional_name(&name)?;
+        Ok(self.additional.insert(name, value))
+    }
 }
 
 /// Logging capability declaration
@@ -6274,6 +6499,273 @@ mod tests {
     use crate::error::JsonRpcError;
 
     // =========================================================================
+    // Open capability sets (#1645)
+    // =========================================================================
+
+    fn round_trip<T: Serialize + DeserializeOwned>(value: Value) -> Value {
+        let typed: T = serde_json::from_value(value).unwrap();
+        serde_json::to_value(&typed).unwrap()
+    }
+
+    #[test]
+    fn server_capabilities_keep_an_unknown_events_capability() {
+        let wire = serde_json::json!({ "tools": {}, "events": {} });
+        let caps: ServerCapabilities = serde_json::from_value(wire).unwrap();
+        assert!(caps.tools.is_some());
+        assert_eq!(caps.additional.get("events"), Some(&serde_json::json!({})));
+        assert!(caps.experimental.is_none());
+        assert!(caps.extensions.is_none());
+
+        let out = serde_json::to_value(&caps).unwrap();
+        assert_eq!(out["events"], serde_json::json!({}));
+        assert!(out.get("experimental").is_none());
+        assert!(out.get("extensions").is_none());
+    }
+
+    #[test]
+    fn server_capabilities_keep_arbitrary_values_unchanged() {
+        let wire = serde_json::json!({
+            "com.example/streaming": { "maxStreams": 4, "modes": ["a", "b"] },
+            "flag": true,
+            "level": 3,
+            "nothing": null,
+        });
+        assert_eq!(round_trip::<ServerCapabilities>(wire.clone()), wire);
+    }
+
+    #[test]
+    fn server_capabilities_mixed_known_and_unknown_round_trip() {
+        let wire = serde_json::json!({
+            "tools": { "listChanged": true },
+            "resources": { "subscribe": true, "listChanged": false },
+            "prompts": { "listChanged": false },
+            "logging": {},
+            "completions": {},
+            "experimental": { "vendorThing": {} },
+            "extensions": { "io.modelcontextprotocol/tasks": {} },
+            "events": { "kinds": ["created"] },
+            "custom": {},
+        });
+        let caps: ServerCapabilities = serde_json::from_value(wire.clone()).unwrap();
+        assert!(caps.tools.as_ref().unwrap().list_changed);
+        assert!(caps.resources.as_ref().unwrap().subscribe);
+        assert!(
+            caps.experimental
+                .as_ref()
+                .unwrap()
+                .contains_key("vendorThing")
+        );
+        assert!(
+            caps.extensions
+                .as_ref()
+                .unwrap()
+                .contains_key("io.modelcontextprotocol/tasks")
+        );
+        // Only the unknown keys land in the catch-all.
+        assert_eq!(
+            caps.additional
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["events", "custom"]
+        );
+        assert_eq!(serde_json::to_value(&caps).unwrap(), wire);
+    }
+
+    #[test]
+    fn server_capabilities_still_validate_extensions_alongside_unknown_keys() {
+        let wire = serde_json::json!({ "events": {}, "extensions": { "unprefixed": {} } });
+        assert!(serde_json::from_value::<ServerCapabilities>(wire).is_err());
+    }
+
+    #[test]
+    fn initialize_result_round_trip_keeps_unknown_server_capabilities() {
+        let wire = serde_json::json!({
+            "protocolVersion": "2025-11-25",
+            "capabilities": { "tools": { "listChanged": false }, "events": {}, "custom": { "x": 1 } },
+            "serverInfo": { "name": "upstream", "version": "1.0.0" },
+        });
+        let out = round_trip::<InitializeResult>(wire.clone());
+        assert_eq!(out, wire);
+    }
+
+    #[test]
+    fn discover_result_round_trip_keeps_unknown_server_capabilities() {
+        let wire = serde_json::json!({
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": { "prompts": { "listChanged": false }, "events": {}, "custom": { "x": 1 } },
+        });
+        let result: DiscoverResult = serde_json::from_value(wire).unwrap();
+        assert_eq!(
+            result.capabilities.additional.get("events"),
+            Some(&serde_json::json!({}))
+        );
+        let out = serde_json::to_value(&result).unwrap();
+        assert_eq!(out["capabilities"]["events"], serde_json::json!({}));
+        assert_eq!(out["capabilities"]["custom"], serde_json::json!({ "x": 1 }));
+        assert!(out["capabilities"].get("experimental").is_none());
+        assert!(out["capabilities"].get("extensions").is_none());
+    }
+
+    #[test]
+    fn server_insert_additional_rejects_built_in_names() {
+        let mut caps = ServerCapabilities::default();
+        for name in ServerCapabilities::KNOWN_CAPABILITIES {
+            assert_eq!(
+                caps.insert_additional(*name, serde_json::json!({})),
+                Err(AdditionalCapabilityError::ReservedName((*name).to_string())),
+            );
+        }
+        assert_eq!(
+            caps.insert_additional("", serde_json::json!({})),
+            Err(AdditionalCapabilityError::EmptyName),
+        );
+        assert!(caps.additional.is_empty());
+
+        assert_eq!(
+            caps.insert_additional("events", serde_json::json!({})),
+            Ok(None)
+        );
+        assert_eq!(
+            caps.insert_additional("events", serde_json::json!({ "v": 2 })),
+            Ok(Some(serde_json::json!({}))),
+        );
+        assert_eq!(
+            serde_json::to_value(&caps).unwrap(),
+            serde_json::json!({ "events": { "v": 2 } })
+        );
+    }
+
+    #[test]
+    fn server_built_in_names_inserted_directly_never_serialize() {
+        // The map is a public field, so a caller can bypass
+        // `insert_additional`. A built-in name must neither emit a duplicate
+        // key nor override the typed field, and an `extensions` entry must
+        // not slip past extension validation.
+        let mut caps = ServerCapabilities {
+            tools: Some(ToolsCapability { list_changed: true }),
+            ..Default::default()
+        };
+        caps.additional
+            .insert("tools".into(), serde_json::json!({ "listChanged": false }));
+        caps.additional
+            .insert("extensions".into(), serde_json::json!({ "unprefixed": 1 }));
+        caps.additional.insert("".into(), serde_json::json!({}));
+        caps.additional
+            .insert("events".into(), serde_json::json!({}));
+
+        let text = serde_json::to_string(&caps).unwrap();
+        assert_eq!(text.matches("\"tools\"").count(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&text).unwrap(),
+            serde_json::json!({ "tools": { "listChanged": true }, "events": {} })
+        );
+    }
+
+    #[test]
+    fn known_capability_lists_match_the_serialized_field_names() {
+        let server = ServerCapabilities {
+            tools: Some(Default::default()),
+            resources: Some(Default::default()),
+            prompts: Some(Default::default()),
+            logging: Some(Default::default()),
+            tasks: Some(Default::default()),
+            completions: Some(Default::default()),
+            experimental: Some(HashMap::new()),
+            extensions: Some(HashMap::new()),
+            additional: serde_json::Map::new(),
+        };
+        let server = serde_json::to_value(server).unwrap();
+        let mut keys: Vec<_> = server.as_object().unwrap().keys().cloned().collect();
+        let mut known: Vec<_> = ServerCapabilities::KNOWN_CAPABILITIES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        keys.sort();
+        known.sort();
+        assert_eq!(keys, known);
+
+        let client = ClientCapabilities {
+            roots: Some(Default::default()),
+            sampling: Some(Default::default()),
+            elicitation: Some(Default::default()),
+            tasks: Some(Default::default()),
+            experimental: Some(HashMap::new()),
+            extensions: Some(HashMap::new()),
+            additional: serde_json::Map::new(),
+        };
+        let client = serde_json::to_value(client).unwrap();
+        let mut keys: Vec<_> = client.as_object().unwrap().keys().cloned().collect();
+        let mut known: Vec<_> = ClientCapabilities::KNOWN_CAPABILITIES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        keys.sort();
+        known.sort();
+        assert_eq!(keys, known);
+    }
+
+    #[test]
+    fn client_capabilities_keep_unknown_capabilities() {
+        let wire = serde_json::json!({
+            "sampling": {},
+            "elicitation": { "form": {} },
+            "extensions": { "io.modelcontextprotocol/ui": {} },
+            "events": {},
+            "custom": { "depth": 2 },
+        });
+        let caps: ClientCapabilities = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            caps.additional
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["events", "custom"]
+        );
+        assert_eq!(serde_json::to_value(&caps).unwrap(), wire);
+    }
+
+    #[test]
+    fn initialize_params_round_trip_keeps_unknown_client_capabilities() {
+        let wire = serde_json::json!({
+            "protocolVersion": "2025-11-25",
+            "capabilities": { "roots": { "listChanged": true }, "events": {} },
+            "clientInfo": { "name": "client", "version": "1.0.0" },
+        });
+        let params: InitializeParams = serde_json::from_value(wire).unwrap();
+        assert_eq!(
+            params.capabilities.additional.get("events"),
+            Some(&serde_json::json!({}))
+        );
+        let out = serde_json::to_value(&params).unwrap();
+        assert_eq!(out["capabilities"]["events"], serde_json::json!({}));
+        assert!(out["capabilities"].get("experimental").is_none());
+    }
+
+    #[test]
+    fn client_insert_additional_rejects_built_in_names() {
+        let mut caps = ClientCapabilities::default();
+        for name in ClientCapabilities::KNOWN_CAPABILITIES {
+            assert_eq!(
+                caps.insert_additional(*name, serde_json::json!({})),
+                Err(AdditionalCapabilityError::ReservedName((*name).to_string())),
+            );
+        }
+        // A server-only name is an ordinary additional client capability.
+        assert_eq!(
+            caps.insert_additional("tools", serde_json::json!({})),
+            Ok(None)
+        );
+
+        caps.additional
+            .insert("sampling".into(), serde_json::json!({ "tools": {} }));
+        assert_eq!(
+            serde_json::to_value(&caps).unwrap(),
+            serde_json::json!({ "tools": {} })
+        );
+    }
+
+    // =========================================================================
     // Request id wire forms
     // =========================================================================
 
@@ -7141,6 +7633,7 @@ mod tests {
             tasks: None,
             experimental: None,
             extensions: None,
+            ..Default::default()
         };
 
         let json = serde_json::to_value(&caps).unwrap();
@@ -7256,6 +7749,7 @@ mod tests {
             tasks: None,
             experimental: None,
             extensions: None,
+            ..Default::default()
         };
 
         let json = serde_json::to_value(&caps).unwrap();
