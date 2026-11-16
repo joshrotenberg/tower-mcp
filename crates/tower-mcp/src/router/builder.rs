@@ -959,6 +959,9 @@ impl McpRouter {
     /// The referenced prompt, resource, or resource template must be registered, enabled,
     /// and visible to the request before this handler is invoked.
     ///
+    /// Registering a handler is what advertises the `completions` capability. A router
+    /// without one answers `completion/complete` with `-32601` (method not found).
+    ///
     /// # Example
     ///
     /// ```rust

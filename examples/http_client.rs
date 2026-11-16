@@ -85,11 +85,19 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     println!("Pong!");
     println!();
 
+    // Only call methods for capabilities the server advertised. A server that
+    // does not advertise one answers its methods with -32601.
+    let capabilities = &server_info.capabilities;
+
     // List tools
     println!("Listing tools...");
-    let tools = client.list_tools().await?;
-    println!("Available tools ({}):", tools.tools.len());
-    for tool in &tools.tools {
+    let tools = if capabilities.tools.is_some() {
+        client.list_tools().await?.tools
+    } else {
+        Vec::new()
+    };
+    println!("Available tools ({}):", tools.len());
+    for tool in &tools {
         println!(
             "  - {} : {}",
             tool.name,
@@ -100,12 +108,16 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
 
     // List resources
     println!("Listing resources...");
-    let resources = client.list_resources().await?;
-    if resources.resources.is_empty() {
+    let resources = if capabilities.resources.is_some() {
+        client.list_resources().await?.resources
+    } else {
+        Vec::new()
+    };
+    if resources.is_empty() {
         println!("  (no resources)");
     } else {
-        println!("Available resources ({}):", resources.resources.len());
-        for resource in &resources.resources {
+        println!("Available resources ({}):", resources.len());
+        for resource in &resources {
             println!("  - {} : {}", resource.uri, resource.name);
         }
     }
@@ -113,12 +125,16 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
 
     // List prompts
     println!("Listing prompts...");
-    let prompts = client.list_prompts().await?;
-    if prompts.prompts.is_empty() {
+    let prompts = if capabilities.prompts.is_some() {
+        client.list_prompts().await?.prompts
+    } else {
+        Vec::new()
+    };
+    if prompts.is_empty() {
         println!("  (no prompts)");
     } else {
-        println!("Available prompts ({}):", prompts.prompts.len());
-        for prompt in &prompts.prompts {
+        println!("Available prompts ({}):", prompts.len());
+        for prompt in &prompts {
             println!(
                 "  - {} : {}",
                 prompt.name,
@@ -129,11 +145,11 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     println!();
 
     // Call tools if they exist
-    if !tools.tools.is_empty() {
+    if !tools.is_empty() {
         println!("Calling tools...");
         println!();
 
-        if tools.tools.iter().any(|t| t.name == "echo") {
+        if tools.iter().any(|t| t.name == "echo") {
             println!("  Calling 'echo' with message: \"Hello from tower-mcp HTTP client!\"");
             let result = client
                 .call_tool(
@@ -144,7 +160,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
             print_result(&result);
         }
 
-        if tools.tools.iter().any(|t| t.name == "add") {
+        if tools.iter().any(|t| t.name == "add") {
             println!("  Calling 'add' with a=42, b=58");
             let result = client
                 .call_tool("add", serde_json::json!({"a": 42, "b": 58}))

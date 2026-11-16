@@ -69,6 +69,19 @@ fn secret_url(base: &str) -> String {
     )
 }
 
+/// A router advertising `tools`, so `tools/list` is routed rather than
+/// answered with -32601 (#1654).
+fn tools_router() -> McpRouter {
+    McpRouter::new().tool(
+        tower_mcp::ToolBuilder::new("echo")
+            .description("Echo the arguments")
+            .handler(|args: serde_json::Value| async move {
+                Ok(tower_mcp::CallToolResult::text(args.to_string()))
+            })
+            .build(),
+    )
+}
+
 fn config() -> HttpClientConfig {
     HttpClientConfig {
         auto_sse: false,
@@ -185,24 +198,23 @@ async fn credential_bearing_transport_failures_are_redacted() {
     // failure must preserve status details and allow a subsequent request.
     let reject = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let rejecting = reject.clone();
-    let router =
-        HttpTransport::new(McpRouter::new())
-            .into_router()
-            .layer(axum::middleware::from_fn(
-                move |req: axum::extract::Request, next: axum::middleware::Next| {
-                    let reject = rejecting.clone();
-                    async move {
-                        if reject.load(std::sync::atomic::Ordering::SeqCst) {
-                            return axum::response::IntoResponse::into_response((
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                [("retry-after", "7")],
-                                "sentinel-body: reflected credentials",
-                            ));
-                        }
-                        next.run(req).await
+    let router = HttpTransport::new(tools_router())
+        .into_router()
+        .layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let reject = rejecting.clone();
+                async move {
+                    if reject.load(std::sync::atomic::Ordering::SeqCst) {
+                        return axum::response::IntoResponse::into_response((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            [("retry-after", "7")],
+                            "sentinel-body: reflected credentials",
+                        ));
                     }
-                },
-            ));
+                    next.run(req).await
+                }
+            },
+        ));
     let server = serve(router).await;
     // This server's MCP route is the root, so query credentials are sufficient
     // to exercise established-session errors without changing its routing.

@@ -921,6 +921,12 @@ impl McpRouter {
     /// `tools/list` and `tools/call` requests. Static tools take precedence
     /// over dynamic tools when names collide.
     ///
+    /// The router advertises the `tools` capability from this call on, even
+    /// while the registry is empty, so tools registered after a client
+    /// connected are reachable. Without any tools or a dynamic registry,
+    /// `tools/list` and `tools/call` answer `-32601` (method not found). The
+    /// other dynamic registries behave the same way for their capabilities.
+    ///
     /// # Example
     ///
     /// ```rust
@@ -1467,14 +1473,11 @@ impl McpRouter {
     }
 
     /// Server capabilities, derived from what is registered.
+    ///
+    /// Whether `tools`, `resources`, `prompts`, and `completions` appear at
+    /// all is decided by `advertises`, which also gates dispatch in `handle`
+    /// (#1654).
     fn capabilities(&self) -> ServerCapabilities {
-        let has_resources =
-            !self.inner.resources.is_empty() || !self.inner.resource_templates.is_empty();
-        // SEP-2640: a server declaring the Skills extension MUST also declare
-        // the resources capability, even when every skill is dynamic and its
-        // files are served from somewhere the router cannot see.
-        #[cfg(feature = "skills")]
-        let has_resources = has_resources || self.inner.skills.is_some();
         let has_notifications = self.inner.notification_tx.is_some();
 
         // Each of these defaults to `has_notifications`, which is what this
@@ -1500,45 +1503,26 @@ impl McpRouter {
             .advertise_mcp_logging
             .unwrap_or(has_notifications);
 
-        #[cfg(feature = "dynamic-tools")]
-        let has_dynamic_tools = self.inner.dynamic_tools.is_some();
-        #[cfg(not(feature = "dynamic-tools"))]
-        let has_dynamic_tools = false;
-
-        #[cfg(feature = "dynamic-tools")]
-        let has_dynamic_prompts = self.inner.dynamic_prompts.is_some();
-        #[cfg(not(feature = "dynamic-tools"))]
-        let has_dynamic_prompts = false;
-
-        #[cfg(feature = "dynamic-tools")]
-        let has_dynamic_resources = self.inner.dynamic_resources.is_some()
-            || self.inner.dynamic_resource_templates.is_some();
-        #[cfg(not(feature = "dynamic-tools"))]
-        let has_dynamic_resources = false;
-
         ServerCapabilities {
-            tools: if self.inner.tools.is_empty() && !has_dynamic_tools {
-                None
-            } else {
-                Some(ToolsCapability {
+            tools: self
+                .advertises(ScopedCapability::Tools)
+                .then_some(ToolsCapability {
                     list_changed: tools_list_changed,
-                })
-            },
-            resources: if has_resources || has_dynamic_resources {
-                Some(ResourcesCapability {
+                }),
+            // SEP-2640: a server declaring the Skills extension MUST also
+            // declare the resources capability; `advertises` counts a skills
+            // catalog for that reason.
+            resources: self.advertises(ScopedCapability::Resources).then_some(
+                ResourcesCapability {
                     subscribe: self.inner.advertise_resource_subscriptions,
                     list_changed: resources_list_changed,
-                })
-            } else {
-                None
-            },
-            prompts: if self.inner.prompts.is_empty() && !has_dynamic_prompts {
-                None
-            } else {
-                Some(PromptsCapability {
+                },
+            ),
+            prompts: self
+                .advertises(ScopedCapability::Prompts)
+                .then_some(PromptsCapability {
                     list_changed: prompts_list_changed,
-                })
-            },
+                }),
             // Advertised when a notification channel is configured, unless
             // overridden by `mcp_logging` (#1338).
             logging: if mcp_logging {
@@ -1577,11 +1561,9 @@ impl McpRouter {
                 }
             },
             // Completions capability when a handler is registered
-            completions: if self.inner.completion_handler.is_some() {
-                Some(CompletionsCapability::default())
-            } else {
-                None
-            },
+            completions: self
+                .advertises(ScopedCapability::Completions)
+                .then(CompletionsCapability::default),
             experimental: None,
             extensions: {
                 let mut map = self.inner.protocol_extensions.clone();
@@ -1850,6 +1832,20 @@ impl McpRouter {
                 "Session not initialized. Only 'initialize' and 'ping' are allowed before initialization. Got: {}",
                 method
             ))));
+        }
+
+        // A method scoped by a capability this router does not advertise is
+        // not routed, on either lifecycle (#1654). `advertises` is the same
+        // predicate that builds the advertised capability object.
+        if let Some(capability) = ScopedCapability::required_by(&request)
+            && !self.advertises(capability)
+        {
+            tracing::debug!(
+                method = %method,
+                capability = ?capability,
+                "Request rejected: capability not advertised"
+            );
+            return Err(Error::JsonRpc(JsonRpcError::method_not_found(method)));
         }
 
         match request {
@@ -3372,31 +3368,28 @@ impl McpRouter {
                     "Completion request"
                 );
 
-                // Delegate to registered completion handler if available
-                if let Some(ref handler) = self.inner.completion_handler {
-                    self.authorize_completion_reference(&extensions, &params.reference)?;
-                    let progress_token = params
-                        .meta
-                        .as_ref()
-                        .and_then(|meta| meta.get("progressToken"))
-                        .map(|token| serde_json::from_value(token.clone()))
-                        .transpose()
-                        .map_err(|error| {
-                            Error::invalid_params(format!(
-                                "Invalid completion progress token: {error}"
-                            ))
-                        })?;
-                    let ctx = self.create_context_with_extensions(
-                        request_id,
-                        progress_token,
-                        &extensions,
-                    );
-                    let result = handler(ctx, params).await?;
-                    Ok(McpResponse::Complete(result))
-                } else {
-                    // No completion handler registered, return empty completions
-                    Ok(McpResponse::Complete(CompleteResult::new(vec![])))
-                }
+                // The capability gate above already refused this request
+                // when no handler is registered; the `else` keeps that answer
+                // rather than an empty success should the two ever diverge.
+                let Some(handler) = self.inner.completion_handler.as_ref() else {
+                    return Err(Error::JsonRpc(JsonRpcError::method_not_found(
+                        "completion/complete",
+                    )));
+                };
+                self.authorize_completion_reference(&extensions, &params.reference)?;
+                let progress_token = params
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.get("progressToken"))
+                    .map(|token| serde_json::from_value(token.clone()))
+                    .transpose()
+                    .map_err(|error| {
+                        Error::invalid_params(format!("Invalid completion progress token: {error}"))
+                    })?;
+                let ctx =
+                    self.create_context_with_extensions(request_id, progress_token, &extensions);
+                let result = handler(ctx, params).await?;
+                Ok(McpResponse::Complete(result))
             }
 
             #[cfg(feature = "stateless")]
@@ -3868,7 +3861,7 @@ mod skills;
 mod task_ops;
 
 use capabilities::{
-    TaskOwnerResolver, custom_task_owner_resolver, default_task_owner_resolver,
+    ScopedCapability, TaskOwnerResolver, custom_task_owner_resolver, default_task_owner_resolver,
     final_client_capabilities,
 };
 // The HTTP transport uses the same default principal for its sessions.
@@ -3903,6 +3896,9 @@ use task_ops::validate_input_required_result;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod capability_gate_tests;
 
 #[cfg(all(test, feature = "stateless"))]
 mod task_error_tests;

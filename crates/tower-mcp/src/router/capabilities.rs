@@ -1,10 +1,122 @@
-//! Reading the capabilities and principal a request arrived with.
+//! Reading the capabilities and principal a request arrived with, and
+//! deciding which server capabilities this router advertises.
 //!
 //! The `final_*` and legacy spellings sit side by side here because the two
 //! protocol revisions carry this information differently, and every caller
 //! wants the same answer regardless.
 
 use super::*;
+
+/// A server capability whose advertisement decides whether a set of request
+/// methods is routed at all (#1654).
+///
+/// The lifecycle on both protocol revisions says a peer uses only the
+/// capabilities the other side declared. A router that does not advertise a
+/// capability therefore answers its methods with `-32601` (method not found)
+/// rather than an empty success, which would contradict what `initialize` and
+/// `server/discover` just told the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ScopedCapability {
+    /// `capabilities.tools`: `tools/list`, `tools/call`.
+    Tools,
+    /// `capabilities.resources`: `resources/list`, `resources/templates/list`,
+    /// `resources/read`, `resources/subscribe`, `resources/unsubscribe`.
+    Resources,
+    /// `capabilities.prompts`: `prompts/list`, `prompts/get`.
+    Prompts,
+    /// `capabilities.completions`: `completion/complete`.
+    Completions,
+}
+
+impl ScopedCapability {
+    /// The capability a request requires, or `None` for a method that is not
+    /// scoped by one of the four registry-derived capabilities.
+    ///
+    /// Deliberately absent:
+    ///
+    /// - `initialize`, `server/discover`, `ping`, and `subscriptions/listen`
+    ///   are lifecycle methods every server answers.
+    /// - `logging/setLevel` stays routed whether or not `logging` is
+    ///   advertised. That capability follows the notification channel a
+    ///   transport attaches, so a router used directly would start refusing a
+    ///   harmless request it has always accepted. The method is deprecated
+    ///   (SEP-2577) and already refused on the 2026-07-28 lifecycle.
+    /// - The `tasks/*` methods carry their own negotiation check.
+    /// - `skills/list`, `skills/get`, and `resources/directory/read` answer
+    ///   `-32601` themselves when no skills catalog is configured, and a
+    ///   catalog always advertises `resources`.
+    ///
+    /// `resources/subscribe` and `resources/unsubscribe` require `resources`
+    /// only, not `resources.subscribe`: [`McpRouter::resource_subscriptions`]
+    /// is documented to affect advertisement alone.
+    pub(super) fn required_by(request: &McpRequest) -> Option<Self> {
+        match request {
+            McpRequest::ListTools(_) | McpRequest::CallTool(_) => Some(Self::Tools),
+            McpRequest::ListResources(_)
+            | McpRequest::ListResourceTemplates(_)
+            | McpRequest::ReadResource(_)
+            | McpRequest::SubscribeResource(_)
+            | McpRequest::UnsubscribeResource(_) => Some(Self::Resources),
+            McpRequest::ListPrompts(_) | McpRequest::GetPrompt(_) => Some(Self::Prompts),
+            McpRequest::Complete(_) => Some(Self::Completions),
+            _ => None,
+        }
+    }
+}
+
+impl McpRouter {
+    /// Whether this router advertises `capability`.
+    ///
+    /// This is the single predicate behind both the capability object sent in
+    /// `initialize` / `server/discover` and the dispatch gate in `handle`, so
+    /// the two cannot disagree. Neither protocol revision changes the answer:
+    /// `capabilities_for_protocol` adjusts flags inside these capabilities,
+    /// never their presence.
+    ///
+    /// A configured dynamic registry advertises its capability even while it
+    /// is empty. Entries can be registered at any time after `initialize`, and
+    /// the capability set a client received then is not renegotiated, so the
+    /// methods must stay routable for the life of the router. A lazy
+    /// initializer such as `dynamic_prompt_initializer` advertises nothing by
+    /// itself; it fills the dynamic registry, which does.
+    ///
+    /// A skills catalog advertises `resources`, as SEP-2640 requires, even
+    /// when every skill is dynamic and has no resource registered here.
+    pub(super) fn advertises(&self, capability: ScopedCapability) -> bool {
+        match capability {
+            ScopedCapability::Tools => {
+                #[cfg(feature = "dynamic-tools")]
+                let dynamic = self.inner.dynamic_tools.is_some();
+                #[cfg(not(feature = "dynamic-tools"))]
+                let dynamic = false;
+                !self.inner.tools.is_empty() || dynamic
+            }
+            ScopedCapability::Resources => {
+                #[cfg(feature = "dynamic-tools")]
+                let dynamic = self.inner.dynamic_resources.is_some()
+                    || self.inner.dynamic_resource_templates.is_some();
+                #[cfg(not(feature = "dynamic-tools"))]
+                let dynamic = false;
+                #[cfg(feature = "skills")]
+                let skills = self.inner.skills.is_some();
+                #[cfg(not(feature = "skills"))]
+                let skills = false;
+                !self.inner.resources.is_empty()
+                    || !self.inner.resource_templates.is_empty()
+                    || dynamic
+                    || skills
+            }
+            ScopedCapability::Prompts => {
+                #[cfg(feature = "dynamic-tools")]
+                let dynamic = self.inner.dynamic_prompts.is_some();
+                #[cfg(not(feature = "dynamic-tools"))]
+                let dynamic = false;
+                !self.inner.prompts.is_empty() || dynamic
+            }
+            ScopedCapability::Completions => self.inner.completion_handler.is_some(),
+        }
+    }
+}
 
 pub(super) type TaskOwnerResolver =
     Arc<dyn Fn(&crate::context::Extensions) -> TaskOwnerResolution + Send + Sync + 'static>;
