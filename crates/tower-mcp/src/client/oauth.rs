@@ -232,6 +232,77 @@ pub(crate) fn unix_time() -> u64 {
         .as_secs()
 }
 
+/// Pre-expiry refresh margin actually applied to a token (#1646).
+///
+/// The OAuth token providers renew a cached token shortly before it expires,
+/// so a request sent with it does not reach the resource server just after it
+/// lapses. A fixed margin breaks short-lived tokens: a token issued with an
+/// `expires_in` at or below the margin is inside the renewal window the moment
+/// it arrives, so every call fetches or refreshes again. The margin is
+/// therefore capped at half of the token's original lifetime:
+///
+/// ```text
+/// effective = min(configured, lifetime / 2)
+/// ```
+///
+/// With the default 30-second buffer, a token issued for 3600 seconds keeps
+/// the full 30-second margin, a 20-second token is renewed in its last 10
+/// seconds, and a 1-second token in its last half second.
+///
+/// When the original lifetime is unknown (`None`) the configured buffer
+/// applies unchanged. That covers persisted
+/// [`OAuthStoredToken`](super::oauth_flow::OAuthStoredToken) records written
+/// before the lifetime was recorded: the lifetime is not inferred from the
+/// remaining time.
+pub(crate) fn effective_refresh_buffer(
+    configured: Duration,
+    lifetime: Option<Duration>,
+) -> Duration {
+    match lifetime {
+        Some(lifetime) => configured.min(lifetime / 2),
+        None => configured,
+    }
+}
+
+/// Whether a token with `remaining` time before expiry is still served from
+/// cache instead of being renewed, under [`effective_refresh_buffer`].
+///
+/// The comparison is strict, so a token with no time left, either expired or
+/// marked unusable by [`TokenProvider::invalidate`], is never served, even
+/// when the effective buffer is zero.
+pub(crate) fn token_is_fresh(
+    remaining: Duration,
+    lifetime: Option<Duration>,
+    configured: Duration,
+) -> bool {
+    remaining > effective_refresh_buffer(configured, lifetime)
+}
+
+/// [`token_is_fresh`] for an in-memory token that expires at `expires_at` and
+/// was issued for `lifetime`.
+pub(crate) fn instant_token_is_fresh(
+    expires_at: Instant,
+    lifetime: Duration,
+    configured: Duration,
+) -> bool {
+    token_is_fresh(
+        expires_at.saturating_duration_since(Instant::now()),
+        Some(lifetime),
+        configured,
+    )
+}
+
+/// The instant a token issued now for `lifetime` expires.
+///
+/// An `expires_in` too large to represent as an [`Instant`] is clamped to
+/// roughly 136 years instead of panicking on overflow.
+pub(crate) fn expires_at_after(lifetime: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(lifetime)
+        .or_else(|| now.checked_add(Duration::from_secs(u64::from(u32::MAX))))
+        .unwrap_or(now)
+}
+
 /// Authentication method used at an OAuth token endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -581,6 +652,9 @@ impl std::error::Error for OAuthClientError {}
 struct CachedToken {
     access_token: String,
     expires_at: Instant,
+    /// Lifetime the token was issued with, which bounds the refresh buffer
+    /// (see [`effective_refresh_buffer`]).
+    lifetime: Duration,
 }
 
 /// OAuth 2.0 token response (subset of RFC 6749 Section 5.1).
@@ -617,8 +691,10 @@ struct OAuthClientCredentialsInner {
 ///
 /// # Token Caching
 ///
-/// Tokens are cached in an `RwLock` and refreshed when they expire
-/// (minus a configurable buffer, default 30 seconds). Concurrent
+/// Tokens are cached in an `RwLock` and refreshed shortly before they
+/// expire. The margin is the configured buffer (default 30 seconds), capped
+/// at half of the token's issued lifetime so a short-lived token is not
+/// renewed on every call. Concurrent
 /// callers share the read lock; only one caller performs the refresh
 /// while others wait on the write lock, then re-verify (double-check
 /// pattern to prevent thundering herd).
@@ -719,12 +795,10 @@ impl OAuthClientCredentials {
             .map_err(|e| OAuthClientError::Discovery(e.to_string()))
     }
 
-    /// Check if the cached token is still valid (not expired minus buffer).
+    /// Check if the cached token is still valid: more time remains than the
+    /// lifetime-bounded refresh buffer (see [`effective_refresh_buffer`]).
     fn is_token_valid(token: &CachedToken, buffer: Duration) -> bool {
-        token
-            .expires_at
-            .checked_sub(buffer)
-            .is_some_and(|effective| Instant::now() < effective)
+        instant_token_is_fresh(token.expires_at, token.lifetime, buffer)
     }
 
     /// Perform the token request to the authorization server.
@@ -791,12 +865,12 @@ impl OAuthClientCredentials {
             .map_err(|e| OAuthClientError::InvalidResponse(e.to_string()))?;
 
         // Default to 1 hour if expires_in not provided
-        let expires_in = Duration::from_secs(token_response.expires_in.unwrap_or(3600));
-        let expires_at = Instant::now() + expires_in;
+        let lifetime = Duration::from_secs(token_response.expires_in.unwrap_or(3600));
 
         Ok(CachedToken {
             access_token: token_response.access_token,
-            expires_at,
+            expires_at: expires_at_after(lifetime),
+            lifetime,
         })
     }
 }
@@ -925,6 +999,12 @@ impl OAuthClientCredentialsBuilder {
     ///
     /// Tokens are refreshed this long before their actual expiry to avoid
     /// using a token that expires during a request. Default: 30 seconds.
+    ///
+    /// The buffer applied to a given token is capped at half of the lifetime
+    /// it was issued with (`min(buffer, expires_in / 2)`), so a token issued
+    /// for less than twice the buffer is still reused until its last half,
+    /// instead of being fetched again on every call. A token is never used
+    /// once it has expired.
     pub fn refresh_buffer(mut self, duration: Duration) -> Self {
         self.refresh_buffer = Some(duration);
         self
@@ -1154,6 +1234,7 @@ mod tests {
         let valid_token = CachedToken {
             access_token: "valid".into(),
             expires_at: Instant::now() + Duration::from_secs(300),
+            lifetime: Duration::from_secs(3600),
         };
         assert!(OAuthClientCredentials::is_token_valid(
             &valid_token,
@@ -1163,6 +1244,7 @@ mod tests {
         let expiring_soon = CachedToken {
             access_token: "expiring".into(),
             expires_at: Instant::now() + Duration::from_secs(10),
+            lifetime: Duration::from_secs(3600),
         };
         // 30s buffer > 10s remaining = invalid
         assert!(!OAuthClientCredentials::is_token_valid(
@@ -1173,6 +1255,7 @@ mod tests {
         let expired = CachedToken {
             access_token: "expired".into(),
             expires_at: Instant::now() - Duration::from_secs(10),
+            lifetime: Duration::from_secs(3600),
         };
         assert!(!OAuthClientCredentials::is_token_valid(
             &expired,
@@ -1315,6 +1398,7 @@ mod tests {
             *cache = Some(CachedToken {
                 access_token: "cached-token-123".into(),
                 expires_at: Instant::now() + Duration::from_secs(300),
+                lifetime: Duration::from_secs(3600),
             });
         }
 
@@ -1342,6 +1426,7 @@ mod tests {
             *cache = Some(CachedToken {
                 access_token: "expired-token".into(),
                 expires_at: Instant::now() - Duration::from_secs(60),
+                lifetime: Duration::from_secs(3600),
             });
         }
 
@@ -1526,5 +1611,268 @@ mod tests {
         let cloned = provider.clone();
         // Both share the same inner state
         assert!(Arc::ptr_eq(&provider.inner, &cloned.inner));
+    }
+
+    // -------------------------------------------------------------------
+    // Lifetime-aware refresh buffer (#1646)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn effective_refresh_buffer_is_capped_at_half_the_lifetime() {
+        let secs = Duration::from_secs;
+        for (configured, lifetime, expected) in [
+            // Long-lived tokens keep the configured buffer.
+            (secs(30), Some(secs(3600)), secs(30)),
+            (secs(30), Some(secs(60)), secs(30)),
+            // Short-lived tokens get half their lifetime.
+            (secs(30), Some(secs(30)), secs(15)),
+            (secs(30), Some(secs(20)), secs(10)),
+            (secs(30), Some(secs(1)), Duration::from_millis(500)),
+            (secs(30), Some(Duration::ZERO), Duration::ZERO),
+            // A zero buffer stays zero; a large one is still capped.
+            (Duration::ZERO, Some(secs(3600)), Duration::ZERO),
+            (secs(86_400), Some(secs(3600)), secs(1800)),
+            // Unknown lifetime: the configured buffer, unchanged.
+            (secs(30), None, secs(30)),
+            (secs(86_400), None, secs(86_400)),
+        ] {
+            assert_eq!(
+                effective_refresh_buffer(configured, lifetime),
+                expected,
+                "configured={configured:?} lifetime={lifetime:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn token_is_fresh_never_accepts_a_token_with_no_time_left() {
+        let secs = Duration::from_secs;
+        // Zero remaining is unusable even when the effective buffer is zero,
+        // which covers expiry and `invalidate()` for every configuration.
+        for (lifetime, configured) in [
+            (Some(Duration::ZERO), secs(30)),
+            (Some(secs(1)), Duration::ZERO),
+            (Some(secs(3600)), Duration::ZERO),
+            (None, Duration::ZERO),
+        ] {
+            assert!(
+                !token_is_fresh(Duration::ZERO, lifetime, configured),
+                "lifetime={lifetime:?} configured={configured:?}"
+            );
+        }
+        // A freshly issued short-lived token is usable under the default
+        // buffer, and stays usable until its last half.
+        assert!(token_is_fresh(secs(20), Some(secs(20)), secs(30)));
+        assert!(token_is_fresh(secs(11), Some(secs(20)), secs(30)));
+        assert!(!token_is_fresh(secs(10), Some(secs(20)), secs(30)));
+        assert!(token_is_fresh(secs(1), Some(secs(1)), secs(30)));
+        // A long-lived token near expiry is renewed as before.
+        assert!(!token_is_fresh(secs(30), Some(secs(3600)), secs(30)));
+        assert!(token_is_fresh(secs(31), Some(secs(3600)), secs(30)));
+        // Without a lifetime the configured buffer decides.
+        assert!(!token_is_fresh(secs(20), None, secs(30)));
+        assert!(token_is_fresh(secs(31), None, secs(30)));
+    }
+
+    #[test]
+    fn short_lived_cached_tokens_are_valid_until_their_last_half() {
+        let token = |remaining: u64, lifetime: u64| CachedToken {
+            access_token: "token".into(),
+            expires_at: Instant::now() + Duration::from_secs(remaining),
+            lifetime: Duration::from_secs(lifetime),
+        };
+        let buffer = Duration::from_secs(30);
+        assert!(OAuthClientCredentials::is_token_valid(
+            &token(20, 20),
+            buffer
+        ));
+        assert!(OAuthClientCredentials::is_token_valid(
+            &token(30, 30),
+            buffer
+        ));
+        assert!(!OAuthClientCredentials::is_token_valid(
+            &token(5, 20),
+            buffer
+        ));
+        // A large configured buffer still applies in full to a token whose
+        // lifetime is more than twice as long.
+        let large = Duration::from_secs(600);
+        assert!(!OAuthClientCredentials::is_token_valid(
+            &token(500, 3600),
+            large
+        ));
+        assert!(OAuthClientCredentials::is_token_valid(
+            &token(700, 3600),
+            large
+        ));
+        // Expired, with a zero effective buffer.
+        let expired = CachedToken {
+            access_token: "token".into(),
+            expires_at: Instant::now() - Duration::from_secs(1),
+            lifetime: Duration::from_secs(1),
+        };
+        assert!(!OAuthClientCredentials::is_token_valid(
+            &expired,
+            Duration::ZERO
+        ));
+    }
+
+    /// A local client-credentials token endpoint that answers every request
+    /// with `token-<n>` and the given `expires_in` (omitted when `None`).
+    /// Returns the token endpoint URL and a counter of requests received.
+    async fn spawn_counting_token_server(expires_in: Option<u64>) -> (String, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let mut bytes = Vec::new();
+                    let header_end = loop {
+                        let mut chunk = [0_u8; 1024];
+                        let read = stream.read(&mut chunk).await.unwrap_or(0);
+                        if read == 0 {
+                            return;
+                        }
+                        bytes.extend_from_slice(&chunk[..read]);
+                        if let Some(index) =
+                            bytes.windows(4).position(|window| window == b"\r\n\r\n")
+                        {
+                            break index + 4;
+                        }
+                    };
+                    let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    while bytes.len() < header_end + content_length {
+                        let mut chunk = [0_u8; 1024];
+                        let read = stream.read(&mut chunk).await.unwrap_or(0);
+                        if read == 0 {
+                            break;
+                        }
+                        bytes.extend_from_slice(&chunk[..read]);
+                    }
+                    let n = counter.fetch_add(1, Ordering::SeqCst);
+                    let mut body = serde_json::json!({
+                        "access_token": format!("token-{n}"),
+                        "token_type": "Bearer",
+                    });
+                    if let Some(expires_in) = expires_in {
+                        body["expires_in"] = expires_in.into();
+                    }
+                    let body = body.to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (endpoint, requests)
+    }
+
+    fn counting_provider(endpoint: String, buffer: Option<Duration>) -> OAuthClientCredentials {
+        let mut builder = OAuthClientCredentials::builder()
+            .client_id("id")
+            .client_secret("secret")
+            .token_endpoint(endpoint)
+            .resource("https://mcp.example.com");
+        if let Some(buffer) = buffer {
+            builder = builder.refresh_buffer(buffer);
+        }
+        builder.build().unwrap()
+    }
+
+    /// #1646: with the default 30-second buffer, a token issued for 30
+    /// seconds or less used to be inside the refresh window on arrival, so
+    /// every call fetched a new one.
+    #[tokio::test]
+    async fn short_lived_tokens_are_fetched_once_for_back_to_back_calls() {
+        for lifetime in [1, 20, 30] {
+            let (endpoint, requests) = spawn_counting_token_server(Some(lifetime)).await;
+            let provider = counting_provider(endpoint, None);
+            for _ in 0..5 {
+                assert_eq!(provider.get_token().await.unwrap(), "token-0");
+            }
+            assert_eq!(requests.load(Ordering::SeqCst), 1, "lifetime={lifetime}s");
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_expires_in_keeps_the_one_hour_default() {
+        let (endpoint, requests) = spawn_counting_token_server(None).await;
+        let provider = counting_provider(endpoint, None);
+        for _ in 0..3 {
+            assert_eq!(provider.get_token().await.unwrap(), "token-0");
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        let cache = provider.inner.cache.read().await;
+        assert_eq!(cache.as_ref().unwrap().lifetime, Duration::from_secs(3600));
+    }
+
+    #[tokio::test]
+    async fn an_expired_short_lived_token_is_fetched_again() {
+        let (endpoint, requests) = spawn_counting_token_server(Some(1)).await;
+        let provider = counting_provider(endpoint, None);
+        assert_eq!(provider.get_token().await.unwrap(), "token-0");
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        assert_eq!(provider.get_token().await.unwrap(), "token-1");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn zero_and_large_buffers_reuse_short_lived_tokens() {
+        for buffer in [Duration::ZERO, Duration::from_secs(3600)] {
+            let (endpoint, requests) = spawn_counting_token_server(Some(20)).await;
+            let provider = counting_provider(endpoint, Some(buffer));
+            for _ in 0..5 {
+                assert_eq!(provider.get_token().await.unwrap(), "token-0");
+            }
+            assert_eq!(requests.load(Ordering::SeqCst), 1, "buffer={buffer:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn invalidate_discards_a_fresh_short_lived_token() {
+        let (endpoint, requests) = spawn_counting_token_server(Some(20)).await;
+        let provider = counting_provider(endpoint, None);
+        assert_eq!(provider.get_token().await.unwrap(), "token-0");
+
+        provider.invalidate().await;
+
+        assert_eq!(provider.get_token().await.unwrap(), "token-1");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_callers_share_one_fetch_of_a_short_lived_token() {
+        let (endpoint, requests) = spawn_counting_token_server(Some(20)).await;
+        let provider = counting_provider(endpoint, None);
+        let tasks: Vec<_> = (0..16)
+            .map(|_| {
+                let provider = provider.clone();
+                tokio::spawn(async move { provider.get_token().await.unwrap() })
+            })
+            .collect();
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), "token-0");
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 }
