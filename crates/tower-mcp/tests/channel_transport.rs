@@ -146,8 +146,17 @@ async fn dynamic_prompt_initializer_runs_only_when_prompts_are_accessed() {
         .await
         .expect("connect");
     client.initialize("test", "1.0.0").await.unwrap();
-    client.list_tools().await.unwrap();
-    client.list_resources().await.unwrap();
+    // Neither capability is advertised, so both methods answer -32601
+    // (#1654). Either way the prompt initializer must not run.
+    for result in [
+        client.list_tools().await.map(drop),
+        client.list_resources().await.map(drop),
+    ] {
+        match result {
+            Err(tower_mcp::Error::JsonRpc(error)) => assert_eq!(error.code, -32601),
+            other => panic!("expected method not found, got {other:?}"),
+        }
+    }
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 
     let listed = client.list_prompts().await.unwrap();

@@ -53,9 +53,18 @@ fn run_piped_requests(input: String) -> Vec<serde_json::Value> {
         .enable_all()
         .build()
         .unwrap();
+    // The tool advertises `tools`, so a piped `tools/list` is routed rather
+    // than answered with -32601 (#1654).
+    let tool = ToolBuilder::new("echo")
+        .description("Echo the arguments")
+        .handler(
+            |args: serde_json::Value| async move { Ok(CallToolResult::text(args.to_string())) },
+        )
+        .build();
     runtime.block_on(async {
-        let mut transport =
-            BidirectionalStdioTransport::new(McpRouter::new().server_info("eof-test", "0"));
+        let mut transport = BidirectionalStdioTransport::new(
+            McpRouter::new().server_info("eof-test", "0").tool(tool),
+        );
         timeout(
             Duration::from_secs(2),
             transport.run_with_streams(io::Cursor::new(input), output.clone()),

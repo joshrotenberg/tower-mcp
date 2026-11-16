@@ -38,8 +38,17 @@ async fn attach_identity(mut request: Request<Body>, next: axum::middleware::Nex
     next.run(request).await
 }
 
+/// Advertises `tools`, so the `tools/list` requests below are routed rather
+/// than answered with -32601 (#1654).
 fn test_router() -> McpRouter {
-    McpRouter::new().server_info("binding-test", "1.0.0")
+    McpRouter::new().server_info("binding-test", "1.0.0").tool(
+        tower_mcp::ToolBuilder::new("echo")
+            .description("Echo the arguments")
+            .handler(|args: serde_json::Value| async move {
+                Ok(tower_mcp::CallToolResult::text(args.to_string()))
+            })
+            .build(),
+    )
 }
 
 /// A transport that resolves the principal from [`Identity`].

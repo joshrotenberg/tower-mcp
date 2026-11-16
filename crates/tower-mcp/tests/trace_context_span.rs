@@ -78,7 +78,18 @@ async fn span_records_trace_and_parent_ids() {
     let subscriber = tracing_subscriber::registry().with(capture.clone());
     let _guard = tracing::subscriber::set_default(subscriber);
 
-    let router = McpRouter::new().server_info("trace-span-test", "0.0.0");
+    // The tool advertises `tools`, so `tools/list` is routed rather than
+    // answered with -32601 (#1654).
+    let router = McpRouter::new()
+        .server_info("trace-span-test", "0.0.0")
+        .tool(
+            tower_mcp::ToolBuilder::new("echo")
+                .description("Echo the arguments")
+                .handler(|args: serde_json::Value| async move {
+                    Ok(tower_mcp::CallToolResult::text(args.to_string()))
+                })
+                .build(),
+        );
     router.session().mark_preinitialized();
     let mut service = JsonRpcService::new(McpTracingLayer::new().layer(router));
 

@@ -697,7 +697,14 @@ async fn test_error_missing_required_params() {
 
 #[tokio::test]
 async fn test_error_resources_not_found() {
-    let router = create_test_router();
+    // One resource advertises `resources`, so an unknown URI reaches the
+    // not-found path rather than the -32601 for an unadvertised capability
+    // (#1654).
+    let router = create_test_router().resource(
+        ResourceBuilder::new("file:///known")
+            .name("known")
+            .text("hi"),
+    );
     let mut service = JsonRpcService::new(router.clone());
 
     // Initialize
@@ -709,7 +716,7 @@ async fn test_error_resources_not_found() {
     service.call_single(init_req).await.unwrap();
     router.handle_notification(tower_mcp::protocol::McpNotification::Initialized);
 
-    // Try to read a resource (none registered)
+    // Try to read a resource that is not registered
     let read_req = JsonRpcRequest::new(2, "resources/read").with_params(serde_json::json!({
         "uri": "file:///nonexistent"
     }));
@@ -726,7 +733,10 @@ async fn test_error_resources_not_found() {
 
 #[tokio::test]
 async fn test_error_prompts_not_found() {
-    let router = create_test_router();
+    // One prompt advertises `prompts`, so an unknown name reaches the
+    // not-found path rather than the -32601 for an unadvertised capability
+    // (#1654).
+    let router = create_test_router().prompt(PromptBuilder::new("known").user_message("hi"));
     let mut service = JsonRpcService::new(router.clone());
 
     // Initialize
@@ -738,7 +748,7 @@ async fn test_error_prompts_not_found() {
     service.call_single(init_req).await.unwrap();
     router.handle_notification(tower_mcp::protocol::McpNotification::Initialized);
 
-    // Try to get a prompt (none registered)
+    // Try to get a prompt that is not registered
     let get_req = JsonRpcRequest::new(2, "prompts/get").with_params(serde_json::json!({
         "name": "nonexistent"
     }));

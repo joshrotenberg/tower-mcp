@@ -297,8 +297,18 @@ proptest! {
     }
 }
 
+/// A router advertising `tools`, so the many tests here that use `tools/list`
+/// as a generic routed request reach the router (#1654: a method whose
+/// capability is not advertised answers -32601).
 fn create_test_router() -> McpRouter {
-    McpRouter::new().server_info("test-server", "1.0.0")
+    McpRouter::new().server_info("test-server", "1.0.0").tool(
+        crate::ToolBuilder::new("echo")
+            .description("Echo the arguments")
+            .handler(|args: serde_json::Value| async move {
+                Ok(crate::CallToolResult::text(args.to_string()))
+            })
+            .build(),
+    )
 }
 
 #[test]
@@ -5097,11 +5107,20 @@ async fn post_modern_request(
 
 #[cfg(feature = "stateless")]
 fn modern_not_found_app() -> axum::Router {
-    let router = McpRouter::new().server_info("test-server", "1.0.0").prompt(
-        crate::prompt::PromptBuilder::new("greet")
-            .required_arg("name", "Name to greet")
-            .user_message("hi"),
-    );
+    // One tool, resource, and prompt, so each capability is advertised and an
+    // unknown name reaches the not-found path instead of the -32601 an
+    // unadvertised capability answers (#1654).
+    let router = create_test_router()
+        .resource(
+            crate::resource::ResourceBuilder::new("file:///known.txt")
+                .name("known")
+                .text("hi"),
+        )
+        .prompt(
+            crate::prompt::PromptBuilder::new("greet")
+                .required_arg("name", "Name to greet")
+                .user_message("hi"),
+        );
     HttpTransport::new(router)
         .disable_origin_validation()
         .disable_host_validation()

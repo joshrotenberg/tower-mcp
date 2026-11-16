@@ -3143,8 +3143,17 @@ mod tests {
     // process_line tests
     // =========================================================================
 
+    /// Advertises `tools`, so `tools/list` is routed rather than answered
+    /// with -32601 (#1654).
     fn make_router() -> McpRouter {
-        McpRouter::new().server_info("test-server", "1.0.0")
+        McpRouter::new().server_info("test-server", "1.0.0").tool(
+            crate::ToolBuilder::new("echo")
+                .description("Echo the arguments")
+                .handler(|args: serde_json::Value| async move {
+                    Ok(crate::CallToolResult::text(args.to_string()))
+                })
+                .build(),
+        )
     }
 
     async fn init_service(router: &McpRouter) -> JsonRpcService<McpRouter> {

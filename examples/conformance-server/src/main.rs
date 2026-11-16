@@ -20,6 +20,7 @@
 //! - Tools with various input types and state
 //! - Resources and resource templates
 //! - Prompts with arguments
+//! - Completions (a minimal handler that declares the capability)
 //! - Progress notifications
 //! - Logging notifications
 //! - Sampling (LLM requests back to client)
@@ -33,9 +34,10 @@ mod skills;
 mod tools;
 
 use clap::Parser;
-use tower_mcp::protocol::DeprecationInfo;
+use tower_mcp::protocol::{CompleteParams, DeprecationInfo};
 use tower_mcp::{
-    HttpTransport, McpRouter, RequestStateCodec, StdioTransport, notification_channel,
+    CompleteResult, HttpTransport, McpRouter, RequestStateCodec, StdioTransport,
+    notification_channel,
 };
 
 #[derive(Parser)]
@@ -103,6 +105,13 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     for prompt in prompts::build_prompts() {
         router = router.prompt(prompt);
     }
+    // The `completion-complete` scenario needs the `completions` capability
+    // declared and a well-formed result; it accepts an empty suggestion list.
+    // Without a handler the router does not advertise the capability and
+    // answers `completion/complete` with -32601 (#1654).
+    router = router.completion_handler(|_params: CompleteParams| async move {
+        Ok(CompleteResult::new(Vec::new()))
+    });
     router = router.skills(skills::build_skills()?);
 
     match args.transport.as_str() {

@@ -6078,7 +6078,7 @@ async fn completion_resolves_dynamic_prompts_resources_and_templates() {
 }
 
 #[tokio::test]
-async fn test_completion_without_handler_returns_empty() {
+async fn test_completion_without_handler_is_method_not_found() {
     let router = McpRouter::new().server_info("test", "1.0");
 
     // Initialize
@@ -6116,7 +6116,8 @@ async fn test_completion_without_handler_returns_empty() {
     // Send initialized notification
     router.handle_notification(McpNotification::Initialized);
 
-    // Test completion request still works but returns empty
+    // Without the capability the method is not routed (#1654). It used to
+    // answer an empty success.
     let complete_req = RouterRequest {
         id: RequestId::Number(1),
         inner: McpRequest::Complete(CompleteParams {
@@ -6137,10 +6138,11 @@ async fn test_completion_without_handler_returns_empty() {
         .unwrap();
 
     match resp.inner {
-        Ok(McpResponse::Complete(result)) => {
-            assert!(result.completion.values.is_empty());
+        Err(error) => {
+            assert_eq!(error.code, crate::error::ErrorCode::MethodNotFound as i32);
+            assert_eq!(error.message, "Method not found: completion/complete");
         }
-        _ => panic!("Expected Complete response"),
+        other => panic!("Expected method not found, got {other:?}"),
     }
 }
 
@@ -8369,8 +8371,11 @@ async fn test_tool_if_false_skips() {
         .build();
 
     let mut router = McpRouter::new().tool_if(false, tool);
+    assert!(router.capabilities().tools.is_none());
     init_router(&mut router).await;
 
+    // No tool registered, so `tools` is not advertised and `tools/list` is
+    // not routed (#1654).
     let req = RouterRequest {
         id: RequestId::Number(1),
         inner: McpRequest::ListTools(ListToolsParams::default()),
@@ -8378,10 +8383,8 @@ async fn test_tool_if_false_skips() {
     };
     let resp = router.ready().await.unwrap().call(req).await.unwrap();
     match resp.inner {
-        Ok(McpResponse::ListTools(result)) => {
-            assert_eq!(result.tools.len(), 0);
-        }
-        _ => panic!("Expected ListTools response"),
+        Err(error) => assert_eq!(error.code, crate::error::ErrorCode::MethodNotFound as i32),
+        other => panic!("Expected method not found, got {other:?}"),
     }
 }
 
@@ -8399,8 +8402,11 @@ async fn test_tools_if_batch_conditional() {
     ];
 
     let mut router = McpRouter::new().tools_if(false, tools);
+    assert!(router.capabilities().tools.is_none());
     init_router(&mut router).await;
 
+    // No tool registered, so `tools` is not advertised and `tools/list` is
+    // not routed (#1654).
     let req = RouterRequest {
         id: RequestId::Number(1),
         inner: McpRequest::ListTools(ListToolsParams::default()),
@@ -8408,10 +8414,8 @@ async fn test_tools_if_batch_conditional() {
     };
     let resp = router.ready().await.unwrap().call(req).await.unwrap();
     match resp.inner {
-        Ok(McpResponse::ListTools(result)) => {
-            assert_eq!(result.tools.len(), 0);
-        }
-        _ => panic!("Expected ListTools response"),
+        Err(error) => assert_eq!(error.code, crate::error::ErrorCode::MethodNotFound as i32),
+        other => panic!("Expected method not found, got {other:?}"),
     }
 }
 
