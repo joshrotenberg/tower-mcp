@@ -5558,6 +5558,162 @@ impl ElicitFormSchema {
         self
     }
 
+    /// Add a titled single-select enum field.
+    ///
+    /// Each option is a `(value, title)` pair: `value` is what the client
+    /// returns, `title` is the label it displays. Serializes as
+    /// `{"type": "string", "oneOf": [{"const": value, "title": title}, ...]}`
+    /// (`TitledSingleSelectEnumSchema` in the spec).
+    pub fn titled_enum_field(
+        self,
+        name: &str,
+        description: Option<&str>,
+        options: &[(&str, &str)],
+        required: bool,
+    ) -> Self {
+        self.titled_enum(name, description, options, None, required)
+    }
+
+    /// Add a titled single-select enum field with a default value.
+    ///
+    /// See [`titled_enum_field`](Self::titled_enum_field) for the option shape.
+    pub fn titled_enum_field_with_default(
+        self,
+        name: &str,
+        description: Option<&str>,
+        required: bool,
+        options: &[(&str, &str)],
+        default: &str,
+    ) -> Self {
+        self.titled_enum(name, description, options, Some(default), required)
+    }
+
+    fn titled_enum(
+        self,
+        name: &str,
+        description: Option<&str>,
+        options: &[(&str, &str)],
+        default: Option<&str>,
+        required: bool,
+    ) -> Self {
+        self.field(
+            name,
+            PrimitiveSchemaDefinition::TitledSingleSelectEnum(TitledSingleSelectEnumSchema {
+                schema_type: "string".to_string(),
+                title: None,
+                description: description.map(|s| s.to_string()),
+                one_of: TitledEnumOption::from_pairs(options),
+                default: default.map(|s| s.to_string()),
+            }),
+            required,
+        )
+    }
+
+    /// Add a legacy titled single-select enum field.
+    ///
+    /// Each option is a `(value, title)` pair. Serializes as
+    /// `{"type": "string", "enum": [...], "enumNames": [...]}`
+    /// (`LegacyTitledEnumSchema` in the spec). The spec deprecates this shape
+    /// in favor of [`titled_enum_field`](Self::titled_enum_field); use it only
+    /// for clients that do not understand `oneOf`.
+    pub fn legacy_titled_enum_field(
+        self,
+        name: &str,
+        description: Option<&str>,
+        options: &[(&str, &str)],
+        required: bool,
+    ) -> Self {
+        self.field(
+            name,
+            PrimitiveSchemaDefinition::LegacyTitledEnum(LegacyTitledEnumSchema {
+                schema_type: "string".to_string(),
+                title: None,
+                description: description.map(|s| s.to_string()),
+                enum_values: options.iter().map(|(v, _)| v.to_string()).collect(),
+                enum_names: options.iter().map(|(_, t)| t.to_string()).collect(),
+                default: None,
+            }),
+            required,
+        )
+    }
+
+    /// Add an untitled multi-select enum field.
+    ///
+    /// Serializes as
+    /// `{"type": "array", "items": {"type": "string", "enum": [...]}}`
+    /// (`UntitledMultiSelectEnumSchema` in the spec). For `minItems`,
+    /// `maxItems`, or a default, build a [`MultiSelectEnumSchema`] and add it
+    /// with [`field`](Self::field).
+    pub fn multi_select_enum_field(
+        self,
+        name: &str,
+        description: Option<&str>,
+        options: &[&str],
+        required: bool,
+    ) -> Self {
+        self.field(
+            name,
+            PrimitiveSchemaDefinition::MultiSelectEnum(MultiSelectEnumSchema {
+                schema_type: "array".to_string(),
+                title: None,
+                description: description.map(|s| s.to_string()),
+                items: MultiSelectEnumItems {
+                    schema_type: "string".to_string(),
+                    enum_values: options.iter().map(|s| s.to_string()).collect(),
+                },
+                unique_items: None,
+                min_items: None,
+                max_items: None,
+                default: None,
+            }),
+            required,
+        )
+    }
+
+    /// Add a titled multi-select enum field.
+    ///
+    /// Each option is a `(value, title)` pair. Serializes as
+    /// `{"type": "array", "items": {"anyOf": [{"const": value, "title": title}, ...]}}`
+    /// (`TitledMultiSelectEnumSchema` in the spec). For `minItems`,
+    /// `maxItems`, or a default, build a [`TitledMultiSelectEnumSchema`] and
+    /// add it with [`field`](Self::field).
+    pub fn titled_multi_select_enum_field(
+        self,
+        name: &str,
+        description: Option<&str>,
+        options: &[(&str, &str)],
+        required: bool,
+    ) -> Self {
+        self.field(
+            name,
+            PrimitiveSchemaDefinition::TitledMultiSelectEnum(TitledMultiSelectEnumSchema {
+                schema_type: "array".to_string(),
+                title: None,
+                description: description.map(|s| s.to_string()),
+                items: TitledMultiSelectEnumItems {
+                    any_of: TitledEnumOption::from_pairs(options),
+                },
+                unique_items: None,
+                min_items: None,
+                max_items: None,
+                default: None,
+            }),
+            required,
+        )
+    }
+
+    /// Add a field from a fully specified schema definition.
+    ///
+    /// Use this when a typed builder does not expose a keyword you need, such
+    /// as `minItems` on a multi-select or a `title` on any field.
+    pub fn field(mut self, name: &str, schema: PrimitiveSchemaDefinition, required: bool) -> Self {
+        self.properties.insert(name.to_string(), schema);
+        if required {
+            self.required.push(name.to_string());
+        }
+        self
+    }
+
     /// Add a raw JSON schema field
     ///
     /// Use this for advanced schema features not covered by the typed builders.
@@ -5590,51 +5746,90 @@ pub enum PrimitiveSchemaDefinition {
     Number(NumberSchema),
     /// Boolean field
     Boolean(BooleanSchema),
-    /// Single-select enum field
+    /// Untitled single-select enum field (`UntitledSingleSelectEnumSchema`):
+    /// `{"type": "string", "enum": [...]}`
     SingleSelectEnum(SingleSelectEnumSchema),
-    /// Multi-select enum field
+    /// Untitled multi-select enum field (`UntitledMultiSelectEnumSchema`):
+    /// `{"type": "array", "items": {"type": "string", "enum": [...]}}`
     MultiSelectEnum(MultiSelectEnumSchema),
-    /// Raw JSON schema (for advanced/custom schemas)
+    /// Titled single-select enum field (`TitledSingleSelectEnumSchema`):
+    /// `{"type": "string", "oneOf": [{"const": ..., "title": ...}]}`
+    TitledSingleSelectEnum(TitledSingleSelectEnumSchema),
+    /// Titled multi-select enum field (`TitledMultiSelectEnumSchema`):
+    /// `{"type": "array", "items": {"anyOf": [{"const": ..., "title": ...}]}}`
+    TitledMultiSelectEnum(TitledMultiSelectEnumSchema),
+    /// Legacy titled single-select enum field (`LegacyTitledEnumSchema`):
+    /// `{"type": "string", "enum": [...], "enumNames": [...]}`. Deprecated in
+    /// the spec in favor of [`TitledSingleSelectEnum`](Self::TitledSingleSelectEnum).
+    LegacyTitledEnum(LegacyTitledEnumSchema),
+    /// Raw JSON schema (for advanced/custom schemas).
+    ///
+    /// Also the decode target for any shape that does not parse into one of
+    /// the modelled variants, so an unmodelled or malformed field is carried
+    /// through verbatim instead of failing the whole request.
     Raw(serde_json::Value),
 }
 
-// Dispatch on the JSON Schema `type` (and on `enum` for the select variants)
-// rather than letting an untagged enum try variants in order. Every schema
-// struct here declares `type` as a plain `String` that accepts any value, so
-// the first variant matched everything: a `{"type": "boolean"}` field parsed
-// as `String`, and a single-select's `enum` values were dropped entirely
-// because `StringSchema` has nowhere to keep them (#1189).
+// Dispatch on the JSON Schema `type` and on the keyword that carries the
+// choices, rather than letting an untagged enum try variants in order. Every
+// schema struct here declares `type` as a plain `String` that accepts any
+// value, so the first variant matched everything: a `{"type": "boolean"}`
+// field parsed as `String`, and a single-select's `enum` values were dropped
+// entirely because `StringSchema` has nowhere to keep them (#1189).
+//
+// The five enum shapes of SEP-1330 are told apart by their choice keyword:
+// `enum` (untitled single), `enum` + `enumNames` (legacy titled), `oneOf`
+// (titled single), `items.enum` (untitled multi), `items.anyOf` (titled
+// multi). A shape that fails to parse into its variant becomes `Raw` (#1652).
 impl<'de> Deserialize<'de> for PrimitiveSchemaDefinition {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
-        let schema_type = value.get("type").and_then(Value::as_str);
-        let has_enum = value.get("enum").is_some();
+        Ok(Self::from_value(value))
+    }
+}
 
-        // An unrecognized shape is preserved verbatim as `Raw` rather than
-        // rejected, so a server using a schema keyword this crate does not
-        // model yet still round-trips through a client.
-        fn parse<T, E>(value: Value) -> Result<T, E>
-        where
-            T: serde::de::DeserializeOwned,
-            E: serde::de::Error,
-        {
-            serde_json::from_value(value).map_err(serde::de::Error::custom)
+impl PrimitiveSchemaDefinition {
+    /// Classify a JSON schema value. Never fails: an unrecognized or
+    /// malformed shape is preserved verbatim as `Raw` rather than rejected, so
+    /// a server using a schema keyword this crate does not model yet still
+    /// round-trips through a client, and one bad field cannot fail an entire
+    /// `elicitation/create` request.
+    fn from_value(value: Value) -> Self {
+        fn parse<T: serde::de::DeserializeOwned>(
+            value: Value,
+            wrap: fn(T) -> PrimitiveSchemaDefinition,
+        ) -> PrimitiveSchemaDefinition {
+            match T::deserialize(&value) {
+                Ok(schema) => wrap(schema),
+                Err(_) => PrimitiveSchemaDefinition::Raw(value),
+            }
         }
 
-        Ok(match (schema_type, has_enum) {
-            (Some("string"), true) => Self::SingleSelectEnum(parse(value)?),
-            (Some("string"), false) => Self::String(parse(value)?),
-            (Some("integer"), _) => Self::Integer(parse(value)?),
-            (Some("number"), _) => Self::Number(parse(value)?),
-            (Some("boolean"), _) => Self::Boolean(parse(value)?),
-            // The multi-select carries its choices in `items.enum`, so the
-            // top-level `enum` check does not apply.
-            (Some("array"), _) => Self::MultiSelectEnum(parse(value)?),
+        let has = |key: &str| value.get(key).is_some();
+        let items_has = |key: &str| {
+            value
+                .get("items")
+                .and_then(|items| items.get(key))
+                .is_some()
+        };
+
+        match value.get("type").and_then(Value::as_str) {
+            Some("string") if has("enum") && has("enumNames") => {
+                parse(value, Self::LegacyTitledEnum)
+            }
+            Some("string") if has("enum") => parse(value, Self::SingleSelectEnum),
+            Some("string") if has("oneOf") => parse(value, Self::TitledSingleSelectEnum),
+            Some("string") => parse(value, Self::String),
+            Some("integer") => parse(value, Self::Integer),
+            Some("number") => parse(value, Self::Number),
+            Some("boolean") => parse(value, Self::Boolean),
+            Some("array") if items_has("anyOf") => parse(value, Self::TitledMultiSelectEnum),
+            Some("array") => parse(value, Self::MultiSelectEnum),
             _ => Self::Raw(value),
-        })
+        }
     }
 }
 
@@ -5773,6 +5968,12 @@ pub struct MultiSelectEnumSchema {
     /// Whether duplicate selections are forbidden.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unique_items: Option<bool>,
+    /// Minimum number of items to select.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_items: Option<u64>,
+    /// Maximum number of items to select.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_items: Option<u64>,
     /// Default value for this field
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default: Option<Vec<String>>,
@@ -5787,6 +5988,127 @@ pub struct MultiSelectEnumItems {
     /// Exact string values permitted in the selection array.
     #[serde(rename = "enum")]
     pub enum_values: Vec<String>,
+}
+
+/// One choice of a titled enum: the value the client returns and the label
+/// it displays.
+///
+/// Serializes as `{"const": value, "title": title}`. Used by the `oneOf` of a
+/// [`TitledSingleSelectEnumSchema`] and the `items.anyOf` of a
+/// [`TitledMultiSelectEnumSchema`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TitledEnumOption {
+    /// The enum value (`const`).
+    #[serde(rename = "const")]
+    pub value: String,
+    /// Display label for this option.
+    pub title: String,
+}
+
+impl TitledEnumOption {
+    /// Create an option from a value and its display label.
+    pub fn new(value: impl Into<String>, title: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            title: title.into(),
+        }
+    }
+
+    fn from_pairs(options: &[(&str, &str)]) -> Vec<Self> {
+        options
+            .iter()
+            .map(|(value, title)| Self::new(*value, *title))
+            .collect()
+    }
+}
+
+/// Titled single-select enum schema (`TitledSingleSelectEnumSchema`).
+///
+/// `{"type": "string", "oneOf": [{"const": "a", "title": "A"}, ...]}`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TitledSingleSelectEnumSchema {
+    /// JSON Schema type marker; must be `"string"`.
+    #[serde(rename = "type")]
+    pub schema_type: String,
+    /// Human-readable title for this field
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Optional human-readable help text for the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The choices, each a value and its display label.
+    pub one_of: Vec<TitledEnumOption>,
+    /// Default value for this field
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+}
+
+/// Titled multi-select enum schema (`TitledMultiSelectEnumSchema`).
+///
+/// `{"type": "array", "items": {"anyOf": [{"const": "a", "title": "A"}, ...]}}`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TitledMultiSelectEnumSchema {
+    /// JSON Schema type marker; must be `"array"`.
+    #[serde(rename = "type")]
+    pub schema_type: String,
+    /// Human-readable title for this field
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Optional human-readable help text for the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The choices permitted in the selection array.
+    pub items: TitledMultiSelectEnumItems,
+    /// Whether duplicate selections are forbidden.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unique_items: Option<bool>,
+    /// Minimum number of items to select.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_items: Option<u64>,
+    /// Maximum number of items to select.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_items: Option<u64>,
+    /// Default value for this field
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<Vec<String>>,
+}
+
+/// Items definition for a titled multi-select enum.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TitledMultiSelectEnumItems {
+    /// The choices, each a value and its display label.
+    #[serde(rename = "anyOf")]
+    pub any_of: Vec<TitledEnumOption>,
+}
+
+/// Legacy titled single-select enum schema (`LegacyTitledEnumSchema`).
+///
+/// `{"type": "string", "enum": ["a"], "enumNames": ["A"]}`. Deprecated in the
+/// spec in favor of [`TitledSingleSelectEnumSchema`]. A legacy schema without
+/// `enumNames` is indistinguishable from an untitled single-select and decodes
+/// as [`SingleSelectEnumSchema`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacyTitledEnumSchema {
+    /// JSON Schema type marker; must be `"string"`.
+    #[serde(rename = "type")]
+    pub schema_type: String,
+    /// Human-readable title for this field
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Optional human-readable help text for the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Exact string values the user may select.
+    #[serde(rename = "enum")]
+    pub enum_values: Vec<String>,
+    /// Display names for `enum_values`, index for index.
+    pub enum_names: Vec<String>,
+    /// Default value for this field
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
 }
 
 /// User action in response to elicitation
@@ -9270,6 +9592,9 @@ mod primitive_schema_dispatch_tests {
             PrimitiveSchemaDefinition::Boolean(_) => "Boolean",
             PrimitiveSchemaDefinition::SingleSelectEnum(_) => "SingleSelectEnum",
             PrimitiveSchemaDefinition::MultiSelectEnum(_) => "MultiSelectEnum",
+            PrimitiveSchemaDefinition::TitledSingleSelectEnum(_) => "TitledSingleSelectEnum",
+            PrimitiveSchemaDefinition::TitledMultiSelectEnum(_) => "TitledMultiSelectEnum",
+            PrimitiveSchemaDefinition::LegacyTitledEnum(_) => "LegacyTitledEnum",
             PrimitiveSchemaDefinition::Raw(_) => "Raw",
         }
     }
@@ -9360,6 +9685,416 @@ mod primitive_schema_dispatch_tests {
         let json = serde_json::json!({"type": "null", "title": "Nothing"});
         let parsed: PrimitiveSchemaDefinition = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(serde_json::to_value(&parsed).unwrap(), json);
+    }
+}
+
+/// #1652: every SEP-1330 enum shape in the 2026-07-28 schema decodes into a
+/// variant that keeps all of its keywords, and an unparseable shape becomes
+/// `Raw` instead of failing the request it arrived in.
+#[cfg(test)]
+mod sep1330_enum_shape_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn untitled_single() -> Value {
+        json!({
+            "type": "string",
+            "title": "Color",
+            "description": "Pick a color",
+            "enum": ["red", "green", "blue"],
+            "default": "green"
+        })
+    }
+
+    fn titled_single() -> Value {
+        json!({
+            "type": "string",
+            "title": "Color",
+            "description": "Pick a color",
+            "oneOf": [
+                {"const": "#FF0000", "title": "Red"},
+                {"const": "#00FF00", "title": "Green"}
+            ],
+            "default": "#00FF00"
+        })
+    }
+
+    fn legacy_titled() -> Value {
+        json!({
+            "type": "string",
+            "title": "Color",
+            "description": "Pick a color",
+            "enum": ["red", "green"],
+            "enumNames": ["Red", "Green"],
+            "default": "red"
+        })
+    }
+
+    fn untitled_multi() -> Value {
+        json!({
+            "type": "array",
+            "title": "Colors",
+            "description": "Pick colors",
+            "minItems": 1,
+            "maxItems": 2,
+            "items": {"type": "string", "enum": ["red", "green", "blue"]},
+            "default": ["red", "blue"]
+        })
+    }
+
+    fn titled_multi() -> Value {
+        json!({
+            "type": "array",
+            "title": "Colors",
+            "description": "Pick colors",
+            "minItems": 1,
+            "maxItems": 2,
+            "items": {"anyOf": [
+                {"const": "#FF0000", "title": "Red"},
+                {"const": "#00FF00", "title": "Green"}
+            ]},
+            "default": ["#FF0000"]
+        })
+    }
+
+    fn all_shapes() -> Vec<(&'static str, Value)> {
+        vec![
+            ("untitledSingle", untitled_single()),
+            ("titledSingle", titled_single()),
+            ("legacyEnum", legacy_titled()),
+            ("untitledMulti", untitled_multi()),
+            ("titledMulti", titled_multi()),
+        ]
+    }
+
+    fn form_params_json() -> Value {
+        let properties: serde_json::Map<String, Value> = all_shapes()
+            .into_iter()
+            .map(|(name, schema)| (name.to_string(), schema))
+            .collect();
+        json!({
+            "mode": "form",
+            "message": "Choose",
+            "requestedSchema": {
+                "type": "object",
+                "properties": properties,
+                "required": ["titledSingle"]
+            }
+        })
+    }
+
+    fn round_trip(json: &Value) -> PrimitiveSchemaDefinition {
+        let parsed: PrimitiveSchemaDefinition = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(&serde_json::to_value(&parsed).unwrap(), json);
+        parsed
+    }
+
+    #[test]
+    fn untitled_single_select_round_trips() {
+        let PrimitiveSchemaDefinition::SingleSelectEnum(schema) = round_trip(&untitled_single())
+        else {
+            panic!("expected SingleSelectEnum");
+        };
+        assert_eq!(schema.enum_values, ["red", "green", "blue"]);
+        assert_eq!(schema.default.as_deref(), Some("green"));
+        assert_eq!(schema.title.as_deref(), Some("Color"));
+        assert_eq!(schema.description.as_deref(), Some("Pick a color"));
+    }
+
+    #[test]
+    fn titled_single_select_round_trips() {
+        let PrimitiveSchemaDefinition::TitledSingleSelectEnum(schema) =
+            round_trip(&titled_single())
+        else {
+            panic!("expected TitledSingleSelectEnum");
+        };
+        assert_eq!(
+            schema.one_of,
+            [
+                TitledEnumOption::new("#FF0000", "Red"),
+                TitledEnumOption::new("#00FF00", "Green"),
+            ]
+        );
+        assert_eq!(schema.default.as_deref(), Some("#00FF00"));
+        assert_eq!(schema.title.as_deref(), Some("Color"));
+        assert_eq!(schema.description.as_deref(), Some("Pick a color"));
+    }
+
+    #[test]
+    fn legacy_titled_enum_round_trips() {
+        let PrimitiveSchemaDefinition::LegacyTitledEnum(schema) = round_trip(&legacy_titled())
+        else {
+            panic!("expected LegacyTitledEnum");
+        };
+        assert_eq!(schema.enum_values, ["red", "green"]);
+        assert_eq!(schema.enum_names, ["Red", "Green"]);
+        assert_eq!(schema.default.as_deref(), Some("red"));
+    }
+
+    #[test]
+    fn untitled_multi_select_round_trips() {
+        let PrimitiveSchemaDefinition::MultiSelectEnum(schema) = round_trip(&untitled_multi())
+        else {
+            panic!("expected MultiSelectEnum");
+        };
+        assert_eq!(schema.items.enum_values, ["red", "green", "blue"]);
+        assert_eq!(schema.min_items, Some(1));
+        assert_eq!(schema.max_items, Some(2));
+        assert_eq!(
+            schema.default.as_deref(),
+            Some(&["red".to_string(), "blue".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn titled_multi_select_round_trips() {
+        let PrimitiveSchemaDefinition::TitledMultiSelectEnum(schema) = round_trip(&titled_multi())
+        else {
+            panic!("expected TitledMultiSelectEnum");
+        };
+        assert_eq!(
+            schema.items.any_of,
+            [
+                TitledEnumOption::new("#FF0000", "Red"),
+                TitledEnumOption::new("#00FF00", "Green"),
+            ]
+        );
+        assert_eq!(schema.min_items, Some(1));
+        assert_eq!(schema.max_items, Some(2));
+        assert_eq!(
+            schema.default.as_deref(),
+            Some(&["#FF0000".to_string()][..])
+        );
+    }
+
+    /// The minimal spec shapes, with no optional keywords, also round-trip.
+    #[test]
+    fn minimal_shapes_round_trip() {
+        for json in [
+            json!({"type": "string", "oneOf": [{"const": "a", "title": "A"}]}),
+            json!({"type": "string", "enum": ["a"], "enumNames": ["A"]}),
+            json!({"type": "array", "items": {"anyOf": [{"const": "a", "title": "A"}]}}),
+        ] {
+            let parsed = round_trip(&json);
+            assert!(
+                !matches!(parsed, PrimitiveSchemaDefinition::Raw(_)),
+                "{json} decoded as Raw"
+            );
+        }
+    }
+
+    /// A shape that matches a variant's discriminating keyword but fails
+    /// that variant's parse used to propagate the error and fail the whole
+    /// request. It is now kept verbatim as `Raw`.
+    #[test]
+    fn malformed_shapes_fall_back_to_raw() {
+        for json in [
+            // Option missing its title.
+            json!({"type": "array", "items": {"anyOf": [{"const": "a"}]}}),
+            // Multi-select items with neither enum nor anyOf.
+            json!({"type": "array", "items": {"type": "string"}}),
+            json!({"type": "array"}),
+            // Non-string enum values.
+            json!({"type": "string", "enum": [1, 2]}),
+            // oneOf that is not an array of options.
+            json!({"type": "string", "oneOf": "a"}),
+            // enumNames that is not an array of strings.
+            json!({"type": "string", "enum": ["a"], "enumNames": [1]}),
+            // Wrongly typed scalar keywords.
+            json!({"type": "integer", "minimum": "low"}),
+            json!({"type": "boolean", "default": "yes"}),
+            json!({"type": "string", "maxLength": -1}),
+        ] {
+            let parsed: PrimitiveSchemaDefinition = serde_json::from_value(json.clone())
+                .unwrap_or_else(|e| panic!("{json} failed to decode: {e}"));
+            let PrimitiveSchemaDefinition::Raw(raw) = &parsed else {
+                panic!("{json} should decode as Raw, got {parsed:?}");
+            };
+            assert_eq!(raw, &json);
+            assert_eq!(serde_json::to_value(&parsed).unwrap(), json);
+        }
+    }
+
+    #[test]
+    fn elicit_form_params_round_trip_every_shape() {
+        let json = form_params_json();
+        let params: ElicitFormParams = serde_json::from_value(json.clone()).unwrap();
+        let kinds: Vec<&str> = params
+            .requested_schema
+            .properties
+            .values()
+            .map(|schema| match schema {
+                PrimitiveSchemaDefinition::SingleSelectEnum(_) => "single",
+                PrimitiveSchemaDefinition::TitledSingleSelectEnum(_) => "titledSingle",
+                PrimitiveSchemaDefinition::LegacyTitledEnum(_) => "legacy",
+                PrimitiveSchemaDefinition::MultiSelectEnum(_) => "multi",
+                PrimitiveSchemaDefinition::TitledMultiSelectEnum(_) => "titledMulti",
+                other => panic!("unexpected variant {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            ["single", "titledSingle", "legacy", "multi", "titledMulti"]
+        );
+        assert_eq!(serde_json::to_value(&params).unwrap(), json);
+
+        let request: ElicitRequestParams = serde_json::from_value(json.clone()).unwrap();
+        assert!(matches!(request, ElicitRequestParams::Form(_)));
+        assert_eq!(serde_json::to_value(&request).unwrap(), json);
+    }
+
+    #[test]
+    fn input_request_elicit_round_trips_every_shape() {
+        let json = json!({"method": "elicitation/create", "params": form_params_json()});
+        let request: InputRequest = serde_json::from_value(json.clone()).unwrap();
+        let InputRequest::Elicit(ElicitRequestParams::Form(params)) = &request else {
+            panic!("expected a form elicitation, got {request:?}");
+        };
+        assert_eq!(params.requested_schema.properties.len(), 5);
+        assert!(
+            params
+                .requested_schema
+                .properties
+                .values()
+                .all(|schema| !matches!(schema, PrimitiveSchemaDefinition::Raw(_)))
+        );
+        assert_eq!(serde_json::to_value(&request).unwrap(), json);
+
+        let envelope = json!({
+            "resultType": "input_required",
+            "inputRequests": {"choose": json},
+            "requestState": "opaque"
+        });
+        let parsed: InputRequiredResult = serde_json::from_value(envelope.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), envelope);
+    }
+
+    /// One malformed field no longer fails the request it is part of.
+    #[test]
+    fn a_malformed_field_does_not_fail_the_request() {
+        let mut json = form_params_json();
+        let bad = json!({"type": "array", "items": {"anyOf": [{"const": "a"}]}});
+        json["requestedSchema"]["properties"]["bad"] = bad.clone();
+
+        let params: ElicitFormParams = serde_json::from_value(json.clone()).unwrap();
+        assert!(matches!(
+            params.requested_schema.properties.get("bad"),
+            Some(PrimitiveSchemaDefinition::Raw(raw)) if raw == &bad
+        ));
+        assert_eq!(serde_json::to_value(&params).unwrap(), json);
+
+        let request: InputRequest =
+            serde_json::from_value(json!({"method": "elicitation/create", "params": json}))
+                .unwrap();
+        assert!(matches!(
+            request,
+            InputRequest::Elicit(ElicitRequestParams::Form(_))
+        ));
+    }
+
+    #[test]
+    fn builders_produce_the_titled_shapes() {
+        let schema = ElicitFormSchema::new()
+            .titled_enum_field(
+                "titledSingle",
+                Some("Pick one"),
+                &[("a", "A"), ("b", "B")],
+                true,
+            )
+            .titled_enum_field_with_default(
+                "titledSingleDefault",
+                None,
+                false,
+                &[("a", "A"), ("b", "B")],
+                "b",
+            )
+            .legacy_titled_enum_field("legacy", None, &[("a", "A"), ("b", "B")], false)
+            .multi_select_enum_field("multi", None, &["a", "b"], false)
+            .titled_multi_select_enum_field(
+                "titledMulti",
+                Some("Pick some"),
+                &[("a", "A"), ("b", "B")],
+                true,
+            );
+
+        assert_eq!(
+            serde_json::to_value(&schema).unwrap(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "titledSingle": {
+                        "type": "string",
+                        "description": "Pick one",
+                        "oneOf": [{"const": "a", "title": "A"}, {"const": "b", "title": "B"}]
+                    },
+                    "titledSingleDefault": {
+                        "type": "string",
+                        "oneOf": [{"const": "a", "title": "A"}, {"const": "b", "title": "B"}],
+                        "default": "b"
+                    },
+                    "legacy": {
+                        "type": "string",
+                        "enum": ["a", "b"],
+                        "enumNames": ["A", "B"]
+                    },
+                    "multi": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["a", "b"]}
+                    },
+                    "titledMulti": {
+                        "type": "array",
+                        "description": "Pick some",
+                        "items": {"anyOf": [
+                            {"const": "a", "title": "A"},
+                            {"const": "b", "title": "B"}
+                        ]}
+                    }
+                },
+                "required": ["titledSingle", "titledMulti"]
+            })
+        );
+
+        // And the builder output decodes back into the same variants.
+        let reparsed: ElicitFormSchema =
+            serde_json::from_value(serde_json::to_value(&schema).unwrap()).unwrap();
+        assert!(matches!(
+            reparsed.properties.get("titledSingle"),
+            Some(PrimitiveSchemaDefinition::TitledSingleSelectEnum(_))
+        ));
+        assert!(matches!(
+            reparsed.properties.get("legacy"),
+            Some(PrimitiveSchemaDefinition::LegacyTitledEnum(_))
+        ));
+        assert!(matches!(
+            reparsed.properties.get("titledMulti"),
+            Some(PrimitiveSchemaDefinition::TitledMultiSelectEnum(_))
+        ));
+    }
+
+    /// `field` exposes keywords the shorthand builders do not take.
+    #[test]
+    fn field_builder_carries_min_and_max_items() {
+        let schema = ElicitFormSchema::new().field(
+            "colors",
+            PrimitiveSchemaDefinition::MultiSelectEnum(MultiSelectEnumSchema {
+                schema_type: "array".to_string(),
+                title: Some("Colors".to_string()),
+                description: Some("Pick colors".to_string()),
+                items: MultiSelectEnumItems {
+                    schema_type: "string".to_string(),
+                    enum_values: vec!["red".into(), "green".into(), "blue".into()],
+                },
+                unique_items: None,
+                min_items: Some(1),
+                max_items: Some(2),
+                default: Some(vec!["red".into(), "blue".into()]),
+            }),
+            false,
+        );
+        assert_eq!(
+            serde_json::to_value(&schema).unwrap()["properties"]["colors"],
+            untitled_multi()
+        );
     }
 }
 
