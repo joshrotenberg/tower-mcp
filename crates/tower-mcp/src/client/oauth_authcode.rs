@@ -44,7 +44,7 @@ use tokio::sync::{Mutex, RwLock, oneshot};
 
 use super::oauth::{
     OAuthBearerChallenge, OAuthClientError, OAuthRefreshScopePolicy, OAuthTokenEndpointAuthMethod,
-    TokenProvider, unix_time,
+    TokenProvider, expires_at_after, instant_token_is_fresh, unix_time,
 };
 
 // =============================================================================
@@ -1285,6 +1285,9 @@ struct CachedAuthCodeToken {
     access_token: String,
     refresh_token: Option<String>,
     expires_at: Instant,
+    /// Lifetime the token was issued with, which bounds the refresh buffer
+    /// (see [`effective_refresh_buffer`](super::oauth::effective_refresh_buffer)).
+    lifetime: Duration,
     /// Scopes the authorization server granted, space-delimited. Refresh
     /// requests send these rather than the originally requested scopes.
     scope: Option<String>,
@@ -1746,7 +1749,7 @@ fn is_invalid_grant(body: &str) -> bool {
 /// Build the cached token. `fallback_scope` applies when the response omits
 /// `scope`; a present but empty `scope` records an empty grant.
 fn to_cached_token(response: TokenResponse, fallback_scope: Option<String>) -> CachedAuthCodeToken {
-    let expires_in = Duration::from_secs(response.expires_in.unwrap_or(3600));
+    let lifetime = Duration::from_secs(response.expires_in.unwrap_or(3600));
     let scope = match response.scope {
         Some(granted) => {
             let granted = granted
@@ -1760,16 +1763,16 @@ fn to_cached_token(response: TokenResponse, fallback_scope: Option<String>) -> C
     CachedAuthCodeToken {
         access_token: response.access_token,
         refresh_token: response.refresh_token,
-        expires_at: Instant::now() + expires_in,
+        expires_at: expires_at_after(lifetime),
+        lifetime,
         scope,
     }
 }
 
+/// Whether more time remains on `token` than the lifetime-bounded refresh
+/// buffer (see [`effective_refresh_buffer`](super::oauth::effective_refresh_buffer)).
 fn is_token_valid(token: &CachedAuthCodeToken, buffer: Duration) -> bool {
-    token
-        .expires_at
-        .checked_sub(buffer)
-        .is_some_and(|effective| Instant::now() < effective)
+    instant_token_is_fresh(token.expires_at, token.lifetime, buffer)
 }
 
 #[async_trait]
@@ -1866,6 +1869,12 @@ pub struct OAuthAuthCodeConfig {
     /// Port for the local callback server. Default: random available port.
     pub callback_port: Option<u16>,
     /// Buffer before token expiry to trigger refresh. Default: 30 seconds.
+    ///
+    /// The buffer applied to a given token is capped at half of the lifetime
+    /// it was issued with (`min(refresh_buffer, expires_in / 2)`), so a token
+    /// issued for less than twice the buffer is still used until its last
+    /// half instead of being refreshed on every call. A token is never used
+    /// once it has expired.
     pub refresh_buffer: Duration,
     /// Custom reqwest client.
     pub http_client: Option<reqwest::Client>,
@@ -3013,6 +3022,7 @@ mod tests {
             access_token: "token".into(),
             refresh_token: None,
             expires_at: Instant::now() + Duration::from_secs(300),
+            lifetime: Duration::from_secs(3600),
             scope: None,
         };
         assert!(is_token_valid(&valid, Duration::from_secs(30)));
@@ -3021,6 +3031,7 @@ mod tests {
             access_token: "token".into(),
             refresh_token: None,
             expires_at: Instant::now() + Duration::from_secs(10),
+            lifetime: Duration::from_secs(3600),
             scope: None,
         };
         assert!(!is_token_valid(&expiring, Duration::from_secs(30)));
@@ -3123,6 +3134,15 @@ mod tests {
         token_endpoint: String,
         cache: CachedAuthCodeToken,
     ) -> OAuthAuthorizationCode {
+        test_provider_with_cached_token_and_buffer(token_endpoint, cache, Duration::from_secs(30))
+    }
+
+    /// [`test_provider_with_cached_token`] with a configured refresh buffer.
+    fn test_provider_with_cached_token_and_buffer(
+        token_endpoint: String,
+        cache: CachedAuthCodeToken,
+        refresh_buffer: Duration,
+    ) -> OAuthAuthorizationCode {
         OAuthAuthorizationCode {
             inner: Arc::new(OAuthAuthCodeInner {
                 authorization_url: "https://auth.example.com/authorize".to_string(),
@@ -3135,7 +3155,7 @@ mod tests {
                 state: "state".to_string(),
                 redirect_uri: "http://127.0.0.1:0/callback".to_string(),
                 scopes: None,
-                refresh_buffer: Duration::from_secs(30),
+                refresh_buffer,
                 refresh_scope_policy: OAuthRefreshScopePolicy::default(),
                 client: reqwest::Client::new(),
                 cache: RwLock::new(Some(cache)),
@@ -3158,6 +3178,7 @@ mod tests {
                 access_token: "expired-access-token".to_string(),
                 refresh_token: Some("dead-refresh-token".to_string()),
                 expires_at: Instant::now() - Duration::from_secs(1),
+                lifetime: Duration::from_secs(3600),
                 scope: None,
             },
         );
@@ -3186,6 +3207,7 @@ mod tests {
                 access_token: "still-valid-access-token".to_string(),
                 refresh_token: Some("refresh-token".to_string()),
                 expires_at: Instant::now() + Duration::from_secs(3600),
+                lifetime: Duration::from_secs(3600),
                 scope: None,
             },
         );
@@ -3216,6 +3238,7 @@ mod tests {
                 access_token: "still-valid-access-token".to_string(),
                 refresh_token: None,
                 expires_at: Instant::now() + Duration::from_secs(3600),
+                lifetime: Duration::from_secs(3600),
                 scope: None,
             },
         );
@@ -3228,6 +3251,210 @@ mod tests {
             message.contains("reauthorization"),
             "expected the error to say reauthorization is needed, got: {message}"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Lifetime-aware refresh buffer (#1646)
+    // -------------------------------------------------------------------
+
+    /// A token endpoint that answers refresh `n` with `refreshed-<n>`, a
+    /// rotated refresh token, and `expires_in: lifetime`.
+    async fn spawn_short_lived_refresh_server(
+        lifetime: u64,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        spawn_scripted_json_server(move |_body, index| {
+            (
+                "200 OK",
+                serde_json::json!({
+                    "access_token": format!("refreshed-{index}"),
+                    "token_type": "Bearer",
+                    "expires_in": lifetime,
+                    "refresh_token": format!("rotated-{index}"),
+                }),
+            )
+        })
+        .await
+    }
+
+    fn cached_token(
+        access_token: &str,
+        refresh_token: Option<&str>,
+        expires_at: Instant,
+        lifetime: u64,
+    ) -> CachedAuthCodeToken {
+        CachedAuthCodeToken {
+            access_token: access_token.to_string(),
+            refresh_token: refresh_token.map(str::to_string),
+            expires_at,
+            lifetime: Duration::from_secs(lifetime),
+            scope: None,
+        }
+    }
+
+    fn expired_with_refresh_token() -> CachedAuthCodeToken {
+        cached_token(
+            "expired-access-token",
+            Some("refresh-token"),
+            Instant::now() - Duration::from_secs(1),
+            3600,
+        )
+    }
+
+    #[test]
+    fn short_lived_token_validity_is_bounded_by_its_lifetime() {
+        let at = |secs: u64| Instant::now() + Duration::from_secs(secs);
+        let buffer = Duration::from_secs(30);
+        assert!(is_token_valid(&cached_token("t", None, at(20), 20), buffer));
+        assert!(is_token_valid(&cached_token("t", None, at(30), 30), buffer));
+        assert!(!is_token_valid(&cached_token("t", None, at(5), 20), buffer));
+        // A long-lived token keeps the full configured buffer.
+        assert!(!is_token_valid(
+            &cached_token("t", None, at(20), 3600),
+            buffer
+        ));
+        // Expired with a zero effective buffer is still unusable.
+        assert!(!is_token_valid(
+            &cached_token("t", None, Instant::now() - Duration::from_secs(1), 1),
+            Duration::ZERO
+        ));
+    }
+
+    /// #1646: a refreshed token issued for 30 seconds or less used to be
+    /// inside the default 30-second window on arrival, so every call
+    /// refreshed again and rotated the refresh token.
+    #[tokio::test]
+    async fn short_lived_tokens_are_refreshed_once_for_back_to_back_calls() {
+        for lifetime in [1, 20, 30] {
+            let (base, bodies) = spawn_short_lived_refresh_server(lifetime).await;
+            let provider = test_provider_with_cached_token(
+                format!("{base}/token"),
+                expired_with_refresh_token(),
+            );
+            for _ in 0..5 {
+                assert_eq!(
+                    TokenProvider::get_token(&provider).await.unwrap(),
+                    "refreshed-0",
+                    "lifetime={lifetime}s"
+                );
+            }
+            assert_eq!(bodies.lock().unwrap().len(), 1, "lifetime={lifetime}s");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_expired_short_lived_token_is_refreshed_again() {
+        let (base, bodies) = spawn_short_lived_refresh_server(1).await;
+        let provider =
+            test_provider_with_cached_token(format!("{base}/token"), expired_with_refresh_token());
+        assert_eq!(
+            TokenProvider::get_token(&provider).await.unwrap(),
+            "refreshed-0"
+        );
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        assert_eq!(
+            TokenProvider::get_token(&provider).await.unwrap(),
+            "refreshed-1"
+        );
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        // The second refresh used the rotated refresh token.
+        assert_eq!(
+            form_field(&bodies[1], "refresh_token").as_deref(),
+            Some("rotated-0")
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_and_large_buffers_reuse_short_lived_tokens() {
+        for buffer in [Duration::ZERO, Duration::from_secs(3600)] {
+            let (base, bodies) = spawn_short_lived_refresh_server(20).await;
+            let provider = test_provider_with_cached_token_and_buffer(
+                format!("{base}/token"),
+                expired_with_refresh_token(),
+                buffer,
+            );
+            for _ in 0..5 {
+                assert_eq!(
+                    TokenProvider::get_token(&provider).await.unwrap(),
+                    "refreshed-0"
+                );
+            }
+            assert_eq!(bodies.lock().unwrap().len(), 1, "buffer={buffer:?}");
+        }
+    }
+
+    /// Without a refresh token, a freshly issued short-lived token used to be
+    /// rejected outright as needing reauthorization.
+    #[tokio::test]
+    async fn short_lived_token_without_refresh_token_is_served_until_it_expires() {
+        let provider = test_provider_with_cached_token(
+            "http://127.0.0.1:0/token".to_string(),
+            cached_token(
+                "short-lived",
+                None,
+                Instant::now() + Duration::from_secs(20),
+                20,
+            ),
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                TokenProvider::get_token(&provider).await.unwrap(),
+                "short-lived"
+            );
+        }
+
+        let expired = test_provider_with_cached_token(
+            "http://127.0.0.1:0/token".to_string(),
+            cached_token(
+                "short-lived",
+                None,
+                Instant::now() - Duration::from_secs(1),
+                20,
+            ),
+        );
+        let message = TokenProvider::get_token(&expired)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("reauthorization"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn invalidate_forces_a_refresh_of_a_fresh_short_lived_token() {
+        let (base, bodies) = spawn_short_lived_refresh_server(20).await;
+        let provider =
+            test_provider_with_cached_token(format!("{base}/token"), expired_with_refresh_token());
+        assert_eq!(
+            TokenProvider::get_token(&provider).await.unwrap(),
+            "refreshed-0"
+        );
+
+        provider.invalidate().await;
+
+        assert_eq!(
+            TokenProvider::get_token(&provider).await.unwrap(),
+            "refreshed-1"
+        );
+        assert_eq!(bodies.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_callers_share_one_refresh_of_a_short_lived_token() {
+        let (base, bodies) = spawn_short_lived_refresh_server(20).await;
+        let provider =
+            test_provider_with_cached_token(format!("{base}/token"), expired_with_refresh_token());
+        let tasks: Vec<_> = (0..16)
+            .map(|_| {
+                let provider = provider.clone();
+                tokio::spawn(async move { TokenProvider::get_token(&provider).await.unwrap() })
+            })
+            .collect();
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), "refreshed-0");
+        }
+        assert_eq!(bodies.lock().unwrap().len(), 1);
     }
 
     /// A local JSON endpoint (token or registration) that answers each
@@ -3325,6 +3552,7 @@ mod tests {
                 access_token: "expired-access-token".to_string(),
                 refresh_token: Some("refresh-token".to_string()),
                 expires_at: Instant::now() - Duration::from_secs(1),
+                lifetime: Duration::from_secs(3600),
                 scope: Some("read".to_string()),
             },
         );
@@ -3392,6 +3620,7 @@ mod tests {
             access_token: "expired-access-token".to_string(),
             refresh_token: Some("refresh-token".to_string()),
             expires_at: Instant::now() - Duration::from_secs(1),
+            lifetime: Duration::from_secs(3600),
             scope: scope.map(str::to_string),
         }
     }
@@ -3601,6 +3830,7 @@ mod tests {
                 access_token: "expired-access-token".to_string(),
                 refresh_token: Some("refresh-token".to_string()),
                 expires_at: Instant::now() - Duration::from_secs(1),
+                lifetime: Duration::from_secs(3600),
                 scope: Some("read write".to_string()),
             },
         );
@@ -3636,6 +3866,7 @@ mod tests {
                 access_token: String::new(),
                 refresh_token: None,
                 expires_at: Instant::now(),
+                lifetime: Duration::from_secs(3600),
                 scope: None,
             },
         );

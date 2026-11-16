@@ -15,7 +15,8 @@ use tokio::sync::{Mutex, RwLock, oneshot};
 
 use super::oauth::{
     OAuthBearerChallenge, OAuthClientError, OAuthRefreshScopePolicy, OAuthScopeEscalationHandler,
-    OAuthScopeEscalationRequest, OAuthTokenEndpointAuthMethod, TokenProvider, unix_time,
+    OAuthScopeEscalationRequest, OAuthTokenEndpointAuthMethod, TokenProvider, token_is_fresh,
+    unix_time,
 };
 use super::oauth_authcode::{
     OAuthAuthorizationServerMetadata, OAuthClientRegistration, OAuthClientRegistrationMethod,
@@ -256,6 +257,19 @@ pub struct OAuthStoredToken {
     /// This is [`u64::MAX`] when the authorization server did not advertise
     /// an `expires_in` lifetime.
     pub expires_at: u64,
+    /// Lifetime in seconds the token was issued with: the token response's
+    /// `expires_in`, or `None` when the authorization server sent none.
+    ///
+    /// The flow caps its refresh buffer at half of this lifetime
+    /// (`min(refresh_buffer, expires_in / 2)`), so a short-lived token is not
+    /// refreshed on every call.
+    ///
+    /// Records persisted before this field existed deserialize with `None`.
+    /// Their lifetime is not inferred from `expires_at`; the configured
+    /// refresh buffer applies to them unchanged, as it did when they were
+    /// written, until their next refresh records a lifetime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in: Option<u64>,
     /// Scopes represented by this token.
     pub scopes: Vec<String>,
 }
@@ -270,6 +284,7 @@ impl fmt::Debug for OAuthStoredToken {
                 &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
             )
             .field("expires_at", &self.expires_at)
+            .field("expires_in", &self.expires_in)
             .field("scopes", &self.scopes)
             .finish()
     }
@@ -721,7 +736,15 @@ impl OAuthAuthorizationFlowBuilder {
         self
     }
 
-    /// Set the pre-expiry refresh buffer.
+    /// Set the pre-expiry refresh buffer. Default: 30 seconds.
+    ///
+    /// The buffer applied to a given token is capped at half of the lifetime
+    /// it was issued with (`min(buffer, expires_in / 2)`), so a token issued
+    /// for less than twice the buffer is used until its last half instead of
+    /// being refreshed on every call. A token is never used once it has
+    /// expired. A persisted [`OAuthStoredToken`] without a recorded
+    /// [`expires_in`](OAuthStoredToken::expires_in) uses this buffer
+    /// unchanged.
     pub fn refresh_buffer(mut self, buffer: Duration) -> Self {
         self.refresh_buffer = buffer;
         self
@@ -1941,12 +1964,26 @@ fn token_from_response(
             .expires_in
             .map(|lifetime| unix_time().saturating_add(lifetime))
             .unwrap_or(u64::MAX),
+        expires_in: response.expires_in,
         scopes,
     })
 }
 
 fn token_is_valid(token: &OAuthStoredToken, buffer: Duration) -> bool {
-    unix_time().saturating_add(buffer.as_secs()) < token.expires_at
+    token_is_valid_at(token, buffer, unix_time())
+}
+
+/// Whether `token` is still served at Unix time `now`: more time remains than
+/// the lifetime-bounded refresh buffer (see
+/// [`effective_refresh_buffer`](super::oauth::effective_refresh_buffer)). A
+/// record without [`expires_in`](OAuthStoredToken::expires_in) uses the
+/// configured buffer unchanged.
+fn token_is_valid_at(token: &OAuthStoredToken, buffer: Duration, now: u64) -> bool {
+    token_is_fresh(
+        Duration::from_secs(token.expires_at.saturating_sub(now)),
+        token.expires_in.map(Duration::from_secs),
+        buffer,
+    )
 }
 
 /// Whether `a` and `b` are different credentials rather than the same token
@@ -2192,6 +2229,7 @@ mod tests {
         no_resource_scopes: bool,
         registration_response: Option<serde_json::Value>,
         no_registration_endpoint: bool,
+        token_lifetime: Option<u64>,
     }
 
     impl MockOAuthHttp {
@@ -2206,7 +2244,15 @@ mod tests {
                 no_resource_scopes: false,
                 registration_response: None,
                 no_registration_endpoint: false,
+                token_lifetime: None,
             }
+        }
+
+        /// Code exchanges (unless [`expiring`](Self::expiring)) and plain
+        /// refreshes issue tokens with this `expires_in` instead of 3600.
+        fn token_lifetime(mut self, seconds: u64) -> Self {
+            self.token_lifetime = Some(seconds);
+            self
         }
 
         /// The 401 challenge carries no `scope` and the protected-resource
@@ -2453,7 +2499,7 @@ mod tests {
                                 serde_json::json!({
                                     "access_token": "refreshed-token",
                                     "token_type": "Bearer",
-                                    "expires_in": 3600,
+                                    "expires_in": self.token_lifetime.unwrap_or(3600),
                                     "scope": scope
                                 }),
                             )),
@@ -2468,7 +2514,11 @@ mod tests {
                             serde_json::json!({
                                 "access_token": format!("access-token-{request_number}"),
                                 "token_type": "Bearer",
-                                "expires_in": if self.expire_initial_token { 0 } else { 3600 },
+                                "expires_in": if self.expire_initial_token {
+                                    0
+                                } else {
+                                    self.token_lifetime.unwrap_or(3600)
+                                },
                                 "refresh_token": refresh_token,
                                 "scope": scope
                             }),
@@ -3278,6 +3328,7 @@ mod tests {
             access_token: "stale-discovered-token".to_string(),
             refresh_token: None,
             expires_at: u64::MAX,
+            expires_in: None,
             scopes: vec![],
         };
         tokens
@@ -3811,6 +3862,361 @@ mod tests {
         assert!(token_is_valid(&stored, Duration::ZERO));
     }
 
+    // -------------------------------------------------------------------
+    // Lifetime-aware refresh buffer (#1646)
+    // -------------------------------------------------------------------
+
+    fn stored_token(expires_at: u64, expires_in: Option<u64>) -> OAuthStoredToken {
+        OAuthStoredToken {
+            access_token: "stored".to_string(),
+            refresh_token: None,
+            expires_at,
+            expires_in,
+            scopes: vec![],
+        }
+    }
+
+    #[test]
+    fn stored_token_validity_is_bounded_by_its_lifetime() {
+        const NOW: u64 = 1_000_000;
+        let default = Duration::from_secs(30);
+        let valid = |token: OAuthStoredToken, buffer: Duration, now: u64| {
+            token_is_valid_at(&token, buffer, now)
+        };
+
+        // Short-lived tokens are usable on issuance and until their last half.
+        assert!(valid(stored_token(NOW + 1, Some(1)), default, NOW));
+        assert!(!valid(stored_token(NOW + 1, Some(1)), default, NOW + 1));
+        assert!(valid(stored_token(NOW + 20, Some(20)), default, NOW));
+        assert!(valid(stored_token(NOW + 20, Some(20)), default, NOW + 9));
+        assert!(!valid(stored_token(NOW + 20, Some(20)), default, NOW + 10));
+        assert!(valid(stored_token(NOW + 30, Some(30)), default, NOW));
+        assert!(!valid(stored_token(NOW + 30, Some(30)), default, NOW + 15));
+        // Truly expired.
+        assert!(!valid(stored_token(NOW, Some(20)), default, NOW + 25));
+
+        // A long-lived token keeps the full configured buffer.
+        assert!(!valid(stored_token(NOW + 30, Some(3600)), default, NOW));
+        assert!(valid(stored_token(NOW + 31, Some(3600)), default, NOW));
+
+        // Zero buffer: usable until expiry, never at or after it.
+        assert!(valid(
+            stored_token(NOW + 1, Some(3600)),
+            Duration::ZERO,
+            NOW
+        ));
+        assert!(!valid(stored_token(NOW, Some(3600)), Duration::ZERO, NOW));
+
+        // A large buffer is capped at half the lifetime.
+        let large = Duration::from_secs(86_400);
+        assert!(valid(stored_token(NOW + 3600, Some(3600)), large, NOW));
+        assert!(!valid(
+            stored_token(NOW + 3600, Some(3600)),
+            large,
+            NOW + 1800
+        ));
+
+        // No `expires_in` from the server: never expires, as before.
+        assert!(valid(stored_token(u64::MAX, None), large, NOW));
+
+        // A record persisted before `expires_in` was recorded: the
+        // configured buffer applies unchanged.
+        assert!(!valid(stored_token(NOW + 20, None), default, NOW));
+        assert!(valid(stored_token(NOW + 31, None), default, NOW));
+
+        // `invalidate()` zeroes `expires_at`, which is unusable under any
+        // buffer.
+        assert!(!valid(stored_token(0, Some(1)), Duration::ZERO, NOW));
+    }
+
+    #[test]
+    fn stored_token_records_without_a_lifetime_still_load() {
+        let legacy = serde_json::json!({
+            "access_token": "a",
+            "refresh_token": "r",
+            "expires_at": 1_000_020,
+            "scopes": ["challenge.scope"]
+        });
+        let token: OAuthStoredToken = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(token.expires_in, None);
+        assert_eq!(token.expires_at, 1_000_020);
+        // Re-serializing a legacy record does not invent a lifetime.
+        assert_eq!(serde_json::to_value(&token).unwrap(), legacy);
+
+        let current = OAuthStoredToken {
+            expires_in: Some(20),
+            ..token
+        };
+        let json = serde_json::to_value(&current).unwrap();
+        assert_eq!(json["expires_in"], 20);
+        let restored: OAuthStoredToken = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, current);
+    }
+
+    /// #1646: a token issued for 30 seconds or less used to be inside the
+    /// default 30-second window on arrival, so every call refreshed again.
+    #[tokio::test]
+    async fn short_lived_tokens_are_not_refreshed_on_every_call() {
+        for lifetime in [20, 30] {
+            // Straight from the code exchange.
+            let http = MockOAuthHttp::new(RegistrationMode::Dynamic).token_lifetime(lifetime);
+            let flow = flow_builder(
+                http.clone(),
+                dynamic_options(),
+                AutomaticAuthorizationHandler::default(),
+            )
+            .build()
+            .unwrap();
+            flow.authorize(["challenge.scope"]).await.unwrap();
+            for _ in 0..5 {
+                assert_eq!(flow.get_token().await.unwrap(), "access-token-0");
+            }
+            assert_eq!(http.token_requests().await, 1, "lifetime={lifetime}s");
+
+            // From a refresh.
+            let http = MockOAuthHttp::new(RegistrationMode::Dynamic)
+                .expiring()
+                .token_lifetime(lifetime);
+            let flow = flow_builder(
+                http.clone(),
+                dynamic_options(),
+                AutomaticAuthorizationHandler::default(),
+            )
+            .build()
+            .unwrap();
+            flow.authorize(["challenge.scope"]).await.unwrap();
+            for _ in 0..5 {
+                assert_eq!(flow.get_token().await.unwrap(), "refreshed-token");
+            }
+            assert_eq!(http.token_requests().await, 2, "lifetime={lifetime}s");
+        }
+    }
+
+    /// The flow records expiry in whole Unix seconds, so a 1-second token can
+    /// lapse at the next second boundary however recently it was issued.
+    /// Five back-to-back calls cross at most one boundary, so at most one
+    /// refresh follows the code exchange, where the fixed 30-second buffer
+    /// refreshed on every call. `stored_token_validity_is_bounded_by_its_lifetime`
+    /// covers the 1-second boundary exactly with a fixed clock.
+    #[tokio::test]
+    async fn one_second_tokens_are_not_refreshed_on_every_call() {
+        let http = MockOAuthHttp::new(RegistrationMode::Dynamic).token_lifetime(1);
+        let flow = flow_builder(
+            http.clone(),
+            dynamic_options(),
+            AutomaticAuthorizationHandler::default(),
+        )
+        .build()
+        .unwrap();
+        flow.authorize(["challenge.scope"]).await.unwrap();
+        for _ in 0..5 {
+            flow.get_token().await.unwrap();
+        }
+        let requests = http.token_requests().await;
+        assert!(requests <= 2, "{requests} token requests for 5 calls");
+    }
+
+    #[tokio::test]
+    async fn an_expired_short_lived_token_is_refreshed() {
+        let http = MockOAuthHttp::new(RegistrationMode::Dynamic).token_lifetime(1);
+        let flow = flow_builder(
+            http.clone(),
+            dynamic_options(),
+            AutomaticAuthorizationHandler::default(),
+        )
+        .build()
+        .unwrap();
+        flow.authorize(["challenge.scope"]).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+
+        assert_eq!(flow.get_token().await.unwrap(), "refreshed-token");
+        assert_eq!(http.token_requests().await, 2);
+    }
+
+    #[tokio::test]
+    async fn zero_and_large_buffers_reuse_short_lived_tokens() {
+        for buffer in [Duration::ZERO, Duration::from_secs(86_400)] {
+            let http = MockOAuthHttp::new(RegistrationMode::Dynamic).token_lifetime(20);
+            let flow = flow_builder(
+                http.clone(),
+                dynamic_options(),
+                AutomaticAuthorizationHandler::default(),
+            )
+            .refresh_buffer(buffer)
+            .build()
+            .unwrap();
+            flow.authorize(["challenge.scope"]).await.unwrap();
+            for _ in 0..5 {
+                assert_eq!(flow.get_token().await.unwrap(), "access-token-0");
+            }
+            assert_eq!(http.token_requests().await, 1, "buffer={buffer:?}");
+        }
+    }
+
+    /// Authorize once with a first flow, then rewrite the persisted token
+    /// with `edit`, as a store written earlier (or by an older release)
+    /// would hold it. Returns the stores to rebuild a flow against.
+    async fn persisted_token_stores(
+        http: MockOAuthHttp,
+        edit: impl FnOnce(&mut OAuthStoredToken),
+    ) -> (
+        MemoryOAuthTokenStore,
+        super::super::oauth_authcode::MemoryOAuthClientRegistrationStore,
+        OAuthTokenBinding,
+    ) {
+        let tokens = MemoryOAuthTokenStore::new();
+        let registrations = super::super::oauth_authcode::MemoryOAuthClientRegistrationStore::new();
+        let first = flow_builder(
+            http,
+            dynamic_options(),
+            AutomaticAuthorizationHandler::default(),
+        )
+        .registration_store(registrations.clone())
+        .token_store(tokens.clone())
+        .build()
+        .unwrap();
+        first.authorize(["challenge.scope"]).await.unwrap();
+
+        let binding = OAuthTokenBinding {
+            resource: "https://mcp.example.com/mcp".to_string(),
+            issuer: "https://auth.example.com/issuer".to_string(),
+            client_id: "dynamic-client".to_string(),
+        };
+        let mut token = tokens.load(&binding).await.unwrap().unwrap();
+        edit(&mut token);
+        tokens.save(&binding, &token).await.unwrap();
+        (tokens, registrations, binding)
+    }
+
+    /// A restored short-lived token without a refresh token used to fall
+    /// outside the 30-second window and send `begin()` back to a new
+    /// authorization.
+    #[tokio::test]
+    async fn restored_short_lived_token_is_used_without_refresh_or_reauthorization() {
+        let (tokens, registrations, _) =
+            persisted_token_stores(MockOAuthHttp::new(RegistrationMode::Dynamic), |token| {
+                token.access_token = "restored-short-lived".to_string();
+                token.refresh_token = None;
+                token.expires_at = unix_time() + 20;
+                token.expires_in = Some(20);
+            })
+            .await;
+
+        let http = MockOAuthHttp::new(RegistrationMode::Dynamic);
+        let handler = AutomaticAuthorizationHandler::default();
+        let calls = handler.calls.clone();
+        let restored = flow_builder(http.clone(), dynamic_options(), handler)
+            .registration_store(registrations)
+            .token_store(tokens)
+            .build()
+            .unwrap();
+
+        let start = restored.begin(["challenge.scope"]).await.unwrap();
+        assert!(matches!(start, OAuthAuthorizationStart::Authorized { .. }));
+        assert_eq!(restored.get_token().await.unwrap(), "restored-short-lived");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(http.token_requests().await, 0);
+    }
+
+    /// A record persisted before `expires_in` existed has no known lifetime.
+    /// It is judged against the configured buffer, as it was when written,
+    /// rather than against a lifetime guessed from `expires_at`.
+    #[tokio::test]
+    async fn restored_legacy_record_uses_the_configured_buffer() {
+        // 20 seconds left, inside the 30-second buffer: refreshed.
+        let (tokens, registrations, binding) =
+            persisted_token_stores(MockOAuthHttp::new(RegistrationMode::Dynamic), |token| {
+                token.expires_at = unix_time() + 20;
+                token.expires_in = None;
+            })
+            .await;
+        let http = MockOAuthHttp::new(RegistrationMode::Dynamic);
+        let restored = flow_builder(
+            http.clone(),
+            dynamic_options(),
+            AutomaticAuthorizationHandler::default(),
+        )
+        .registration_store(registrations)
+        .token_store(tokens.clone())
+        .build()
+        .unwrap();
+        let start = restored.begin(["challenge.scope"]).await.unwrap();
+        assert!(matches!(start, OAuthAuthorizationStart::Authorized { .. }));
+        assert_eq!(restored.get_token().await.unwrap(), "refreshed-token");
+        assert_eq!(http.token_requests().await, 1);
+        // The refreshed record carries its lifetime from now on.
+        let saved = tokens.load(&binding).await.unwrap().unwrap();
+        assert_eq!(saved.expires_in, Some(3600));
+
+        // An hour left: used as is.
+        let (tokens, registrations, _) =
+            persisted_token_stores(MockOAuthHttp::new(RegistrationMode::Dynamic), |token| {
+                token.access_token = "legacy-long-lived".to_string();
+                token.expires_at = unix_time() + 3600;
+                token.expires_in = None;
+            })
+            .await;
+        let http = MockOAuthHttp::new(RegistrationMode::Dynamic);
+        let restored = flow_builder(
+            http.clone(),
+            dynamic_options(),
+            AutomaticAuthorizationHandler::default(),
+        )
+        .registration_store(registrations)
+        .token_store(tokens)
+        .build()
+        .unwrap();
+        restored.begin(["challenge.scope"]).await.unwrap();
+        assert_eq!(restored.get_token().await.unwrap(), "legacy-long-lived");
+        assert_eq!(http.token_requests().await, 0);
+    }
+
+    #[tokio::test]
+    async fn invalidate_forces_a_refresh_of_a_fresh_short_lived_token() {
+        let http = MockOAuthHttp::new(RegistrationMode::Dynamic).token_lifetime(20);
+        let flow = flow_builder(
+            http.clone(),
+            dynamic_options(),
+            AutomaticAuthorizationHandler::default(),
+        )
+        .build()
+        .unwrap();
+        flow.authorize(["challenge.scope"]).await.unwrap();
+        assert_eq!(flow.get_token().await.unwrap(), "access-token-0");
+
+        flow.invalidate().await;
+
+        assert_eq!(flow.get_token().await.unwrap(), "refreshed-token");
+        assert_eq!(http.token_requests().await, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_callers_share_one_refresh_of_a_short_lived_token() {
+        let http = MockOAuthHttp::new(RegistrationMode::Dynamic)
+            .expiring()
+            .token_lifetime(20);
+        let flow = flow_builder(
+            http.clone(),
+            dynamic_options(),
+            AutomaticAuthorizationHandler::default(),
+        )
+        .build()
+        .unwrap();
+        flow.authorize(["challenge.scope"]).await.unwrap();
+        let tasks: Vec<_> = (0..16)
+            .map(|_| {
+                let flow = flow.clone();
+                tokio::spawn(async move { flow.get_token().await.unwrap() })
+            })
+            .collect();
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), "refreshed-token");
+        }
+        // The code exchange plus a single refresh.
+        assert_eq!(http.token_requests().await, 2);
+    }
+
     /// #1472: when the shared store already holds a different, valid token
     /// for this binding, `get_token` must adopt it instead of spending a
     /// network round trip on a refresh.
@@ -3839,6 +4245,7 @@ mod tests {
             access_token: "externally-refreshed-token".to_string(),
             refresh_token: Some("externally-refreshed-refresh-token".to_string()),
             expires_at: unix_time() + 3600,
+            expires_in: Some(3600),
             scopes: vec!["challenge.scope".to_string()],
         };
         tokens.save(&binding, &newer).await.unwrap();
@@ -3900,6 +4307,7 @@ mod tests {
             access_token: "winner-access-token".to_string(),
             refresh_token: Some("winner-refresh-token".to_string()),
             expires_at: unix_time() + 3600,
+            expires_in: Some(3600),
             scopes: vec!["challenge.scope".to_string()],
         };
         let http = RaceOnRefreshHttp {
