@@ -46,6 +46,7 @@ use super::oauth::{
     OAuthBearerChallenge, OAuthClientError, OAuthRefreshScopePolicy, OAuthTokenEndpointAuthMethod,
     TokenProvider, expires_at_after, instant_token_is_fresh, unix_time,
 };
+use super::oauth_address::{AddressGuard, OAuthAddressPolicy, address_blocked_in};
 
 // =============================================================================
 // PKCE (RFC 7636)
@@ -156,6 +157,9 @@ impl OAuthAuthorizationDiscovery {
 
 /// Discover the authorization server metadata from the MCP server's
 /// Protected Resource Metadata (RFC 9728) or directly from well-known.
+///
+/// Applies the default [`OAuthAddressPolicy`] to server-supplied URLs; see
+/// [`discover_oauth_authorization`].
 pub async fn discover_oauth_authorization_server(
     server_url: &str,
     client: &reqwest::Client,
@@ -173,11 +177,9 @@ pub async fn probe_oauth_bearer_challenge(
     resource_url: &str,
     client: &reqwest::Client,
 ) -> Result<Option<OAuthBearerChallenge>, OAuthClientError> {
-    let response = client
-        .get(resource_url)
-        .send()
-        .await
-        .map_err(|e| OAuthClientError::Discovery(e.to_string()))?;
+    let response = client.get(resource_url).send().await.map_err(|error| {
+        address_blocked_in(&error).unwrap_or_else(|| OAuthClientError::Discovery(error.to_string()))
+    })?;
     Ok(response
         .headers()
         .get_all(reqwest::header::WWW_AUTHENTICATE)
@@ -197,10 +199,44 @@ pub async fn probe_oauth_bearer_challenge(
 /// treated as a hard failure; see `discover_protected_resource_metadata`.
 /// Authorization-server metadata discovery tries the RFC 8414 and OpenID
 /// Connect variants and validates exact issuer equality.
+///
+/// Every server-supplied URL (the challenge's `resource_metadata` and each
+/// issuer's metadata URLs) is checked against the default
+/// [`OAuthAddressPolicy`] before it is fetched, with host names resolved and
+/// every address checked. URLs on `server_url`'s own origin are exempt. Use
+/// [`discover_oauth_authorization_with_policy`] to configure the policy. A
+/// `client` built without [`OAuthAddressPolicy::resolver`] is not protected
+/// against DNS rebinding or redirects to host names.
 pub async fn discover_oauth_authorization(
     server_url: &str,
     challenge: Option<OAuthBearerChallenge>,
     client: &reqwest::Client,
+) -> Result<OAuthAuthorizationDiscovery, OAuthClientError> {
+    discover_oauth_authorization_with_policy(
+        server_url,
+        challenge,
+        client,
+        &OAuthAddressPolicy::default(),
+    )
+    .await
+}
+
+/// [`discover_oauth_authorization`] with an explicit [`OAuthAddressPolicy`].
+pub async fn discover_oauth_authorization_with_policy(
+    server_url: &str,
+    challenge: Option<OAuthBearerChallenge>,
+    client: &reqwest::Client,
+    policy: &OAuthAddressPolicy,
+) -> Result<OAuthAuthorizationDiscovery, OAuthClientError> {
+    let guard = AddressGuard::new(policy, server_url, true);
+    discover_with_guard(server_url, challenge, client, &guard).await
+}
+
+async fn discover_with_guard(
+    server_url: &str,
+    challenge: Option<OAuthBearerChallenge>,
+    client: &reqwest::Client,
+    guard: &AddressGuard,
 ) -> Result<OAuthAuthorizationDiscovery, OAuthClientError> {
     let challenge = match challenge {
         Some(challenge) => Some(challenge),
@@ -208,7 +244,7 @@ pub async fn discover_oauth_authorization(
     };
 
     let (metadata_url, protected_resource_metadata) =
-        discover_protected_resource_metadata(server_url, &challenge, client).await?;
+        discover_protected_resource_metadata(server_url, &challenge, client, guard).await?;
     if protected_resource_metadata.authorization_servers.is_empty() {
         return Err(OAuthClientError::Discovery(format!(
             "protected resource metadata at `{metadata_url}` omitted authorization_servers"
@@ -221,7 +257,7 @@ pub async fn discover_oauth_authorization(
     let mut authorization_servers = Vec::new();
     let mut last_error = None;
     for issuer in issuers {
-        match discover_authorization_server_from_issuer(&issuer, client).await {
+        match discover_authorization_server_from_issuer(&issuer, client, guard).await {
             Ok(metadata) => authorization_servers.push(metadata),
             Err(error) => last_error = Some(error),
         }
@@ -259,6 +295,7 @@ async fn discover_protected_resource_metadata(
     server_url: &str,
     challenge: &Option<OAuthBearerChallenge>,
     client: &reqwest::Client,
+    guard: &AddressGuard,
 ) -> Result<(String, OAuthProtectedResourceMetadata), OAuthClientError> {
     let mut attempts = Vec::new();
 
@@ -266,7 +303,7 @@ async fn discover_protected_resource_metadata(
         .as_ref()
         .and_then(|challenge| challenge.resource_metadata.as_ref())
     {
-        match fetch_matching_protected_resource(client, url, server_url).await {
+        match fetch_matching_protected_resource(client, url, server_url, guard).await {
             Ok(metadata) => return Ok((url.clone(), metadata)),
             Err(reason) => {
                 tracing::debug!(
@@ -280,7 +317,7 @@ async fn discover_protected_resource_metadata(
     }
 
     for url in protected_resource_metadata_urls(server_url)? {
-        match fetch_matching_protected_resource(client, &url, server_url).await {
+        match fetch_matching_protected_resource(client, &url, server_url, guard).await {
             Ok(metadata) => return Ok((url, metadata)),
             Err(reason) => {
                 tracing::debug!(%url, %reason, "OAuth protected-resource metadata candidate failed");
@@ -304,8 +341,9 @@ async fn fetch_matching_protected_resource(
     client: &reqwest::Client,
     url: &str,
     server_url: &str,
+    guard: &AddressGuard,
 ) -> Result<OAuthProtectedResourceMetadata, String> {
-    let metadata = fetch_json::<OAuthProtectedResourceMetadata>(client, url)
+    let metadata = fetch_json::<OAuthProtectedResourceMetadata>(client, url, guard)
         .await
         .map_err(discovery_reason)?;
     validate_resource_identifier(server_url, &metadata.resource).map_err(discovery_reason)?;
@@ -327,10 +365,11 @@ pub(crate) fn discovery_reason(error: OAuthClientError) -> String {
 async fn discover_authorization_server_from_issuer(
     issuer: &str,
     client: &reqwest::Client,
+    guard: &AddressGuard,
 ) -> Result<OAuthAuthorizationServerMetadata, OAuthClientError> {
     let mut last_error = None;
     for url in authorization_server_metadata_urls(issuer)? {
-        match fetch_json::<OAuthAuthorizationServerMetadata>(client, &url).await {
+        match fetch_json::<OAuthAuthorizationServerMetadata>(client, &url, guard).await {
             Ok(metadata) => {
                 validate_metadata_issuer(&metadata, issuer)?;
                 return Ok(metadata);
@@ -348,12 +387,12 @@ async fn discover_authorization_server_from_issuer(
 async fn fetch_json<T: serde::de::DeserializeOwned>(
     client: &reqwest::Client,
     url: &str,
+    guard: &AddressGuard,
 ) -> Result<T, OAuthClientError> {
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|error| OAuthClientError::Discovery(error.to_string()))?;
+    guard.check(url).await?;
+    let response = client.get(url).send().await.map_err(|error| {
+        address_blocked_in(&error).unwrap_or_else(|| OAuthClientError::Discovery(error.to_string()))
+    })?;
 
     // `error_for_status` only rejects 4xx/5xx, so a redirect-averse client
     // (`Policy::none()`) surfaces a 3xx here rather than an error. Report it
@@ -1388,13 +1427,20 @@ impl OAuthAuthorizationCode {
         scopes: &[&str],
         mut config: OAuthAuthCodeConfig,
     ) -> Result<Self, OAuthClientError> {
-        let client = config.http_client.take().unwrap_or_default();
+        let guard = AddressGuard::new(&config.address_policy, server_url, true);
+        let client = match config.http_client.take() {
+            Some(client) => client,
+            None => guard
+                .client_builder(true)
+                .build()
+                .map_err(|error| OAuthClientError::Http(error.to_string()))?,
+        };
 
         // Discover the protected resource and every advertised authorization
         // server. Applications can pin an issuer when the PRM advertises more
         // than one; otherwise the resource's preference order is retained.
         let discovery =
-            discover_oauth_authorization(server_url, config.challenge.take(), &client).await?;
+            discover_with_guard(server_url, config.challenge.take(), &client, &guard).await?;
 
         // An explicit override replaces the discovered resource everywhere
         // the RFC 8707 resource indicator is sent below: the authorize URL,
@@ -1424,6 +1470,8 @@ impl OAuthAuthorizationCode {
                 .ok_or_else(|| OAuthClientError::Discovery("no authorization server discovered".into()))?,
         };
         require_s256(&metadata)?;
+        // The token endpoint comes from server-supplied metadata too.
+        guard.check(&metadata.token_endpoint).await?;
         let token_endpoint_auth_method = OAuthTokenEndpointAuthMethod::select(
             &metadata.token_endpoint_auth_methods_supported,
             config.client_secret.is_some(),
@@ -1877,6 +1925,12 @@ pub struct OAuthAuthCodeConfig {
     /// once it has expired.
     pub refresh_buffer: Duration,
     /// Custom reqwest client.
+    ///
+    /// When omitted, the default client applies
+    /// [`address_policy`](Self::address_policy) at connect time and to every
+    /// redirect it follows. A client supplied here still gets the
+    /// pre-request address check, but not those two unless it was built with
+    /// [`OAuthAddressPolicy::resolver`] and a matching redirect policy.
     pub http_client: Option<reqwest::Client>,
     /// Bearer challenge already obtained from the protected resource.
     ///
@@ -1899,6 +1953,12 @@ pub struct OAuthAuthCodeConfig {
     /// Controls the `scope` parameter on refresh requests. Default:
     /// [`OAuthRefreshScopePolicy::SendGranted`].
     pub refresh_scope_policy: OAuthRefreshScopePolicy,
+    /// Address policy for server-supplied URLs (the challenge's
+    /// `resource_metadata`, issuer metadata URLs, redirects, and the token
+    /// endpoint). Default: [`OAuthAddressPolicy::default()`], which blocks
+    /// loopback, link-local, and private-network destinations outside
+    /// `server_url`'s own origin.
+    pub address_policy: OAuthAddressPolicy,
 }
 
 impl Default for OAuthAuthCodeConfig {
@@ -1913,6 +1973,7 @@ impl Default for OAuthAuthCodeConfig {
             preferred_authorization_server: None,
             resource: None,
             refresh_scope_policy: OAuthRefreshScopePolicy::default(),
+            address_policy: OAuthAddressPolicy::default(),
         }
     }
 }

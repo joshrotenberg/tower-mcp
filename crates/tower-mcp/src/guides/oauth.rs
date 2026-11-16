@@ -416,6 +416,60 @@ registration, and token calls through its own HTTP stack. Redirects must remain
 disabled: authorization endpoints are user-agent destinations, while metadata,
 registration, and token endpoint redirects can cross trust boundaries.
 
+### Server-supplied URLs and SSRF
+
+Discovery makes the client fetch URLs a remote party chose: the
+`resource_metadata` URL in a `WWW-Authenticate` challenge, each issuer in
+`authorization_servers`, and the token and registration endpoints in
+authorization server metadata. A malicious MCP server could use them to make a
+server-side client (a gateway or agent host) send requests to loopback, cloud
+metadata (`169.254.169.254`), or private-network services.
+
+`OAuthAddressPolicy` blocks those destinations by default in
+`OAuthAuthorizationFlow`, `OAuthAuthorizationCode`,
+`OAuthClientCredentials::discover`, and `discover_oauth_authorization`. It
+rejects loopback, link-local, RFC 1918, CGNAT, IPv6 unique local, unspecified,
+multicast, broadcast, and documentation/benchmark ranges, including IPv4-mapped
+and other IPv6 forms that embed those IPv4 addresses. The check runs on
+resolved addresses, not host strings: the default reqwest clients install a DNS
+resolver that checks every address at connect time (which also covers DNS
+rebinding and redirects to host names), and IP-literal URLs and redirect
+targets are checked directly.
+
+Two exemptions keep local and private deployments working:
+
+- A URL on the configured MCP server's own origin (scheme, host, and port) is
+  never checked.
+- When the configured server URL itself names a loopback host, loopback
+  destinations are allowed (a local MCP server with its authorization server on
+  another port). When it is a private IP literal, private destinations are
+  allowed. DNS answers for a configured host name never widen the policy.
+
+An authorization server reached through a private address from a public or
+host-named MCP server needs an explicit allowance:
+
+```rust
+use tower_mcp::client::{OAuthAddressPolicy, OAuthAuthorizationFlow, OAuthRedirectPolicy};
+
+fn build_flow() -> Result<OAuthAuthorizationFlow, tower_mcp::client::OAuthClientError> {
+    let policy = OAuthAddressPolicy::default()
+        .allow_host("sso.corp.example")
+        .allow_cidr("10.20.0.0/16")?;
+    OAuthAuthorizationFlow::builder("https://mcp.corp.example/mcp")
+        .redirect_policy(OAuthRedirectPolicy::loopback())
+        .address_policy(policy)
+        .build()
+}
+```
+
+`OAuthAddressPolicy::disabled()` turns the check off. A custom
+`OAuthHttpClient` still has IP literals and `localhost` checked before each
+request, but the flow cannot see how it resolves names; build its reqwest
+client with `OAuthAddressPolicy::resolver` (or use
+`ReqwestOAuthHttpClient::with_address_policy`) to enforce the policy on
+resolved addresses. If outbound traffic uses an HTTP proxy on a private
+address, allow the proxy host too.
+
 ## Service-to-service client credentials
 
 For a client acting on its own behalf, use `OAuthClientCredentials`. Discovery
@@ -498,8 +552,10 @@ security boundaries rather than identity-provider details.
 - Configure a bounded scope-escalation retry count and require explicit user
   interaction when the application is acting on behalf of a person.
 - Treat DCR as a compatibility fallback. Rate-limit registration and callback
-  endpoints, and apply SSRF controls when fetching CIMD, PRM, AS metadata, or
-  JWKS in custom infrastructure.
+  endpoints. Keep the client's `OAuthAddressPolicy` enabled and allow only the
+  specific private hosts or networks you need; apply equivalent SSRF controls
+  when fetching CIMD, PRM, AS metadata, or JWKS in custom infrastructure,
+  including a custom `OAuthHttpClient`.
 - Test missing, expired, wrong-issuer, wrong-audience, wrong-resource, missing
   scope, issuer-change, callback replay, and key-rotation cases before release.
 

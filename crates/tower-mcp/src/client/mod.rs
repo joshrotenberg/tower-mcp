@@ -57,6 +57,8 @@ mod http;
 #[cfg(feature = "oauth-client")]
 mod oauth;
 #[cfg(feature = "oauth-client")]
+mod oauth_address;
+#[cfg(feature = "oauth-client")]
 mod oauth_authcode;
 #[cfg(feature = "oauth-client")]
 mod oauth_flow;
@@ -78,14 +80,16 @@ pub use oauth::{
     TokenProvider,
 };
 #[cfg(feature = "oauth-client")]
+pub use oauth_address::{OAuthAddressPolicy, OAuthAddressResolver};
+#[cfg(feature = "oauth-client")]
 pub use oauth_authcode::{
     MemoryOAuthClientRegistrationStore, OAuthApplicationType, OAuthAuthCodeConfig,
     OAuthAuthorizationCode, OAuthAuthorizationDiscovery, OAuthAuthorizationServerMetadata,
     OAuthClientRegistration, OAuthClientRegistrationMethod, OAuthClientRegistrationOptions,
     OAuthClientRegistrationStore, OAuthDynamicClientRegistration, OAuthProtectedResourceMetadata,
     discover_oauth_authorization, discover_oauth_authorization_server,
-    probe_oauth_bearer_challenge, resolve_oauth_client_registration,
-    resolve_oauth_client_registration_with_store,
+    discover_oauth_authorization_with_policy, probe_oauth_bearer_challenge,
+    resolve_oauth_client_registration, resolve_oauth_client_registration_with_store,
 };
 #[cfg(feature = "oauth-client")]
 pub use oauth_flow::{
