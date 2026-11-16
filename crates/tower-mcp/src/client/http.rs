@@ -1228,21 +1228,85 @@ async fn read_bounded_body(
 /// never quoted in transport-generated errors or logs.
 const MAX_ERROR_BODY_SIZE: usize = 64 * 1024;
 
-/// Read a non-2xx response body up to [`MAX_ERROR_BODY_SIZE`], truncating
-/// rather than failing the request if the server sends more.
-async fn read_error_body(response: reqwest::Response) -> String {
+/// A non-2xx response body as [`read_error_body`] collected it.
+///
+/// Only a [`Complete`](Self::Complete) body may be decoded as a JSON-RPC
+/// error. A prefix of a longer document can be valid JSON on its own (a
+/// matching-id error padded out to the limit, then garbage), and a body that
+/// stopped early is not what the server sent, so neither carries protocol
+/// meaning (#1647).
+#[derive(Debug, PartialEq, Eq)]
+enum ErrorBody {
+    /// The whole body: its end was observed within the limit.
+    Complete(String),
+    /// The first `limit` bytes of a body that is longer, or whose end had
+    /// not been observed when the limit was reached. A diagnostic prefix
+    /// only, never decoded and never quoted.
+    Truncated(Vec<u8>),
+    /// Reading failed before the body ended.
+    ReadFailed,
+}
+
+impl ErrorBody {
+    /// The body decoded as a JSON-RPC error response, when it is complete
+    /// and is one.
+    fn jsonrpc_error(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::Complete(body) => serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .filter(is_jsonrpc_error_response),
+            Self::Truncated(prefix) => {
+                tracing::debug!(
+                    retained_bytes = prefix.len(),
+                    "HTTP error body reached the diagnostic limit; not decoded as JSON-RPC"
+                );
+                None
+            }
+            Self::ReadFailed => {
+                tracing::debug!("HTTP error body could not be read; not decoded as JSON-RPC");
+                None
+            }
+        }
+    }
+}
+
+/// Read a non-2xx response body, keeping at most [`MAX_ERROR_BODY_SIZE`]
+/// bytes and never failing the request over it.
+async fn read_error_body(response: reqwest::Response) -> ErrorBody {
+    read_error_body_limited(response, MAX_ERROR_BODY_SIZE).await
+}
+
+/// [`read_error_body`] with the limit as a parameter.
+///
+/// Reading stops as soon as the buffer reaches `limit`. At that point the
+/// body counts as complete only when `Content-Length` declares exactly that
+/// length; otherwise it is a truncated prefix. The reader never waits for an
+/// end of body or another chunk once the limit is reached, so a server that
+/// streams a diagnostic without end cannot hold the request open.
+async fn read_error_body_limited(response: reqwest::Response, limit: usize) -> ErrorBody {
     use futures::StreamExt;
+    let declared_len = response.content_length();
     let mut stream = response.bytes_stream();
     let mut buf = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let Ok(chunk) = chunk else { break };
+        let Ok(chunk) = chunk else {
+            return ErrorBody::ReadFailed;
+        };
+        let room = limit - buf.len();
+        if chunk.len() > room {
+            buf.extend_from_slice(&chunk[..room]);
+            return ErrorBody::Truncated(buf);
+        }
         buf.extend_from_slice(&chunk);
-        if buf.len() > MAX_ERROR_BODY_SIZE {
-            buf.truncate(MAX_ERROR_BODY_SIZE);
-            break;
+        if buf.len() == limit {
+            return if declared_len == Some(limit as u64) {
+                ErrorBody::Complete(String::from_utf8_lossy(&buf).into_owned())
+            } else {
+                ErrorBody::Truncated(buf)
+            };
         }
     }
-    String::from_utf8_lossy(&buf).into_owned()
+    ErrorBody::Complete(String::from_utf8_lossy(&buf).into_owned())
 }
 
 fn operation_label(parsed: Option<&serde_json::Value>) -> String {
@@ -1535,10 +1599,9 @@ impl ClientTransport for HttpClientTransport {
                     // session signal, since any id it carries is the server's
                     // and could match one of the client's own pending
                     // requests.
-                    if !body.is_empty()
-                        && let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&body)
-                        && is_jsonrpc_error_response(&v)
-                    {
+                    // Only a complete body is decoded: a truncated prefix or
+                    // a failed read stays a status-only error (#1647).
+                    if let Some(mut v) = body.jsonrpc_error() {
                         let is_session_signal =
                             v.pointer("/error/code").and_then(|c| c.as_i64()) == Some(-32005);
                         if reply_id.is_none() && !is_session_signal {
@@ -1740,10 +1803,7 @@ impl ClientTransport for HttpClientTransport {
         if !status.is_success() {
             let status_error = http_status_error(status, response.headers());
             let body = read_error_body(response).await;
-            if is_modern_request
-                && let Ok(mut error) = serde_json::from_str::<serde_json::Value>(&body)
-                && is_jsonrpc_error_response(&error)
-            {
+            if is_modern_request && let Some(mut error) = body.jsonrpc_error() {
                 if let Some(id) = parsed_message.as_ref().and_then(|value| value.get("id"))
                     && !error
                         .get("id")
@@ -4233,5 +4293,596 @@ mod tests {
             &url("https://example.com/mcp"),
             true,
         ));
+    }
+
+    // =========================================================================
+    // #1647: only a complete error body is decoded as JSON-RPC
+    // =========================================================================
+
+    mod truncated_error_body {
+        use super::*;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        const LIMIT: usize = MAX_ERROR_BODY_SIZE;
+        const WAIT: Duration = Duration::from_secs(5);
+
+        /// A JSON-RPC error carrying a sentinel message, so a test can tell
+        /// the server's error from one the transport made up.
+        fn error_json(id: &str, code: i64) -> String {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"error":{{"code":{code},"message":"server sentinel"}}}}"#
+            )
+        }
+
+        /// `json` followed by spaces up to `len` bytes: still valid JSON.
+        fn padded_to(json: &str, len: usize) -> String {
+            format!("{json}{}", " ".repeat(len - json.len()))
+        }
+
+        /// The issue's fixture: a valid matching-id error padded to exactly
+        /// the limit, then garbage. The whole document is invalid; its
+        /// limit-sized prefix parses.
+        fn padded_then_garbage(id: &str, code: i64) -> Vec<u8> {
+            let mut body = padded_to(&error_json(id, code), LIMIT).into_bytes();
+            body.extend_from_slice(b"garbage that makes the document invalid");
+            body
+        }
+
+        /// Read one HTTP/1.1 request and return its body.
+        async fn read_request(stream: &mut TcpStream) -> Option<String> {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                    let len = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    while buf.len() < end + 4 + len {
+                        let n = stream.read(&mut chunk).await.ok()?;
+                        if n == 0 {
+                            return None;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    return Some(
+                        String::from_utf8_lossy(&buf[end + 4..end + 4 + len]).into_owned(),
+                    );
+                }
+                let n = stream.read(&mut chunk).await.ok()?;
+                if n == 0 {
+                    return None;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+        }
+
+        /// A raw server that hands each request's body and its socket to
+        /// `respond`, one connection per request, so a test controls every
+        /// byte and every pause of the response.
+        async fn serve<F, Fut>(respond: F) -> String
+        where
+            F: Fn(String, TcpStream) -> Fut + Send + Sync + 'static,
+            Fut: std::future::Future<Output = ()> + Send + 'static,
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let respond = Arc::new(respond);
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let respond = respond.clone();
+                    tokio::spawn(async move {
+                        if let Some(body) = read_request(&mut stream).await {
+                            respond(body, stream).await;
+                        }
+                    });
+                }
+            });
+            url
+        }
+
+        async fn write_head(stream: &mut TcpStream, status: &str, extra: &str) {
+            let head = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{extra}Connection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(head.as_bytes()).await;
+        }
+
+        /// A complete response with `Content-Length`.
+        async fn write_sized(stream: &mut TcpStream, status: &str, extra: &str, body: &[u8]) {
+            write_head(
+                stream,
+                status,
+                &format!("{extra}Content-Length: {}\r\n", body.len()),
+            )
+            .await;
+            let _ = stream.write_all(body).await;
+            let _ = stream.flush().await;
+        }
+
+        async fn write_chunk(stream: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
+            stream
+                .write_all(format!("{:x}\r\n", bytes.len()).as_bytes())
+                .await?;
+            stream.write_all(bytes).await?;
+            stream.write_all(b"\r\n").await?;
+            stream.flush().await
+        }
+
+        /// A chunked response sending `chunks` with a pause between each, so
+        /// the client sees them as separate reads, then the terminator.
+        async fn write_chunked(stream: &mut TcpStream, status: &str, chunks: &[&[u8]]) {
+            write_head(stream, status, "Transfer-Encoding: chunked\r\n").await;
+            for chunk in chunks {
+                let _ = write_chunk(stream, chunk).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let _ = stream.write_all(b"0\r\n\r\n").await;
+            let _ = stream.flush().await;
+        }
+
+        async fn error_response(url: &str) -> reqwest::Response {
+            reqwest::Client::new()
+                .post(url)
+                .body("{}")
+                .send()
+                .await
+                .unwrap()
+        }
+
+        async fn read_with(url: &str, limit: usize) -> ErrorBody {
+            let response = error_response(url).await;
+            tokio::time::timeout(WAIT, read_error_body_limited(response, limit))
+                .await
+                .expect("the error body reader must not wait on the body's tail")
+        }
+
+        fn assert_truncated_prefix(body: &ErrorBody, expected: &[u8]) {
+            match body {
+                ErrorBody::Truncated(prefix) => {
+                    assert_eq!(prefix.len(), expected.len(), "prefix length");
+                    assert!(prefix.as_slice() == expected, "prefix content");
+                }
+                other => panic!("expected a truncated prefix, got {other:?}"),
+            }
+            assert_eq!(body.jsonrpc_error(), None, "a prefix is never decoded");
+        }
+
+        #[tokio::test]
+        async fn complete_error_within_the_limit_is_decoded() {
+            let url = serve(|_, mut s| async move {
+                write_sized(
+                    &mut s,
+                    "400 Bad Request",
+                    "",
+                    error_json("1", -32602).as_bytes(),
+                )
+                .await;
+            })
+            .await;
+
+            let body = read_with(&url, LIMIT).await;
+            assert_eq!(body, ErrorBody::Complete(error_json("1", -32602)));
+            let error = body.jsonrpc_error().expect("a complete error is decoded");
+            assert_eq!(error["error"]["message"], "server sentinel");
+        }
+
+        #[tokio::test]
+        async fn complete_error_split_across_chunks_is_decoded() {
+            let json = error_json("1", -32602);
+            let bytes = json.as_bytes().to_vec();
+            let url = serve(move |_, mut s| {
+                let bytes = bytes.clone();
+                async move {
+                    let (a, rest) = bytes.split_at(1);
+                    let (b, c) = rest.split_at(rest.len() / 2);
+                    write_chunked(&mut s, "400 Bad Request", &[a, b, c]).await;
+                }
+            })
+            .await;
+
+            let body = read_with(&url, LIMIT).await;
+            assert_eq!(body, ErrorBody::Complete(json));
+            assert!(body.jsonrpc_error().is_some());
+        }
+
+        /// The issue's fixture with a declared length: the prefix parses,
+        /// the document does not, so nothing is decoded.
+        #[tokio::test]
+        async fn padded_error_then_garbage_with_content_length_is_not_decoded() {
+            let fixture = padded_then_garbage("1", -32005);
+            let sent = fixture.clone();
+            let url = serve(move |_, mut s| {
+                let sent = sent.clone();
+                async move { write_sized(&mut s, "400 Bad Request", "", &sent).await }
+            })
+            .await;
+
+            let body = read_with(&url, LIMIT).await;
+            assert!(
+                serde_json::from_slice::<serde_json::Value>(&fixture[..LIMIT]).is_ok(),
+                "test setup: the retained prefix must be valid JSON on its own"
+            );
+            assert_truncated_prefix(&body, &fixture[..LIMIT]);
+        }
+
+        /// The same fixture, chunked, with the chunk boundary placed before,
+        /// at, and after the limit.
+        #[tokio::test]
+        async fn padded_error_then_garbage_is_not_decoded_at_any_chunk_boundary() {
+            let fixture = padded_then_garbage("1", -32005);
+            for split in [1, LIMIT / 2, LIMIT - 1, LIMIT, LIMIT + 1, fixture.len() - 1] {
+                let sent = fixture.clone();
+                let url = serve(move |_, mut s| {
+                    let sent = sent.clone();
+                    async move {
+                        let (a, b) = sent.split_at(split);
+                        write_chunked(&mut s, "400 Bad Request", &[a, b]).await;
+                    }
+                })
+                .await;
+
+                let body = read_with(&url, LIMIT).await;
+                assert_truncated_prefix(&body, &fixture[..LIMIT]);
+            }
+        }
+
+        /// A body exactly at the limit whose `Content-Length` says so is
+        /// complete, and still decoded.
+        #[tokio::test]
+        async fn error_exactly_at_the_limit_with_content_length_is_decoded() {
+            let exact = padded_to(&error_json("1", -32602), LIMIT);
+            let sent = exact.clone();
+            let url = serve(move |_, mut s| {
+                let sent = sent.clone();
+                async move { write_sized(&mut s, "400 Bad Request", "", sent.as_bytes()).await }
+            })
+            .await;
+
+            let body = read_with(&url, LIMIT).await;
+            assert_eq!(body, ErrorBody::Complete(exact));
+            assert!(body.jsonrpc_error().is_some());
+        }
+
+        /// A body that reaches the limit with no declared length is a prefix
+        /// as soon as the limit is reached. The reader must not wait for the
+        /// end of the body, which this server never sends.
+        #[tokio::test]
+        async fn error_at_the_limit_without_a_length_does_not_wait_for_the_end() {
+            let exact = padded_to(&error_json("1", -32005), LIMIT).into_bytes();
+            let sent = exact.clone();
+            let url = serve(move |_, mut s| {
+                let sent = sent.clone();
+                async move {
+                    write_head(&mut s, "400 Bad Request", "Transfer-Encoding: chunked\r\n").await;
+                    let _ = write_chunk(&mut s, &sent).await;
+                    std::future::pending::<()>().await;
+                }
+            })
+            .await;
+
+            let body = read_with(&url, LIMIT).await;
+            assert_truncated_prefix(&body, &exact);
+        }
+
+        /// A diagnostic stream that never ends must not hold the request.
+        #[tokio::test]
+        async fn nonterminating_diagnostic_stream_returns_promptly() {
+            let url = serve(|_, mut s| async move {
+                write_head(
+                    &mut s,
+                    "500 Internal Server Error",
+                    "Transfer-Encoding: chunked\r\n",
+                )
+                .await;
+                let chunk = [b'x'; 1000];
+                while write_chunk(&mut s, &chunk).await.is_ok() {}
+            })
+            .await;
+
+            let body = read_with(&url, LIMIT).await;
+            assert_truncated_prefix(&body, &[b'x'; LIMIT]);
+        }
+
+        /// Small limits make the boundary arithmetic visible.
+        #[tokio::test]
+        async fn chunk_boundaries_around_a_small_limit() {
+            // (chunks, expected)
+            let cases: [(&[&[u8]], ErrorBody); 4] = [
+                (&[b"abc", b"defg"], ErrorBody::Complete("abcdefg".into())),
+                (&[b"abcdefghi"], ErrorBody::Truncated(b"abcdefgh".to_vec())),
+                (
+                    &[b"abcdefg", b"hi"],
+                    ErrorBody::Truncated(b"abcdefgh".to_vec()),
+                ),
+                // Reaching the limit with no declared length is a prefix even
+                // if the terminator would have followed.
+                (
+                    &[b"abcd", b"efgh"],
+                    ErrorBody::Truncated(b"abcdefgh".to_vec()),
+                ),
+            ];
+            for (chunks, expected) in cases {
+                let chunks: Vec<Vec<u8>> = chunks.iter().map(|c| c.to_vec()).collect();
+                let url = serve(move |_, mut s| {
+                    let chunks = chunks.clone();
+                    async move {
+                        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+                        write_chunked(&mut s, "400 Bad Request", &refs).await;
+                    }
+                })
+                .await;
+                assert_eq!(read_with(&url, 8).await, expected);
+            }
+        }
+
+        /// A body cut short is a read failure, and a complete-looking JSON
+        /// error inside it is not decoded.
+        #[tokio::test]
+        async fn body_read_failure_is_not_decoded() {
+            let url = serve(|_, mut s| async move {
+                let json = error_json("1", -32005);
+                write_head(
+                    &mut s,
+                    "400 Bad Request",
+                    &format!("Content-Length: {}\r\n", json.len() + 100),
+                )
+                .await;
+                let _ = s.write_all(json.as_bytes()).await;
+                let _ = s.flush().await;
+                // Closing here leaves 100 declared bytes unsent.
+            })
+            .await;
+
+            let body = read_with(&url, LIMIT).await;
+            assert_eq!(body, ErrorBody::ReadFailed);
+            assert_eq!(body.jsonrpc_error(), None);
+        }
+
+        // ---------------------------------------------------------------------
+        // Both request paths, through the transport
+        // ---------------------------------------------------------------------
+
+        fn client_transport(url: &str) -> HttpClientTransport {
+            HttpClientTransport::with_config(
+                url,
+                HttpClientConfig {
+                    auto_sse: false,
+                    request_timeout: WAIT,
+                    ..Default::default()
+                },
+            )
+        }
+
+        async fn next_frame(transport: &mut HttpClientTransport) -> serde_json::Value {
+            let frame = tokio::time::timeout(WAIT, transport.recv())
+                .await
+                .expect("no frame arrived")
+                .expect("recv failed")
+                .expect("transport closed");
+            serde_json::from_str(&frame).unwrap()
+        }
+
+        /// On an established 2025-11-25 session (the background request
+        /// path), answer `tools/list` with `status`, `extra` headers, and
+        /// `body`, and return the frame the transport delivers for it.
+        async fn session_path_frame(
+            status: &'static str,
+            extra: &'static str,
+            body: Vec<u8>,
+        ) -> serde_json::Value {
+            let url = serve(move |request, mut s| {
+                let body = body.clone();
+                async move {
+                    if request.contains("\"initialize\"") {
+                        let reply = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"raw","version":"0"}}}"#;
+                        write_sized(
+                            &mut s,
+                            "200 OK",
+                            "mcp-session-id: s-1\r\nmcp-protocol-version: 2025-11-25\r\n",
+                            reply.as_bytes(),
+                        )
+                        .await;
+                    } else {
+                        write_sized(&mut s, status, extra, &body).await;
+                    }
+                }
+            })
+            .await;
+
+            let mut transport = client_transport(&url);
+            transport
+                .send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+                .await
+                .unwrap();
+            assert_eq!(next_frame(&mut transport).await["id"], 1);
+            assert!(transport.session_id.is_some(), "test setup: session");
+            transport
+                .send(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#)
+                .await
+                .unwrap();
+            next_frame(&mut transport).await
+        }
+
+        /// The fixture on a session request must not become a -32005 (which
+        /// the message loop treats as an expired session) or any other
+        /// server error: the caller gets the status-only transport error.
+        #[tokio::test]
+        async fn session_path_does_not_decode_a_truncated_session_signal() {
+            let frame =
+                session_path_frame("400 Bad Request", "", padded_then_garbage("2", -32005)).await;
+
+            assert_eq!(frame["id"], 2);
+            assert_eq!(frame["error"]["code"], -32000, "got {frame}");
+            assert_ne!(frame["error"]["message"], "server sentinel");
+            assert_eq!(frame["error"]["data"]["httpStatus"], 400);
+            assert!(!frame.to_string().contains("garbage"), "bodies are private");
+        }
+
+        /// A complete -32005 body is still the session signal.
+        #[tokio::test]
+        async fn session_path_still_decodes_a_complete_session_signal() {
+            let frame = session_path_frame(
+                "400 Bad Request",
+                "",
+                error_json("null", -32005).into_bytes(),
+            )
+            .await;
+
+            assert_eq!(frame["error"]["code"], -32005);
+            assert_eq!(frame["error"]["message"], "server sentinel");
+        }
+
+        /// A truncated body on a 401 keeps the status and the challenge.
+        #[tokio::test]
+        async fn session_path_truncated_401_keeps_status_and_challenge() {
+            let frame = session_path_frame(
+                "401 Unauthorized",
+                "WWW-Authenticate: Bearer realm=\"mcp\"\r\n",
+                padded_then_garbage("2", -32001),
+            )
+            .await;
+
+            assert_eq!(frame["id"], 2);
+            assert_eq!(frame["error"]["code"], -32000);
+            assert_eq!(frame["error"]["data"]["httpStatus"], 401);
+            assert_eq!(
+                frame["error"]["data"]["wwwAuthenticate"],
+                r#"Bearer realm="mcp""#
+            );
+        }
+
+        /// A failed body read on a session request is a status-only error,
+        /// even when the bytes that did arrive form a JSON-RPC error.
+        #[tokio::test]
+        async fn session_path_read_failure_is_status_only() {
+            let url = serve(|request, mut s| async move {
+                if request.contains("\"initialize\"") {
+                    let reply = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"raw","version":"0"}}}"#;
+                    write_sized(
+                        &mut s,
+                        "200 OK",
+                        "mcp-session-id: s-1\r\nmcp-protocol-version: 2025-11-25\r\n",
+                        reply.as_bytes(),
+                    )
+                    .await;
+                } else {
+                    let json = error_json("2", -32005);
+                    write_head(
+                        &mut s,
+                        "400 Bad Request",
+                        &format!("Content-Length: {}\r\n", json.len() + 100),
+                    )
+                    .await;
+                    let _ = s.write_all(json.as_bytes()).await;
+                    let _ = s.flush().await;
+                }
+            })
+            .await;
+
+            let mut transport = client_transport(&url);
+            transport
+                .send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+                .await
+                .unwrap();
+            next_frame(&mut transport).await;
+            transport
+                .send(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#)
+                .await
+                .unwrap();
+            let frame = next_frame(&mut transport).await;
+
+            assert_eq!(frame["id"], 2);
+            assert_eq!(frame["error"]["code"], -32000, "got {frame}");
+            assert_eq!(frame["error"]["data"]["httpStatus"], 400);
+        }
+
+        const MODERN_META: &str =
+            r#""params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}"#;
+
+        /// A 2026-07-28 request also takes the background path.
+        #[tokio::test]
+        async fn modern_request_path_decodes_only_a_complete_error() {
+            for (body, decoded) in [
+                (padded_then_garbage("7", -32602), false),
+                (error_json("7", -32602).into_bytes(), true),
+            ] {
+                let url = serve(move |_, mut s| {
+                    let body = body.clone();
+                    async move { write_sized(&mut s, "400 Bad Request", "", &body).await }
+                })
+                .await;
+                let mut transport = client_transport(&url);
+                transport
+                    .send(&format!(
+                        r#"{{"jsonrpc":"2.0","id":7,"method":"ping",{MODERN_META}}}"#
+                    ))
+                    .await
+                    .unwrap();
+                let frame = next_frame(&mut transport).await;
+
+                assert_eq!(frame["id"], 7);
+                if decoded {
+                    assert_eq!(frame["error"]["code"], -32602);
+                    assert_eq!(frame["error"]["message"], "server sentinel");
+                } else {
+                    assert_eq!(frame["error"]["code"], -32000, "got {frame}");
+                    assert_eq!(frame["error"]["data"]["httpStatus"], 400);
+                }
+            }
+        }
+
+        /// The synchronous path (a 2026-07-28 notification) queues a decoded
+        /// error only from a complete body; otherwise `send` fails with the
+        /// HTTP status.
+        #[tokio::test]
+        async fn synchronous_path_decodes_only_a_complete_error() {
+            let notification =
+                format!(r#"{{"jsonrpc":"2.0","method":"notifications/cancelled",{MODERN_META}}}"#);
+
+            let url = serve(|_, mut s| async move {
+                write_sized(
+                    &mut s,
+                    "400 Bad Request",
+                    "",
+                    &padded_then_garbage("null", -32005),
+                )
+                .await;
+            })
+            .await;
+            let mut transport = client_transport(&url);
+            let error = tokio::time::timeout(WAIT, transport.send(&notification))
+                .await
+                .expect("send hung")
+                .expect_err("a truncated body must not be queued as a JSON-RPC error");
+            let message = error.to_string();
+            assert!(message.contains("400"), "got: {message}");
+            assert!(!message.contains("sentinel") && !message.contains("garbage"));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), transport.recv())
+                    .await
+                    .is_err(),
+                "nothing may be queued for a truncated body"
+            );
+
+            let url = serve(|_, mut s| async move {
+                write_sized(
+                    &mut s,
+                    "400 Bad Request",
+                    "",
+                    error_json("null", -32005).as_bytes(),
+                )
+                .await;
+            })
+            .await;
+            let mut transport = client_transport(&url);
+            transport.send(&notification).await.unwrap();
+            let frame = next_frame(&mut transport).await;
+            assert_eq!(frame["error"]["code"], -32005);
+            assert_eq!(frame["error"]["message"], "server sentinel");
+        }
     }
 }
