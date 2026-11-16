@@ -1213,6 +1213,16 @@ async fn check_resources_list(
                         rmcp_resp.body["error"], tower_err
                     ),
                 ));
+            } else if tower_err["code"].as_i64() == Some(-32601) {
+                // tower-mcp refuses methods for capabilities it does not
+                // advertise (#1654). rmcp made the same change in #1446,
+                // after the 3.1 line this harness pins, which still answers
+                // with an empty list.
+                results.push(known_diff(
+                    "resources/list",
+                    "capability not advertised: tower-mcp answers -32601 (#1654), \
+                     rmcp 3.1 answers an empty list (changed upstream in rmcp #1446)",
+                ));
             } else {
                 results.push(fail(
                     "resources/list",
@@ -1308,10 +1318,22 @@ async fn check_prompts_list(
         }
         (true, false) => {
             let tower_err = &tower_resp.body["error"];
-            results.push(fail(
-                "prompts/list",
-                format!("rmcp returned result, tower-mcp returned error: {tower_err}"),
-            ));
+            if tower_err["code"].as_i64() == Some(-32601) {
+                // tower-mcp refuses methods for capabilities it does not
+                // advertise (#1654). rmcp made the same change in #1446,
+                // after the 3.1 line this harness pins, which still answers
+                // with an empty list.
+                results.push(known_diff(
+                    "prompts/list",
+                    "capability not advertised: tower-mcp answers -32601 (#1654), \
+                     rmcp 3.1 answers an empty list (changed upstream in rmcp #1446)",
+                ));
+            } else {
+                results.push(fail(
+                    "prompts/list",
+                    format!("rmcp returned result, tower-mcp returned error: {tower_err}"),
+                ));
+            }
         }
         (false, true) => {
             let rmcp_err = &rmcp_resp.body["error"];
