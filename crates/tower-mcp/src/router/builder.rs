@@ -709,6 +709,13 @@ impl McpRouter {
                 .insert(identifier.clone(), settings.clone());
         }
 
+        // Merge additional server capabilities (last wins).
+        for (name, value) in &other_inner.additional_capabilities {
+            inner
+                .additional_capabilities
+                .insert(name.clone(), value.clone());
+        }
+
         // Merge skills catalogs (last wins per skill URI). The skill files
         // already arrived with the resources above.
         #[cfg(feature = "skills")]
@@ -932,6 +939,14 @@ impl McpRouter {
             inner
                 .protocol_extensions
                 .insert(identifier.clone(), settings.clone());
+        }
+
+        // Additional server capabilities are server-wide too, and likewise
+        // use last-write-wins.
+        for (name, value) in &other_inner.additional_capabilities {
+            inner
+                .additional_capabilities
+                .insert(name.clone(), value.clone());
         }
 
         self

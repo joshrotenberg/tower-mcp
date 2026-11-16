@@ -178,6 +178,7 @@ fn validate_initialize_result() {
             tools: None,
             tasks: None,
             extensions: None,
+            ..Default::default()
         },
         server_info: Implementation {
             name: "test-server".to_string(),
@@ -257,6 +258,7 @@ fn validate_initialize_request_params() {
             elicitation: None,
             tasks: None,
             extensions: None,
+            ..Default::default()
         },
         client_info: Implementation {
             name: "test-client".to_string(),
@@ -662,6 +664,7 @@ fn validate_server_capabilities() {
         tools: Some(ToolsCapability { list_changed: true }),
         tasks: None,
         extensions: None,
+        ..Default::default()
     };
     validate_against_def(&caps, "ServerCapabilities");
 }
@@ -685,6 +688,7 @@ fn validate_client_capabilities() {
         }),
         tasks: None,
         extensions: None,
+        ..Default::default()
     };
     validate_against_def(&caps, "ClientCapabilities");
 }
