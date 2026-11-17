@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.27.0] - 2026-11-16
+
+### Bug Fixes
+
+- **client:** Bound list_all pagination with a page budget ([#1648](https://github.com/joshrotenberg/tower-mcp/pull/1648))
+- **client:** Never parse a truncated HTTP error body as JSON-RPC ([#1649](https://github.com/joshrotenberg/tower-mcp/pull/1649))
+- [**breaking**] **oauth-client:** Bound proactive refresh by token lifetime ([#1651](https://github.com/joshrotenberg/tower-mcp/pull/1651))
+- [**breaking**] **types:** Preserve additional top-level capabilities ([#1650](https://github.com/joshrotenberg/tower-mcp/pull/1650))
+- **client:** Decode SSE lines from bytes so split code points survive ([#1658](https://github.com/joshrotenberg/tower-mcp/pull/1658))
+- [**breaking**] **types:** Model every SEP-1330 elicitation enum shape ([#1659](https://github.com/joshrotenberg/tower-mcp/pull/1659))
+- [**breaking**] **oauth-client:** Apply an address policy to server-supplied URLs ([#1660](https://github.com/joshrotenberg/tower-mcp/pull/1660))
+- [**breaking**] **router:** Answer -32601 for methods whose capability is not advertised ([#1661](https://github.com/joshrotenberg/tower-mcp/pull/1661))
+
+
+
 ## [0.26.1] - 2026-11-15
 
 ### Bug Fixes
