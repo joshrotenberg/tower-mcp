@@ -445,8 +445,8 @@ pub struct McpClient {
     connected: Arc<AtomicBool>,
     /// Whether the transport supports session recovery.
     supports_session_recovery: bool,
-    /// Stored init params for session recovery re-initialization.
-    init_params: RwLock<Option<(String, String)>>,
+    /// Client identity from the last successful legacy handshake, for recovery.
+    recovery_client_info: RwLock<Option<Implementation>>,
     /// Lock to prevent concurrent session recovery attempts.
     recovery_lock: Mutex<()>,
     /// Maximum number of input-required rounds auto-driven per operation.
@@ -901,7 +901,7 @@ impl McpClient {
             roots,
             connected,
             supports_session_recovery,
-            init_params: RwLock::new(None),
+            recovery_client_info: RwLock::new(None),
             recovery_lock: Mutex::new(()),
             max_mrtr_rounds,
             max_list_pages,
@@ -1020,30 +1020,27 @@ impl McpClient {
         // A failure of a repeat call leaves the established session alone;
         // only a handshake that never completed has a session to release.
         let was_initialized = self.initialized.load(Ordering::Acquire);
-        let result = self.initialize_once(client_name, client_version).await;
+        let client_info = Implementation {
+            name: client_name.to_string(),
+            version: client_version.to_string(),
+            ..Default::default()
+        };
+        let result = self.initialize_once(client_info).await;
         if result.is_err() && !was_initialized {
             self.end_abandoned_session().await;
         }
         result
     }
 
-    async fn initialize_once(
-        &self,
-        client_name: &str,
-        client_version: &str,
-    ) -> Result<InitializeResult> {
+    async fn initialize_once(&self, client_info: Implementation) -> Result<InitializeResult> {
         let params = InitializeParams {
             protocol_version: crate::protocol::LATEST_PROTOCOL_VERSION.to_string(),
             capabilities: self.capabilities.clone(),
-            client_info: Implementation {
-                name: client_name.to_string(),
-                version: client_version.to_string(),
-                ..Default::default()
-            },
+            client_info,
             meta: None,
         };
 
-        let result: InitializeResult = self.send_request("initialize", &params).await?;
+        let result: InitializeResult = self.send_request_once("initialize", &params).await?;
 
         // The server picks the protocol version, not necessarily the one
         // offered. A response outside the initialize-lifecycle set this
@@ -1060,12 +1057,6 @@ impl McpClient {
             )));
         }
 
-        *self.server_info.write().await = Some(result.clone());
-
-        // Store init params for potential session recovery
-        *self.init_params.write().await =
-            Some((client_name.to_string(), client_version.to_string()));
-
         // Send initialized notification. A delivery failure is an
         // initialization failure: the server will reject every subsequent
         // request until the notification arrives.
@@ -1076,6 +1067,8 @@ impl McpClient {
                     "failed to deliver notifications/initialized: {error}"
                 ))
             })?;
+        *self.recovery_client_info.write().await = Some(params.client_info);
+        *self.server_info.write().await = Some(result.clone());
         self.initialized.store(true, Ordering::Release);
 
         Ok(result)
@@ -2816,17 +2809,12 @@ impl McpClient {
         // Serialize recovery attempts
         let _guard = self.recovery_lock.lock().await;
 
-        // Check if another task already recovered while we waited
-        // (the init_params being present means we were initialized before)
-        let init_params = self.init_params.read().await.clone();
-        let (client_name, client_version) = match init_params {
-            Some(params) => params,
-            None => {
-                return Err(Error::Transport(
-                    "Cannot recover: never initialized".to_string(),
-                ));
-            }
-        };
+        let client_info = self
+            .recovery_client_info
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| Error::Transport("Cannot recover: never initialized".to_string()))?;
 
         // Tell the message loop to reset the transport
         let (done_tx, done_rx) = oneshot::channel();
@@ -2842,40 +2830,12 @@ impl McpClient {
         self.initialized.store(false, Ordering::Release);
         *self.server_info.write().await = None;
 
-        // Re-initialize (using send_request_once to avoid recursion)
         tracing::info!("Re-initializing session after expiry");
-        let result = self.reinitialize(client_name, client_version).await;
+        let result = self.initialize_once(client_info).await;
         if result.is_err() {
             self.end_abandoned_session().await;
         }
-        result
-    }
-
-    async fn reinitialize(&self, client_name: String, client_version: String) -> Result<()> {
-        let params = InitializeParams {
-            protocol_version: crate::protocol::LATEST_PROTOCOL_VERSION.to_string(),
-            capabilities: self.capabilities.clone(),
-            client_info: Implementation {
-                name: client_name,
-                version: client_version,
-                ..Default::default()
-            },
-            meta: None,
-        };
-
-        let result: InitializeResult = self.send_request_once("initialize", &params).await?;
-        *self.server_info.write().await = Some(result);
-
-        self.send_notification("notifications/initialized", &serde_json::json!({}))
-            .await
-            .map_err(|error| {
-                Error::Transport(format!(
-                    "failed to deliver notifications/initialized: {error}"
-                ))
-            })?;
-        self.initialized.store(true, Ordering::Release);
-
-        Ok(())
+        result.map(|_| ())
     }
 
     /// Release the session a failed `initialize` left on the server.
