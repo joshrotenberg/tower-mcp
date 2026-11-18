@@ -49,6 +49,42 @@ use tokio::sync::RwLock;
 
 use super::oauth_address::{AddressGuard, OAuthAddressPolicy, address_blocked_in};
 use super::oauth_authcode::{discover_oauth_authorization_with_policy, redirect_error_detail};
+use crate::oauth_http_body::{self, BodyError};
+
+pub(super) async fn read_oauth_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T, String> {
+    let url = response.url().clone();
+    let body = oauth_http_body::read(response)
+        .await
+        .map_err(|error| error.to_string())?;
+    serde_json::from_slice(&body)
+        .map_err(|_| format!("error decoding response body for url ({url})"))
+}
+
+pub(super) async fn read_oauth_error_body(response: reqwest::Response) -> String {
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .cloned();
+    let body = match oauth_http_body::read(response).await {
+        Ok(body) => body,
+        Err(error @ BodyError::TooLarge) => return error.to_string(),
+        Err(BodyError::Read(_)) => return String::new(),
+    };
+
+    // Use reqwest's charset and BOM handling when its charset feature is enabled.
+    let mut buffered = http::Response::new(body);
+    if let Some(content_type) = content_type {
+        buffered
+            .headers_mut()
+            .insert(reqwest::header::CONTENT_TYPE, content_type);
+    }
+    reqwest::Response::from(buffered)
+        .text()
+        .await
+        .unwrap_or_default()
+}
 
 /// Trait for dynamic token providers.
 ///
@@ -695,6 +731,7 @@ struct OAuthClientCredentialsInner {
 /// [client credentials grant](https://datatracker.ietf.org/doc/html/rfc6749#section-4.4)
 /// and caches them until expiry. Uses `client_secret_basic` authentication
 /// (HTTP Basic with `client_id:client_secret`).
+/// Response bodies are limited to 256 KiB, including error responses.
 ///
 /// # Token Caching
 ///
@@ -889,17 +926,16 @@ impl OAuthClientCredentials {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body = read_oauth_error_body(response).await;
             return Err(OAuthClientError::TokenRequest(format!(
                 "HTTP {}: {}",
                 status, body
             )));
         }
 
-        let token_response: TokenResponse = response
-            .json()
+        let token_response: TokenResponse = read_oauth_json(response)
             .await
-            .map_err(|e| OAuthClientError::InvalidResponse(e.to_string()))?;
+            .map_err(OAuthClientError::InvalidResponse)?;
 
         // Default to 1 hour if expires_in not provided
         let lifetime = Duration::from_secs(token_response.expires_in.unwrap_or(3600));
@@ -1470,6 +1506,58 @@ mod tests {
         // get_token should try to refresh and fail (unreachable endpoint)
         let err = provider.get_token().await.unwrap_err();
         assert!(matches!(err, OAuthClientError::TokenRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn bounded_error_text_matches_reqwest_decoding() {
+        for (body, content_type) in [
+            (&b"caf\xe9"[..], "text/plain; charset=windows-1252"),
+            (&b"\xef\xbb\xbfexample"[..], "text/plain"),
+        ] {
+            let response = || {
+                reqwest::Response::from(
+                    http::Response::builder()
+                        .header(reqwest::header::CONTENT_TYPE, content_type)
+                        .body(body)
+                        .unwrap(),
+                )
+            };
+            assert_eq!(
+                read_oauth_error_body(response()).await,
+                response().text().await.unwrap()
+            );
+        }
+    }
+
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn client_credentials_rejects_an_over_limit_error_body() {
+        let app = axum::Router::new().route(
+            "/token",
+            axum::routing::post(|| async {
+                (http::StatusCode::BAD_REQUEST, "a".repeat(256 * 1024 + 1))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let provider = OAuthClientCredentials::builder()
+            .client_id("service-client")
+            .client_secret("service-secret")
+            .token_endpoint(endpoint)
+            .resource("https://mcp.example.com/mcp")
+            .build()
+            .unwrap();
+        let error = provider.get_token().await.unwrap_err();
+        server.abort();
+        let OAuthClientError::TokenRequest(message) = error else {
+            panic!("expected a token request error, got {error}");
+        };
+        assert_eq!(
+            message,
+            "HTTP 400 Bad Request: response body exceeds the 262144-byte limit"
+        );
     }
 
     #[tokio::test]

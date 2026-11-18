@@ -568,6 +568,8 @@ pub mod middleware;
 pub mod mrtr;
 #[cfg(feature = "oauth")]
 pub mod oauth;
+#[cfg(any(feature = "oauth-client", feature = "jwks"))]
+mod oauth_http_body;
 pub mod prompt;
 pub mod protocol;
 mod protocol_support;

@@ -14,7 +14,7 @@ use axum::routing::get;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::json;
 use tokio::sync::RwLock;
-use tower_mcp::oauth::{JwksValidator, TokenValidator};
+use tower_mcp::oauth::{JwksError, JwksValidator, TokenValidator};
 
 /// RSA key pair generated for testing (2048-bit).
 ///
@@ -66,6 +66,25 @@ fn create_signed_token(
     header.kid = kid.map(String::from);
 
     jsonwebtoken::encode(&header, claims, encoding_key).unwrap()
+}
+
+#[tokio::test]
+async fn test_jwks_validator_rejects_an_over_limit_body() {
+    let (_, public_jwk) = test_rsa_keypair();
+    let jwks_json = Arc::new(RwLock::new(json!({
+        "keys": [public_jwk],
+        "description": "a".repeat(256 * 1024 + 1),
+    })));
+    let (base_url, server) = start_jwks_server(jwks_json).await;
+
+    let result = JwksValidator::builder(format!("{base_url}/.well-known/jwks.json"))
+        .build()
+        .await;
+    server.abort();
+    let Err(JwksError::Parse(message)) = result else {
+        panic!("expected a JWKS parse error, got {:?}", result.err());
+    };
+    assert_eq!(message, "response body exceeds the 262144-byte limit");
 }
 
 #[tokio::test]

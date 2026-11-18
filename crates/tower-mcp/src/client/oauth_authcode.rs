@@ -44,7 +44,8 @@ use tokio::sync::{Mutex, RwLock, oneshot};
 
 use super::oauth::{
     OAuthBearerChallenge, OAuthClientError, OAuthRefreshScopePolicy, OAuthTokenEndpointAuthMethod,
-    TokenProvider, expires_at_after, instant_token_is_fresh, unix_time,
+    TokenProvider, expires_at_after, instant_token_is_fresh, read_oauth_error_body,
+    read_oauth_json, unix_time,
 };
 use super::oauth_address::{AddressGuard, OAuthAddressPolicy, address_blocked_in};
 
@@ -190,6 +191,7 @@ pub async fn probe_oauth_bearer_challenge(
 
 /// Discover Protected Resource Metadata and all advertised authorization
 /// servers for an MCP resource.
+/// Metadata response bodies are limited to 256 KiB.
 ///
 /// A challenge-provided `resource_metadata` URL is tried first; if fetching
 /// or matching it fails, discovery falls through to the well-known
@@ -405,12 +407,12 @@ async fn fetch_json<T: serde::de::DeserializeOwned>(
         )));
     }
 
-    response
+    let response = response
         .error_for_status()
-        .map_err(|error| OAuthClientError::Discovery(error.to_string()))?
-        .json()
+        .map_err(|error| OAuthClientError::Discovery(error.to_string()))?;
+    read_oauth_json(response)
         .await
-        .map_err(|error| OAuthClientError::Discovery(error.to_string()))
+        .map_err(OAuthClientError::Discovery)
 }
 
 /// Describe a redirect response for an error message: its status and, when
@@ -1228,10 +1230,8 @@ async fn resolve_oauth_client_registration_inner(
             .map_err(|error| OAuthClientError::Registration(error.to_string()))?;
         let status = response.status();
         if !status.is_success() {
-            let body: String = response
-                .text()
+            let body: String = read_oauth_error_body(response)
                 .await
-                .unwrap_or_default()
                 .chars()
                 .take(1024)
                 .collect();
@@ -1239,10 +1239,9 @@ async fn resolve_oauth_client_registration_inner(
                 "dynamic client registration failed with {status}: {body}"
             )));
         }
-        let response: DynamicClientRegistrationResponse = response
-            .json()
+        let response: DynamicClientRegistrationResponse = read_oauth_json(response)
             .await
-            .map_err(|error| OAuthClientError::Registration(error.to_string()))?;
+            .map_err(OAuthClientError::Registration)?;
         require_secret_for_confidential_registration(
             response
                 .token_endpoint_auth_method
@@ -1340,6 +1339,7 @@ struct CachedAuthCodeToken {
 ///
 /// Handles the interactive browser-based login flow and provides
 /// automatic token caching and refresh.
+/// Response bodies are limited to 256 KiB, including error responses.
 #[derive(Clone)]
 pub struct OAuthAuthorizationCode {
     inner: Arc<OAuthAuthCodeInner>,
@@ -1636,17 +1636,16 @@ impl OAuthAuthorizationCode {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body = read_oauth_error_body(response).await;
             return Err(OAuthClientError::TokenRequest(format!(
                 "HTTP {}: {}",
                 status, body
             )));
         }
 
-        let token_response: TokenResponse = response
-            .json()
+        let token_response: TokenResponse = read_oauth_json(response)
             .await
-            .map_err(|e| OAuthClientError::InvalidResponse(e.to_string()))?;
+            .map_err(OAuthClientError::InvalidResponse)?;
 
         // RFC 6749 section 5.1: an omitted `scope` means the grant matches
         // what was requested.
@@ -1686,7 +1685,7 @@ impl OAuthAuthorizationCode {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body = read_oauth_error_body(response).await;
             // RFC 6749 §5.2: `invalid_grant` means the refresh token itself
             // is dead (revoked or expired at the AS), not that this request
             // failed transiently. Surface that distinctly so the caller can
@@ -1703,10 +1702,9 @@ impl OAuthAuthorizationCode {
             )));
         }
 
-        let mut token_response: TokenResponse = response
-            .json()
+        let mut token_response: TokenResponse = read_oauth_json(response)
             .await
-            .map_err(|e| OAuthClientError::InvalidResponse(e.to_string()))?;
+            .map_err(OAuthClientError::InvalidResponse)?;
 
         // Preserve the refresh token if the server doesn't return a new one
         if token_response.refresh_token.is_none() {
@@ -1790,6 +1788,7 @@ struct TokenErrorResponse {
 
 /// Whether a token endpoint error body is RFC 6749 §5.2 `invalid_grant`.
 fn is_invalid_grant(body: &str) -> bool {
+    let body = body.strip_prefix('\u{feff}').unwrap_or(body);
     serde_json::from_str::<TokenErrorResponse>(body)
         .is_ok_and(|error| error.error == "invalid_grant")
 }
@@ -3133,8 +3132,8 @@ mod tests {
                 })
                 .to_string();
                 let response = format!(
-                    "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
+                    "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n\u{feff}{body}",
+                    body.len() + '\u{feff}'.len_utf8()
                 );
                 let _ = stream.write_all(response.as_bytes()).await;
             }
@@ -3244,13 +3243,22 @@ mod tests {
             },
         );
 
+        assert!(
+            matches!(
+                provider
+                    .refresh_token("dead-refresh-token", None, None)
+                    .await,
+                Err(OAuthClientError::TokenRefreshRejected(_))
+            ),
+            "a BOM-prefixed invalid_grant must be classified as a rejected refresh"
+        );
         assert!(TokenProvider::get_token(&provider).await.is_err());
-        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
         assert!(provider.inner.cache.read().await.is_none());
 
         // The dead refresh token must not be retried on a subsequent call.
         assert!(TokenProvider::get_token(&provider).await.is_err());
-        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
     }
 
     /// #1467: `invalidate` previously inherited the no-op default, so a 401

@@ -27,6 +27,7 @@ use super::oauth_authcode::{
     require_secret_for_confidential_registration, stored_registration_is_reusable,
     validate_resource_identifier, validate_resource_override,
 };
+use crate::oauth_http_body;
 
 /// HTTP method used by an OAuth protocol request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,6 +157,9 @@ impl OAuthHttpResponse {
 /// the policy to the resolved addresses, for example by building its reqwest
 /// client with [`OAuthAddressPolicy::resolver`], and should not follow
 /// redirects (or should check each redirect target).
+///
+/// Custom implementations are responsible for bounding response bodies as
+/// they read them. [`OAuthHttpResponse`] carries an already-buffered body.
 #[async_trait]
 pub trait OAuthHttpClient: Send + Sync + 'static {
     /// Execute one OAuth protocol request.
@@ -166,6 +170,7 @@ pub trait OAuthHttpClient: Send + Sync + 'static {
 }
 
 /// [`OAuthHttpClient`] backed by reqwest.
+/// Response bodies are limited to 256 KiB, including error responses.
 #[derive(Clone)]
 pub struct ReqwestOAuthHttpClient {
     client: reqwest::Client,
@@ -249,11 +254,9 @@ impl OAuthHttpClient for ReqwestOAuthHttpClient {
                     .map(|value| (name.as_str().to_string(), value.to_string()))
             })
             .collect();
-        let body = response
-            .bytes()
+        let body = oauth_http_body::read(response)
             .await
-            .map_err(|error| OAuthClientError::Http(error.to_string()))?
-            .to_vec();
+            .map_err(|error| OAuthClientError::Http(error.to_string()))?;
         Ok(OAuthHttpResponse {
             status,
             headers,
