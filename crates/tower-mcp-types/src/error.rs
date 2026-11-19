@@ -572,6 +572,16 @@ pub enum Error {
         limit: usize,
     },
 
+    /// A proxy backend setup failure with its original cause.
+    #[error("{context}: {source}")]
+    ProxySetup {
+        /// The setup operation that failed, including the method for catalog errors.
+        context: String,
+        /// Original error, or backend failures reported by the proxy builder.
+        #[source]
+        source: BoxError,
+    },
+
     /// An internal library or server failure not represented by another variant.
     #[error("Internal error: {0}")]
     Internal(String),
