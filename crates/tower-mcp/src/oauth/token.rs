@@ -377,7 +377,7 @@ impl<V: crate::auth::Validate> TokenValidator for ValidateAdapter<V> {
 pub enum JwksError {
     /// HTTP request to the JWKS endpoint failed.
     Fetch(reqwest::Error),
-    /// The JWKS JSON could not be parsed.
+    /// The JWKS response could not be read within the limit or parsed as JSON.
     Parse(String),
     /// No suitable key was found in the JWKS for the given `kid`.
     KeyNotFound(Option<String>),
@@ -453,6 +453,7 @@ struct JwksValidatorInner {
 /// Keys are cached and refreshed on-demand when expired or when a token
 /// presents an unknown `kid`. The initial JWKS fetch happens eagerly during
 /// [`JwksValidatorBuilder::build`] so configuration errors are caught early.
+/// JWKS response bodies are limited to 256 KiB.
 ///
 /// # Example
 ///
@@ -722,6 +723,8 @@ async fn fetch_and_parse_jwks(
     url: &str,
     default_ttl: std::time::Duration,
 ) -> std::result::Result<(HashMap<Option<String>, CachedKey>, std::time::Duration), JwksError> {
+    use crate::oauth_http_body::{self, BodyError};
+
     let response = client
         .get(url)
         .send()
@@ -736,10 +739,14 @@ async fn fetch_and_parse_jwks(
     )
     .unwrap_or(default_ttl);
 
-    let jwks: jsonwebtoken::jwk::JwkSet = response
-        .json()
+    let invalid_response = || JwksError::Parse("invalid JWKS response".to_string());
+    let body = oauth_http_body::read(response)
         .await
-        .map_err(|_| JwksError::Parse("invalid JWKS response".to_string()))?;
+        .map_err(|error| match error {
+            BodyError::TooLarge => JwksError::Parse(error.to_string()),
+            BodyError::Read(_) => invalid_response(),
+        })?;
+    let jwks = serde_json::from_slice(&body).map_err(|_| invalid_response())?;
 
     let keys = parse_jwk_set(&jwks)?;
     Ok((keys, ttl))
