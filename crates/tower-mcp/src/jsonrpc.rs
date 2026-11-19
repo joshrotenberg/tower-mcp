@@ -21,6 +21,8 @@ use tower_service::Service;
 
 use crate::context::CancellationToken;
 use crate::error::{Error, JsonRpcError, Result};
+#[cfg(feature = "http")]
+use crate::inspection::JsonRpcPayload;
 use crate::inspection::{
     McpDirection, McpInspection, McpInspectionError, McpInspectionErrorKind, McpInspector,
     McpProtocolRevision,
@@ -755,15 +757,37 @@ pub(crate) fn inspect_runtime_value(
     protocol_support: &ProtocolSupport,
     direction: McpDirection,
 ) -> std::result::Result<McpInspection, JsonRpcError> {
+    runtime_inspector(revision, protocol_support)?
+        .inspect(value, Some(direction))
+        .map_err(inspection_error_to_json_rpc)
+}
+
+/// Apply the runtime revision's MCP rules to an already decoded envelope or
+/// batch, returning the typed payload for dispatch.
+#[cfg(feature = "http")]
+pub(crate) fn inspect_runtime_payload(
+    payload: JsonRpcPayload,
+    revision: McpProtocolRevision,
+    protocol_support: &ProtocolSupport,
+    direction: McpDirection,
+) -> std::result::Result<JsonRpcPayload, JsonRpcError> {
+    runtime_inspector(revision, protocol_support)?
+        .inspect_payload(payload, Some(direction))
+        .map(McpInspection::into_payload)
+        .map_err(inspection_error_to_json_rpc)
+}
+
+fn runtime_inspector(
+    revision: McpProtocolRevision,
+    protocol_support: &ProtocolSupport,
+) -> std::result::Result<McpInspector, JsonRpcError> {
     if !protocol_support.contains(revision.as_str()) {
         return Err(JsonRpcError::unsupported_protocol_version(
             revision.as_str(),
             protocol_support.versions().iter().map(String::as_str),
         ));
     }
-    McpInspector::for_revision(revision)
-        .inspect(value, Some(direction))
-        .map_err(inspection_error_to_json_rpc)
+    Ok(McpInspector::for_revision(revision))
 }
 
 fn inspection_error_to_json_rpc(error: McpInspectionError) -> JsonRpcError {

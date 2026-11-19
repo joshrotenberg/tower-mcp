@@ -287,13 +287,12 @@ use crate::error::{Error, JsonRpcError, Result};
 #[cfg(feature = "stateless")]
 use crate::error::{ErrorCode, McpErrorCode};
 use crate::inspection::{McpDirection, McpProtocolRevision};
-use crate::jsonrpc::{JsonRpcService, apply_protocol_result_fields, inspect_runtime_value};
+use crate::jsonrpc::{JsonRpcService, apply_protocol_result_fields};
 #[cfg(feature = "stateless")]
 use crate::protocol::SubscriptionFilter;
 use crate::protocol::{
-    ClientCapabilities, Implementation, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
-    JsonRpcResponse, LATEST_PROTOCOL_VERSION, McpNotification, PROTOCOL_VERSION_2026_07_28,
-    RequestId,
+    ClientCapabilities, Implementation, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
+    LATEST_PROTOCOL_VERSION, McpNotification, PROTOCOL_VERSION_2026_07_28, RequestId,
 };
 use crate::router::{McpRouter, RouterRequest, RouterResponse};
 use crate::transport::service::{

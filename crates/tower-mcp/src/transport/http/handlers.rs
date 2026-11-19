@@ -17,6 +17,8 @@
 //! Split out of `http.rs` in #1256 (phase 3).
 
 use super::*;
+use crate::inspection::{JsonRpcEnvelope, JsonRpcPayload};
+use crate::jsonrpc::{inspect_runtime_payload, inspect_runtime_value};
 
 type AssociatedCall = Pin<Box<dyn Future<Output = Result<JsonRpcResponse>> + Send + 'static>>;
 
@@ -259,20 +261,14 @@ pub(super) async fn handle_post(
         Ok(bytes) => match String::from_utf8(bytes.to_vec()) {
             Ok(s) => s,
             Err(e) => {
-                return json_rpc_error_response(
-                    None,
-                    JsonRpcError::parse_error(format!("Invalid UTF-8: {}", e)),
-                );
+                return body_parse_error_response(format!("Invalid UTF-8: {e}"));
             }
         },
         Err(e) if is_length_limit_error(&e) => {
             return body_too_large_response(state.max_body_size);
         }
         Err(e) => {
-            return json_rpc_error_response(
-                None,
-                JsonRpcError::parse_error(format!("Failed to read body: {}", e)),
-            );
+            return body_parse_error_response(format!("Failed to read body: {e}"));
         }
     };
 
@@ -290,10 +286,7 @@ pub(super) async fn handle_post(
         match serde_json::from_str(crate::framing::clean_input_line(&body)) {
             Ok(v) => v,
             Err(e) => {
-                return json_rpc_error_response(
-                    None,
-                    JsonRpcError::parse_error(format!("Invalid JSON: {}", e)),
-                );
+                return body_parse_error_response(format!("Invalid JSON: {e}"));
             }
         };
 
@@ -323,10 +316,12 @@ pub(super) async fn handle_post(
         }
     };
 
+    let modern_request = claims_modern_protocol(protocol_version_header.as_deref(), &parsed);
+
     // A version header supplies enough exact context to reject a batch before
     // any object-only HTTP classification runs. Legacy batches without a
     // header are validated against their session revision after lookup below.
-    if parsed.is_array()
+    let payload = if parsed.is_array()
         && let Some(version) = protocol_version_header.clone()
     {
         let revision = match version.parse::<McpProtocolRevision>() {
@@ -341,20 +336,38 @@ pub(super) async fn handle_post(
                 );
             }
         };
-        if let Err(error) = inspect_runtime_value(
+        match inspect_runtime_value(
             &parsed,
             revision,
             &state.protocol_support,
             McpDirection::ClientToServer,
         ) {
-            let status = if revision == McpProtocolRevision::V2026_07_28 {
-                StatusCode::BAD_REQUEST
-            } else {
-                StatusCode::OK
-            };
-            return json_rpc_error_response_with_status(None, error, status);
+            Ok(inspection) => inspection.into_payload(),
+            Err(error) => {
+                let status = if revision == McpProtocolRevision::V2026_07_28 {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::OK
+                };
+                return json_rpc_error_response_with_status(None, error, status);
+            }
         }
-    }
+    } else if let Ok(payload) = JsonRpcPayload::inspect(&parsed) {
+        payload
+    } else {
+        // Reject invalid JSON-RPC shapes before modern metadata checks or
+        // legacy routing based on the presence of an ID, method, or response.
+        let status = if modern_request {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::OK
+        };
+        return json_rpc_error_response_with_status(
+            extract_request_id(&parsed),
+            JsonRpcError::invalid_request("not a valid JSON-RPC envelope"),
+            status,
+        );
+    };
 
     // Check if this is an initialize request (creates new session)
     let is_init = is_initialize_request(&parsed);
@@ -364,14 +377,13 @@ pub(super) async fn handle_post(
         .unwrap_or_default()
         .to_string();
     let tool_input_schema = request_tool_input_schema(&state.service_source, &parsed);
-    let modern_request = claims_modern_protocol(protocol_version_header.as_deref(), &parsed);
 
     // The modern protocol is selected by its per-request `_meta` envelope,
     // with the final-version HTTP header also acting as a signal for malformed
     // requests whose envelope is missing. Resolve that era before consulting
     // any legacy session state so modern traffic cannot accidentally fall
     // through to the initialize/session lifecycle.
-    if modern_request {
+    let payload = if modern_request {
         let id = extract_request_id(&parsed);
         let body_version = match validate_modern_request_meta(&parsed) {
             Ok(version) => version,
@@ -422,14 +434,17 @@ pub(super) async fn handle_post(
                 );
             }
         };
-        if let Err(error) = inspect_runtime_value(
-            &parsed,
+        let payload = match inspect_runtime_payload(
+            payload,
             revision,
             &state.protocol_support,
             McpDirection::ClientToServer,
         ) {
-            return json_rpc_error_response_with_status(id, error, StatusCode::BAD_REQUEST);
-        }
+            Ok(payload) => payload,
+            Err(error) => {
+                return json_rpc_error_response_with_status(id, error, StatusCode::BAD_REQUEST);
+            }
+        };
 
         let sep_2243_mode = crate::transport::http_headers::mode_for_version(&body_version);
         if let Err(error) = crate::transport::http_headers::validate_with_tool_schema(
@@ -454,7 +469,10 @@ pub(super) async fn handle_post(
                 StatusCode::NOT_FOUND,
             );
         }
-    }
+        payload
+    } else {
+        payload
+    };
 
     // SEP-2575 / SEP-2567: version-gated stateless mode for 2026-07-28+ clients.
     //
@@ -515,25 +533,14 @@ pub(super) async fn handle_post(
                 return resp;
             }
 
-            // The id is captured before `parsed` is consumed below so a
-            // malformed-but-identified request can still be answered with a
-            // matching id instead of null (#1336). `extract_request_id`
-            // itself falls back to `None` when the id isn't a usable number
-            // or string, which is exactly the "genuinely no usable id" case
-            // that must still answer null.
-            let id = extract_request_id(&parsed);
-            let request: JsonRpcRequest = match serde_json::from_value(parsed) {
-                Ok(r) => r,
-                Err(_) => {
-                    // The serde message is not surfaced: for a struct
-                    // deserialize it can name the Rust type, the same
-                    // disclosure #1284 removed from the stdio path.
-                    return json_rpc_error_response(
-                        id,
-                        JsonRpcError::parse_error("not a valid JSON-RPC request"),
-                    );
-                }
+            let JsonRpcPayload::Single(JsonRpcEnvelope::Request(request)) = payload else {
+                return json_rpc_error_response_with_status(
+                    extract_request_id(&parsed),
+                    JsonRpcError::invalid_request("not a valid JSON-RPC request"),
+                    StatusCode::BAD_REQUEST,
+                );
             };
+            drop(parsed);
 
             // Ephemeral pre-initialized service -- no session is stored or created.
             //
@@ -773,25 +780,13 @@ pub(super) async fn handle_post(
                 return StatusCode::ACCEPTED.into_response();
             }
 
-            // The id is captured before `parsed` is consumed below so a
-            // malformed-but-identified request can still be answered with a
-            // matching id instead of null (#1336). `extract_request_id`
-            // itself falls back to `None` when the id isn't a usable number
-            // or string, which is exactly the "genuinely no usable id" case
-            // that must still answer null.
-            let id = extract_request_id(&parsed);
-            let request: JsonRpcRequest = match serde_json::from_value(parsed) {
-                Ok(r) => r,
-                Err(_) => {
-                    // The serde message is not surfaced: for a struct
-                    // deserialize it can name the Rust type, the same
-                    // disclosure #1284 removed from the stdio path.
-                    return json_rpc_error_response(
-                        id,
-                        JsonRpcError::parse_error("not a valid JSON-RPC request"),
-                    );
-                }
+            let JsonRpcPayload::Single(JsonRpcEnvelope::Request(request)) = payload else {
+                return json_rpc_error_response(
+                    extract_request_id(&parsed),
+                    JsonRpcError::invalid_request("not a valid JSON-RPC request"),
+                );
             };
+            drop(parsed);
 
             // Ephemeral pre-initialized service -- no session stored
             let mut service = match &state.service_source {
@@ -956,9 +951,8 @@ pub(super) async fn handle_post(
         return session_required_response();
     };
 
-    // Session lookup establishes the exact legacy revision. Validate the raw
-    // envelope before object-only notification/response routing, then let the
-    // existing request dispatcher consume the typed shape.
+    // Session lookup establishes the exact legacy revision for MCP validation
+    // before notification, response, or request dispatch.
     let session_protocol_version = if uses_transient_session {
         let version = state
             .protocol_support
@@ -989,16 +983,19 @@ pub(super) async fn handle_post(
             );
         }
     };
-    if !is_init
-        && let Err(error) = inspect_runtime_value(
-            &parsed,
+    let payload = if is_init {
+        payload
+    } else {
+        match inspect_runtime_payload(
+            payload,
             session_revision,
             &state.protocol_support,
             McpDirection::ClientToServer,
-        )
-    {
-        return json_rpc_error_response(extract_request_id(&parsed), error);
-    }
+        ) {
+            Ok(payload) => payload,
+            Err(error) => return json_rpc_error_response(extract_request_id(&parsed), error),
+        }
+    };
 
     if parsed.is_array() {
         if state.strict_initialization
@@ -1157,7 +1154,7 @@ pub(super) async fn handle_post(
     // Check if this is a notification (no id field)
     if parsed.get("id").is_none() {
         // Handle notification
-        if let Ok(notification) = serde_json::from_value::<JsonRpcNotification>(parsed)
+        if let JsonRpcPayload::Single(JsonRpcEnvelope::Notification(notification)) = payload
             && let Ok(mcp_notification) = McpNotification::from_jsonrpc(&notification)
         {
             // Per the MCP 2025-11-25 spec, clients MUST send
@@ -1198,12 +1195,9 @@ pub(super) async fn handle_post(
         );
     }
 
-    // For initialize requests, capture the advertised client info /
-    // capabilities from the raw params before `parsed` is consumed by
-    // deserialization. These are stashed onto the live `Session` after a
-    // successful initialize so the persisted SessionRecord faithfully
-    // describes the client (rather than carrying the defaults set at
-    // session-create time).
+    // Capture initialize client info and capabilities from the raw params.
+    // After successful initialization, save them on the live session so the
+    // session record reflects the advertised values.
     let init_client_metadata: Option<(Option<Implementation>, Option<ClientCapabilities>)> =
         if is_init {
             let params = parsed.get("params");
@@ -1218,26 +1212,14 @@ pub(super) async fn handle_post(
             None
         };
 
-    // Handle as JSON-RPC request. The id is captured before `parsed` is
-    // consumed below so a malformed-but-identified request can still be
-    // answered with a matching id instead of null (#1336).
-    // `extract_request_id` itself falls back to `None` when the id isn't a
-    // usable number or string, which is exactly the "genuinely no usable id"
-    // case that must still answer null.
-    let id = extract_request_id(&parsed);
-    let request: JsonRpcRequest = match serde_json::from_value(parsed) {
-        Ok(r) => r,
-        Err(_) => {
-            // The serde message is not surfaced: for a struct deserialize it
-            // can name the Rust type, the same disclosure #1284 removed from
-            // the stdio path.
-            discard_init_session(&state, &session, is_init).await;
-            return json_rpc_error_response(
-                id,
-                JsonRpcError::parse_error("not a valid JSON-RPC request"),
-            );
-        }
+    let JsonRpcPayload::Single(JsonRpcEnvelope::Request(request)) = payload else {
+        discard_init_session(&state, &session, is_init).await;
+        return json_rpc_error_response(
+            extract_request_id(&parsed),
+            JsonRpcError::invalid_request("not a valid JSON-RPC request"),
+        );
     };
+    drop(parsed);
 
     // Process the request through the middleware-wrapped service
     let mut service = JsonRpcService::new(session.make_service());
@@ -1928,6 +1910,14 @@ pub(super) fn json_rpc_error_response_with_status(
     let mut response = json_rpc_error_response(id, error);
     *response.status_mut() = status;
     response
+}
+
+fn body_parse_error_response(message: String) -> Response {
+    json_rpc_error_response_with_status(
+        None,
+        JsonRpcError::parse_error(message),
+        StatusCode::BAD_REQUEST,
+    )
 }
 
 /// HTTP 413 response for a POST body exceeding [`HttpTransport::max_body_size`].
