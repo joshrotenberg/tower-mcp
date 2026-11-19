@@ -92,11 +92,10 @@
 //! # Ok(()) }
 //! ```
 //!
-//! The wait for in-flight work is unbounded by default, so nothing already
-//! accepted is dropped. A client holding an SSE notification stream open is
-//! also an in-flight request, and it can outlast the shutdown that started
-//! it. [`drain_timeout`](crate::HttpTransport::drain_timeout) bounds that
-//! wait:
+//! Built-in HTTP shutdown sends terminal results to open `subscriptions/listen`
+//! streams and ends legacy GET notification streams. The wait for in-flight
+//! requests is unbounded by default. Use
+//! [`drain_timeout`](crate::HttpTransport::drain_timeout) to bound it:
 //!
 //! ```rust,no_run
 //! # use std::time::Duration;
@@ -116,8 +115,10 @@
 //! future. A WebSocket leaves axum's connection tracking when it is
 //! upgraded, so that transport has no `drain_timeout`: shutting down stops
 //! new clients getting in, and open sockets run until their clients hang up.
-//! If you serve the router yourself with `into_router()`, the equivalent of
-//! all this is `axum::serve(..).with_graceful_shutdown(..)`.
+//! If you serve the HTTP router yourself, use
+//! `axum::serve(..).with_graceful_shutdown(..)` to stop accepting connections.
+//! With the final protocol enabled, a
+//! [`SessionHandle`](crate::SessionHandle) can drain open subscription streams.
 //!
 //! A built-in live Task handler is detached after its `tools/call` returns a
 //! Task object, so transport request drain does not wait for that handler.

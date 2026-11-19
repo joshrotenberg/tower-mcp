@@ -276,6 +276,7 @@ use tokio::sync::mpsc;
 use tokio::sync::{Mutex, RwLock, broadcast, oneshot};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
+use tokio_util::sync::CancellationToken;
 
 use crate::context::ServerNotification;
 use crate::context::{
@@ -438,6 +439,8 @@ struct AppState {
     protocol_support: ProtocolSupport,
     /// Session store
     sessions: Arc<SessionRegistry>,
+    /// Ends transport-owned notification streams during built-in shutdown.
+    stream_shutdown: CancellationToken,
     /// Whether to validate Origin header
     validate_origin: bool,
     /// Allowed origins (if validation is enabled), parsed and normalized at
@@ -1506,6 +1509,7 @@ impl HttpTransport {
     }
 
     fn build_state(&self) -> Arc<AppState> {
+        let stream_shutdown = CancellationToken::new();
         #[cfg(feature = "stateless")]
         let modern_subscriptions = Arc::new(ModernSubscriptionRegistry::new(
             self.subscription_limits,
@@ -1519,6 +1523,7 @@ impl HttpTransport {
                 ServiceSource::Router { router, .. } => router.subscription_observer(),
                 ServiceSource::Service(_) => None,
             },
+            stream_shutdown.clone(),
         ));
 
         // Keep one transport-lifetime notification sender registered with
@@ -1572,6 +1577,7 @@ impl HttpTransport {
             service_source,
             protocol_support: self.protocol_support.clone(),
             sessions,
+            stream_shutdown,
             validate_origin: self.validate_origin,
             allowed_origins: self.allowed_origins.clone(),
             validate_host: self.validate_host,
@@ -1595,8 +1601,7 @@ impl HttpTransport {
 
     /// Build the axum router for this transport.
     pub fn into_router(self) -> Router {
-        let (router, _handle) = self.into_router_with_handle();
-        router
+        self.into_root_router().0
     }
 
     /// Build the axum router and return a [`SessionHandle`] for managing
@@ -1611,15 +1616,19 @@ impl HttpTransport {
     /// // Use handle in an admin endpoint
     /// let count = handle.session_count().await;
     /// ```
-    pub fn into_router_with_handle(mut self) -> (Router, SessionHandle) {
-        let external_rx = self.external_notifications.take();
-        let state = self.build_state();
+    pub fn into_router_with_handle(self) -> (Router, SessionHandle) {
+        let (router, state) = self.into_root_router();
         let handle = SessionHandle {
             store: state.sessions.clone(),
             #[cfg(feature = "stateless")]
             modern_subscriptions: state.modern_subscriptions.clone(),
         };
+        (router, handle)
+    }
 
+    fn into_root_router(mut self) -> (Router, Arc<AppState>) {
+        let external_rx = self.external_notifications.take();
+        let state = self.build_state();
         spawn_external_notification_fanout(
             external_rx,
             state.sessions.clone(),
@@ -1632,12 +1641,12 @@ impl HttpTransport {
             .route("/", get(handle_get))
             .route("/", delete(handle_delete))
             .route("/health", get(handle_health))
-            .with_state(state);
+            .with_state(state.clone());
 
         #[cfg(feature = "oauth")]
         let router = self.add_oauth_route(router, "");
 
-        (router, handle)
+        (router, state)
     }
 
     /// Build an axum router mounted at a specific path.
@@ -1686,11 +1695,7 @@ impl HttpTransport {
     /// signal arrives is still answered. That is the right default and it
     /// stays the default.
     ///
-    /// Set a bound when a connection might not close on its own. An SSE
-    /// notification stream is the case that matters here: it is a live
-    /// connection until its client hangs up, so an unbounded drain can
-    /// outlast the shutdown that started it. Reaching the bound returns
-    /// rather than waiting further, which is preferable to never returning.
+    /// Set a bound when an in-flight request might take too long to finish.
     /// This mirrors
     /// [`StdioTransport::drain_timeout`](crate::transport::stdio::StdioTransport::drain_timeout).
     ///
@@ -1724,9 +1729,9 @@ impl HttpTransport {
     /// returns. Binding still happens up front, so a bind error is reported
     /// before the signal is ever awaited.
     ///
-    /// Set [`drain_timeout`](Self::drain_timeout) to bound the wait for open
-    /// connections. Without it a client holding an SSE stream open keeps the
-    /// server alive.
+    /// Open `subscriptions/listen` streams send their terminal result and
+    /// legacy GET notification streams end. Set
+    /// [`drain_timeout`](Self::drain_timeout) to bound the wait for connections.
     ///
     /// ```rust,no_run
     /// use tower_mcp::{HttpTransport, McpRouter};
@@ -1751,7 +1756,27 @@ impl HttpTransport {
         tracing::info!("MCP HTTP transport listening on {}", addr);
 
         let drain_timeout = self.drain_timeout;
-        let router = self.into_router();
+        self.serve_on_listener(listener, signal, drain_timeout)
+            .await
+    }
+
+    pub(super) async fn serve_on_listener<L>(
+        self,
+        listener: L,
+        signal: impl Future<Output = ()> + Send + 'static,
+        drain_timeout: Option<Duration>,
+    ) -> Result<()>
+    where
+        L: axum::serve::Listener,
+        L::Addr: std::fmt::Debug,
+    {
+        let (router, state) = self.into_root_router();
+        let signal = async move {
+            signal.await;
+            state.stream_shutdown.cancel();
+            #[cfg(feature = "stateless")]
+            state.modern_subscriptions.close_all();
+        };
         crate::transport::graceful::serve_with_shutdown(listener, router, signal, drain_timeout)
             .await
     }

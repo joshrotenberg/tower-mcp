@@ -102,6 +102,7 @@ pub(super) enum SubscriptionTerminal {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SubscriptionAdmissionError {
+    ShuttingDown,
     GlobalLimit,
     PrincipalLimit,
     MetadataTooLarge,
@@ -182,6 +183,7 @@ pub(super) struct ModernSubscriptionRegistry {
     limits: SubscriptionLimits,
     server_info: Option<Implementation>,
     observer: Option<Arc<dyn crate::transport::subscriptions::SubscriptionObserver>>,
+    stream_shutdown: CancellationToken,
 }
 
 impl ModernSubscriptionRegistry {
@@ -189,6 +191,7 @@ impl ModernSubscriptionRegistry {
         limits: SubscriptionLimits,
         server_info: Option<Implementation>,
         observer: Option<Arc<dyn crate::transport::subscriptions::SubscriptionObserver>>,
+        stream_shutdown: CancellationToken,
     ) -> Self {
         Self {
             next_key: AtomicU64::new(0),
@@ -196,6 +199,7 @@ impl ModernSubscriptionRegistry {
             limits,
             server_info,
             observer,
+            stream_shutdown,
         }
     }
 
@@ -232,6 +236,11 @@ impl ModernSubscriptionRegistry {
         }
 
         let mut subscriptions = self.subscriptions.lock().unwrap();
+        // Shutdown cancels the token before taking this lock to drain the map.
+        // A registration that wins the check is therefore included in the drain.
+        if self.stream_shutdown.is_cancelled() {
+            return Err(SubscriptionAdmissionError::ShuttingDown);
+        }
         if subscriptions.len() >= self.limits.max_active {
             return Err(SubscriptionAdmissionError::GlobalLimit);
         }
@@ -389,7 +398,12 @@ impl ModernSubscriptionRegistry {
 
 impl Default for ModernSubscriptionRegistry {
     fn default() -> Self {
-        Self::new(SubscriptionLimits::default(), None, None)
+        Self::new(
+            SubscriptionLimits::default(),
+            None,
+            None,
+            CancellationToken::new(),
+        )
     }
 }
 
@@ -794,6 +808,13 @@ pub(super) async fn handle_modern_subscriptions_listen_sse(
         subscription_principal(http_extensions),
     ) {
         Ok(registration) => registration,
+        Err(SubscriptionAdmissionError::ShuttingDown) => {
+            return json_rpc_error_response_with_status(
+                Some(subscription_id),
+                JsonRpcError::internal_error("Server is shutting down"),
+                StatusCode::SERVICE_UNAVAILABLE,
+            );
+        }
         Err(_) => {
             return json_rpc_error_response_with_status(
                 Some(subscription_id),
