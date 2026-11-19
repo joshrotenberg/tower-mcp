@@ -3579,29 +3579,51 @@ async fn test_notification_returns_accepted() {
 }
 
 #[tokio::test]
-async fn test_invalid_json_returns_parse_error() {
-    let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
-    let app = transport.into_router();
+async fn malformed_post_body_returns_http_400_parse_error() {
+    let app = HttpTransport::new(create_test_router())
+        .disable_origin_validation()
+        .into_router();
 
-    let request = Request::builder()
-        .method("POST")
-        .uri("/")
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json")
-        .body(Body::from("not valid json{{{"))
-        .unwrap();
+    for version in [None, Some("2025-11-25"), Some("2026-07-28")] {
+        let error = Err::<axum::body::Bytes, _>(std::io::Error::other("fixture read failed"));
+        for (kind, body) in [
+            ("invalid JSON", Body::from(r#"{"jsonrpc":"2.0","id":7,"#)),
+            ("invalid UTF-8", Body::from(vec![0xff])),
+            (
+                "read failure",
+                Body::from_stream(futures::stream::iter([error])),
+            ),
+        ] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/")
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json");
+            if let Some(version) = version {
+                request = request.header(MCP_PROTOCOL_VERSION_HEADER, version);
+            }
 
-    let response = app.oneshot(request).await.unwrap();
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    tower_mcp_types::testing::assert_jsonrpc_error_response(&json);
-    assert!(
-        json["id"].is_null(),
-        "id must be null on parse error: {json}"
-    );
-    assert_eq!(json["error"]["code"].as_i64().unwrap(), -32700);
+            let request = request.body(body).unwrap();
+            let version = version.unwrap_or("headerless");
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{version} {kind}"
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            tower_mcp_types::testing::assert_jsonrpc_error_response(&json);
+            assert_eq!(
+                json.get("id"),
+                Some(&serde_json::Value::Null),
+                "{version} {kind}"
+            );
+            assert_eq!(json["error"]["code"], -32700, "{version} {kind}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -6327,13 +6349,21 @@ async fn send_initialized(app: &axum::Router, session_id: &str) {
     assert_eq!(response.status(), StatusCode::ACCEPTED);
 }
 
-async fn post_legacy_batch(app: &axum::Router, session_id: &str) -> serde_json::Value {
-    let request = Request::builder()
+async fn post_legacy_batch(
+    app: &axum::Router,
+    session_id: &str,
+    version: Option<&str>,
+) -> serde_json::Value {
+    let mut request = Request::builder()
         .method("POST")
         .uri("/")
         .header("Content-Type", "application/json")
         .header("Accept", "application/json")
-        .header(MCP_SESSION_ID_HEADER, session_id)
+        .header(MCP_SESSION_ID_HEADER, session_id);
+    if let Some(version) = version {
+        request = request.header(MCP_PROTOCOL_VERSION_HEADER, version);
+    }
+    let request = request
         .body(Body::from(
             serde_json::json!([
                 {"jsonrpc": "2.0", "id": 2, "method": "ping"},
@@ -6359,22 +6389,26 @@ async fn http_batch_policy_uses_exact_session_revision() {
         .into_router();
     let march_session = do_initialize_for_revision(&march_app, "2025-03-26").await;
     send_initialized(&march_app, &march_session).await;
-    let march_response = post_legacy_batch(&march_app, &march_session).await;
-    assert_eq!(march_response.as_array().map(Vec::len), Some(2));
 
     let november_app = HttpTransport::new(create_test_router())
         .disable_origin_validation()
         .into_router();
     let november_session = do_initialize(&november_app).await;
     send_initialized(&november_app, &november_session).await;
-    let november_response = post_legacy_batch(&november_app, &november_session).await;
-    assert_eq!(november_response["error"]["code"], -32600);
-    assert!(
-        november_response["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("does not permit top-level JSON-RPC batches")
-    );
+
+    for version in [None, Some("2025-03-26")] {
+        let march_response = post_legacy_batch(&march_app, &march_session, version).await;
+        assert_eq!(march_response.as_array().map(Vec::len), Some(2));
+
+        let november_response = post_legacy_batch(&november_app, &november_session, version).await;
+        assert_eq!(november_response["error"]["code"], -32600);
+        assert!(
+            november_response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("does not permit top-level JSON-RPC batches")
+        );
+    }
 }
 
 #[tokio::test]
@@ -6384,7 +6418,7 @@ async fn http_rejects_batch_for_2025_06_18_session() {
         .into_router();
     let session = do_initialize_for_revision(&app, "2025-06-18").await;
     send_initialized(&app, &session).await;
-    let response = post_legacy_batch(&app, &session).await;
+    let response = post_legacy_batch(&app, &session, None).await;
     assert_eq!(response["error"]["code"], -32600);
     assert!(
         response["error"]["message"]
@@ -6755,11 +6789,8 @@ async fn post_body_with_leading_bom_is_served() {
     );
 }
 
-/// SEP-1442 stateless dispatch (the legacy stateless site, reached with no
-/// `Mcp-Session-Id` and a supported `MCP-Protocol-Version` header) never
-/// validates the envelope before deserializing into `JsonRpcRequest`, so a
-/// malformed-but-identified request must still come back with its own id
-/// and a message that doesn't name the Rust type.
+/// A malformed legacy stateless request echoes its readable ID and returns
+/// a generic error message.
 #[tokio::test]
 #[cfg(feature = "stateless")]
 async fn stateless_malformed_request_with_readable_id_gets_a_matching_id() {
@@ -6780,6 +6811,7 @@ async fn stateless_malformed_request_with_readable_id_gets_a_matching_id() {
         .unwrap();
 
     let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -6790,7 +6822,7 @@ async fn stateless_malformed_request_with_readable_id_gets_a_matching_id() {
         serde_json::json!(7),
         "the id was present and readable, so it must be echoed back: {json}"
     );
-    assert_eq!(json["error"]["code"].as_i64().unwrap(), -32700);
+    assert_eq!(json["error"]["code"], -32600);
     let message = json["error"]["message"].as_str().unwrap();
     assert!(
         !message.contains("JsonRpcRequest") && !message.to_lowercase().contains("struct"),
@@ -6798,48 +6830,45 @@ async fn stateless_malformed_request_with_readable_id_gets_a_matching_id() {
     );
 }
 
-/// The same site, but the id itself is unusable (present, but neither a
-/// number nor a string). There is nothing to correlate the error against,
-/// so it must still answer with a null id.
 #[tokio::test]
 #[cfg(feature = "stateless")]
-async fn stateless_malformed_request_with_unusable_id_stays_null() {
+async fn stateless_malformed_envelope_with_no_readable_id_stays_null() {
     let transport = HttpTransport::new(create_test_router())
         .disable_origin_validation()
         .stateless(crate::stateless::StatelessConfig::new());
     let app = transport.into_router();
 
-    let request = Request::builder()
-        .method("POST")
-        .uri("/")
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json, text/event-stream")
-        .header("MCP-Protocol-Version", "2025-11-25")
-        .body(Body::from(r#"{"jsonrpc":"2.0","id":null,"method":42}"#))
-        .unwrap();
+    for body in [
+        r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#,
+        r#"{"jsonrpc":"2.0","method":42}"#,
+    ] {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header(MCP_PROTOCOL_VERSION_HEADER, "2025-11-25")
+            .body(Body::from(body))
+            .unwrap();
 
-    let response = app.oneshot(request).await.unwrap();
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{body}");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
-    assert!(
-        json["id"].is_null(),
-        "no usable id was available, so the response id must be null: {json}"
-    );
-    assert_eq!(json["error"]["code"].as_i64().unwrap(), -32700);
+        assert_eq!(json.get("id"), Some(&serde_json::Value::Null), "{body}");
+        assert_eq!(json["error"]["code"], -32600, "{body}");
+    }
 }
 
-/// The session-based legacy path also has a malformed-but-identified window:
-/// `initialize` requests skip the envelope inspection that runs ahead of
-/// every other request, so a structurally invalid `initialize` body (here,
-/// a non-string `jsonrpc` field) still reaches the raw `JsonRpcRequest`
-/// deserialize and must come back with its own id and a generic message.
+/// A malformed legacy initialize request echoes its readable ID and leaves
+/// no session behind.
 #[tokio::test]
 async fn legacy_initialize_with_malformed_envelope_gets_a_matching_id() {
     let transport = HttpTransport::new(create_test_router()).disable_origin_validation();
-    let app = transport.into_router();
+    let (app, handle) = transport.into_router_with_handle();
 
     let body = serde_json::json!({
         "jsonrpc": 2.0,
@@ -6861,6 +6890,7 @@ async fn legacy_initialize_with_malformed_envelope_gets_a_matching_id() {
         .unwrap();
 
     let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -6871,12 +6901,107 @@ async fn legacy_initialize_with_malformed_envelope_gets_a_matching_id() {
         serde_json::json!(7),
         "the id was present and readable, so it must be echoed back: {json}"
     );
-    assert_eq!(json["error"]["code"].as_i64().unwrap(), -32700);
+    assert_eq!(json["error"]["code"], -32600);
     let message = json["error"]["message"].as_str().unwrap();
     assert!(
         !message.contains("JsonRpcRequest") && !message.to_lowercase().contains("struct"),
         "error message must not name the Rust type (#1284 precedent): {message}"
     );
+    assert_eq!(handle.session_count().await, 0);
+}
+
+#[tokio::test]
+async fn legacy_session_distinguishes_valid_and_invalid_responses() {
+    let app = HttpTransport::new(create_test_router())
+        .disable_origin_validation()
+        .require_sessions()
+        .into_router();
+    let session_id = do_initialize(&app).await;
+    send_initialized(&app, &session_id).await;
+
+    for (body, status) in [
+        (
+            r#"{"jsonrpc":"2.0","id":"sample","result":{}}"#,
+            StatusCode::ACCEPTED,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":"sample","error":{}}"#,
+            StatusCode::OK,
+        ),
+    ] {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header(MCP_SESSION_ID_HEADER, &session_id)
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), status, "{body}");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        if status == StatusCode::ACCEPTED {
+            assert!(bytes.is_empty());
+        } else {
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["id"], "sample");
+            assert_eq!(json["error"]["code"], -32600);
+        }
+    }
+}
+
+#[tokio::test]
+#[cfg(feature = "stateless")]
+async fn modern_post_validates_envelope_before_metadata_and_method_headers() {
+    use serde_json::json;
+
+    let app = HttpTransport::new(create_test_router())
+        .disable_origin_validation()
+        .into_router();
+
+    let meta = json!({"_meta": {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {}
+    }});
+    for (body, id, code) in [
+        (json!(true), json!(null), -32600),
+        (
+            json!({"jsonrpc":"2.0","id":7,"method":42}),
+            json!(7),
+            -32600,
+        ),
+        (
+            json!({"jsonrpc":"2.0","id":true,"method":"tools/list","params":meta}),
+            json!(null),
+            -32600,
+        ),
+        (
+            json!({"jsonrpc":"2.0","id":"list","method":"tools/list"}),
+            json!("list"),
+            -32602,
+        ),
+    ] {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header(MCP_PROTOCOL_VERSION_HEADER, "2026-07-28")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json.get("id"), Some(&id), "{body}");
+        assert_eq!(json["error"]["code"], code, "{body}");
+    }
 }
 
 /// Status of a legacy SSE GET on a valid initialized session, given one
