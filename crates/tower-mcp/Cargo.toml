@@ -51,9 +51,17 @@ jsonschema = { version = "0.61", optional = true, default-features = false }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(any(unix, windows))'.dependencies]
+cap-fs-ext = { version = "4.0.3", optional = true }
+cap-std = { version = "4.0.3", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", optional = true, features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 async-trait.workspace = true
 proptest = "1"
+tempfile = "3"
 tokio-test = "0.4"
 tower = { workspace = true, features = ["timeout", "limit"] }
 tower-mcp-types = { path = "../tower-mcp-types", features = ["testing"] }
@@ -107,7 +115,7 @@ mcp-apps = ["dep:url"]
 protocol-2026-07-28 = ["stateless"]
 # Skills extension (SEP-2640): serve Agent Skills as `skill://` resources with
 # `skills/list`, `skills/get`, and optional `resources/directory/read`.
-skills = ["dep:icu_normalizer", "dep:icu_properties", "dep:sha2", "dep:urlencoding", "dep:yaml_serde"]
+skills = ["dep:cap-fs-ext", "dep:cap-std", "dep:icu_normalizer", "dep:icu_properties", "dep:sha2", "dep:urlencoding", "dep:windows-sys", "dep:yaml_serde"]
 # Compatibility alias for the former feature name. New consumers should enable
 # `protocol-2026-07-28`; existing `stateless` users retain the same behavior.
 stateless = ["dep:sha2"]

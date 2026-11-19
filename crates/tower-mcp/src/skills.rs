@@ -40,16 +40,24 @@
 //!
 //! # Loading from disk
 //!
-//! [`SkillSet::from_dir`] walks a directory tree once. Every directory that
-//! contains a `SKILL.md` is a skill, and its path relative to the root becomes
-//! its `<skill-path>`. When the root itself contains a `SKILL.md`, the root
-//! directory's own name is used, so pointing at a single skill directory works
-//! too. A skill's file list includes the files of any skill nested inside it,
-//! as the spec requires. The walk skips symbolic link entries and names that
-//! start with `.`. Use a trusted directory tree that untrusted users cannot
-//! modify during loading. If the walk or a skill file read fails, loading
-//! returns an error for the whole directory load. Changes on disk after loading
-//! are not picked up.
+//! On Unix and Windows, [`SkillSet::from_dir`] discovers skills by walking
+//! from an open directory handle. The caller-selected root is initially
+//! resolved by the OS and may itself be reached through symbolic links.
+//! Below the root, each directory and file is opened relative to a directory
+//! handle without following symbolic links. Dot entries, symbolic links, and
+//! other nonregular entries are skipped when encountered during discovery.
+//! On Windows, discovery also skips other reparse points.
+//!
+//! The path relative to the root becomes the `<skill-path>` of each directory
+//! with a `SKILL.md`. If the root itself is a skill, the final component of
+//! the canonical root path is used as its name. A skill's file list includes
+//! the files of any skills nested inside it.
+//!
+//! Discovery and reads occur separately. Use a stable tree for a consistent
+//! catalog. Changes during loading can affect which entries or bytes are
+//! observed, and an error opening, enumerating, or reading an expected
+//! entry fails the entire load. Changes after loading are picked up on a new
+//! load. Disk loading returns an unsupported I/O error on other targets.
 //!
 //! # Validation
 //!
@@ -75,7 +83,7 @@
 //! too. Hidden files are also left out of directory listings.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -94,6 +102,9 @@ use crate::protocol::{CacheScope, ReadResourceResult, ResourceContent, ResourceD
 use crate::resource::{Resource, ResourceBuilder};
 
 pub use tower_mcp_types::skills::*;
+
+#[cfg(any(unix, windows))]
+mod disk;
 
 /// Why a skill could not be loaded or registered.
 #[derive(Debug)]
@@ -292,7 +303,8 @@ impl SkillSet {
 
     /// Load every skill under `root` into this catalog.
     ///
-    /// Use a [trusted directory tree](self#loading-from-disk).
+    /// See [loading from disk](self#loading-from-disk) for platform support
+    /// and consistency requirements.
     pub fn load_dir(self, root: impl AsRef<Path>) -> Result<Self, SkillError> {
         self.load_dir_with_prefix(root, "")
     }
@@ -302,67 +314,25 @@ impl SkillSet {
     /// With prefix `acme/billing`, a skill at `refunds/` under `root` is
     /// served at `skill://acme/billing/refunds/SKILL.md`.
     ///
-    /// Use a [trusted directory tree](self#loading-from-disk).
+    /// See [loading from disk](self#loading-from-disk) for platform support
+    /// and consistency requirements.
     pub fn load_dir_with_prefix(
-        mut self,
+        self,
         root: impl AsRef<Path>,
         prefix: &str,
     ) -> Result<Self, SkillError> {
-        let root = root.as_ref();
-        let prefix = prefix.trim_matches('/');
-        let files = walk_dir(root)?;
-
-        let skill_dirs: BTreeSet<String> = files
-            .keys()
-            .filter_map(|rel| {
-                if rel == SKILL_MANIFEST_FILE {
-                    Some(String::new())
-                } else {
-                    rel.strip_suffix(&format!("/{SKILL_MANIFEST_FILE}"))
-                        .map(str::to_string)
-                }
-            })
-            .collect();
-
-        // When the root itself is a skill, it is served under its own
-        // directory name, so `from_dir("skills/git-workflow")` works.
-        let root_segment = if skill_dirs.contains("") {
-            let name = root
-                .canonicalize()
-                .ok()
-                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-                .ok_or_else(|| SkillError::InvalidPath {
-                    path: root.display().to_string(),
-                    reason: "a skill root needs a directory name to use as its skill path"
-                        .to_string(),
-                })?;
-            Some(name)
-        } else {
-            None
-        };
-
-        for dir in &skill_dirs {
-            let skill_path =
-                join_path(&[prefix, root_segment.as_deref().unwrap_or(""), dir.as_str()]);
-            let mut builder = SkillBuilder::new(skill_path);
-            let dir_prefix = if dir.is_empty() {
-                String::new()
-            } else {
-                format!("{dir}/")
-            };
-            for (rel, path) in files.range(dir_prefix.clone()..) {
-                let Some(within) = rel.strip_prefix(&dir_prefix) else {
-                    break;
-                };
-                let bytes = std::fs::read(path).map_err(|source| SkillError::Io {
-                    path: path.clone(),
-                    source,
-                })?;
-                builder = builder.file(within, bytes);
-            }
-            self = self.skill(builder)?;
+        #[cfg(any(unix, windows))]
+        {
+            disk::load(self, root.as_ref(), prefix)
         }
-        Ok(self)
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = prefix;
+            Err(SkillError::Io {
+                path: root.as_ref().to_path_buf(),
+                source: std::io::ErrorKind::Unsupported.into(),
+            })
+        }
     }
 
     /// Add one in-memory skill.
@@ -845,15 +815,6 @@ fn validate_path(path: &str) -> Result<(), SkillError> {
     Ok(())
 }
 
-fn join_path(parts: &[&str]) -> String {
-    parts
-        .iter()
-        .map(|p| p.trim_matches('/'))
-        .filter(|p| !p.is_empty())
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
 fn path_with_rel(skill_path: &str, rel: &str) -> String {
     format!("{skill_path}/{rel}")
 }
@@ -932,44 +893,6 @@ fn guess_mime_type(path: &str, bytes: &[u8]) -> &'static str {
         _ if file_text(bytes).is_some() => "text/plain",
         _ => "application/octet-stream",
     }
-}
-
-/// Every regular file under `root`, keyed by its `/`-separated path relative
-/// to `root`. Symbolic links and dot-entries are skipped.
-fn walk_dir(root: &Path) -> Result<BTreeMap<String, PathBuf>, SkillError> {
-    let mut out = BTreeMap::new();
-    let mut stack = vec![(root.to_path_buf(), String::new())];
-    while let Some((dir, rel)) = stack.pop() {
-        let entries = std::fs::read_dir(&dir).map_err(|source| SkillError::Io {
-            path: dir.clone(),
-            source,
-        })?;
-        for entry in entries {
-            let entry = entry.map_err(|source| SkillError::Io {
-                path: dir.clone(),
-                source,
-            })?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') {
-                continue;
-            }
-            let file_type = entry.file_type().map_err(|source| SkillError::Io {
-                path: entry.path(),
-                source,
-            })?;
-            let child_rel = if rel.is_empty() {
-                name
-            } else {
-                format!("{rel}/{name}")
-            };
-            if file_type.is_dir() {
-                stack.push((entry.path(), child_rel));
-            } else if file_type.is_file() {
-                out.insert(child_rel, entry.path());
-            }
-        }
-    }
-    Ok(out)
 }
 
 /// Host-side verification of skill content against its entry (SEP-2640
@@ -1499,10 +1422,11 @@ mod tests {
         );
     }
 
+    #[cfg(any(unix, windows))]
     #[test]
     fn load_dir_finds_nested_skills() {
-        let dir = std::env::temp_dir().join(format!("tower-mcp-skills-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
         let write = |rel: &str, content: &str| {
             let path = dir.join(rel);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1516,8 +1440,9 @@ mod tests {
         );
         write("git-workflow/.hidden", "ignored");
         write("loose.md", "not part of a skill");
+        std::fs::create_dir(dir.join("empty")).unwrap();
 
-        let set = SkillSet::from_dir(&dir).unwrap();
+        let set = SkillSet::from_dir(dir).unwrap();
         let outer = set.get("skill://git-workflow/SKILL.md").unwrap();
         // The enclosing skill lists the nested skill's files too.
         assert_eq!(outer.resources.files().unwrap().len(), 3);
@@ -1532,7 +1457,5 @@ mod tests {
             SkillSet::load_dir_with_prefix(SkillSet::new(), dir.join("git-workflow"), "team")
                 .unwrap();
         assert!(single.get("skill://team/git-workflow/SKILL.md").is_some());
-
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
