@@ -605,7 +605,7 @@ pub(super) async fn handle_post(
 
             enum FirstOutbound {
                 Response(crate::error::Result<JsonRpcResponse>),
-                Notification(crate::context::ServerNotification),
+                Notification(Box<crate::context::ServerNotification>),
                 InitialResponseTimeout,
             }
 
@@ -625,7 +625,7 @@ pub(super) async fn handle_post(
             // attached, or all senders dropped) leaves the other two.
             let mut notifications_open = true;
             let first = loop {
-                let outbound = tokio::select! {
+                break tokio::select! {
                     // A handler may enqueue a notification and complete in
                     // the same poll. Observe the queued notification first so
                     // it is neither dropped nor raced behind the response.
@@ -633,7 +633,10 @@ pub(super) async fn handle_post(
                     // when it fires still decides the status.
                     biased;
                     maybe = notif_rx.recv(), if notifications_open => match maybe {
-                        Some(n) => FirstOutbound::Notification(n),
+                        Some(notification) if state.modern_subscriptions.publish(&notification) => {
+                            continue;
+                        }
+                        Some(notification) => FirstOutbound::Notification(Box::new(notification)),
                         None => {
                             notifications_open = false;
                             continue;
@@ -642,14 +645,6 @@ pub(super) async fn handle_post(
                     result = &mut call => FirstOutbound::Response(result),
                     () = &mut initial_response_deadline => FirstOutbound::InitialResponseTimeout,
                 };
-                match outbound {
-                    FirstOutbound::Notification(notification)
-                        if state.modern_subscriptions.publish(&notification) =>
-                    {
-                        continue;
-                    }
-                    outbound => break outbound,
-                }
             };
 
             match first {
@@ -731,7 +726,7 @@ pub(super) async fn handle_post(
                 }
                 outbound => {
                     let first_notif = match outbound {
-                        FirstOutbound::Notification(notification) => Some(notification),
+                        FirstOutbound::Notification(notification) => Some(*notification),
                         _ => None,
                     };
                     let mut resp = stateless_sse_with_notifications(

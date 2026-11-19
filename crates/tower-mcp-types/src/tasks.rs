@@ -13,7 +13,7 @@
 //! from the negotiated protocol version without emitting mixed compatibility
 //! objects.
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 
 use crate::error::JsonRpcError;
@@ -100,6 +100,9 @@ impl Task {
 /// The internally tagged representation guarantees that required payloads
 /// match their status: `input_required` has `inputRequests`, `completed` has
 /// `result`, and `failed` has `error`.
+///
+/// Each variant stores unknown task fields in its `additional` map. Use
+/// `..` when matching a variant if you only need its typed fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -109,6 +112,9 @@ pub enum DetailedTask {
         /// Shared task fields.
         #[serde(flatten)]
         metadata: TaskMetadata,
+        /// Additional top-level task fields.
+        #[serde(flatten, with = "detailed_additional")]
+        additional: Map<String, Value>,
     },
     /// Work is paused until the client fulfils the outstanding requests.
     InputRequired {
@@ -118,6 +124,9 @@ pub enum DetailedTask {
         /// All currently outstanding server-to-client requests.
         #[serde(rename = "inputRequests")]
         input_requests: InputRequests,
+        /// Additional top-level task fields.
+        #[serde(flatten, with = "detailed_additional")]
+        additional: Map<String, Value>,
     },
     /// Work completed successfully.
     ///
@@ -128,6 +137,9 @@ pub enum DetailedTask {
         metadata: TaskMetadata,
         /// The exact object the original synchronous request would return.
         result: Map<String, Value>,
+        /// Additional top-level task fields.
+        #[serde(flatten, with = "detailed_additional")]
+        additional: Map<String, Value>,
     },
     /// Execution failed with a JSON-RPC error.
     Failed {
@@ -136,19 +148,28 @@ pub enum DetailedTask {
         metadata: TaskMetadata,
         /// Structured JSON-RPC execution error.
         error: JsonRpcError,
+        /// Additional top-level task fields.
+        #[serde(flatten, with = "detailed_additional")]
+        additional: Map<String, Value>,
     },
     /// Work was cancelled before completion.
     Cancelled {
         /// Shared task fields.
         #[serde(flatten)]
         metadata: TaskMetadata,
+        /// Additional top-level task fields.
+        #[serde(flatten, with = "detailed_additional")]
+        additional: Map<String, Value>,
     },
 }
 
 impl DetailedTask {
     /// Construct a working task.
     pub fn working(metadata: TaskMetadata) -> Self {
-        Self::Working { metadata }
+        Self::Working {
+            metadata,
+            additional: Map::new(),
+        }
     }
 
     /// Construct an input-required task.
@@ -156,22 +177,34 @@ impl DetailedTask {
         Self::InputRequired {
             metadata,
             input_requests,
+            additional: Map::new(),
         }
     }
 
     /// Construct a completed task from an object-valued synchronous result.
     pub fn completed(metadata: TaskMetadata, result: Map<String, Value>) -> Self {
-        Self::Completed { metadata, result }
+        Self::Completed {
+            metadata,
+            result,
+            additional: Map::new(),
+        }
     }
 
     /// Construct a failed task from a structured JSON-RPC error.
     pub fn failed(metadata: TaskMetadata, error: JsonRpcError) -> Self {
-        Self::Failed { metadata, error }
+        Self::Failed {
+            metadata,
+            error,
+            additional: Map::new(),
+        }
     }
 
     /// Construct a cancelled task.
     pub fn cancelled(metadata: TaskMetadata) -> Self {
-        Self::Cancelled { metadata }
+        Self::Cancelled {
+            metadata,
+            additional: Map::new(),
+        }
     }
 
     /// Current task status.
@@ -193,11 +226,34 @@ impl DetailedTask {
     /// Shared task metadata.
     pub fn metadata(&self) -> &TaskMetadata {
         match self {
-            Self::Working { metadata }
+            Self::Working { metadata, .. }
             | Self::InputRequired { metadata, .. }
             | Self::Completed { metadata, .. }
             | Self::Failed { metadata, .. }
-            | Self::Cancelled { metadata } => metadata,
+            | Self::Cancelled { metadata, .. } => metadata,
+        }
+    }
+
+    /// Unknown top-level task fields.
+    pub fn additional(&self) -> &Map<String, Value> {
+        match self {
+            Self::Working { additional, .. }
+            | Self::InputRequired { additional, .. }
+            | Self::Completed { additional, .. }
+            | Self::Failed { additional, .. }
+            | Self::Cancelled { additional, .. } => additional,
+        }
+    }
+
+    /// Edit additional task fields. Serialization skips keys reserved by
+    /// the task or its enclosing result or notification.
+    pub fn additional_mut(&mut self) -> &mut Map<String, Value> {
+        match self {
+            Self::Working { additional, .. }
+            | Self::InputRequired { additional, .. }
+            | Self::Completed { additional, .. }
+            | Self::Failed { additional, .. }
+            | Self::Cancelled { additional, .. } => additional,
         }
     }
 
@@ -241,6 +297,10 @@ pub struct CreateTaskResult {
     /// Optional result metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Map<String, Value>>,
+    /// Additional top-level fields. Serialization skips keys reserved by
+    /// the task or this result.
+    #[serde(flatten, with = "create_additional")]
+    pub additional: Map<String, Value>,
 }
 
 impl CreateTaskResult {
@@ -250,6 +310,7 @@ impl CreateTaskResult {
             result_type: ResultType::Other(crate::protocol::RESULT_TYPE_TASK.to_string()),
             task,
             meta: None,
+            additional: Map::new(),
         }
     }
 
@@ -268,8 +329,8 @@ pub struct GetTaskResult {
         deserialize_with = "deserialize_complete_result_type"
     )]
     result_type: ResultType,
-    /// Status-specific task state, flattened on the wire.
-    #[serde(flatten)]
+    /// Status-specific task state and additional fields, flattened on the wire.
+    #[serde(flatten, serialize_with = "serialize_get_task")]
     pub task: DetailedTask,
     /// Optional result metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
@@ -371,12 +432,107 @@ pub struct CancelTaskParams {
 /// Parameters for `notifications/tasks`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskStatusNotificationParams {
-    /// Complete status-specific task state.
-    #[serde(flatten)]
+    /// Complete status-specific task state and additional fields.
+    #[serde(flatten, serialize_with = "serialize_notification_task")]
     pub task: DetailedTask,
     /// Optional notification metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Map<String, Value>>,
+}
+
+fn is_task_field(key: &str) -> bool {
+    matches!(
+        key,
+        "status"
+            | "taskId"
+            | "statusMessage"
+            | "createdAt"
+            | "lastUpdatedAt"
+            | "ttlMs"
+            | "pollIntervalMs"
+    )
+}
+
+mod create_additional {
+    use super::*;
+
+    fn is_reserved(key: &str) -> bool {
+        is_task_field(key) || matches!(key, "resultType" | "_meta")
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Map<String, Value>, D::Error> {
+        // Task itself uses flatten, leaving its typed fields visible to this map.
+        let mut additional = Map::deserialize(deserializer)?;
+        additional.retain(|key, _| !is_reserved(key));
+        Ok(additional)
+    }
+
+    pub(super) fn serialize<S: Serializer>(
+        additional: &Map<String, Value>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(additional.iter().filter(|(key, _)| !is_reserved(key)))
+    }
+}
+
+mod detailed_additional {
+    use super::*;
+
+    fn is_reserved(key: &str) -> bool {
+        is_task_field(key) || matches!(key, "inputRequests" | "result" | "error")
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Map<String, Value>, D::Error> {
+        let mut additional = Map::deserialize(deserializer)?;
+        additional.retain(|key, _| !is_reserved(key));
+        Ok(additional)
+    }
+
+    pub(super) fn serialize<S: Serializer>(
+        additional: &Map<String, Value>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(additional.iter().filter(|(key, _)| !is_reserved(key)))
+    }
+}
+
+fn serialize_get_task<S: Serializer>(
+    task: &DetailedTask,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serialize_enclosed_task(task, &["resultType", "_meta"], serializer)
+}
+
+fn serialize_notification_task<S: Serializer>(
+    task: &DetailedTask,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serialize_enclosed_task(task, &["_meta"], serializer)
+}
+
+fn serialize_enclosed_task<S: Serializer>(
+    task: &DetailedTask,
+    envelope_fields: &[&str],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    // The outer serde struct consumes its named fields before deserializing
+    // the flattened task. Apply the same ownership when serializing.
+    if envelope_fields
+        .iter()
+        .any(|key| task.additional().contains_key(*key))
+    {
+        let mut task = task.clone();
+        for key in envelope_fields {
+            task.additional_mut().remove(*key);
+        }
+        task.serialize(serializer)
+    } else {
+        task.serialize(serializer)
+    }
 }
 
 fn deserialize_task_result_type<'de, D>(deserializer: D) -> Result<ResultType, D::Error>
@@ -453,6 +609,146 @@ mod tests {
         let mut invalid = value;
         invalid["resultType"] = json!("complete");
         assert!(serde_json::from_value::<CreateTaskResult>(invalid).is_err());
+    }
+
+    fn extra_fields() -> Map<String, Value> {
+        Map::from_iter([
+            ("example/object".into(), json!({"_meta": [null, true, 2.5]})),
+            ("example/array".into(), json!([{}, "item", 42])),
+            ("example/string".into(), json!("note")),
+            ("example/bool".into(), json!(false)),
+            ("example/number".into(), json!(7)),
+            ("example/null".into(), Value::Null),
+            (String::new(), json!("empty key")),
+        ])
+    }
+
+    fn assert_round_trip<T: Serialize + for<'de> Deserialize<'de>>(typed: &T, expected: &Value) {
+        let wire = serde_json::to_string(typed).unwrap();
+        assert_eq!(&serde_json::from_str::<Value>(&wire).unwrap(), expected);
+        // Decoding the actual text catches duplicate known keys that Value
+        // would overwrite when it constructs an object.
+        let decoded = serde_json::from_str::<T>(&wire).unwrap();
+        assert_eq!(&serde_json::to_value(decoded).unwrap(), expected);
+    }
+
+    #[test]
+    fn create_task_additional_fields_round_trip_without_collisions() {
+        let mut expected = serde_json::to_value(CreateTaskResult::new(Task::new(
+            metadata(),
+            TaskStatus::Working,
+        )))
+        .unwrap();
+        expected.as_object_mut().unwrap().extend(extra_fields());
+        let mut result: CreateTaskResult = serde_json::from_value(expected.clone()).unwrap();
+        assert_eq!(result.additional, extra_fields());
+        for key in ["resultType", "_meta", "taskId", "status", "statusMessage"] {
+            result.additional.insert(key.into(), json!("collision"));
+        }
+        assert_round_trip(&result, &expected);
+
+        expected["_meta"] = json!({"example/request": "a"});
+        result.meta = Some(expected["_meta"].as_object().unwrap().clone());
+        assert_round_trip(&result, &expected);
+    }
+
+    #[test]
+    fn detailed_task_fields_round_trip_alone_and_inside_envelopes() {
+        let requests = InputRequests::from([(
+            "roots".into(),
+            InputRequest::ListRoots(ListRootsParams { meta: None }),
+        )]);
+        for task in [
+            DetailedTask::working(metadata()),
+            DetailedTask::input_required(metadata(), requests),
+            DetailedTask::completed(
+                metadata(),
+                Map::from_iter([("isError".into(), json!(true))]),
+            ),
+            DetailedTask::failed(metadata(), JsonRpcError::internal_error("task failed")),
+            DetailedTask::cancelled(metadata()),
+        ] {
+            let mut bare = serde_json::to_value(task).unwrap();
+            bare.as_object_mut().unwrap().extend(extra_fields());
+            let mut get = bare.clone();
+            get["resultType"] = json!("complete");
+            get["_meta"] = json!({"example/request": "b"});
+            let mut notification = bare.clone();
+            notification["_meta"] = json!({"example/event": "updated"});
+
+            let mut decoded_get: GetTaskResult = serde_json::from_value(get.clone()).unwrap();
+            let mut decoded_notification: TaskStatusNotificationParams =
+                serde_json::from_value(notification.clone()).unwrap();
+            assert_eq!(decoded_get.task.additional(), &extra_fields());
+            assert_eq!(decoded_notification.task.additional(), &extra_fields());
+
+            bare["resultType"] = json!("example/standalone");
+            bare["_meta"] = json!([null]);
+            let mut decoded_bare: DetailedTask = serde_json::from_value(bare.clone()).unwrap();
+            assert_eq!(decoded_bare.additional()["resultType"], bare["resultType"]);
+            assert_eq!(decoded_bare.additional()["_meta"], bare["_meta"]);
+
+            for key in [
+                "status",
+                "taskId",
+                "statusMessage",
+                "inputRequests",
+                "result",
+                "error",
+            ] {
+                decoded_bare
+                    .additional_mut()
+                    .insert(key.into(), Value::Null);
+            }
+            assert_round_trip(&decoded_bare, &bare);
+
+            decoded_get.task = decoded_bare.clone();
+            assert_round_trip(&decoded_get, &get);
+            decoded_get.meta = None;
+            get.as_object_mut().unwrap().remove("_meta");
+            assert_round_trip(&decoded_get, &get);
+
+            decoded_notification.task = decoded_bare;
+            notification["resultType"] = bare["resultType"].clone();
+            assert_round_trip(&decoded_notification, &notification);
+            decoded_notification.meta = None;
+            notification.as_object_mut().unwrap().remove("_meta");
+            assert_round_trip(&decoded_notification, &notification);
+        }
+    }
+
+    #[test]
+    fn additional_fields_do_not_bypass_typed_validation() {
+        let base = serde_json::to_value(DetailedTask::working(metadata())).unwrap();
+        for (status, field) in [
+            ("input_required", "inputRequests"),
+            ("completed", "result"),
+            ("failed", "error"),
+        ] {
+            let mut invalid = base.clone();
+            invalid["status"] = json!(status);
+            invalid[field] = json!("invalid payload");
+            assert!(serde_json::from_value::<DetailedTask>(invalid.clone()).is_err());
+            assert!(
+                serde_json::from_value::<TaskStatusNotificationParams>(invalid.clone()).is_err()
+            );
+            invalid["resultType"] = json!("complete");
+            assert!(serde_json::from_value::<GetTaskResult>(invalid).is_err());
+        }
+
+        let mut invalid = base.clone();
+        invalid["resultType"] = json!("task");
+        assert!(
+            serde_json::from_value::<GetTaskResult>(invalid.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("resultType must be \"complete\"")
+        );
+        invalid["_meta"] = json!([]);
+        assert!(serde_json::from_value::<CreateTaskResult>(invalid.clone()).is_err());
+        invalid["resultType"] = json!("complete");
+        assert!(serde_json::from_value::<GetTaskResult>(invalid.clone()).is_err());
+        assert!(serde_json::from_value::<TaskStatusNotificationParams>(invalid).is_err());
     }
 
     #[test]
