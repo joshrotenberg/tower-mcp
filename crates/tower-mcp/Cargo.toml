@@ -147,7 +147,7 @@ optional = true
 features = ["v4"]
 
 [dependencies.jsonwebtoken]
-version = "11"
+version = "12"
 optional = true
 default-features = false
 features = ["aws_lc_rs", "use_pem"]
