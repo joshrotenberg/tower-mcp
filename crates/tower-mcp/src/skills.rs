@@ -45,16 +45,19 @@
 //! its `<skill-path>`. When the root itself contains a `SKILL.md`, the root
 //! directory's own name is used, so pointing at a single skill directory works
 //! too. A skill's file list includes the files of any skill nested inside it,
-//! as the spec requires. Symbolic links and entries whose names start with `.`
-//! are skipped. Changes on disk after loading are not picked up.
+//! as the spec requires. The walk skips symbolic link entries and names that
+//! start with `.`. Use a trusted directory tree that untrusted users cannot
+//! modify during loading. If the walk or a skill file read fails, loading
+//! returns an error for the whole directory load. Changes on disk after loading
+//! are not picked up.
 //!
 //! # Validation
 //!
 //! Loading fails with a [`SkillError`] rather than serving a skill that breaks
 //! a requirement of the spec: a missing or malformed `SKILL.md` frontmatter, a
-//! `name` that is not a valid Agent Skills name or does not equal the final
-//! `<skill-path>` segment, an empty `description`, more than
-//! [`MAX_RESOURCES_PER_SKILL`] files, or more than
+//! `name` that is not a valid Agent Skills name or does not match the final
+//! `<skill-path>` segment after Unicode normalization, an empty
+//! `description`, more than [`MAX_RESOURCES_PER_SKILL`] files, or more than
 //! [`MAX_TOTAL_SIZE_PER_SKILL`] bytes.
 //!
 //! # Dynamic skills
@@ -71,12 +74,18 @@
 //! with a [resource filter](crate::McpRouter::resource_filter), hides the skill
 //! too. Hidden files are also left out of directory listings.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use base64::Engine as _;
+use icu_normalizer::ComposingNormalizer;
+use icu_properties::props::{
+    ChangesWhenLowercased, GeneralCategory, GeneralCategoryGroup, WhiteSpace,
+};
+use icu_properties::{CodePointMapData, CodePointSetData};
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
 
@@ -170,9 +179,10 @@ impl std::error::Error for SkillError {
 
 /// An in-memory skill, added to a [`SkillSet`] with [`SkillSet::skill`].
 ///
-/// The skill path is a `/`-separated path whose final segment must equal the
-/// `name` in the `SKILL.md` frontmatter, for example `git-workflow` or
-/// `acme/billing/refunds`. File paths are relative to the skill root.
+/// The skill path is a `/`-separated path whose final segment must match the
+/// `name` in the `SKILL.md` frontmatter after Unicode normalization, for
+/// example `git-workflow` or `acme/billing/refunds`. File paths are relative
+/// to the skill root.
 #[derive(Debug, Clone)]
 pub struct SkillBuilder {
     path: String,
@@ -201,7 +211,8 @@ impl SkillBuilder {
         self.file(SKILL_MANIFEST_FILE, content)
     }
 
-    /// Add a supporting file. The MIME type is inferred from the extension.
+    /// Add a supporting file. The MIME type is inferred from the extension
+    /// when recognized and from the contents otherwise.
     pub fn file(mut self, path: impl Into<String>, content: impl Into<Vec<u8>>) -> Self {
         self.files.insert(
             path.into(),
@@ -273,13 +284,15 @@ impl SkillSet {
         Self::default()
     }
 
-    /// Load every skill under `root`. Shorthand for
-    /// `SkillSet::new().load_dir(root)`.
+    /// Load every skill under a trusted `root`. Shorthand for
+    /// `SkillSet::new().load_dir(root)`. See [loading from disk](self#loading-from-disk).
     pub fn from_dir(root: impl AsRef<Path>) -> Result<Self, SkillError> {
         Self::new().load_dir(root)
     }
 
     /// Load every skill under `root` into this catalog.
+    ///
+    /// Use a [trusted directory tree](self#loading-from-disk).
     pub fn load_dir(self, root: impl AsRef<Path>) -> Result<Self, SkillError> {
         self.load_dir_with_prefix(root, "")
     }
@@ -288,6 +301,8 @@ impl SkillSet {
     ///
     /// With prefix `acme/billing`, a skill at `refunds/` under `root` is
     /// served at `skill://acme/billing/refunds/SKILL.md`.
+    ///
+    /// Use a [trusted directory tree](self#loading-from-disk).
     pub fn load_dir_with_prefix(
         mut self,
         root: impl AsRef<Path>,
@@ -377,18 +392,12 @@ impl SkillSet {
                 reason,
             }
         })?;
-        let name = validate_frontmatter(&skill_uri, &frontmatter)?;
+        let final_segment = path.rsplit('/').next().unwrap_or_default();
+        let name = validate_frontmatter(&skill_uri, &frontmatter, final_segment)?;
         let description = frontmatter
             .get("description")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let final_segment = path.rsplit('/').next().unwrap_or_default();
-        if final_segment != name {
-            return Err(SkillError::NameMismatch {
-                uri: skill_uri,
-                name: name.to_string(),
-            });
-        }
 
         if files.len() > MAX_RESOURCES_PER_SKILL {
             return Err(SkillError::LimitExceeded {
@@ -421,7 +430,6 @@ impl SkillSet {
             } else {
                 source
                     .mime_type
-                    .clone()
                     .unwrap_or_else(|| guess_mime_type(&rel, &source.bytes).to_string())
             };
             resources.push(SkillResource {
@@ -481,10 +489,11 @@ impl SkillSet {
     /// `"dynamic"`.
     ///
     /// `uri` is the skill's `SKILL.md` URI and `frontmatter` must contain the
-    /// `name` and `description` the served `SKILL.md` will carry. No files
-    /// are registered: the application serves them, for example with a
-    /// resource template. Hosts may decline dynamic skills, since they cannot
-    /// be verified or content-bound.
+    /// `name` and `description` the served `SKILL.md` will carry. The final
+    /// skill path segment is percent-decoded as UTF-8 for name validation.
+    /// The application serves the files, for example with a resource
+    /// template. Hosts may decline dynamic skills, since they cannot be
+    /// verified or content-bound.
     pub fn dynamic_skill(
         mut self,
         uri: impl Into<String>,
@@ -498,13 +507,11 @@ impl SkillSet {
             path: uri.clone(),
             reason: "a skill URI must end in /SKILL.md".to_string(),
         })?;
-        let name = validate_frontmatter(&uri, &frontmatter)?;
-        if path_name != name {
-            return Err(SkillError::NameMismatch {
-                uri,
-                name: name.to_string(),
-            });
-        }
+        let path_name = urlencoding::decode(path_name).map_err(|_| SkillError::InvalidPath {
+            path: uri.clone(),
+            reason: "the final skill path segment must decode as UTF-8".to_string(),
+        })?;
+        validate_frontmatter(&uri, &frontmatter, &path_name)?;
         self.skills.insert(
             uri.clone(),
             ServedSkill {
@@ -666,15 +673,15 @@ impl SkillSet {
 fn build_resource(file: &ServedFile) -> Resource {
     let definition = &file.definition;
     let mime_type = definition.mime_type.clone();
-    let content = match std::str::from_utf8(&file.bytes) {
-        Ok(text) => ResourceContent {
+    let content = match file_text(&file.bytes) {
+        Some(text) => ResourceContent {
             uri: definition.uri.clone(),
             mime_type: mime_type.clone(),
             text: Some(text.to_string()),
             blob: None,
             meta: None,
         },
-        Err(_) => ResourceContent {
+        None => ResourceContent {
             uri: definition.uri.clone(),
             mime_type: mime_type.clone(),
             text: None,
@@ -750,21 +757,40 @@ pub fn parse_frontmatter(skill_md: &[u8]) -> Result<Map<String, Value>, String> 
     }
 }
 
-/// Check the Agent Skills `name` rules: 1 to 64 characters of lowercase ASCII
-/// letters, digits, and hyphens, with no leading, trailing, or doubled hyphen.
+/// Check the Agent Skills `name` rules after trimming and NFKC normalization.
+///
+/// A normalized name has 1 to 64 Unicode letters, numbers, and hyphens, equals
+/// its lowercase form, and has no leading, trailing, or doubled hyphen.
 pub fn is_valid_skill_name(name: &str) -> bool {
-    (1..=64).contains(&name.len())
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    is_valid_normalized_skill_name(&normalize_skill_name(name))
+}
+
+fn normalize_skill_name(name: &str) -> Cow<'_, str> {
+    let whitespace = CodePointSetData::new::<WhiteSpace>();
+    // Python's str.strip also treats these four separators as whitespace.
+    let trimmed = name.trim_matches(|c| whitespace.contains(c) || matches!(c, '\u{1c}'..='\u{1f}'));
+    ComposingNormalizer::new_nfkc().normalize(trimmed)
+}
+
+fn is_valid_normalized_skill_name(name: &str) -> bool {
+    let category = CodePointMapData::<GeneralCategory>::new();
+    let alphanumeric = GeneralCategoryGroup::Letter.union(GeneralCategoryGroup::Number);
+    let changes_when_lowercased = CodePointSetData::new::<ChangesWhenLowercased>();
+
+    (1..=64).contains(&name.chars().count())
         && !name.starts_with('-')
         && !name.ends_with('-')
         && !name.contains("--")
+        && name.chars().all(|c| {
+            c == '-'
+                || (alphanumeric.contains(category.get(c)) && !changes_when_lowercased.contains(c))
+        })
 }
 
 fn validate_frontmatter<'a>(
     uri: &str,
     frontmatter: &'a Map<String, Value>,
+    final_segment: &str,
 ) -> Result<&'a str, SkillError> {
     let invalid = |reason: String| SkillError::InvalidFrontmatter {
         uri: uri.to_string(),
@@ -774,9 +800,10 @@ fn validate_frontmatter<'a>(
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid("`name` is missing or not a string".to_string()))?;
-    if !is_valid_skill_name(name) {
+    let normalized_name = normalize_skill_name(name);
+    if !is_valid_normalized_skill_name(&normalized_name) {
         return Err(invalid(format!(
-            "`name` {name:?} must be 1-64 lowercase letters, digits, and single hyphens"
+            "`name` {name:?} must normalize to 1-64 lowercase Unicode letters, numbers, and single hyphens"
         )));
     }
     let description = frontmatter
@@ -787,6 +814,12 @@ fn validate_frontmatter<'a>(
         return Err(invalid(
             "`description` must be 1 to 1024 characters".to_string(),
         ));
+    }
+    if ComposingNormalizer::new_nfkc().normalize(final_segment) != normalized_name {
+        return Err(SkillError::NameMismatch {
+            uri: uri.to_string(),
+            name: name.to_string(),
+        });
     }
     Ok(name)
 }
@@ -864,6 +897,12 @@ fn encode_path(path: &str) -> String {
     out
 }
 
+fn file_text(bytes: &[u8]) -> Option<&str> {
+    std::str::from_utf8(bytes)
+        .ok()
+        .filter(|text| !text.contains('\0'))
+}
+
 fn guess_mime_type(path: &str, bytes: &[u8]) -> &'static str {
     let ext = path
         .rsplit_once('.')
@@ -890,7 +929,7 @@ fn guess_mime_type(path: &str, bytes: &[u8]) -> &'static str {
         "gif" => "image/gif",
         "webp" => "image/webp",
         "pdf" => "application/pdf",
-        _ if std::str::from_utf8(bytes).is_ok() => "text/plain",
+        _ if file_text(bytes).is_some() => "text/plain",
         _ => "application/octet-stream",
     }
 }
@@ -1207,6 +1246,113 @@ mod tests {
     }
 
     #[test]
+    fn skill_names_are_validated_after_normalization() {
+        for name in [
+            "  ｃａｆｅ\u{301}-２  ",
+            "日本語",
+            "\u{323b0}", // CJK Unified Ideograph added in Unicode 17.
+            &"é".repeat(64),
+            &"e\u{301}".repeat(64),
+        ] {
+            assert!(is_valid_skill_name(name), "{name:?}");
+        }
+        for name in [
+            "Éclair",
+            "ａ－－ｂ",
+            "－ａ",
+            "ａ－",
+            "a_b",
+            "a\u{05b0}",
+            &"é".repeat(65),
+            &"ﬀ".repeat(33),
+        ] {
+            assert!(!is_valid_skill_name(name), "{name:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn skills_route_unicode_without_rewriting_uris_or_frontmatter() {
+        use crate::McpRouter;
+        use crate::client::{ChannelTransport, McpClient};
+
+        const NAME: &str = "  ｃａｆｅ\u{301}  ";
+        const STATIC_URI: &str = "skill://static/cafe%CC%81/SKILL.md";
+        const DYNAMIC_URI: &str = "skill://generated/caf%c3%a9/SKILL.md";
+        let manifest = format!("---\nname: '{NAME}'\ndescription: Café guide\n---\n");
+        let frontmatter = parse_frontmatter(manifest.as_bytes()).unwrap();
+        let set = SkillSet::new()
+            .skill(SkillBuilder::new("static/cafe\u{301}").skill_md(manifest.clone()))
+            .unwrap()
+            .dynamic_skill(DYNAMIC_URI, frontmatter.clone())
+            .unwrap();
+        assert!(matches!(
+            SkillSet::new().dynamic_skill("skill://generated/%FF/SKILL.md", frontmatter.clone()),
+            Err(SkillError::InvalidPath { .. })
+        ));
+        assert!(matches!(
+            SkillSet::new().dynamic_skill("skill://generated/Caf%C3%A9/SKILL.md", frontmatter),
+            Err(SkillError::NameMismatch { .. })
+        ));
+
+        let router = McpRouter::new()
+            .skills(set)
+            .resource(ResourceBuilder::new(DYNAMIC_URI).text(manifest.clone()));
+        let client = McpClient::connect(ChannelTransport::new(router))
+            .await
+            .unwrap();
+        client.initialize("skills-test", "1.0.0").await.unwrap();
+        for uri in [STATIC_URI, DYNAMIC_URI] {
+            let entry = client.get_skill(uri).await.unwrap().skill;
+            assert_eq!(entry.uri, uri);
+            assert_eq!(entry.name(), Some(NAME));
+            assert_eq!(entry.resources.is_dynamic(), uri == DYNAMIC_URI);
+            let content = client.read_resource(uri).await.unwrap().contents.remove(0);
+            assert_eq!(content.uri, uri);
+            assert_eq!(content.text.as_deref(), Some(manifest.as_str()));
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_nul_payloads_use_blobs_without_overriding_mime_types() {
+        use crate::McpRouter;
+        use crate::client::{ChannelTransport, McpClient};
+
+        let bytes = b"first\0second";
+        let set = SkillSet::new()
+            .skill(
+                SkillBuilder::new("git-workflow")
+                    .skill_md(SKILL_MD)
+                    .file("fallback", bytes.as_slice())
+                    .file("inferred.txt", bytes.as_slice())
+                    .file_with_mime_type("explicit", bytes.as_slice(), "application/example"),
+            )
+            .unwrap();
+        let router = McpRouter::new().skills(set);
+        let client = McpClient::connect(ChannelTransport::new(router))
+            .await
+            .unwrap();
+        client.initialize("skills-test", "1.0.0").await.unwrap();
+        let skill = client
+            .get_skill("skill://git-workflow/SKILL.md")
+            .await
+            .unwrap()
+            .skill;
+        for (file, mime) in [
+            ("fallback", "application/octet-stream"),
+            ("inferred.txt", "text/plain"),
+            ("explicit", "application/example"),
+        ] {
+            let uri = format!("skill://git-workflow/{file}");
+            let content = client.read_resource(&uri).await.unwrap().contents.remove(0);
+            assert_eq!(content.mime_type.as_deref(), Some(mime));
+            assert!(content.text.is_none());
+            let decoded = verify::content_bytes(&content).unwrap();
+            assert_eq!(decoded, bytes);
+            verify::verify_file(&skill, &uri, &decoded).unwrap();
+        }
+    }
+
+    #[test]
     fn missing_skill_md_is_rejected() {
         let err = SkillSet::new()
             .skill(SkillBuilder::new("a").file("README.md", "x"))
@@ -1365,8 +1511,8 @@ mod tests {
         write("git-workflow/SKILL.md", SKILL_MD);
         write("git-workflow/references/a.md", "a");
         write(
-            "git-workflow/sub/nested/SKILL.md",
-            "---\nname: nested\ndescription: Nested skill\n---\n",
+            "git-workflow/sub/ａｂ/SKILL.md",
+            "---\nname: ab\ndescription: Nested skill\n---\n",
         );
         write("git-workflow/.hidden", "ignored");
         write("loose.md", "not part of a skill");
@@ -1375,7 +1521,9 @@ mod tests {
         let outer = set.get("skill://git-workflow/SKILL.md").unwrap();
         // The enclosing skill lists the nested skill's files too.
         assert_eq!(outer.resources.files().unwrap().len(), 3);
-        let nested = set.get("skill://git-workflow/sub/nested/SKILL.md").unwrap();
+        let nested = set
+            .get("skill://git-workflow/sub/%EF%BD%81%EF%BD%82/SKILL.md")
+            .unwrap();
         assert_eq!(nested.resources.files().unwrap().len(), 1);
         assert_eq!(set.len(), 2);
 

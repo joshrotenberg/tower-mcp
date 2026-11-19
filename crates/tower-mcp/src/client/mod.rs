@@ -2118,24 +2118,67 @@ impl McpClient {
     /// List the direct children of a directory resource
     /// (`resources/directory/read`, SEP-2640).
     ///
-    /// Only call this against a server whose skills extension settings
-    /// declare `directoryRead: true`. Subdirectories carry
-    /// `mimeType: "inode/directory"`; the listing is not recursive.
+    /// If the server's skills extension settings do not declare
+    /// `directoryRead: true`, returns a local method-not-found error before
+    /// sending a request. Subdirectories carry `mimeType: "inode/directory"`;
+    /// the listing is not recursive.
     pub async fn read_resource_directory(
         &self,
         uri: &str,
         cursor: Option<String>,
     ) -> Result<crate::protocol::skills::ReadResourceDirectoryResult> {
+        use crate::protocol::skills::{
+            METHOD_RESOURCES_DIRECTORY_READ, ReadResourceDirectoryParams,
+        };
+
         self.ensure_initialized()?;
-        self.send_request(
-            crate::protocol::skills::METHOD_RESOURCES_DIRECTORY_READ,
-            &crate::protocol::skills::ReadResourceDirectoryParams {
-                uri: uri.to_string(),
-                cursor,
-                meta: None,
-            },
-        )
+        let params = ReadResourceDirectoryParams {
+            uri: uri.to_string(),
+            cursor,
+            meta: None,
+        };
+        self.send_with_session_recovery(METHOD_RESOURCES_DIRECTORY_READ, || async {
+            self.ensure_directory_read_supported().await?;
+            self.send_request_once(METHOD_RESOURCES_DIRECTORY_READ, &params)
+                .await
+        })
         .await
+    }
+
+    async fn ensure_directory_read_supported(&self) -> Result<()> {
+        use serde::Deserialize as _;
+
+        use crate::protocol::skills::{
+            METHOD_RESOURCES_DIRECTORY_READ, SKILLS_EXTENSION_ID, SkillsExtensionSettings,
+        };
+
+        let supports_directory_read = |capabilities: &crate::protocol::ServerCapabilities| {
+            capabilities
+                .extensions
+                .as_ref()
+                .and_then(|extensions| extensions.get(SKILLS_EXTENSION_ID))
+                .and_then(|settings| SkillsExtensionSettings::deserialize(settings).ok())
+                .is_some_and(|settings| settings.directory_read)
+        };
+        let supported = if self.uses_final_protocol().await {
+            self.discovery
+                .read()
+                .await
+                .as_ref()
+                .is_some_and(|result| supports_directory_read(&result.capabilities))
+        } else {
+            self.server_info
+                .read()
+                .await
+                .as_ref()
+                .is_some_and(|result| supports_directory_read(&result.capabilities))
+        };
+        if !supported {
+            return Err(Error::JsonRpc(JsonRpcError::method_not_found(
+                METHOD_RESOURCES_DIRECTORY_READ,
+            )));
+        }
+        Ok(())
     }
 
     /// Read one file of a skill and verify it against the skill's entry.
@@ -2745,14 +2788,28 @@ impl McpClient {
         method: &str,
         params: &P,
     ) -> Result<R> {
+        self.send_with_session_recovery(method, || async {
+            self.send_request_once(method, params).await
+        })
+        .await
+    }
+
+    async fn send_with_session_recovery<R, F>(
+        &self,
+        method: &str,
+        send: impl Fn() -> F,
+    ) -> Result<R>
+    where
+        F: std::future::Future<Output = Result<R>>,
+    {
         let final_protocol = self.uses_final_protocol().await;
-        match self.send_request_once(method, params).await {
+        match send().await {
             Err(Error::SessionExpired)
                 if self.supports_session_recovery && !final_protocol && method != "initialize" =>
             {
                 tracing::info!(method = %method, "Session expired, attempting recovery");
                 self.recover_session().await?;
-                self.send_request_once(method, params).await
+                send().await
             }
             other => other,
         }
