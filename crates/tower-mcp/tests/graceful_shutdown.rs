@@ -1,10 +1,8 @@
 //! Graceful shutdown for the transports that own their listener (#1285).
 //!
-//! `UnixSocketTransport` is covered in `unix_socket.rs`, alongside the rest
-//! of its coverage. Here are the HTTP and WebSocket halves, plus both sides
-//! of the drain contract the shared implementation has to get right: an
-//! unbounded shutdown answers what is already in flight, and a bounded one
-//! stops waiting for it.
+//! TCP and Unix HTTP tests keep notification streams open through shutdown.
+//! The request drain tests cover both the unbounded default and an explicit
+//! deadline.
 //!
 //! Every wait in this file is bounded. The failure being guarded against is
 //! a future that never resolves, so a hang has to surface as a failed
@@ -33,6 +31,7 @@ mod http {
 
     use std::sync::Arc;
 
+    use serde_json::{Value, json};
     use tokio::sync::{Notify, oneshot};
     use tower_mcp::{CallToolResult, HttpTransport, McpRouter, ToolBuilder};
 
@@ -122,6 +121,159 @@ mod http {
             .json()
             .await
             .expect("decode tools/call response")
+    }
+
+    async fn check_sse_shutdown(client: reqwest::Client, url: &str, stop: oneshot::Sender<()>) {
+        let initialized = client
+            .post(url)
+            .header("accept", "application/json, text/event-stream")
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "clientInfo": {"name": "shutdown-test", "version": "1.0.0"},
+                    "capabilities": {}
+                }
+            }))
+            .send()
+            .await
+            .expect("initialize legacy session")
+            .error_for_status()
+            .unwrap();
+        let session_id = initialized.headers()["mcp-session-id"].clone();
+        let body: Value = initialized.json().await.unwrap();
+        assert_eq!(body["result"]["protocolVersion"], PROTOCOL_VERSION);
+
+        let legacy = client
+            .get(url)
+            .header("accept", "text/event-stream")
+            .header("mcp-session-id", session_id)
+            .header("mcp-protocol-version", PROTOCOL_VERSION)
+            .send()
+            .await
+            .expect("open legacy GET stream");
+        assert_eq!(legacy.status(), reqwest::StatusCode::OK);
+        assert_eq!(legacy.headers()["content-type"], "text/event-stream");
+
+        #[cfg(feature = "stateless")]
+        let listen = {
+            let version = "2026-07-28";
+            let listen = client
+                .post(url)
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", version)
+                .header("mcp-method", "subscriptions/listen")
+                .json(&json!({
+                    "jsonrpc": "2.0",
+                    "id": "listen",
+                    "method": "subscriptions/listen",
+                    "params": {
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": version,
+                            "io.modelcontextprotocol/clientCapabilities": {}
+                        },
+                        "notifications": {"toolsListChanged": true}
+                    }
+                }))
+                .send()
+                .await
+                .expect("open final-protocol listen stream");
+            assert_eq!(listen.status(), reqwest::StatusCode::OK);
+            assert_eq!(listen.headers()["content-type"], "text/event-stream");
+            listen
+        };
+
+        // The client has received both response headers and still owns the bodies.
+        stop.send(()).expect("send shutdown signal");
+        assert!(
+            legacy
+                .bytes()
+                .await
+                .expect("read legacy stream to EOF")
+                .is_empty()
+        );
+
+        #[cfg(feature = "stateless")]
+        {
+            let body = listen.text().await.expect("read listen stream to EOF");
+            let events: Vec<Value> = body
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .map(|data| serde_json::from_str(data).expect("decode SSE event"))
+                .collect();
+            assert_eq!(events.len(), 2, "{body}");
+            assert_eq!(
+                events[0]["method"],
+                "notifications/subscriptions/acknowledged"
+            );
+            assert_eq!(events[1]["id"], "listen");
+            assert_eq!(events[1]["result"]["resultType"], "complete");
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_open_http_notification_streams() {
+        let port = free_port().await;
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            HttpTransport::new(McpRouter::new())
+                .serve_with_shutdown(&format!("127.0.0.1:{port}"), async move {
+                    stop_rx.await.expect("shutdown signal");
+                })
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            wait_until_serving(port).await;
+            check_sse_shutdown(
+                reqwest::Client::new(),
+                &format!("http://127.0.0.1:{port}/"),
+                stop_tx,
+            )
+            .await;
+            server.await.expect("server task").expect("serve");
+        })
+        .await
+        .expect("HTTP streams and server must finish without a drain deadline");
+    }
+
+    #[cfg(all(unix, feature = "unix"))]
+    #[tokio::test]
+    async fn shutdown_closes_open_unix_http_notification_streams() {
+        struct SocketFile(std::path::PathBuf);
+        impl Drop for SocketFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let socket =
+            SocketFile(std::env::temp_dir().join(format!("tmcp-sse-{}.sock", std::process::id())));
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let server = tokio::spawn(
+            tower_mcp::UnixSocketTransport::new(McpRouter::new())
+                .serve_with_shutdown(socket.0.clone(), async move {
+                    stop_rx.await.expect("shutdown signal")
+                }),
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while tokio::net::UnixStream::connect(&socket.0).await.is_err() {
+                if server.is_finished() {
+                    panic!("Unix HTTP server exited before startup: {:?}", server.await);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let client = reqwest::Client::builder()
+                .unix_socket(socket.0.clone())
+                .build()
+                .expect("build Unix HTTP client");
+            check_sse_shutdown(client, "http://localhost/", stop_tx).await;
+            server.await.expect("server task").expect("serve");
+        })
+        .await
+        .expect("Unix HTTP streams and server must finish without a drain deadline");
     }
 
     /// The unbounded default. The signal closes the listener but does not

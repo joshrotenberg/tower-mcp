@@ -1084,7 +1084,7 @@ pub(super) async fn handle_post(
                 session.protocol_version.read().await.clone()
             };
             if version_supports_subscriptions_listen(&effective_version, &state.protocol_support) {
-                return handle_subscriptions_listen_sse(session).await;
+                return handle_subscriptions_listen_sse(session, state.stream_shutdown.clone());
             } else {
                 return json_rpc_error_response(
                     req_id,
@@ -1577,11 +1577,14 @@ fn version_supports_subscriptions_listen(
 /// Subscribes to the session's notification broadcast channel and returns a
 /// streaming `text/event-stream` response. The stream closes naturally when:
 /// - The client disconnects (axum drops the response body).
-/// - The broadcast channel closes (server shutdown / session expiry).
+/// - The transport begins shutdown or the broadcast channel closes.
 ///
 /// Each notification is assigned a monotonically increasing event ID for
 /// potential stream resumption (SEP-1699).
-async fn handle_subscriptions_listen_sse(session: Arc<Session>) -> Response {
+fn handle_subscriptions_listen_sse(
+    session: Arc<Session>,
+    stream_shutdown: CancellationToken,
+) -> Response {
     let rx = session.notifications_tx.subscribe();
     let session_clone = session.clone();
 
@@ -1607,13 +1610,16 @@ async fn handle_subscriptions_listen_sse(session: Arc<Session>) -> Response {
         })
         .filter_map(|x| x);
 
-    Sse::new(stream)
-        .keep_alive(
-            axum::response::sse::KeepAlive::new()
-                .interval(Duration::from_secs(30))
-                .text("ping"),
-        )
-        .into_response()
+    Sse::new(futures::StreamExt::take_until(
+        stream,
+        stream_shutdown.cancelled_owned(),
+    ))
+    .keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(Duration::from_secs(30))
+            .text("ping"),
+    )
+    .into_response()
 }
 
 /// Split an HTTP list or parameter list on `delimiter`, ignoring delimiters
@@ -1790,13 +1796,16 @@ pub(super) async fn handle_get(
     // Chain replay stream with live stream
     let stream = replay_stream.chain(live_stream);
 
-    Sse::new(stream)
-        .keep_alive(
-            axum::response::sse::KeepAlive::new()
-                .interval(Duration::from_secs(30))
-                .text("ping"),
-        )
-        .into_response()
+    Sse::new(futures::StreamExt::take_until(
+        stream,
+        state.stream_shutdown.clone().cancelled_owned(),
+    ))
+    .keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(Duration::from_secs(30))
+            .text("ping"),
+    )
+    .into_response()
 }
 
 /// Handle DELETE requests (session termination)

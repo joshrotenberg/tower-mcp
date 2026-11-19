@@ -425,10 +425,9 @@ async fn main() -> Result<(), BoxError> {
 }
 ```
 
-`drain_timeout` bounds the wait for requests still in flight. It is
-unbounded by default, and a client holding an SSE notification stream open
-counts as in flight, so a server that has to stop within a deadline should
-set it.
+Built-in HTTP shutdown sends terminal results to open `subscriptions/listen`
+streams and ends legacy GET notification streams. The wait for requests still
+in flight is unbounded by default. Use `drain_timeout` to bound it.
 
 A Task-backed `tools/call` stops counting as an HTTP request after its Task
 object has been returned, while a built-in live handler can continue running.

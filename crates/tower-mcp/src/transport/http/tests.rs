@@ -21,6 +21,42 @@ use proptest::prelude::*;
 use tower::ServiceExt;
 
 #[cfg(feature = "stateless")]
+#[tokio::test]
+async fn modern_subscription_registration_stays_closed_after_shutdown() {
+    use super::stateless_dispatch::{SubscriptionAdmissionError, SubscriptionTerminal};
+
+    let shutdown = CancellationToken::new();
+    let registry = Arc::new(ModernSubscriptionRegistry::new(
+        SubscriptionLimits::default(),
+        None,
+        None,
+        shutdown.clone(),
+    ));
+    let register =
+        || registry.try_register(RequestId::Number(1), SubscriptionFilter::default(), None);
+
+    // A host can drain active streams and still accept subsequent listens.
+    let active = register().unwrap();
+    assert_eq!(registry.close_all(), 1);
+    assert!(matches!(
+        active.terminal.await,
+        Ok(SubscriptionTerminal::Drained(_))
+    ));
+
+    let active = register().unwrap();
+    shutdown.cancel();
+    assert_eq!(registry.close_all(), 1);
+    assert!(matches!(
+        active.terminal.await,
+        Ok(SubscriptionTerminal::Drained(_))
+    ));
+    assert!(matches!(
+        register(),
+        Err(SubscriptionAdmissionError::ShuttingDown)
+    ));
+}
+
+#[cfg(feature = "stateless")]
 #[derive(Clone, Default)]
 struct TraceCapture(Arc<std::sync::Mutex<Vec<u8>>>);
 
@@ -391,6 +427,7 @@ async fn modern_subscription_registry_reports_closes() {
         SubscriptionLimits::default(),
         None,
         Some(observer.clone()),
+        CancellationToken::new(),
     ));
 
     // A dropped guard is a client disconnect.
@@ -540,6 +577,7 @@ fn modern_subscription_registry_enforces_global_and_principal_limits() {
         SubscriptionLimits::default().max_active(1),
         None,
         None,
+        CancellationToken::new(),
     ));
     let first = global
         .try_register(
@@ -573,6 +611,7 @@ fn modern_subscription_registry_enforces_global_and_principal_limits() {
             .max_active_per_principal(1),
         None,
         None,
+        CancellationToken::new(),
     ));
     let alice = Some(SubscriptionPrincipal::AuthClient("alice".into()));
     let bob = Some(SubscriptionPrincipal::AuthClient("bob".into()));
@@ -606,6 +645,7 @@ fn modern_subscription_registry_enforces_global_and_principal_limits() {
         SubscriptionLimits::default().max_metadata_bytes(8),
         None,
         None,
+        CancellationToken::new(),
     ));
     let oversized = bounded_metadata.try_register(
         RequestId::String("filter-too-large".into()),
@@ -628,6 +668,7 @@ fn modern_subscription_registry_enforces_global_and_principal_limits() {
         SubscriptionLimits::default().max_metadata_bytes(empty_filter_bytes + 8),
         None,
         None,
+        CancellationToken::new(),
     ));
     let oversized_id = bounded_id.try_register(
         RequestId::String("x".repeat(64)),
@@ -648,6 +689,7 @@ fn modern_subscription_registry_enforces_global_and_principal_limits() {
         SubscriptionLimits::default().max_buffered_messages(usize::MAX),
         None,
         None,
+        CancellationToken::new(),
     ));
     let registration = oversized_message_limit
         .try_register(
@@ -727,6 +769,7 @@ async fn modern_subscription_registry_bounds_messages_and_reports_overflow_once(
         SubscriptionLimits::default().max_buffered_messages(1),
         None,
         Some(observer.clone()),
+        CancellationToken::new(),
     ));
     let registration = registry
         .try_register(
@@ -773,6 +816,7 @@ async fn modern_subscription_registry_enforces_the_byte_budget() {
             .max_buffered_bytes(1),
         None,
         None,
+        CancellationToken::new(),
     ));
     let registration = registry
         .try_register(

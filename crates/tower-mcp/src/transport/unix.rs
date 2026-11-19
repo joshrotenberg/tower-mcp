@@ -229,10 +229,7 @@ impl UnixSocketTransport {
     /// Bound how long [`serve_with_shutdown`](Self::serve_with_shutdown)
     /// waits for open connections after the shutdown signal fires.
     ///
-    /// See [`HttpTransport::drain_timeout`], which this mirrors. The bound
-    /// matters here for the same reason: an SSE notification stream stays
-    /// open until its client hangs up, so an unbounded drain can outlive the
-    /// shutdown that triggered it.
+    /// See [`HttpTransport::drain_timeout`], which this mirrors.
     pub fn drain_timeout(mut self, timeout: Duration) -> Self {
         self.drain_timeout = Some(timeout);
         self
@@ -277,9 +274,9 @@ impl UnixSocketTransport {
     /// returns. Binding still happens up front, so a bind error is reported
     /// before the signal is ever awaited.
     ///
-    /// Set [`drain_timeout`](Self::drain_timeout) to bound the wait for open
-    /// connections. Without it a client holding an SSE stream open keeps the
-    /// server alive.
+    /// Open `subscriptions/listen` streams send their terminal result and
+    /// legacy GET notification streams end. Set
+    /// [`drain_timeout`](Self::drain_timeout) to bound the wait for connections.
     ///
     /// ```rust,no_run
     /// use tower_mcp::{McpRouter, UnixSocketTransport};
@@ -322,9 +319,7 @@ impl UnixSocketTransport {
 
         tracing::info!("MCP Unix socket transport listening on {}", path.display());
 
-        let drain_timeout = self.drain_timeout;
-        let router = self.inner.into_router();
-        crate::transport::graceful::serve_with_shutdown(listener, router, signal, drain_timeout)
+        self.serve_with_listener_and_shutdown(listener, signal)
             .await
     }
 
@@ -427,9 +422,8 @@ impl UnixSocketTransport {
         L::Addr: std::fmt::Debug,
         F: Future<Output = ()> + Send + 'static,
     {
-        let drain_timeout = self.drain_timeout;
-        let router = self.inner.into_router();
-        crate::transport::graceful::serve_with_shutdown(listener, router, signal, drain_timeout)
+        self.inner
+            .serve_on_listener(listener, signal, self.drain_timeout)
             .await
     }
 }
