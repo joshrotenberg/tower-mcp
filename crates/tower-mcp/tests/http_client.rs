@@ -3674,6 +3674,75 @@ async fn test_session_recovery_follows_a_404_from_the_real_transport() {
     );
 }
 
+#[tokio::test]
+async fn test_session_recovery_rejects_an_excluded_protocol_and_deletes_the_session() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let seen = requests.clone();
+    let url = spawn_raw_server(move |req| {
+        let mut seen = seen.lock().unwrap();
+        let is_first_request = seen.is_empty();
+        seen.push(req.to_owned());
+
+        if raw_is(req, "initialize") {
+            let response = raw_initialize_ok(req);
+            if is_first_request {
+                response
+            } else {
+                response
+                    .replace("raw-session", "replacement-session")
+                    .replace("2025-11-25", "2025-06-18")
+            }
+        } else if raw_is(req, "notifications/initialized") {
+            raw_response("202 Accepted", "", "")
+        } else if req.starts_with("DELETE ") {
+            raw_response("204 No Content", "", "")
+        } else {
+            raw_response("404 Not Found", "", "")
+        }
+    })
+    .await;
+
+    let client = McpClient::builder()
+        .protocol_support(tower_mcp::ProtocolSupport::try_new(["2025-11-25"]).unwrap())
+        .connect_simple(HttpClientTransport::with_config(url, raw_client_config()))
+        .await
+        .unwrap();
+    client.initialize("recovery-client", "2.3.4").await.unwrap();
+
+    let error = client.list_tools().await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("`2025-06-18`, which is not an initialize-lifecycle version"),
+        "the replacement must fail protocol validation, got: {error}"
+    );
+    assert!(!client.is_initialized());
+    assert!(client.server_info().await.is_none());
+
+    let seen = requests.lock().unwrap();
+    let [initial, notification, tools, replacement, delete] = seen.as_slice() else {
+        panic!("unexpected requests during the failed handshake: {seen:?}");
+    };
+    assert!(raw_is(initial, "initialize"));
+    assert!(raw_is(notification, "notifications/initialized"));
+    assert!(raw_is(tools, "tools/list"));
+    assert!(raw_is(replacement, "initialize"));
+    for request in [initial, replacement] {
+        let (_, body) = request.split_once("\r\n\r\n").unwrap();
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            body["params"]["clientInfo"],
+            serde_json::json!({"name": "recovery-client", "version": "2.3.4"})
+        );
+    }
+    assert!(delete.starts_with("DELETE "));
+    assert!(
+        delete
+            .lines()
+            .any(|line| { line.eq_ignore_ascii_case("mcp-session-id: replacement-session") })
+    );
+}
+
 /// Verify that session recovery is disabled when configured.
 #[tokio::test]
 async fn test_session_recovery_disabled() {
