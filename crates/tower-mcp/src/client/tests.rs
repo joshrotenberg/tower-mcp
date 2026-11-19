@@ -477,6 +477,137 @@ fn final_discover_result() -> serde_json::Value {
     })
 }
 
+async fn check_directory_read_capability(handshake: serde_json::Value) {
+    use crate::protocol::skills::{METHOD_RESOURCES_DIRECTORY_READ, SKILLS_EXTENSION_ID};
+    use serde_json::json;
+
+    for (extensions, expected) in [
+        (None, false),
+        (Some(json!({ SKILLS_EXTENSION_ID: {} })), false),
+        (
+            Some(json!({ SKILLS_EXTENSION_ID: { "directoryRead": false } })),
+            false,
+        ),
+        (
+            Some(json!({ SKILLS_EXTENSION_ID: { "directoryRead": "true" } })),
+            false,
+        ),
+        (
+            Some(json!({ SKILLS_EXTENSION_ID: { "directoryRead": true } })),
+            true,
+        ),
+    ] {
+        let mut handshake = handshake.clone();
+        if let Some(extensions) = extensions {
+            handshake["capabilities"]["extensions"] = extensions;
+        }
+        #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+        let discover = handshake.get("supportedVersions").is_some();
+        let transport = MockTransport::with_responses(vec![
+            handshake,
+            json!({
+                "resultType": "complete",
+                "resources": [],
+                "nextCursor": "next-page",
+                "ttlMs": 0,
+                "cacheScope": "private"
+            }),
+        ]);
+        let outgoing = transport.outgoing.clone();
+        let client = McpClient::builder()
+            .connect_simple(transport)
+            .await
+            .unwrap();
+        #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+        if discover {
+            client.discover("test-client", "1.0.0").await.unwrap();
+        } else {
+            client.initialize("test-client", "1.0.0").await.unwrap();
+        }
+        #[cfg(not(any(feature = "protocol-2026-07-28", feature = "stateless")))]
+        client.initialize("test-client", "1.0.0").await.unwrap();
+
+        let before = outgoing.lock().unwrap().len();
+        let result = client
+            .read_resource_directory("skill://reports", Some("page".into()))
+            .await;
+        let outgoing = outgoing.lock().unwrap();
+        if expected {
+            assert_eq!(outgoing.len(), before + 1);
+            let request: serde_json::Value = serde_json::from_str(&outgoing[before]).unwrap();
+            assert_eq!(request["method"], METHOD_RESOURCES_DIRECTORY_READ);
+            assert_eq!(request["params"]["uri"], "skill://reports");
+            assert_eq!(request["params"]["cursor"], "page");
+            assert_eq!(result.unwrap().next_cursor.as_deref(), Some("next-page"));
+        } else {
+            assert_eq!(
+                outgoing.len(),
+                before,
+                "directory request reached transport"
+            );
+            assert!(matches!(result, Err(Error::JsonRpc(error)) if error.code == -32601));
+        }
+    }
+}
+
+#[tokio::test]
+async fn directory_read_uses_initialize_capabilities() {
+    check_directory_read_capability(mock_initialize_response()).await;
+}
+
+#[tokio::test]
+async fn directory_read_rechecks_capabilities_after_session_recovery() {
+    use crate::protocol::skills::{METHOD_RESOURCES_DIRECTORY_READ, SKILLS_EXTENSION_ID};
+    use serde_json::json;
+
+    let mut initial = mock_initialize_response();
+    initial["capabilities"]["extensions"] =
+        json!({ SKILLS_EXTENSION_ID: { "directoryRead": true } });
+    let transport = MockTransport::with_replies(vec![
+        MockReply::Result(initial),
+        MockReply::Error(JsonRpcError::session_not_found()),
+        MockReply::Result(mock_initialize_response()),
+        MockReply::Result(json!({ "resources": [] })),
+    ]);
+    let outgoing = transport.outgoing.clone();
+    let mut client = McpClient::builder()
+        .connect_simple(transport)
+        .await
+        .unwrap();
+    client.supports_session_recovery = true;
+    client.initialize("test-client", "1.0.0").await.unwrap();
+
+    let result = client
+        .read_resource_directory("skill://reports", None)
+        .await;
+    assert!(matches!(result, Err(Error::JsonRpc(error)) if error.code == -32601));
+
+    let methods: Vec<_> = outgoing
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|message| {
+            serde_json::from_str::<serde_json::Value>(message).unwrap()["method"].clone()
+        })
+        .collect();
+    assert_eq!(
+        methods,
+        [
+            "initialize",
+            "notifications/initialized",
+            METHOD_RESOURCES_DIRECTORY_READ,
+            "initialize",
+            "notifications/initialized",
+        ]
+    );
+}
+
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+#[tokio::test]
+async fn directory_read_uses_discover_capabilities() {
+    check_directory_read_capability(final_discover_result()).await;
+}
+
 /// #1473: a server that rejects `server/discover` with `-32022` and offers
 /// only legacy `initialize`-lifecycle versions in `supported` has nothing
 /// discover can retry with. Picking a legacy version there would leave the
