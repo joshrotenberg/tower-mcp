@@ -101,6 +101,50 @@
 //! [`CatchError`](crate::transport::CatchError), preserving the
 //! `Error = Infallible` contract required by transports.
 //!
+//! # Setup deadlines
+//!
+//! Use [`BackendSetupOptions`] with [`McpProxyBuilder::backend_with_options`]
+//! to opt into per-phase deadlines and advertised catalog validation. Legacy
+//! entry points still discover all catalogs and treat listing failures as
+//! empty. With options, unadvertised catalogs are skipped and advertised
+//! catalogs must list successfully through the last page. The resources
+//! capability has no templates flag, so a first-page JSON-RPC Method Not Found
+//! from `resources/templates/list` is treated as unsupported.
+//!
+//! An application such as mcp-proxy can pass the same per-backend settings
+//! during startup and when reloading a backend. The RPC layer applies to
+//! routed calls. A failed replacement leaves the previous connection serving.
+//!
+//! ```rust,no_run
+//! use std::time::Duration;
+//! use tower::timeout::TimeoutLayer;
+//! use tower_mcp::client::StdioClientTransport;
+//! use tower_mcp::proxy::{BackendSetupOptions, McpProxy};
+//!
+//! # async fn example() -> Result<(), tower_mcp::BoxError> {
+//! let setup = BackendSetupOptions {
+//!     connect_timeout: Duration::from_secs(3),
+//!     initialize_timeout: Duration::from_secs(10),
+//!     discovery_timeout: Duration::from_secs(20),
+//! };
+//! let rpc_timeout = TimeoutLayer::new(Duration::from_secs(60));
+//! let proxy = McpProxy::builder("mcp-proxy", "1.0.0")
+//!     .backend_with_options("db", StdioClientTransport::spawn("db-server", &[]), setup)
+//!     .await
+//!     .backend_layer(rpc_timeout.clone())
+//!     .build_strict()
+//!     .await?;
+//!
+//! proxy.replace_backend_with_options_and_layer(
+//!     "db",
+//!     StdioClientTransport::spawn("db-server", &["--new-config"]),
+//!     setup,
+//!     rpc_timeout,
+//! ).await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # Proxy-Level Middleware
 //!
 //! Because [`McpProxy`] implements `Service<RouterRequest>`, standard Tower
@@ -144,7 +188,9 @@
 //!
 //! # Health Checks
 //!
-//! Ping all backends concurrently to verify connectivity:
+//! Ping all backends concurrently to verify connectivity. Use
+//! [`McpProxy::health_checks`] for bounded probes in completion order or
+//! [`McpProxy::health_check`] for an aggregate in backend order.
 //!
 //! ```rust,ignore
 //! let health = proxy.health_check().await;
@@ -202,8 +248,10 @@ mod builder;
 mod service;
 mod tests;
 
-pub use builder::{McpProxyBuilder, ProxyBuildResult, SkippedBackend, SkippedPhase};
+pub use builder::{
+    BackendSetupFailures, McpProxyBuilder, ProxyBuildResult, SkippedBackend, SkippedPhase,
+};
 pub use service::{AddBackendError, BackendHealth, McpProxy};
 
 // Re-export BackendService so users can write layer bounds against it
-pub use backend::BackendService;
+pub use backend::{BackendService, BackendSetupOptions};

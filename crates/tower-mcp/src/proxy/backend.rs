@@ -8,19 +8,88 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use tokio::sync::{RwLock, mpsc};
 use tower_service::Service;
 
 use crate::client::{ClientTransport, McpClient, NotificationHandler};
+use crate::error::Error;
 use crate::protocol::{
-    McpRequest, McpResponse, PromptDefinition, ResourceDefinition, ResourceTemplateDefinition,
-    ToolDefinition,
+    InitializeResult, McpRequest, McpResponse, PromptDefinition, ResourceDefinition,
+    ResourceTemplateDefinition, ToolDefinition,
 };
 use crate::router::{RouterRequest, RouterResponse};
 use tower_mcp_types::JsonRpcError;
 
 type Result<T> = std::result::Result<T, crate::error::Error>;
+
+/// Per-backend deadlines and opt-in capability-aware discovery.
+///
+/// Defaults are 10 seconds for transport connection, 15 seconds for MCP
+/// initialize, and 30 seconds for initial discovery. Each budget starts when
+/// its phase starts. Routed RPC middleware and notification refreshes use
+/// their own existing behavior.
+///
+/// Pass transport construction as a future to include it in the connection
+/// budget. Work done before that future is polled is outside the budget.
+/// For transports that defer network I/O until the first RPC (such as HTTP),
+/// that I/O is part of the initialize budget.
+///
+/// A timeout drops the phase future. A rejected backend drops its client,
+/// which aborts the message loop and drops the transport. Use cancellation-safe
+/// transport construction and drop-based transport cleanup. Setup does not
+/// wait for graceful close on timeout. Legacy HTTP session deletion on drop
+/// is best effort. A server-issued session can remain active until the
+/// server expires it, including when setup ends before the session ID arrives.
+#[derive(Debug, Clone, Copy)]
+pub struct BackendSetupOptions {
+    /// Time to construct the transport and attach the MCP client.
+    pub connect_timeout: Duration,
+    /// Time for the MCP initialize exchange, including the initialized notification.
+    pub initialize_timeout: Duration,
+    /// Time for all initial catalog requests, including all pagination.
+    pub discovery_timeout: Duration,
+}
+
+impl Default for BackendSetupOptions {
+    fn default() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(10),
+            initialize_timeout: Duration::from_secs(15),
+            discovery_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+async fn setup_phase<T>(
+    deadline: Option<Duration>,
+    phase: &str,
+    future: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    match deadline {
+        Some(duration) => tokio::time::timeout(duration, future)
+            .await
+            .map_err(|_| Error::Transport(format!("{phase} timed out after {duration:?}")))?,
+        None => future.await,
+    }
+}
+
+/// Fetch one initial catalog. A successful empty catalog and an unadvertised
+/// catalog are both empty in the proxy cache. Only the former sends a request.
+async fn discover_catalog<T>(
+    advertised: bool,
+    method: &str,
+    fetch: impl Future<Output = Result<Vec<T>>>,
+) -> Result<Vec<T>> {
+    if !advertised {
+        return Ok(Vec::new());
+    }
+    fetch.await.map_err(|error| Error::ProxySetup {
+        context: format!("initial capability discovery failed for {method}"),
+        source: Box::new(error),
+    })
+}
 
 /// Cached capabilities from a backend server.
 #[derive(Debug, Default, Clone)]
@@ -74,9 +143,10 @@ impl Backend {
     /// that sends invalidation signals on the provided channel.
     pub async fn connect(
         namespace: impl Into<String>,
-        transport: impl ClientTransport,
+        transport: impl Future<Output = Result<impl ClientTransport>>,
         separator: String,
         invalidation_tx: mpsc::Sender<ListChanged>,
+        options: Option<BackendSetupOptions>,
     ) -> Result<Self> {
         let tools_tx = invalidation_tx.clone();
         let resources_tx = invalidation_tx.clone();
@@ -93,7 +163,12 @@ impl Backend {
                 let _ = prompts_tx.try_send(ListChanged::Prompts);
             });
 
-        let client = McpClient::connect_with_handler(transport, handler).await?;
+        let client = setup_phase(
+            options.map(|options| options.connect_timeout),
+            "transport connect",
+            async { McpClient::connect_with_handler(transport.await?, handler).await },
+        )
+        .await?;
         let cache = Arc::new(RwLock::new(CachedCapabilities::default()));
 
         Ok(Self {
@@ -128,22 +203,76 @@ impl Backend {
         }
     }
 
-    /// Initialize the backend: run MCP initialize handshake and discover capabilities.
-    ///
-    /// Returns the backend's instructions (if any) from the initialize response.
-    pub async fn initialize(
-        &self,
+    /// Run the initialize handshake and discover capabilities before publishing the cache.
+    pub async fn finish_setup(
+        &mut self,
         proxy_name: &str,
         proxy_version: &str,
-    ) -> Result<Option<String>> {
-        let result = self.client.initialize(proxy_name, proxy_version).await?;
-        let instructions = result.instructions.clone();
-        self.refresh_capabilities().await?;
-        Ok(instructions)
+        options: Option<BackendSetupOptions>,
+    ) -> Result<()> {
+        let result = setup_phase(
+            options.map(|options| options.initialize_timeout),
+            "MCP initialize",
+            async {
+                if options.is_some() && self.client.is_initialized() {
+                    return self.client.server_info().await.ok_or_else(|| {
+                        Error::internal("backend client has no MCP initialize result")
+                    });
+                }
+                self.client.initialize(proxy_name, proxy_version).await
+            },
+        )
+        .await?;
+
+        let cache = match options {
+            Some(options) => {
+                setup_phase(
+                    Some(options.discovery_timeout),
+                    "initial capability discovery",
+                    self.discover_capabilities(&result),
+                )
+                .await?
+            }
+            None => self.discover_capabilities_lenient().await,
+        };
+        *self.cache.write().await = cache;
+        self.instructions = result.instructions;
+        Ok(())
     }
 
-    /// Refresh cached capabilities from the backend.
-    pub async fn refresh_capabilities(&self) -> Result<()> {
+    async fn discover_capabilities(&self, info: &InitializeResult) -> Result<CachedCapabilities> {
+        let capabilities = &info.capabilities;
+        let (tools, resources, resource_templates, prompts) = tokio::try_join!(
+            discover_catalog(
+                capabilities.tools.is_some(),
+                "tools/list",
+                self.client.list_all_tools()
+            ),
+            discover_catalog(
+                capabilities.resources.is_some(),
+                "resources/list",
+                self.client.list_all_resources()
+            ),
+            discover_catalog(
+                capabilities.resources.is_some(),
+                "resources/templates/list",
+                self.client.list_optional_resource_templates()
+            ),
+            discover_catalog(
+                capabilities.prompts.is_some(),
+                "prompts/list",
+                self.client.list_all_prompts()
+            ),
+        )?;
+        Ok(CachedCapabilities {
+            tools,
+            resources,
+            resource_templates,
+            prompts,
+        })
+    }
+
+    async fn discover_capabilities_lenient(&self) -> CachedCapabilities {
         let (tools, resources, templates, prompts) = tokio::join!(
             self.client.list_all_tools(),
             self.client.list_all_resources(),
@@ -151,13 +280,12 @@ impl Backend {
             self.client.list_all_prompts(),
         );
 
-        let mut cache = self.cache.write().await;
-        cache.tools = tools.unwrap_or_default();
-        cache.resources = resources.unwrap_or_default();
-        cache.resource_templates = templates.unwrap_or_default();
-        cache.prompts = prompts.unwrap_or_default();
-
-        Ok(())
+        CachedCapabilities {
+            tools: tools.unwrap_or_default(),
+            resources: resources.unwrap_or_default(),
+            resource_templates: templates.unwrap_or_default(),
+            prompts: prompts.unwrap_or_default(),
+        }
     }
 
     /// Refresh only the tools cache.

@@ -2003,8 +2003,37 @@ impl McpClient {
     pub async fn list_all_resource_templates_with_cache_hints(
         &self,
     ) -> Result<AggregateList<ResourceTemplateDefinition>> {
+        self.list_resource_template_pages(false).await
+    }
+
+    #[cfg(feature = "proxy")]
+    pub(crate) async fn list_optional_resource_templates(
+        &self,
+    ) -> Result<Vec<ResourceTemplateDefinition>> {
+        Ok(self.list_resource_template_pages(true).await?.items)
+    }
+
+    async fn list_resource_template_pages(
+        &self,
+        allow_unsupported: bool,
+    ) -> Result<AggregateList<ResourceTemplateDefinition>> {
         self.collect_list_pages("resources/templates/list", |cursor| async move {
-            let page = self.list_resource_templates_with_cursor(cursor).await?;
+            let first_page = cursor.is_none();
+            let page = match self.list_resource_templates_with_cursor(cursor).await {
+                Err(Error::JsonRpc(error))
+                    if allow_unsupported
+                        && first_page
+                        && error.code == ErrorCode::MethodNotFound.code() =>
+                {
+                    return Ok(ListPage {
+                        items: Vec::new(),
+                        next_cursor: None,
+                        ttl_ms: None,
+                        cache_scope: None,
+                    });
+                }
+                result => result?,
+            };
             Ok(ListPage {
                 items: page.resource_templates,
                 next_cursor: page.next_cursor,

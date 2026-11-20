@@ -10,8 +10,11 @@ mod proxy_tests {
 
     use crate::client::{ChannelTransport, McpClient};
     use crate::context::notification_channel;
+    use crate::error::Error;
     use crate::protocol::{McpRequest, McpResponse, RequestId};
-    use crate::proxy::McpProxy;
+    use crate::proxy::{
+        AddBackendError, BackendSetupFailures, BackendSetupOptions, McpProxy, SkippedPhase,
+    };
     use crate::router::{Extensions, RouterRequest};
     use crate::{
         CallToolResult, GetPromptResult, McpRouter, PromptBuilder, ReadResourceResult,
@@ -2254,5 +2257,414 @@ mod proxy_tests {
             forwarded,
             Some(crate::context::ServerNotification::PromptsListChanged)
         ));
+    }
+
+    struct CatalogTransport<F> {
+        respond: F,
+        replies: std::collections::VecDeque<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl<F> crate::client::ClientTransport for CatalogTransport<F>
+    where
+        F: FnMut(&serde_json::Value) -> Option<serde_json::Value> + Send + 'static,
+    {
+        async fn send(&mut self, message: &str) -> crate::error::Result<()> {
+            let request: serde_json::Value = serde_json::from_str(message)?;
+            if request.get("id").is_some()
+                && let Some(mut reply) = (self.respond)(&request)
+            {
+                reply["jsonrpc"] = json!("2.0");
+                reply["id"] = request["id"].clone();
+                self.replies.push_back(reply.to_string());
+            }
+            Ok(())
+        }
+
+        async fn recv(&mut self) -> crate::error::Result<Option<String>> {
+            match self.replies.pop_front() {
+                Some(reply) => Ok(Some(reply)),
+                None => std::future::pending().await,
+            }
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        async fn close(&mut self) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn catalog_transport(
+        capabilities: serde_json::Value,
+        mut respond: impl FnMut(&serde_json::Value) -> Option<serde_json::Value> + Send + 'static,
+    ) -> impl crate::client::ClientTransport {
+        CatalogTransport {
+            respond: move |request: &serde_json::Value| {
+                if request["method"] == "initialize" {
+                    Some(json!({"result": {
+                        "protocolVersion": "2025-11-25",
+                        "serverInfo": {"name": "catalog", "version": "1"},
+                        "capabilities": capabilities,
+                    }}))
+                } else {
+                    respond(request)
+                }
+            },
+            replies: Default::default(),
+        }
+    }
+
+    fn method_not_found() -> serde_json::Value {
+        json!({"error": {"code": -32601, "message": "unsupported method"}})
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn setup_deadlines_report_connect_initialize_and_discovery() {
+        let options = BackendSetupOptions {
+            connect_timeout: Duration::from_secs(1),
+            initialize_timeout: Duration::from_secs(2),
+            discovery_timeout: Duration::from_secs(3),
+        };
+        let builder = McpProxy::builder("proxy", "1")
+            .backend_with_options(
+                "connect",
+                std::future::pending::<crate::error::Result<StallTransport>>(),
+                options,
+            )
+            .await
+            // A layer on a skipped first connection must not panic.
+            .backend_layer(TimeoutLayer::new(Duration::from_secs(1)))
+            .backend_with_options("initialize", async { Ok(StallTransport) }, options)
+            .await
+            .backend_with_options(
+                "discover",
+                async {
+                    Ok(catalog_transport(json!({"tools": {}}), |request| {
+                        assert_eq!(request["method"], "tools/list");
+                        None
+                    }))
+                },
+                options,
+            )
+            .await;
+        let error = builder
+            .build()
+            .await
+            .err()
+            .expect("all attempts failed")
+            .to_string();
+        assert!(error.contains("[connect] Connect failed"), "{error}");
+        assert!(
+            error.contains("transport connect timed out after 1s"),
+            "{error}"
+        );
+        assert!(error.contains("[initialize] Initialize failed"), "{error}");
+        assert!(
+            error.contains("MCP initialize timed out after 2s"),
+            "{error}"
+        );
+        assert!(error.contains("[discover] Initialize failed"), "{error}");
+        assert!(
+            error.contains("initial capability discovery timed out after 3s"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_discovery_skips_unadvertised_catalogs_and_optional_templates() {
+        let transport = catalog_transport(json!({"tools": {}, "resources": {}}), |request| {
+            Some(match request["method"].as_str().unwrap() {
+                "tools/list" => json!({"result": {"tools": []}}),
+                "resources/list" => json!({"result": {"resources": []}}),
+                "resources/templates/list" => method_not_found(),
+                method => panic!("unexpected request {method}"),
+            })
+        });
+        let mut proxy = McpProxy::builder("proxy", "1")
+            .backend_with_options(
+                "empty",
+                async { Ok(transport) },
+                BackendSetupOptions::default(),
+            )
+            .await
+            .build_strict()
+            .await
+            .expect("successful empty and unsupported catalogs should be accepted");
+        assert_eq!(proxy.backend_namespaces(), ["empty"]);
+        assert!(listed_tool_names(&mut proxy).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn configured_connected_client_reuses_initialize_result() {
+        let mut initialized = false;
+        let client = McpClient::connect(CatalogTransport {
+            respond: move |request: &serde_json::Value| {
+                Some(match request["method"].as_str().unwrap() {
+                    "initialize" => {
+                        assert!(!initialized, "initialize ran twice");
+                        initialized = true;
+                        json!({"result": {
+                            "protocolVersion": "2025-11-25",
+                            "serverInfo": {"name": "connected", "version": "1"},
+                            "capabilities": {},
+                        }})
+                    }
+                    method => panic!("unexpected request {method}"),
+                })
+            },
+            replies: Default::default(),
+        })
+        .await
+        .unwrap();
+        client.initialize("upstream", "1").await.unwrap();
+
+        let proxy = McpProxy::builder("proxy", "1")
+            .backend_client_with_options("connected", client, BackendSetupOptions::default())
+            .build_strict()
+            .await
+            .unwrap();
+        assert_eq!(proxy.backend_namespaces(), ["connected"]);
+    }
+
+    #[tokio::test]
+    async fn discovery_failure_on_a_later_page_obeys_build_policy() {
+        for strict in [false, true] {
+            let transport = catalog_transport(json!({"tools": {}}), |request| {
+                assert_eq!(request["method"], "tools/list");
+                Some(if request["params"]["cursor"] == "next-page" {
+                    json!({"error": {"code": -32601, "message": "unsupported method", "data": {"cursor": "next-page"}}})
+                } else {
+                    json!({"result": {
+                        "tools": [{"name": "partial", "inputSchema": {"type": "object"}}],
+                        "nextCursor": "next-page"
+                    }})
+                })
+            });
+            let builder = McpProxy::builder("proxy", "1")
+                .backend_with_options(
+                    "broken",
+                    async { Ok(transport) },
+                    BackendSetupOptions::default(),
+                )
+                .await
+                .backend("math", ChannelTransport::new(math_router()))
+                .await;
+            let skipped = if strict {
+                let error = builder
+                    .build_strict()
+                    .await
+                    .err()
+                    .expect("strict build failed");
+                let Error::ProxySetup { source, .. } = error else {
+                    panic!("expected build context, got {error}");
+                };
+                source.downcast::<BackendSetupFailures>().unwrap().skipped
+            } else {
+                let mut result = builder.build().await.expect("degraded build succeeded");
+                assert_eq!(listed_tool_names(&mut result.proxy).await, ["math_add"]);
+                result.skipped
+            };
+            assert_eq!(skipped.len(), 1);
+            assert_eq!(skipped[0].namespace, "broken");
+            assert_eq!(skipped[0].phase, SkippedPhase::Initialize);
+            let error = skipped[0].error.to_string();
+            assert!(
+                error.contains("initial capability discovery failed for tools/list"),
+                "{error}"
+            );
+            assert!(error.contains("unsupported method"), "{error}");
+            let cause = std::error::Error::source(&skipped[0].error).unwrap();
+            let Some(Error::JsonRpc(rpc)) = cause.downcast_ref::<Error>() else {
+                panic!("expected original JSON-RPC error, got {cause}");
+            };
+            assert_eq!(rpc.code, -32601);
+            assert_eq!(rpc.data, Some(json!({"cursor": "next-page"})));
+        }
+    }
+
+    #[tokio::test]
+    async fn all_failed_build_retains_discovery_page_limit_cause() {
+        let transport = catalog_transport(json!({"tools": {}}), |_| {
+            Some(json!({"result": {"tools": [], "nextCursor": "more"}}))
+        });
+        let client = McpClient::builder()
+            .max_list_pages(1)
+            .connect_simple(transport)
+            .await
+            .unwrap();
+        let error = McpProxy::builder("proxy", "1")
+            .backend_client_with_options("limited", client, BackendSetupOptions::default())
+            .build()
+            .await
+            .err()
+            .expect("catalog exceeds client's page limit");
+        let mut cause: &(dyn std::error::Error + 'static) = &error;
+        while let Some(source) = cause.source() {
+            cause = source;
+        }
+        assert!(
+            matches!(cause.downcast_ref::<Error>(),
+                Some(Error::ListPageLimitExceeded { method, limit: 1 }) if method == "tools/list"
+            ),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn builder_layer_after_rejected_connection_leaves_previous_backend_unwrapped() {
+        let calls = std::sync::Arc::default();
+        let mut proxy = McpProxy::builder("proxy", "1")
+            .backend("math", ChannelTransport::new(math_router()))
+            .await
+            .backend_with_options(
+                "rejected",
+                async { Err::<StallTransport, _>(crate::error::Error::internal("unavailable")) },
+                BackendSetupOptions::default(),
+            )
+            .await
+            .backend_layer(MarkerLayer {
+                tag: "rejected",
+                calls: std::sync::Arc::clone(&calls),
+            })
+            .build()
+            .await
+            .unwrap()
+            .proxy;
+        assert_eq!(call_math_add(&mut proxy).await.unwrap(), "5");
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_replacement_connect_timeout_keeps_current_backend_serving() {
+        let mut proxy = build_test_proxy().await;
+        let options = BackendSetupOptions {
+            connect_timeout: Duration::from_secs(2),
+            ..Default::default()
+        };
+        let error = proxy
+            .replace_backend_with_options(
+                "math",
+                std::future::pending::<crate::error::Result<StallTransport>>(),
+                options,
+            )
+            .await
+            .expect_err("transport construction should time out");
+        assert!(matches!(error, AddBackendError::Connect(_)), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("transport connect timed out after 2s")
+        );
+        assert_eq!(call_math_add(&mut proxy).await.unwrap(), "5");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_dynamic_layered_setup_retains_previous_backend_on_failure() {
+        let mut proxy = build_test_proxy().await;
+        let calls = std::sync::Arc::default();
+        let layer = MarkerLayer {
+            tag: "dynamic",
+            calls: std::sync::Arc::clone(&calls),
+        };
+        let options = BackendSetupOptions {
+            discovery_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+        proxy
+            .add_backend_with_options_and_layer(
+                "other",
+                async { Ok(ChannelTransport::new(math_router())) },
+                options,
+                layer.clone(),
+            )
+            .await
+            .unwrap();
+        let listed = listed_tool_names(&mut proxy).await;
+        assert!(listed.contains(&"other_add".to_string()));
+
+        for stall in [false, true] {
+            let transport = catalog_transport(json!({"tools": {}}), move |_| {
+                if stall {
+                    None
+                } else {
+                    Some(json!({"error": {"code": -32603, "message": "catalog unavailable"}}))
+                }
+            });
+            let failure = proxy
+                .replace_backend_with_options_and_layer(
+                    "math",
+                    async { Ok(transport) },
+                    options,
+                    layer.clone(),
+                )
+                .await
+                .expect_err("replacement discovery failed");
+            assert!(matches!(failure, AddBackendError::Initialize(_)));
+            let message = failure.to_string();
+            assert!(
+                message.contains(if stall {
+                    "initial capability discovery timed out"
+                } else {
+                    "catalog unavailable"
+                }),
+                "{message}"
+            );
+            assert_eq!(call_math_add(&mut proxy).await.unwrap(), "5");
+            assert_eq!(listed_tool_names(&mut proxy).await, listed);
+            assert!(
+                calls.lock().unwrap().is_empty(),
+                "failed staging must not install its layer"
+            );
+        }
+
+        proxy
+            .replace_backend_with_options_and_layer(
+                "math",
+                async { Ok(ChannelTransport::new(math_router())) },
+                options,
+                layer,
+            )
+            .await
+            .unwrap();
+        assert_eq!(call_math_add(&mut proxy).await.unwrap(), "5");
+        assert_eq!(*calls.lock().unwrap(), ["dynamic"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_stream_yields_fast_backend_before_stalled_snapshot_member() {
+        use futures::StreamExt;
+
+        let stalled = catalog_transport(json!({}), |request| {
+            assert_eq!(request["method"], "ping");
+            None
+        });
+        let mut proxy = McpProxy::builder("proxy", "1")
+            .backend_with_options(
+                "stalled",
+                async { Ok(stalled) },
+                BackendSetupOptions::default(),
+            )
+            .await
+            .backend("math", ChannelTransport::new(math_router()))
+            .await
+            .build_strict()
+            .await
+            .unwrap();
+        let timeout = Duration::from_millis(250);
+        let probes = proxy.health_checks(timeout).await;
+        futures::pin_mut!(probes);
+        let first = probes.next().await.unwrap();
+        assert_eq!(first.namespace, "math");
+        assert!(first.healthy);
+        assert!(proxy.remove_backend("stalled").await);
+        let last = probes.next().await.unwrap();
+        assert_eq!(last.namespace, "stalled");
+        assert!(!last.healthy);
+        assert!(probes.next().await.is_none());
+        assert_eq!(proxy.health_check().await[0].namespace, "math");
+        assert_eq!(call_math_add(&mut proxy).await.unwrap(), "5");
     }
 }

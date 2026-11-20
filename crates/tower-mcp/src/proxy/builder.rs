@@ -2,6 +2,7 @@
 
 use std::convert::Infallible;
 use std::fmt;
+use std::future::Future;
 
 use tokio::sync::mpsc;
 use tower::Layer;
@@ -12,15 +13,17 @@ use crate::error::{Error, Result};
 use crate::router::{RouterRequest, RouterResponse};
 use crate::transport::CatchError;
 
-use super::backend::{Backend, ListChanged};
+use super::backend::{Backend, BackendSetupOptions, ListChanged};
 use super::service::{BackendEntry, McpProxy};
 
 /// A backend that was skipped during proxy construction.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("[{namespace}] {phase:?} failed: {error}")]
 pub struct SkippedBackend {
     /// The namespace that was assigned to this backend.
     pub namespace: String,
     /// The error that caused the backend to be skipped.
+    #[source]
     pub error: Error,
     /// The phase where the failure occurred.
     pub phase: SkippedPhase,
@@ -31,17 +34,35 @@ pub struct SkippedBackend {
 pub enum SkippedPhase {
     /// Failed to connect the transport.
     Connect,
-    /// Failed during MCP initialization handshake.
+    /// Failed during initialization or initial capability discovery.
+    /// Discovery errors identify the phase in the accompanying error.
     Initialize,
 }
 
-impl fmt::Display for SkippedBackend {
+/// Source of a proxy build error that includes a catalog discovery failure.
+/// Each entry retains its original cause. The standard error chain follows
+/// the first reported backend.
+#[derive(Debug)]
+pub struct BackendSetupFailures {
+    /// Backend failures in report order.
+    pub skipped: Vec<SkippedBackend>,
+}
+
+impl fmt::Display for BackendSetupFailures {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "[{}] {:?} failed: {}",
-            self.namespace, self.phase, self.error
-        )
+        for (i, backend) in self.skipped.iter().enumerate() {
+            if i > 0 {
+                f.write_str("; ")?;
+            }
+            backend.fmt(f)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for BackendSetupFailures {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.skipped.first().map(|backend| backend as _)
     }
 }
 
@@ -49,7 +70,7 @@ impl fmt::Display for SkippedBackend {
 pub struct ProxyBuildResult {
     /// The constructed proxy.
     pub proxy: McpProxy,
-    /// Backends that failed to connect or initialize and were skipped.
+    /// Backends skipped because a setup phase failed.
     pub skipped: Vec<SkippedBackend>,
 }
 
@@ -58,6 +79,7 @@ struct PendingBackend {
     namespace: String,
     backend: Backend,
     invalidation_rx: Option<mpsc::Receiver<ListChanged>>,
+    options: Option<BackendSetupOptions>,
     /// Type-erased service (set by `.backend_layer()`).
     /// If None, BackendService is used directly.
     custom_service: Option<BoxCloneService<RouterRequest, RouterResponse, Infallible>>,
@@ -112,6 +134,7 @@ pub struct McpProxyBuilder {
     pending: Vec<PendingBackend>,
     notification_tx: Option<crate::context::NotificationSender>,
     connection_failures: Vec<ConnectionFailure>,
+    last_connection_failed: bool,
     /// Custom instructions override. If set, used instead of aggregated backend instructions.
     instructions: Option<String>,
 }
@@ -126,6 +149,7 @@ impl McpProxyBuilder {
             pending: Vec::new(),
             notification_tx: None,
             connection_failures: Vec::new(),
+            last_connection_failed: false,
             instructions: None,
         }
     }
@@ -181,14 +205,39 @@ impl McpProxyBuilder {
     /// Note: backends added this way will not have automatic cache refresh
     /// on list-changed notifications. Use [`backend()`](Self::backend) with
     /// a transport for full notification support.
-    pub fn backend_client(mut self, namespace: impl Into<String>, client: McpClient) -> Self {
+    pub fn backend_client(self, namespace: impl Into<String>, client: McpClient) -> Self {
+        self.push_client(namespace, client, None)
+    }
+
+    /// Add an already connected client with bounded initialization and discovery.
+    ///
+    /// This requires the MCP initialize lifecycle. An existing initialize result
+    /// is reused. The connection deadline does not apply and the proxy does not
+    /// install a notification handler.
+    pub fn backend_client_with_options(
+        self,
+        namespace: impl Into<String>,
+        client: McpClient,
+        options: BackendSetupOptions,
+    ) -> Self {
+        self.push_client(namespace, client, Some(options))
+    }
+
+    fn push_client(
+        mut self,
+        namespace: impl Into<String>,
+        client: McpClient,
+        options: Option<BackendSetupOptions>,
+    ) -> Self {
         let backend = Backend::from_client(namespace, client, self.separator.clone());
         self.pending.push(PendingBackend {
             namespace: backend.namespace.clone(),
             backend,
             invalidation_rx: None,
+            options,
             custom_service: None,
         });
+        self.last_connection_failed = false;
         self
     }
 
@@ -198,40 +247,43 @@ impl McpProxyBuilder {
     /// that watches for list-changed events. Initialization happens during
     /// [`build()`](Self::build).
     pub async fn backend(
-        mut self,
+        self,
         namespace: impl Into<String>,
         transport: impl ClientTransport,
     ) -> Self {
-        let namespace = namespace.into();
-        let (invalidation_tx, invalidation_rx) = mpsc::channel(16);
+        self.connect_backend(namespace.into(), async { Ok(transport) }, None)
+            .await
+    }
 
-        match Backend::connect(
-            namespace.clone(),
-            transport,
-            self.separator.clone(),
-            invalidation_tx,
-        )
-        .await
+    /// Add a backend with distinct setup deadlines and capability-aware discovery.
+    ///
+    /// The transport future runs immediately. Initialization and discovery
+    /// run during [`build`](Self::build). Connection failures are recorded
+    /// for the build result.
+    pub async fn backend_with_options<T: ClientTransport>(
+        self,
+        namespace: impl Into<String>,
+        transport: impl Future<Output = Result<T>> + Send,
+        options: BackendSetupOptions,
+    ) -> Self {
+        self.connect_backend(namespace.into(), transport, Some(options))
+            .await
+    }
+
+    async fn connect_backend<T: ClientTransport>(
+        mut self,
+        namespace: String,
+        transport: impl Future<Output = Result<T>> + Send,
+        options: Option<BackendSetupOptions>,
+    ) -> Self {
+        if let Err(error) = self
+            .push_transport(namespace.clone(), transport, options)
+            .await
         {
-            Ok(backend) => {
-                self.pending.push(PendingBackend {
-                    namespace,
-                    backend,
-                    invalidation_rx: Some(invalidation_rx),
-                    custom_service: None,
-                });
-            }
-            Err(e) => {
-                tracing::error!(
-                    namespace = %namespace,
-                    error = %e,
-                    "Failed to connect backend"
-                );
-                self.connection_failures.push(ConnectionFailure {
-                    namespace,
-                    error: e,
-                });
-            }
+            tracing::error!(%namespace, %error, "Failed to connect backend");
+            self.connection_failures
+                .push(ConnectionFailure { namespace, error });
+            self.last_connection_failed = true;
         }
         self
     }
@@ -252,7 +304,30 @@ impl McpProxyBuilder {
         namespace: impl Into<String>,
         transport: impl ClientTransport,
     ) -> Result<Self> {
-        let namespace = namespace.into();
+        self.push_transport(namespace.into(), async { Ok(transport) }, None)
+            .await?;
+        Ok(self)
+    }
+
+    /// Like [`backend_with_options`](Self::backend_with_options), returning
+    /// a transport connection error immediately.
+    pub async fn backend_try_with_options<T: ClientTransport>(
+        mut self,
+        namespace: impl Into<String>,
+        transport: impl Future<Output = Result<T>> + Send,
+        options: BackendSetupOptions,
+    ) -> Result<Self> {
+        self.push_transport(namespace.into(), transport, Some(options))
+            .await?;
+        Ok(self)
+    }
+
+    async fn push_transport<T: ClientTransport>(
+        &mut self,
+        namespace: String,
+        transport: impl Future<Output = Result<T>> + Send,
+        options: Option<BackendSetupOptions>,
+    ) -> Result<()> {
         let (invalidation_tx, invalidation_rx) = mpsc::channel(16);
 
         let backend = Backend::connect(
@@ -260,6 +335,7 @@ impl McpProxyBuilder {
             transport,
             self.separator.clone(),
             invalidation_tx,
+            options,
         )
         .await?;
 
@@ -267,13 +343,17 @@ impl McpProxyBuilder {
             namespace,
             backend,
             invalidation_rx: Some(invalidation_rx),
+            options,
             custom_service: None,
         });
 
-        Ok(self)
+        self.last_connection_failed = false;
+        Ok(())
     }
 
-    /// Apply a Tower layer to the most recently added backend.
+    /// Apply a Tower layer to the most recent backend addition.
+    ///
+    /// After a failed connection, this is a no-op.
     ///
     /// The layer wraps the backend's dispatch service, allowing standard
     /// Tower middleware (timeout, rate limit, concurrency limit, etc.) to
@@ -306,7 +386,7 @@ impl McpProxyBuilder {
     ///
     /// # Panics
     ///
-    /// Panics if no backend has been added yet.
+    /// Panics if no backend addition has been attempted.
     pub fn backend_layer<L>(mut self, layer: L) -> Self
     where
         L: Layer<BoxCloneService<RouterRequest, RouterResponse, Infallible>> + Send + 'static,
@@ -317,6 +397,9 @@ impl McpProxyBuilder {
         <L::Service as tower_service::Service<RouterRequest>>::Error: fmt::Display + Send,
         <L::Service as tower_service::Service<RouterRequest>>::Future: Send,
     {
+        if self.last_connection_failed {
+            return self;
+        }
         let pending = self
             .pending
             .last_mut()
@@ -340,11 +423,11 @@ impl McpProxyBuilder {
     /// Build the proxy, initializing all backends concurrently.
     ///
     /// Each backend runs the MCP initialize handshake and discovers its
-    /// capabilities (tools, resources, prompts). Backends that fail to
-    /// initialize are logged and skipped.
+    /// capabilities (tools, resources, prompts). Backends that fail setup
+    /// are logged and skipped.
     ///
     /// Returns a [`ProxyBuildResult`] containing the proxy and any backends
-    /// that were skipped due to initialization failures. Check
+    /// that were skipped due to setup failures. Check
     /// `result.skipped` to see which backends failed and why.
     ///
     /// For backends added via [`backend()`](Self::backend), a background task
@@ -354,9 +437,13 @@ impl McpProxyBuilder {
     /// # Errors
     ///
     /// Returns an error if no backends were configured or if all backends
-    /// failed to initialize.
-    pub async fn build(mut self) -> Result<ProxyBuildResult> {
-        if self.pending.is_empty() {
+    /// failed setup.
+    pub async fn build(self) -> Result<ProxyBuildResult> {
+        self.build_with_policy(false).await
+    }
+
+    async fn build_with_policy(mut self, strict: bool) -> Result<ProxyBuildResult> {
+        if self.pending.is_empty() && self.connection_failures.is_empty() {
             return Err(Error::internal("No backends configured"));
         }
 
@@ -411,9 +498,8 @@ impl McpProxyBuilder {
                 let name = name.clone();
                 let version = version.clone();
                 async move {
-                    match pb.backend.initialize(&name, &version).await {
-                        Ok(instructions) => {
-                            pb.backend.instructions = instructions;
+                    match pb.backend.finish_setup(&name, &version, pb.options).await {
+                        Ok(()) => {
                             {
                                 let cache = pb.backend.cache.read().await;
                                 tracing::info!(
@@ -430,7 +516,7 @@ impl McpProxyBuilder {
                             tracing::error!(
                                 namespace = %pb.namespace,
                                 error = %e,
-                                "Failed to initialize backend, skipping"
+                                "Backend setup failed, skipping"
                             );
                             Err(SkippedBackend {
                                 namespace: pb.namespace,
@@ -482,8 +568,26 @@ impl McpProxyBuilder {
             backends.push(pb.backend);
         }
 
-        if backends.is_empty() {
-            return Err(Error::internal("All backends failed to initialize"));
+        if backends.is_empty() || (strict && !skipped.is_empty()) {
+            let context = if backends.is_empty() {
+                "All backends failed setup"
+            } else {
+                skipped.truncate(1);
+                "Backend setup failed"
+            };
+            let failures = BackendSetupFailures { skipped };
+            if failures
+                .skipped
+                .iter()
+                .any(|backend| matches!(backend.error, Error::ProxySetup { .. }))
+            {
+                return Err(Error::ProxySetup {
+                    context: context.to_owned(),
+                    source: Box::new(failures),
+                });
+            }
+            // Keep the existing JSON-RPC build error for other setup failures.
+            return Err(Error::internal(format!("{context}: {failures}")));
         }
 
         // Build instructions: use custom override or aggregate from backends
@@ -525,24 +629,16 @@ impl McpProxyBuilder {
         Ok(ProxyBuildResult { proxy, skipped })
     }
 
-    /// Build the proxy, failing if any backend fails to initialize.
+    /// Build the proxy, failing if any backend fails setup.
     ///
     /// Unlike [`build()`](Self::build) which skips failed backends,
-    /// this method returns an error if any backend fails to connect or
-    /// initialize.
+    /// this method requires every backend to complete setup.
     ///
     /// # Errors
     ///
-    /// Returns the first initialization failure encountered (after
-    /// waiting for all backends to attempt initialization).
+    /// Returns a setup error after all backends have finished their attempts.
+    /// If every backend fails, the error describes all failures.
     pub async fn build_strict(self) -> Result<McpProxy> {
-        let result = self.build().await?;
-        if let Some(first) = result.skipped.into_iter().next() {
-            return Err(Error::internal(format!(
-                "Backend \"{}\" failed to initialize: {}",
-                first.namespace, first.error
-            )));
-        }
-        Ok(result.proxy)
+        Ok(self.build_with_policy(true).await?.proxy)
     }
 }
