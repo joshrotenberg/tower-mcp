@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.28.0] - 2026-11-20
+
+### Bug Fixes
+
+- [**breaking**] **types:** Preserve task wire extension fields ([#1673](https://github.com/joshrotenberg/tower-mcp/pull/1673))
+
+### Features
+
+- **proxy:** Bound backend setup and stream health results ([#1678](https://github.com/joshrotenberg/tower-mcp/pull/1678))
+
+
+
 ## [0.27.0] - 2026-11-16
 
 ### Bug Fixes
