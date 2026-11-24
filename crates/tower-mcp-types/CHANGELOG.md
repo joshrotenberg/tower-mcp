@@ -6,11 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Bug Fixes
 
-- [**breaking**] **types:** Preserve task wire extension fields ([#1673](https://github.com/joshrotenberg/tower-mcp/pull/1673))
+- [**breaking**] **types:** Preserve task wire extension fields. Use the `DetailedTask` constructors and add `..` to variant patterns that only need the typed fields. ([#1673](https://github.com/joshrotenberg/tower-mcp/pull/1673))
 
 ### Features
 
-- **proxy:** Bound backend setup and stream health results ([#1678](https://github.com/joshrotenberg/tower-mcp/pull/1678))
+- **proxy:** Add `Error::ProxySetup` to preserve the cause of backend setup failures ([#1678](https://github.com/joshrotenberg/tower-mcp/pull/1678))
 
 
 
