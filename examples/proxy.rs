@@ -3,6 +3,7 @@
 //! Demonstrates using McpProxy to combine tools from multiple backend
 //! MCP servers behind a single endpoint, with:
 //! - Namespace prefixing (tools become `basic_*` and `sampling_*`)
+//! - Per-backend connection, initialization, and discovery deadlines
 //! - Per-backend middleware (timeout on the sampling backend)
 //! - Notification forwarding (backend list changes propagate to clients)
 //! - Health checks (ping all backends)
@@ -11,15 +12,24 @@
 //! - `getting_started` server (provides echo and add tools)
 //! - `sampling_server` (provides summarize, confirm_delete, slow_task tools)
 //!
-//! Run with: cargo run --example proxy --features proxy
+//! From the workspace root, pre-build the two servers with the default
+//! features used by their subprocess commands, then start the proxy. This
+//! keeps first-time compilation outside the handshake deadlines.
+//!
+//! ```sh
+//! cargo build -p tower-mcp-examples --example getting_started --example sampling_server
+//! cargo run -p tower-mcp-examples --example proxy --features proxy
+//! ```
 //!
 //! Then interact via JSON-RPC on stdin/stdout, or connect with any MCP client.
 
+use std::pin::pin;
 use std::time::Duration;
 
+use futures::StreamExt;
 use tower::timeout::TimeoutLayer;
 use tower_mcp::client::StdioClientTransport;
-use tower_mcp::proxy::McpProxy;
+use tower_mcp::proxy::{BackendSetupOptions, McpProxy};
 use tower_mcp::{GenericStdioTransport, notification_channel};
 
 #[tokio::main]
@@ -31,11 +41,12 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
 
     tracing::info!("Starting MCP proxy...");
 
-    // Spawn backend servers as subprocesses
-    let basic_transport =
-        StdioClientTransport::spawn("cargo", &["run", "--example", "getting_started"]).await?;
-    let sampling_transport =
-        StdioClientTransport::spawn("cargo", &["run", "--example", "sampling_server"]).await?;
+    // Populate these durations from each backend's configuration in mcp-proxy.
+    let sampling_setup = BackendSetupOptions {
+        connect_timeout: Duration::from_secs(5),
+        initialize_timeout: Duration::from_secs(30),
+        discovery_timeout: Duration::from_secs(10),
+    };
 
     // Create notification channel for forwarding backend list-changed
     // events to downstream clients (e.g., when a backend adds/removes tools)
@@ -44,11 +55,37 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     // Build the proxy -- backends initialize concurrently
     let result = McpProxy::builder("mcp-proxy-example", "1.0.0")
         .notification_sender(notif_tx)
-        .backend("basic", basic_transport)
+        .backend_with_options(
+            "basic",
+            StdioClientTransport::spawn(
+                "cargo",
+                &[
+                    "run",
+                    "-p",
+                    "tower-mcp-examples",
+                    "--example",
+                    "getting_started",
+                ],
+            ),
+            BackendSetupOptions::default(),
+        )
         .await
-        // Per-backend middleware: 30s timeout on sampling backend
-        .backend("sampling", sampling_transport)
+        .backend_with_options(
+            "sampling",
+            StdioClientTransport::spawn(
+                "cargo",
+                &[
+                    "run",
+                    "-p",
+                    "tower-mcp-examples",
+                    "--example",
+                    "sampling_server",
+                ],
+            ),
+            sampling_setup,
+        )
         .await
+        // This layer applies to routed RPCs.
         .backend_layer(TimeoutLayer::new(Duration::from_secs(30)))
         .build()
         .await?;
@@ -61,9 +98,9 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     }
     let proxy = result.proxy;
 
-    // Health check all backends
-    let health = proxy.health_check().await;
-    for h in &health {
+    // Process each backend's health result as soon as it completes.
+    let mut health = pin!(proxy.health_checks(Duration::from_secs(2)).await);
+    while let Some(h) = health.next().await {
         tracing::info!(
             namespace = %h.namespace,
             healthy = h.healthy,

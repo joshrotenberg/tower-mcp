@@ -6,13 +6,16 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
+
+use futures::stream::{FuturesUnordered, Stream};
 
 use tokio::sync::{RwLock, mpsc};
 use tower::ServiceExt;
 use tower::util::BoxCloneService;
 use tower_service::Service;
 
-use crate::client::ClientTransport;
+use crate::client::{ClientTransport, McpClient};
 use crate::protocol::{
     CallToolParams, GetPromptParams, Implementation, InitializeResult, ListPromptsResult,
     ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, McpRequest, McpResponse,
@@ -23,7 +26,9 @@ use crate::router::{Extensions, RouterRequest, RouterResponse};
 use crate::transport::CatchError;
 use tower_mcp_types::JsonRpcError;
 
-use super::backend::{Backend, BackendService, CachedCapabilities, ListChanged};
+use super::backend::{
+    Backend, BackendService, BackendSetupOptions, CachedCapabilities, ListChanged,
+};
 
 /// A backend entry in the proxy, combining cached capabilities with a
 /// type-erased service for dispatching routed requests.
@@ -139,7 +144,8 @@ pub enum AddBackendError {
     },
     /// Failed to connect the transport.
     Connect(crate::error::Error),
-    /// Failed during MCP initialization handshake.
+    /// Failed during initialization or initial capability discovery.
+    /// Discovery errors identify the phase in the accompanying error.
     Initialize(crate::error::Error),
 }
 
@@ -161,7 +167,14 @@ impl fmt::Display for AddBackendError {
     }
 }
 
-impl std::error::Error for AddBackendError {}
+impl std::error::Error for AddBackendError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Connect(error) | Self::Initialize(error) => Some(error),
+            Self::DuplicateNamespace(_) | Self::AmbiguousPrefix { .. } => None,
+        }
+    }
+}
 
 /// A backend that is connected and initialized but not yet published.
 struct StagedBackend {
@@ -227,11 +240,11 @@ impl McpProxy {
     ///
     /// Membership changes ([`add_backend`](Self::add_backend),
     /// [`remove_backend`](Self::remove_backend),
-    /// [`replace_backend`](Self::replace_backend) and their `_with_layer`
-    /// forms) are serialized at a single commit point and take effect in the
+    /// [`replace_backend`](Self::replace_backend) and their variants)
+    /// are serialized at a single commit point and take effect in the
     /// order they commit. The namespace is checked before connecting and again
     /// at commit, since another call may have claimed it in the meantime.
-    /// Dropping the returned future before it completes publishes nothing.
+    /// Dropping the returned future before commit publishes nothing.
     ///
     /// # Errors
     ///
@@ -252,11 +265,31 @@ impl McpProxy {
         namespace: impl Into<String>,
         transport: impl ClientTransport,
     ) -> Result<(), AddBackendError> {
-        let namespace = namespace.into();
-        self.check_namespace(&namespace, None)?;
-        let staged = self.stage(namespace, transport).await?;
-        let entry = BackendEntry::from_backend(&staged.backend);
-        self.commit(staged, entry, CommitMode::Add).await
+        self.change_backend(
+            namespace.into(),
+            async { Ok(transport) },
+            None,
+            CommitMode::Add,
+            BackendEntry::from_backend,
+        )
+        .await
+    }
+
+    /// Like [`add_backend`](Self::add_backend), with bounded setup and capability-aware discovery.
+    pub async fn add_backend_with_options<T: ClientTransport>(
+        &self,
+        namespace: impl Into<String>,
+        transport: impl Future<Output = crate::error::Result<T>> + Send,
+        options: BackendSetupOptions,
+    ) -> Result<(), AddBackendError> {
+        self.change_backend(
+            namespace.into(),
+            transport,
+            Some(options),
+            CommitMode::Add,
+            BackendEntry::from_backend,
+        )
+        .await
     }
 
     /// Add a backend dynamically with a custom middleware-wrapped service.
@@ -288,11 +321,38 @@ impl McpProxy {
         <L::Service as Service<RouterRequest>>::Error: fmt::Display + Send,
         <L::Service as Service<RouterRequest>>::Future: Send,
     {
-        let namespace = namespace.into();
-        self.check_namespace(&namespace, None)?;
-        let staged = self.stage(namespace, transport).await?;
-        let entry = layered_entry(&staged.backend, layer);
-        self.commit(staged, entry, CommitMode::Add).await
+        self.change_backend(
+            namespace.into(),
+            async { Ok(transport) },
+            None,
+            CommitMode::Add,
+            |backend| layered_entry(backend, layer),
+        )
+        .await
+    }
+
+    /// Like [`add_backend_with_layer`](Self::add_backend_with_layer), with bounded setup and capability-aware discovery.
+    pub async fn add_backend_with_options_and_layer<T: ClientTransport, L>(
+        &self,
+        namespace: impl Into<String>,
+        transport: impl Future<Output = crate::error::Result<T>> + Send,
+        options: BackendSetupOptions,
+        layer: L,
+    ) -> Result<(), AddBackendError>
+    where
+        L: tower::Layer<BackendService> + Send + 'static,
+        L::Service: Service<RouterRequest, Response = RouterResponse> + Clone + Send + 'static,
+        <L::Service as Service<RouterRequest>>::Error: fmt::Display + Send,
+        <L::Service as Service<RouterRequest>>::Future: Send,
+    {
+        self.change_backend(
+            namespace.into(),
+            transport,
+            Some(options),
+            CommitMode::Add,
+            |backend| layered_entry(backend, layer),
+        )
+        .await
     }
 
     /// Validate that a namespace can be added without conflicts.
@@ -337,27 +397,47 @@ impl McpProxy {
         self.validate_namespace(namespace, &self.shared.separator, &entries, replacing)
     }
 
+    async fn change_backend<T: ClientTransport>(
+        &self,
+        namespace: String,
+        transport: impl Future<Output = crate::error::Result<T>> + Send,
+        options: Option<BackendSetupOptions>,
+        mode: CommitMode,
+        make_entry: impl FnOnce(&Backend) -> BackendEntry + Send,
+    ) -> Result<(), AddBackendError> {
+        let replacing = match mode {
+            CommitMode::Add => None,
+            CommitMode::Replace => Some(namespace.as_str()),
+        };
+        self.check_namespace(&namespace, replacing)?;
+        let staged = self.stage(namespace, transport, options).await?;
+        let entry = make_entry(&staged.backend);
+        self.commit(staged, entry, mode).await
+    }
+
     /// Connect, initialize, and discover a backend without publishing it.
     ///
     /// Nothing shared is touched here, so a failure or a dropped future
     /// leaves the proxy exactly as it was.
-    async fn stage(
+    async fn stage<T: ClientTransport>(
         &self,
         namespace: String,
-        transport: impl ClientTransport,
+        transport: impl Future<Output = crate::error::Result<T>> + Send,
+        options: Option<BackendSetupOptions>,
     ) -> Result<StagedBackend, AddBackendError> {
         let (invalidation_tx, invalidation_rx) = mpsc::channel(16);
-        let backend = Backend::connect(
+        let mut backend = Backend::connect(
             namespace,
             transport,
             self.shared.separator.clone(),
             invalidation_tx,
+            options,
         )
         .await
         .map_err(AddBackendError::Connect)?;
 
         backend
-            .initialize(&self.shared.name, &self.shared.version)
+            .finish_setup(&self.shared.name, &self.shared.version, options)
             .await
             .map_err(AddBackendError::Initialize)?;
 
@@ -536,7 +616,7 @@ impl McpProxy {
     /// discovered while the existing backend keeps serving requests. Only
     /// then are routing and backend state switched over together, keeping
     /// the backend's position. If connecting or initializing fails, or the
-    /// returned future is dropped before it completes, the existing backend
+    /// staging future is dropped before commit, the existing backend
     /// is left in place and keeps serving.
     ///
     /// Replacing a namespace that has no backend adds one. Concurrent
@@ -561,11 +641,31 @@ impl McpProxy {
         namespace: impl Into<String>,
         transport: impl ClientTransport,
     ) -> Result<(), AddBackendError> {
-        let namespace = namespace.into();
-        self.check_namespace(&namespace, Some(&namespace))?;
-        let staged = self.stage(namespace, transport).await?;
-        let entry = BackendEntry::from_backend(&staged.backend);
-        self.commit(staged, entry, CommitMode::Replace).await
+        self.change_backend(
+            namespace.into(),
+            async { Ok(transport) },
+            None,
+            CommitMode::Replace,
+            BackendEntry::from_backend,
+        )
+        .await
+    }
+
+    /// Like [`replace_backend`](Self::replace_backend), with bounded setup and capability-aware discovery.
+    pub async fn replace_backend_with_options<T: ClientTransport>(
+        &self,
+        namespace: impl Into<String>,
+        transport: impl Future<Output = crate::error::Result<T>> + Send,
+        options: BackendSetupOptions,
+    ) -> Result<(), AddBackendError> {
+        self.change_backend(
+            namespace.into(),
+            transport,
+            Some(options),
+            CommitMode::Replace,
+            BackendEntry::from_backend,
+        )
+        .await
     }
 
     /// Replace a backend with a new middleware-wrapped connection.
@@ -586,11 +686,38 @@ impl McpProxy {
         <L::Service as Service<RouterRequest>>::Error: fmt::Display + Send,
         <L::Service as Service<RouterRequest>>::Future: Send,
     {
-        let namespace = namespace.into();
-        self.check_namespace(&namespace, Some(&namespace))?;
-        let staged = self.stage(namespace, transport).await?;
-        let entry = layered_entry(&staged.backend, layer);
-        self.commit(staged, entry, CommitMode::Replace).await
+        self.change_backend(
+            namespace.into(),
+            async { Ok(transport) },
+            None,
+            CommitMode::Replace,
+            |backend| layered_entry(backend, layer),
+        )
+        .await
+    }
+
+    /// Like [`replace_backend_with_layer`](Self::replace_backend_with_layer), with bounded setup and capability-aware discovery.
+    pub async fn replace_backend_with_options_and_layer<T: ClientTransport, L>(
+        &self,
+        namespace: impl Into<String>,
+        transport: impl Future<Output = crate::error::Result<T>> + Send,
+        options: BackendSetupOptions,
+        layer: L,
+    ) -> Result<(), AddBackendError>
+    where
+        L: tower::Layer<BackendService> + Send + 'static,
+        L::Service: Service<RouterRequest, Response = RouterResponse> + Clone + Send + 'static,
+        <L::Service as Service<RouterRequest>>::Error: fmt::Display + Send,
+        <L::Service as Service<RouterRequest>>::Future: Send,
+    {
+        self.change_backend(
+            namespace.into(),
+            transport,
+            Some(options),
+            CommitMode::Replace,
+            |backend| layered_entry(backend, layer),
+        )
+        .await
     }
 
     /// Return the namespaces of all currently registered backends.
@@ -613,24 +740,52 @@ impl McpProxy {
 
     /// Check the health of all backends by pinging them concurrently.
     ///
-    /// Returns a map of namespace to health status. Backends that respond
-    /// to ping within a reasonable time are considered healthy.
+    /// Returns results in backend snapshot order after all the pings finish.
     pub async fn health_check(&self) -> Vec<BackendHealth> {
-        let backends = self.shared.backends.read().await;
-        let futures: Vec<_> = backends
-            .iter()
-            .map(|backend| {
-                let client = Arc::clone(&backend.client);
-                let namespace = backend.namespace.clone();
-                async move {
-                    let healthy = client.ping().await.is_ok();
-                    BackendHealth { namespace, healthy }
-                }
-            })
-            .collect();
-        drop(backends);
+        futures::future::join_all(Self::health_probes(self.health_snapshot().await, None)).await
+    }
 
-        futures::future::join_all(futures).await
+    /// Ping a snapshot of the current backends and yield results as they complete.
+    ///
+    /// Each probe is bounded by `timeout`, starting when first polled. A failed
+    /// or timed-out ping yields `healthy: false`. Poll the stream to drive the
+    /// probes. The stream owns the snapshotted connections, so a result may
+    /// refer to a backend that has since been removed or replaced. A new call
+    /// takes a fresh snapshot. Dropping the stream drops unfinished probes.
+    pub async fn health_checks(
+        &self,
+        timeout: Duration,
+    ) -> impl Stream<Item = BackendHealth> + Send + 'static + use<> {
+        Self::health_probes(self.health_snapshot().await, Some(timeout))
+            .collect::<FuturesUnordered<_>>()
+    }
+
+    async fn health_snapshot(&self) -> Vec<(String, Arc<McpClient>)> {
+        self.shared
+            .backends
+            .read()
+            .await
+            .iter()
+            .map(|backend| (backend.namespace.clone(), Arc::clone(&backend.client)))
+            .collect()
+    }
+
+    fn health_probes(
+        snapshot: Vec<(String, Arc<McpClient>)>,
+        timeout: Option<Duration>,
+    ) -> impl Iterator<Item = impl Future<Output = BackendHealth> + Send + 'static> {
+        snapshot
+            .into_iter()
+            .map(move |(namespace, client)| async move {
+                let ping = client.ping();
+                let healthy = match timeout {
+                    Some(duration) => tokio::time::timeout(duration, ping)
+                        .await
+                        .is_ok_and(|result| result.is_ok()),
+                    None => ping.await.is_ok(),
+                };
+                BackendHealth { namespace, healthy }
+            })
     }
 
     /// Notify downstream clients that all capability lists have changed.
