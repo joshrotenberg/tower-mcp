@@ -7782,7 +7782,7 @@ async fn test_list_tools_pagination() {
 }
 
 #[tokio::test]
-async fn test_list_tools_no_pagination_by_default() {
+async fn test_unpaginated_lists_reject_continuation_cursors() {
     let tool_a = ToolBuilder::new("alpha")
         .description("a")
         .handler(|_input: AddInput| async { Ok(CallToolResult::text("ok")) })
@@ -7792,28 +7792,36 @@ async fn test_list_tools_no_pagination_by_default() {
         .handler(|_input: AddInput| async { Ok(CallToolResult::text("ok")) })
         .build();
 
-    let mut router = McpRouter::new()
-        .server_info("test", "1.0")
+    let resource = crate::ResourceBuilder::new("test://item")
+        .name("Item")
+        .text("item");
+    let router = McpRouter::new()
         .tool(tool_a)
-        .tool(tool_b);
+        .tool(tool_b)
+        .resource(resource);
+    let mut service = JsonRpcService::new(router.clone());
+    init_jsonrpc_service(&mut service, &router).await;
 
-    init_router(&mut router).await;
+    for (method, field, count) in [
+        ("tools/list", "tools", 2),
+        ("resources/list", "resources", 1),
+    ] {
+        let request = JsonRpcRequest::new(format!("{method}-first"), method);
+        let response = service.call_single(request).await.unwrap();
+        let JsonRpcResponse::Result(page) = response else {
+            panic!("{method} failed without a cursor: {response:?}");
+        };
+        assert_eq!(page.result[field].as_array().unwrap().len(), count);
+        assert!(page.result.get("nextCursor").is_none());
 
-    let req = RouterRequest {
-        id: RequestId::Number(1),
-        inner: McpRequest::ListTools(ListToolsParams {
-            cursor: None,
-            meta: None,
-        }),
-        extensions: Extensions::new(),
-    };
-    let resp = router.ready().await.unwrap().call(req).await.unwrap();
-    match resp.inner {
-        Ok(McpResponse::ListTools(result)) => {
-            assert_eq!(result.tools.len(), 2);
-            assert!(result.next_cursor.is_none());
-        }
-        other => panic!("Expected ListTools, got {:?}", other),
+        // Even a well-formed offset is invalid when no cursor was issued.
+        let request = JsonRpcRequest::new(format!("{method}-continuation"), method)
+            .with_params(serde_json::json!({"cursor": encode_cursor(1)}));
+        let response = service.call_single(request).await.unwrap();
+        let JsonRpcResponse::Error(error) = response else {
+            panic!("{method} accepted a cursor without pagination: {response:?}");
+        };
+        assert_eq!(error.error.code, -32602);
     }
 }
 
