@@ -300,12 +300,13 @@ Disable the cache for diagnostics with `disable_response_cache`.
 
 tower-mcp retries only where the library can establish a safe boundary:
 
-- legacy HTTP session expiry (a 404 on a request that carried
-  `Mcp-Session-Id`, whatever its body, or a JSON-RPC `-32005`) resets the
-  transport, repeats `initialize`, and retries the failed request once; call
-  `disable_session_recovery` on the HTTP transport if the application must own
-  recovery. A 404 on a 2026-07-28 request is not session expiry, since that
-  protocol has no sessions;
+- a 404 on a legacy HTTP request carrying `Mcp-Session-Id`, or a JSON-RPC
+  `-32005`, signals session expiry. The client repeats `initialize` and
+  restores its GET listener. It retries a request once when the server
+  explicitly rejected that request. If the GET listener reports expiry,
+  callers still waiting for replies receive an error because their POSTs
+  may already have executed. Call `disable_session_recovery` to manage
+  recovery in the application. The 2026-07-28 protocol is sessionless.
 - final version selection retries one recognized unsupported-version response
   with a mutually supported modern version;
 - final tool calls refresh `tools/list` and retry once after a pre-execution
