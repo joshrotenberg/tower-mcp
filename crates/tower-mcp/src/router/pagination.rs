@@ -31,6 +31,11 @@ pub(super) fn paginate<T>(
     page_size: Option<usize>,
 ) -> Result<(Vec<T>, Option<String>)> {
     let Some(page_size) = page_size else {
+        if cursor.is_some() {
+            return Err(Error::invalid_params(
+                "This listing does not accept a pagination cursor",
+            ));
+        }
         return Ok((items, None));
     };
 

@@ -181,8 +181,8 @@ impl McpRouter {
     ///
     /// When set, list methods (`tools/list`, `resources/list`, etc.) will return
     /// at most `page_size` items per response, with a `next_cursor` for fetching
-    /// subsequent pages. When `None` (the default), all items are returned in a
-    /// single response.
+    /// subsequent pages. By default, the router returns all items in a single
+    /// response and rejects requests that supply a continuation cursor.
     pub fn page_size(mut self, size: usize) -> Self {
         Arc::make_mut(&mut self.inner).page_size = Some(size);
         self
